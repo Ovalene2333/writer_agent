@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useRef, useState } from "react";
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
@@ -63,7 +63,15 @@ type State = {
   usage: Usage;
   provider: Provider;
   activeJobs?: AgentJob[];
-  styles?: Array<{ id: string; name: string }>;
+  styleTemplates?: Array<{ id: string; name: string }>;
+};
+
+type TreeNode = {
+  name: string;
+  path: string;
+  kind: "file" | "folder";
+  children: TreeNode[];
+  hidden: boolean;
 };
 
 const MODE_LABELS: Record<WritingMode, string> = {
@@ -118,7 +126,222 @@ function Markdown({ content, className }: { content: string; className?: string 
     .replace(/\n/g, "<br/>");
 
   return (
-    <div className={`markdown ${className ?? ""}`} dangerouslySetInnerHTML={{ __html: `<p>${html}</p>` }} />
+    <div
+      className={`markdown ${className ?? ""}`}
+      dangerouslySetInnerHTML={{ __html: `<p>${html}</p>` }}
+    />
+  );
+}
+
+function buildTree(docs: string[], folders: string[], hiddenDocs: string[], hiddenFolders: string[]): TreeNode[] {
+  const folderMap = new Map<string, TreeNode>();
+  for (const path of folders) {
+    const parts = path.split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+    folderMap.set(path, {
+      name: parts[parts.length - 1],
+      path,
+      kind: "folder",
+      children: [],
+      hidden: hiddenFolders.includes(path),
+    });
+  }
+
+  const roots: TreeNode[] = [];
+  for (const [path, node] of folderMap) {
+    const parentPath = path.substring(0, path.lastIndexOf("/", path.length - 2) + 1);
+    const parent = folderMap.get(parentPath);
+    if (parent) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  for (const path of docs) {
+    const parts = path.split("/");
+    const name = parts.pop()!;
+    const parentPath = parts.join("/") + (parts.length > 0 ? "/" : "");
+    const fileNode: TreeNode = {
+      name,
+      path,
+      kind: "file",
+      children: [],
+      hidden: hiddenDocs.includes(path),
+    };
+
+    const parent = folderMap.get(parentPath);
+    if (parent) {
+      parent.children.push(fileNode);
+    } else {
+      roots.push(fileNode);
+    }
+  }
+
+  const sortNodes = (nodes: TreeNode[]) => {
+    nodes.sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const node of nodes) sortNodes(node.children);
+  };
+  sortNodes(roots);
+  return roots;
+}
+
+function FileTreeItem({
+  node,
+  depth,
+  activePath,
+  collapsed,
+  onSelect,
+  onRename,
+  onDelete,
+  onToggleHidden,
+  onDropFile,
+  onNewChild,
+  expandedFolders,
+  setExpandedFolders,
+}: {
+  node: TreeNode;
+  depth: number;
+  activePath: string;
+  collapsed: Set<string>;
+  onSelect: (path: string) => void;
+  onRename: (oldPath: string, kind: "file" | "folder") => void;
+  onDelete: (path: string, kind: "file" | "folder") => void;
+  onToggleHidden: (path: string, kind: "file" | "folder", current: boolean) => void;
+  onDropFile: (filePath: string, targetFolder: string) => void;
+  onNewChild: (parentFolder: string, kind: "file" | "folder") => void;
+  expandedFolders: Set<string>;
+  setExpandedFolders: React.Dispatch<React.SetStateAction<Set<string>>>;
+}) {
+  const isExpanded = node.kind === "folder" && expandedFolders.has(node.path);
+  const isCollapsed = collapsed.has(node.path);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleDragStart = (e: React.DragEvent) => {
+    e.dataTransfer.setData("text/plain", node.path);
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (node.kind !== "folder") return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOver(true);
+  };
+
+  const handleDragLeave = () => setDragOver(false);
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const filePath = e.dataTransfer.getData("text/plain");
+    if (filePath && node.kind === "folder" && filePath !== node.path) {
+      onDropFile(filePath, node.path);
+    }
+  };
+
+  const toggleFolder = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(node.path)) next.delete(node.path);
+      else next.add(node.path);
+      return next;
+    });
+  };
+
+  const handleClick = () => {
+    if (node.kind === "file") onSelect(node.path);
+    else toggleFolder({ stopPropagation: () => {} } as React.MouseEvent);
+  };
+
+  return (
+    <div className={`tree-node ${node.hidden ? "agent-hidden" : ""} ${node.kind}`}>
+      <div
+        className={`tree-row ${activePath === node.path ? "active" : ""} ${dragOver ? "drop-target" : ""}`}
+        style={{ paddingLeft: depth * 16 + 4 }}
+        draggable={node.kind === "file"}
+        onDragStart={node.kind === "file" ? handleDragStart : undefined}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        onClick={handleClick}
+      >
+        {node.kind === "folder" ? (
+          <span className={`tree-arrow ${isExpanded ? "expanded" : ""}`} onClick={toggleFolder} />
+        ) : (
+          <span className="tree-arrow-spacer" />
+        )}
+        <span className="tree-label" title={node.path}>
+          <span className="tree-name">{node.name}</span>
+        </span>
+        <div className="tree-actions">
+          <button
+            className="tree-action-btn"
+            title={node.hidden ? "Show to AI" : "Hide from AI"}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleHidden(node.path, node.kind, node.hidden);
+            }}
+          >
+            {node.hidden ? "Show" : "Hide"}
+          </button>
+          {node.kind === "folder" && (
+            <button
+              className="tree-action-btn"
+              title="New file in folder"
+              onClick={(e) => {
+                e.stopPropagation();
+                onNewChild(node.path, "file");
+              }}
+            >
+              +File
+            </button>
+          )}
+          <button
+            className="tree-action-btn"
+            title="Rename"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRename(node.path, node.kind);
+            }}
+          >
+            Rename
+          </button>
+          <button
+            className="tree-action-btn danger"
+            title="Delete"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(node.path, node.kind);
+            }}
+          >
+            Del
+          </button>
+        </div>
+      </div>
+      {isExpanded &&
+        node.children.map((child) => (
+          <FileTreeItem
+            key={child.path}
+            node={child}
+            depth={depth + 1}
+            activePath={activePath}
+            collapsed={collapsed}
+            onSelect={onSelect}
+            onRename={onRename}
+            onDelete={onDelete}
+            onToggleHidden={onToggleHidden}
+            onDropFile={onDropFile}
+            onNewChild={onNewChild}
+            expandedFolders={expandedFolders}
+            setExpandedFolders={setExpandedFolders}
+          />
+        ))}
+    </div>
   );
 }
 
@@ -135,9 +358,16 @@ function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [mobileTab, setMobileTab] = useState<"docs" | "editor" | "agent">("editor");
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [renaming, setRenaming] = useState<{ path: string; kind: "file" | "folder" } | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [creating, setCreating] = useState<{ parent: string; kind: "file" | "folder" } | null>(null);
+  const [createValue, setCreateValue] = useState("");
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const createInputRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(
     async (targetSession?: string) => {
@@ -164,6 +394,14 @@ function App() {
       })
       .catch((e) => setError(String(e)));
   }, [activePath]);
+
+  useEffect(() => {
+    if (renaming && renameInputRef.current) renameInputRef.current.focus();
+  }, [renaming]);
+
+  useEffect(() => {
+    if (creating && createInputRef.current) createInputRef.current.focus();
+  }, [creating]);
 
   function handleAgentEvent(event: AgentStreamEvent) {
     if (event.type === "step_start") {
@@ -322,6 +560,131 @@ function App() {
     }
   }
 
+  async function handleRename(oldPath: string, kind: "file" | "folder") {
+    setRenaming({ path: oldPath, kind });
+    setRenameValue(oldPath.split("/").pop()!);
+  }
+
+  async function submitRename() {
+    if (!renaming || !renameValue.trim()) {
+      setRenaming(null);
+      return;
+    }
+    const oldPath = renaming.path;
+    const parts = oldPath.split("/");
+    parts[parts.length - 1] = renameValue.trim();
+    if (renaming.kind === "file" && !parts[parts.length - 1].endsWith(".md")) {
+      parts[parts.length - 1] += ".md";
+    }
+    const newPath = parts.join("/");
+    try {
+      const endpoint = renaming.kind === "file" ? "/api/document/rename" : "/api/folder/rename";
+      await api(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({ fromPath: oldPath, toPath: newPath }),
+      });
+      if (activePath === oldPath) setActivePath(newPath);
+      await refresh(state?.sessionId);
+    } catch (e) {
+      setError(String(e));
+    }
+    setRenaming(null);
+  }
+
+  async function handleDelete(path: string, kind: "file" | "folder") {
+    const label = kind === "file" ? "document" : "folder";
+    if (!confirm(`Delete ${label} "${path}"? This cannot be undone.`)) return;
+    try {
+      const endpoint = kind === "file" ? "/api/document" : "/api/folder";
+      await api(`${endpoint}?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+      if (activePath === path) setActivePath("");
+      await refresh(state?.sessionId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleToggleHidden(path: string, kind: "file" | "folder", current: boolean) {
+    try {
+      const endpoint = kind === "file" ? "/api/document/visibility" : "/api/folder/visibility";
+      await api(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({ path, hidden: !current }),
+      });
+      await refresh(state?.sessionId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleDropFile(filePath: string, targetFolder: string) {
+    const parts = filePath.split("/");
+    const name = parts.pop()!;
+    const newPath = `${targetFolder}/${name}`;
+    if (newPath === filePath) return;
+    try {
+      await api("/api/document/rename", {
+        method: "PUT",
+        body: JSON.stringify({ fromPath: filePath, toPath: newPath }),
+      });
+      if (activePath === filePath) setActivePath(newPath);
+      await refresh(state?.sessionId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleNewChild(parent: string, kind: "file" | "folder") {
+    setCreating({ parent, kind });
+    setCreateValue(kind === "file" ? "new-document" : "new-folder");
+  }
+
+  async function submitCreate() {
+    if (!creating || !createValue.trim()) {
+      setCreating(null);
+      return;
+    }
+    const name = createValue.trim();
+    const fullPath = creating.parent
+      ? `${creating.parent}/${name}${creating.kind === "file" && !name.endsWith(".md") ? ".md" : ""}`
+      : `${name}${creating.kind === "file" && !name.endsWith(".md") ? ".md" : ""}`;
+    try {
+      if (creating.kind === "file") {
+        await api("/api/document", {
+          method: "POST",
+          body: JSON.stringify({ path: fullPath, content: "# New Document\n\n" }),
+        });
+      } else {
+        await api("/api/folder", {
+          method: "POST",
+          body: JSON.stringify({ path: fullPath }),
+        });
+      }
+      setExpandedFolders((prev) => {
+        const next = new Set(prev);
+        next.add(creating.parent);
+        return next;
+      });
+      await refresh(state?.sessionId);
+    } catch (e) {
+      setError(String(e));
+    }
+    setCreating(null);
+  }
+
+  const tree = useMemo(() => {
+    if (!state) return [];
+    return buildTree(state.documents, state.documentFolders, state.hiddenDocuments, state.hiddenFolders);
+  }, [state?.documents, state?.documentFolders, state?.hiddenDocuments, state?.hiddenFolders]);
+
+  const collapsed = useMemo(() => {
+    if (!state) return new Set<string>();
+    const set = new Set<string>();
+    for (const d of state.hiddenDocuments) set.add(d);
+    for (const f of state.hiddenFolders) set.add(f);
+    return set;
+  }, [state?.hiddenDocuments, state?.hiddenFolders]);
+
   if (!state) {
     return (
       <main className="app-shell">
@@ -337,7 +700,6 @@ function App() {
 
   return (
     <div className="app">
-      {/* ── Header ── */}
       <header>
         <div className="header-left">
           <span className="logo">WRITER</span>
@@ -348,7 +710,7 @@ function App() {
             <span className="usage-number">{usagePct}%</span>
             <span>{state.usage.totalTokens.toLocaleString()} tok</span>
             <span>
-              {state.usage.currency === "CNY" ? "¥" : "$"}
+              {state.usage.currency === "CNY" ? "&yen;" : "$"}
               {state.usage.cost.toFixed(4)}
             </span>
           </div>
@@ -368,7 +730,6 @@ function App() {
         </div>
       </header>
 
-      {/* ── Mobile tabs ── */}
       <div className="mobile-tabs">
         <button className={mobileTab === "docs" ? "active" : ""} onClick={() => setMobileTab("docs")}>
           Docs
@@ -381,29 +742,101 @@ function App() {
         </button>
       </div>
 
-      {/* ── Sidebar ── */}
       <aside className={`documents ${mobileTab === "docs" ? "mobile-active" : ""}`}>
+        <div className="file-manager-actions">
+          <button
+            onClick={() => {
+              setCreating({ parent: "", kind: "file" });
+              setCreateValue("new-document");
+            }}
+          >
+            + Document
+          </button>
+          <button
+            onClick={() => {
+              setCreating({ parent: "", kind: "folder" });
+              setCreateValue("new-folder");
+            }}
+          >
+            + Folder
+          </button>
+        </div>
+
+        {renaming && (
+          <div className="inline-edit">
+            <input
+              ref={renameInputRef}
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitRename();
+                if (e.key === "Escape") setRenaming(null);
+              }}
+              onBlur={submitRename}
+              placeholder="New name..."
+            />
+          </div>
+        )}
+
+        {creating && (
+          <div className="inline-edit">
+            <input
+              ref={createInputRef}
+              value={createValue}
+              onChange={(e) => setCreateValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitCreate();
+                if (e.key === "Escape") setCreating(null);
+              }}
+              onBlur={submitCreate}
+              placeholder={creating.kind === "file" ? "filename.md" : "folder-name"}
+            />
+          </div>
+        )}
+
         <div className="sidebar-section docs">
-          <h2>Documents</h2>
-          {state.documents.length === 0 ? (
+          {tree.length === 0 ? (
             <div className="sidebar-empty">No documents yet</div>
           ) : (
-            state.documents.map((path) => (
-              <button
-                key={path}
-                className={`sidebar-item ${path === activePath ? "active" : ""}`}
-                onClick={() => {
-                  setActivePath(path);
-                  setMobileTab("editor");
-                }}
-              >
-                {path}
-              </button>
-            ))
+            <div className="document-tree">
+              {tree.map((node) => (
+                <FileTreeItem
+                  key={node.path}
+                  node={node}
+                  depth={0}
+                  activePath={activePath}
+                  collapsed={collapsed}
+                  onSelect={(path) => {
+                    setActivePath(path);
+                    setMobileTab("editor");
+                  }}
+                  onRename={handleRename}
+                  onDelete={handleDelete}
+                  onToggleHidden={handleToggleHidden}
+                  onDropFile={handleDropFile}
+                  onNewChild={handleNewChild}
+                  expandedFolders={expandedFolders}
+                  setExpandedFolders={setExpandedFolders}
+                />
+              ))}
+            </div>
           )}
         </div>
+
         <div className="sidebar-section sessions">
-          <h2>Sessions</h2>
+          <h2>
+            Sessions
+            <button
+              className="ghost"
+              style={{ padding: "1px 6px", fontSize: 12 }}
+              onClick={async () => {
+                const r = await api<{ sessionId: string }>("/api/session", { method: "POST" });
+                await refresh(r.sessionId);
+              }}
+            >
+              +
+            </button>
+          </h2>
           {state.sessions.length === 0 ? (
             <div className="sidebar-empty">No sessions</div>
           ) : (
@@ -416,8 +849,8 @@ function App() {
                   setMobileTab("agent");
                 }}
               >
-                <div>
-                  {s.title}
+                <div style={{ overflow: "hidden" }}>
+                  <div style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{s.title}</div>
                   <span className="sidebar-meta">{new Date(s.updatedAt).toLocaleDateString()}</span>
                 </div>
               </button>
@@ -426,7 +859,6 @@ function App() {
         </div>
       </aside>
 
-      {/* ── Editor ── */}
       <main className={`editor ${mobileTab === "editor" ? "mobile-active" : ""}`}>
         <div className="editor-bar">
           <span className="doc-path">{activePath || "No document selected"}</span>
@@ -453,7 +885,6 @@ function App() {
               <Markdown content={document.content} />
             ) : (
               <div className="empty-state">
-                <span className="empty-icon">{"\u270E"}</span>
                 <p>Select a document to read</p>
                 <span className="empty-hint">Choose a file from the sidebar</span>
               </div>
@@ -462,7 +893,6 @@ function App() {
         )}
       </main>
 
-      {/* ── Agent Panel ── */}
       <section className={`agent-panel ${mobileTab === "agent" ? "mobile-active" : ""}`}>
         <div className="agent-head">
           <h2>Agent</h2>
@@ -500,7 +930,7 @@ function App() {
                 {step.tools.length > 0 && (
                   <span className="agent-step-tools">{step.tools.join(", ")}</span>
                 )}
-                <span className="agent-step-chevron">{step.expanded ? "\u25B2" : "\u25BC"}</span>
+                <span className="agent-step-chevron">{step.expanded ? "^" : "v"}</span>
               </button>
               {step.expanded && (
                 <div className="agent-step-content">
@@ -519,11 +949,8 @@ function App() {
           ))}
           {state.messages.length === 0 && streamSteps.length === 0 && (
             <div className="empty-state">
-              <span className="empty-icon">{"\u2728"}</span>
               <p>Start a conversation</p>
-              <span className="empty-hint">
-                Describe your writing task below
-              </span>
+              <span className="empty-hint">Describe your writing task below</span>
             </div>
           )}
           {notice && <article className="notice">{notice}</article>}
@@ -571,14 +998,11 @@ function App() {
         </div>
       </section>
 
-      {/* ── Proposals ── */}
       <section className="proposals">
         <h2>
           Proposals
           {pendingProposals.length > 0 && (
-            <span style={{ fontWeight: 400, marginLeft: 8 }}>
-              ({pendingProposals.length})
-            </span>
+            <span style={{ fontWeight: 400, marginLeft: 8 }}>({pendingProposals.length})</span>
           )}
         </h2>
         {pendingProposals.length === 0 ? (
