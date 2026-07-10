@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { resolve } from "node:path";
+import process from "node:process";
+import { Command } from "commander";
+import { runAgent } from "./agent.js";
+import type { WritingMode } from "./generation.js";
+import { WriterProject } from "./project.js";
+import { ProviderManager } from "./provider_catalog.js";
+import { startWriterServer } from "./server.js";
+import { WriterStore } from "./store.js";
+
+const program = new Command();
+program
+  .name("writer")
+  .description("面向长篇创作的终端写作 Agent")
+  .version("0.1.0");
+
+program.command("init")
+  .description("初始化写作项目")
+  .argument("[directory]", "项目目录", ".")
+  .option("--title <title>", "作品名称")
+  .action((directory: string, options: { title?: string }) => {
+    const target = resolve(directory);
+    if (existsSync(resolve(target, "writer.yaml"))) throw new Error("目标目录已经是写作项目");
+    const project = WriterProject.init(target, options.title);
+    const store = new WriterStore(project);
+    store.close();
+    process.stdout.write(`已初始化《${project.config().title}》：${project.root}\n`);
+  });
+
+program.command("run")
+  .description("执行一次写作生成并退出")
+  .argument("<prompt>", "写作指令")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .option("-s, --session <id>", "继续指定会话")
+  .option("-m, --mode <mode>", "写作动作：write、continue、rewrite、rewrite_document、polish", "write")
+  .option("--path <path>", "目标 Markdown 文档")
+  .option("--json", "逐行输出 JSON 事件")
+  .option("--debug", "在终端输出模型请求体和原始返回体")
+  .action(async (prompt: string, options: { project: string; session?: string; mode: WritingMode; path?: string; json?: boolean; debug?: boolean }) => {
+    if (options.debug) process.env.WRITER_DEBUG = "1";
+    const { project, store, providers } = openProject(options.project);
+    try {
+      const sessionId = resolveSession(store, options.session, false);
+      await runAgent({
+        project, store, sessionId, prompt, requestedMode: options.mode, targetPath: options.path,
+        purpose: options.mode === "polish" ? "review" : options.mode === "rewrite" ? "inline" : "agent",
+        models: {
+          agent: providers.modelConfig("agent"), writer: providers.modelConfig("writer"),
+          inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),
+        },
+        onEvent: (event) => {
+          if (options.json) process.stdout.write(`${JSON.stringify(event)}\n`);
+          else if (event.type === "text") process.stdout.write(event.text);
+          else if (event.type === "proposal") process.stdout.write(`\n[待审批提案 #${event.proposal.id}：${event.proposal.path}]\n`);
+          else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
+        },
+      });
+      if (!options.json) process.stdout.write("\n");
+    } finally { store.close(); }
+  });
+
+program.command("web")
+  .alias("serve")
+  .description("启动常驻 Web 写作工作台")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .option("--lan", "允许局域网设备访问")
+  .option("--host <host>", "监听地址")
+  .option("--port <port>", "监听端口", "4096")
+  .option("--share", "创建临时公网访问地址（需要已安装 cloudflared）")
+  .option("--no-open", "不自动打开 PC 浏览器")
+  .option("--debug", "在终端输出模型请求体和原始返回体")
+  .action(async (options: { project: string; lan?: boolean; host?: string; port: string; share?: boolean; open: boolean; debug?: boolean }) => {
+    if (options.debug) process.env.WRITER_DEBUG = "1";
+    const { project, store, providers } = openProject(options.project);
+    const host = options.host || (options.lan ? "0.0.0.0" : "127.0.0.1");
+    const port = Number(options.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口必须是 1 至 65535 的整数");
+    const server = await startWriterServer({ project, store, providers, host, port });
+    const tunnel = options.share ? startShareTunnel(port, server.token) : undefined;
+    if (options.open) openBrowser(server.url);
+    const stop = async () => {
+      tunnel?.kill();
+      await server.close();
+      store.close();
+      process.exit(0);
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    await new Promise(() => undefined);
+  });
+
+program.command("export")
+  .description("按章节顺序导出作品")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .option("-f, --format <format>", "导出格式：md 或 txt", "md")
+  .option("-o, --output <file>", "输出文件；省略时写到标准输出")
+  .action((options: { project: string; format: string; output?: string }) => {
+    if (options.format !== "md" && options.format !== "txt") throw new Error("导出格式仅支持 md 或 txt");
+    const project = new WriterProject(options.project);
+    if (!project.exists()) throw new Error("当前目录不是写作项目，请先执行 writer init");
+    const content = project.export(options.format);
+    if (options.output) writeFileSync(resolve(options.output), content, "utf8");
+    else process.stdout.write(content);
+  });
+
+const session = program.command("session").description("管理写作会话");
+session.command("list")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .action((options: { project: string }) => {
+    const { store } = openProject(options.project);
+    try {
+      for (const item of store.listSessions()) process.stdout.write(`${item.id}\t${item.updatedAt}\t${item.title}\n`);
+    } finally { store.close(); }
+  });
+
+program
+  .argument("[project]", "写作项目目录", ".")
+  .action(async (projectPath: string) => {
+    const { project, store, providers } = openProject(projectPath);
+    const server = await startWriterServer({ project, store, providers });
+    openBrowser(server.url);
+    const stop = async () => { await server.close(); store.close(); process.exit(0); };
+    process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    await new Promise(() => undefined);
+  });
+
+program.parseAsync().catch((error) => {
+  process.stderr.write(`错误：${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
+
+function openProject(path: string): { project: WriterProject; store: WriterStore; providers: ProviderManager } {
+  const project = new WriterProject(path);
+  if (!project.exists()) throw new Error("当前目录不是写作项目，请先执行 writer init");
+  return { project, store: new WriterStore(project), providers: new ProviderManager(project) };
+}
+
+function resolveSession(store: WriterStore, requested: string | undefined, useLatest: boolean): string {
+  if (requested) {
+    if (!store.sessionExists(requested)) throw new Error(`会话不存在：${requested}`);
+    return requested;
+  }
+  if (useLatest) return store.latestSession() ?? store.createSession();
+  return store.createSession();
+}
+
+function openBrowser(url: string): void {
+  try {
+    const command = process.platform === "win32" ? "cmd"
+      : process.platform === "darwin" ? "open"
+        : "xdg-open";
+    const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    child.once("error", () => process.stderr.write(`无法自动打开浏览器，请手动访问：${url}\n`));
+    child.unref();
+  } catch {
+    process.stderr.write(`无法自动打开浏览器，请手动访问：${url}\n`);
+  }
+}
+
+function startShareTunnel(port: number, token: string): ChildProcessWithoutNullStreams {
+  process.stdout.write("正在创建公网临时访问地址（cloudflared）...\n");
+  const tunnel = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+    windowsHide: true,
+    stdio: "pipe",
+  });
+  let printed = false;
+  const handleOutput = (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+    if (match && !printed) {
+      printed = true;
+      process.stdout.write(`公网访问：${match[0]}/#token=${token}\n`);
+      process.stdout.write("注意：这个地址会暴露你的写作工作台。只发给自己可信设备，结束终端进程后隧道会关闭。\n");
+    }
+  };
+  tunnel.stdout.on("data", handleOutput);
+  tunnel.stderr.on("data", handleOutput);
+  tunnel.once("error", (error) => {
+    process.stderr.write(`无法启动 cloudflared：${error.message}\n`);
+    process.stderr.write("请先安装 Cloudflare Tunnel 客户端，或改用 `writer web --lan` 只在局域网访问。\n");
+  });
+  tunnel.once("exit", (code) => {
+    if (!printed && code !== 0) {
+      process.stderr.write("cloudflared 隧道未成功创建。请确认 cloudflared 已安装且网络可访问 Cloudflare。\n");
+    }
+  });
+  return tunnel;
+}

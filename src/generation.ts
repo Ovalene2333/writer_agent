@@ -1,0 +1,567 @@
+import type { AgentEvent, Character, ModelConfig } from "./types.js";
+import { WriterProject } from "./project.js";
+import { WriterStore } from "./store.js";
+import { logModelRequest, logModelResponse } from "./model_debug.js";
+
+export type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
+export type ActionMode = WritingMode | "character";
+export type ActionSuggestion = {
+  mode: ActionMode;
+  label: string;
+  reason: string;
+  characterId?: number;
+  documentPaths?: string[];
+};
+
+export async function suggestActions(input: {
+  model: ModelConfig;
+  request: string;
+  conversation?: Array<{ role: "user" | "assistant"; content: string }>;
+  documents: string[];
+  activePath?: string;
+  hasSelection: boolean;
+  characters: Array<{ id: number; name: string; aliases: string[] }>;
+  signal?: AbortSignal;
+}): Promise<ActionSuggestion[]> {
+  if (!input.request.trim()) throw new Error("请求不能为空");
+  if (input.activePath && requestsWholeDocumentRewrite(input.request)) {
+    return [{
+      mode: "rewrite_document",
+      label: "修改全文档",
+      reason: "指令明确要求修改当前完整文档",
+    }];
+  }
+  const result = await completeText(input.model, [
+    { role: "system", content: `你是写作应用的意图路由器，只负责提出可执行动作，不创作正文，也不修改数据。只输出 JSON 数组，包含 1 到 3 个对象。对象字段：mode（只能是 write/continue/rewrite/rewrite_document/polish/character）、label（简短中文按钮文案）、reason（不超过40字）、characterId（仅修改已有角色时使用，必须来自给定角色列表）、documentPaths（可选字符串数组）。规则：新建正文用 write；接续当前文档用 continue；修改选区内容用 rewrite；修改当前完整文档用 rewrite_document；仅改善选区语言用 polish；创建或修改角色资料用 character。rewrite_document 只有存在 activePath 时才能提出，且不要求文本选区。处理角色卡时，根据用户要求可从给定 documents 中选择最多 5 个可能相关的世界观、设定或大纲文档放入 documentPaths；不需要资料时返回空数组。conversation 是当前请求之前的最近对话。必须结合它判断省略的操作对象和指代：若用户正在创建或修改角色卡，后续补充、调整、确认等请求仍应路由到 character；对话中提到的世界观或参考文档不代表要切换为正文或文档编辑。仅在用户明确改变任务时切换模式。不要发明文档、角色 ID 或其他工具。` },
+    { role: "user", content: JSON.stringify({ request: input.request, conversation: input.conversation?.slice(-12) ?? [], activePath: input.activePath || null, hasSelection: input.hasSelection, documents: input.documents.slice(0, 100), characters: input.characters.slice(0, 100) }) },
+  ], input.signal);
+  const value = parseJsonArray(result.content);
+  const validModes = new Set<ActionMode>(["write", "continue", "rewrite", "rewrite_document", "polish", "character"]);
+  const characterIds = new Set(input.characters.map(item => item.id));
+  const documents = new Set(input.documents);
+  const suggestions = value.slice(0, 3).flatMap(item => {
+    if (!item || typeof item !== "object") return [];
+    const raw = item as Record<string, unknown>;
+    const mode = raw.mode as ActionMode;
+    if (!validModes.has(mode)) return [];
+    if ((mode === "continue" || mode === "rewrite" || mode === "rewrite_document" || mode === "polish") && !input.activePath) return [];
+    if ((mode === "rewrite" || mode === "polish") && !input.hasSelection) return [];
+    const characterId = Number(raw.characterId);
+    return [{
+      mode,
+      label: typeof raw.label === "string" && raw.label.trim() ? raw.label.trim().slice(0, 24) : defaultActionLabel(mode),
+      reason: typeof raw.reason === "string" ? raw.reason.trim().slice(0, 80) : "",
+      ...(mode === "character" && characterIds.has(characterId) ? { characterId } : {}),
+      ...(mode === "character" && Array.isArray(raw.documentPaths) ? {
+        documentPaths: raw.documentPaths.filter((path): path is string => typeof path === "string" && documents.has(path)).slice(0, 5),
+      } : {}),
+    }];
+  });
+  return suggestions.length ? suggestions : [{ mode: input.activePath ? "continue" : "write", label: input.activePath ? "续写当前文档" : "新写正文", reason: "根据当前编辑上下文执行" }];
+}
+
+function requestsWholeDocumentRewrite(request: string): boolean {
+  const text = request.trim().replace(/\s+/g, "");
+  const editIntent = /(?:修改|改写|重写|调整|优化|修订|润色|完善|精简|扩写|重构|统一|检查并修改)/u;
+  const wholeDocumentScope = /(?:全文档|全文|整个文档|整份文档|当前文档|这篇文档|本文档|整篇|通篇|全文内容|本章|整章|整篇文章|整篇正文|wholedocument|entiredocument)/iu;
+  const genericDocumentRequest = /(?:修改|改写|重写|调整|优化|修订|润色|完善)(?:一下|下)?(?:当前|这篇|本文)?(?:文档|文章|正文)(?:吧|。|！|!)?$/u;
+  const localScope = /(?:选区|所选|这段|这一段|该段|第[一二三四五六七八九十\d]+段|这句|该句|标题|开头|结尾|某一段|局部)/u;
+  return !localScope.test(text) && ((editIntent.test(text) && wholeDocumentScope.test(text)) || genericDocumentRequest.test(text));
+}
+
+export interface GenerateWritingOptions {
+  project: WriterProject;
+  store: WriterStore;
+  draftModel: ModelConfig;
+  model: ModelConfig;
+  summaryModel?: ModelConfig;
+  sessionId: string;
+  mode: WritingMode;
+  instruction: string;
+  path?: string;
+  selection?: string;
+  characterIds?: number[];
+  signal?: AbortSignal;
+  onEvent?: (event: AgentEvent) => void | Promise<void>;
+}
+
+export async function generateWriting(options: GenerateWritingOptions): Promise<void> {
+  const emit = async (event: AgentEvent) => { await options.onEvent?.(event); };
+  const pending = options.store.writingDraft(options.sessionId);
+  const effective = pending
+    ? { ...options, mode: pending.mode as WritingMode, instruction: pending.instruction, path: pending.path, selection: pending.selection }
+    : options;
+  validateWritingRequest(effective);
+  const before = effective.path && effective.project.documentExists(effective.path)
+    ? effective.project.read(effective.path)
+    : "";
+  const characters = selectedCharacters(effective.store, effective.characterIds);
+  options.store.addMessage(options.sessionId, "user", options.instruction.trim());
+  try {
+    if (!pending || !isDraftConfirmation(options.instruction)) {
+      await emit({ type: "step_start", step: 1 });
+      const draftBase = pending
+        ? { ...options, mode: pending.mode as WritingMode, instruction: pending.instruction, path: pending.path, selection: pending.selection }
+        : options;
+      const draftBefore = draftBase.path && draftBase.project.documentExists(draftBase.path) ? draftBase.project.read(draftBase.path) : "";
+      const draftResult = await buildWritingDraft(draftBase, draftBefore, async (name) => {
+        await emit({ type: "tool", name });
+      }, pending ? { draft: pending.draft, revision: options.instruction } : undefined);
+      draftBase.store.saveWritingDraft(draftBase.sessionId, {
+        mode: draftBase.mode, instruction: draftBase.instruction, path: draftBase.path,
+        selection: draftBase.selection, draft: draftResult.draft,
+      });
+      if (draftResult.usage && draftBase.draftModel.pricing) {
+        await emit({ type: "usage", usage: draftBase.store.recordUsage(draftBase.sessionId, draftBase.draftModel.model, draftResult.usage, draftBase.draftModel.pricing) });
+      }
+      const report = `${pending ? "草案已修改" : "写作草案已生成"}：\n\n${draftResult.draft}\n\n回复修改要求可继续调整草案；回复“确认开写”后才会调用正文模型。`;
+      draftBase.store.addMessage(draftBase.sessionId, "assistant", report);
+      await emit({ type: "text", text: report, channel: "output" });
+      await emit({ type: "step_done", step: 1 });
+      await emit({ type: "done", sessionId: draftBase.sessionId });
+      return;
+    }
+    await emit({ type: "step_start", step: 1 });
+    const messages = writingMessages(effective, before, characters, pending.draft);
+    const result = await streamText(effective.model, messages, effective.signal, async text => {
+      await emit({ type: "text", text, channel: "output" });
+    });
+    const generated = cleanModelText(result.content);
+    if (!generated) throw new Error("模型没有返回正文");
+    const path = targetPath(effective);
+    const after = applyGeneratedText(effective.mode, before, effective.selection, generated);
+    const proposal = effective.store.createProposal(effective.sessionId, path, after, proposalSummary(effective.mode));
+    effective.store.clearWritingDraft(effective.sessionId);
+    const fallbackSummary = `已生成${modeLabel(effective.mode)}提案：${path}`;
+    const summary = await safeChangeSummary(effective.summaryModel ?? effective.model, {
+      kind: "document", action: modeLabel(effective.mode), target: path, instruction: effective.instruction,
+      before: summaryBefore(effective.mode, before, effective.selection), after: summaryAfter(effective.mode, generated),
+    }, fallbackSummary, effective.signal);
+    effective.store.addMessage(effective.sessionId, "assistant", summary);
+    await emit({ type: "text", text: `\n\n${summary}`, channel: "output" });
+    if (result.usage && effective.model.pricing) {
+      await emit({ type: "usage", usage: effective.store.recordUsage(effective.sessionId, effective.model.model, result.usage, effective.model.pricing) });
+    }
+    await emit({ type: "proposal", proposal });
+    await emit({ type: "step_done", step: 1 });
+    await emit({ type: "done", sessionId: effective.sessionId });
+  } catch (error) {
+    if (options.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+      await emit({ type: "cancelled", sessionId: options.sessionId });
+      return;
+    }
+    await emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+}
+
+export async function generateCharacter(input: {
+  model: ModelConfig;
+  description: string;
+  existing?: Partial<Character>;
+  project?: WriterProject;
+  allowedDocumentPaths?: string[];
+  onTool?: (name: string, path: string) => void | Promise<void>;
+  signal?: AbortSignal;
+}): Promise<Omit<Character, "id" | "updatedAt">> {
+  if (!input.description.trim()) throw new Error("角色描述不能为空");
+  const messages: ToolLoopMessage[] = [
+    { role: "system", content: `你是小说角色设计助手。根据用户要求生成或补全角色卡。你可以按需读取获准的参考文档，但不要读取无关资料。完成后只输出一个 JSON 对象，不要 Markdown，不要解释。字段必须完整：name(string), aliases(string[]), role(string), appearance(string), traits(string), background(string), goals(string), relationships(string), relatedCharacterIds(number[]), abilities(string), notes(string)。不要擅自关联未知角色，relatedCharacterIds 默认空数组。` },
+    { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
+  ];
+  const result = input.project && input.allowedDocumentPaths?.length
+    ? await runReadOnlyToolLoop(input.model, messages, input.project, input.allowedDocumentPaths, input.signal, input.onTool)
+    : await completeText(input.model, messages, input.signal);
+  const parsed = parseJsonObject(result.content);
+  return normalizeCharacterDraft(parsed);
+}
+
+export async function updateCharacterFromConversation(input: {
+  model: ModelConfig;
+  summaryModel?: ModelConfig;
+  store: WriterStore;
+  sessionId: string;
+  instruction: string;
+  characterId?: number;
+  allowedDocumentPaths?: string[];
+  signal?: AbortSignal;
+  onEvent?: (event: AgentEvent) => void | Promise<void>;
+}): Promise<void> {
+  const emit = async (event: AgentEvent) => { await input.onEvent?.(event); };
+  if (!input.store.sessionExists(input.sessionId)) throw new Error("写作会话不存在");
+  const existing = input.characterId === undefined
+    ? undefined
+    : input.store.characters().find(item => item.id === input.characterId);
+  if (input.characterId !== undefined && !existing) throw new Error("目标角色卡不存在");
+  const userMessageId = input.store.addMessage(input.sessionId, "user", input.instruction.trim());
+  await emit({ type: "step_start", step: 1 });
+  try {
+    const draft = await generateCharacter({
+      model: input.model, description: input.instruction, existing,
+      project: input.store.project, allowedDocumentPaths: input.allowedDocumentPaths,
+      onTool: async () => { await emit({ type: "tool", name: "read_document" }); }, signal: input.signal,
+    });
+    const character = input.store.saveCharacterWithRevision(input.sessionId, userMessageId, {
+      ...draft, id: existing?.id,
+      relatedCharacterIds: existing?.relatedCharacterIds ?? draft.relatedCharacterIds,
+    });
+    const fallback = existing ? `已更新角色卡：${character.name}` : `已创建角色卡：${character.name}`;
+    const message = await safeChangeSummary(input.summaryModel ?? input.model, {
+      kind: "character", action: existing ? "更新角色卡" : "创建角色卡", target: character.name,
+      instruction: input.instruction,
+      before: existing ? JSON.stringify(characterContext(existing), null, 2) : "（新建）",
+      after: JSON.stringify(characterContext(character), null, 2),
+    }, fallback, input.signal);
+    input.store.addMessage(input.sessionId, "assistant", message);
+    await emit({ type: "text", text: message, channel: "output" });
+    await emit({ type: "character", character });
+    await emit({ type: "step_done", step: 1 });
+    await emit({ type: "done", sessionId: input.sessionId });
+  } catch (error) {
+    if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+      await emit({ type: "cancelled", sessionId: input.sessionId }); return;
+    }
+    await emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+}
+
+type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
+type ToolLoopMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
+};
+type ChatMessage = ToolLoopMessage;
+
+async function buildWritingDraft(
+  options: GenerateWritingOptions,
+  document: string,
+  onTool: (name: string) => void | Promise<void>,
+  revision?: { draft: string; revision: string },
+): Promise<{ draft: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
+  const allowedCharacterIds = new Set(selectedCharacters(options.store, options.characterIds).map(item => item.id));
+  const documents = options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)).slice(0, 100);
+  const documentSet = new Set(documents);
+  const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.name, aliases: item.aliases, role: item.role }));
+  const tools = [
+    { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
+    { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡。", parameters: { type: "object", properties: { id: { type: "number", enum: [...allowedCharacterIds] } }, required: ["id"], additionalProperties: false } } },
+    { type: "function", function: { name: "list_documents", description: "列出可读取的世界观、设定、大纲和正文文档路径。先看目录，只选择本次确实需要的文档。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
+    { type: "function", function: { name: "read_document", description: "读取一份与本次情节或事实核对直接相关的文档。", parameters: { type: "object", properties: { path: { type: "string", enum: documents } }, required: ["path"], additionalProperties: false } } },
+  ];
+  const existingContext = options.mode === "continue" ? document.slice(-12_000)
+    : options.mode === "rewrite_document" ? document.slice(0, 16_000)
+      : options.selection?.trim() || document.slice(-6_000);
+  const messages: ToolLoopMessage[] = [
+    { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
+先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取世界观、设定、大纲或前文文档，不得为了“全面”遍历资料。
+最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
+    { role: "user", content: revision
+      ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。`
+      : `写作动作：${options.mode}\n写作要求：${options.instruction.trim()}\n目标文档：${options.path ?? "新文档"}\n当前必要上下文：\n${existingContext || "（无）"}` },
+  ];
+  const endpoint = `${options.draftModel.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const usage = { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 };
+  let hasUsage = false;
+  for (let turn = 0; turn < 7; turn += 1) {
+    const requestBody = JSON.stringify({
+      model: options.draftModel.model, messages, tools, tool_choice: "auto", stream: false,
+      ...(options.draftModel.temperature === undefined ? {} : { temperature: options.draftModel.temperature }),
+      ...(options.draftModel.topP === undefined ? {} : { top_p: options.draftModel.topP }),
+    });
+    logModelRequest(endpoint, requestBody);
+    const response = await fetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody });
+    const responseBody = await response.text();
+    logModelResponse(endpoint, responseBody);
+    if (!response.ok) throw new Error(`草案模型请求失败（${response.status}）：${responseBody.slice(0, 500)}`);
+    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; prompt_cache_hit_tokens?: number } };
+    if (payload.usage) {
+      hasUsage = true;
+      const promptTokens = Number(payload.usage.prompt_tokens ?? 0);
+      const cacheHitTokens = Number(payload.usage.prompt_tokens_details?.cached_tokens ?? payload.usage.prompt_cache_hit_tokens ?? 0);
+      usage.promptTokens += promptTokens;
+      usage.completionTokens += Number(payload.usage.completion_tokens ?? 0);
+      usage.cacheHitTokens += cacheHitTokens;
+      usage.cacheMissTokens += Math.max(0, promptTokens - cacheHitTokens);
+    }
+    const message = payload.choices?.[0]?.message;
+    if (!message) throw new Error("草案模型没有返回有效响应");
+    const calls = message.tool_calls ?? [];
+    if (!calls.length) {
+      const draft = message.content?.trim();
+      if (!draft) throw new Error("草案模型没有生成写作草案");
+      return { draft, ...(hasUsage ? { usage } : {}) };
+    }
+    messages.push({ role: "assistant", content: message.content ?? null, tool_calls: calls });
+    for (const call of calls) {
+      await onTool(call.function.name);
+      let result: unknown;
+      try {
+        const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
+        if (call.function.name === "list_characters") result = characterDirectory;
+        else if (call.function.name === "read_character") {
+          const id = Number(args.id);
+          if (!allowedCharacterIds.has(id)) throw new Error("角色不在本次获准范围内");
+          const character = options.store.characters().find(item => item.id === id);
+          if (!character) throw new Error("角色不存在");
+          result = characterContext(character);
+        } else if (call.function.name === "list_documents") result = documents.map(path => ({ path, characters: options.project.read(path).length }));
+        else if (call.function.name === "read_document") {
+          const path = typeof args.path === "string" ? args.path : "";
+          if (!documentSet.has(path)) throw new Error("文档未获准或已被屏蔽");
+          const content = options.project.read(path);
+          result = { path, content: content.slice(0, 16_000), truncated: content.length > 16_000 };
+        } else throw new Error("未知草案工具");
+      } catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
+      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+  }
+  throw new Error("草案模型的工具循环超过 7 轮，请缩小写作范围或资料范围");
+}
+
+function isDraftConfirmation(instruction: string): boolean {
+  const text = instruction.trim().replace(/[\s，,。！!]/g, "");
+  return /^(?:确认|确认开写|确认开始写|确认直接开写|开始写|开始正文|直接开写|按草案写|按这个草案写|就按这个写|草案没问题|通过|继续写正文)$/u.test(text);
+}
+
+function writingMessages(options: GenerateWritingOptions, document: string, characters: Character[], draft: string): ChatMessage[] {
+  const context = options.mode === "continue" ? document.slice(-12_000)
+    : options.mode === "rewrite_document" ? document
+    : options.mode === "rewrite" || options.mode === "polish" ? selectionContext(document, options.selection!)
+      : "";
+  const task: Record<WritingMode, string> = {
+    write: "创作一篇新的小说正文。只输出可直接写入 Markdown 文档的正文。",
+    continue: "从给出的文档末尾自然续写。只输出新增正文，不要重复已有内容。",
+    rewrite: "按要求改写选区。只输出替换选区的新文本，不要输出分析或原文。",
+    rewrite_document: "按要求修改给出的完整文档。只输出修改后的完整正文，不要输出分析、摘要或原文对照。",
+    polish: "润色选区，保持事实、视角、时序和人物声线不变。只输出替换选区的新文本。",
+  };
+  return [
+    { role: "system", content: `你是小说写作助手。${task[options.mode]}
+正文要求：
+- 先写可观察的动作、选择、代价、对白和有对象的感官细节，避免用抽象性格或情绪标签包办人物。
+- 不在动作、对白或细节之后重复说明人物的心理、潜台词、象征或“这意味着什么”；仅在省略会造成因果断裂时解释。
+- 句长、段长和信息密度服从场景，不追求整齐、对称、三项并列或每段总结。不同人物的词汇、句长、礼貌程度和回避方式应可区分。
+- 避免套语、模板化转折、连续排比以及“不是A，而是B”一类先否定再定义的解释框架。直接写有效的动作、观察或结果。
+- 通过具体且相关的内容差异降低机器感；不要随机换同义词、强行拆句、故意写病句、滥加口语或无关细节。
+- 保留必要的朴素过渡、留白、轻重差别和不对称。新增细节必须来自现有上下文，并服务于行动、空间、因果或伏笔。
+不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡之外的关键设定。` },
+    { role: "user", content: [
+      `作品语言：${options.project.config().language}`,
+      characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(characterContext), null, 2)}` : "相关角色卡：无",
+      `写作前草案（用于约束情节、事实和必要信息；不要在正文中复述草案）：\n${draft}`,
+      context ? `文档上下文：\n${context}` : "",
+      `写作要求：${options.instruction.trim()}`,
+    ].filter(Boolean).join("\n\n") },
+  ];
+}
+
+function validateWritingRequest(options: GenerateWritingOptions): void {
+  if (!["write", "continue", "rewrite", "rewrite_document", "polish"].includes(options.mode)) throw new Error("写作动作无效");
+  if (!options.store.sessionExists(options.sessionId)) throw new Error("写作会话不存在");
+  if (!options.instruction.trim()) throw new Error("写作要求不能为空");
+  if (options.mode !== "write" && !options.path) throw new Error("该写作动作需要目标文档");
+  if (options.path && options.mode !== "write" && !options.project.documentExists(options.path)) throw new Error("目标文档不存在");
+  if (options.path && options.project.isDocumentHidden(options.path)) throw new Error("目标文档已对 Agent 屏蔽，请先取消屏蔽");
+  if ((options.mode === "rewrite" || options.mode === "polish") && !options.selection?.trim()) throw new Error("改写或润色需要文本选区");
+  if (options.mode === "write" && options.path && options.project.documentExists(options.path)) throw new Error("新文档已经存在");
+}
+
+function targetPath(options: GenerateWritingOptions): string {
+  if (options.path) return options.path;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `chapters/generated-${stamp}.md`;
+}
+
+function applyGeneratedText(mode: WritingMode, before: string, selection: string | undefined, generated: string): string {
+  if (mode === "write") return generated.endsWith("\n") ? generated : `${generated}\n`;
+  if (mode === "continue") return `${before.replace(/\s+$/, "")}\n\n${generated.trim()}\n`;
+  if (mode === "rewrite_document") return generated.endsWith("\n") ? generated : `${generated}\n`;
+  const needle = selection!.trim();
+  const count = before.split(needle).length - 1;
+  if (count !== 1) throw new Error(`选区在文档中出现 ${count} 次，无法安全替换；请扩大选区后重试`);
+  return before.replace(needle, generated.trim());
+}
+
+function selectionContext(document: string, selection: string): string {
+  const needle = selection.trim();
+  const index = document.indexOf(needle);
+  if (index < 0) throw new Error("选区已失效，请重新选择");
+  const start = Math.max(0, index - 2_000);
+  const end = Math.min(document.length, index + needle.length + 2_000);
+  return `${document.slice(start, index)}\n<selection>\n${needle}\n</selection>\n${document.slice(index + needle.length, end)}`;
+}
+
+function selectedCharacters(store: WriterStore, ids?: number[]): Character[] {
+  if (!ids?.length) return [];
+  const allowed = new Set(ids);
+  return store.characters().filter(item => allowed.has(item.id)).slice(0, 12);
+}
+
+function characterContext(item: Character) {
+  return { id: item.id, name: item.name, aliases: item.aliases, role: item.role, appearance: item.appearance, traits: item.traits, background: item.background, goals: item.goals, relationships: item.relationships, relatedCharacterIds: item.relatedCharacterIds, abilities: item.abilities, notes: item.notes };
+}
+
+function proposalSummary(mode: WritingMode): string { return `${modeLabel(mode)}生成内容，等待确认`; }
+function modeLabel(mode: WritingMode): string { return ({ write: "新写", continue: "续写", rewrite: "改写选区", rewrite_document: "修改全文档", polish: "润色" })[mode]; }
+function cleanModelText(value: string): string { return value.trim().replace(/^```(?:markdown|md)?\s*/i, "").replace(/\s*```$/, "").trim(); }
+
+function parseJsonObject(value: string): Record<string, unknown> {
+  const cleaned = value.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("{"); const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("模型没有返回有效角色卡 JSON");
+  try { return JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>; }
+  catch { throw new Error("模型返回的角色卡 JSON 无法解析"); }
+}
+
+function parseJsonArray(value: string): unknown[] {
+  const cleaned = value.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("["); const end = cleaned.lastIndexOf("]");
+  if (start < 0 || end <= start) throw new Error("意图路由器没有返回有效选项");
+  try { const parsed = JSON.parse(cleaned.slice(start, end + 1)); return Array.isArray(parsed) ? parsed : []; }
+  catch { throw new Error("意图路由器返回的选项无法解析"); }
+}
+
+function defaultActionLabel(mode: ActionMode): string {
+  return ({ write: "新写正文", continue: "续写当前文档", rewrite: "改写选区", rewrite_document: "修改全文档", polish: "润色选区", character: "处理角色卡" })[mode];
+}
+
+async function safeChangeSummary(model: ModelConfig, change: {
+  kind: "document" | "character"; action: string; target: string;
+  instruction: string; before: string; after: string;
+}, fallback: string, signal?: AbortSignal): Promise<string> {
+  try {
+    const result = await completeText(model, [
+      { role: "system", content: `你是写作应用的改动总结器。只根据操作前后内容说明实际变化，不继续创作，不评价质量，不提出下一步建议。使用简洁中文：先用一句话说明结果，再列出 1 至 5 条最重要的具体改动。正文指出情节、段落、措辞或新增内容发生在哪里；角色卡指出哪些结构化字段改变。没有证据的变化不要声称。不要输出 Markdown 标题。` },
+      { role: "user", content: JSON.stringify({ ...change, before: change.before.slice(-6_000), after: change.after.slice(0, 6_000) }) },
+    ], signal);
+    return result.content.trim() || fallback;
+  } catch { return fallback; }
+}
+
+function summaryBefore(mode: WritingMode, before: string, selection?: string): string {
+  if (mode === "write") return "（新建文档）";
+  if (mode === "rewrite" || mode === "polish") return selection?.trim() ?? "";
+  if (mode === "rewrite_document") return before;
+  return before.slice(-6_000);
+}
+
+function summaryAfter(mode: WritingMode, generated: string): string {
+  return mode === "continue" ? `（续写新增内容）\n${generated}` : generated;
+}
+
+function normalizeCharacterDraft(value: Record<string, unknown>): Omit<Character, "id" | "updatedAt"> {
+  const text = (key: string) => typeof value[key] === "string" ? value[key].trim() : "";
+  const aliases = Array.isArray(value.aliases) ? value.aliases.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20) : [];
+  if (!text("name")) throw new Error("生成的角色卡缺少姓名");
+  return { name: text("name"), aliases, role: text("role"), appearance: text("appearance"), traits: text("traits"), background: text("background"), goals: text("goals"), relationships: text("relationships"), relatedCharacterIds: [], abilities: text("abilities"), notes: text("notes") };
+}
+
+async function runReadOnlyToolLoop(
+  model: ModelConfig,
+  messages: ToolLoopMessage[],
+  project: WriterProject,
+  allowedPaths: string[],
+  signal?: AbortSignal,
+  onTool?: (name: string, path: string) => void | Promise<void>,
+): Promise<{ content: string }> {
+  if (!model.apiKey) throw new Error("请先配置模型 API Key");
+  const allowed = new Set(allowedPaths.filter(path => project.documentExists(path) && !project.isDocumentHidden(path)).slice(0, 5));
+  const read = new Map<string, string>();
+  const tools = [{ type: "function", function: {
+    name: "read_document",
+    description: "读取一份已获用户批准的世界观、设定或大纲文档。仅在角色设计确实需要时调用。",
+    parameters: { type: "object", properties: { path: { type: "string", enum: [...allowed] } }, required: ["path"], additionalProperties: false },
+  } }];
+  for (let turn = 0; turn < 4; turn += 1) {
+    const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const requestBody = JSON.stringify({ model: model.model, messages, tools, tool_choice: "auto", stream: false,
+      ...(model.temperature === undefined ? {} : { temperature: model.temperature }),
+      ...(model.topP === undefined ? {} : { top_p: model.topP }) });
+    logModelRequest(endpoint, requestBody);
+    const response = await fetch(endpoint, {
+      method: "POST", signal,
+      headers: { "content-type": "application/json", authorization: `Bearer ${model.apiKey}` },
+      body: requestBody,
+    });
+    const responseBody = await response.text();
+    logModelResponse(endpoint, responseBody);
+    if (!response.ok) throw new Error(`角色卡上下文读取失败（${response.status}）：${responseBody.slice(0, 500)}`);
+    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }> };
+    const message = payload.choices?.[0]?.message;
+    if (!message) throw new Error("角色模型没有返回有效响应");
+    const calls = message.tool_calls ?? [];
+    if (!calls.length) return { content: message.content ?? "" };
+    messages.push({ role: "assistant", content: message.content ?? null, tool_calls: calls });
+    for (const call of calls) {
+      let result: Record<string, unknown>;
+      try {
+        const args = JSON.parse(call.function.arguments || "{}") as { path?: unknown };
+        const path = typeof args.path === "string" ? args.path : "";
+        if (call.function.name !== "read_document") throw new Error("工具不在允许列表中");
+        if (!allowed.has(path)) throw new Error("文档未获用户批准或已被屏蔽");
+        if (!read.has(path)) {
+          if (read.size >= 5) throw new Error("读取文档数量已达到上限");
+          await onTool?.("read_document", path);
+          read.set(path, project.read(path).slice(0, 8_000));
+        }
+        result = { path, content: read.get(path), truncated: project.read(path).length > 8_000 };
+      } catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
+      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+  }
+  throw new Error("角色模型读取文档超过 4 轮限制，请缩小参考文档范围后重试");
+}
+
+async function completeText(model: ModelConfig, messages: ChatMessage[], signal?: AbortSignal) {
+  let content = "";
+  const result = await streamText(model, messages, signal, text => { content += text; });
+  return { ...result, content: content || result.content };
+}
+
+async function streamText(model: ModelConfig, messages: ChatMessage[], signal: AbortSignal | undefined, onText: (text: string) => void | Promise<void>) {
+  if (!model.apiKey) throw new Error("请先配置模型 API Key");
+  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const requestBody = JSON.stringify({ model: model.model, messages, stream: true, stream_options: { include_usage: true }, ...(model.temperature === undefined ? {} : { temperature: model.temperature }), ...(model.topP === undefined ? {} : { top_p: model.topP }) });
+  logModelRequest(endpoint, requestBody);
+  const response = await fetch(endpoint, {
+    method: "POST", signal,
+    headers: { "content-type": "application/json", authorization: `Bearer ${model.apiKey}` },
+    body: requestBody,
+  });
+  if (!response.ok) {
+    const responseBody = await response.text();
+    logModelResponse(endpoint, responseBody);
+    throw new Error(`模型请求失败（${response.status}）：${responseBody.slice(0, 500)}`);
+  }
+  if (!response.body) throw new Error("模型响应没有内容");
+  const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = "";
+  let usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } | undefined;
+  const consume = async (block: string) => {
+    for (const line of block.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim(); if (!data || data === "[DONE]") continue;
+      const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }>; usage?: Record<string, unknown> };
+      const text = chunk.choices?.[0]?.delta?.content;
+      if (text) { content += text; await onText(text); }
+      if (chunk.usage) {
+        const cached = Number((chunk.usage.prompt_tokens_details as { cached_tokens?: number } | undefined)?.cached_tokens ?? chunk.usage.prompt_cache_hit_tokens ?? 0);
+        const prompt = Number(chunk.usage.prompt_tokens ?? 0);
+        usage = { promptTokens: prompt, completionTokens: Number(chunk.usage.completion_tokens ?? 0), cacheHitTokens: cached, cacheMissTokens: Math.max(0, prompt - cached) };
+      }
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() ?? "";
+    for (const block of blocks) await consume(block);
+    if (done) break;
+  }
+  if (buffer.trim()) await consume(buffer);
+  const completed = { content, usage };
+  logModelResponse(endpoint, JSON.stringify(completed, null, 2));
+  return completed;
+}
