@@ -102,6 +102,88 @@ const EMPTY_CHARACTER: CharacterDraft = {
   capabilities: "", limitations: "", relationships: [], notes: "",
 };
 
+/** Visual UI themes (workspace chrome). Not writing style templates. */
+type UiThemeId = "parchment" | "midnight" | "ink" | "aurora" | "sakura" | "carbon";
+
+type UiTheme = {
+  id: UiThemeId;
+  name: string;
+  tag: string;
+  description: string;
+  example: string;
+  /** Mini preview swatches: bg, surface, surface2, border, accent, text */
+  preview: { bg: string; surface: string; surface2: string; border: string; accent: string; text: string };
+  dark: boolean;
+};
+
+const UI_THEMES: UiTheme[] = [
+  {
+    id: "parchment",
+    name: "羊皮纸",
+    tag: "默认浅色",
+    description: "暖纸张底 + 墨绿强调，现有工作台的经典配色。",
+    example: "长篇正文阅读、白天连载写作",
+    preview: { bg: "#f3f0e9", surface: "#fffdfa", surface2: "#f8f5ef", border: "#e0d9cc", accent: "#3d5a45", text: "#2c332b" },
+    dark: false,
+  },
+  {
+    id: "midnight",
+    name: "午夜林",
+    tag: "默认深色",
+    description: "深绿夜色 + 薄荷强调，现有暗色模式的演进版。",
+    example: "夜间写作、降亮度长时间改稿",
+    preview: { bg: "#151c17", surface: "#1b231d", surface2: "#1d2820", border: "#2e3a30", accent: "#8bb89a", text: "#d5dfd8" },
+    dark: true,
+  },
+  {
+    id: "ink",
+    name: "墨砚",
+    tag: "纸墨",
+    description: "近黑正文与朱砂点缀，偏传统出版与中文排版气质。",
+    example: "严肃文学、设定文档校对",
+    preview: { bg: "#f2efe8", surface: "#fbfaf6", surface2: "#f4f1ea", border: "#d4cfc3", accent: "#b33a2b", text: "#1a1a1a" },
+    dark: false,
+  },
+  {
+    id: "aurora",
+    name: "极光",
+    tag: "现代",
+    description: "冷调蓝紫工具感，侧栏与对话更像产品工作台。",
+    example: "规划大纲、工具调用密集的 Agent 会话",
+    preview: { bg: "#eef2f8", surface: "#fbfcfe", surface2: "#f3f6fb", border: "#d3dbe8", accent: "#4f6ef7", text: "#1c2433" },
+    dark: false,
+  },
+  {
+    id: "sakura",
+    name: "樱色",
+    tag: "柔和",
+    description: "浅粉纸感与玫红强调，阅读区更轻、更“轻小说”。",
+    example: "日常/恋爱线正文精读",
+    preview: { bg: "#faf4f5", surface: "#fffafb", surface2: "#fbf5f6", border: "#ead5da", accent: "#c45c7a", text: "#3a2a2e" },
+    dark: false,
+  },
+  {
+    id: "carbon",
+    name: "碳黑",
+    tag: "编辑器",
+    description: "高对比深灰 + 电青强调，接近代码编辑器的夜间界面。",
+    example: "深夜改设定、对照检索与补丁提案",
+    preview: { bg: "#0e0f12", surface: "#16181d", surface2: "#12141a", border: "#2a2e38", accent: "#64d2ff", text: "#e8eaef" },
+    dark: true,
+  },
+];
+
+const UI_THEME_IDS = new Set<string>(UI_THEMES.map((item) => item.id));
+
+function loadUiTheme(): UiThemeId {
+  const stored = localStorage.getItem("writer-ui-theme") || localStorage.getItem("writer-theme");
+  if (stored === "light") return "parchment";
+  if (stored === "dark") return "midnight";
+  if (stored && UI_THEME_IDS.has(stored)) return stored as UiThemeId;
+  if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) return "midnight";
+  return "parchment";
+}
+
 const hashToken = new URLSearchParams(location.hash.slice(1)).get("token");
 if (hashToken) {
   localStorage.setItem("writer-token", hashToken);
@@ -406,9 +488,8 @@ function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [mobileTab, setMobileTab] = useState<"docs" | "editor" | "agent">("editor");
-  const [theme, setTheme] = useState<"light" | "dark">(() =>
-    localStorage.getItem("writer-theme") === "dark" ? "dark" : "light",
-  );
+  const [theme, setTheme] = useState<UiThemeId>(() => loadUiTheme());
+  const [showThemePicker, setShowThemePicker] = useState(false);
   const [managementView, setManagementView] = useState<"characters" | "sessions" | null>(null);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
   const [showModelConfig, setShowModelConfig] = useState(false);
@@ -458,13 +539,27 @@ function App() {
   }, []);
 
   useEffect(() => {
-    window.document.documentElement.dataset.theme = theme;
-    localStorage.setItem("writer-theme", theme);
+    const root = window.document.documentElement;
+    root.dataset.theme = theme;
+    localStorage.setItem("writer-ui-theme", theme);
+    localStorage.setItem("writer-theme", theme === "midnight" || theme === "carbon" ? "dark" : "light");
+    const meta = window.document.querySelector('meta[name="theme-color"]');
+    const active = UI_THEMES.find((item) => item.id === theme);
+    if (meta && active) meta.setAttribute("content", active.preview.accent);
   }, [theme]);
 
   useEffect(() => {
     localStorage.setItem("writer-outline-collapsed", String(outlineCollapsed));
   }, [outlineCollapsed]);
+
+  useEffect(() => {
+    if (!showThemePicker) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowThemePicker(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showThemePicker]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -899,15 +994,15 @@ function App() {
             </span>
             <span className="settings-glyph" aria-hidden="true">⚙</span>
           </button>
-          <button className="ghost nav-action" onClick={() => setManagementView("characters")}>Characters</button>
-          <button className="ghost nav-action" onClick={() => setManagementView("sessions")}>Sessions</button>
+          <button className="ghost nav-action" title="角色卡" onClick={() => setManagementView("characters")}>角色</button>
+          <button className="ghost nav-action" title="会话" onClick={() => setManagementView("sessions")}>会话</button>
           <button
             className="icon"
-            title={theme === "dark" ? "Use light mode" : "Use dark mode"}
-            aria-label={theme === "dark" ? "Use light mode" : "Use dark mode"}
-            onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}
+            title="界面风格"
+            aria-label="选择界面风格"
+            onClick={() => setShowThemePicker(true)}
           >
-            {theme === "dark" ? "☀" : "◐"}
+            ◐
           </button>
           <button
             className="ghost"
@@ -925,17 +1020,17 @@ function App() {
         </div>
       </header>
 
-      <div className="mobile-tabs">
-        <button className={mobileTab === "docs" ? "active" : ""} onClick={() => setMobileTab("docs")}>
-          <span className="tab-icon" aria-hidden="true">☷</span><span>Docs</span>
+      <nav className="mobile-tabs" aria-label="主区域">
+        <button type="button" className={mobileTab === "docs" ? "active" : ""} onClick={() => setMobileTab("docs")}>
+          <span className="tab-icon" aria-hidden="true">☷</span><span>文档</span>
         </button>
-        <button className={mobileTab === "editor" ? "active" : ""} onClick={() => setMobileTab("editor")}>
-          <span className="tab-icon" aria-hidden="true">✎</span><span>Editor</span>
+        <button type="button" className={mobileTab === "editor" ? "active" : ""} onClick={() => setMobileTab("editor")}>
+          <span className="tab-icon" aria-hidden="true">✎</span><span>正文</span>
         </button>
-        <button className={mobileTab === "agent" ? "active" : ""} onClick={() => setMobileTab("agent")}>
+        <button type="button" className={mobileTab === "agent" ? "active" : ""} onClick={() => setMobileTab("agent")}>
           <span className="tab-icon" aria-hidden="true">✦</span><span>Agent</span>
         </button>
-      </div>
+      </nav>
 
       <aside className={`documents ${mobileTab === "docs" ? "mobile-active" : ""}`}>
         <div className="file-manager-actions">
@@ -1266,6 +1361,78 @@ function App() {
           ))
         )}
       </section>
+
+      {showThemePicker && (
+        <div
+          className="theme-picker-backdrop"
+          onMouseDown={() => setShowThemePicker(false)}
+          role="presentation"
+        >
+          <div
+            className="theme-picker"
+            role="dialog"
+            aria-modal="true"
+            aria-label="界面风格"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="theme-picker-head">
+              <div>
+                <span className="eyebrow">Appearance</span>
+                <h2>界面风格</h2>
+                <p>
+                  选择工作台配色。下方「案例」对应典型用法；写作风格模板仍在正文侧单独配置。
+                </p>
+              </div>
+              <button className="icon" aria-label="关闭" onClick={() => setShowThemePicker(false)}>×</button>
+            </div>
+            <div className="theme-grid">
+              {UI_THEMES.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`theme-card${theme === item.id ? " active" : ""}`}
+                  onClick={() => {
+                    setTheme(item.id);
+                    setShowThemePicker(false);
+                  }}
+                >
+                  <div
+                    className="theme-preview"
+                    style={{
+                      ["--tp-bg"]: item.preview.bg,
+                      ["--tp-surface"]: item.preview.surface,
+                      ["--tp-surface2"]: item.preview.surface2,
+                      ["--tp-border"]: item.preview.border,
+                      ["--tp-accent"]: item.preview.accent,
+                      ["--tp-text"]: item.preview.text,
+                    } as React.CSSProperties}
+                    aria-hidden="true"
+                  >
+                    <div className="theme-preview-chrome">
+                      <i /><i /><i />
+                    </div>
+                    <div className="theme-preview-body">
+                      <div className="theme-preview-side" />
+                      <div className="theme-preview-main">
+                        <span /><span /><span />
+                      </div>
+                      <div className="theme-preview-agent" />
+                    </div>
+                  </div>
+                  <div className="theme-card-meta">
+                    <strong>
+                      {item.name}
+                      <span className="theme-tag">{item.tag}</span>
+                    </strong>
+                    <small>{item.description}</small>
+                    <span className="theme-example">{item.example}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {managementView && (
         <div className="management-backdrop" onMouseDown={() => setManagementView(null)}>

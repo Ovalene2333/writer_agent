@@ -42,16 +42,17 @@ test("OutlineStore keeps IDs stable and validates linked draft", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-outline-"));
   try {
     const project = WriterProject.init(root, "测试作品");
-    project.writeRaw("story/outline.md", SAMPLE);
+    project.writeRaw("outline/outline.md", SAMPLE);
     project.writeRaw("chapters/chapter-001.md", "# 第一章\n\n## 车站告别\n\n调令已经下达。千夏收起损坏的车票，登上列车。她终于接受了任务。\n");
     const outline = new OutlineStore(project);
     const first = outline.sync();
+    assert.equal(first.sourcePath, "outline/outline.md");
     const scene = first.nodes.find(node => node.type === "scene");
     assert.ok(scene);
     assert.equal(outline.validate().some(issue => issue.issue.includes("尚无回收")), true);
     assert.equal(outline.compareWithDraft(scene.id).linked, true);
 
-    project.writeRaw("story/outline.md", SAMPLE.replace("千夏在车站与苏远告别", "千夏在清晨的车站与苏远告别"));
+    project.writeRaw("outline/outline.md", SAMPLE.replace("千夏在车站与苏远告别", "千夏在清晨的车站与苏远告别"));
     const second = outline.sync();
     assert.equal(second.nodes.find(node => node.type === "scene")?.id, scene.id);
   } finally {

@@ -22,6 +22,42 @@ const DEFAULT_CONFIG: WriterConfig = {
   style: "",
 };
 
+/** Document role inferred from path conventions under resource/. */
+export type DocumentKind = "lore" | "outline" | "chapter" | "archive" | "side" | "other";
+
+export function documentKind(path: string): DocumentKind {
+  const normalized = normalizeDocumentPath(path);
+  if (normalized.startsWith("lore/") || normalized.startsWith("story/")) {
+    return /(?:^|\/)(?:outline|大纲)[^/]*\.md$/i.test(normalized) ? "outline" : "lore";
+  }
+  if (normalized.startsWith("outline/") || /(?:^|\/)(?:outline|大纲)[^/]*\.md$/i.test(normalized)) return "outline";
+  if (normalized.startsWith("chapters/")) return "chapter";
+  if (normalized.startsWith("archive/") || normalized.startsWith("屏蔽/")) return "archive";
+  if (normalized.startsWith("side/") || normalized.startsWith("涩涩/")) return "side";
+  return "other";
+}
+
+/** Resolve the primary outline markdown path for structured outline tools. */
+export function resolveOutlineSourcePath(project: WriterProject, preferred?: string): string {
+  if (preferred && project.documentExists(preferred)) return preferred;
+  for (const candidate of ["outline/outline.md", "story/outline.md"]) {
+    if (project.documentExists(candidate)) return candidate;
+  }
+  const underOutline = project.listDocuments()
+    .filter((path) => path.startsWith("outline/") && path.endsWith(".md"))
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
+  if (underOutline.length) return underOutline[0];
+  const named = project.listDocuments()
+    .filter((path) => {
+      const kind = documentKind(path);
+      return kind === "outline" || /大纲/.test(path);
+    })
+    .filter((path) => !path.startsWith("archive/") && !path.startsWith("屏蔽/") && !path.startsWith("side/") && !path.startsWith("涩涩/"))
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
+  if (named.length) return named[0];
+  return preferred ?? "outline/outline.md";
+}
+
 export class WriterProject {
   readonly root: string;
   readonly privateDir: string;
@@ -38,13 +74,16 @@ export class WriterProject {
   static init(root: string, title?: string): WriterProject {
     const project = new WriterProject(root);
     const config = { ...DEFAULT_CONFIG, title: title?.trim() || DEFAULT_CONFIG.title };
-    mkdirSync(resolve(project.resourceDir, "story"), { recursive: true });
-    mkdirSync(resolve(project.root, "characters"), { recursive: true });
+    mkdirSync(resolve(project.resourceDir, "lore"), { recursive: true });
+    mkdirSync(resolve(project.resourceDir, "outline"), { recursive: true });
     mkdirSync(resolve(project.resourceDir, "chapters"), { recursive: true });
+    mkdirSync(resolve(project.resourceDir, "archive"), { recursive: true });
+    mkdirSync(resolve(project.resourceDir, "side"), { recursive: true });
+    mkdirSync(resolve(project.root, "characters"), { recursive: true });
     mkdirSync(project.privateDir, { recursive: true });
     project.writeRaw("writer.yaml", YAML.stringify(config));
-    project.writeRaw("story/bible.md", "# 故事设定\n\n");
-    project.writeRaw("story/outline.md", "# 故事大纲\n\n");
+    project.writeRaw("lore/world.md", "# 故事设定\n\n世界规则、专名、组织、力量体系等**事实**写在 `lore/` 下；不要写成章节正文。\n\n");
+    project.writeRaw("outline/outline.md", "# 故事大纲\n\n情节计划写在 `outline/` 下。场景节点推荐字段：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。\n\n");
     project.writeRaw("chapters/chapter-001.md", "# 第一章\n\n");
     project.writeCharacterCardsJsonl("");
     return project;

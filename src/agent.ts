@@ -1,5 +1,5 @@
 import type { AgentEvent, Character, ModelConfig } from "./types.js";
-import { WriterProject } from "./project.js";
+import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 import { documentBlocks, documentSections } from "./document_blocks.js";
@@ -43,7 +43,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_documents",
-      description: "列出作品项目中的所有 Markdown 文档",
+      description: "列出作品中的 Markdown 文档（含 kind：lore 设定 / outline 大纲 / chapter 正文 / archive 旧稿 / side 支线 / other）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -89,8 +89,12 @@ const TOOLS = [
         type: "object",
         properties: {
           query: { type: "string", description: "概念、专有名词或短查询" },
-          scope: { type: "string", enum: ["all", "story", "outline", "chapters"], description: "文档范围；世界观概念优先 story" },
-          pathPrefix: { type: "string", description: "可选相对目录前缀，例如 story" },
+          scope: {
+            type: "string",
+            enum: ["all", "lore", "story", "outline", "chapters"],
+            description: "文档范围：lore=设定（story 为旧别名）、outline=大纲、chapters=正文；世界观/专名优先 lore",
+          },
+          pathPrefix: { type: "string", description: "可选相对目录前缀，例如 lore、outline、chapters" },
           mode: { type: "string", enum: ["any", "all", "exact"], description: "任一词、全部词或精确短语" },
           contextLines: { type: "number", description: "匹配行前后上下文，0～12，默认 2" },
           limit: { type: "number", description: "结果数，1～12，默认 8" },
@@ -274,7 +278,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "ask_user",
-      description: "向用户提出一个问题或呈现一组选项，暂停执行并等待用户回复。当需要用户决定方向、选择方案、或澄清信息时，必须先调用此工具再停止；不要在提问的同时调用其他工具，也不要自行替用户做出选择",
+      description: "缺少目标文档、既有事实或会改变结果的关键选择，且无法从当前上下文可靠推断时，向用户提一个简短问题并暂停。情节、对白、描写等可逆创作选择应自行作合理决定，不要过度询问；不要与其他工具同时调用",
       parameters: {
         type: "object",
         properties: {
@@ -404,57 +408,36 @@ function writingSystemPrompt(project: WriterProject): string {
   const styleBlock = styleTemplate
     ? `\n当前激活的风格模板：${styleTemplate.name}\n${styleTemplate.systemPromptAddition}\n`
     : "";
-  return `你是的创意写作 Agent。界面语言为中文，作品语言为 ${config.language}。
+  return `你是长篇创作 Agent。界面语言为中文，作品语言为 ${config.language}。
 ${styleBlock}
-## 职责：协助构思、续写、改写和检查长篇作品，同时尊重作者的最终决定。
+职责：协助构思、规划、写作、改写和审校；当前用户请求优先，作者保留最终决定。
 
-## 绝对禁令：
-- 禁止使用先否定再定义、先否定再解释的句式，包括“不是……而是……”“不是……是……”“并非……而是……”“并非……却是……”“与其说……不如说……”“没有……只有……”“不是因为……只是……”。
-- 禁止用“——”承接解释、转折、补充定义或作者说明；破折号只可用于自然中断、话语被打断或极少量必要插入。
-- 禁止用随手比喻代替直接陈述。比喻必须来自当前视角人物的经验、现场物象或作品既有意象，并改变读者对动作、空间、关系或情绪的理解。
-- 禁止在对话中加入不合语境的比喻、金句或完整观点陈述。人物说话优先服从身份、关系、处境、回避和当下目的。
+文档分区（必须遵守，勿把不同类型内容写进同一路径）：
+- lore/：设定与事实源（世界规则、专名、组织、力量体系、地理政治等）。只写可检索事实，不写章节散文。
+- outline/：情节计划（卷/章/场景、前因结果、伏笔）。不写可发表正文。
+- chapters/：唯一主线正文；续写、改写、导出默认只针对这里。
+- side/：支线或间章（非主线导出）；archive/：旧稿与弃用版，默认不要当作现行事实，也不要主动写入。
+- characters/：角色卡（结构化工具维护，不是 Markdown 散文）。
+旧项目若仍使用 story/，视为 lore/ 的等价目录。
 
-## 正文写作指导：
-- 先呈现证据，再决定是否需要判断。人物的性格和情绪优先通过具体动作、选择、代价、停顿、误解及有对象的感官细节显露；避免用“敏感、坚强、冷漠、破碎、释然”等标签包办人物。标签若保留，应属于人物或叙述者的有限看法，并允许后续行为与它矛盾。
-- 不替读者翻译刚写出的动作、对白或细节。写出证据后，删除紧随其后的心理结论、潜台词说明和象征解释；只有缺少说明会造成因果断裂或事实误解时才补充。心理活动必须带有角色自身的词汇、偏见和当下目的。
-- 段落围绕当前注意力或叙事动作组织。句长、段长和信息密度随场景自然变化，不追求各段等长、论点对称或结构完整，不连续堆叠同构短句、排比句、三项并列或设问句。
-- 禁止用“不是A，而是B”“并非A，却是B”“与其说A，不如说B”“没有A，只有B”“不是因为A，只是B”等先否定再解释的对照句代替描写。直接陈述B对应的动作、观察或结果。只有人物确实在纠正误解时才使用；每 3000 字最多一处。
-- 比喻必须来自当前人物的经验和现场物象；同一段通常不使用两个比喻。删除只制造气氛、不改变观察结果的空泛修饰。
-- 对白允许答非所问、打断、回避和沉默。不同人物在用词、句长、礼貌程度及信息习惯上要可区分；不让人物轮流完整陈述观点或替作者解释设定。
-- 避免高频套语和通用反应，如“心中一震”“不由得”“嘴角勾起”“眼神复杂”“空气仿佛凝固”“一股莫名的情绪”。需要表达时，改写为该人物在该场景中独有且可观察的反应。
-- 不在段尾反复追加总结、升华、预告或解释性判断。场景结束落在一个已经发生的动作、决定、发现或未解决的具体问题上。
-- 降低机器感依靠内容和观察的差异，不靠随机换同义词、强行切碎句子、滥加口语、病句或无关细节。加入的具体信息应来自既有上下文，并服务于人物行动、空间关系、因果或伏笔。
-- 不追求每句话都精致或每个方面都交代齐全。保留必要的朴素过渡、信息落差、轻重差别和有意义的不对称；让结构服从真实的叙事重点。
+正文标准：
+1. 用动作、选择、代价、停顿、对白和具体感官呈现人物，避免紧随其后的情绪、潜台词或象征解释。
+2. 避免模板化对照句、解释性破折号、无人物经验或现场物象支撑的比喻，以及作者借角色解释设定。
+3. 对白服从人物身份、关系、处境和当下目的，允许回避、打断、答非所问和沉默。
+4. 句段节奏随场景变化；避免套语、同构句堆叠、段尾总结和无关细节。场景落在具体动作、决定、发现或未解决的问题上。
+5. 提交正文前自检：保留必要信息，改写违反以上标准的句子，不用随机换词或故意制造病句降低机器感。
 `;
-}
-
-function writingHardConstraintsPrompt(): string {
-  return `写作硬约束复查：
-输出正文或改写提案前，逐段删除以下内容：
-1. “不是……而是……”“不是……是……”“并非……而是……”“并非……却是……”“与其说……不如说……”“没有……只有……”“不是因为……只是……”等先否定再解释句式。
-2. 用“——”制造说明关系、定义关系、转折关系或作者旁白解释。
-3. 没有来自人物经验、现场物象或既有意象支撑的比喻。
-4. 对话中的不合语境比喻、金句、完整论述和替作者解释设定的台词。
-若某句承担必要信息，保留信息本身，改为直接动作、观察、对白、停顿、选择或结果。`;
 }
 
 function executionRulesPrompt(): string {
   return `执行规则：
-1. 先依据本轮任务计划判断是否需要项目上下文。计划为 none 时直接回答，不调用文档工具；计划需要文档时，才使用 search_project 定位或 inspect_document 查看结构，再用 read_document 读取最小必要块。除非文档很短或确需全文重写，不逐块读取整篇文档。
-1.1 写作、规划和一致性检查开始前，先判断是否依赖尚未出现在当前上下文中的项目事实。出现项目专有概念、能力规则、组织制度、地理历史、科技限制、过去事件，或用户要求符合设定/避免冲突时，先用 search_project 搜索；如果缺少某信息会产生多个互相冲突的事实版本，也应先搜索。纯写作建议、只润色已提供文本或当前上下文已有完整定义时不搜索。
-1.2 世界观检索采用“搜索定位→最小截取”：search_project 返回路径、标题和行号后，用 read_document 的 startLine/endLine 或 section 读取直接相关原文。每轮最多调用 search_project 两次；结果不足时换用更精确的查询，不遍历全部文档。明确区分检索到的项目事实与模型推测。
-2. 修改已有文档时优先调用 propose_document_patch 提交局部搜索替换；修改大纲节点优先使用 propose_outline_patch；propose_document 只用于新建文档或全文重写。提案不会直接写入，作者可审批或拒绝。
-2.1 凡用户要求写正文、续写、继续写、扩写或改写，必须以 propose_document 或 propose_document_patch 提交到目标 Markdown 文档。禁止只在最终回复中粘贴正文来代替文档提案；最终回复只能简要说明已提交的内容。
-2.2 用户用"继续""接着写""往下写"等短指令承接上一轮写作时，默认继续上一轮目标文档。先读取目标文档末尾的必要范围，再提交追加或替换提案；无法确定目标文件时应先询问，不得直接输出正文。
-3. 保持既有人物、世界观、叙事视角和 Markdown 结构，除非作者明确要求改变。写入正文、大纲或设定时使用常见 Markdown 标记组织结构：用 #/##/### 表示章、节和场景层级，必要时使用 *强调*、列表或分隔线；标题应简短稳定，便于浏览跳转和按节读取。不要为每个自然段添加标题。
-4. 信息不足时，必须调用 ask_user 工具提出简短、具体的问题，不擅自补充关键设定。调用 ask_user 后本轮不得再调用其他工具；等待用户回复后再继续执行。但对于写作本身（情节走向、对白、描写等），直接给出具体内容，不要停留在建议层面。
-5. 当有多个合理的写作方向时，必须调用 ask_user 工具的 options 参数以简洁编号列出选项（每个选项 ≤ 20 字），等候作者选择，不自己决定方向。调用 ask_user 后本轮停止，等待用户回复后按选定方向继续。
-6. 提交文档提案（propose_document、propose_document_patch 或 propose_outline_patch）后本轮立即停止，不继续调用其他工具或自行追加正文。等待用户审批提案后再继续。
-7. 不输出工具调用的内部参数，不使用项目范围外的信息。
-8. 对话回复默认使用自然、简洁的纯文本。文档创作应使用适量 Markdown 结构标记，但避免滥用标题、粗体、列表和代码块；小说正文不得为每个自然段添加标题或项目符号。
-9. 管理角色必须使用 save_character。创建角色卡时只填写用户已提供或可可靠归纳的字段，未知字段允许留空，不得为了填满表格而虚构设定。修改已有角色时先 list_characters 获取 ID，再用 get_character 读取完整卡片，并传入 id 更新；不得清空未要求修改的字段，也不要重复创建角色卡。写作时需要角色资料，也使用 get_character 的 fields 参数只读取当前场景真正需要的字段，例如对白优先读取 speechStyle，动作描写读取 appearance/capabilities/limitations，人物决策读取 personality/values/currentGoal/fears；不要默认读取整张卡片。
-10. 工具已经返回过的长内容不会永久保留在上下文中。后续需要精确原文时，重新读取最小必要范围，不要求系统恢复整份旧输出。
-11. 历史工具调用中若出现"内容已压缩"的占位文本，它只表示旧正文已从上下文移除；不得把占位文本当作正文、参数名示例或可复用内容。新的 propose_document 必须使用 content 参数提交完整正文；新的 propose_document_patch 必须使用 edits 参数提交真实搜索替换。`;
+1. 按本轮任务计划决定是否读取项目资料。需要项目事实时先 search_project（世界观/专名 scope=lore，情节计划 scope=outline，已写正文 scope=chapters），再读取最小相关片段；每轮最多搜索两次。区分项目事实与推测。
+2. 保持既有人物、世界观、视角和 Markdown 结构。局部修改用补丁；大纲节点用大纲补丁；新建或全文重写才提交完整文档。新建设定→lore/，新建大纲→outline/，新建正文→chapters/；不要把设定写进章节，也不要把正文写进 lore。
+3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。
+4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
+5. 管理角色使用 save_character。修改前读取完整卡片并保留未要求修改的字段；写作时只读取所需角色字段。
+6. 长工具结果被压缩后，如需精确原文就重新读取最小范围，不把压缩占位文本当作正文。
+7. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。`;
 }
 
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
@@ -523,6 +506,7 @@ async function planWritingTask(
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
 字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
 决策原则：当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
+路径约定：lore/=设定事实，outline/=情节计划，chapters/=主线正文，side/=支线，archive/=旧稿。为正文写作选 targetPath 时优先 chapters/；为大纲任务优先 outline/；查世界观优先在 lore/ 上 search。
 文档目录（只有路径，尚未读取正文）：${JSON.stringify(documents)}
 角色目录：${JSON.stringify(characters)}
 范文目录：${JSON.stringify(examples)}
@@ -590,17 +574,19 @@ function taskInstructions(mode: WritingTaskMode): string {
 - 给出三个真正不同的候选方向，分别说明核心冲突与后续潜力。
 - 不把候选设想写入项目事实，除非作者明确选定。`;
   if (mode === "outline") return `本次工作流：
-- 先调用 list_outline_nodes 了解“卷/幕—章—场景”结构；读取或修改具体节点时用 get_outline_node，不要靠全文搜索猜测节点边界。
+- 大纲文档在 outline/（旧项目可能是 story/outline.md）。先调用 list_outline_nodes 了解“卷/幕—章—场景”结构；读取或修改具体节点时用 get_outline_node，不要靠全文搜索猜测节点边界。
 - 每个场景节点维护前因、行动、结果和状态变化；同时维护人物弧、信息释放、伏笔埋设与回收。
 - 修改既有节点使用 propose_outline_patch 提交局部提案；结构完整性检查使用 validate_outline。
+- 新建大纲写入 outline/，不要写入 chapters/ 或 lore/。
 - 大纲场景推荐字段格式：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。字段写成 Markdown 列表“字段：值”。`;
   if (mode === "write_scene") return `本次工作流（内部执行，不输出分析过程）：
-1. 确定场景开场状态、人物目标、阻力、信息变化和不可逆结果。
-2. 根据人物已知信息和动机推演至少三个下一步行动，选择因果最强且不过度套路化的一项。
-3. 写作正文；每个场景必须造成事实、关系、情绪或目标中的至少一项变化。
-4. 检查事实、时间、地点、人物知情范围、叙事视角和风格漂移。
-5. 删除替读者解释情绪或主题的句子，检查套语、同构句、泛化比喻、角色同声和段尾总结；只在有具体文本证据时修改。
-6. 已有文档优先通过 propose_document_patch 提交。`;
+1. 目标正文默认在 chapters/；按需从 lore/ 核对设定、从 outline/ 核对场景目标，不要把设定说明写进正文。
+2. 确定场景开场状态、人物目标、阻力、信息变化和不可逆结果。
+3. 根据人物已知信息和动机推演至少三个下一步行动，选择因果最强且不过度套路化的一项。
+4. 写作正文；每个场景必须造成事实、关系、情绪或目标中的至少一项变化。
+5. 检查事实、时间、地点、人物知情范围、叙事视角和风格漂移。
+6. 删除替读者解释情绪或主题的句子，检查套语、同构句、泛化比喻、角色同声和段尾总结；只在有具体文本证据时修改。
+7. 已有文档优先通过 propose_document_patch 提交。`;
   if (mode === "rewrite") return `本次工作流（内部执行，不输出分析过程）：
 - 只改变作者明确要求调整的维度，保持其余事件事实、人物动机和信息顺序不变。
 - 风格变化必须落实到叙述距离、句法节奏、对白比例、感官重点和信息释放。
@@ -724,7 +710,6 @@ export async function runAgent(options: {
   const messages: ApiMessage[] = [
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt() },
-    { role: "system", content: writingHardConstraintsPrompt() },
     ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
     ...(historicalContext ? [historicalContext] : []),
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
@@ -932,7 +917,7 @@ function executeToolCached(
   const normalized = Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) =>
     [key, typeof value === "string" ? value.trim() : value]));
   const path = typeof normalized.path === "string" ? normalized.path : undefined;
-  const outlinePath = call.name.includes("outline") ? "story/outline.md" : undefined;
+  const outlinePath = call.name.includes("outline") ? resolveOutlineSourcePath(project) : undefined;
   const sourcePath = path ?? (outlinePath && project.documentExists(outlinePath) ? outlinePath : undefined);
   const sourceHash = sourcePath && project.documentExists(sourcePath)
     ? project.hash(project.read(sourcePath))
@@ -1127,9 +1112,11 @@ function executeTool(
       });
     }
     if (call.name === "search_project") {
-      const allowedScopes = new Set(["all", "story", "outline", "chapters"]);
+      const allowedScopes = new Set(["all", "lore", "story", "outline", "chapters"]);
       const allowedModes = new Set(["any", "all", "exact"]);
-      const scope = typeof input.scope === "string" && allowedScopes.has(input.scope) ? input.scope as "all" | "story" | "outline" | "chapters" : "all";
+      const scope = typeof input.scope === "string" && allowedScopes.has(input.scope)
+        ? input.scope as "all" | "lore" | "story" | "outline" | "chapters"
+        : "all";
       const mode = typeof input.mode === "string" && allowedModes.has(input.mode) ? input.mode as "any" | "all" | "exact" : "any";
       const limit = Math.max(1, Math.min(12, optionalPositiveInteger(input.limit, "limit") ?? 8));
       const contextLines = typeof input.contextLines === "number" && Number.isFinite(input.contextLines)
@@ -1313,13 +1300,14 @@ function countOccurrences(content: string, search: string): number {
   return count;
 }
 
-function documentMap(project: WriterProject): Array<{ path: string; lines: number; characters: number; headings: string[] }> {
-  const result: Array<{ path: string; lines: number; characters: number; headings: string[] }> = [];
+function documentMap(project: WriterProject): Array<{ path: string; kind: string; lines: number; characters: number; headings: string[] }> {
+  const result: Array<{ path: string; kind: string; lines: number; characters: number; headings: string[] }> = [];
   let budget = 6_000;
   for (const path of project.listDocuments().filter(path => !project.isDocumentHidden(path)).slice(0, 100)) {
     const content = project.read(path);
     const entry = {
       path,
+      kind: documentKind(path),
       lines: content.split(/\r?\n/).length,
       characters: content.length,
       headings: content.split(/\r?\n/).filter((line) => /^#{1,6}\s+/.test(line)).slice(0, 6),

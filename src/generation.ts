@@ -32,7 +32,7 @@ export async function suggestActions(input: {
     }];
   }
   const result = await completeText(input.model, [
-    { role: "system", content: `你是写作应用的意图路由器，只负责提出可执行动作，不创作正文，也不修改数据。只输出 JSON 数组，包含 1 到 3 个对象。对象字段：mode（只能是 write/continue/rewrite/rewrite_document/polish/character）、label（简短中文按钮文案）、reason（不超过40字）、characterId（仅修改已有角色时使用，必须来自给定角色列表）、documentPaths（可选字符串数组）。规则：新建正文用 write；接续当前文档用 continue；修改选区内容用 rewrite；修改当前完整文档用 rewrite_document；仅改善选区语言用 polish；创建或修改角色资料用 character。rewrite_document 只有存在 activePath 时才能提出，且不要求文本选区。处理角色卡时，根据用户要求可从给定 documents 中选择最多 5 个可能相关的世界观、设定或大纲文档放入 documentPaths；不需要资料时返回空数组。conversation 是当前请求之前的最近对话。必须结合它判断省略的操作对象和指代：若用户正在创建或修改角色卡，后续补充、调整、确认等请求仍应路由到 character；对话中提到的世界观或参考文档不代表要切换为正文或文档编辑。仅在用户明确改变任务时切换模式。不要发明文档、角色 ID 或其他工具。` },
+    { role: "system", content: `你是写作应用的意图路由器，只负责提出可执行动作，不创作正文，也不修改数据。只输出 JSON 数组，包含 1 到 3 个对象。对象字段：mode（只能是 write/continue/rewrite/rewrite_document/polish/character）、label（简短中文按钮文案）、reason（不超过40字）、characterId（仅修改已有角色时使用，必须来自给定角色列表）、documentPaths（可选字符串数组）。规则：新建正文用 write；接续当前文档用 continue；修改选区内容用 rewrite；修改当前完整文档用 rewrite_document；仅改善选区语言用 polish；创建或修改角色资料用 character。rewrite_document 只有存在 activePath 时才能提出，且不要求文本选区。处理角色卡时，根据用户要求可从给定 documents 中选择最多 5 个可能相关的 lore/设定 或 outline/大纲 文档放入 documentPaths（优先 lore/ 与 outline/，不要选 archive 旧稿）；不需要资料时返回空数组。conversation 是当前请求之前的最近对话。必须结合它判断省略的操作对象和指代：若用户正在创建或修改角色卡，后续补充、调整、确认等请求仍应路由到 character；对话中提到的世界观或参考文档不代表要切换为正文或文档编辑。仅在用户明确改变任务时切换模式。不要发明文档、角色 ID 或其他工具。` },
     { role: "user", content: JSON.stringify({ request: input.request, conversation: input.conversation?.slice(-12) ?? [], activePath: input.activePath || null, hasSelection: input.hasSelection, documents: input.documents.slice(0, 100), characters: input.characters.slice(0, 100) }) },
   ], input.signal);
   const value = parseJsonArray(result.content);
@@ -248,7 +248,7 @@ async function buildWritingDraft(
   const tools = [
     { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡。", parameters: { type: "object", properties: { id: { type: "number", enum: [...allowedCharacterIds] } }, required: ["id"], additionalProperties: false } } },
-    { type: "function", function: { name: "list_documents", description: "列出可读取的世界观、设定、大纲和正文文档路径。先看目录，只选择本次确实需要的文档。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
+    { type: "function", function: { name: "list_documents", description: "列出可读取文档路径。约定：lore/=设定，outline/=大纲，chapters/=正文。先看目录，只选本次需要的文档。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "read_document", description: "读取一份与本次情节或事实核对直接相关的文档。", parameters: { type: "object", properties: { path: { type: "string", enum: documents } }, required: ["path"], additionalProperties: false } } },
   ];
   const existingContext = options.mode === "continue" ? document.slice(-12_000)
@@ -256,7 +256,7 @@ async function buildWritingDraft(
       : options.selection?.trim() || document.slice(-6_000);
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
-先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取世界观、设定、大纲或前文文档，不得为了“全面”遍历资料。
+项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
 最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
     { role: "user", content: revision
       ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。`
@@ -478,7 +478,7 @@ async function runReadOnlyToolLoop(
   const read = new Map<string, string>();
   const tools = [{ type: "function", function: {
     name: "read_document",
-    description: "读取一份已获用户批准的世界观、设定或大纲文档。仅在角色设计确实需要时调用。",
+    description: "读取一份已获用户批准的 lore/设定 或 outline/大纲 文档。仅在角色设计确实需要时调用。",
     parameters: { type: "object", properties: { path: { type: "string", enum: [...allowed] } }, required: ["path"], additionalProperties: false },
   } }];
   for (let turn = 0; turn < 4; turn += 1) {

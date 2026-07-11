@@ -21,7 +21,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "style", usage: "/style [list|set <id>|off]", description: "列出或切换写作风格模板", category: "创作" },
   { name: "docs", usage: "/docs [关键词]", description: "索引作品中的全部文档", category: "上下文" },
   { name: "read", usage: "/read <文档路径>", description: "直接读取一份作品文档", category: "上下文" },
-  { name: "search", usage: "/search <关键词>", description: "全文检索设定、大纲和正文", category: "上下文" },
+  { name: "search", usage: "/search <关键词>", description: "全文检索 lore 设定、outline 大纲和 chapters 正文", category: "上下文" },
   { name: "connect", usage: "/connect", description: "接入 DeepSeek API", category: "模型" },
   { name: "provider", usage: "/provider", description: "显示当前模型供应商", category: "模型" },
   { name: "models", usage: "/models", description: "列出并切换可用模型", category: "模型" },

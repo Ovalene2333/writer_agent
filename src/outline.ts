@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { OutlineNode, OutlineNodeStatus, OutlineNodeType, OutlineSnapshot } from "./types.js";
-import { WriterProject } from "./project.js";
+import { resolveOutlineSourcePath, WriterProject } from "./project.js";
 
-const DEFAULT_OUTLINE_PATH = "story/outline.md";
+const DEFAULT_OUTLINE_PATH = "outline/outline.md";
 
 type ParsedNode = Omit<OutlineNode, "id" | "parentId"> & { parentIndex?: number };
 
@@ -13,9 +13,9 @@ export class OutlineStore {
   readonly sourcePath: string;
   readonly snapshotPath: string;
 
-  constructor(project: WriterProject, sourcePath = DEFAULT_OUTLINE_PATH) {
+  constructor(project: WriterProject, sourcePath?: string) {
     this.project = project;
-    this.sourcePath = sourcePath;
+    this.sourcePath = resolveOutlineSourcePath(project, sourcePath ?? DEFAULT_OUTLINE_PATH);
     this.snapshotPath = resolve(project.privateDir, "outline.json");
   }
 

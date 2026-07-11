@@ -669,7 +669,7 @@ export class WriterStore {
   }
 
   search(query: string, limit = 6, options: {
-    pathPrefix?: string; scope?: "all" | "story" | "outline" | "chapters";
+    pathPrefix?: string; scope?: "all" | "lore" | "story" | "outline" | "chapters";
     mode?: "any" | "all" | "exact"; contextLines?: number;
   } = {}): Array<{ path: string; excerpt: string; block?: number; heading?: string; startLine?: number; endLine?: number }> {
     const normalizedQuery = query.trim().toLowerCase();
@@ -682,8 +682,13 @@ export class WriterStore {
     const matchesPath = (path: string) => {
       const prefix = options.pathPrefix?.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
       if (prefix && path !== prefix && !path.startsWith(`${prefix}/`)) return false;
-      if (options.scope === "story" && !path.startsWith("story/")) return false;
-      if (options.scope === "outline" && !/(?:^|\/)(?:outline|大纲)[^/]*\.md$/i.test(path)) return false;
+      if (options.scope === "lore" || options.scope === "story") {
+        // lore/ is canonical; story/ kept for older projects
+        if (!(path.startsWith("lore/") || path.startsWith("story/"))) return false;
+      }
+      if (options.scope === "outline") {
+        if (!(path.startsWith("outline/") || /(?:^|\/)(?:outline|大纲)[^/]*\.md$/i.test(path))) return false;
+      }
       if (options.scope === "chapters" && !path.startsWith("chapters/")) return false;
       return true;
     };
