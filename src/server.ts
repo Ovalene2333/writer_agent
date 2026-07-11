@@ -87,6 +87,7 @@ class BackgroundAgentJobs {
     job.updatedAt = new Date().toISOString();
     if (event.type === "done") this.finish(job, "completed");
     if (event.type === "cancelled") this.finish(job, "cancelled");
+    if (event.type === "waiting_for_input") this.finish(job, "completed");
     if (event.type === "error") this.finish(job, "failed");
     for (const listener of job.listeners) listener(stored);
   }
@@ -404,7 +405,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character"; path?: string; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character"; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
@@ -427,11 +428,8 @@ export async function startWriterServer(options: {
           store: options.store,
           sessionId: body.sessionId,
           prompt: body.prompt,
-          requestedMode: body.mode ?? (body.documentSelections?.length ? "rewrite" : body.path ? "continue" : "write"),
-          targetPath: body.path,
           selectedDocumentBlocks: body.documentSelections,
           characterScope,
-          purpose: body.mode === "polish" ? "review" : body.mode === "rewrite" ? "inline" : "agent",
           models: {
             agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
             inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
@@ -458,9 +456,9 @@ export async function startWriterServer(options: {
       for (const event of job.events) await write(event);
       if (job.status !== "running") return;
       await new Promise<void>((resolve) => {
-        const unsubscribe = agentJobs.subscribe(job.id, (event) => {
-          void write(event);
-          if (event.type === "done" || event.type === "cancelled" || event.type === "error") {
+        const unsubscribe = agentJobs.subscribe(job.id, async (event) => {
+          await write(event);
+          if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
             unsubscribe?.();
             resolve();
           }

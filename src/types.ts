@@ -144,5 +144,6 @@ export type AgentEvent =
   | { type: "character"; character: Character }
   | { type: "done"; sessionId: string }
   | { type: "cancelled"; sessionId: string }
+  | { type: "waiting_for_input"; sessionId: string; question: string; options?: string[] }
   | { type: "usage"; usage: UsageSummary }
   | { type: "error"; message: string };

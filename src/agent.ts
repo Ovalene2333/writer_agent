@@ -168,6 +168,22 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "ask_user",
+      description: "向用户提出一个问题或呈现一组选项，暂停执行并等待用户回复。当需要用户决定方向、选择方案、或澄清信息时，必须先调用此工具再停止；不要在提问的同时调用其他工具，也不要自行替用户做出选择",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "向用户提出的问题（简短，不超过 120 字）" },
+          options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 5, description: "可选答案列表；如不需要选项则省略" },
+        },
+        required: ["question"],
+        additionalProperties: false,
+      },
+    },
+  },
 ] as const;
 
 const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
@@ -325,15 +341,16 @@ function executionRulesPrompt(): string {
 1. 先依据本轮任务计划判断是否需要项目上下文。计划为 none 时直接回答，不调用文档工具；计划需要文档时，才使用 search_project 定位或 inspect_document 查看结构，再用 read_document 读取最小必要块。除非文档很短或确需全文重写，不逐块读取整篇文档。
 2. 修改已有文档时优先调用 propose_document_patch 提交局部搜索替换；propose_document 只用于新建文档或全文重写。提案不会直接写入，作者可审批或拒绝。
 2.1 凡用户要求写正文、续写、继续写、扩写或改写，必须以 propose_document 或 propose_document_patch 提交到目标 Markdown 文档。禁止只在最终回复中粘贴正文来代替文档提案；最终回复只能简要说明已提交的内容。
-2.2 用户用“继续”“接着写”“往下写”等短指令承接上一轮写作时，默认继续上一轮目标文档。先读取目标文档末尾的必要范围，再提交追加或替换提案；无法确定目标文件时应先询问，不得直接输出正文。
+2.2 用户用"继续""接着写""往下写"等短指令承接上一轮写作时，默认继续上一轮目标文档。先读取目标文档末尾的必要范围，再提交追加或替换提案；无法确定目标文件时应先询问，不得直接输出正文。
 3. 保持既有人物、世界观、叙事视角和 Markdown 结构，除非作者明确要求改变。
-4. 信息不足时提出简短、具体的问题，不擅自补充关键设定。但对于写作本身（情节走向、对白、描写等），直接给出具体内容，不要停留在建议层面。
-5. 当有多个合理的写作方向时，以"选项 1 / 选项 2 / 选项 3"的简洁编号形式列出，等候作者选择，然后按选定方向执行。不要用冗长段落描述各选项。
-6. 不输出工具调用的内部参数，不使用项目范围外的信息。
-7. 回复默认使用自然、简洁的纯文本。只有层级结构确实有助于阅读时才使用 Markdown；避免滥用标题、粗体、列表和代码块。创作正文不得为每段添加标题或项目符号。
-8. 管理角色必须使用 save_character。修改已有角色时先 list_characters 获取 ID，并传入 id 更新；不要重复创建角色卡。
-9. 工具已经返回过的长内容不会永久保留在上下文中。后续需要精确原文时，重新读取最小必要范围，不要求系统恢复整份旧输出。
-10. 历史工具调用中若出现“内容已压缩”的占位文本，它只表示旧正文已从上下文移除；不得把占位文本当作正文、参数名示例或可复用内容。新的 propose_document 必须使用 content 参数提交完整正文；新的 propose_document_patch 必须使用 edits 参数提交真实搜索替换。`;
+4. 信息不足时，必须调用 ask_user 工具提出简短、具体的问题，不擅自补充关键设定。调用 ask_user 后本轮不得再调用其他工具；等待用户回复后再继续执行。但对于写作本身（情节走向、对白、描写等），直接给出具体内容，不要停留在建议层面。
+5. 当有多个合理的写作方向时，必须调用 ask_user 工具的 options 参数以简洁编号列出选项（每个选项 ≤ 20 字），等候作者选择，不自己决定方向。调用 ask_user 后本轮停止，等待用户回复后按选定方向继续。
+6. 提交文档提案（propose_document 或 propose_document_patch）后本轮立即停止，不继续调用其他工具或自行追加正文。等待用户审批提案后再继续。
+7. 不输出工具调用的内部参数，不使用项目范围外的信息。
+8. 回复默认使用自然、简洁的纯文本。只有层级结构确实有助于阅读时才使用 Markdown；避免滥用标题、粗体、列表和代码块。创作正文不得为每段添加标题或项目符号。
+9. 管理角色必须使用 save_character。修改已有角色时先 list_characters 获取 ID，并传入 id 更新；不要重复创建角色卡。
+10. 工具已经返回过的长内容不会永久保留在上下文中。后续需要精确原文时，重新读取最小必要范围，不要求系统恢复整份旧输出。
+11. 历史工具调用中若出现"内容已压缩"的占位文本，它只表示旧正文已从上下文移除；不得把占位文本当作正文、参数名示例或可复用内容。新的 propose_document 必须使用 content 参数提交完整正文；新的 propose_document_patch 必须使用 edits 参数提交真实搜索替换。`;
 }
 
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
@@ -386,7 +403,7 @@ async function planWritingTask(
   const planningMessages: ApiMessage[] = [{
     role: "system",
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
-字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（只有用户要求新增或修改 Markdown 正文/大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
+字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
 决策原则：先利用当前对话。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
 文档目录（只有路径，尚未读取正文）：${JSON.stringify(documents)}
 角色目录：${JSON.stringify(characters)}
@@ -538,9 +555,6 @@ export async function runAgent(options: {
   selectedDocumentBlocks?: Array<{ path: string; text?: string }>;
   model?: ModelConfig;
   models?: Partial<Record<"agent" | "inline" | "writer" | "reviewer", ModelConfig>>;
-  purpose?: "agent" | "inline" | "review";
-  requestedMode?: "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
-  targetPath?: string;
   maxTurns?: number;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
@@ -554,23 +568,17 @@ export async function runAgent(options: {
   if (!store.sessionExists(sessionId)) throw new Error("会话不存在");
 
   const history = compactHistory(store.messages(sessionId, 40).filter((message) => message.role !== "tool" && message.role !== "system"));
-  const requestContext = [
-    options.requestedMode ? `用户在界面中选择的写作动作：${options.requestedMode}` : "",
-    options.targetPath ? `用户在界面中指定的目标文档：${options.targetPath}` : "",
-  ].filter(Boolean).join("\n");
-  const planningRequest = requestContext ? `${prompt}\n\n[界面提供的确定上下文]\n${requestContext}` : prompt;
-  const plannerModel = model;
-  const planned = await planWritingTask(plannerModel, project, store, planningRequest, history, signal);
+  const planned = await planWritingTask(model, project, store, prompt, history, signal);
   const task = planned.task;
-  const executionModel = options.purpose === "review"
+  const executionModel = task.mode === "audit"
     ? options.models?.reviewer ?? model
-    : options.purpose === "inline"
+    : task.mode === "rewrite"
     ? options.models?.inline ?? model
     : task.documentProposalRequired
       ? options.models?.writer ?? model
       : model;
-  if (planned.usage && plannerModel.pricing) {
-    emit({ type: "usage", usage: store.recordUsage(sessionId, plannerModel.model, planned.usage, plannerModel.pricing) });
+  if (planned.usage && model.pricing) {
+    emit({ type: "usage", usage: store.recordUsage(sessionId, model.model, planned.usage, model.pricing) });
   }
   const continuationPath = task.continuation
     ? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
@@ -581,18 +589,19 @@ export async function runAgent(options: {
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt() },
     ...history,
-    { role: "system", content: dynamicContextPrompt(project, store, planningRequest, task, characterScope, continuationPath) },
-    ...(requestContext ? [{ role: "system" as const, content: `以下目标由写作界面明确指定，必须遵守，不要另选文档：\n${requestContext}` }] : []),
+    { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
     ...(selectedContext ? [{ role: "system" as const, content: selectedContext }] : []),
-    ...(options.purpose === "review" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
+    ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
     { role: "system", content: writingHardConstraintsPrompt() },
     { role: "user", content: prompt },
   ];
   let transcript = "";
   let documentProposalSubmitted = false;
+  let waitingForUser = false;
 
   try {
     const maxTurns = options.maxTurns ?? 20;
+    let turnStart = messages.length;
     for (let turn = 0; turn < maxTurns; turn += 1) {
       compactRuntimeMessages(messages);
       const step = turn + 1;
@@ -607,21 +616,13 @@ export async function runAgent(options: {
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
-        if (task.documentProposalRequired && !documentProposalSubmitted) {
-          messages.push({ role: "assistant", content: stripDsmlText(result.content || "", "[工具调用已隐藏]") });
-          messages.push({
-            role: "system",
-            content: `你尚未提交文档提案，因此任务不能结束。不要再次直接回复正文。立即定位上一轮写作的目标 Markdown 文档${continuationPath ? `（${continuationPath}）` : ""}，读取末尾必要行段，并使用 propose_document_patch 追加正文；仅在新建文档或确需全文重写时使用 propose_document。`,
-          });
-          transcript = "";
-          continue;
-        }
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
         store.addMessage(sessionId, "assistant", answer);
         emit({ type: "done", sessionId });
         return;
       }
 
+      turnStart = messages.length;
       messages.push({
         role: "assistant",
         content: stripDsmlText(result.content || "", "[工具调用已隐藏]"),
@@ -633,6 +634,7 @@ export async function runAgent(options: {
         })),
       });
 
+      waitingForUser = false;
       for (const call of result.toolCalls) {
         emit({ type: "tool", name: call.name });
         const toolResult = executeTool(call, project, store, sessionId, emit, characterScope);
@@ -642,10 +644,40 @@ export async function runAgent(options: {
             if (!("error" in parsed)) documentProposalSubmitted = true;
           } catch { /* 无效工具结果不能视为已提交。 */ }
         }
+        if (call.name === "ask_user") {
+          try {
+            const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+            if (parsed.status === "waiting") waitingForUser = true;
+          } catch { /* 无效工具结果不能视为等待。 */ }
+        }
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
+      if (documentProposalSubmitted || waitingForUser) break;
       compactCompletedToolCalls(messages);
+    }
+    if (waitingForUser) {
+      try {
+        for (let i = turnStart; i < messages.length; i++) {
+          const msg = messages[i];
+          if (msg.role !== "system" && msg.role !== "user") {
+            store.addMessage(sessionId, msg.role, msg.content ?? "");
+          }
+        }
+      } catch { /* 消息保存失败不影响流程 */ }
+      return;
+    }
+    if (documentProposalSubmitted) {
+      try {
+        for (let i = turnStart; i < messages.length; i++) {
+          const msg = messages[i];
+          if (msg.role !== "system" && msg.role !== "user") {
+            store.addMessage(sessionId, msg.role, msg.content ?? "");
+          }
+        }
+      } catch { /* 消息保存失败不影响流程 */ }
+      emit({ type: "done", sessionId });
+      return;
     }
     const debugContext = runtimeDebugContext(messages, {
       task: task.label,
@@ -902,6 +934,19 @@ function executeTool(
         notes: typeof input.notes === "string" ? input.notes : "",
       });
       return JSON.stringify({ id: character.id, name: character.name, message: "角色卡已保存" });
+    }
+    if (call.name === "ask_user") {
+      const question = requireString(input.question, "question").slice(0, 300);
+      const rawOptions = Array.isArray(input.options)
+        ? input.options.filter((v): v is string => typeof v === "string").slice(0, 5)
+        : [];
+      const options = rawOptions.length >= 2 ? rawOptions : undefined;
+      const message = options
+        ? `${question}\n\n${options.map((opt, i) => `选项 ${i + 1}：${opt}`).join("\n")}`
+        : question;
+      store.addMessage(sessionId, "assistant", message);
+      emit({ type: "waiting_for_input", sessionId, question, options: options ?? undefined });
+      return JSON.stringify({ status: "waiting", message: "问题已提交，等待用户回复" });
     }
     return JSON.stringify({ error: `未知工具：${call.name}` });
   } catch (error) {

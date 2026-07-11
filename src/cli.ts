@@ -5,7 +5,6 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { Command } from "commander";
 import { runAgent } from "./agent.js";
-import type { WritingMode } from "./generation.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { startWriterServer } from "./server.js";
@@ -35,18 +34,15 @@ program.command("run")
   .argument("<prompt>", "写作指令")
   .option("-p, --project <directory>", "项目目录", ".")
   .option("-s, --session <id>", "继续指定会话")
-  .option("-m, --mode <mode>", "写作动作：write、continue、rewrite、rewrite_document、polish", "write")
-  .option("--path <path>", "目标 Markdown 文档")
   .option("--json", "逐行输出 JSON 事件")
   .option("--debug", "在终端输出模型请求体和原始返回体")
-  .action(async (prompt: string, options: { project: string; session?: string; mode: WritingMode; path?: string; json?: boolean; debug?: boolean }) => {
+  .action(async (prompt: string, options: { project: string; session?: string; json?: boolean; debug?: boolean }) => {
     if (options.debug) process.env.WRITER_DEBUG = "1";
     const { project, store, providers } = openProject(options.project);
     try {
       const sessionId = resolveSession(store, options.session, false);
       await runAgent({
-        project, store, sessionId, prompt, requestedMode: options.mode, targetPath: options.path,
-        purpose: options.mode === "polish" ? "review" : options.mode === "rewrite" ? "inline" : "agent",
+        project, store, sessionId, prompt,
         models: {
           agent: providers.modelConfig("agent"), writer: providers.modelConfig("writer"),
           inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),

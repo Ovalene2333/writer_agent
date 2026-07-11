@@ -1,5 +1,6 @@
 ﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { ModelConfig, type ProviderCatalog } from "./model_config";
 import "./style.css";
 
 type Proposal = {
@@ -12,8 +13,12 @@ type Proposal = {
 };
 type Message = { id: number; role: string; content: string };
 type DocumentData = { content: string; hash: string };
-type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish" | "character";
-type Character = { id: number; name: string };
+type Character = {
+  id: number; name: string; aliases: string[]; role: string; appearance: string;
+  traits: string; background: string; goals: string; relationships: string;
+  relatedCharacterIds: number[]; abilities: string; notes: string; updatedAt: string;
+};
+type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StreamStep = {
   id: number;
   output: string;
@@ -37,6 +42,9 @@ type AgentStreamEvent = {
   name?: string;
   message?: string;
   sessionId?: string;
+  question?: string;
+  options?: string[];
+  proposal?: { id: number; path: string; summary: string; beforeContent: string; afterContent: string; status: "pending" };
 };
 type Usage = {
   promptTokens: number;
@@ -48,7 +56,17 @@ type Usage = {
   currency: string;
   lastPromptTokens: number;
 };
-type Provider = { provider: string; model: string; pricing: { contextWindow: number } };
+type Provider = {
+  provider: "deepseek" | "openai-compatible";
+  baseUrl: string;
+  model: string;
+  apiKeyConfigured: boolean;
+  apiKeyHint: string;
+  source: "project" | "environment";
+  pricing: { cacheHit: number; cacheMiss: number; output: number; currency: "CNY" | "USD"; contextWindow: number };
+  temperature?: number;
+  topP?: number;
+};
 type State = {
   config: { title: string; style?: string };
   documents: string[];
@@ -62,6 +80,7 @@ type State = {
   characters: Character[];
   usage: Usage;
   provider: Provider;
+  providerCatalog: ProviderCatalog;
   activeJobs?: AgentJob[];
   styleTemplates?: Array<{ id: string; name: string }>;
 };
@@ -74,13 +93,9 @@ type TreeNode = {
   hidden: boolean;
 };
 
-const MODE_LABELS: Record<WritingMode, string> = {
-  write: "Write",
-  continue: "Continue",
-  rewrite: "Rewrite (scope)",
-  rewrite_document: "Rewrite (doc)",
-  polish: "Polish",
-  character: "Character",
+const EMPTY_CHARACTER: CharacterDraft = {
+  name: "", aliases: [], role: "", appearance: "", traits: "", background: "",
+  goals: "", relationships: "", relatedCharacterIds: [], abilities: "", notes: "",
 };
 
 const hashToken = new URLSearchParams(location.hash.slice(1)).get("token");
@@ -134,22 +149,26 @@ function Markdown({ content, className }: { content: string; className?: string 
 }
 
 function buildTree(docs: string[], folders: string[], hiddenDocs: string[], hiddenFolders: string[]): TreeNode[] {
+  const folderKey = (path: string) => path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const hiddenFolderKeys = new Set(hiddenFolders.map(folderKey));
   const folderMap = new Map<string, TreeNode>();
   for (const path of folders) {
-    const parts = path.split("/").filter(Boolean);
+    const key = folderKey(path);
+    const parts = key.split("/").filter(Boolean);
     if (parts.length === 0) continue;
-    folderMap.set(path, {
+    folderMap.set(key, {
       name: parts[parts.length - 1],
-      path,
+      path: key,
       kind: "folder",
       children: [],
-      hidden: hiddenFolders.includes(path),
+      hidden: hiddenFolderKeys.has(key),
     });
   }
 
   const roots: TreeNode[] = [];
-  for (const [path, node] of folderMap) {
-    const parentPath = path.substring(0, path.lastIndexOf("/", path.length - 2) + 1);
+  for (const [key, node] of folderMap) {
+    const slash = key.lastIndexOf("/");
+    const parentPath = slash >= 0 ? key.slice(0, slash) : "";
     const parent = folderMap.get(parentPath);
     if (parent) {
       parent.children.push(node);
@@ -159,15 +178,16 @@ function buildTree(docs: string[], folders: string[], hiddenDocs: string[], hidd
   }
 
   for (const path of docs) {
-    const parts = path.split("/");
+    const normalizedPath = path.replace(/\\/g, "/").replace(/^\/+/, "");
+    const parts = normalizedPath.split("/");
     const name = parts.pop()!;
-    const parentPath = parts.join("/") + (parts.length > 0 ? "/" : "");
+    const parentPath = parts.join("/");
     const fileNode: TreeNode = {
       name,
-      path,
+      path: normalizedPath,
       kind: "file",
       children: [],
-      hidden: hiddenDocs.includes(path),
+      hidden: hiddenDocs.includes(path) || hiddenDocs.includes(normalizedPath),
     };
 
     const parent = folderMap.get(parentPath);
@@ -193,7 +213,7 @@ function FileTreeItem({
   node,
   depth,
   activePath,
-  collapsed,
+  ancestorHidden = false,
   onSelect,
   onRename,
   onDelete,
@@ -206,7 +226,7 @@ function FileTreeItem({
   node: TreeNode;
   depth: number;
   activePath: string;
-  collapsed: Set<string>;
+  ancestorHidden?: boolean;
   onSelect: (path: string) => void;
   onRename: (oldPath: string, kind: "file" | "folder") => void;
   onDelete: (path: string, kind: "file" | "folder") => void;
@@ -217,7 +237,7 @@ function FileTreeItem({
   setExpandedFolders: React.Dispatch<React.SetStateAction<Set<string>>>;
 }) {
   const isExpanded = node.kind === "folder" && expandedFolders.has(node.path);
-  const isCollapsed = collapsed.has(node.path);
+  const isEffectivelyHidden = ancestorHidden || node.hidden;
   const [dragOver, setDragOver] = useState(false);
 
   const handleDragStart = (e: React.DragEvent) => {
@@ -247,8 +267,15 @@ function FileTreeItem({
     e.stopPropagation();
     setExpandedFolders((prev) => {
       const next = new Set(prev);
-      if (next.has(node.path)) next.delete(node.path);
-      else next.add(node.path);
+      if (next.has(node.path)) {
+        // Collapsing a branch also resets every nested folder. Reopening the
+        // parent should not leave descendants visually expanded out of sync.
+        for (const path of next) {
+          if (path === node.path || path.startsWith(`${node.path}/`)) next.delete(path);
+        }
+      } else {
+        next.add(node.path);
+      }
       return next;
     });
   };
@@ -259,7 +286,7 @@ function FileTreeItem({
   };
 
   return (
-    <div className={`tree-node ${node.hidden ? "agent-hidden" : ""} ${node.kind}`}>
+    <div className={`tree-node ${isEffectivelyHidden ? "agent-hidden" : ""} ${node.kind}`}>
       <div
         className={`tree-row ${activePath === node.path ? "active" : ""} ${dragOver ? "drop-target" : ""}`}
         style={{ paddingLeft: depth * 16 + 4 }}
@@ -269,12 +296,16 @@ function FileTreeItem({
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         onClick={handleClick}
+        aria-expanded={node.kind === "folder" ? isExpanded : undefined}
       >
         {node.kind === "folder" ? (
           <span className={`tree-arrow ${isExpanded ? "expanded" : ""}`} onClick={toggleFolder} />
         ) : (
           <span className="tree-arrow-spacer" />
         )}
+        <span className="tree-icon" aria-hidden="true">
+          {node.kind === "folder" ? (isExpanded ? "📂" : "📁") : "·"}
+        </span>
         <span className="tree-label" title={node.path}>
           <span className="tree-name">{node.name}</span>
         </span>
@@ -287,7 +318,7 @@ function FileTreeItem({
               onToggleHidden(node.path, node.kind, node.hidden);
             }}
           >
-            {node.hidden ? "Show" : "Hide"}
+            {isEffectivelyHidden ? "◉" : "○"}
           </button>
           {node.kind === "folder" && (
             <button
@@ -298,7 +329,7 @@ function FileTreeItem({
                 onNewChild(node.path, "file");
               }}
             >
-              +File
+              +
             </button>
           )}
           <button
@@ -309,7 +340,7 @@ function FileTreeItem({
               onRename(node.path, node.kind);
             }}
           >
-            Rename
+            ✎
           </button>
           <button
             className="tree-action-btn danger"
@@ -319,18 +350,19 @@ function FileTreeItem({
               onDelete(node.path, node.kind);
             }}
           >
-            Del
+            ×
           </button>
         </div>
       </div>
-      {isExpanded &&
-        node.children.map((child) => (
+      {isExpanded && (
+        <div className="tree-children">
+        {node.children.map((child) => (
           <FileTreeItem
             key={child.path}
             node={child}
             depth={depth + 1}
             activePath={activePath}
-            collapsed={collapsed}
+            ancestorHidden={isEffectivelyHidden}
             onSelect={onSelect}
             onRename={onRename}
             onDelete={onDelete}
@@ -341,6 +373,8 @@ function FileTreeItem({
             setExpandedFolders={setExpandedFolders}
           />
         ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -352,17 +386,35 @@ function App() {
   const [documentDraft, setDocumentDraft] = useState("");
   const [editingDocument, setEditingDocument] = useState(false);
   const [prompt, setPrompt] = useState("");
-  const [mode, setMode] = useState<WritingMode>("continue");
   const [streamSteps, setStreamSteps] = useState<StreamStep[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [mobileTab, setMobileTab] = useState<"docs" | "editor" | "agent">("editor");
+  const [theme, setTheme] = useState<"light" | "dark">(() =>
+    localStorage.getItem("writer-theme") === "dark" ? "dark" : "light",
+  );
+  const [managementView, setManagementView] = useState<"characters" | "sessions" | null>(null);
+  const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
+  const [showModelConfig, setShowModelConfig] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<{ path: string; kind: "file" | "folder" } | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [creating, setCreating] = useState<{ parent: string; kind: "file" | "folder" } | null>(null);
   const [createValue, setCreateValue] = useState("");
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    Number(localStorage.getItem("writer-sidebar-w")) || 248,
+  );
+  const [agentWidth, setAgentWidth] = useState(() =>
+    Number(localStorage.getItem("writer-agent-w")) || 380,
+  );
+  const [readerFontSize, setReaderFontSize] = useState(() =>
+    Number(localStorage.getItem("writer-reader-fs")) || 16,
+  );
+  const [readerWidth, setReaderWidth] = useState(() =>
+    Number(localStorage.getItem("writer-reader-w")) || 760,
+  );
+  const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
@@ -383,6 +435,41 @@ function App() {
   useEffect(() => {
     void refresh().catch((e) => setError(String(e)));
   }, []);
+
+  useEffect(() => {
+    window.document.documentElement.dataset.theme = theme;
+    localStorage.setItem("writer-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const root = window.document.documentElement;
+    root.style.setProperty("--sidebar-w", `${sidebarWidth}px`);
+    root.style.setProperty("--agent-w", `${agentWidth}px`);
+    root.style.setProperty("--reader-font-size", `${readerFontSize}px`);
+    root.style.setProperty("--reader-width", `${readerWidth}px`);
+    localStorage.setItem("writer-sidebar-w", String(sidebarWidth));
+    localStorage.setItem("writer-agent-w", String(agentWidth));
+    localStorage.setItem("writer-reader-fs", String(readerFontSize));
+    localStorage.setItem("writer-reader-w", String(readerWidth));
+  }, [sidebarWidth, agentWidth, readerFontSize, readerWidth]);
+
+  useEffect(() => {
+    if (!resizing) return;
+    const handleMove = (e: MouseEvent) => {
+      if (resizing === "sidebar") {
+        setSidebarWidth((w) => Math.max(180, Math.min(480, w + e.movementX)));
+      } else {
+        setAgentWidth((w) => Math.max(240, Math.min(560, w - e.movementX)));
+      }
+    };
+    const handleUp = () => setResizing(null);
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [resizing]);
 
   useEffect(() => {
     if (!activePath) return;
@@ -437,6 +524,12 @@ function App() {
         current.map((s) => (s.status === "running" ? { ...s, status: "failed", expanded: true } : s)),
       );
     }
+    if (event.type === "waiting_for_input") {
+      setNotice(event.question || "Agent is waiting for your input.");
+    }
+    if (event.type === "proposal" && event.proposal) {
+      setState((prev) => prev ? { ...prev, proposals: [event.proposal!, ...prev.proposals] } : prev);
+    }
   }
 
   async function subscribeAgentJob(jobId: string, sessionId: string, clearContextOnDone = false) {
@@ -455,6 +548,7 @@ function App() {
       const decoder = new TextDecoder();
       let buffer = "";
       let terminal = false;
+      let waitingForInput = false;
       for (;;) {
         const { done, value } = await reader.read();
         buffer += decoder.decode(value, { stream: !done });
@@ -465,15 +559,14 @@ function App() {
           if (!line) continue;
           const event = JSON.parse(line.slice(5)) as AgentStreamEvent;
           handleAgentEvent(event);
-          if (event.type === "done" || event.type === "cancelled" || event.type === "error") terminal = true;
+          if (event.type === "waiting_for_input") waitingForInput = true;
+          if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") terminal = true;
         }
         if (done) break;
       }
       if (terminal) {
         await refresh(sessionId);
-        if (clearContextOnDone) setNotice("Agent job completed.");
-        setStreamSteps([]);
-        streamOutputRef.current = "";
+        if (clearContextOnDone && !waitingForInput) setNotice("Agent job completed.");
       }
     } catch (cause) {
       if (!(cause instanceof Error && cause.name === "AbortError")) {
@@ -481,6 +574,8 @@ function App() {
         await refresh(sessionId).catch((e) => setError(String(e)));
       }
     } finally {
+      setStreamSteps([]);
+      streamOutputRef.current = "";
       if (currentJobRef.current === jobId) {
         abortRef.current = undefined;
         currentJobRef.current = undefined;
@@ -516,8 +611,6 @@ function App() {
         body: JSON.stringify({
           sessionId: state.sessionId,
           prompt: text,
-          mode,
-          path: activePath || undefined,
           characterScope: state.characters.map((c) => c.id),
         }),
       });
@@ -551,12 +644,16 @@ function App() {
   }
 
   async function decide(proposal: Proposal, action: "accept" | "reject") {
-    await api(`/api/proposals/${proposal.id}/${action}`, { method: "POST" });
-    await refresh(state?.sessionId);
-    if (action === "accept" && proposal.path === activePath) {
-      const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
-      setDocument(next);
-      setDocumentDraft(next.content);
+    try {
+      await api(`/api/proposals/${proposal.id}/${action}`, { method: "POST" });
+      await refresh(state?.sessionId);
+      if (action === "accept" && proposal.path === activePath) {
+        const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
+        setDocument(next);
+        setDocumentDraft(next.content);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -672,18 +769,41 @@ function App() {
     setCreating(null);
   }
 
+  async function saveCharacter() {
+    if (!characterDraft?.name.trim()) return;
+    await api("/api/characters", { method: "POST", body: JSON.stringify(characterDraft) });
+    setCharacterDraft(null);
+    await refresh(state?.sessionId);
+  }
+
+  function openProviderSettings() {
+    setShowModelConfig(true);
+  }
+
+  async function deleteCharacter(character: Character) {
+    if (!confirm(`Delete character “${character.name}”?`)) return;
+    await api(`/api/characters/${character.id}`, { method: "DELETE" });
+    setCharacterDraft(null);
+    await refresh(state?.sessionId);
+  }
+
+  async function renameSession(id: string, currentTitle: string) {
+    const title = window.prompt("Session title", currentTitle)?.trim();
+    if (!title || title === currentTitle) return;
+    await api(`/api/session/${id}`, { method: "PUT", body: JSON.stringify({ title }) });
+    await refresh(state?.sessionId);
+  }
+
+  async function deleteSession(id: string) {
+    if (!confirm("Delete this session? This cannot be undone.")) return;
+    await api(`/api/session/${id}`, { method: "DELETE" });
+    await refresh(id === state?.sessionId ? undefined : state?.sessionId);
+  }
+
   const tree = useMemo(() => {
     if (!state) return [];
     return buildTree(state.documents, state.documentFolders, state.hiddenDocuments, state.hiddenFolders);
   }, [state?.documents, state?.documentFolders, state?.hiddenDocuments, state?.hiddenFolders]);
-
-  const collapsed = useMemo(() => {
-    if (!state) return new Set<string>();
-    const set = new Set<string>();
-    for (const d of state.hiddenDocuments) set.add(d);
-    for (const f of state.hiddenFolders) set.add(f);
-    return set;
-  }, [state?.hiddenDocuments, state?.hiddenFolders]);
 
   if (!state) {
     return (
@@ -700,20 +820,41 @@ function App() {
 
   return (
     <div className="app">
+      <div
+        className={`resize-handle${resizing === "sidebar" ? " active" : ""}`}
+        style={{ left: `calc(var(--sidebar-w, 248px) - 2.5px)` }}
+        onMouseDown={() => setResizing("sidebar")}
+      />
+      <div
+        className={`resize-handle${resizing === "agent" ? " active" : ""}`}
+        style={{ right: `calc(var(--agent-w, 380px) - 2.5px)` }}
+        onMouseDown={() => setResizing("agent")}
+      />
       <header>
         <div className="header-left">
-          <span className="logo">WRITER</span>
+          <span className="logo"><span className="logo-mark">W</span><span>Writer</span></span>
           <h1>{state.config.title || "Writer Agent"}</h1>
         </div>
         <div className="header-right">
-          <div className="usage-strip">
-            <span className="usage-number">{usagePct}%</span>
-            <span>{state.usage.totalTokens.toLocaleString()} tok</span>
-            <span>
-              {state.usage.currency === "CNY" ? "&yen;" : "$"}
-              {state.usage.cost.toFixed(4)}
+          <button className="usage-strip" onClick={openProviderSettings} title="Open model configuration">
+            <span className="model-name">{state.provider.model}</span>
+            <span title="Context window used">{usagePct}% context</span>
+            <span>{state.usage.totalTokens.toLocaleString()} tokens</span>
+            <span className="usage-number">
+              {state.usage.currency === "CNY" ? "¥" : "$"}{state.usage.cost.toFixed(4)}
             </span>
-          </div>
+            <span className="settings-glyph" aria-hidden="true">⚙</span>
+          </button>
+          <button className="ghost nav-action" onClick={() => setManagementView("characters")}>Characters</button>
+          <button className="ghost nav-action" onClick={() => setManagementView("sessions")}>Sessions</button>
+          <button
+            className="icon"
+            title={theme === "dark" ? "Use light mode" : "Use dark mode"}
+            aria-label={theme === "dark" ? "Use light mode" : "Use dark mode"}
+            onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}
+          >
+            {theme === "dark" ? "☀" : "◐"}
+          </button>
           <button
             className="ghost"
             title="New session"
@@ -732,13 +873,13 @@ function App() {
 
       <div className="mobile-tabs">
         <button className={mobileTab === "docs" ? "active" : ""} onClick={() => setMobileTab("docs")}>
-          Docs
+          <span className="tab-icon" aria-hidden="true">☷</span><span>Docs</span>
         </button>
         <button className={mobileTab === "editor" ? "active" : ""} onClick={() => setMobileTab("editor")}>
-          Editor
+          <span className="tab-icon" aria-hidden="true">✎</span><span>Editor</span>
         </button>
         <button className={mobileTab === "agent" ? "active" : ""} onClick={() => setMobileTab("agent")}>
-          Agent
+          <span className="tab-icon" aria-hidden="true">✦</span><span>Agent</span>
         </button>
       </div>
 
@@ -805,7 +946,6 @@ function App() {
                   node={node}
                   depth={0}
                   activePath={activePath}
-                  collapsed={collapsed}
                   onSelect={(path) => {
                     setActivePath(path);
                     setMobileTab("editor");
@@ -823,58 +963,42 @@ function App() {
           )}
         </div>
 
-        <div className="sidebar-section sessions">
-          <h2>
-            Sessions
-            <button
-              className="ghost"
-              style={{ padding: "1px 6px", fontSize: 12 }}
-              onClick={async () => {
-                const r = await api<{ sessionId: string }>("/api/session", { method: "POST" });
-                await refresh(r.sessionId);
-              }}
-            >
-              +
-            </button>
-          </h2>
-          {state.sessions.length === 0 ? (
-            <div className="sidebar-empty">No sessions</div>
-          ) : (
-            state.sessions.map((s) => (
-              <button
-                key={s.id}
-                className={`sidebar-item ${s.id === state.sessionId ? "active" : ""}`}
-                onClick={() => {
-                  void refresh(s.id);
-                  setMobileTab("agent");
-                }}
-              >
-                <div style={{ overflow: "hidden" }}>
-                  <div style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{s.title}</div>
-                  <span className="sidebar-meta">{new Date(s.updatedAt).toLocaleDateString()}</span>
-                </div>
-              </button>
-            ))
-          )}
-        </div>
       </aside>
 
       <main className={`editor ${mobileTab === "editor" ? "mobile-active" : ""}`}>
         <div className="editor-bar">
           <span className="doc-path">{activePath || "No document selected"}</span>
-          <div className="editor-bar-actions">
-            {editingDocument ? (
-              <>
-                <button onClick={cancelEdit}>Cancel</button>
-                <button className="primary" onClick={() => void saveDocument()}>
-                  Save
-                </button>
-              </>
-            ) : (
-              <button disabled={!activePath} onClick={() => setEditingDocument(true)}>
-                Edit
-              </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {!editingDocument && document.content && (
+              <div className="reader-controls">
+                <div className="ctrl-group">
+                  <span className="ctrl-label">A</span>
+                  <button onClick={() => setReaderFontSize((v) => Math.max(12, v - 1))} title="Decrease font size">-</button>
+                  <span className="ctrl-val">{readerFontSize}</span>
+                  <button onClick={() => setReaderFontSize((v) => Math.min(24, v + 1))} title="Increase font size">+</button>
+                </div>
+                <div className="ctrl-group">
+                  <span className="ctrl-label">W</span>
+                  <button onClick={() => setReaderWidth((v) => Math.max(420, v - 60))} title="Narrower margins">-</button>
+                  <span className="ctrl-val">{readerWidth}</span>
+                  <button onClick={() => setReaderWidth((v) => Math.min(1200, v + 60))} title="Wider margins">+</button>
+                </div>
+              </div>
             )}
+            <div className="editor-bar-actions">
+              {editingDocument ? (
+                <>
+                  <button onClick={cancelEdit}>Cancel</button>
+                  <button className="primary" onClick={() => void saveDocument()}>
+                    Save
+                  </button>
+                </>
+              ) : (
+                <button disabled={!activePath} onClick={() => setEditingDocument(true)}>
+                  Edit
+                </button>
+              )}
+            </div>
           </div>
         </div>
         {editingDocument ? (
@@ -896,7 +1020,14 @@ function App() {
       <section className={`agent-panel ${mobileTab === "agent" ? "mobile-active" : ""}`}>
         <div className="agent-head">
           <h2>Agent</h2>
-          <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "Running" : "Idle"}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "Running" : "Idle"}</span>
+            {busy && (
+              <button className="agent-stop-btn" onClick={stop}>
+                Stop
+              </button>
+            )}
+          </div>
         </div>
         <div className="conversation">
           {state.messages.map((msg) => (
@@ -957,18 +1088,6 @@ function App() {
           {error && <article className="error">{error}</article>}
         </div>
         <div className="composer">
-          <div className="mode-chips">
-            {(Object.keys(MODE_LABELS) as WritingMode[]).map((m) => (
-              <button
-                key={m}
-                className={mode === m ? "active-chip" : ""}
-                onClick={() => setMode(m)}
-                title={m}
-              >
-                {MODE_LABELS[m]}
-              </button>
-            ))}
-          </div>
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -996,6 +1115,26 @@ function App() {
             </button>
           </div>
         </div>
+        {pendingProposals.length > 0 && (
+          <div className="mobile-proposals">
+            <h2>
+              Proposals
+              <span style={{ fontWeight: 400, marginLeft: 8 }}>({pendingProposals.length})</span>
+            </h2>
+            {pendingProposals.map((p) => (
+              <div className="proposal-card" key={p.id}>
+                <h3>{p.path}</h3>
+                <p>{p.summary}</p>
+                <div className="proposal-actions">
+                  <button onClick={() => void decide(p, "reject")}>Reject</button>
+                  <button className="primary" onClick={() => void decide(p, "accept")}>
+                    Accept
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="proposals">
@@ -1022,6 +1161,89 @@ function App() {
           ))
         )}
       </section>
+
+      {managementView && (
+        <div className="management-backdrop" onMouseDown={() => setManagementView(null)}>
+          <section className="management-view" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="management-head">
+              <div>
+                <span className="eyebrow">Workspace</span>
+                <h2>{managementView === "characters" ? "Character cards" : "Sessions"}</h2>
+              </div>
+              <div className="management-actions">
+                {managementView === "characters" ? (
+                  <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}>+ Character</button>
+                ) : (
+                  <button className="primary" onClick={async () => {
+                    const result = await api<{ sessionId: string }>("/api/session", { method: "POST" });
+                    await refresh(result.sessionId);
+                    setManagementView(null);
+                  }}>+ Session</button>
+                )}
+                <button className="icon" aria-label="Close" onClick={() => setManagementView(null)}>×</button>
+              </div>
+            </div>
+
+            {managementView === "characters" ? (
+              <div className="character-grid">
+                {state.characters.map((character) => (
+                  <button className="character-card" key={character.id} onClick={() => setCharacterDraft({ ...character })}>
+                    <span className="character-avatar">{character.name.slice(0, 1)}</span>
+                    <span className="character-card-body">
+                      <strong>{character.name}</strong>
+                      <small>{character.role || "Role not set"}</small>
+                      <span>{character.traits || character.background || "No description yet"}</span>
+                    </span>
+                  </button>
+                ))}
+                {state.characters.length === 0 && <div className="management-empty">No character cards yet.</div>}
+              </div>
+            ) : (
+              <div className="session-list">
+                {state.sessions.map((session) => (
+                  <div className={`session-card ${session.id === state.sessionId ? "active" : ""}`} key={session.id}>
+                    <button className="session-main" onClick={() => { void refresh(session.id); setManagementView(null); setMobileTab("agent"); }}>
+                      <strong>{session.title}</strong>
+                      <span>{new Date(session.updatedAt).toLocaleString()}</span>
+                    </button>
+                    {session.id === state.sessionId && <span className="current-badge">Current</span>}
+                    <button className="icon" title="Rename" onClick={() => void renameSession(session.id, session.title)}>✎</button>
+                    <button className="icon danger" title="Delete" onClick={() => void deleteSession(session.id)}>×</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {characterDraft && (
+        <div className="modal-backdrop" onMouseDown={() => setCharacterDraft(null)}>
+          <section className="modal character-editor" onMouseDown={(e) => e.stopPropagation()}>
+            <h2>{characterDraft.id ? "Edit character" : "New character"}</h2>
+            <div className="character-form-grid">
+              <label><span>Name</span><input value={characterDraft.name} onChange={(e) => setCharacterDraft({ ...characterDraft, name: e.target.value })} /></label>
+              <label><span>Role</span><input value={characterDraft.role} onChange={(e) => setCharacterDraft({ ...characterDraft, role: e.target.value })} /></label>
+              <label className="wide"><span>Aliases (comma separated)</span><input value={characterDraft.aliases.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, aliases: e.target.value.split(/[,，]/).map(v => v.trim()).filter(Boolean) })} /></label>
+              {(["appearance", "traits", "background", "goals", "relationships", "abilities", "notes"] as const).map((field) => (
+                <label className="wide" key={field}><span>{field[0].toUpperCase() + field.slice(1)}</span><textarea value={characterDraft[field]} onChange={(e) => setCharacterDraft({ ...characterDraft, [field]: e.target.value })} /></label>
+              ))}
+              <label className="wide"><span>Related characters</span><div className="relation-picker">
+                {state.characters.filter(item => item.id !== characterDraft.id).map(item => (
+                  <button type="button" className={characterDraft.relatedCharacterIds.includes(item.id) ? "selected" : ""} key={item.id} onClick={() => setCharacterDraft({ ...characterDraft, relatedCharacterIds: characterDraft.relatedCharacterIds.includes(item.id) ? characterDraft.relatedCharacterIds.filter(id => id !== item.id) : [...characterDraft.relatedCharacterIds, item.id] })}>{item.name}</button>
+                ))}
+              </div></label>
+            </div>
+            <div className="modal-actions">
+              {characterDraft.id && <button className="danger" onClick={() => void deleteCharacter(characterDraft as Character)}>Delete</button>}
+              <button onClick={() => setCharacterDraft(null)}>Cancel</button>
+              <button className="primary" disabled={!characterDraft.name.trim()} onClick={() => void saveCharacter()}>Save</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {showModelConfig && <ModelConfig initialCatalog={state.providerCatalog} request={api} onClose={() => setShowModelConfig(false)} onChanged={() => refresh(state.sessionId)} />}
     </div>
   );
 }
