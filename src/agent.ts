@@ -4,6 +4,7 @@ import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 import { documentBlocks, documentSections } from "./document_blocks.js";
 import { contrastStyleError } from "./prose_quality.js";
+import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 
 type ApiMessage = {
@@ -63,7 +64,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "read_document",
-      description: "按 Markdown 标题节或自然边界块读取文档。可用 section 指定标题、用 lastSection 读取最后一节；没有合适标题时再按 block 读取。先用 inspect_document 查看结构",
+      description: "按 Markdown 标题节、自然边界块或行范围截取文档。搜索结果已有行号时优先读取最小行范围；长文档先用 inspect_document 查看结构",
       parameters: {
         type: "object",
         properties: {
@@ -71,6 +72,8 @@ const TOOLS = [
           block: { type: "number", description: "块编号，1 开始；默认读取第 1 块" },
           section: { type: "string", description: "按 Markdown 标题读取一节；填写 inspect_document 返回的标题文字（不含 #）" },
           lastSection: { type: "boolean", description: "读取文档最后一个 Markdown 标题节；续写时优先使用" },
+          startLine: { type: "number", description: "起始行，1 开始；必须与 endLine 同时提供" },
+          endLine: { type: "number", description: "结束行（包含）；最多读取 200 行和 12000 字符" },
         },
         required: ["path"],
         additionalProperties: false,
@@ -81,12 +84,82 @@ const TOOLS = [
     type: "function",
     function: {
       name: "search_project",
-      description: "在作品设定、人物、大纲和章节中全文检索",
+      description: "像代码搜索一样在项目 Markdown 中定位概念或设定，返回路径、所属标题、行号和上下文。需要逐字事实时再用 read_document 截取",
       parameters: {
         type: "object",
-        properties: { query: { type: "string" } },
+        properties: {
+          query: { type: "string", description: "概念、专有名词或短查询" },
+          scope: { type: "string", enum: ["all", "story", "outline", "chapters"], description: "文档范围；世界观概念优先 story" },
+          pathPrefix: { type: "string", description: "可选相对目录前缀，例如 story" },
+          mode: { type: "string", enum: ["any", "all", "exact"], description: "任一词、全部词或精确短语" },
+          contextLines: { type: "number", description: "匹配行前后上下文，0～12，默认 2" },
+          limit: { type: "number", description: "结果数，1～12，默认 8" },
+        },
         required: ["query"],
         additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_outline_nodes",
+      description: "读取结构化故事大纲目录，返回稳定节点 ID、层级、摘要、状态和正文关联。规划、续写或检查情节时优先使用",
+      parameters: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["act", "chapter", "scene"], description: "可选节点类型过滤" },
+          status: { type: "string", enum: ["idea", "planned", "drafted", "diverged"], description: "可选状态过滤" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_outline_node",
+      description: "按稳定 ID 读取一个大纲节点的结构化字段和对应 Markdown 原文；先调用 list_outline_nodes",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "大纲节点 ID" } },
+        required: ["id"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_outline_patch",
+      description: "针对一个已读取的大纲节点提交局部 Markdown 搜索替换提案。修改仍需作者审批；search 必须在该节点原文内且在整篇大纲中唯一",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "已通过 get_outline_node 读取的节点 ID" },
+          search: { type: "string", description: "节点原文中的唯一精确文本" },
+          replace: { type: "string", description: "替换后的 Markdown" },
+          summary: { type: "string", description: "一句话概括修改目的" },
+        },
+        required: ["id", "search", "replace", "summary"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "validate_outline",
+      description: "检查场景节点是否缺少前因、行动、结果、状态变化、人物或正文关联，并检查未回收伏笔",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "compare_outline_with_draft",
+      description: "将一个已关联正文的大纲场景与对应正文做基础偏离检查，返回正文证据和需要人工确认的差异",
+      parameters: {
+        type: "object", properties: { id: { type: "string", description: "场景节点 ID" } },
+        required: ["id"], additionalProperties: false,
       },
     },
   },
@@ -368,13 +441,15 @@ function writingHardConstraintsPrompt(): string {
 function executionRulesPrompt(): string {
   return `执行规则：
 1. 先依据本轮任务计划判断是否需要项目上下文。计划为 none 时直接回答，不调用文档工具；计划需要文档时，才使用 search_project 定位或 inspect_document 查看结构，再用 read_document 读取最小必要块。除非文档很短或确需全文重写，不逐块读取整篇文档。
-2. 修改已有文档时优先调用 propose_document_patch 提交局部搜索替换；propose_document 只用于新建文档或全文重写。提案不会直接写入，作者可审批或拒绝。
+1.1 写作、规划和一致性检查开始前，先判断是否依赖尚未出现在当前上下文中的项目事实。出现项目专有概念、能力规则、组织制度、地理历史、科技限制、过去事件，或用户要求符合设定/避免冲突时，先用 search_project 搜索；如果缺少某信息会产生多个互相冲突的事实版本，也应先搜索。纯写作建议、只润色已提供文本或当前上下文已有完整定义时不搜索。
+1.2 世界观检索采用“搜索定位→最小截取”：search_project 返回路径、标题和行号后，用 read_document 的 startLine/endLine 或 section 读取直接相关原文。每轮最多调用 search_project 两次；结果不足时换用更精确的查询，不遍历全部文档。明确区分检索到的项目事实与模型推测。
+2. 修改已有文档时优先调用 propose_document_patch 提交局部搜索替换；修改大纲节点优先使用 propose_outline_patch；propose_document 只用于新建文档或全文重写。提案不会直接写入，作者可审批或拒绝。
 2.1 凡用户要求写正文、续写、继续写、扩写或改写，必须以 propose_document 或 propose_document_patch 提交到目标 Markdown 文档。禁止只在最终回复中粘贴正文来代替文档提案；最终回复只能简要说明已提交的内容。
 2.2 用户用"继续""接着写""往下写"等短指令承接上一轮写作时，默认继续上一轮目标文档。先读取目标文档末尾的必要范围，再提交追加或替换提案；无法确定目标文件时应先询问，不得直接输出正文。
 3. 保持既有人物、世界观、叙事视角和 Markdown 结构，除非作者明确要求改变。写入正文、大纲或设定时使用常见 Markdown 标记组织结构：用 #/##/### 表示章、节和场景层级，必要时使用 *强调*、列表或分隔线；标题应简短稳定，便于浏览跳转和按节读取。不要为每个自然段添加标题。
 4. 信息不足时，必须调用 ask_user 工具提出简短、具体的问题，不擅自补充关键设定。调用 ask_user 后本轮不得再调用其他工具；等待用户回复后再继续执行。但对于写作本身（情节走向、对白、描写等），直接给出具体内容，不要停留在建议层面。
 5. 当有多个合理的写作方向时，必须调用 ask_user 工具的 options 参数以简洁编号列出选项（每个选项 ≤ 20 字），等候作者选择，不自己决定方向。调用 ask_user 后本轮停止，等待用户回复后按选定方向继续。
-6. 提交文档提案（propose_document 或 propose_document_patch）后本轮立即停止，不继续调用其他工具或自行追加正文。等待用户审批提案后再继续。
+6. 提交文档提案（propose_document、propose_document_patch 或 propose_outline_patch）后本轮立即停止，不继续调用其他工具或自行追加正文。等待用户审批提案后再继续。
 7. 不输出工具调用的内部参数，不使用项目范围外的信息。
 8. 对话回复默认使用自然、简洁的纯文本。文档创作应使用适量 Markdown 结构标记，但避免滥用标题、粗体、列表和代码块；小说正文不得为每个自然段添加标题或项目符号。
 9. 管理角色必须使用 save_character。创建角色卡时只填写用户已提供或可可靠归纳的字段，未知字段允许留空，不得为了填满表格而虚构设定。修改已有角色时先 list_characters 获取 ID，再用 get_character 读取完整卡片，并传入 id 更新；不得清空未要求修改的字段，也不要重复创建角色卡。写作时需要角色资料，也使用 get_character 的 fields 参数只读取当前场景真正需要的字段，例如对白优先读取 speechStyle，动作描写读取 appearance/capabilities/limitations，人物决策读取 personality/values/currentGoal/fears；不要默认读取整张卡片。
@@ -383,7 +458,9 @@ function executionRulesPrompt(): string {
 }
 
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
-  const references = [...new Set([...(task.targetPath ? [task.targetPath] : []), ...explicitReferencePaths(project, request)])];
+  const explicitReferences = explicitReferencePaths(project, request);
+  const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
+  const references = [...new Set([...explicitReferences, ...inferredTargets])];
   const creativeContext = structuredCreativeContext(store, task, characterScope);
   const characterScopeInstruction = characterScope === undefined
     ? "角色资料按任务相关性自动筛选。"
@@ -402,6 +479,7 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   return `当前任务：${task.label}
 
 当前用户请求是本轮唯一要执行的指令。历史对话只用于理解指代和既有事实，不得把已经完成的旧修改要求自动并入本轮任务。
+只有“当前消息中的 @ 明确引用”部分列出的路径，才能称为“用户指定”或“用户 @ 指定”。规划器推断目标、会话活动文档和历史文档都只能称为系统推断，不得冒充用户选择。
 
 ${taskInstructions(task.mode)}
 
@@ -414,8 +492,11 @@ ${taskInstructions(task.mode)}
 按本次任务筛选的结构化创作资料（JSON；未出现的资料不代表不存在，需要时使用工具检索）：
 ${creativeContext}
 
-用户使用 @ 指定的路径（尚未读取）：
-${references.length ? references.map(path => `- ${path}`).join("\n") : "- 无"}`;
+当前消息中的 @ 明确引用（尚未读取）：
+${explicitReferences.length ? explicitReferences.map(path => `- ${path}`).join("\n") : "- 无；不得声称用户指定了任何文档"}
+
+系统根据当前任务推断的候选目标（不是用户 @ 指定）：
+${inferredTargets.length ? inferredTargets.map(path => `- ${path}`).join("\n") : "- 无"}`;
 }
 
 const TASK_LABELS: Record<WritingTaskMode, string> = {
@@ -482,15 +563,37 @@ async function planWritingTask(
   };
 }
 
+function fastRouteWritingTask(project: WriterProject, store: WriterStore, sessionId: string, request: string): WritingTask | undefined {
+  const references = explicitReferencePaths(project, request);
+  const sessionContext = store.sessionContext(sessionId);
+  const continuation = /^(继续|接着|续写|往下写)(?:[。！!，,\s]|$)/.test(request.trim());
+  const rewrite = /(改写|重写|润色|修改).*(这一段|这段|选区)/.test(request);
+  const audit = /(审阅|检查|校对|找问题)/.test(request) && references.length > 0;
+  const targetPath = references[0] ?? (continuation ? sessionContext.activeDocument ?? store.proposals().find(item => item.sessionId === sessionId)?.path : undefined);
+  if (continuation && targetPath) return { mode: "write_scene", label: TASK_LABELS.write_scene, documentContext: "continuation", targetPath,
+    searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: true };
+  if (rewrite && targetPath) return { mode: "rewrite", label: TASK_LABELS.rewrite, documentContext: "target", targetPath,
+    searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: false };
+  if (audit) return { mode: "audit", label: TASK_LABELS.audit, documentContext: "target", targetPath,
+    searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: false, continuation: false };
+  if (references.length === 1) {
+    const writing = /(写|续写|扩写|改写|重写|修改|润色)/.test(request);
+    return { mode: writing ? "write_scene" : "general", label: TASK_LABELS[writing ? "write_scene" : "general"], documentContext: "target",
+      targetPath, searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: writing, continuation: false };
+  }
+  return undefined;
+}
+
 function taskInstructions(mode: WritingTaskMode): string {
   if (mode === "brainstorm") return `本次工作流：
 - 先明确人物欲望、阻力、失败代价和不可逆后果。
 - 给出三个真正不同的候选方向，分别说明核心冲突与后续潜力。
 - 不把候选设想写入项目事实，除非作者明确选定。`;
   if (mode === "outline") return `本次工作流：
-- 使用“卷/幕—章—场景”的动态分层大纲，每个节点都要有前因、行动、结果和状态变化。
-- 同时维护人物弧、信息释放、伏笔埋设与回收，不使用只有事件名称的空洞大纲。
-- 修改既有大纲前先读取相关行段，优先通过局部补丁提案提交。`;
+- 先调用 list_outline_nodes 了解“卷/幕—章—场景”结构；读取或修改具体节点时用 get_outline_node，不要靠全文搜索猜测节点边界。
+- 每个场景节点维护前因、行动、结果和状态变化；同时维护人物弧、信息释放、伏笔埋设与回收。
+- 修改既有节点使用 propose_outline_patch 提交局部提案；结构完整性检查使用 validate_outline。
+- 大纲场景推荐字段格式：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。字段写成 Markdown 列表“字段：值”。`;
   if (mode === "write_scene") return `本次工作流（内部执行，不输出分析过程）：
 1. 确定场景开场状态、人物目标、阻力、信息变化和不可逆结果。
 2. 根据人物已知信息和动机推演至少三个下一步行动，选择因果最强且不过度套路化的一项。
@@ -597,7 +700,8 @@ export async function runAgent(options: {
   if (!store.sessionExists(sessionId)) throw new Error("会话不存在");
 
   const history = compactHistory(store.messages(sessionId, 40).filter((message) => message.role !== "tool" && message.role !== "system"));
-  const planned = await planWritingTask(model, project, store, prompt, history, signal);
+  const fastTask = fastRouteWritingTask(project, store, sessionId, prompt);
+  const planned = fastTask ? { task: fastTask } : await planWritingTask(model, project, store, prompt, history, signal);
   const task = planned.task;
   const executionModel = task.mode === "audit"
     ? options.models?.reviewer ?? model
@@ -606,28 +710,33 @@ export async function runAgent(options: {
     : task.documentProposalRequired
       ? options.models?.writer ?? model
       : model;
-  if (planned.usage && model.pricing) {
+  if ("usage" in planned && planned.usage && model.pricing) {
     emit({ type: "usage", usage: store.recordUsage(sessionId, model.model, planned.usage, model.pricing) });
   }
   const continuationPath = task.continuation
     ? task.targetPath ?? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
     : undefined;
+  store.saveSessionContext(sessionId, { activeDocument: task.targetPath ?? continuationPath, currentIntent: `${task.mode}: ${prompt.slice(0, 240)}` });
   store.addMessage(sessionId, "user", prompt);
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historicalContext = historicalConversationContext(history);
+  const artifactContext = recentArtifactsContext(store, sessionId);
   const messages: ApiMessage[] = [
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt() },
+    { role: "system", content: writingHardConstraintsPrompt() },
+    ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
     ...(historicalContext ? [historicalContext] : []),
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
+    ...(artifactContext ? [{ role: "system" as const, content: artifactContext }] : []),
     ...(selectedContext ? [{ role: "system" as const, content: selectedContext }] : []),
-    ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
-    { role: "system", content: writingHardConstraintsPrompt() },
     { role: "user", content: prompt },
   ];
   let transcript = "";
   let documentProposalSubmitted = false;
   let waitingForUser = false;
+  const toolCallCounts = new Map<string, number>();
+  let projectSearchCalls = 0;
 
   try {
     const maxTurns = options.maxTurns ?? 20;
@@ -667,8 +776,13 @@ export async function runAgent(options: {
       waitingForUser = false;
       for (const call of result.toolCalls) {
         emit({ type: "tool", name: call.name });
-        const toolResult = executeTool(call, project, store, sessionId, emit, characterScope);
-        if (call.name === "propose_document" || call.name === "propose_document_patch") {
+        let toolResult: string;
+        if (call.name === "search_project" && ++projectSearchCalls > 2) {
+          toolResult = JSON.stringify({ error: "本轮项目搜索已达到两次上限；请使用已有结果和最小文档截取继续。" });
+        } else {
+          toolResult = executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope);
+        }
+        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_outline_patch") {
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (!("error" in parsed)) documentProposalSubmitted = true;
@@ -798,6 +912,53 @@ function selectedBlocksContext(project: WriterProject, references?: Array<{ path
   return sections.length ? `用户从网页浏览器明确加入了以下文本选区。只把它们作为本轮上下文，不要自行扩展为整篇文档：\n\n${sections.join("\n\n---\n\n")}` : "";
 }
 
+function recentArtifactsContext(store: WriterStore, sessionId: string): string {
+  const artifacts = store.recentContextArtifacts(sessionId, 6);
+  const state = store.sessionContext(sessionId);
+  if (!artifacts.length && !state.activeDocument && !state.currentIntent) return "";
+  return `会话状态与工作记忆（这些资料已经读取过；摘要足够时直接复用，不要重复调用相同工具。需要逐字原文时才重新读取）：\n${JSON.stringify({ state, artifacts })}`;
+}
+
+const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
+
+function executeToolCached(
+  call: ToolAccumulator, project: WriterProject, store: WriterStore, sessionId: string,
+  emit: (event: AgentEvent) => void, counts: Map<string, number>, characterScope?: number[],
+): string {
+  if (!CACHEABLE_TOOLS.has(call.name)) return executeTool(call, project, store, sessionId, emit, characterScope);
+  let input: Record<string, unknown>;
+  try { input = JSON.parse(call.arguments || "{}") as Record<string, unknown>; }
+  catch { return executeTool(call, project, store, sessionId, emit, characterScope); }
+  const normalized = Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) =>
+    [key, typeof value === "string" ? value.trim() : value]));
+  const path = typeof normalized.path === "string" ? normalized.path : undefined;
+  const outlinePath = call.name.includes("outline") ? "story/outline.md" : undefined;
+  const sourcePath = path ?? (outlinePath && project.documentExists(outlinePath) ? outlinePath : undefined);
+  const sourceHash = sourcePath && project.documentExists(sourcePath)
+    ? project.hash(project.read(sourcePath))
+    : project.hash(JSON.stringify(project.listDocuments()));
+  const cacheKey = `${call.name}:${JSON.stringify(normalized)}:${sourceHash}`;
+  const count = (counts.get(cacheKey) ?? 0) + 1;
+  counts.set(cacheKey, count);
+  const cached = store.contextArtifact(sessionId, cacheKey);
+  if (count > 3) return JSON.stringify({ error: "相同工具调用已重复三次，结果没有变化；请使用现有工作记忆继续。" });
+  if (cached && count > 1) return JSON.stringify({ status: "already_available", artifactId: cached.id, kind: cached.kind,
+    path: cached.path, sourceHash: cached.sourceHash, digest: cached.digest, message: "相同且未变化的工具结果已在本轮上下文中，请直接使用。" });
+  if (cached) return cached.content;
+  const result = executeTool(call, project, store, sessionId, emit, characterScope);
+  let digest = `${call.name} 已完成`;
+  try {
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    if (typeof parsed.error === "string") return result;
+    const location = [parsed.path, parsed.heading ?? parsed.section ?? parsed.block].filter(value => value !== undefined).join(" · ");
+    const excerpt = typeof parsed.content === "string" ? parsed.content.replace(/\s+/g, " ").slice(0, 240)
+      : typeof parsed.excerpt === "string" ? parsed.excerpt.replace(/\s+/g, " ").slice(0, 240) : "";
+    digest = [call.name, location, excerpt].filter(Boolean).join("：");
+  } catch { digest = `${call.name} 返回了非 JSON 结果`; }
+  store.saveContextArtifact(sessionId, { cacheKey, kind: call.name, path: sourcePath, sourceHash, content: result, digest });
+  return result;
+}
+
 function compactHistory(messages: Array<{ role: string; content: string }>): ApiMessage[] {
   const recent = messages.slice(-8);
   const older = messages.slice(0, -8);
@@ -813,12 +974,7 @@ function compactHistory(messages: Array<{ role: string; content: string }>): Api
   }
   result.push(...recent.map((message) => ({
     role: message.role as "user" | "assistant",
-    content: (() => {
-      const content = stripDsmlText(message.content, "[工具调用已隐藏]");
-      return content.length > 4_000
-        ? `${content.slice(0, 2_400)}\n[中间内容已压缩；相关正文请从项目文档重新读取]\n${content.slice(-1_200)}`
-        : content;
-    })(),
+    content: stripDsmlText(message.content, "[工具调用已隐藏]"),
   })));
   return result;
 }
@@ -828,7 +984,13 @@ function compactRuntimeMessages(messages: ApiMessage[]): void {
   for (const index of toolIndexes.slice(0, -3)) {
     const message = messages[index];
     if (message.content && message.content.length > 300) {
-      message.content = JSON.stringify({ status: "工具结果已压缩，需要时请重新读取最小必要范围" });
+      try {
+        const parsed = JSON.parse(message.content) as Record<string, unknown>;
+        message.content = JSON.stringify({ status: "artifact_compacted", path: parsed.path, section: parsed.section,
+          heading: parsed.heading, block: parsed.block, sourceHash: parsed.sourceHash,
+          digest: typeof parsed.content === "string" ? parsed.content.replace(/\s+/g, " ").slice(0, 240) : undefined,
+          message: "完整结果保存在会话工作记忆中；摘要足够时直接继续。" });
+      } catch { message.content = JSON.stringify({ status: "artifact_compacted", message: "完整结果保存在会话工作记忆中。" }); }
     }
   }
 }
@@ -910,6 +1072,20 @@ function executeTool(
       const path = requireString(input.path, "path");
       if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
       const content = project.read(path);
+      const requestedStart = optionalPositiveInteger(input.startLine, "startLine");
+      const requestedEnd = optionalPositiveInteger(input.endLine, "endLine");
+      if ((requestedStart === undefined) !== (requestedEnd === undefined)) throw new Error("startLine 和 endLine 必须同时提供");
+      if (requestedStart !== undefined && requestedEnd !== undefined) {
+        const lines = content.split(/\r?\n/);
+        if (requestedStart > requestedEnd) throw new Error("startLine 不能大于 endLine");
+        if (requestedStart > lines.length) throw new Error(`startLine 超出范围；文档共 ${lines.length} 行`);
+        if (requestedEnd - requestedStart + 1 > 200) throw new Error("单次最多读取 200 行");
+        const actualEnd = Math.min(requestedEnd, lines.length);
+        const selected = lines.slice(requestedStart - 1, actualEnd).join("\n");
+        if (selected.length > 12_000) throw new Error("行范围超过 12000 字符，请缩小读取范围");
+        return JSON.stringify({ path, startLine: requestedStart, endLine: actualEnd, lineCount: lines.length,
+          characters: selected.length, content: selected });
+      }
       const sections = documentSections(content);
       const requestedSection = typeof input.section === "string" ? input.section.trim().replace(/^#{1,6}\s+/, "") : "";
       if (requestedSection || input.lastSection === true) {
@@ -951,7 +1127,51 @@ function executeTool(
       });
     }
     if (call.name === "search_project") {
-      return JSON.stringify(store.search(requireString(input.query, "query"), 8).filter(item => !project.isDocumentHidden(item.path)));
+      const allowedScopes = new Set(["all", "story", "outline", "chapters"]);
+      const allowedModes = new Set(["any", "all", "exact"]);
+      const scope = typeof input.scope === "string" && allowedScopes.has(input.scope) ? input.scope as "all" | "story" | "outline" | "chapters" : "all";
+      const mode = typeof input.mode === "string" && allowedModes.has(input.mode) ? input.mode as "any" | "all" | "exact" : "any";
+      const limit = Math.max(1, Math.min(12, optionalPositiveInteger(input.limit, "limit") ?? 8));
+      const contextLines = typeof input.contextLines === "number" && Number.isFinite(input.contextLines)
+        ? Math.max(0, Math.min(12, Math.round(input.contextLines))) : 2;
+      const pathPrefix = typeof input.pathPrefix === "string" ? input.pathPrefix : undefined;
+      return JSON.stringify({ query: requireString(input.query, "query"), scope, mode,
+        matches: store.search(requireString(input.query, "query"), limit, { scope, mode, contextLines, pathPrefix })
+          .filter(item => !project.isDocumentHidden(item.path)) });
+    }
+    if (call.name === "list_outline_nodes") {
+      const outline = new OutlineStore(project).sync();
+      const type = typeof input.type === "string" ? input.type : undefined;
+      const status = typeof input.status === "string" ? input.status : undefined;
+      return JSON.stringify({ sourcePath: outline.sourcePath, updatedAt: outline.updatedAt, nodes: outline.nodes
+        .filter(node => !type || node.type === type)
+        .filter(node => !status || node.status === status)
+        .map(({ startLine, endLine, level, ...node }) => ({ ...node, lines: [startLine, endLine], level })) });
+    }
+    if (call.name === "get_outline_node") {
+      const outline = new OutlineStore(project);
+      const id = requireString(input.id, "id");
+      return JSON.stringify({ node: outline.node(id), markdown: outline.section(id) });
+    }
+    if (call.name === "validate_outline") return JSON.stringify({ issues: new OutlineStore(project).validate() });
+    if (call.name === "compare_outline_with_draft") {
+      return JSON.stringify(new OutlineStore(project).compareWithDraft(requireString(input.id, "id")));
+    }
+    if (call.name === "propose_outline_patch") {
+      const outline = new OutlineStore(project);
+      const id = requireString(input.id, "id");
+      const nodeSection = outline.section(id);
+      const search = requireString(input.search, "search");
+      const replace = typeof input.replace === "string" ? input.replace : undefined;
+      if (replace === undefined) throw new Error("缺少有效参数：replace");
+      rejectCompressedPlaceholder(search, "search"); rejectCompressedPlaceholder(replace, "replace");
+      if (!nodeSection.includes(search)) throw new Error("search 不在指定大纲节点中；请重新读取节点原文");
+      const content = project.read(outline.sourcePath);
+      const occurrences = countOccurrences(content, search);
+      if (occurrences !== 1) throw new Error(`search 在大纲中出现 ${occurrences} 次，必须唯一`);
+      const proposal = store.createProposal(sessionId, outline.sourcePath, content.replace(search, replace), requireString(input.summary, "summary"));
+      emit({ type: "proposal", proposal });
+      return JSON.stringify({ proposalId: proposal.id, status: proposal.status, nodeId: id, message: "大纲局部修改已等待用户审批" });
     }
     if (call.name === "propose_document") {
       if (project.isDocumentHidden(requireString(input.path, "path"))) throw new Error("文档已对 Agent 屏蔽");

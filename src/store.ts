@@ -91,6 +91,25 @@ export class WriterStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS context_artifacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        cache_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        path TEXT,
+        source_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT NOT NULL,
+        UNIQUE(session_id, cache_key)
+      );
+      CREATE TABLE IF NOT EXISTS session_context (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        active_document TEXT,
+        current_intent TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS character_revisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -109,6 +128,47 @@ export class WriterStore {
     if (!revisionColumns.some(column => column.name === "created_file")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN created_file INTEGER NOT NULL DEFAULT 0");
     }
+  }
+
+  contextArtifact(sessionId: string, cacheKey: string): { id: number; kind: string; path?: string; sourceHash: string; content: string; digest: string } | undefined {
+    const row = this.database.prepare("SELECT id,kind,path,source_hash,content,digest FROM context_artifacts WHERE session_id=? AND cache_key=?")
+      .get(sessionId, cacheKey) as Row | undefined;
+    if (!row) return undefined;
+    this.database.prepare("UPDATE context_artifacts SET last_used_at=? WHERE id=?").run(new Date().toISOString(), Number(row.id));
+    return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), content: String(row.content), digest: String(row.digest),
+      ...(typeof row.path === "string" ? { path: row.path } : {}) };
+  }
+
+  saveContextArtifact(sessionId: string, value: { cacheKey: string; kind: string; path?: string; sourceHash: string; content: string; digest: string }): number {
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO context_artifacts(session_id,cache_key,kind,path,source_hash,content,digest,created_at,last_used_at)
+      VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,cache_key) DO UPDATE SET kind=excluded.kind,path=excluded.path,source_hash=excluded.source_hash,
+      content=excluded.content,digest=excluded.digest,last_used_at=excluded.last_used_at`)
+      .run(sessionId, value.cacheKey, value.kind, value.path ?? null, value.sourceHash, value.content, value.digest, now, now);
+    const row = this.database.prepare("SELECT id FROM context_artifacts WHERE session_id=? AND cache_key=?").get(sessionId, value.cacheKey) as Row;
+    return Number(row.id);
+  }
+
+  recentContextArtifacts(sessionId: string, limit = 6): Array<{ id: number; kind: string; path?: string; sourceHash: string; digest: string }> {
+    return this.database.prepare("SELECT id,kind,path,source_hash,digest FROM context_artifacts WHERE session_id=? ORDER BY last_used_at DESC LIMIT ?")
+      .all(sessionId, limit).map(raw => {
+        const row = raw as Row;
+        return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), digest: String(row.digest),
+          ...(typeof row.path === "string" ? { path: row.path } : {}) };
+      });
+  }
+
+  sessionContext(sessionId: string): { activeDocument?: string; currentIntent: string } {
+    const row = this.database.prepare("SELECT active_document,current_intent FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
+    return { currentIntent: typeof row?.current_intent === "string" ? row.current_intent : "",
+      ...(typeof row?.active_document === "string" ? { activeDocument: row.active_document } : {}) };
+  }
+
+  saveSessionContext(sessionId: string, value: { activeDocument?: string; currentIntent: string }): void {
+    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET active_document=COALESCE(excluded.active_document,session_context.active_document),
+      current_intent=excluded.current_intent,updated_at=excluded.updated_at`)
+      .run(sessionId, value.activeDocument ?? null, value.currentIntent, new Date().toISOString());
   }
 
   writingDraft(sessionId: string): { mode: string; instruction: string; path?: string; selection?: string; draft: string } | undefined {
@@ -608,11 +668,25 @@ export class WriterStore {
     for (const path of this.project.listDocuments()) insert.run(path, this.project.read(path));
   }
 
-  search(query: string, limit = 6): Array<{ path: string; excerpt: string; block?: number; startLine?: number; endLine?: number }> {
-    const terms = query.toLowerCase().match(/[a-z0-9_]{2,}|[\p{Script=Han}]{2,}/gu)?.slice(0, 8) ?? [];
+  search(query: string, limit = 6, options: {
+    pathPrefix?: string; scope?: "all" | "story" | "outline" | "chapters";
+    mode?: "any" | "all" | "exact"; contextLines?: number;
+  } = {}): Array<{ path: string; excerpt: string; block?: number; heading?: string; startLine?: number; endLine?: number }> {
+    const normalizedQuery = query.trim().toLowerCase();
+    const terms = normalizedQuery.match(/[a-z0-9_]{2,}|[\p{Script=Han}]{2,}/gu)?.slice(0, 8) ?? [];
     if (!terms.length) return [];
-    const expression = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+    const mode = options.mode ?? "any";
+    const expressionTerms = mode === "exact" ? [normalizedQuery] : terms;
+    const expression = expressionTerms.map((term) => `"${term.replaceAll('"', '""')}"`).join(mode === "all" ? " AND " : " OR ");
     const results = new Map<string, { path: string; excerpt: string }>();
+    const matchesPath = (path: string) => {
+      const prefix = options.pathPrefix?.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+      if (prefix && path !== prefix && !path.startsWith(`${prefix}/`)) return false;
+      if (options.scope === "story" && !path.startsWith("story/")) return false;
+      if (options.scope === "outline" && !/(?:^|\/)(?:outline|大纲)[^/]*\.md$/i.test(path)) return false;
+      if (options.scope === "chapters" && !path.startsWith("chapters/")) return false;
+      return true;
+    };
     try {
       const rows = this.database.prepare(`
         SELECT path, snippet(document_index, 1, '【', '】', '…', 24) AS excerpt
@@ -620,7 +694,7 @@ export class WriterStore {
       `).all(expression, limit);
       for (const row of rows) {
         const item = row as Row;
-        results.set(item.path as string, { path: item.path as string, excerpt: item.excerpt as string });
+        if (matchesPath(item.path as string)) results.set(item.path as string, { path: item.path as string, excerpt: item.excerpt as string });
       }
     } catch { /* 中文连续文本可能无法被默认分词器解析，继续使用正文回退检索。 */ }
 
@@ -641,7 +715,9 @@ export class WriterStore {
           }
           return { path: item.path as string, content, score, position };
         })
-        .filter((item) => item.score > 0 && !results.has(item.path))
+        .filter((item) => item.score > 0 && !results.has(item.path) && matchesPath(item.path))
+        .filter((item) => mode !== "exact" || item.content.toLowerCase().includes(normalizedQuery))
+        .filter((item) => mode !== "all" || terms.every(term => item.content.toLowerCase().includes(term)))
         .sort((a, b) => b.score - a.score || a.position - b.position)
         .slice(0, limit - results.size);
       for (const item of fallbackRows) {
@@ -656,12 +732,26 @@ export class WriterStore {
       const lower = content.toLowerCase();
       const positions = searchFragments(terms).map((term) => lower.indexOf(term)).filter((index) => index >= 0);
       if (!positions.length) return item;
-      const position = Math.min(...positions);
-      const startLine = content.slice(0, position).split(/\r?\n/).length;
-      const excerptLines = item.excerpt.split(/\r?\n/).length;
-      return { ...item, block: blockAtOffset(documentBlocks(content), content, position), startLine, endLine: startLine + Math.max(0, excerptLines - 1) };
+      const position = mode === "exact" ? lower.indexOf(normalizedQuery) : Math.min(...positions);
+      const matchLine = content.slice(0, position).split(/\r?\n/).length;
+      const lines = content.split(/\r?\n/);
+      const contextLines = Math.max(0, Math.min(12, Math.round(options.contextLines ?? 2)));
+      const startLine = Math.max(1, matchLine - contextLines);
+      const endLine = Math.min(lines.length, matchLine + contextLines);
+      const excerpt = lines.slice(startLine - 1, endLine).join("\n");
+      const heading = headingAtLine(lines, matchLine);
+      return { path: item.path, excerpt, block: blockAtOffset(documentBlocks(content), content, position),
+        ...(heading ? { heading } : {}), startLine, endLine };
     });
   }
+}
+
+function headingAtLine(lines: string[], line: number): string | undefined {
+  for (let index = Math.min(line - 1, lines.length - 1); index >= 0; index -= 1) {
+    const match = /^#{1,6}\s+(.+?)\s*$/.exec(lines[index]);
+    if (match) return match[1].replace(/\s+#+\s*$/, "").trim();
+  }
+  return undefined;
 }
 
 function searchFragments(terms: string[]): string[] {

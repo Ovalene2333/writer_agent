@@ -136,6 +136,43 @@ export interface WritingExample {
   updatedAt: string;
 }
 
+export type OutlineNodeType = "act" | "chapter" | "scene";
+export type OutlineNodeStatus = "idea" | "planned" | "drafted" | "diverged";
+
+export interface OutlineNode {
+  id: string;
+  parentId?: string;
+  type: OutlineNodeType;
+  title: string;
+  summary: string;
+  cause: string;
+  action: string;
+  outcome: string;
+  stateChange: string;
+  povCharacterId?: number;
+  characterIds: number[];
+  location: string;
+  time: string;
+  plotlines: string[];
+  setups: string[];
+  payoffs: string[];
+  status: OutlineNodeStatus;
+  documentPath?: string;
+  documentHeading?: string;
+  level: number;
+  order: number;
+  startLine: number;
+  endLine: number;
+}
+
+export interface OutlineSnapshot {
+  schemaVersion: 1;
+  sourcePath: string;
+  sourceHash: string;
+  updatedAt: string;
+  nodes: OutlineNode[];
+}
+
 export interface Proposal {
   id: number;
   sessionId: string;
