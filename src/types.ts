@@ -99,19 +99,32 @@ export interface Message {
 }
 
 export interface Character {
+  schemaVersion: 2;
   id: number;
   name: string;
   aliases: string[];
-  role: string;
+  narrativeRole: string;
+  identity: string;
   appearance: string;
-  traits: string;
+  personality: string;
+  values: string;
+  speechStyle: string;
   background: string;
-  goals: string;
-  relationships: string;
-  relatedCharacterIds: number[];
-  abilities: string;
+  longTermGoal: string;
+  currentGoal: string;
+  fears: string;
+  capabilities: string;
+  limitations: string;
+  relationships: CharacterRelationship[];
   notes: string;
   updatedAt: string;
+}
+
+export interface CharacterRelationship {
+  characterId: number;
+  type: string;
+  description: string;
+  attitude: string;
 }
 
 export interface WritingExample {

@@ -46,6 +46,7 @@ export class WriterProject {
     project.writeRaw("story/bible.md", "# 故事设定\n\n");
     project.writeRaw("story/outline.md", "# 故事大纲\n\n");
     project.writeRaw("chapters/chapter-001.md", "# 第一章\n\n");
+    project.writeCharacterCardsJsonl("");
     return project;
   }
 
@@ -315,6 +316,24 @@ export class WriterProject {
     return readdirSync(this.charactersDir, { withFileTypes: true })
       .filter(entry => entry.isFile() && extname(entry.name).toLowerCase() === ".json")
       .map(entry => entry.name).sort();
+  }
+
+  readCharacterCardsJsonl(): string {
+    const target = resolve(this.charactersDir, "characters.jsonl");
+    return existsSync(target) ? readFileSync(target, "utf8") : "";
+  }
+
+  writeCharacterCardsJsonl(content: string): void {
+    mkdirSync(this.charactersDir, { recursive: true });
+    const target = resolve(this.charactersDir, "characters.jsonl");
+    const temporary = `${target}.writer-tmp-${process.pid}`;
+    writeFileSync(temporary, content, "utf8");
+    try { renameSync(temporary, target); }
+    catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM") throw error;
+      writeFileSync(target, content, "utf8");
+      try { unlinkSync(temporary); } catch { /* 临时文件不影响角色数据。 */ }
+    }
   }
 
   readCharacterCard(file: string): string {

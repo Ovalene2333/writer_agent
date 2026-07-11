@@ -134,10 +134,12 @@ export async function startWriterServer(options: {
       hiddenFolders: options.project.hiddenFolders(),
       sessions: options.store.listSessions(),
       sessionId,
-      messages: options.store.messages(sessionId, 50).map(message => ({
-        ...message,
-        content: stripDsmlText(message.content, "[工具调用已隐藏]"),
-      })),
+      messages: options.store.messages(sessionId, 50)
+        .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
+        .map(message => ({
+          ...message,
+          content: stripDsmlText(message.content, "[工具调用已隐藏]"),
+        })),
       proposals: options.store.proposals(),
       characters: options.store.characters(),
       examples: options.store.writingExamples(),
@@ -287,17 +289,19 @@ export async function startWriterServer(options: {
   app.post("/api/characters", async (context) => {
     try {
       const body = await context.req.json<{
-        id?: number; name: string; aliases?: string[]; role?: string; appearance?: string;
-        traits?: string; background?: string; goals?: string; relationships?: string; relatedCharacterIds?: number[]; abilities?: string; notes?: string;
+        id?: number; name: string; aliases?: string[]; narrativeRole?: string; identity?: string; appearance?: string;
+        personality?: string; values?: string; speechStyle?: string; background?: string; longTermGoal?: string; currentGoal?: string;
+        fears?: string; capabilities?: string; limitations?: string;
+        relationships?: Array<{ characterId: number; type: string; description: string; attitude: string }>; notes?: string;
       }>();
       if (body.name?.length > 120) throw new Error("角色名称过长");
       return context.json({ character: options.store.saveCharacter({
-        id: body.id, name: body.name ?? "", aliases: Array.isArray(body.aliases) ? body.aliases : [],
-        role: body.role ?? "", appearance: body.appearance ?? "",
-        traits: body.traits ?? "", background: body.background ?? "",
-        goals: body.goals ?? "", relationships: body.relationships ?? "",
-        relatedCharacterIds: Array.isArray(body.relatedCharacterIds) ? body.relatedCharacterIds : [],
-        abilities: body.abilities ?? "", notes: body.notes ?? "",
+        schemaVersion: 2, id: body.id, name: body.name ?? "", aliases: Array.isArray(body.aliases) ? body.aliases : [],
+        narrativeRole: body.narrativeRole ?? "", identity: body.identity ?? "", appearance: body.appearance ?? "",
+        personality: body.personality ?? "", values: body.values ?? "", speechStyle: body.speechStyle ?? "",
+        background: body.background ?? "", longTermGoal: body.longTermGoal ?? "", currentGoal: body.currentGoal ?? "",
+        fears: body.fears ?? "", capabilities: body.capabilities ?? "", limitations: body.limitations ?? "",
+        relationships: Array.isArray(body.relationships) ? body.relationships : [], notes: body.notes ?? "",
       }) });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });

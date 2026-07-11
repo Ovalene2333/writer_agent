@@ -4,6 +4,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
 import process from "node:process";
 import { Command } from "commander";
+import QRCode from "qrcode";
 import { runAgent } from "./agent.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -162,16 +163,40 @@ function startShareTunnel(port: number, token: string): ChildProcessWithoutNullS
   const tunnel = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
     windowsHide: true,
     stdio: "pipe",
+    env: {
+      ...process.env,
+      TUNNEL_TRANSPORT_PROTOCOL: process.env.WRITER_TUNNEL_PROTOCOL || "http2",
+    },
   });
   let printed = false;
+  let publicUrl = "";
+  let outputBuffer = "";
+  let readinessTimer: NodeJS.Timeout | undefined;
+  const printAccess = () => {
+    if (printed || !publicUrl) return;
+    printed = true;
+    if (readinessTimer) clearTimeout(readinessTimer);
+    process.stdout.write(`公网访问：${publicUrl}\n`);
+    void QRCode.toString(publicUrl, { type: "terminal", small: true })
+      .then(qr => {
+        process.stdout.write(qr);
+        process.stdout.write("注意：这个地址会暴露你的写作工作台。只发给自己可信设备，结束终端进程后隧道会关闭。\n");
+      })
+      .catch(() => process.stdout.write("二维码生成失败，请直接复制上方公网地址。\n"));
+  };
   const handleOutput = (chunk: Buffer) => {
     const text = chunk.toString("utf8");
-    const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-    if (match && !printed) {
-      printed = true;
-      process.stdout.write(`公网访问：${match[0]}/#token=${token}\n`);
-      process.stdout.write("注意：这个地址会暴露你的写作工作台。只发给自己可信设备，结束终端进程后隧道会关闭。\n");
+    outputBuffer = `${outputBuffer}${text}`.slice(-16_000);
+    const match = outputBuffer.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+    if (match && !publicUrl) {
+      publicUrl = `${match[0]}/#token=${token}`;
+      process.stdout.write("公网地址已分配，正在等待隧道连接就绪...\n");
+      readinessTimer = setTimeout(() => {
+        if (!printed) process.stderr.write("公网隧道尚未连接到 Cloudflare；暂不显示二维码，以免访问时出现 Error 1033。请检查下方 cloudflared 错误或网络防火墙。\n");
+      }, 15_000);
     }
+    if (/Registered tunnel connection/i.test(outputBuffer)) printAccess();
+    if (/\bERR\b|failed to connect|Unable to establish connection/i.test(text)) process.stderr.write(text);
   };
   tunnel.stdout.on("data", handleOutput);
   tunnel.stderr.on("data", handleOutput);
@@ -180,9 +205,8 @@ function startShareTunnel(port: number, token: string): ChildProcessWithoutNullS
     process.stderr.write("请先安装 Cloudflare Tunnel 客户端，或改用 `writer web --lan` 只在局域网访问。\n");
   });
   tunnel.once("exit", (code) => {
-    if (!printed && code !== 0) {
-      process.stderr.write("cloudflared 隧道未成功创建。请确认 cloudflared 已安装且网络可访问 Cloudflare。\n");
-    }
+    if (readinessTimer) clearTimeout(readinessTimer);
+    if (!printed) process.stderr.write(`cloudflared 隧道未成功连接或已提前退出（代码 ${code ?? "未知"}）。请确认 cloudflared 已更新、网络可访问 Cloudflare，且 ~/.cloudflared/config.yaml 未干扰 Quick Tunnel。\n`);
   });
   return tunnel;
 }

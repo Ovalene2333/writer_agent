@@ -16,6 +16,7 @@ export class WriterStore {
     this.database = new DatabaseSync(resolve(project.privateDir, "writer.db"));
     this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
     this.migrate();
+    this.migrateCharacterCardsToJsonl();
     this.reindex();
   }
 
@@ -132,9 +133,10 @@ export class WriterStore {
   }
 
   characters(): Character[] {
-    return this.project.listCharacterCardFiles().flatMap(file => {
+    return this.project.readCharacterCardsJsonl().split(/\r?\n/).flatMap(line => {
+      if (!line.trim()) return [];
       try {
-        const parsed = JSON.parse(this.project.readCharacterCard(file)) as Character;
+        const parsed = JSON.parse(line) as Character;
         return [this.normalizeCharacter(parsed)];
       } catch { return []; }
     }).sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
@@ -144,25 +146,29 @@ export class WriterStore {
     const name = input.name.trim();
     if (!name) throw new Error("角色名称不能为空");
     const characters = this.characters();
-    const existing = input.id ? this.characterEntry(input.id) : undefined;
-    const id = existing?.character.id ?? Math.max(0, ...characters.map(item => item.id)) + 1;
+    const existing = input.id ? characters.find(item => item.id === input.id) : undefined;
+    const id = existing?.id ?? Math.max(0, ...characters.map(item => item.id)) + 1;
     const availableIds = new Set(characters.map(item => item.id));
-    const relatedCharacterIds = [...new Set(input.relatedCharacterIds)]
-      .filter(value => Number.isInteger(value) && value !== id && availableIds.has(value));
+    const relationships = input.relationships.filter((item, index, all) =>
+      Number.isInteger(item.characterId) && item.characterId !== id && availableIds.has(item.characterId)
+      && all.findIndex(candidate => candidate.characterId === item.characterId) === index,
+    ).map(item => ({
+      characterId: item.characterId,
+      type: item.type.trim(),
+      description: item.description.trim(),
+      attitude: item.attitude.trim(),
+    }));
     const character: Character = {
+      schemaVersion: 2,
       id, name, aliases: input.aliases.map(value => value.trim()).filter(Boolean).slice(0, 20),
-      role: input.role.trim(), appearance: input.appearance.trim(), traits: input.traits.trim(),
-      background: input.background.trim(), goals: input.goals.trim(),
-      relationships: input.relationships.trim(), relatedCharacterIds, abilities: input.abilities.trim(),
+      narrativeRole: input.narrativeRole.trim(), identity: input.identity.trim(), appearance: input.appearance.trim(),
+      personality: input.personality.trim(), values: input.values.trim(), speechStyle: input.speechStyle.trim(),
+      background: input.background.trim(), longTermGoal: input.longTermGoal.trim(), currentGoal: input.currentGoal.trim(),
+      fears: input.fears.trim(), capabilities: input.capabilities.trim(), limitations: input.limitations.trim(), relationships,
       notes: input.notes.trim(),
       updatedAt: new Date().toISOString(),
     };
-    const base = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "-").replace(/[. ]+$/g, "").slice(0, 80) || `角色-${id}`;
-    const preferred = `${base}.json`;
-    const occupied = this.project.listCharacterCardFiles().find(file => file.toLowerCase() === preferred.toLowerCase() && file !== existing?.file);
-    const file = occupied ? `${base}-${id}.json` : preferred;
-    this.project.writeCharacterCard(file, `${JSON.stringify(character, null, 2)}\n`);
-    if (existing && existing.file !== file) this.project.removeCharacterCard(existing.file);
+    this.writeCharacters([...characters.filter(item => item.id !== id), character]);
     return character;
   }
 
@@ -171,29 +177,26 @@ export class WriterStore {
     messageId: number,
     input: Omit<Character, "id" | "updatedAt"> & { id?: number },
   ): Character {
-    const before = input.id ? this.characterEntry(input.id) : undefined;
-    const beforeContent = before ? this.project.readCharacterCard(before.file) : null;
+    const before = input.id ? this.characters().find(item => item.id === input.id) : undefined;
+    const beforeContent = before ? JSON.stringify(before) : null;
     const character = this.saveCharacter(input);
-    const after = this.characterEntry(character.id);
-    if (!after) throw new Error("角色卡保存后无法读取");
-    const afterContent = this.project.readCharacterCard(after.file);
+    const afterContent = JSON.stringify(character);
     this.database.prepare(`INSERT INTO character_revisions(
       session_id,message_id,character_id,before_file,after_file,before_content,after_content,created_at
     ) VALUES(?,?,?,?,?,?,?,?)`).run(
-      sessionId, messageId, character.id, before?.file ?? null, after.file,
+      sessionId, messageId, character.id, before ? "characters.jsonl" : null, "characters.jsonl",
       beforeContent, afterContent, new Date().toISOString(),
     );
     return character;
   }
 
   deleteCharacter(id: number): void {
-    const entry = this.characterEntry(id);
-    if (!entry) throw new Error("角色不存在");
-    for (const character of this.characters()) {
-      if (character.id === id || !character.relatedCharacterIds.includes(id)) continue;
-      this.saveCharacter({ ...character, relatedCharacterIds: character.relatedCharacterIds.filter(value => value !== id) });
-    }
-    this.project.removeCharacterCard(entry.file);
+    const characters = this.characters();
+    if (!characters.some(item => item.id === id)) throw new Error("角色不存在");
+    this.writeCharacters(characters.filter(item => item.id !== id).map(character => ({
+      ...character,
+      relationships: character.relationships.filter(item => item.characterId !== id),
+    })));
   }
 
   writingExamples(): WritingExample[] {
@@ -236,27 +239,60 @@ export class WriterStore {
     return this.characters().find(item => String(item.id) === normalized || item.name.toLowerCase() === normalized || item.aliases.some(alias => alias.toLowerCase() === normalized));
   }
 
-  private characterEntry(id: number): { file: string; character: Character } | undefined {
-    for (const file of this.project.listCharacterCardFiles()) {
-      try {
-        const character = this.normalizeCharacter(JSON.parse(this.project.readCharacterCard(file)) as Character);
-        if (character.id === id) return { file, character };
-      } catch { /* 跳过损坏的角色卡，避免阻断其他卡片。 */ }
+  private writeCharacters(characters: Character[]): void {
+    const content = [...characters].sort((a, b) => a.id - b.id).map(character => JSON.stringify(character)).join("\n");
+    this.project.writeCharacterCardsJsonl(content ? `${content}\n` : "");
+  }
+
+  private migrateCharacterCardsToJsonl(): void {
+    const jsonl = this.project.readCharacterCardsJsonl();
+    if (jsonl.trim()) {
+      const lines = jsonl.split(/\r?\n/).filter(line => line.trim());
+      const characters: Character[] = [];
+      for (const line of lines) {
+        try { characters.push(this.normalizeCharacter(JSON.parse(line) as Character)); }
+        catch { return; }
+      }
+      this.writeCharacters(characters);
+      return;
     }
-    return undefined;
+    const files = this.project.listCharacterCardFiles();
+    if (!files.length) return;
+    const characters = files.flatMap(file => {
+      try { return [this.normalizeCharacter(JSON.parse(this.project.readCharacterCard(file)) as Character)]; }
+      catch { return []; }
+    });
+    if (!characters.length) return;
+    this.writeCharacters(characters);
+    for (const file of files) this.project.removeCharacterCard(file);
   }
 
   private normalizeCharacter(input: Character): Character {
+    const legacy = input as unknown as Record<string, unknown>;
     if (!Number.isInteger(input.id) || !String(input.name ?? "").trim()) throw new Error("角色卡格式无效");
+    const legacyRelatedIds = Array.isArray(legacy.relatedCharacterIds) ? legacy.relatedCharacterIds.map(Number) : [];
+    const relationships = Array.isArray(input.relationships)
+      ? input.relationships.flatMap(item => item && typeof item === "object" && Number.isInteger(Number(item.characterId))
+        ? [{ characterId: Number(item.characterId), type: String(item.type ?? ""), description: String(item.description ?? ""), attitude: String(item.attitude ?? "") }]
+        : [])
+      : legacyRelatedIds.filter(Number.isInteger).map(characterId => ({
+        characterId,
+        type: "",
+        description: typeof legacy.relationships === "string" ? legacy.relationships : "",
+        attitude: "",
+      }));
     return {
+      schemaVersion: 2,
       id: input.id, name: String(input.name), aliases: Array.isArray(input.aliases) ? input.aliases.map(String) : [],
-      role: String(input.role ?? ""), appearance: String(input.appearance ?? ""),
-      traits: String(input.traits ?? ""), background: String(input.background ?? ""),
-      goals: String(input.goals ?? ""), relationships: String(input.relationships ?? ""),
-      relatedCharacterIds: Array.isArray(input.relatedCharacterIds)
-        ? input.relatedCharacterIds.map(Number).filter(value => Number.isInteger(value) && value !== input.id)
-        : [],
-      abilities: String(input.abilities ?? ""), notes: String(input.notes ?? ""),
+      narrativeRole: String(input.narrativeRole ?? legacy.role ?? ""), identity: String(input.identity ?? ""),
+      appearance: String(input.appearance ?? ""), personality: String(input.personality ?? legacy.traits ?? ""),
+      values: String(input.values ?? ""), speechStyle: String(input.speechStyle ?? ""), background: String(input.background ?? ""),
+      longTermGoal: String(input.longTermGoal ?? legacy.goals ?? ""), currentGoal: String(input.currentGoal ?? ""),
+      fears: String(input.fears ?? ""), capabilities: String(input.capabilities ?? legacy.abilities ?? ""),
+      limitations: String(input.limitations ?? ""),
+      relationships: relationships.filter(item => item.characterId !== input.id),
+      notes: [String(input.notes ?? ""), !legacyRelatedIds.length && typeof legacy.relationships === "string" && legacy.relationships.trim()
+        ? `[旧版关系说明] ${legacy.relationships.trim()}` : ""].filter(Boolean).join("\n"),
       updatedAt: String(input.updatedAt ?? ""),
     };
   }
@@ -493,17 +529,20 @@ export class WriterStore {
     ).all(sessionId, fromId) as Row[];
     const undoneCharacters: string[] = [];
     for (const row of characterRows) {
-      const afterFile = row.after_file as string;
-      if (!this.project.listCharacterCardFiles().includes(afterFile)) continue;
-      const current = this.project.readCharacterCard(afterFile);
-      if (current !== row.after_content) continue;
-      this.project.removeCharacterCard(afterFile);
-      const beforeFile = row.before_file as string | null;
-      if (beforeFile && typeof row.before_content === "string") {
-        this.project.writeCharacterCard(beforeFile, row.before_content);
+      let after: Character;
+      try { after = this.normalizeCharacter(JSON.parse(row.after_content as string) as Character); }
+      catch { continue; }
+      const characters = this.characters();
+      const current = characters.find(item => item.id === after.id);
+      if (!current || JSON.stringify(current) !== JSON.stringify(after)) continue;
+      let restored = characters.filter(item => item.id !== after.id);
+      if (typeof row.before_content === "string") {
+        try { restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character)); }
+        catch { continue; }
       }
+      this.writeCharacters(restored);
       this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(row.id as number);
-      undoneCharacters.push((JSON.parse(row.after_content as string) as Character).name);
+      undoneCharacters.push(after.name);
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);

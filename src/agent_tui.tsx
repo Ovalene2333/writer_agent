@@ -155,7 +155,7 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
       } else if (name === "usage") append(`输入 ${usage.promptTokens.toLocaleString()} · 输出 ${usage.completionTokens.toLocaleString()} · 缓存命中 ${usage.cacheHitTokens.toLocaleString()} · 总计 ${usage.totalTokens.toLocaleString()} Token · ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`);
       else if (name === "character") {
         const command = parseCharacterCommand(args);
-        if (command.action === "list") append(props.store.characters().map(item => `${item.id}  ${item.name}  ${item.role}`).join("\n") || "characters/ 目录中没有角色卡");
+        if (command.action === "list") append(props.store.characters().map(item => `${item.id}  ${item.name}  ${item.narrativeRole}`).join("\n") || "characters/ 目录中没有角色卡");
         else if (command.action === "show") {
           const item = props.store.findCharacter(command.values.join(" "));
           if (!item) throw new Error("找不到角色卡");
@@ -163,7 +163,7 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
         } else if (command.action === "create") {
           const [characterName, role = "", description = ""] = command.values;
           if (!characterName) throw new Error("用法：/character create 姓名 | 定位 | 性格、背景和目标");
-          props.store.saveCharacter({ name: characterName, aliases: [], role, appearance: "", traits: description, background: "", goals: "", relationships: "", relatedCharacterIds: [], abilities: "", notes: "" });
+          props.store.saveCharacter({ schemaVersion: 2, name: characterName, aliases: [], narrativeRole: role, identity: "", appearance: "", personality: description, values: "", speechStyle: "", background: "", longTermGoal: "", currentGoal: "", fears: "", capabilities: "", limitations: "", relationships: [], notes: "" });
           append(`已创建角色卡：characters/${characterName}.json`);
         } else if (command.action === "delete") {
           const item = props.store.findCharacter(command.values.join(" "));

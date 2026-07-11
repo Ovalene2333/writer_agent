@@ -1,8 +1,8 @@
-import type { AgentEvent, ModelConfig } from "./types.js";
+import type { AgentEvent, Character, ModelConfig } from "./types.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import { documentBlocks } from "./document_blocks.js";
+import { documentBlocks, documentSections } from "./document_blocks.js";
 import { contrastStyleError } from "./prose_quality.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 
@@ -34,6 +34,7 @@ interface WritingTask {
   documentContext: DocumentContextMode;
   documentProposalRequired: boolean;
   continuation: boolean;
+  targetPath?: string;
 }
 
 const TOOLS = [
@@ -62,12 +63,14 @@ const TOOLS = [
     type: "function",
     function: {
       name: "read_document",
-      description: "按自然边界读取 Markdown 文档块。块优先在标题、段落和完整句子之间分隔，不会按字符硬截断。先用 inspect_document 获取块数",
+      description: "按 Markdown 标题节或自然边界块读取文档。可用 section 指定标题、用 lastSection 读取最后一节；没有合适标题时再按 block 读取。先用 inspect_document 查看结构",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "项目内相对路径" },
           block: { type: "number", description: "块编号，1 开始；默认读取第 1 块" },
+          section: { type: "string", description: "按 Markdown 标题读取一节；填写 inspect_document 返回的标题文字（不含 #）" },
+          lastSection: { type: "boolean", description: "读取文档最后一个 Markdown 标题节；续写时优先使用" },
         },
         required: ["path"],
         additionalProperties: false,
@@ -145,6 +148,25 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "get_character",
+      description: "按 ID 读取角色卡。写作时用 fields 选择必要字段以节省上下文；修改角色卡时省略 fields 读取完整卡片",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "number", description: "角色 ID；先调用 list_characters 获取" },
+          fields: { type: "array", description: "只读取本次任务需要的字段；省略则读取完整角色卡", items: { type: "string", enum: [
+            "aliases", "narrativeRole", "identity", "appearance", "personality", "values", "speechStyle", "background",
+            "longTermGoal", "currentGoal", "fears", "capabilities", "limitations", "relationships", "notes",
+          ] } },
+        },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "save_character",
       description: "创建或更新角色卡（结构化 JSON，存入 characters/ 目录）。修改已有角色时必须传入 id，否则会创建新角色。先 list_characters 获取角色 ID 和名称，再用此工具创建或更新",
       parameters: {
@@ -152,15 +174,22 @@ const TOOLS = [
         properties: {
           id: { type: "number", description: "要更新的角色 ID（修改已有角色时必填，新建角色时省略）" },
           name: { type: "string", description: "角色姓名（必填）" },
-          role: { type: "string", description: "角色定位，如『主角』、『反派』" },
+          narrativeRole: { type: "string", description: "叙事定位，如主角、配角、反派" },
+          identity: { type: "string", description: "职业、社会身份或阵营身份" },
           aliases: { type: "array", items: { type: "string" }, description: "别名、称号" },
           appearance: { type: "string", description: "外观服饰：身高体型、面容特征、衣着风格" },
-          traits: { type: "string", description: "性格特征" },
+          personality: { type: "string", description: "稳定的性格与行为倾向" },
+          values: { type: "string", description: "价值观、原则与底线" },
+          speechStyle: { type: "string", description: "措辞、语气、口头习惯和说话节奏" },
           background: { type: "string", description: "背景故事" },
-          goals: { type: "string", description: "目标与动机" },
-          relationships: { type: "string", description: "与其他角色的关系" },
-          relatedCharacterIds: { type: "array", items: { type: "number" }, description: "关联的已有角色 ID；先调用 list_characters 获取 ID，可关联多个角色" },
-          abilities: { type: "string", description: "角色能力，如特殊技能、战斗技巧、魔法、超能力等" },
+          longTermGoal: { type: "string", description: "长期欲望或最终目标" },
+          currentGoal: { type: "string", description: "当前阶段正在争取的具体目标" },
+          fears: { type: "string", description: "恐惧、软肋或极力避免的结果" },
+          capabilities: { type: "string", description: "技能、知识、能力和可支配资源" },
+          limitations: { type: "string", description: "能力边界、缺陷、代价和现实限制" },
+          relationships: { type: "array", description: "与已有角色的结构化关系；先用 list_characters 获取 ID", items: { type: "object", properties: {
+            characterId: { type: "number" }, type: { type: "string" }, description: { type: "string" }, attitude: { type: "string" },
+          }, required: ["characterId", "type", "description", "attitude"], additionalProperties: false } },
           notes: { type: "string", description: "补充说明" },
         },
         required: ["name"],
@@ -342,19 +371,19 @@ function executionRulesPrompt(): string {
 2. 修改已有文档时优先调用 propose_document_patch 提交局部搜索替换；propose_document 只用于新建文档或全文重写。提案不会直接写入，作者可审批或拒绝。
 2.1 凡用户要求写正文、续写、继续写、扩写或改写，必须以 propose_document 或 propose_document_patch 提交到目标 Markdown 文档。禁止只在最终回复中粘贴正文来代替文档提案；最终回复只能简要说明已提交的内容。
 2.2 用户用"继续""接着写""往下写"等短指令承接上一轮写作时，默认继续上一轮目标文档。先读取目标文档末尾的必要范围，再提交追加或替换提案；无法确定目标文件时应先询问，不得直接输出正文。
-3. 保持既有人物、世界观、叙事视角和 Markdown 结构，除非作者明确要求改变。
+3. 保持既有人物、世界观、叙事视角和 Markdown 结构，除非作者明确要求改变。写入正文、大纲或设定时使用常见 Markdown 标记组织结构：用 #/##/### 表示章、节和场景层级，必要时使用 *强调*、列表或分隔线；标题应简短稳定，便于浏览跳转和按节读取。不要为每个自然段添加标题。
 4. 信息不足时，必须调用 ask_user 工具提出简短、具体的问题，不擅自补充关键设定。调用 ask_user 后本轮不得再调用其他工具；等待用户回复后再继续执行。但对于写作本身（情节走向、对白、描写等），直接给出具体内容，不要停留在建议层面。
 5. 当有多个合理的写作方向时，必须调用 ask_user 工具的 options 参数以简洁编号列出选项（每个选项 ≤ 20 字），等候作者选择，不自己决定方向。调用 ask_user 后本轮停止，等待用户回复后按选定方向继续。
 6. 提交文档提案（propose_document 或 propose_document_patch）后本轮立即停止，不继续调用其他工具或自行追加正文。等待用户审批提案后再继续。
 7. 不输出工具调用的内部参数，不使用项目范围外的信息。
-8. 回复默认使用自然、简洁的纯文本。只有层级结构确实有助于阅读时才使用 Markdown；避免滥用标题、粗体、列表和代码块。创作正文不得为每段添加标题或项目符号。
-9. 管理角色必须使用 save_character。修改已有角色时先 list_characters 获取 ID，并传入 id 更新；不要重复创建角色卡。
+8. 对话回复默认使用自然、简洁的纯文本。文档创作应使用适量 Markdown 结构标记，但避免滥用标题、粗体、列表和代码块；小说正文不得为每个自然段添加标题或项目符号。
+9. 管理角色必须使用 save_character。创建角色卡时只填写用户已提供或可可靠归纳的字段，未知字段允许留空，不得为了填满表格而虚构设定。修改已有角色时先 list_characters 获取 ID，再用 get_character 读取完整卡片，并传入 id 更新；不得清空未要求修改的字段，也不要重复创建角色卡。写作时需要角色资料，也使用 get_character 的 fields 参数只读取当前场景真正需要的字段，例如对白优先读取 speechStyle，动作描写读取 appearance/capabilities/limitations，人物决策读取 personality/values/currentGoal/fears；不要默认读取整张卡片。
 10. 工具已经返回过的长内容不会永久保留在上下文中。后续需要精确原文时，重新读取最小必要范围，不要求系统恢复整份旧输出。
 11. 历史工具调用中若出现"内容已压缩"的占位文本，它只表示旧正文已从上下文移除；不得把占位文本当作正文、参数名示例或可复用内容。新的 propose_document 必须使用 content 参数提交完整正文；新的 propose_document_patch 必须使用 edits 参数提交真实搜索替换。`;
 }
 
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
-  const references = explicitReferencePaths(project, request);
+  const references = [...new Set([...(task.targetPath ? [task.targetPath] : []), ...explicitReferencePaths(project, request)])];
   const creativeContext = structuredCreativeContext(store, task, characterScope);
   const characterScopeInstruction = characterScope === undefined
     ? "角色资料按任务相关性自动筛选。"
@@ -368,9 +397,11 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
     none: "无需读取项目文档。直接使用当前对话完成任务；不要调用 list_documents、search_project、inspect_document 或 read_document。",
     search: `需要核对项目资料。先调用 search_project，查询：${task.searchQuery || request.slice(0, 120)}。仅在检索片段不足时继续 inspect_document/read_document。`,
     target: `需要读取用户指定或可明确推断的目标文档。${references.length ? `候选路径：${references.join("、")}。` : "先定位目标路径。"}先 inspect_document，再按任务读取最小必要块。`,
-    continuation: `需要承接已有正文。${continuationPath ? `目标路径：${continuationPath}。` : "先从对话和提案记录确定目标路径；无法确定时询问用户。"}只读取文档末尾及维持连续性所需的片段。`,
+    continuation: `需要承接已有正文。${continuationPath ? `目标路径：${continuationPath}。` : "先从对话和提案记录确定目标路径；无法确定时询问用户。"}先 inspect_document 查看标题结构，再用 read_document 的 lastSection=true 读取最后一节；文档没有 Markdown 标题时才读取最后一个自然块。仅补读维持连续性所需的片段。`,
   };
   return `当前任务：${task.label}
+
+当前用户请求是本轮唯一要执行的指令。历史对话只用于理解指代和既有事实，不得把已经完成的旧修改要求自动并入本轮任务。
 
 ${taskInstructions(task.mode)}
 
@@ -397,18 +428,24 @@ async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const documents = project.listDocuments().filter(path => !project.isDocumentHidden(path));
-  const characters = store.characters().map(item => ({ id: item.id, name: item.name, aliases: item.aliases, role: item.role }));
-  const examples = store.writingExamples().map(item => ({ id: item.id, title: item.title, category: item.category, notes: item.notes.slice(0, 160) }));
-  const recent = history.slice(-6).map(item => ({ role: item.role, content: item.content?.slice(0, 800) ?? "" }));
+  const characters = store.characters().map(item => ({ id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity }));
+  const activeStyleId = project.config().style;
+  const activeStyle = activeStyleId ? getStyleTemplate(activeStyleId) : undefined;
+  const examples = store.writingExamples()
+    .filter(item => !item.title.startsWith("[风格模板]") || item.title === `[风格模板] ${activeStyle?.name}`)
+    .map(item => ({ id: item.id, title: item.title, category: item.category, notes: item.notes.slice(0, 160) }));
+  const recent = history.slice(-6).map(item => item.role === "user"
+    ? { content: item.content?.slice(0, 800) ?? "" }
+    : { role: item.role, content: item.content?.slice(0, 800) ?? "" });
   const planningMessages: ApiMessage[] = [{
     role: "system",
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
-字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
-决策原则：先利用当前对话。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
+字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
+决策原则：当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
 文档目录（只有路径，尚未读取正文）：${JSON.stringify(documents)}
 角色目录：${JSON.stringify(characters)}
 范文目录：${JSON.stringify(examples)}
-最近对话：${JSON.stringify(recent)}`,
+历史对话数据：${JSON.stringify(recent)}`,
   }, { role: "user", content: request }];
   const result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, false);
   const firstBrace = result.content.indexOf("{");
@@ -423,6 +460,7 @@ async function planWritingTask(
     : "none";
   const validCharacterIds = new Set(characters.map(item => item.id));
   const validExampleIds = new Set(examples.map(item => item.id));
+  const validDocumentPaths = new Set(documents);
   const continuation = parsed.continuation === true;
   const documentProposalRequired = parsed.documentProposalRequired === true;
   const normalizedDocumentContext = continuation
@@ -438,6 +476,7 @@ async function planWritingTask(
       documentContext: normalizedDocumentContext,
       documentProposalRequired,
       continuation,
+      ...(typeof parsed.targetPath === "string" && validDocumentPaths.has(parsed.targetPath) ? { targetPath: parsed.targetPath } : {}),
     },
     usage: result.usage,
   };
@@ -480,30 +519,9 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
   const selectedCharacters = scopedIds
     ? rankedCharacters.filter(entry => scopedIds.has(entry.item.id))
     : rankedCharacters.filter((entry) => entry.score > 0).slice(0, 4);
-  const characterById = new Map(rankedCharacters.map(entry => [entry.item.id, entry.item]));
-  const selectedIds = new Set(selectedCharacters.map(entry => entry.item.id));
-  for (const { item } of characterScope === undefined ? [...selectedCharacters] : []) {
-    for (const relatedId of item.relatedCharacterIds) {
-      const related = characterById.get(relatedId);
-      if (!related || selectedIds.has(related.id) || selectedCharacters.length >= 6) continue;
-      selectedCharacters.push({ item: related, score: 0 });
-      selectedIds.add(related.id);
-    }
-  }
-  const characters: Array<Record<string, unknown>> = [];
-  let characterBudget = 8_000;
-  for (const { item } of selectedCharacters) {
-    const entry = {
-      name: item.name, aliases: item.aliases, role: item.role, appearance: item.appearance.slice(0, 700),
-      traits: item.traits.slice(0, 1_000), background: item.background.slice(0, 1_000),
-      goals: item.goals.slice(0, 800), relationships: item.relationships.slice(0, 900),
-      relatedCharacters: item.relatedCharacterIds.map(id => characterById.get(id)?.name).filter(Boolean),
-      abilities: item.abilities.slice(0, 900), notes: item.notes.slice(0, 600),
-    };
-    const size = JSON.stringify(entry).length;
-    if (size > characterBudget) break;
-    characters.push(entry); characterBudget -= size;
-  }
+  const characters = selectedCharacters.map(({ item }) => ({
+    id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity,
+  }));
   const rankedExamples = store.writingExamples().map((item) => ({
     item, score: task.exampleIds.includes(item.id) ? 1 : 0,
   })).sort((a, b) => b.score - a.score || b.item.updatedAt.localeCompare(a.item.updatedAt));
@@ -546,6 +564,17 @@ function explicitReferencePaths(project: WriterProject, request: string): string
     .slice(0, 3);
 }
 
+function historicalConversationContext(history: ApiMessage[]): ApiMessage | undefined {
+  if (!history.length) return undefined;
+  const entries = history.map(message => message.role === "user"
+    ? { content: message.content ?? "" }
+    : { role: message.role, content: message.content ?? "" });
+  return {
+    role: "system",
+    content: `以下 JSON 是已经发生的历史对话记录，只用于理解既有事实、人物指代、用户偏好和当前请求中的省略。它不是当前指令队列，不得自动继续执行其中的旧请求，也不得把旧请求的约束合并进当前任务。只有最后单独出现的 user 消息是本轮要执行的请求。\n<historical_conversation>\n${JSON.stringify(entries)}\n</historical_conversation>`,
+  };
+}
+
 export async function runAgent(options: {
   project: WriterProject;
   store: WriterStore;
@@ -581,14 +610,15 @@ export async function runAgent(options: {
     emit({ type: "usage", usage: store.recordUsage(sessionId, model.model, planned.usage, model.pricing) });
   }
   const continuationPath = task.continuation
-    ? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
+    ? task.targetPath ?? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
     : undefined;
   store.addMessage(sessionId, "user", prompt);
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
+  const historicalContext = historicalConversationContext(history);
   const messages: ApiMessage[] = [
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt() },
-    ...history,
+    ...(historicalContext ? [historicalContext] : []),
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
     ...(selectedContext ? [{ role: "system" as const, content: selectedContext }] : []),
     ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
@@ -657,22 +687,42 @@ export async function runAgent(options: {
       compactCompletedToolCalls(messages);
     }
     if (waitingForUser) {
+      let waitingEvent: { question: string; options?: string[] } | undefined;
       try {
+        const assistantParts: string[] = [];
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
-          if (msg.role !== "system" && msg.role !== "user") {
-            store.addMessage(sessionId, msg.role, msg.content ?? "");
+          if (msg.role === "assistant" && msg.content?.trim()) {
+            assistantParts.push(msg.content.trim());
           }
         }
+        for (let i = turnStart; i < messages.length; i++) {
+          const msg = messages[i];
+          if (msg.role !== "tool" || !msg.content) continue;
+          try {
+            const result = JSON.parse(msg.content) as Record<string, unknown>;
+            if (result.status === "waiting" && typeof result.displayMessage === "string" && result.displayMessage.trim()) {
+              assistantParts.push(result.displayMessage.trim());
+              if (typeof result.question === "string") {
+                waitingEvent = {
+                  question: result.question,
+                  ...(Array.isArray(result.options) ? { options: result.options.filter((item): item is string => typeof item === "string") } : {}),
+                };
+              }
+            }
+          } catch { /* 非 ask_user 工具结果无需保存为对话。 */ }
+        }
+        if (assistantParts.length) store.addMessage(sessionId, "assistant", assistantParts.join("\n\n"));
       } catch { /* 消息保存失败不影响流程 */ }
+      if (waitingEvent) emit({ type: "waiting_for_input", sessionId, ...waitingEvent });
       return;
     }
     if (documentProposalSubmitted) {
       try {
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
-          if (msg.role !== "system" && msg.role !== "user") {
-            store.addMessage(sessionId, msg.role, msg.content ?? "");
+          if (msg.role === "assistant" && msg.content?.trim()) {
+            store.addMessage(sessionId, "assistant", msg.content.trim());
           }
         }
       } catch { /* 消息保存失败不影响流程 */ }
@@ -784,7 +834,18 @@ function compactRuntimeMessages(messages: ApiMessage[]): void {
 }
 
 function compactCompletedToolCalls(messages: ApiMessage[]): void {
-  for (const message of messages) {
+  let latestProposalMessage = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && message.tool_calls?.some(call => call.function.name.startsWith("propose_document"))) {
+      latestProposalMessage = index;
+    }
+  }
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    // The newest failed proposal is the model's repair context for the next turn.
+    // Successful proposals exit before this compactor runs.
+    if (index === latestProposalMessage) continue;
     if (message.role !== "assistant" || !message.tool_calls) continue;
     for (const call of message.tool_calls) {
       if (!call.function.name.startsWith("propose_document")) continue;
@@ -849,6 +910,30 @@ function executeTool(
       const path = requireString(input.path, "path");
       if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
       const content = project.read(path);
+      const sections = documentSections(content);
+      const requestedSection = typeof input.section === "string" ? input.section.trim().replace(/^#{1,6}\s+/, "") : "";
+      if (requestedSection || input.lastSection === true) {
+        if (!sections.length) throw new Error("文档没有 Markdown 标题，无法按节读取；请改用 block");
+        const matches = requestedSection
+          ? sections.filter(item => item.heading === requestedSection)
+          : [sections[sections.length - 1]];
+        if (!matches.length) throw new Error(`未找到标题“${requestedSection}”；请先用 inspect_document 查看标题结构`);
+        if (matches.length > 1) throw new Error(`标题“${requestedSection}”出现多次，请改用唯一标题或 block 读取`);
+        const selected = matches[0];
+        return JSON.stringify({
+          path,
+          section: selected.section,
+          sectionCount: sections.length,
+          heading: selected.heading,
+          level: selected.level,
+          startLine: selected.startLine,
+          endLine: selected.endLine,
+          characters: selected.characters,
+          hasPrevious: selected.section > 1,
+          hasNext: selected.section < sections.length,
+          content: selected.content,
+        });
+      }
       const blocks = documentBlocks(content);
       const requestedBlock = optionalPositiveInteger(input.block, "block") ?? 1;
       if (requestedBlock > blocks.length) throw new Error(`block 超出范围；文档共 ${blocks.length} 块`);
@@ -913,25 +998,52 @@ function executeTool(
     if (call.name === "list_characters") {
       const allowedIds = characterScope === undefined ? undefined : new Set(characterScope);
       return JSON.stringify(store.characters().filter(c => !allowedIds || allowedIds.has(c.id)).map((c) => ({
-        id: c.id, name: c.name, role: c.role, aliases: c.aliases,
+        id: c.id, name: c.name, narrativeRole: c.narrativeRole, identity: c.identity, aliases: c.aliases,
         appearance: c.appearance.slice(0, 80),
-        relatedCharacterIds: c.relatedCharacterIds,
+        relationships: c.relationships,
       })));
     }
+    if (call.name === "get_character") {
+      const id = optionalPositiveInteger(input.id, "id");
+      if (!id) throw new Error("缺少有效参数：id");
+      if (characterScope !== undefined && !characterScope.includes(id)) throw new Error("该角色不在用户允许的角色范围内");
+      const character = store.characters().find(item => item.id === id);
+      if (!character) throw new Error("角色不存在");
+      const allowedFields = new Set([
+        "aliases", "narrativeRole", "identity", "appearance", "personality", "values", "speechStyle", "background",
+        "longTermGoal", "currentGoal", "fears", "capabilities", "limitations", "relationships", "notes",
+      ]);
+      const requestedFields = Array.isArray(input.fields)
+        ? [...new Set(input.fields.filter((field): field is string => typeof field === "string" && allowedFields.has(field)))]
+        : [];
+      if (!requestedFields.length) return JSON.stringify(character);
+      const selected: Record<string, unknown> = { id: character.id, name: character.name };
+      const values = character as unknown as Record<string, unknown>;
+      for (const field of requestedFields) selected[field] = values[field];
+      return JSON.stringify(selected);
+    }
     if (call.name === "save_character") {
+      const characterId = typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined;
+      const existing = characterId ? store.characters().find(item => item.id === characterId) : undefined;
+      if (characterId && !existing) throw new Error("要修改的角色不存在");
+      const value = (field: keyof Character, fallback = "") =>
+        typeof input[field] === "string" ? input[field] as string : existing && typeof existing[field] === "string" ? existing[field] as string : fallback;
       const character = store.saveCharacter({
-        id: typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined,
+        id: characterId,
         name: requireString(input.name, "name"),
-        aliases: Array.isArray(input.aliases) ? input.aliases.filter((v): v is string => typeof v === "string") : [],
-        role: typeof input.role === "string" ? input.role : "",
-        appearance: typeof input.appearance === "string" ? input.appearance : "",
-        traits: typeof input.traits === "string" ? input.traits : "",
-        background: typeof input.background === "string" ? input.background : "",
-        goals: typeof input.goals === "string" ? input.goals : "",
-        relationships: typeof input.relationships === "string" ? input.relationships : "",
-        relatedCharacterIds: characterScope ?? (Array.isArray(input.relatedCharacterIds) ? input.relatedCharacterIds.map(Number) : []),
-        abilities: typeof input.abilities === "string" ? input.abilities : "",
-        notes: typeof input.notes === "string" ? input.notes : "",
+        aliases: Array.isArray(input.aliases) ? input.aliases.filter((v): v is string => typeof v === "string") : existing?.aliases ?? [],
+        schemaVersion: 2,
+        narrativeRole: value("narrativeRole"), identity: value("identity"), appearance: value("appearance"),
+        personality: value("personality"), values: value("values"), speechStyle: value("speechStyle"),
+        background: value("background"), longTermGoal: value("longTermGoal"), currentGoal: value("currentGoal"), fears: value("fears"),
+        relationships: Array.isArray(input.relationships) ? input.relationships.flatMap(value => {
+          if (!value || typeof value !== "object") return [];
+          const relation = value as Record<string, unknown>;
+          const characterId = Number(relation.characterId);
+          if (!Number.isInteger(characterId) || (characterScope && !characterScope.includes(characterId))) return [];
+          return [{ characterId, type: String(relation.type ?? ""), description: String(relation.description ?? ""), attitude: String(relation.attitude ?? "") }];
+        }) : existing?.relationships ?? [],
+        capabilities: value("capabilities"), limitations: value("limitations"), notes: value("notes"),
       });
       return JSON.stringify({ id: character.id, name: character.name, message: "角色卡已保存" });
     }
@@ -944,9 +1056,7 @@ function executeTool(
       const message = options
         ? `${question}\n\n${options.map((opt, i) => `选项 ${i + 1}：${opt}`).join("\n")}`
         : question;
-      store.addMessage(sessionId, "assistant", message);
-      emit({ type: "waiting_for_input", sessionId, question, options: options ?? undefined });
-      return JSON.stringify({ status: "waiting", message: "问题已提交，等待用户回复" });
+      return JSON.stringify({ status: "waiting", message: "问题已提交，等待用户回复", displayMessage: message, question, options: options ?? undefined });
     }
     return JSON.stringify({ error: `未知工具：${call.name}` });
   } catch (error) {

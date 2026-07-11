@@ -8,7 +8,41 @@ export interface DocumentBlock {
   endOffset: number;
 }
 
+export interface DocumentSection {
+  section: number;
+  level: number;
+  heading: string;
+  startLine: number;
+  endLine: number;
+  characters: number;
+  content: string;
+}
+
 const DEFAULT_TARGET_CHARACTERS = 6_000;
+
+/** Split a Markdown document by headings, respecting heading hierarchy. */
+export function documentSections(content: string): DocumentSection[] {
+  const normalized = content.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  const headings = lines.flatMap((line, index) => {
+    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+    return match ? [{ lineIndex: index, level: match[1].length, heading: match[2].replace(/\s+#+\s*$/, "").trim() }] : [];
+  });
+  return headings.map((item, index) => {
+    const next = headings.slice(index + 1).find(candidate => candidate.level <= item.level);
+    const endLineIndex = next ? next.lineIndex - 1 : lines.length - 1;
+    const sectionContent = lines.slice(item.lineIndex, endLineIndex + 1).join("\n").trimEnd();
+    return {
+      section: index + 1,
+      level: item.level,
+      heading: item.heading,
+      startLine: item.lineIndex + 1,
+      endLine: endLineIndex + 1,
+      characters: sectionContent.length,
+      content: sectionContent,
+    };
+  });
+}
 
 /**
  * Split prose on structural boundaries. The target is soft: a complete sentence

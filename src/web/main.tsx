@@ -13,10 +13,13 @@ type Proposal = {
 };
 type Message = { id: number; role: string; content: string };
 type DocumentData = { content: string; hash: string };
+type MarkdownHeading = { id: string; level: number; text: string };
 type Character = {
-  id: number; name: string; aliases: string[]; role: string; appearance: string;
-  traits: string; background: string; goals: string; relationships: string;
-  relatedCharacterIds: number[]; abilities: string; notes: string; updatedAt: string;
+  schemaVersion: 2; id: number; name: string; aliases: string[]; narrativeRole: string; identity: string; appearance: string;
+  personality: string; values: string; speechStyle: string; background: string; longTermGoal: string;
+  currentGoal: string; fears: string; capabilities: string; limitations: string;
+  relationships: Array<{ characterId: number; type: string; description: string; attitude: string }>;
+  notes: string; updatedAt: string;
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StreamStep = {
@@ -94,8 +97,9 @@ type TreeNode = {
 };
 
 const EMPTY_CHARACTER: CharacterDraft = {
-  name: "", aliases: [], role: "", appearance: "", traits: "", background: "",
-  goals: "", relationships: "", relatedCharacterIds: [], abilities: "", notes: "",
+  schemaVersion: 2, name: "", aliases: [], narrativeRole: "", identity: "", appearance: "", personality: "",
+  values: "", speechStyle: "", background: "", longTermGoal: "", currentGoal: "", fears: "",
+  capabilities: "", limitations: "", relationships: [], notes: "",
 };
 
 const hashToken = new URLSearchParams(location.hash.slice(1)).get("token");
@@ -123,7 +127,16 @@ function activeStepIndex(steps: StreamStep[]): number {
   return -1;
 }
 
-function Markdown({ content, className }: { content: string; className?: string }) {
+function markdownHeadings(content: string, prefix: string): MarkdownHeading[] {
+  return [...content.matchAll(/^(#{1,6})\s+(.+?)\s*$/gm)].map((match, index) => ({
+    id: `${prefix}-section-${index + 1}`,
+    level: match[1].length,
+    text: match[2].replace(/\s+#+\s*$/, "").trim(),
+  }));
+}
+
+function Markdown({ content, className, headingPrefix }: { content: string; className?: string; headingPrefix?: string }) {
+  let headingIndex = 0;
   const html = content
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -131,9 +144,11 @@ function Markdown({ content, className }: { content: string; className?: string 
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
-    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+    .replace(/^(#{1,6})\s+(.+?)\s*$/gm, (_match, hashes: string, title: string) => {
+      const level = hashes.length;
+      const id = headingPrefix ? ` id="${headingPrefix}-section-${++headingIndex}"` : "";
+      return `<h${level}${id}>${title.replace(/\s+#+\s*$/, "")}</h${level}>`;
+    })
     .replace(/^> (.+)$/gm, "<blockquote>$1</blockquote>")
     .replace(/^- (.+)$/gm, "<li>$1</li>")
     .replace(/^(\d+)\. (.+)$/gm, "<li>$2</li>")
@@ -414,12 +429,18 @@ function App() {
   const [readerWidth, setReaderWidth] = useState(() =>
     Number(localStorage.getItem("writer-reader-w")) || 760,
   );
+  const [outlineCollapsed, setOutlineCollapsed] = useState(() =>
+    localStorage.getItem("writer-outline-collapsed") === "true",
+  );
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
   const renameInputRef = useRef<HTMLInputElement>(null);
   const createInputRef = useRef<HTMLInputElement>(null);
+  const documentReaderRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const headings = useMemo(() => markdownHeadings(document.content, "document"), [document.content]);
 
   const refresh = useCallback(
     async (targetSession?: string) => {
@@ -440,6 +461,10 @@ function App() {
     window.document.documentElement.dataset.theme = theme;
     localStorage.setItem("writer-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem("writer-outline-collapsed", String(outlineCollapsed));
+  }, [outlineCollapsed]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -525,7 +550,7 @@ function App() {
       );
     }
     if (event.type === "waiting_for_input") {
-      setNotice(event.question || "Agent is waiting for your input.");
+      setNotice("");
     }
     if (event.type === "proposal" && event.proposal) {
       setState((prev) => prev ? { ...prev, proposals: [event.proposal!, ...prev.proposals] } : prev);
@@ -574,7 +599,6 @@ function App() {
         await refresh(sessionId).catch((e) => setError(String(e)));
       }
     } finally {
-      setStreamSteps([]);
       streamOutputRef.current = "";
       if (currentJobRef.current === jobId) {
         abortRef.current = undefined;
@@ -625,6 +649,34 @@ function App() {
     const jobId = currentJobRef.current;
     if (jobId) void api(`/api/chat/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
     abortRef.current?.abort();
+  }
+
+  async function rewindMessage(message: Message) {
+    if (!state || busy || message.role !== "user") return;
+    if (!window.confirm("从这条消息重新编辑？此消息之后的对话、已接受文档修改和角色卡修改将一并回退。")) return;
+    setError("");
+    setNotice("");
+    try {
+      const result = await api<{ prompt: string }>(
+        `/api/messages?session=${encodeURIComponent(state.sessionId)}&target=${message.id}`,
+        { method: "DELETE" },
+      );
+      setPrompt(result.prompt);
+      await refresh(state.sessionId);
+      if (activePath) {
+        try {
+          const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
+          setDocument(next);
+          setDocumentDraft(next.content);
+        } catch {
+          setDocument({ content: "", hash: "" });
+          setDocumentDraft("");
+        }
+      }
+      requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
   async function saveDocument() {
@@ -814,6 +866,8 @@ function App() {
   }
 
   const pendingProposals = state.proposals.filter((p) => p.status === "pending");
+  const visibleMessages = state.messages.filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.content.trim());
+  const lastUserMessageId = [...visibleMessages].reverse().find(msg => msg.role === "user")?.id;
   const usagePct = state.provider.pricing.contextWindow
     ? Math.round((state.usage.lastPromptTokens / state.provider.pricing.contextWindow) * 100)
     : 0;
@@ -1004,9 +1058,37 @@ function App() {
         {editingDocument ? (
           <textarea value={documentDraft} onChange={(e) => setDocumentDraft(e.target.value)} />
         ) : (
-          <div className="document-reader">
+          <div className="document-reader" ref={documentReaderRef}>
             {document.content ? (
-              <Markdown content={document.content} />
+              <div className={`document-reader-layout ${outlineCollapsed ? "outline-collapsed" : ""}`}>
+                {headings.length > 0 && (
+                  <nav className={`document-outline ${outlineCollapsed ? "collapsed" : ""}`} aria-label="Document sections">
+                    <div className="document-outline-head">
+                      {!outlineCollapsed && <strong>Sections</strong>}
+                      <button
+                        className="document-outline-toggle"
+                        onClick={() => setOutlineCollapsed((value) => !value)}
+                        title={outlineCollapsed ? "Expand sections" : "Collapse sections"}
+                        aria-label={outlineCollapsed ? "Expand sections" : "Collapse sections"}
+                        aria-expanded={!outlineCollapsed}
+                      >
+                        {outlineCollapsed ? "☰" : "‹"}
+                      </button>
+                    </div>
+                    {!outlineCollapsed && headings.map((heading) => (
+                        <button
+                          key={heading.id}
+                          className={`document-outline-item level-${heading.level}`}
+                          title={heading.text}
+                          onClick={() => documentReaderRef.current?.querySelector(`#${heading.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                        >
+                          {heading.text}
+                        </button>
+                      ))}
+                  </nav>
+                )}
+                <Markdown content={document.content} headingPrefix="document" />
+              </div>
             ) : (
               <div className="empty-state">
                 <p>Select a document to read</p>
@@ -1030,17 +1112,22 @@ function App() {
           </div>
         </div>
         <div className="conversation">
-          {state.messages.map((msg) => (
-            <article className={msg.role} key={msg.id}>
+          {visibleMessages.map((msg) => (
+            <React.Fragment key={msg.id}>
+            <article className={msg.role}>
               <div className="msg-label">{msg.role === "assistant" ? "Assistant" : "You"}</div>
               {msg.role === "assistant" ? (
                 <Markdown content={msg.content} />
               ) : (
-                <div>{msg.content}</div>
+                <>
+                  <div>{msg.content}</div>
+                  {msg.id > 0 && <div className="message-actions">
+                    <button disabled={busy} onClick={() => void rewindMessage(msg)} title="Edit from this message">Edit</button>
+                  </div>}
+                </>
               )}
             </article>
-          ))}
-          {streamSteps.map((step) => (
+            {msg.id === lastUserMessageId && streamSteps.map((step) => (
             <article className={`agent-step ${step.status}`} key={step.id}>
               <button
                 className="agent-step-summary"
@@ -1077,6 +1164,23 @@ function App() {
                 </div>
               )}
             </article>
+            ))}
+            </React.Fragment>
+          ))}
+          {!lastUserMessageId && streamSteps.map((step) => (
+            <article className={`agent-step ${step.status}`} key={step.id}>
+              <button className="agent-step-summary" onClick={() => setStreamSteps((current) => current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)))}>
+                <span className="agent-step-indicator" />
+                <strong>{step.status === "running" ? `Step ${step.id}` : step.status === "failed" ? `Step ${step.id} failed` : `Step ${step.id} done`}</strong>
+                {step.tools.length > 0 && <span className="agent-step-tools">{step.tools.join(", ")}</span>}
+                <span className="agent-step-chevron">{step.expanded ? "^" : "v"}</span>
+              </button>
+              {step.expanded && <div className="agent-step-content">
+                {step.reasoning && <div className="agent-step-reasoning"><Markdown content={step.reasoning} /></div>}
+                {step.output && <Markdown content={step.output} />}
+                {!step.reasoning && !step.output && <p className="agent-step-waiting">Waiting for model response...</p>}
+              </div>}
+            </article>
           ))}
           {state.messages.length === 0 && streamSteps.length === 0 && (
             <div className="empty-state">
@@ -1089,6 +1193,7 @@ function App() {
         </div>
         <div className="composer">
           <textarea
+            ref={composerRef}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={(e) => {
@@ -1191,8 +1296,8 @@ function App() {
                     <span className="character-avatar">{character.name.slice(0, 1)}</span>
                     <span className="character-card-body">
                       <strong>{character.name}</strong>
-                      <small>{character.role || "Role not set"}</small>
-                      <span>{character.traits || character.background || "No description yet"}</span>
+                      <small>{[character.narrativeRole, character.identity].filter(Boolean).join(" · ") || "Role not set"}</small>
+                      <span>{character.personality || character.background || "No description yet"}</span>
                     </span>
                   </button>
                 ))}
@@ -1223,16 +1328,35 @@ function App() {
             <h2>{characterDraft.id ? "Edit character" : "New character"}</h2>
             <div className="character-form-grid">
               <label><span>Name</span><input value={characterDraft.name} onChange={(e) => setCharacterDraft({ ...characterDraft, name: e.target.value })} /></label>
-              <label><span>Role</span><input value={characterDraft.role} onChange={(e) => setCharacterDraft({ ...characterDraft, role: e.target.value })} /></label>
+              <label><span>Narrative role</span><input value={characterDraft.narrativeRole} onChange={(e) => setCharacterDraft({ ...characterDraft, narrativeRole: e.target.value })} /></label>
+              <label><span>Identity</span><input value={characterDraft.identity} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: e.target.value })} /></label>
               <label className="wide"><span>Aliases (comma separated)</span><input value={characterDraft.aliases.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, aliases: e.target.value.split(/[,，]/).map(v => v.trim()).filter(Boolean) })} /></label>
-              {(["appearance", "traits", "background", "goals", "relationships", "abilities", "notes"] as const).map((field) => (
+              {(["appearance", "personality", "values", "speechStyle", "background", "longTermGoal", "currentGoal", "fears", "capabilities", "limitations", "notes"] as const).map((field) => (
                 <label className="wide" key={field}><span>{field[0].toUpperCase() + field.slice(1)}</span><textarea value={characterDraft[field]} onChange={(e) => setCharacterDraft({ ...characterDraft, [field]: e.target.value })} /></label>
               ))}
               <label className="wide"><span>Related characters</span><div className="relation-picker">
                 {state.characters.filter(item => item.id !== characterDraft.id).map(item => (
-                  <button type="button" className={characterDraft.relatedCharacterIds.includes(item.id) ? "selected" : ""} key={item.id} onClick={() => setCharacterDraft({ ...characterDraft, relatedCharacterIds: characterDraft.relatedCharacterIds.includes(item.id) ? characterDraft.relatedCharacterIds.filter(id => id !== item.id) : [...characterDraft.relatedCharacterIds, item.id] })}>{item.name}</button>
+                  <button type="button" className={characterDraft.relationships.some(relation => relation.characterId === item.id) ? "selected" : ""} key={item.id} onClick={() => setCharacterDraft({
+                    ...characterDraft,
+                    relationships: characterDraft.relationships.some(relation => relation.characterId === item.id)
+                      ? characterDraft.relationships.filter(relation => relation.characterId !== item.id)
+                      : [...characterDraft.relationships, { characterId: item.id, type: "", description: "", attitude: "" }],
+                  })}>{item.name}</button>
                 ))}
               </div></label>
+              {characterDraft.relationships.map((relation) => {
+                const related = state?.characters.find(item => item.id === relation.characterId);
+                const updateRelation = (changes: Partial<typeof relation>) => setCharacterDraft({
+                  ...characterDraft,
+                  relationships: characterDraft.relationships.map(item => item.characterId === relation.characterId ? { ...item, ...changes } : item),
+                });
+                return <div className="relationship-editor wide" key={relation.characterId}>
+                  <strong>{related?.name ?? `#${relation.characterId}`}</strong>
+                  <input placeholder="Relationship type" value={relation.type} onChange={(e) => updateRelation({ type: e.target.value })} />
+                  <input placeholder="Attitude" value={relation.attitude} onChange={(e) => updateRelation({ attitude: e.target.value })} />
+                  <textarea placeholder="Relationship description" value={relation.description} onChange={(e) => updateRelation({ description: e.target.value })} />
+                </div>;
+              })}
             </div>
             <div className="modal-actions">
               {characterDraft.id && <button className="danger" onClick={() => void deleteCharacter(characterDraft as Character)}>Delete</button>}

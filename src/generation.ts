@@ -166,7 +166,7 @@ export async function generateCharacter(input: {
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
-    { role: "system", content: `你是小说角色设计助手。根据用户要求生成或补全角色卡。你可以按需读取获准的参考文档，但不要读取无关资料。完成后只输出一个 JSON 对象，不要 Markdown，不要解释。字段必须完整：name(string), aliases(string[]), role(string), appearance(string), traits(string), background(string), goals(string), relationships(string), relatedCharacterIds(number[]), abilities(string), notes(string)。不要擅自关联未知角色，relatedCharacterIds 默认空数组。` },
+    { role: "system", content: `你是小说角色设计助手。根据用户要求生成或补全角色卡。你可以按需读取获准的参考文档，但不要读取无关资料。完成后只输出一个 JSON 对象，不要 Markdown，不要解释。可用字段：name, aliases, narrativeRole, identity, appearance, personality, values, speechStyle, background, longTermGoal, currentGoal, fears, capabilities, limitations, notes。name 必须提供；其余字段只填写用户已提供或能够可靠归纳的内容，未知内容使用空字符串，不得为了填满表格虚构设定。关系由应用单独维护，不要输出 relationships。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
   const result = input.project && input.allowedDocumentPaths?.length
@@ -203,7 +203,7 @@ export async function updateCharacterFromConversation(input: {
     });
     const character = input.store.saveCharacterWithRevision(input.sessionId, userMessageId, {
       ...draft, id: existing?.id,
-      relatedCharacterIds: existing?.relatedCharacterIds ?? draft.relatedCharacterIds,
+      relationships: existing?.relationships ?? draft.relationships,
     });
     const fallback = existing ? `已更新角色卡：${character.name}` : `已创建角色卡：${character.name}`;
     const message = await safeChangeSummary(input.summaryModel ?? input.model, {
@@ -244,7 +244,7 @@ async function buildWritingDraft(
   const allowedCharacterIds = new Set(selectedCharacters(options.store, options.characterIds).map(item => item.id));
   const documents = options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)).slice(0, 100);
   const documentSet = new Set(documents);
-  const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.name, aliases: item.aliases, role: item.role }));
+  const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity }));
   const tools = [
     { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡。", parameters: { type: "object", properties: { id: { type: "number", enum: [...allowedCharacterIds] } }, required: ["id"], additionalProperties: false } } },
@@ -332,8 +332,8 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
     : options.mode === "rewrite" || options.mode === "polish" ? selectionContext(document, options.selection!)
       : "";
   const task: Record<WritingMode, string> = {
-    write: "创作一篇新的小说正文。只输出可直接写入 Markdown 文档的正文。",
-    continue: "从给出的文档末尾自然续写。只输出新增正文，不要重复已有内容。",
+    write: "创作一篇新的小说正文。只输出可直接写入 Markdown 文档的正文。使用 #/##/### 标记章、节或场景层级，必要时使用分隔线---；标题应简短稳定，便于浏览跳转和按节读取，但不要为每个自然段添加标题。",
+    continue: "从给出的文档末尾自然续写。只输出新增正文，不要重复已有内容。延续既有 Markdown 标题层级；进入新节或新场景时使用合适的 ##/### 标题，但不要为每个自然段添加标题。",
     rewrite: "按要求改写选区。只输出替换选区的新文本，不要输出分析或原文。",
     rewrite_document: "按要求修改给出的完整文档。只输出修改后的完整正文，不要输出分析、摘要或原文对照。",
     polish: "润色选区，保持事实、视角、时序和人物声线不变。只输出替换选区的新文本。",
@@ -401,7 +401,10 @@ function selectedCharacters(store: WriterStore, ids?: number[]): Character[] {
 }
 
 function characterContext(item: Character) {
-  return { id: item.id, name: item.name, aliases: item.aliases, role: item.role, appearance: item.appearance, traits: item.traits, background: item.background, goals: item.goals, relationships: item.relationships, relatedCharacterIds: item.relatedCharacterIds, abilities: item.abilities, notes: item.notes };
+  return { id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity,
+    appearance: item.appearance, personality: item.personality, values: item.values, speechStyle: item.speechStyle,
+    background: item.background, longTermGoal: item.longTermGoal, currentGoal: item.currentGoal, fears: item.fears,
+    capabilities: item.capabilities, limitations: item.limitations, relationships: item.relationships, notes: item.notes };
 }
 
 function proposalSummary(mode: WritingMode): string { return `${modeLabel(mode)}生成内容，等待确认`; }
@@ -456,7 +459,10 @@ function normalizeCharacterDraft(value: Record<string, unknown>): Omit<Character
   const text = (key: string) => typeof value[key] === "string" ? value[key].trim() : "";
   const aliases = Array.isArray(value.aliases) ? value.aliases.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20) : [];
   if (!text("name")) throw new Error("生成的角色卡缺少姓名");
-  return { name: text("name"), aliases, role: text("role"), appearance: text("appearance"), traits: text("traits"), background: text("background"), goals: text("goals"), relationships: text("relationships"), relatedCharacterIds: [], abilities: text("abilities"), notes: text("notes") };
+  return { schemaVersion: 2, name: text("name"), aliases, narrativeRole: text("narrativeRole"), identity: text("identity"),
+    appearance: text("appearance"), personality: text("personality"), values: text("values"), speechStyle: text("speechStyle"),
+    background: text("background"), longTermGoal: text("longTermGoal"), currentGoal: text("currentGoal"), fears: text("fears"),
+    capabilities: text("capabilities"), limitations: text("limitations"), relationships: [], notes: text("notes") };
 }
 
 async function runReadOnlyToolLoop(
