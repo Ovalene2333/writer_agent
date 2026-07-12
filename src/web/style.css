@@ -1157,8 +1157,17 @@ button.agent-orb:focus-visible {
   display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 11px 14px; border: 0; border-radius: 0; background: transparent;
   text-align: left; cursor: pointer;
+  /* Avoid global button:active scale — it visually crushes IOC + token digits. */
+  transform: none;
 }
-.agent-step-summary:hover { background: color-mix(in srgb, var(--accent-light) 70%, transparent); }
+.agent-step-summary:hover {
+  background: color-mix(in srgb, var(--accent-light) 70%, transparent);
+  transform: none;
+}
+.agent-step-summary:active {
+  transform: none;
+  background: color-mix(in srgb, var(--accent-light) 85%, transparent);
+}
 .agent-step-indicator {
   width: 11px; height: 11px; flex-shrink: 0; border-radius: 50%;
   background: var(--text-faint);
@@ -1185,24 +1194,55 @@ button.agent-orb:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 .agent-step-tokens {
-  display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+  display: inline-flex; align-items: center; gap: 6px;
+  flex: 0 0 auto;
   padding: 2px 8px; border-radius: 999px;
   background: color-mix(in srgb, var(--surface2) 88%, var(--accent-light));
   border: 1px solid var(--border-light);
   color: var(--text-dim);
   font-family: var(--font-mono); font-size: 10.5px; font-weight: 550;
   font-variant-numeric: tabular-nums; letter-spacing: .01em; white-space: nowrap;
-  max-width: min(100%, 280px); overflow: hidden; text-overflow: ellipsis;
 }
 .agent-step-tokens.pending { opacity: .7; font-style: italic; }
 .agent-step-tokens.estimated { border-style: dashed; }
-.agent-step-tokens em {
-  font-style: normal; color: var(--accent); font-weight: 650;
+.agent-step-tokens .tok-metric {
+  display: inline-flex; align-items: center; gap: 4px;
+  flex: 0 0 auto;
+  line-height: 1;
+  white-space: nowrap;
+}
+.agent-step-tokens .tok-ico {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto;
+  width: 14px; height: 14px;
+  padding: 0;
+  border-radius: 4px;
+  font-size: 9.5px; font-weight: 700; line-height: 1;
+  letter-spacing: 0;
+  font-style: normal;
+  box-sizing: border-box;
+}
+.agent-step-tokens .tok-in .tok-ico {
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.agent-step-tokens .tok-out .tok-ico {
+  color: color-mix(in srgb, #4f8cff 70%, var(--text));
+  background: color-mix(in srgb, #4f8cff 16%, transparent);
+}
+.agent-step-tokens .tok-cache .tok-ico {
+  color: color-mix(in srgb, #c9a227 75%, var(--text));
+  background: color-mix(in srgb, #f0b429 18%, transparent);
+}
+.agent-step-tokens .tok-cost {
+  display: inline-flex; align-items: center;
+  color: var(--accent); font-weight: 650; margin-left: 1px;
+  line-height: 1;
 }
 .agent-step-tokens em.est {
-  padding: 0 4px; border-radius: 4px;
+  font-style: normal; padding: 0 4px; border-radius: 4px;
   background: color-mix(in srgb, var(--warn) 14%, transparent);
-  color: var(--warn); font-size: 10px;
+  color: var(--warn); font-size: 10px; font-weight: 650;
 }
 .agent-step-usage-detail {
   margin: 0 0 10px; padding: 6px 10px; border-radius: 8px;
@@ -1219,9 +1259,8 @@ button.agent-orb:focus-visible {
   background: color-mix(in srgb, var(--accent-light) 35%, var(--surface));
   color: var(--text-dim); font-size: 11.5px;
 }
-.agent-step-trail-total strong {
-  font-family: var(--font-mono); font-size: 11px; font-weight: 650;
-  color: var(--text); font-variant-numeric: tabular-nums;
+.agent-step-trail-total .agent-step-tokens {
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
 }
 .agent-step-tools {
   flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px; align-items: center;

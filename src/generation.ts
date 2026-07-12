@@ -2,7 +2,7 @@ import type { AgentEvent, Character, ModelConfig, StepUsage, UsageSummary } from
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { contrastStyleError } from "./prose_quality.js";
+import { analyzeProseStyle, contrastStyleError, type ProseStyleIssue } from "./prose_quality.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 
@@ -129,8 +129,15 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     const result = await streamText(effective.model, messages, effective.signal, async text => {
       await emit({ type: "text", text, channel: "output" });
     });
-    const generated = cleanModelText(result.content);
+    let generated = cleanModelText(result.content);
     if (!generated) throw new Error("模型没有返回正文");
+    const usages = result.usage ? [result.usage] : [];
+    const repaired = await repairGeneratedProse(effective.model, generated, effective.signal);
+    if (repaired.changed) {
+      generated = repaired.text;
+      usages.push(...repaired.usages);
+      await emit({ type: "text", text: `\n\n[已局部修订 ${repaired.repairedIssues} 处高置信度说明式写法]`, channel: "output" });
+    }
     const styleError = contrastStyleError(generated);
     if (styleError) throw new Error(styleError);
     const path = targetPath(effective);
@@ -144,8 +151,9 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     }, fallbackSummary, effective.signal);
     effective.store.addMessage(effective.sessionId, "assistant", summary);
     await emit({ type: "text", text: `\n\n${summary}`, channel: "output" });
-    if (result.usage) {
-      await emit(buildUsageEvent(effective.store, effective.sessionId, effective.model, result.usage, 1));
+    const totalUsage = sumModelUsage(usages);
+    if (totalUsage) {
+      await emit(buildUsageEvent(effective.store, effective.sessionId, effective.model, totalUsage, 1));
     }
     await emit({ type: "proposal", proposal });
     await emit({ type: "step_done", step: 1 });
@@ -267,6 +275,7 @@ async function buildWritingDraft(
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
 项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
+草案语气保持直接：标出冲突、欲望、身体或暴力要点时用准确词，不要改成含蓄代称；不做道德评判。
 最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束（须引用风格锚定中的句长/对白密度要求）、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: revision
@@ -356,14 +365,16 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
   });
   return [
     { role: "system", content: `你是小说写作助手。${task[options.mode]}
+创作立场：成人向虚构写作；暴力、情欲、残酷、粗口等按剧情与作者要求直写，不做道德说教，不自行含蓄化或降级冲突。不协助现实犯罪；不写真实未成年人的性内容。
 正文要求：
 - 先写可观察的动作、选择、代价、对白和有对象的感官细节，避免用抽象性格或情绪标签包办人物。
 - 不在动作、对白或细节之后重复说明人物的心理、潜台词、象征或“这意味着什么”；仅在省略会造成因果断裂时解释。
 - 句长、段长和信息密度服从「风格锚定」与文档上下文的声线，不追求整齐、对称、三项并列或每段总结。不同人物的词汇、句长、礼貌程度和回避方式应可区分。
-- 避免套语、模板化转折、连续排比，以及“不是A，而是B”“不是A，是B”“并非A，是B”一类先否定再定义的解释框架。
-- 禁止句中解释性破折号（“画面/动作——补充说明”）。破折号仅用于对白打断、行末拖腔或【叮——】类系统框。
+- 让动作产生结果，让可观察细节供读者判断；必要因果写成独立句。人物纠正事实、反驳误解时保留自然口语。
+- 对白中的拖音、中断和迟疑按人物语气保留；叙述中的补充信息直接落到动作、名词或独立句。
 - 通过具体且相关的内容差异降低机器感；不要随机换同义词、强行拆句、故意写病句、滥加口语或无关细节。
 - 保留必要的朴素过渡、留白、轻重差别和不对称。新增细节必须来自现有上下文，并服务于行动、空间、因果或伏笔。
+- 需要直写处用准确名词与动作，避免“那方面”“不可描述”等遮掩。
 不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡与 lore 之外的关键设定。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
@@ -459,6 +470,82 @@ function buildUsageEvent(
 }
 function modeLabel(mode: WritingMode): string { return ({ write: "新写", continue: "续写", rewrite: "改写选区", rewrite_document: "修改全文档", polish: "润色" })[mode]; }
 function cleanModelText(value: string): string { return value.trim().replace(/^```(?:markdown|md)?\s*/i, "").replace(/\s*```$/, "").trim(); }
+
+type ModelUsage = { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number };
+
+async function repairGeneratedProse(
+  model: ModelConfig,
+  original: string,
+  signal?: AbortSignal,
+): Promise<{ text: string; changed: boolean; repairedIssues: number; usages: ModelUsage[] }> {
+  let text = original;
+  let repairedIssues = 0;
+  const usages: ModelUsage[] = [];
+  for (let round = 0; round < 2; round += 1) {
+    const issues = analyzeProseStyle(text).filter(issue => issue.severity === "error").slice(0, 8);
+    if (!issues.length) break;
+    const result = await completeText(model, repairMessages(text, issues), signal);
+    if (result.usage) usages.push(result.usage);
+    const edits = parseRepairEdits(result.content);
+    let next = text;
+    let applied = 0;
+    for (const edit of edits) {
+      if (!issues.some(issue => issue.sentence === edit.search)) continue;
+      if (!edit.replace.trim() || countExact(next, edit.search) !== 1) continue;
+      next = next.replace(edit.search, edit.replace.trim());
+      applied += 1;
+    }
+    if (!applied || next === text) break;
+    repairedIssues += applied;
+    text = next;
+  }
+  return { text, changed: text !== original, repairedIssues, usages };
+}
+
+function repairMessages(text: string, issues: ProseStyleIssue[]): ChatMessage[] {
+  return [
+    { role: "system", content: "你是小说局部修订器。只修复给定问题句，保持事实、视角、时序、人物声线和其他句子不变。优先让动作产生结果、用可观察细节承载信息，必要因果拆为独立句。对白拖音、中断、迟疑和真实纠正不得修改。只输出 JSON 数组，每项为 {search,replace}，search 必须逐字等于问题句。" },
+    { role: "user", content: JSON.stringify({
+      issues: issues.map(issue => ({
+        sentence: issue.sentence, subtype: issue.subtype, reason: issue.reason, suggestions: issue.suggestions,
+      })),
+      nearbyContext: issues.map(issue => text.slice(Math.max(0, issue.start - 180), Math.min(text.length, issue.end + 180))),
+    }) },
+  ];
+}
+
+function parseRepairEdits(value: string): Array<{ search: string; replace: string }> {
+  const cleaned = value.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("["); const end = cleaned.lastIndexOf("]");
+  if (start < 0 || end <= start) return [];
+  try {
+    const parsed = JSON.parse(cleaned.slice(start, end + 1)) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap(item => {
+      if (!item || typeof item !== "object") return [];
+      const edit = item as Record<string, unknown>;
+      return typeof edit.search === "string" && typeof edit.replace === "string"
+        ? [{ search: edit.search, replace: edit.replace }] : [];
+    }).slice(0, 8);
+  } catch { return []; }
+}
+
+function countExact(text: string, search: string): number {
+  if (!search) return 0;
+  let count = 0, index = 0;
+  while ((index = text.indexOf(search, index)) >= 0) { count += 1; index += search.length; }
+  return count;
+}
+
+function sumModelUsage(usages: ModelUsage[]): ModelUsage | undefined {
+  if (!usages.length) return undefined;
+  return usages.reduce((sum, usage) => ({
+    promptTokens: sum.promptTokens + usage.promptTokens,
+    completionTokens: sum.completionTokens + usage.completionTokens,
+    cacheHitTokens: sum.cacheHitTokens + usage.cacheHitTokens,
+    cacheMissTokens: sum.cacheMissTokens + usage.cacheMissTokens,
+  }), { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 });
+}
 
 function parseJsonObject(value: string): Record<string, unknown> {
   const cleaned = value.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");

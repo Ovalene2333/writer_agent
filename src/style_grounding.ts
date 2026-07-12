@@ -21,12 +21,23 @@ export function styleGroundingPrompt(
   store: WriterStore,
   options: StyleGroundingOptions,
 ): string {
+  return [
+    stableStyleGroundingPrompt(project, store, options),
+    dynamicStyleGroundingPrompt(project, store, options),
+  ].filter(Boolean).join("\n\n");
+}
+
+/** Project-stable rules and default examples. Keep this before all per-turn context for KV-cache reuse. */
+export function stableStyleGroundingPrompt(
+  project: WriterProject,
+  store: WriterStore,
+  options: Pick<StyleGroundingOptions, "intensive">,
+): string {
   if (!options.intensive) return "";
 
   const config = project.config();
   const template = config.style ? getStyleTemplate(config.style) : undefined;
-  const examples = pickStyleExamples(store, template?.name, options.exampleIds);
-  const projectSample = pickProjectVoiceSample(project, options.targetPath, options.preferredSample);
+  const examples = pickStyleExamples(store, template?.name);
 
   const sections: string[] = [
     "风格锚定（写正文 / 续写 / 改写时强制遵守；优先级：本项目既有正文声线 > 用户范文 > 风格模板范例 > 泛化文学建议）",
@@ -40,12 +51,6 @@ export function styleGroundingPrompt(
     );
   } else {
     sections.push("未激活风格模板：以本项目既有正文与角色声线为准，避免切换成通用网文或翻译腔。");
-  }
-
-  if (projectSample) {
-    sections.push(
-      `本项目既有正文声线样本（最高优先级；贴合其句长、对白密度、用词与叙事距离，只学声线不抄情节）：\n---\n${projectSample.text}\n---\n来源：${projectSample.source} · 指纹：${styleFingerprint(projectSample.text, "")}`,
-    );
   }
 
   if (examples.length) {
@@ -64,10 +69,34 @@ export function styleGroundingPrompt(
   sections.push(`提交前自检：
 1. 句长、段长、对白占比是否接近上方指纹（本项目样本优先）。
 2. 人物用词是否符合身份与既有对白习惯；勿把所有角色写成同一语气。
-3. 禁止解释性破折号（画面——说明）与“不是……而是……”类模板对照句（人物当面反驳除外）。
+3. 动作之后不重复解释意义；让细节供读者判断，必要因果拆成独立句。保留人物对白中的拖音、中断、迟疑和真实纠正。
 4. 不引入样本、角色卡、lore 中未支撑的关键设定；空白处用可观察动作推进，勿用作者旁白补课。
-5. 场景落在具体动作、决定、发现或未决问题上，避免段尾总结升华。`);
+5. 场景落在具体动作、决定、发现或未决问题上，避免段尾总结升华。
+6. 直写检查：关键身体、暴力、情欲、脏话是否被无故换成含蓄说法或道德滤镜；作者未要求收敛时保持直接、具体。`);
 
+  return sections.join("\n\n");
+}
+
+/** Per-turn voice evidence. It intentionally follows history/task data because it changes frequently. */
+export function dynamicStyleGroundingPrompt(
+  project: WriterProject,
+  store: WriterStore,
+  options: StyleGroundingOptions,
+): string {
+  if (!options.intensive) return "";
+  const projectSample = pickProjectVoiceSample(project, options.targetPath, options.preferredSample);
+  const selectedExamples = pickExplicitStyleExamples(store, options.exampleIds);
+  if (!projectSample && !selectedExamples.length) return "";
+  const sections = ["本轮动态声线证据（优先于固定模板；只学声线，不复述情节）："];
+  if (projectSample) {
+    sections.push(`本项目既有正文样本：\n---\n${projectSample.text}\n---\n来源：${projectSample.source} · 指纹：${styleFingerprint(projectSample.text, "")}`);
+  }
+  if (selectedExamples.length) {
+    sections.push(selectedExamples.map((item, index) => {
+      const body = item.content.slice(0, 1_200);
+      return `任务指定范文 ${index + 1}《${item.title}》\n指纹：${styleFingerprint(item.content, item.notes)}\n${body}${item.content.length > body.length ? "\n…" : ""}`;
+    }).join("\n\n"));
+  }
   return sections.join("\n\n");
 }
 
@@ -124,6 +153,18 @@ function pickStyleExamples(
     content: item.content,
     notes: item.notes,
   }));
+}
+
+function pickExplicitStyleExamples(
+  store: WriterStore,
+  exampleIds?: number[],
+): Array<{ title: string; content: string; notes: string }> {
+  if (!exampleIds?.length) return [];
+  const wanted = new Set(exampleIds);
+  return store.writingExamples()
+    .filter(item => wanted.has(item.id) && !item.title.startsWith("[风格模板]"))
+    .slice(0, 2)
+    .map(item => ({ title: item.title, content: item.content, notes: item.notes }));
 }
 
 function pickProjectVoiceSample(

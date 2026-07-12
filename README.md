@@ -245,6 +245,7 @@ npm test                    # 编译并跑测试
 | `src/provider_catalog.ts` | 模型供应商目录 |
 | `src/generation.ts` | 意图路由与生成辅助 |
 | `src/outline.ts` | 结构化大纲 |
+| `src/creative_outline.ts` | 创意大纲规划器（多路线发散、证据化评分与反俗套约束） |
 | `src/templates.ts` | 风格模板 |
 | `src/web/` | Web 前端（Vite + React） |
 

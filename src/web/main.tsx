@@ -45,6 +45,7 @@ type StepUsage = {
   cost: number;
   currency: string;
   estimated?: boolean;
+  cacheHitRate?: number;
 };
 type StreamStep = {
   id: number;
@@ -91,6 +92,7 @@ type Usage = {
   cost: number;
   currency: string;
   lastPromptTokens: number;
+  cacheHitRate?: number;
 };
 type Provider = {
   provider: "deepseek" | "openai-compatible";
@@ -327,11 +329,57 @@ function clearStepTrail(sessionId: string): void {
   }
 }
 
-function formatStepTokens(usage: StepUsage): string {
-  const inTok = formatTokenCount(usage.promptTokens);
-  const outTok = formatTokenCount(usage.completionTokens);
-  const total = formatTokenCount(usage.totalTokens || usage.promptTokens + usage.completionTokens);
-  return `${inTok}↓ ${outTok}↑ · Σ${total}`;
+function formatStepCost(usage: StepUsage): string | null {
+  if (!(usage.cost > 0)) return null;
+  const symbol = usage.currency === "CNY" ? "¥" : "$";
+  return `${symbol}${usage.cost < 0.01 ? usage.cost.toFixed(4) : usage.cost.toFixed(3)}`;
+}
+
+function stepUsageTitle(usage: StepUsage): string {
+  const parts = [
+    usage.estimated ? "估算" : null,
+    `输入 ${usage.promptTokens.toLocaleString()}`,
+    `输出 ${usage.completionTokens.toLocaleString()}`,
+    `缓存命中 ${usage.cacheHitTokens.toLocaleString()}`,
+    usage.cacheHitRate !== undefined ? `真实命中率 ${(usage.cacheHitRate * 100).toFixed(1)}%` : null,
+    usage.cost > 0
+      ? `费用 ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`
+      : null,
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+/** Compact per-step usage: in · out · cache · cost (no Σ total). */
+function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?: boolean }) {
+  if (!usage) {
+    return (
+      <span className={`agent-step-tokens pending`} title={pending ? "等待本步 token 统计…" : "本步未拿到 token 统计"}>
+        {pending ? "token…" : "—"}
+      </span>
+    );
+  }
+  const cost = formatStepCost(usage);
+  return (
+    <span
+      className={`agent-step-tokens${usage.estimated ? " estimated" : ""}`}
+      title={stepUsageTitle(usage)}
+    >
+      <span className="tok-metric tok-in" title={`输入 ${usage.promptTokens.toLocaleString()}`}>
+        <span className="tok-ico" aria-hidden="true">I</span>
+        {formatTokenCount(usage.promptTokens)}
+      </span>
+      <span className="tok-metric tok-out" title={`输出 ${usage.completionTokens.toLocaleString()}`}>
+        <span className="tok-ico" aria-hidden="true">O</span>
+        {formatTokenCount(usage.completionTokens)}
+      </span>
+      <span className="tok-metric tok-cache" title={`缓存命中 ${usage.cacheHitTokens.toLocaleString()}`}>
+        <span className="tok-ico" aria-hidden="true">C</span>
+        {formatTokenCount(usage.cacheHitTokens)}
+      </span>
+      {cost && <span className="tok-metric tok-cost">{cost}</span>}
+      {usage.estimated && <em className="est">估</em>}
+    </span>
+  );
 }
 
 function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
@@ -340,6 +388,9 @@ function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
   const currency = withUsage.find((step) => step.usage!.cost > 0)?.usage?.currency
     ?? withUsage[0].usage!.currency
     ?? "CNY";
+  const measured = withUsage.filter(step => !step.usage?.estimated);
+  const measuredHits = measured.reduce((sum, step) => sum + (step.usage?.cacheHitTokens ?? 0), 0);
+  const measuredMisses = measured.reduce((sum, step) => sum + (step.usage?.cacheMissTokens ?? 0), 0);
   return {
     promptTokens: withUsage.reduce((sum, step) => sum + (step.usage?.promptTokens ?? 0), 0),
     completionTokens: withUsage.reduce((sum, step) => sum + (step.usage?.completionTokens ?? 0), 0),
@@ -349,6 +400,7 @@ function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
     cost: withUsage.reduce((sum, step) => sum + (step.usage?.cost ?? 0), 0),
     currency,
     estimated: withUsage.some((step) => step.usage?.estimated),
+    ...(measuredHits + measuredMisses > 0 ? { cacheHitRate: measuredHits / (measuredHits + measuredMisses) } : {}),
   };
 }
 
@@ -357,6 +409,15 @@ function formatTokenCount(value: number): string {
   if (value < 1000) return String(value);
   if (value < 10_000) return `${(value / 1000).toFixed(1)}k`;
   return `${Math.round(value / 1000)}k`;
+}
+
+function realCacheHitRate(usage: Pick<Usage, "cacheHitRate" | "cacheHitTokens" | "cacheMissTokens">): number {
+  if (typeof usage.cacheHitRate === "number" && Number.isFinite(usage.cacheHitRate)) {
+    return Math.max(0, Math.min(1, usage.cacheHitRate));
+  }
+  const hit = Number.isFinite(usage.cacheHitTokens) ? Math.max(0, usage.cacheHitTokens) : 0;
+  const miss = Number.isFinite(usage.cacheMissTokens) ? Math.max(0, usage.cacheMissTokens) : 0;
+  return hit + miss > 0 ? hit / (hit + miss) : 0;
 }
 
 function restoreTrailSteps(trail: StoredStepTrail): StreamStep[] {
@@ -771,33 +832,13 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
       : step.status === "failed"
         ? `Step ${step.id} failed`
         : `Step ${step.id} done`;
-  const tokenTitle = step.usage
-    ? `${step.usage.estimated ? "估算 · " : ""}输入 ${step.usage.promptTokens.toLocaleString()} · 输出 ${step.usage.completionTokens.toLocaleString()} · 缓存命中 ${step.usage.cacheHitTokens.toLocaleString()} · 合计 ${step.usage.totalTokens.toLocaleString()}${step.usage.cost > 0 ? ` · ${step.usage.currency === "CNY" ? "¥" : "$"}${step.usage.cost.toFixed(6)}` : ""}`
-    : step.status === "running"
-      ? "等待本步 token 统计…"
-      : "本步未拿到 token 统计";
 
   return (
     <article className={`agent-step ${step.status}`}>
       <button className="agent-step-summary" onClick={onToggle} type="button">
         <span className="agent-step-indicator" />
         <strong>{label}</strong>
-        <span className={`agent-step-tokens${step.usage ? "" : " pending"}${step.usage?.estimated ? " estimated" : ""}`} title={tokenTitle}>
-          {step.usage
-            ? (
-              <>
-                {formatStepTokens(step.usage)}
-                {step.usage.estimated && <em className="est">估</em>}
-                {step.usage.cost > 0 && (
-                  <em>
-                    {step.usage.currency === "CNY" ? "¥" : "$"}
-                    {step.usage.cost < 0.01 ? step.usage.cost.toFixed(4) : step.usage.cost.toFixed(3)}
-                  </em>
-                )}
-              </>
-            )
-            : step.status === "running" ? "token…" : "—"}
-        </span>
+        <StepTokenBadge usage={step.usage} pending={step.status === "running"} />
         {step.tools.length > 0 && (
           <span className="agent-step-tools">
             {step.tools.map((tool) => (
@@ -818,9 +859,12 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               ? (
                 <>
                   本步 token{step.usage.estimated ? "（估算）" : ""}：
-                  入 {step.usage.promptTokens.toLocaleString()} · 出 {step.usage.completionTokens.toLocaleString()}
-                  {" · "}合计 {step.usage.totalTokens.toLocaleString()}
-                  {step.usage.cacheHitTokens > 0 ? ` · 缓存命中 ${step.usage.cacheHitTokens.toLocaleString()}` : ""}
+                  输入 {step.usage.promptTokens.toLocaleString()}
+                  {" · "}输出 {step.usage.completionTokens.toLocaleString()}
+                  {" · "}缓存 {step.usage.cacheHitTokens.toLocaleString()}
+                  {step.usage.cacheHitRate !== undefined
+                    ? ` · 命中率 ${(step.usage.cacheHitRate * 100).toFixed(1)}%`
+                    : ""}
                   {step.usage.cost > 0
                     ? ` · ${step.usage.currency === "CNY" ? "¥" : "$"}${step.usage.cost.toFixed(6)}`
                     : ""}
@@ -1277,12 +1321,14 @@ function App() {
         : value,
     );
     try {
+      // Do not send characterScope unless the user explicitly restricts which existing
+      // cards may be read. Passing every known ID made the agent treat "IDs 1,2 only"
+      // as a ban on creating or writing new NPCs (e.g. a walk-on repairman).
       const result = await api<{ jobId: string }>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           sessionId: state.sessionId,
           prompt: text,
-          characterScope: state.characters.map((c) => c.id),
         }),
       });
       await subscribeAgentJob(result.jobId, state.sessionId, true);
@@ -1619,6 +1665,9 @@ function App() {
             </span>
             <span title="Context window used">{usagePct}%</span>
             <span>{state.usage.totalTokens.toLocaleString()} tokens</span>
+            <span title="仅统计供应商真实返回的缓存 hit/miss；不含估算调用">
+              cache {(realCacheHitRate(state.usage) * 100).toFixed(1)}%
+            </span>
             <span className="usage-number">
               {state.usage.currency === "CNY" ? "¥" : "$"}{state.usage.cost.toFixed(4)}
             </span>
@@ -2051,15 +2100,9 @@ function App() {
                   const total = sumStepUsage(streamSteps);
                   if (!total || streamSteps.length < 1) return null;
                   return (
-                    <div className="agent-step-trail-total" title="本轮各 step 合计">
-                      <span>本轮合计</span>
-                      <strong>
-                        {formatStepTokens(total)}
-                        {total.estimated ? " · 含估算" : ""}
-                        {total.cost > 0
-                          ? ` · ${total.currency === "CNY" ? "¥" : "$"}${total.cost < 0.01 ? total.cost.toFixed(4) : total.cost.toFixed(3)}`
-                          : ""}
-                      </strong>
+                    <div className="agent-step-trail-total" title={stepUsageTitle(total)}>
+                      <span>本轮合计{total.estimated ? "（含估算）" : ""}</span>
+                      <StepTokenBadge usage={total} />
                     </div>
                   );
                 })()}

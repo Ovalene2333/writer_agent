@@ -152,7 +152,7 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
       } else if (name === "context") {
         const pricing = props.providers.publicConfig().pricing;
         append(`最近上下文：${usage.lastPromptTokens.toLocaleString()} / ${pricing.contextWindow.toLocaleString()} Token（${(usage.lastPromptTokens / pricing.contextWindow * 100).toFixed(2)}%）\n包含系统规则、角色卡、写作示例、最近消息、检索片段和 @ 引用文档。`);
-      } else if (name === "usage") append(`输入 ${usage.promptTokens.toLocaleString()} · 输出 ${usage.completionTokens.toLocaleString()} · 缓存命中 ${usage.cacheHitTokens.toLocaleString()} · 总计 ${usage.totalTokens.toLocaleString()} Token · ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`);
+      } else if (name === "usage") append(`输入 ${usage.promptTokens.toLocaleString()} · 输出 ${usage.completionTokens.toLocaleString()} · 缓存命中 ${usage.cacheHitTokens.toLocaleString()} · 真实命中率 ${(usage.cacheHitRate * 100).toFixed(1)}% · 总计 ${usage.totalTokens.toLocaleString()} Token · ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`);
       else if (name === "character") {
         const command = parseCharacterCommand(args);
         if (command.action === "list") append(props.store.characters().map(item => `${item.id}  ${item.name}  ${item.narrativeRole}`).join("\n") || "characters/ 目录中没有角色卡");

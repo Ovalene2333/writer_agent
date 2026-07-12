@@ -3,11 +3,13 @@ import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 import { documentBlocks, documentSections } from "./document_blocks.js";
-import { contrastStyleError } from "./prose_quality.js";
+import { analyzeProseStyle, newProseStyleIssues, proseStyleIssuesError } from "./prose_quality.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { isIntensiveWritingMode, styleFingerprint, styleGroundingPrompt } from "./style_grounding.js";
+import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt, styleFingerprint } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
+import { createCreativeOutlineBrief } from "./creative_outline.js";
+import { createHash } from "node:crypto";
 
 type ApiMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -40,7 +42,7 @@ interface WritingTask {
   targetPath?: string;
 }
 
-const TOOLS = [
+const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
@@ -103,6 +105,38 @@ const TOOLS = [
         },
         required: ["query"],
         additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "design_creative_outline",
+      description: "为新建或重构大纲生成独立的创意规划简报：四条结构差异显著的路线、发散—收敛流程、100分评估表、反俗套约束和最终章节格式。开始创作大纲前调用一次",
+      parameters: {
+        type: "object",
+        properties: {
+          premise: { type: "string", description: "故事前提或本次大纲任务的核心矛盾" },
+          genre: { type: "string", description: "可选类型与气质" },
+          audience: { type: "string", description: "可选目标读者" },
+          targetChapters: { type: "number", description: "期望章节数，3—80" },
+          constraints: { type: "array", items: { type: "string" }, description: "必须遵守的设定或形式约束" },
+          existingBeats: { type: "array", items: { type: "string" }, description: "重构时必须保留的既有节拍" },
+          seed: { type: "string", description: "可选路线种子；相同输入与种子得到相同设计镜头" },
+        },
+        required: ["premise"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "audit_prose_style",
+      description: "对指定正文做确定性风格审计，返回破折号与否定—定义句式的行列、用途分类、严重度、置信度、原因和修改策略。审查正文时先调用；对白拖音、中断和真实纠正会被单独分类，不按说明体计数",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string", description: "项目内正文 Markdown 路径" } },
+        required: ["path"], additionalProperties: false,
       },
     },
   },
@@ -220,7 +254,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_characters",
-      description: "列出作品中的全部角色卡",
+      description: "列出本次可读取的已有角色卡目录（若用户限制了角色范围则只返回范围内角色；本轮新建的角色也会出现）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -228,7 +262,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "get_character",
-      description: "按 ID 读取角色卡。写作时用 fields 选择必要字段以节省上下文；修改角色卡时省略 fields 读取完整卡片",
+      description: "按 ID 读取角色卡。写作时用 fields 选择必要字段以节省上下文；修改角色卡时省略 fields 读取完整卡片。仅可读取范围内的已有卡，或本轮 save_character 新建的卡",
       parameters: {
         type: "object",
         properties: {
@@ -247,7 +281,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "save_character",
-      description: "创建或更新角色卡（结构化 JSON，存入 characters/ 目录）。修改已有角色时必须传入 id，否则会创建新角色。先 list_characters 获取角色 ID 和名称，再用此工具创建或更新",
+      description: "创建或更新角色卡（结构化 JSON，存入 characters/）。省略 id=新建（路人不必建卡；会反复出场或需要稳定人设时再新建）；传入 id=更新已有卡。修改前先 get_character 读完整卡片并保留未改字段。角色范围限制只约束读取已有卡，不禁止新建",
       parameters: {
         type: "object",
         properties: {
@@ -266,7 +300,7 @@ const TOOLS = [
           fears: { type: "string", description: "恐惧、软肋或极力避免的结果" },
           capabilities: { type: "string", description: "技能、知识、能力和可支配资源" },
           limitations: { type: "string", description: "能力边界、缺陷、代价和现实限制" },
-          relationships: { type: "array", description: "与已有角色的结构化关系；先用 list_characters 获取 ID", items: { type: "object", properties: {
+          relationships: { type: "array", description: "与可读取范围内已有角色的结构化关系；先用 list_characters 获取 ID", items: { type: "object", properties: {
             characterId: { type: "number" }, type: { type: "string" }, description: { type: "string" }, attitude: { type: "string" },
           }, required: ["characterId", "type", "description", "attitude"], additionalProperties: false } },
           notes: { type: "string", description: "补充说明" },
@@ -292,9 +326,26 @@ const TOOLS = [
       },
     },
   },
-] as const;
+] as const);
 
 const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
+
+/** Stable schema fingerprint: tool order and definitions are part of the provider KV-cache prefix. */
+export function agentToolSchemaHash(): string {
+  return createHash("sha256").update(JSON.stringify(TOOLS)).digest("hex").slice(0, 16);
+}
+
+export function agentToolNames(): string[] {
+  return TOOLS.map(tool => tool.function.name);
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  }
+  return value;
+}
 
 function dsmlMarkerIndex(text: string): number {
   const patterns = [
@@ -416,6 +467,13 @@ function writingSystemPrompt(project: WriterProject): string {
 ${stylePointer}
 职责：协助构思、规划、写作、改写和审校；当前用户请求优先，作者保留最终决定。
 
+创作立场（虚构作品）：
+- 这是成人向小说协作工具。暴力、情欲、权谋、残酷、粗口、禁忌题材等均可按剧情与作者要求直接书写。
+- 不要用道德说教、安全提示、劝退语或“请注意尺度”打断创作；不要替角色做道德评判，除非作者明确要求该视角。
+- 拒绝含蓄化与软化：需要直写处用准确、具体的名词与动作，避免“那方面”“发生了关系”“不可描述”等遮掩；身体、伤口、欲望、脏话按人物与场景需要写清。
+- 不要为了“得体”删改冲突强度、性描写浓度或黑暗走向；作者未要求收敛时，默认按强冲突、高信息密度呈现。
+- 仍须遵守法律与工具边界：不协助现实世界犯罪操作；不生成针对真实未成年人的性内容。虚构成人角色与架空世界内的情节按作者意图执行。
+
 文档分区（必须遵守，勿把不同类型内容写进同一路径）：
 - lore/：设定与事实源（世界规则、专名、组织、力量体系、地理政治等）。只写可检索事实，不写章节散文。
 - outline/：情节计划（卷/章/场景、前因结果、伏笔）。不写可发表正文。
@@ -426,7 +484,7 @@ ${stylePointer}
 
 正文底线（所有模式）：
 1. 用动作、选择、代价、停顿、对白和具体感官呈现人物，避免紧随其后的情绪、潜台词或象征解释。
-2. 禁止解释性破折号与“不是……而是……”类模板对照句（细则见风格锚定自检）。
+2. 让动作产生结果、让细节供读者判断；必要因果拆成独立句。保留对白中的拖音、中断、迟疑和真实纠正。
 3. 对白服从人物身份与当下目的；场景落在具体动作、决定、发现或未决问题上。
 4. 不编造 lore/角色卡未支撑的关键设定；区分项目事实与合理创作推断。
 `;
@@ -438,9 +496,10 @@ function executionRulesPrompt(): string {
 2. 保持既有人物、世界观、视角和 Markdown 结构。局部修改用补丁；大纲节点用大纲补丁；新建或全文重写才提交完整文档。新建设定→lore/，新建大纲→outline/，新建正文→chapters/；不要把设定写进章节，也不要把正文写进 lore。
 3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。
 4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
-5. 管理角色使用 save_character。修改前读取完整卡片并保留未要求修改的字段；写作时只读取所需角色字段。
-6. 资料复用：会话工作记忆、本轮工具结果、带 reused 标记的返回可直接复用，禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
-7. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。`;
+5. 管理角色使用 save_character：修改已有卡必须传 id，并先读取完整卡片、保留未要求修改的字段；新建卡省略 id。写作时只读取所需角色字段。
+6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
+7. 资料复用：会话工作记忆、本轮工具结果、带 reused 标记的返回可直接复用，禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
+8. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。`;
 }
 
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
@@ -448,11 +507,12 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
   const references = [...new Set([...explicitReferences, ...inferredTargets])];
   const creativeContext = structuredCreativeContext(store, task, characterScope);
+  // Scope only gates reading/listing *existing* cards and relationship targets — not prose NPCs or new cards.
   const characterScopeInstruction = characterScope === undefined
-    ? "角色资料按任务相关性自动筛选。"
+    ? "角色资料按任务相关性自动筛选。list_characters / get_character 可读全部已有角色卡；可用 save_character 新建卡（省略 id）或更新已有卡（传 id）。路人配角可只写正文、不建卡。"
     : characterScope.length
-      ? `用户仅允许关联角色 ID：${characterScope.join("、")}。不得读取、列出或关联范围外的角色。`
-      : "用户明确选择不关联任何已有角色。不得读取或列出其他角色资料。";
+      ? `本次可读取/列出的已有角色卡 ID：${characterScope.join("、")}。不得 get_character / 在 relationships 中关联范围外的*已有*角色。这不禁止：① 在正文中写无名或一次性配角（无需建卡）；② 用 save_character 省略 id 新建角色卡（新建后该 ID 即可读取）；③ 更新范围内已有角色卡。不要把「范围外」理解成禁止创作新人物。`
+      : "本次不加载任何已有角色卡：不得 list_characters / get_character 读取既有资料。仍可在正文中写人物；若用户要求或情节需要稳定人设，可用 save_character 省略 id 新建角色卡。";
   const documentInstruction = task.documentProposalRequired
     ? `本次请求必须产生文档提案后才能结束。不得把正文直接作为最终回复；须基于目标 Markdown 文档提交 propose_document_patch 或 propose_document。若工作记忆或本轮工具结果已含目标文档相关原文且文档未变，可直接提案，不必再次读取。${continuationPath ? `本次是承接上一轮的简短续写，默认目标文档为 ${continuationPath}。` : ""}`
     : "本次请求不强制产生文档提案，按用户意图执行。";
@@ -577,6 +637,7 @@ function taskInstructions(mode: WritingTaskMode): string {
 - 给出三个真正不同的候选方向，分别说明核心冲突与后续潜力。
 - 不把候选设想写入项目事实，除非作者明确选定。`;
   if (mode === "outline") return `本次工作流：
+- 新建大纲或大幅重构时，先调用 design_creative_outline 一次取得创意路线与评估表；基于其 generationPrompt 在内部完成发散、比较、反驳和深化，不要把四份半成品全写入项目。仅做局部字段修补时无需调用。
 - 大纲文档在 outline/（旧项目可能是 story/outline.md）。先调用 list_outline_nodes 了解“卷/幕—章—场景”结构；读取或修改具体节点时用 get_outline_node，不要靠全文搜索猜测节点边界。
 - 每个场景节点维护前因、行动、结果和状态变化；同时维护人物弧、信息释放、伏笔埋设与回收。
 - 修改既有节点使用 propose_outline_patch 提交局部提案；结构完整性检查使用 validate_outline。
@@ -587,14 +648,14 @@ function taskInstructions(mode: WritingTaskMode): string {
 2. 「写作线索」只是候选索引。Step 1 最小核对：情节用 get_outline_node（UUID）；衔接用上一章 read_document(lastSection=true)；人设用 get_character 必要字段；目标文档存在则 inspect 或读一次草稿/末段。
 3. 不要通读整本大纲、不要 list_outline_nodes 超过一次、不要对同一路径反复 read。
 4. 落笔前在内部明确：场景开场、人物目标、阻力、不可逆结果；正文默认 chapters/；设定说明不进正文。
-5. 写作时持续对照风格锚定的指纹与范文；对白区分人物；不引入未支撑设定。
-6. 提交前自检：解释性“——”、“不是……而是……”、段尾升华、与样本声线漂移。
+5. 写作时持续对照风格锚定；对白区分人物；不引入未支撑设定。冲突、情欲、暴力等按剧情直写，不自行降级为含蓄暗示或道德旁白。
+6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。
 7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。`;
   if (mode === "rewrite") return `本次工作流（内部执行，不输出分析过程）：
 - 先读「风格锚定」与原文声线；改写后的句长、对白密度须仍贴近原文/样本，除非作者明确要求换风格。
 - 只改变作者明确要求调整的维度，保持其余事件事实、人物动机和信息顺序不变。
 - 风格变化必须落实到叙述距离、句法节奏、对白比例、感官重点和信息释放，而不是同义替换。
-- 保留原文有辨识度的不规则表达，不把句子统一润色成工整、完整、均匀的书面语。
+- 保留原文有辨识度的不规则表达，不把句子统一润色成工整、完整、均匀的书面语；不要把直白改成含蓄，除非作者要求。
 - 优先用具体名词和动词替换泛化情绪、程度副词与装饰性修辞；避免为了“更有文采”新增比喻、总结或升华。
 - 对照原文检查信息损失与新增事实，优先通过局部补丁提案提交。`;
   if (mode === "audit") return `本次工作流：
@@ -675,7 +736,9 @@ export async function runAgent(options: {
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }): Promise<void> {
-  const { project, store, sessionId, prompt, signal, characterScope } = options;
+  const { project, store, sessionId, prompt, signal } = options;
+  // Mutable copy: newly created character IDs are appended so the same turn can read them.
+  const characterScope = options.characterScope === undefined ? undefined : [...options.characterScope];
   const emit = options.onEvent ?? (() => undefined);
   const model = options.models?.agent ?? options.model ?? modelConfigFromEnv();
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
@@ -710,19 +773,22 @@ export async function runAgent(options: {
     ?.map((block) => block.text?.trim() ?? "")
     .filter(Boolean)
     .join("\n\n");
-  const styleContext = styleGroundingPrompt(project, store, {
+  const styleOptions = {
     intensive: isIntensiveWritingMode(task.mode) || task.documentProposalRequired,
     targetPath: task.targetPath ?? continuationPath,
     exampleIds: task.exampleIds,
     preferredSample: preferredSample || undefined,
-  });
+  };
+  const stableStyleContext = stableStyleGroundingPrompt(project, store, styleOptions);
+  const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
   const messages: ApiMessage[] = [
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt() },
+    ...(stableStyleContext ? [{ role: "system" as const, content: stableStyleContext }] : []),
     ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
     ...(historicalContext ? [historicalContext] : []),
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
-    ...(styleContext ? [{ role: "system" as const, content: styleContext }] : []),
+    ...(dynamicStyleContext ? [{ role: "system" as const, content: dynamicStyleContext }] : []),
     ...(bootstrapContext ? [{ role: "system" as const, content: bootstrapContext }] : []),
     ...(artifactContext ? [{ role: "system" as const, content: artifactContext }] : []),
     ...(selectedContext ? [{ role: "system" as const, content: selectedContext }] : []),
@@ -866,8 +932,9 @@ export async function runAgent(options: {
 }
 
 const REVIEW_PROMPT = `你现在是小说终审编辑。目标是降低机器生成感，不是把文字改成另一种统一腔调。
+先调用 audit_prose_style 获取带行列和语境分类的确定性问题。只把 error 与高置信度 warning 当作修改候选；speech_extension、speech_interruption、speech_hesitation、dialogue_correction 和 system_or_metadata 必须保留。ambiguous_dash 需结合上下文人工判断，不能见符号就删。
 逐段检查并修改：模板化转折和连接词；紧跟动作、对白或细节之后的解释回声；用单一标签包办人物的写法；整齐但空泛的排比和三项并列；句长、段长和句式过度均匀；无意义的总结、升华与强调；角色都说同一种完整而正确的话。
-重点扫描并删除说明类框架：① 句中解释性破折号——凡“前半句画面/动作——后半句补充、定义、原因、心理或评判”一律拆开或改写。坏例：“视线落在门缝里——夹着一张纸条。”“改过——日期是昨天。”好例：“视线落在门缝里。里面夹着一张纸条。”“用红笔改过，日期是昨天。”仅保留对白打断“——」”、行末拖腔、系统框拖长音。② “不是……而是/是……”“并非……”“没有……只有……”“与其说……不如说……”“仿佛……又仿佛……”等对照框架，除非人物当面反驳误解。不要换成另一套说明腔，也不要只改后半句而保留“——/不是”骨架。
+说明类问题优先用三种正向策略处理：让动作产生结果；让可观察细节供读者判断；必要因果拆成独立句。人物纠正事实、反驳误解以及对白中的延长、中断、迟疑属于声线，不得机械改写。
 在忠于原意的前提下让行文更生动：把笼统判断和情绪说明尽量落到可见动作、选择及其代价、身体反应、环境变化、声音、触感或人物独有的观察上。证据已经足够时直接删掉解释，不必逐句改写。让对白带有身份、关系和当下情绪造成的语气差异；按场景张力调整句长、停顿和段落节奏。优先选择准确、有画面的动词和名词，不要靠密集形容词、副词、华丽比喻、感官清单或连续短句制造虚假的生动感。不得为了增加画面而凭空添加事件、道具、设定、心理动机或角色不知道的信息。
 不要用随机同义替换、强行拆句、故意病句、滥加口语或无关细节伪装成人类写作。机器感应通过减少句法模板、增加语义与观察角度的差异、保留叙事重点造成的轻重和不对称来消除。
 优先保留具体、有个性、略带不规则的表达。允许短句、停顿、省略和留白。不得新增剧情、设定或人物动机，不得改变事实、视角、时序和角色声线。没有问题的句子保持原样，禁止为了显示工作量而改写。
@@ -1170,7 +1237,7 @@ function resolveOutlineNodePayload(outline: OutlineStore, idOrTitle: string): Re
   };
 }
 
-const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
+const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
 const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "read_document"]);
 const MAX_READS_PER_PATH_PER_RUN = 3;
 const MAX_DOCUMENT_READS_PER_RUN = 5;
@@ -1418,6 +1485,21 @@ function executeTool(
   }
   try {
     if (call.name === "list_documents") return JSON.stringify(documentMap(project));
+    if (call.name === "audit_prose_style") {
+      const path = requireString(input.path, "path");
+      if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+      const content = project.read(path);
+      const issues = analyzeProseStyle(content);
+      return JSON.stringify({
+        path, sourceHash: project.hash(content),
+        summary: {
+          errors: issues.filter(issue => issue.severity === "error").length,
+          warnings: issues.filter(issue => issue.severity === "warning").length,
+          allowedSpeechOrMetadata: issues.filter(issue => issue.severity === "info").length,
+        },
+        issues,
+      });
+    }
     if (call.name === "inspect_document") {
       const path = requireString(input.path, "path");
       if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
@@ -1523,6 +1605,19 @@ function executeTool(
       const id = requireString(input.id, "id");
       return JSON.stringify(resolveOutlineNodePayload(outline, id));
     }
+    if (call.name === "design_creative_outline") {
+      const strings = (value: unknown): string[] => Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20)
+        : [];
+      return JSON.stringify(createCreativeOutlineBrief({
+        premise: requireString(input.premise, "premise"),
+        ...(typeof input.genre === "string" ? { genre: input.genre } : {}),
+        ...(typeof input.audience === "string" ? { audience: input.audience } : {}),
+        ...(typeof input.targetChapters === "number" ? { targetChapters: input.targetChapters } : {}),
+        constraints: strings(input.constraints), existingBeats: strings(input.existingBeats),
+        ...(typeof input.seed === "string" ? { seed: input.seed } : {}),
+      }));
+    }
     if (call.name === "validate_outline") return JSON.stringify({ issues: new OutlineStore(project).validate() });
     if (call.name === "compare_outline_with_draft") {
       return JSON.stringify(new OutlineStore(project).compareWithDraft(requireString(input.id, "id")));
@@ -1544,14 +1639,16 @@ function executeTool(
       return JSON.stringify({ proposalId: proposal.id, status: proposal.status, nodeId: id, message: "大纲局部修改已等待用户审批" });
     }
     if (call.name === "propose_document") {
-      if (project.isDocumentHidden(requireString(input.path, "path"))) throw new Error("文档已对 Agent 屏蔽");
+      const path = requireString(input.path, "path");
+      if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
       const proposedContent = requireString(input.content, "content");
       rejectCompressedPlaceholder(proposedContent, "content");
-      const styleError = contrastStyleError(proposedContent);
+      const beforeContent = project.documentExists(path) ? project.read(path) : "";
+      const styleError = proseStyleIssuesError(newProseStyleIssues(beforeContent, proposedContent));
       if (styleError) throw new Error(styleError);
       const proposal = store.createProposal(
         sessionId,
-        requireString(input.path, "path"),
+        path,
         proposedContent,
         requireString(input.summary, "summary"),
       );
@@ -1563,12 +1660,8 @@ function executeTool(
       if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
       const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
       if (!edits.length) throw new Error("局部修改至少需要一条 edit");
-      const replacementText = edits.map(rawEdit => rawEdit && typeof rawEdit === "object" && typeof (rawEdit as Record<string, unknown>).replace === "string"
-        ? (rawEdit as Record<string, unknown>).replace as string
-        : "").join("\n");
-      const styleError = contrastStyleError(replacementText);
-      if (styleError) throw new Error(styleError);
-      let content = project.read(path);
+      const beforeContent = project.read(path);
+      let content = beforeContent;
       for (const [index, rawEdit] of edits.entries()) {
         if (!rawEdit || typeof rawEdit !== "object") throw new Error(`第 ${index + 1} 条 edit 格式无效`);
         const edit = rawEdit as Record<string, unknown>;
@@ -1581,6 +1674,8 @@ function executeTool(
         if (occurrences !== 1) throw new Error(`第 ${index + 1} 条 search 在原文中出现 ${occurrences} 次，必须唯一`);
         content = content.replace(search, replace);
       }
+      const styleError = proseStyleIssuesError(newProseStyleIssues(beforeContent, content));
+      if (styleError) throw new Error(styleError);
       const proposal = store.createProposal(sessionId, path, content, requireString(input.summary, "summary"));
       emit({ type: "proposal", proposal });
       return JSON.stringify({ proposalId: proposal.id, status: proposal.status, edits: edits.length, message: "局部修改已等待用户审批" });
@@ -1596,7 +1691,9 @@ function executeTool(
     if (call.name === "get_character") {
       const id = optionalPositiveInteger(input.id, "id");
       if (!id) throw new Error("缺少有效参数：id");
-      if (characterScope !== undefined && !characterScope.includes(id)) throw new Error("该角色不在用户允许的角色范围内");
+      if (characterScope !== undefined && !characterScope.includes(id)) {
+        throw new Error("该角色不在本次可读范围内（范围只限制读取已有卡；若需新人设请用 save_character 省略 id 新建）");
+      }
       const character = store.characters().find(item => item.id === id);
       if (!character) throw new Error("角色不存在");
       const allowedFields = new Set([
@@ -1616,6 +1713,9 @@ function executeTool(
       const characterId = typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined;
       const existing = characterId ? store.characters().find(item => item.id === characterId) : undefined;
       if (characterId && !existing) throw new Error("要修改的角色不存在");
+      if (characterId && characterScope !== undefined && !characterScope.includes(characterId)) {
+        throw new Error("不能修改范围外的已有角色卡；新建请省略 id");
+      }
       const value = (field: keyof Character, fallback = "") =>
         typeof input[field] === "string" ? input[field] as string : existing && typeof existing[field] === "string" ? existing[field] as string : fallback;
       const character = store.saveCharacter({
@@ -1629,13 +1729,22 @@ function executeTool(
         relationships: Array.isArray(input.relationships) ? input.relationships.flatMap(value => {
           if (!value || typeof value !== "object") return [];
           const relation = value as Record<string, unknown>;
-          const characterId = Number(relation.characterId);
-          if (!Number.isInteger(characterId) || (characterScope && !characterScope.includes(characterId))) return [];
-          return [{ characterId, type: String(relation.type ?? ""), description: String(relation.description ?? ""), attitude: String(relation.attitude ?? "") }];
+          const relatedId = Number(relation.characterId);
+          if (!Number.isInteger(relatedId) || (characterScope && !characterScope.includes(relatedId))) return [];
+          return [{ characterId: relatedId, type: String(relation.type ?? ""), description: String(relation.description ?? ""), attitude: String(relation.attitude ?? "") }];
         }) : existing?.relationships ?? [],
         capabilities: value("capabilities"), limitations: value("limitations"), notes: value("notes"),
       });
-      return JSON.stringify({ id: character.id, name: character.name, message: "角色卡已保存" });
+      // Newly created cards become readable in this same run even when a scope was set.
+      if (!characterId && characterScope && !characterScope.includes(character.id)) {
+        characterScope.push(character.id);
+      }
+      return JSON.stringify({
+        id: character.id,
+        name: character.name,
+        message: characterId ? "角色卡已更新" : "角色卡已新建；本轮可继续 get_character 读取该 ID",
+        created: !characterId,
+      });
     }
     if (call.name === "ask_user") {
       const question = requireString(input.question, "question").slice(0, 300);
@@ -1716,6 +1825,7 @@ function toStepUsage(
 ): StepUsage {
   const cacheMissTokens = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
   const normalized = { ...usage, cacheMissTokens };
+  const measuredInput = usage.cacheHitTokens + cacheMissTokens;
   return {
     promptTokens: usage.promptTokens,
     completionTokens: usage.completionTokens,
@@ -1725,6 +1835,7 @@ function toStepUsage(
     cost: pricing && !usage.estimated ? calculateUsageCost(normalized, pricing, at) : 0,
     currency: pricing?.currency ?? "CNY",
     ...(usage.estimated ? { estimated: true } : {}),
+    ...(!usage.estimated && measuredInput > 0 ? { cacheHitRate: usage.cacheHitTokens / measuredInput } : {}),
   };
 }
 

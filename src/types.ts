@@ -46,6 +46,8 @@ export interface UsageSummary {
   cost: number;
   currency: string;
   lastPromptTokens: number;
+  /** Provider-reported cache hit ratio. Estimated calls are never persisted or included. */
+  cacheHitRate: number;
 }
 
 export type ProviderId = "deepseek" | "openai-compatible";
@@ -228,6 +230,8 @@ export interface StepUsage {
   currency: string;
   /** True when numbers were estimated because the provider omitted stream usage. */
   estimated?: boolean;
+  /** Undefined for estimated calls; otherwise cacheHit/(cacheHit+cacheMiss). */
+  cacheHitRate?: number;
 }
 
 export type AgentEvent =

@@ -1,3 +1,26 @@
+export type ProseStyleSeverity = "error" | "warning" | "info";
+export type ProseStyleSubtype =
+  | "speech_extension" | "speech_interruption" | "speech_hesitation"
+  | "system_or_metadata" | "parenthetical_explanation" | "appositive_definition"
+  | "cause_or_judgment" | "ambiguous_dash"
+  | "narrator_redefinition" | "abstract_reframing" | "dialogue_correction" | "factual_exclusion";
+
+export interface ProseStyleIssue {
+  id: string;
+  kind: "dash" | "contrast";
+  subtype: ProseStyleSubtype;
+  severity: ProseStyleSeverity;
+  confidence: number;
+  start: number;
+  end: number;
+  line: number;
+  column: number;
+  sentence: string;
+  evidence: string;
+  reason: string;
+  suggestions: string[];
+}
+
 export interface ContrastStyleReport {
   count: number;
   allowed: number;
@@ -5,12 +28,11 @@ export interface ContrastStyleReport {
   dashCount: number;
   dashAllowed: number;
   frameCount: number;
+  issues: ProseStyleIssue[];
 }
 
-/**
- * Formulaic “不是……而是……” style redefinition frames.
- * Patterns stop at sentence punctuation so cross-sentence “不是。是” is not counted.
- */
+type MatchRange = { start: number; end: number; text: string };
+const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const CONTRAST_PATTERNS = [
   /(?:并)?不是[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
   /并非[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
@@ -19,115 +41,209 @@ const CONTRAST_PATTERNS = [
   /不在于[^\n。！？!?]{0,40}而在于/gu,
   /(?:仿佛|好像)[^\n。！？!?]{0,36}又(?:仿佛|好像)/gu,
 ];
+const EXPLANATION_SIGNALS = /^(?:这|那|因为|由于|意味着|也就是|换句话说|原来|其实|显然|说明|证明|仿佛|好像|更像|正是|即|不过是)/u;
+const ABSTRACT_WORDS = /(?:情绪|愤怒|恐惧|悲伤|沉默|妥协|失败|成功|反抗|勇气|希望|绝望|灵魂|命运|意义|感觉|姿态|态度|选择|真相)/u;
+const SOUND_OR_INTERJECTION = /[啊呀哦噢嗯呜哎唉哈嘿嘘喂诶咦嗡轰砰嘎]/u;
 
-/** Chinese / ASCII em-dash units used as parenthetical asides. */
-const DASH_UNIT = /(?:[—–―－]{1,2}|-{2})/g;
-
-type MatchRange = { start: number; end: number; text: string };
-
-function collectPatternMatches(text: string, patterns: RegExp[]): MatchRange[] {
-  const ranges: MatchRange[] = [];
-  for (const pattern of patterns) {
-    pattern.lastIndex = 0;
-    for (const match of text.matchAll(pattern)) {
-      const snippet = match[0];
-      const start = match.index ?? 0;
-      const end = start + snippet.length;
-      if (ranges.some((range) => start < range.end && end > range.start)) continue;
-      ranges.push({ start, end, text: snippet });
-    }
+/** Context-aware scanner for explanatory dashes and formulaic redefinition frames. */
+export function analyzeProseStyle(text: string): ProseStyleIssue[] {
+  const raw = [...scanDashes(text), ...scanContrasts(text)].sort((a, b) => a.start - b.start);
+  const candidates = raw.filter(issue => issue.severity === "warning" && issue.confidence >= 0.75);
+  // A single occurrence is advisory. Repetition is what turns the mannerism into a blocking style problem.
+  if (candidates.length >= 2) {
+    for (const issue of candidates) issue.severity = "error";
   }
-  ranges.sort((a, b) => a.start - b.start);
-  return ranges;
+  return raw;
 }
 
-/**
- * Mid-sentence em-dashes that append explanation, gloss, or elaboration.
- * Allowed exceptions:
- * - dialogue cut-off before a closing quote: 「我不是——」
- * - line-trailing dramatic pause with no same-line continuation: 而且——
- * - system / UI brackets: 【叮——万界最强系统已激活】
- */
-function collectExplanatoryDashMatches(text: string): MatchRange[] {
-  const ranges: MatchRange[] = [];
-  DASH_UNIT.lastIndex = 0;
-  for (const match of text.matchAll(DASH_UNIT)) {
-    const start = match.index ?? 0;
-    const dash = match[0];
-    const afterStart = start + dash.length;
-    const after = text.slice(afterStart);
-    const before = text.slice(0, start);
-
-    // Dialogue / quote cut-off: dash then closing quote.
-    if (/^\s*[」』"'”’]/.test(after)) continue;
-
-    // Trailing pause: nothing substantive on the same line after the dash.
-    const sameLineRest = after.match(/^[^\n]*/)?.[0] ?? "";
-    if (!/[^\s。！？!?…]/.test(sameLineRest)) continue;
-
-    // System / UI text inside fullwidth brackets.
-    if (/【[^】\n]{0,12}$/.test(before) && /^[^】\n]{0,60}】/.test(after)) continue;
-
-    // Need at least a short gloss after the dash (skip lone punctuation).
-    const afterClause = (after.match(/^[^\n。！？!?]{1,36}/)?.[0] ?? "").trim();
-    if (afterClause.length < 1) continue;
-
-    const beforeClause = (before.match(/[^\n。！？!?]{0,20}$/)?.[0] ?? "").trim();
-    const snippet = `${beforeClause}${dash}${afterClause}`.slice(0, 48);
-    const end = afterStart + Math.min(afterClause.length, 36);
-    if (ranges.some((range) => start < range.end && end > range.start)) continue;
-    ranges.push({ start, end, text: snippet });
-  }
-  return ranges;
-}
-
-function mergeRanges(a: MatchRange[], b: MatchRange[]): MatchRange[] {
-  const all = [...a, ...b].sort((x, y) => x.start - y.start);
-  const merged: MatchRange[] = [];
-  for (const item of all) {
-    if (merged.some((range) => item.start < range.end && item.end > range.start)) continue;
-    merged.push(item);
-  }
-  return merged;
-}
-
-/** Detect formulaic contrast frames and explanatory mid-sentence em-dashes. */
 export function contrastStyleReport(text: string): ContrastStyleReport {
-  const frames = collectPatternMatches(text, CONTRAST_PATTERNS);
-  const dashes = collectExplanatoryDashMatches(text);
-  const merged = mergeRanges(frames, dashes);
+  const issues = analyzeProseStyle(text);
+  const counted = issues.filter(issue => issue.severity !== "info");
+  const dashCount = counted.filter(issue => issue.kind === "dash").length;
+  const frameCount = counted.filter(issue => issue.kind === "contrast").length;
   const characters = text.replace(/\s/g, "").length;
-  // Contrast frames: ~1 / 4000 chars. Mid-sentence dash asides: nearly zero (~1 / 8000).
-  const frameAllowed = Math.floor(characters / 4_000);
-  const dashAllowed = Math.floor(characters / 8_000);
-  const allowed = frameAllowed + dashAllowed;
   return {
-    count: merged.length,
-    allowed,
-    examples: [...new Set(merged.map((item) => item.text))].slice(0, 5),
-    dashCount: dashes.length,
-    dashAllowed,
-    frameCount: frames.length,
+    count: counted.length,
+    allowed: 1 + Math.floor(characters / 4_000),
+    examples: counted.map(issue => issue.evidence).slice(0, 5),
+    dashCount,
+    dashAllowed: 1 + Math.floor(characters / 8_000),
+    frameCount,
+    issues,
   };
 }
 
 export function contrastStyleError(text: string): string | undefined {
-  const report = contrastStyleReport(text);
-  const frameOk = report.frameCount <= Math.floor(text.replace(/\s/g, "").length / 4_000);
-  const dashOk = report.dashCount <= report.dashAllowed;
-  if (frameOk && dashOk) return undefined;
+  const errors = analyzeProseStyle(text).filter(issue => issue.severity === "error");
+  if (!errors.length) return undefined;
+  const located = errors.slice(0, 5).map(issue =>
+    `第${issue.line}行${issue.column}列「${issue.evidence}」：${issue.reason}`,
+  );
+  return `正文中新增或重复的说明式写法过密（${errors.length}处）：${located.join("；")}。` +
+    "请只改命中句：保留事实和人物声线，优先让动作产生结果、用细节供读者判断，必要因果拆成独立句；对白中的延长、中断和真实纠正可以保留。";
+}
 
-  const parts: string[] = [];
-  if (!dashOk) {
-    parts.push(
-      `解释性破折号 ${report.dashCount} 处（最多 ${report.dashAllowed} 处）`,
-    );
+/** Return only issues introduced by `after`, using a multiset so duplicate mannerisms are detected. */
+export function newProseStyleIssues(before: string, after: string): ProseStyleIssue[] {
+  const remaining = new Map<string, number>();
+  for (const issue of analyzeProseStyle(before)) {
+    const key = issueFingerprint(issue);
+    remaining.set(key, (remaining.get(key) ?? 0) + 1);
   }
-  if (!frameOk) {
-    const frameAllowed = Math.floor(text.replace(/\s/g, "").length / 4_000);
-    parts.push(`对照句框架 ${report.frameCount} 处（最多 ${frameAllowed} 处）`);
+  return analyzeProseStyle(after).filter(issue => {
+    const key = issueFingerprint(issue);
+    const count = remaining.get(key) ?? 0;
+    if (count > 0) { remaining.set(key, count - 1); return false; }
+    return true;
+  });
+}
+
+export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undefined {
+  const errors = issues.filter(issue => issue.severity === "error");
+  if (!errors.length) return undefined;
+  return `本次修改新增 ${errors.length} 处高置信度说明式写法：` + errors.slice(0, 5)
+    .map(issue => `第${issue.line}行「${issue.evidence}」`).join("；") + "。请局部改写命中句。";
+}
+
+function scanDashes(text: string): ProseStyleIssue[] {
+  const issues: ProseStyleIssue[] = [];
+  const matches = collectMatches(text, DASH_UNIT);
+  const consumed = new Set<number>();
+  for (let i = 0; i < matches.length; i += 1) {
+    if (consumed.has(i)) continue;
+    const match = matches[i];
+    const bounds = sentenceBounds(text, match.start);
+    const next = matches[i + 1];
+    const lineText = text.slice(text.lastIndexOf("\n", match.start - 1) + 1, lineEnd(text, match.start));
+    const insideQuote = quoteDepthAt(text, match.start) > 0;
+    const before = text.slice(bounds.start, match.start).trim();
+    const after = text.slice(match.end, bounds.end).trim();
+
+    if (isMetadataLine(lineText) || insideFullwidthBracket(text, match.start) || isNumericRange(text, match)) {
+      issues.push(makeIssue(text, match, "dash", "system_or_metadata", "info", 0.99,
+        "标题、列表、系统提示或数值连接中的符号，不属于说明体。", []));
+      continue;
+    }
+
+    if (insideQuote) {
+      const prevChar = previousHan(text, match.start);
+      const nextChar = nextHan(text, match.end);
+      const closesSoon = /^[\s。！？!?…]*[」』”’"']/u.test(text.slice(match.end));
+      if (prevChar && nextChar && prevChar === nextChar) {
+        issues.push(makeIssue(text, match, "dash", "speech_hesitation", "info", 0.98,
+          "破折号位于对白内部并连接重复音节，表示迟疑或结巴。", []));
+      } else if ((prevChar && SOUND_OR_INTERJECTION.test(prevChar)) || closesSoon) {
+        issues.push(makeIssue(text, match, "dash", closesSoon ? "speech_interruption" : "speech_extension", "info", 0.94,
+          "破折号位于对白内部，表示声音延长或话语中断。", []));
+      } else if (EXPLANATION_SIGNALS.test(after)) {
+        issues.push(makeIssue(text, match, "dash", "cause_or_judgment", "warning", 0.78,
+          "虽在对白中，后半句仍以解释信号重新说明前半句。", commonSuggestions()));
+      } else {
+        issues.push(makeIssue(text, match, "dash", "speech_extension", "info", 0.72,
+          "破折号处于对白内部，优先视为拖音、停顿或语气变化。", []));
+      }
+      continue;
+    }
+
+    if (next && next.start < bounds.end) {
+      consumed.add(i + 1);
+      issues.push(makeIssue(text, { start: match.start, end: next.end, text: text.slice(match.start, next.end) },
+        "dash", "parenthetical_explanation", "warning", 0.96,
+        "成对破折号包围插入说明，是高置信度的夹注结构。", commonSuggestions()));
+      continue;
+    }
+    const subtype: ProseStyleSubtype = EXPLANATION_SIGNALS.test(after)
+      ? "cause_or_judgment"
+      : after.length <= 18 && /[是为叫称]|(?:一种|一个|一名)/u.test(after)
+        ? "appositive_definition" : "ambiguous_dash";
+    const confidence = subtype === "ambiguous_dash" ? 0.68 : 0.88;
+    issues.push(makeIssue(text, match, "dash", subtype, "warning", confidence,
+      subtype === "ambiguous_dash"
+        ? "破折号位于叙述句中，但仅凭局部结构无法确定是否为说明，应人工复核。"
+        : "后半句对前半句作定义、原因或意义补充。", commonSuggestions()));
   }
-  return `正文中说明性写法过密（${parts.join("；")}）。命中示例：${report.examples.join("；")}。` +
-    `请重写命中句：叙述里不要用“画面/动作——补充说明”的破折号结构，改为句号拆句或直接写可观察细节；` +
-    `对白被打断可用“话没说完——」”。同时避免“不是……而是……”“不是……是……”等先否定再定义的框架。`;
+  return issues;
+}
+
+function scanContrasts(text: string): ProseStyleIssue[] {
+  const issues: ProseStyleIssue[] = [];
+  for (const match of collectMatches(text, ...CONTRAST_PATTERNS)) {
+    const inQuote = quoteDepthAt(text, match.start) > 0;
+    const bounds = sentenceBounds(text, match.start);
+    const sentence = text.slice(bounds.start, bounds.end);
+    if (inQuote) {
+      issues.push(makeIssue(text, match, "contrast", "dialogue_correction", "info", 0.88,
+        "结构位于对白中，优先视为人物纠正事实或反驳误解。", []));
+      continue;
+    }
+    const abstract = /(?:这|那|这种|这一切|他的|她的)/u.test(sentence.slice(0, Math.max(0, match.start - bounds.start + 8)))
+      || ABSTRACT_WORDS.test(match.text);
+    issues.push(makeIssue(text, match, "contrast", abstract ? "abstract_reframing" : "factual_exclusion",
+      "warning", abstract ? 0.9 : 0.7,
+      abstract
+        ? "叙述者先否定表象再定义抽象意义，容易形成模板化解释。"
+        : "这是叙述中的否定—肯定结构，可能是事实排除，也可能是说明框架。",
+      ["直接陈述真正成立的事实", "若确有误解需要纠正，把纠正落到人物行动或对白中"]));
+  }
+  return issues;
+}
+
+function makeIssue(text: string, range: MatchRange, kind: "dash" | "contrast", subtype: ProseStyleSubtype,
+  severity: ProseStyleSeverity, confidence: number, reason: string, suggestions: string[]): ProseStyleIssue {
+  const bounds = sentenceBounds(text, range.start);
+  const sentence = text.slice(bounds.start, bounds.end).trim();
+  const { line, column } = lineColumn(text, range.start);
+  const evidence = sentence.length <= 90 ? sentence : `${sentence.slice(0, 87)}…`;
+  return {
+    id: `${kind}:${subtype}:${range.start}`, kind, subtype, severity, confidence,
+    start: range.start, end: range.end, line, column, sentence, evidence, reason, suggestions,
+  };
+}
+
+function collectMatches(text: string, ...patterns: RegExp[]): MatchRange[] {
+  const ranges: MatchRange[] = [];
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const start = match.index ?? 0, end = start + match[0].length;
+      if (!ranges.some(range => start < range.end && end > range.start)) ranges.push({ start, end, text: match[0] });
+    }
+  }
+  return ranges.sort((a, b) => a.start - b.start);
+}
+
+function sentenceBounds(text: string, index: number): { start: number; end: number } {
+  const before = text.slice(0, index);
+  const boundary = Math.max(before.lastIndexOf("。"), before.lastIndexOf("！"), before.lastIndexOf("？"), before.lastIndexOf("\n"));
+  const rest = text.slice(index);
+  const match = /[。！？!?\n]/u.exec(rest);
+  return { start: boundary + 1, end: match ? index + match.index + 1 : text.length };
+}
+function lineEnd(text: string, index: number): number { const end = text.indexOf("\n", index); return end < 0 ? text.length : end; }
+function lineColumn(text: string, index: number): { line: number; column: number } {
+  const prefix = text.slice(0, index), last = prefix.lastIndexOf("\n");
+  return { line: prefix.split("\n").length, column: index - last };
+}
+function quoteDepthAt(text: string, index: number): number {
+  const stack: string[] = [];
+  const pairs: Record<string, string> = { "「": "」", "『": "』", "“": "”", "‘": "’" };
+  for (let i = 0; i < index; i += 1) {
+    const char = text[i];
+    if (pairs[char]) stack.push(pairs[char]);
+    else if (stack.at(-1) === char) stack.pop();
+    else if (char === '"') stack.at(-1) === '"' ? stack.pop() : stack.push('"');
+  }
+  return stack.length;
+}
+function insideFullwidthBracket(text: string, index: number): boolean {
+  const start = text.lastIndexOf("【", index), end = text.lastIndexOf("】", index);
+  return start > end && text.indexOf("】", index) >= 0;
+}
+function isMetadataLine(line: string): boolean { return /^\s*(?:#{1,6}\s|[-*+]\s|---+\s*$|——\s*\S+\s*$)/u.test(line); }
+function isNumericRange(text: string, range: MatchRange): boolean { return /\d/u.test(text[range.start - 1] ?? "") && /\d/u.test(text[range.end] ?? ""); }
+function previousHan(text: string, index: number): string { return text.slice(0, index).match(/[\p{Script=Han}A-Za-z]$/u)?.[0] ?? ""; }
+function nextHan(text: string, index: number): string { return text.slice(index).match(/^[\s，、]*(?:([\p{Script=Han}A-Za-z]))/u)?.[1] ?? ""; }
+function commonSuggestions(): string[] { return ["删除重复说明，只保留可观察结果", "用动作或感官细节承载信息", "因果不可省略时拆成两个独立句"]; }
+function issueFingerprint(issue: ProseStyleIssue): string {
+  return `${issue.kind}:${issue.subtype}:${issue.sentence.replace(/\s+/g, "").slice(0, 120)}`;
 }

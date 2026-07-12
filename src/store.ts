@@ -507,10 +507,14 @@ export class WriterStore {
       FROM model_usage WHERE session_id=?`).get(sessionId, sessionId) as Row;
     const promptTokens = Number(row.prompt_tokens);
     const completionTokens = Number(row.completion_tokens);
+    const cacheHitTokens = Number(row.cache_hit_tokens);
+    const cacheMissTokens = Number(row.cache_miss_tokens);
+    const measuredInput = cacheHitTokens + cacheMissTokens;
     return {
-      promptTokens, completionTokens, cacheHitTokens: Number(row.cache_hit_tokens),
-      cacheMissTokens: Number(row.cache_miss_tokens), totalTokens: promptTokens + completionTokens,
+      promptTokens, completionTokens, cacheHitTokens,
+      cacheMissTokens, totalTokens: promptTokens + completionTokens,
       cost: Number(row.cost), currency: String(row.currency), lastPromptTokens: Number(row.last_prompt_tokens),
+      cacheHitRate: measuredInput > 0 ? cacheHitTokens / measuredInput : 0,
     };
   }
 
