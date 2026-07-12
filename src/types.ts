@@ -234,12 +234,24 @@ export interface StepUsage {
   cacheHitRate?: number;
 }
 
+export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+
+export interface AgentTodoItem {
+  id: string;
+  content: string;
+  status: AgentTodoStatus;
+}
+
+export type PermissionMode = "ask" | "auto" | "plan";
+
 export type AgentEvent =
   | { type: "step_start"; step: number }
   | { type: "text"; text: string; channel?: "output" | "reasoning" }
   | { type: "tool"; name: string }
   | { type: "step_done"; step: number }
   | { type: "proposal"; proposal: Proposal }
+  | { type: "todos"; todos: AgentTodoItem[] }
+  | { type: "mode"; mode: PermissionMode }
   | { type: "character"; character: Character }
   | { type: "done"; sessionId: string }
   | { type: "cancelled"; sessionId: string }

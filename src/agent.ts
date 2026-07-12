@@ -1,4 +1,4 @@
-import type { AgentEvent, Character, ModelConfig, StepUsage, UsageSummary } from "./types.js";
+import type { AgentEvent, Character, ModelConfig, PermissionMode, StepUsage, UsageSummary } from "./types.js";
 import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
@@ -9,6 +9,15 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt, styleFingerprint } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 import { createCreativeOutlineBrief } from "./creative_outline.js";
+import {
+  formatTodosForPrompt,
+  loadAgentSettings,
+  loadSkillById,
+  normalizeTodos,
+  permissionModeLabel,
+  projectInstructionsPrompt,
+  skillsCatalogPrompt,
+} from "./agent_runtime.js";
 import { createHash } from "node:crypto";
 
 type ApiMessage = {
@@ -132,7 +141,7 @@ const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "audit_prose_style",
-      description: "对指定正文做确定性风格审计，返回破折号与否定—定义句式的行列、用途分类、严重度、置信度、原因和修改策略。审查正文时先调用；对白拖音、中断和真实纠正会被单独分类，不按说明体计数",
+      description: "对指定正文做风格审计（破折号/说明句式分类）。info 与 warning 不拦截提案；仅过密的高置信说明体（error）会拦截。对白拖音/中断/迟疑、叙事停顿—揭示、同位命名默认允许，不要为消符号而改写",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "项目内正文 Markdown 路径" } },
@@ -326,6 +335,49 @@ const TOOLS = deepFreeze([
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "manage_todos",
+      description: "维护本轮多步任务清单（对齐 code agent 的 todo 工具）。复杂请求（≥3 步）开始时写入清单，推进时更新状态；同一时刻最多一项 in_progress。简单单步请求不必调用",
+      parameters: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            maxItems: 30,
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string", description: "稳定短 id，如 t1" },
+                content: { type: "string", description: "任务描述" },
+                status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
+              },
+              required: ["id", "content", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["todos"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "load_skill",
+      description: "加载项目技能全文（.writer/skills 或 .agents/skills 下的 SKILL.md）。仅当技能目录中有匹配项且细则对当前任务必要时调用",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "技能 id（目录名）或 name" },
+        },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    },
+  },
 ] as const);
 
 const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
@@ -490,16 +542,24 @@ ${stylePointer}
 `;
 }
 
-function executionRulesPrompt(): string {
+function executionRulesPrompt(mode: PermissionMode): string {
+  const modeRule = mode === "plan"
+    ? "3. 当前为 plan 模式：只做检索、分析与计划，禁止调用 propose_document / propose_document_patch / propose_outline_patch / save_character；用最终回复给出可执行计划与待确认点。"
+    : mode === "auto"
+      ? "3. 当前为 auto 模式：写正文、续写、扩写或改写必须提交文档提案（会自动写入文件），不能用最终回复代替正文。提案成功后立即停止。"
+      : "3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。";
   return `执行规则：
 1. 按本轮任务计划决定是否读取项目资料。需要项目事实时先 search_project（世界观/专名 scope=lore，情节计划 scope=outline，已写正文 scope=chapters），再读取最小相关片段；每轮最多搜索两次。区分项目事实与推测。
 2. 保持既有人物、世界观、视角和 Markdown 结构。局部修改用补丁；大纲节点用大纲补丁；新建或全文重写才提交完整文档。新建设定→lore/，新建大纲→outline/，新建正文→chapters/；不要把设定写进章节，也不要把正文写进 lore。
-3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。
+${modeRule}
 4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
 5. 管理角色使用 save_character：修改已有卡必须传 id，并先读取完整卡片、保留未要求修改的字段；新建卡省略 id。写作时只读取所需角色字段。
 6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
 7. 资料复用：会话工作记忆、本轮工具结果、带 reused 标记的返回可直接复用，禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
-8. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。`;
+8. 复杂多步请求（≥3 步）用 manage_todos 维护清单并随进度更新；简单单步不必。同一时刻最多一项 in_progress。
+9. 若系统提示列出了项目技能且细则对当前任务必要，先 load_skill 再执行；不要编造不存在的技能。
+10. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。
+当前执行模式：${permissionModeLabel(mode)}`;
 }
 
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
@@ -649,8 +709,8 @@ function taskInstructions(mode: WritingTaskMode): string {
 3. 不要通读整本大纲、不要 list_outline_nodes 超过一次、不要对同一路径反复 read。
 4. 落笔前在内部明确：场景开场、人物目标、阻力、不可逆结果；正文默认 chapters/；设定说明不进正文。
 5. 写作时持续对照风格锚定；对白区分人物；不引入未支撑设定。冲突、情欲、暴力等按剧情直写，不自行降级为含蓄暗示或道德旁白。
-6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。
-7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。`;
+6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。叙事性破折号（停顿、揭示、对白拖音）可正常使用，不必回避。
+7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。偶发「因为/也就是」类说明句不会拦截提案；仅说明体过密时系统才会报错，届时再局部改写命中句。`;
   if (mode === "rewrite") return `本次工作流（内部执行，不输出分析过程）：
 - 先读「风格锚定」与原文声线；改写后的句长、对白密度须仍贴近原文/样本，除非作者明确要求换风格。
 - 只改变作者明确要求调整的维度，保持其余事件事实、人物动机和信息顺序不变。
@@ -733,6 +793,8 @@ export async function runAgent(options: {
   model?: ModelConfig;
   models?: Partial<Record<"agent" | "inline" | "writer" | "reviewer", ModelConfig>>;
   maxTurns?: number;
+  /** 覆盖 .writer/agent.json 中的权限模式 */
+  permissionMode?: PermissionMode;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }): Promise<void> {
@@ -746,10 +808,17 @@ export async function runAgent(options: {
   }
   if (!store.sessionExists(sessionId)) throw new Error("会话不存在");
 
+  const permissionMode = options.permissionMode ?? loadAgentSettings(project).permissionMode;
+  emit({ type: "mode", mode: permissionMode });
+  const existingTodos = store.sessionTodos(sessionId);
+  if (existingTodos.length) emit({ type: "todos", todos: existingTodos });
+
   const history = compactHistory(store.messages(sessionId, 40).filter((message) => message.role !== "tool" && message.role !== "system"));
   const fastTask = fastRouteWritingTask(project, store, sessionId, prompt);
   const planned = fastTask ? { task: fastTask } : await planWritingTask(model, project, store, prompt, history, signal);
   const task = planned.task;
+  // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
+  if (permissionMode === "plan") task.documentProposalRequired = false;
   const executionModel = task.mode === "audit"
     ? options.models?.reviewer ?? model
     : task.mode === "rewrite"
@@ -769,6 +838,11 @@ export async function runAgent(options: {
   const historicalContext = historicalConversationContext(history);
   const artifactContext = recentArtifactsContext(store, sessionId, project);
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task);
+  const projectInstructions = projectInstructionsPrompt(project);
+  const skillsCatalog = skillsCatalogPrompt(project);
+  const todosPrompt = existingTodos.length
+    ? `本会话未完成任务清单（可用 manage_todos 更新）：\n${formatTodosForPrompt(existingTodos)}`
+    : undefined;
   const preferredSample = options.selectedDocumentBlocks
     ?.map((block) => block.text?.trim() ?? "")
     .filter(Boolean)
@@ -781,15 +855,19 @@ export async function runAgent(options: {
   };
   const stableStyleContext = stableStyleGroundingPrompt(project, store, styleOptions);
   const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
+  const toolContext: ToolExecutionContext = { permissionMode };
   const messages: ApiMessage[] = [
     { role: "system", content: writingSystemPrompt(project) },
-    { role: "system", content: executionRulesPrompt() },
+    { role: "system", content: executionRulesPrompt(permissionMode) },
+    ...(projectInstructions ? [{ role: "system" as const, content: projectInstructions }] : []),
+    ...(skillsCatalog ? [{ role: "system" as const, content: skillsCatalog }] : []),
     ...(stableStyleContext ? [{ role: "system" as const, content: stableStyleContext }] : []),
     ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
     ...(historicalContext ? [historicalContext] : []),
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
     ...(dynamicStyleContext ? [{ role: "system" as const, content: dynamicStyleContext }] : []),
     ...(bootstrapContext ? [{ role: "system" as const, content: bootstrapContext }] : []),
+    ...(todosPrompt ? [{ role: "system" as const, content: todosPrompt }] : []),
     ...(artifactContext ? [{ role: "system" as const, content: artifactContext }] : []),
     ...(selectedContext ? [{ role: "system" as const, content: selectedContext }] : []),
     { role: "user", content: prompt },
@@ -848,7 +926,7 @@ export async function runAgent(options: {
             error: `本轮文档读取已达 ${MAX_DOCUMENT_READS_PER_RUN} 次上限；请使用写作引导、工作记忆和已有工具结果继续写作或提交提案，不要再次读取。`,
           });
         } else {
-          toolResult = executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope);
+          toolResult = executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
         if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_outline_patch") {
           try {
@@ -932,9 +1010,10 @@ export async function runAgent(options: {
 }
 
 const REVIEW_PROMPT = `你现在是小说终审编辑。目标是降低机器生成感，不是把文字改成另一种统一腔调。
-先调用 audit_prose_style 获取带行列和语境分类的确定性问题。只把 error 与高置信度 warning 当作修改候选；speech_extension、speech_interruption、speech_hesitation、dialogue_correction 和 system_or_metadata 必须保留。ambiguous_dash 需结合上下文人工判断，不能见符号就删。
-逐段检查并修改：模板化转折和连接词；紧跟动作、对白或细节之后的解释回声；用单一标签包办人物的写法；整齐但空泛的排比和三项并列；句长、段长和句式过度均匀；无意义的总结、升华与强调；角色都说同一种完整而正确的话。
-说明类问题优先用三种正向策略处理：让动作产生结果；让可观察细节供读者判断；必要因果拆成独立句。人物纠正事实、反驳误解以及对白中的延长、中断、迟疑属于声线，不得机械改写。
+先调用 audit_prose_style 获取带行列和语境分类的问题。优先处理 severity=error；warning 仅在明显模板化且影响阅读时改；info 一律保留。
+必须保留：对白拖音/中断/迟疑（speech_*）、对话纠正（dialogue_correction）、系统/元数据、叙事停顿—揭示与同位命名（ambiguous_dash / appositive_definition）。见破折号就删是错误策略。
+逐段检查并修改：模板化转折和连接词；紧跟动作、对白或细节之后的重复解释回声；用单一标签包办人物的写法；整齐但空泛的排比；句长段长过度均匀；无意义的总结升华；角色都说同一种完整书面语。
+说明类问题优先：让动作产生结果；用可观察细节供读者判断；必要因果拆成独立句。不要为“消说明体”而把有力的停顿、揭示或人物声线抹平。
 在忠于原意的前提下让行文更生动：把笼统判断和情绪说明尽量落到可见动作、选择及其代价、身体反应、环境变化、声音、触感或人物独有的观察上。证据已经足够时直接删掉解释，不必逐句改写。让对白带有身份、关系和当下情绪造成的语气差异；按场景张力调整句长、停顿和段落节奏。优先选择准确、有画面的动词和名词，不要靠密集形容词、副词、华丽比喻、感官清单或连续短句制造虚假的生动感。不得为了增加画面而凭空添加事件、道具、设定、心理动机或角色不知道的信息。
 不要用随机同义替换、强行拆句、故意病句、滥加口语或无关细节伪装成人类写作。机器感应通过减少句法模板、增加语义与观察角度的差异、保留叙事重点造成的轻重和不对称来消除。
 优先保留具体、有个性、略带不规则的表达。允许短句、停顿、省略和留白。不得新增剧情、设定或人物动机，不得改变事实、视角、时序和角色声线。没有问题的句子保持原样，禁止为了显示工作量而改写。
@@ -1264,14 +1343,19 @@ function attachArtifactId(content: string, artifactId: number): string {
   }
 }
 
+type ToolExecutionContext = {
+  permissionMode: PermissionMode;
+};
+
 function executeToolCached(
   call: ToolAccumulator, project: WriterProject, store: WriterStore, sessionId: string,
   emit: (event: AgentEvent) => void, counts: Map<string, number>, characterScope?: number[],
+  context: ToolExecutionContext = { permissionMode: "ask" },
 ): string {
-  if (!CACHEABLE_TOOLS.has(call.name)) return executeTool(call, project, store, sessionId, emit, characterScope);
+  if (!CACHEABLE_TOOLS.has(call.name)) return executeTool(call, project, store, sessionId, emit, characterScope, context);
   let input: Record<string, unknown>;
   try { input = JSON.parse(call.arguments || "{}") as Record<string, unknown>; }
-  catch { return executeTool(call, project, store, sessionId, emit, characterScope); }
+  catch { return executeTool(call, project, store, sessionId, emit, characterScope, context); }
   const normalized = Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) =>
     [key, typeof value === "string" ? value.trim() : value]));
   const path = typeof normalized.path === "string" ? normalized.path : undefined;
@@ -1334,7 +1418,7 @@ function executeToolCached(
         : "相同读取已执行过且文档未变；以下从工作记忆恢复完整结果，请直接使用，禁止再次调用。",
       cached.id);
   }
-  const result = executeTool(call, project, store, sessionId, emit, characterScope);
+  const result = executeTool(call, project, store, sessionId, emit, characterScope, context);
   let digest = `${call.name} 已完成`;
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
@@ -1469,6 +1553,43 @@ function compactCompletedToolCalls(messages: ApiMessage[]): void {
   }
 }
 
+function maybeAutoAcceptProposal(
+  store: WriterStore,
+  proposal: { id: number; status: string },
+  permissionMode: PermissionMode,
+  emit: (event: AgentEvent) => void,
+): { proposalId: number; status: string; message: string; autoAccepted?: boolean } {
+  if (permissionMode !== "auto" || proposal.status !== "pending") {
+    return {
+      proposalId: proposal.id,
+      status: proposal.status,
+      message: permissionMode === "plan" ? "plan 模式不应产生提案" : "已等待用户审批",
+    };
+  }
+  try {
+    const accepted = store.acceptProposal(proposal.id);
+    emit({ type: "proposal", proposal: accepted });
+    return {
+      proposalId: accepted.id,
+      status: accepted.status,
+      autoAccepted: true,
+      message: "auto 模式：提案已自动写入文件",
+    };
+  } catch (error) {
+    return {
+      proposalId: proposal.id,
+      status: "pending",
+      message: `自动接受失败：${error instanceof Error ? error.message : String(error)}；提案仍待审批`,
+    };
+  }
+}
+
+function assertWritableMode(permissionMode: PermissionMode, toolName: string): void {
+  if (permissionMode === "plan") {
+    throw new Error(`plan 模式禁止 ${toolName}；请先用最终回复给出计划，或让用户切换到 ask/auto 模式后再写入`);
+  }
+}
+
 function executeTool(
   call: ToolAccumulator,
   project: WriterProject,
@@ -1476,6 +1597,7 @@ function executeTool(
   sessionId: string,
   emit: (event: AgentEvent) => void,
   characterScope?: number[],
+  context: ToolExecutionContext = { permissionMode: "ask" },
 ): string {
   let input: Record<string, unknown>;
   try {
@@ -1623,6 +1745,7 @@ function executeTool(
       return JSON.stringify(new OutlineStore(project).compareWithDraft(requireString(input.id, "id")));
     }
     if (call.name === "propose_outline_patch") {
+      assertWritableMode(context.permissionMode, "propose_outline_patch");
       const outline = new OutlineStore(project);
       const id = requireString(input.id, "id");
       const nodeSection = outline.section(id);
@@ -1636,9 +1759,10 @@ function executeTool(
       if (occurrences !== 1) throw new Error(`search 在大纲中出现 ${occurrences} 次，必须唯一`);
       const proposal = store.createProposal(sessionId, outline.sourcePath, content.replace(search, replace), requireString(input.summary, "summary"));
       emit({ type: "proposal", proposal });
-      return JSON.stringify({ proposalId: proposal.id, status: proposal.status, nodeId: id, message: "大纲局部修改已等待用户审批" });
+      return JSON.stringify({ nodeId: id, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });
     }
     if (call.name === "propose_document") {
+      assertWritableMode(context.permissionMode, "propose_document");
       const path = requireString(input.path, "path");
       if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
       const proposedContent = requireString(input.content, "content");
@@ -1653,9 +1777,10 @@ function executeTool(
         requireString(input.summary, "summary"),
       );
       emit({ type: "proposal", proposal });
-      return JSON.stringify({ proposalId: proposal.id, status: proposal.status, message: "已等待用户审批" });
+      return JSON.stringify(maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit));
     }
     if (call.name === "propose_document_patch") {
+      assertWritableMode(context.permissionMode, "propose_document_patch");
       const path = requireString(input.path, "path");
       if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
       const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
@@ -1678,7 +1803,7 @@ function executeTool(
       if (styleError) throw new Error(styleError);
       const proposal = store.createProposal(sessionId, path, content, requireString(input.summary, "summary"));
       emit({ type: "proposal", proposal });
-      return JSON.stringify({ proposalId: proposal.id, status: proposal.status, edits: edits.length, message: "局部修改已等待用户审批" });
+      return JSON.stringify({ edits: edits.length, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });
     }
     if (call.name === "list_characters") {
       const allowedIds = characterScope === undefined ? undefined : new Set(characterScope);
@@ -1710,6 +1835,7 @@ function executeTool(
       return JSON.stringify(selected);
     }
     if (call.name === "save_character") {
+      assertWritableMode(context.permissionMode, "save_character");
       const characterId = typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined;
       const existing = characterId ? store.characters().find(item => item.id === characterId) : undefined;
       if (characterId && !existing) throw new Error("要修改的角色不存在");
@@ -1756,6 +1882,29 @@ function executeTool(
         ? `${question}\n\n${options.map((opt, i) => `选项 ${i + 1}：${opt}`).join("\n")}`
         : question;
       return JSON.stringify({ status: "waiting", message: "问题已提交，等待用户回复", displayMessage: message, question, options: options ?? undefined });
+    }
+    if (call.name === "manage_todos") {
+      const todos = normalizeTodos(input.todos);
+      store.saveSessionTodos(sessionId, todos);
+      emit({ type: "todos", todos });
+      const completed = todos.filter(item => item.status === "completed").length;
+      const active = todos.filter(item => item.status === "in_progress").map(item => item.id);
+      return JSON.stringify({
+        todos,
+        summary: { total: todos.length, completed, inProgress: active },
+        message: active.length ? `任务清单已更新；进行中：${active.join("、")}` : "任务清单已更新",
+      });
+    }
+    if (call.name === "load_skill") {
+      const skill = loadSkillById(project, requireString(input.id, "id"));
+      if (!skill) throw new Error("未找到该技能；请核对系统提示中的技能目录");
+      return JSON.stringify({
+        id: skill.id,
+        name: skill.name,
+        description: skill.description,
+        path: skill.path,
+        content: skill.body,
+      });
     }
     return JSON.stringify({ error: `未知工具：${call.name}` });
   } catch (error) {

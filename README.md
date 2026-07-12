@@ -6,8 +6,13 @@
 
 - **项目化写作**：`writer.yaml` + Markdown 文档树，设定、大纲、正文分目录存放
 - **Web 写作工作台**：浏览器中对话、读文档、审批修改；支持局域网与临时公网分享
+- **终端 REPL（TUI）**：`writer chat` 交互式对话，斜杠命令 / 提案审查，对齐主流 code agent 终端体验
 - **一次生成（CLI）**：`writer run` 执行单次写作任务后退出，适合脚本或批处理
-- **修改提案与撤销**：Agent 不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo
+- **权限模式**：`ask`（提案审批）/ `auto`（自动写入）/ `plan`（只读规划），类似 code agent 的 auto-run / plan mode
+- **任务清单**：`manage_todos` 多步任务跟踪，会话内可查看
+- **项目指令**：自动加载 `WRITER.md` / `AGENTS.md` / `CLAUDE.md` / `.writer/instructions.md`
+- **项目技能**：`.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md`，按需 `load_skill`
+- **修改提案与撤销**：Agent 默认不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo
 - **角色卡**：结构化角色资料，可供检索与写作引用
 - **结构化大纲**：幕 / 章 / 场景节点，可与正文对照校验
 - **风格模板**：内置网文爽文、传统文学、轻小说、悬疑推理、玄幻仙侠等
@@ -52,18 +57,21 @@ writer init ./my-novel
 writer init ./my-novel --title "我的小说"
 cd my-novel
 
-# 2. 启动 Web 工作台（默认打开浏览器）
-writer
-# 或显式启动
+# 2a. 终端 REPL（推荐，类 code agent）
+writer chat
+
+# 2b. 或启动 Web 工作台
 writer web
 
-# 3. 在界面中配置 API Key（DeepSeek / OpenAI 兼容），开始对话创作
+# 3. 配置 API Key（/connect 或 Web 设置），开始对话创作
 ```
 
-也可在不进入 Web 的情况下做一次生成：
+也可在不进入交互界面的情况下做一次生成：
 
 ```bash
 writer run "根据大纲写第一章开场，约 1500 字"
+writer run "只出大纲方案，不改文件" --mode plan
+writer run "续写并自动落盘" --mode auto -c   # -c 继续最近会话
 ```
 
 ## 命令行
@@ -72,6 +80,7 @@ writer run "根据大纲写第一章开场，约 1500 字"
 |------|------|
 | `writer [项目目录]` | 启动本地 Web 工作台并打开浏览器（默认当前目录） |
 | `writer init [目录] [--title 名称]` | 初始化写作项目 |
+| `writer chat` / `writer tui` | 交互式终端 Agent（默认续接最近会话） |
 | `writer web` / `writer serve` | 启动常驻 Web 工作台 |
 | `writer run <指令>` | 执行一次写作生成后退出 |
 | `writer export` | 按章节顺序导出作品 |
@@ -90,15 +99,52 @@ writer web --debug                # 打印 step 内容 + 模型请求/响应体
 writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / output（推荐排查 UI step）
 ```
 
+### `writer chat` 常用选项
+
+```bash
+writer chat -p ./my-novel
+writer chat -c                      # 续接最近会话（默认行为）
+writer chat -s <会话ID>
+writer chat --mode plan             # 只读规划
+writer chat --mode auto             # 提案自动写入
+```
+
+TUI 斜杠命令要点：`/mode`、`/plan`、`/todos`、`/skills`、`/accept`、`/proposals`、`/status`。
+
 ### `writer run` 常用选项
 
 ```bash
 writer run "续写第二章" -p ./my-novel
 writer run "润色大纲" --session <会话ID>
+writer run "继续刚才的修改" -c
+writer run "先出计划" --mode plan
+writer run "自动写入" --mode auto
 writer run "检查人设一致性" --json    # 逐行输出 JSON 事件
 writer run "..." --debug
 writer run "..." --debug-steps      # 仅 step 调试输出
 ```
+
+### 权限模式与项目指令
+
+| 模式 | 行为 |
+|------|------|
+| `ask`（默认） | 文档修改以提案提交，需作者审批 |
+| `auto` | 提案创建后自动写入文件（可 undo） |
+| `plan` | 禁止写入类工具，只做检索与规划 |
+
+设置保存在 `.writer/agent.json`。
+
+项目指令（自动注入 system prompt，按优先级取第一个存在的文件）：
+
+1. `WRITER.md`
+2. `AGENTS.md`
+3. `CLAUDE.md`
+4. `.writer/instructions.md`
+
+项目技能目录：
+
+- `.writer/skills/<id>/SKILL.md`
+- `.agents/skills/<id>/SKILL.md`
 
 ### `writer export`
 
@@ -125,9 +171,12 @@ my-novel/
 │   ├── side/                # 支线 / 间章（可选）
 │   └── archive/             # 旧稿 / 弃用版（可对 Agent 隐藏）
 ├── characters/              # 角色卡（jsonl / 单卡 JSON）
+├── WRITER.md                # 项目指令（仿 AGENTS.md，init 时生成模板）
 └── .writer/                 # 运行时私有数据（勿手改关键文件）
     ├── writer.db            # 会话、提案、用量等
     ├── providers.json       # 模型供应商配置（含 API Key；可整文件迁移）
+    ├── agent.json           # 权限模式等 Agent 设置
+    ├── skills/              # 可选项目技能
     └── ...
 ```
 

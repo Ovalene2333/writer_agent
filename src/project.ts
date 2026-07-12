@@ -85,6 +85,23 @@ export class WriterProject {
     project.writeRaw("lore/world.md", "# 故事设定\n\n世界规则、专名、组织、力量体系等**事实**写在 `lore/` 下；不要写成章节正文。\n\n");
     project.writeRaw("outline/outline.md", "# 故事大纲\n\n情节计划写在 `outline/` 下。场景节点推荐字段：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。\n\n");
     project.writeRaw("chapters/chapter-001.md", "# 第一章\n\n");
+    project.writeRaw("WRITER.md", `# 项目指令
+
+本文件会被 Writer Agent 自动加载（也支持 AGENTS.md / CLAUDE.md / .writer/instructions.md）。
+
+## 作者偏好
+
+- 语言：与 writer.yaml 一致
+- 禁止事项：（在此填写硬性约束）
+- 风格要点：（在此填写节奏、对白、视角等）
+
+## 协作约定
+
+- 多步任务用 manage_todos 维护清单
+- 局部修改优先 propose_document_patch
+- 设定进 lore/，大纲进 outline/，正文进 chapters/
+`);
+    mkdirSync(resolve(project.privateDir, "skills"), { recursive: true });
     project.writeCharacterCardsJsonl("");
     return project;
   }

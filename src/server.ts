@@ -8,13 +8,20 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
+import {
+  isPermissionMode,
+  listProjectSkills,
+  loadAgentSettings,
+  loadProjectInstructions,
+  saveAgentSettings,
+} from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate, listStyleTemplates } from "./templates.js";
-import type { AgentEvent } from "./types.js";
+import type { AgentEvent, PermissionMode } from "./types.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 type StoredAgentEvent = AgentEvent & { index: number };
@@ -150,6 +157,12 @@ export async function startWriterServer(options: {
       provider: options.providers.publicConfig(),
       providerCatalog: options.providers.catalog(),
       usage: options.store.usage(sessionId),
+      todos: options.store.sessionTodos(sessionId),
+      agentSettings: loadAgentSettings(options.project),
+      projectInstructions: loadProjectInstructions(options.project)?.path ?? null,
+      skills: listProjectSkills(options.project).map(skill => ({
+        id: skill.id, name: skill.name, description: skill.description,
+      })),
       activeJobs: agentJobs.activeJobs(sessionId),
       characterDirectory: "characters/",
       styleTemplates: listStyleTemplates(),
@@ -442,12 +455,42 @@ export async function startWriterServer(options: {
     catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.get("/api/agent-settings", (context) => {
+    const settings = loadAgentSettings(options.project);
+    const instructions = loadProjectInstructions(options.project);
+    return context.json({
+      permissionMode: settings.permissionMode,
+      instructionsPath: instructions?.path ?? null,
+      skills: listProjectSkills(options.project).map(skill => ({
+        id: skill.id, name: skill.name, description: skill.description, path: skill.path,
+      })),
+    });
+  });
+
+  app.post("/api/agent-settings", async (context) => {
+    try {
+      const body = await context.req.json<{ permissionMode?: string }>();
+      if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
+        return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
+      }
+      const settings = saveAgentSettings(options.project, {
+        ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
+      });
+      return context.json({ permissionMode: settings.permissionMode });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character"; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character"; permissionMode?: string; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
       : undefined;
+    const permissionMode = body.permissionMode && isPermissionMode(body.permissionMode)
+      ? body.permissionMode
+      : loadAgentSettings(options.project).permissionMode;
     const job = agentJobs.start(body.sessionId, async (signal, emit) => {
       const stepDebug = createAgentStepDebugLogger({
         sessionId: body.sessionId,
@@ -487,6 +530,7 @@ export async function startWriterServer(options: {
             prompt: body.prompt,
             selectedDocumentBlocks: body.documentSelections,
             characterScope,
+            permissionMode,
             models: {
               agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
               inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),

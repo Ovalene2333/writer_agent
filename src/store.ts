@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  Character, DocumentVersionDetail, DocumentVersionMeta, Message, Proposal,
+  AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, Proposal,
   StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
@@ -137,6 +137,10 @@ export class WriterStore {
     if (!sessionColumns.some(column => column.name === "auto_title_done")) {
       this.database.exec("ALTER TABLE sessions ADD COLUMN auto_title_done INTEGER NOT NULL DEFAULT 0");
     }
+    const contextColumns = this.database.prepare("PRAGMA table_info(session_context)").all() as Row[];
+    if (!contextColumns.some(column => column.name === "todos_json")) {
+      this.database.exec("ALTER TABLE session_context ADD COLUMN todos_json TEXT NOT NULL DEFAULT '[]'");
+    }
   }
 
   contextArtifact(sessionId: string, cacheKey: string): { id: number; kind: string; path?: string; sourceHash: string; content: string; digest: string } | undefined {
@@ -182,10 +186,43 @@ export class WriterStore {
   }
 
   saveSessionContext(sessionId: string, value: { activeDocument?: string; currentIntent: string }): void {
-    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,updated_at) VALUES(?,?,?,?)
+    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)
       ON CONFLICT(session_id) DO UPDATE SET active_document=COALESCE(excluded.active_document,session_context.active_document),
       current_intent=excluded.current_intent,updated_at=excluded.updated_at`)
-      .run(sessionId, value.activeDocument ?? null, value.currentIntent, new Date().toISOString());
+      .run(sessionId, value.activeDocument ?? null, value.currentIntent, "[]", new Date().toISOString());
+  }
+
+  sessionTodos(sessionId: string): AgentTodoItem[] {
+    const row = this.database.prepare("SELECT todos_json FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
+    if (!row || typeof row.todos_json !== "string" || !row.todos_json.trim()) return [];
+    try {
+      const parsed = JSON.parse(row.todos_json) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const todo = item as Record<string, unknown>;
+        if (typeof todo.id !== "string" || typeof todo.content !== "string") return [];
+        const status = todo.status === "in_progress" || todo.status === "completed" || todo.status === "cancelled"
+          ? todo.status
+          : "pending";
+        return [{ id: todo.id, content: todo.content, status }];
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void {
+    const now = new Date().toISOString();
+    const json = JSON.stringify(todos);
+    const existing = this.database.prepare("SELECT 1 AS ok FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
+    if (existing) {
+      this.database.prepare("UPDATE session_context SET todos_json=?, updated_at=? WHERE session_id=?")
+        .run(json, now, sessionId);
+      return;
+    }
+    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)`)
+      .run(sessionId, null, "", json, now);
   }
 
   writingDraft(sessionId: string): { mode: string; instruction: string; path?: string; selection?: string; draft: string } | undefined {

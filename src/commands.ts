@@ -1,4 +1,4 @@
-export type CommandCategory = "会话" | "创作" | "上下文" | "模型" | "修改" | "界面";
+export type CommandCategory = "会话" | "创作" | "上下文" | "模型" | "修改" | "界面" | "Agent";
 
 export interface SlashCommand {
   name: string;
@@ -12,9 +12,13 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "help", usage: "/help", description: "显示全部命令与快捷键", category: "界面", shortcut: "?" },
   { name: "new", usage: "/new [名称]", description: "创建并切换到新会话", category: "会话", aliases: ["clear"] },
-  { name: "sessions", usage: "/sessions", description: "列出可恢复的历史会话", category: "会话", aliases: ["continue"] },
-  { name: "resume", usage: "/resume <会话ID>", description: "恢复指定会话，可使用 ID 前缀", category: "会话" },
-  { name: "status", usage: "/status", description: "显示项目、会话、模型和待审批状态", category: "会话" },
+  { name: "sessions", usage: "/sessions", description: "列出可恢复的历史会话", category: "会话" },
+  { name: "resume", usage: "/resume <会话ID>", description: "恢复指定会话，可使用 ID 前缀", category: "会话", aliases: ["continue"] },
+  { name: "status", usage: "/status", description: "显示项目、会话、模式和待审批状态", category: "会话" },
+  { name: "mode", usage: "/mode [ask|auto|plan]", description: "查看或切换权限模式（ask 审批 / auto 自动写入 / plan 只读规划）", category: "Agent" },
+  { name: "plan", usage: "/plan", description: "切换到 plan 只读规划模式", category: "Agent" },
+  { name: "todos", usage: "/todos", description: "显示当前会话任务清单", category: "Agent" },
+  { name: "skills", usage: "/skills", description: "列出项目技能（.writer/skills 与 .agents/skills）", category: "Agent" },
   { name: "context", usage: "/context", description: "显示当前上下文组成", category: "上下文" },
   { name: "usage", usage: "/usage", description: "显示会话 Token 用量与费用", category: "上下文" },
   { name: "character", usage: "/character <create|list|show|delete>", description: "创建和管理目录中的角色卡", category: "创作" },

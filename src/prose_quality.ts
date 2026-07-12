@@ -41,16 +41,35 @@ const CONTRAST_PATTERNS = [
   /不在于[^\n。！？!?]{0,40}而在于/gu,
   /(?:仿佛|好像)[^\n。！？!?]{0,36}又(?:仿佛|好像)/gu,
 ];
-const EXPLANATION_SIGNALS = /^(?:这|那|因为|由于|意味着|也就是|换句话说|原来|其实|显然|说明|证明|仿佛|好像|更像|正是|即|不过是)/u;
+/** 仅高教学/解释口吻；日常叙事里「这/那/原来/仿佛」后接破折号很常见，不计入硬说明信号。 */
+const EXPLANATION_SIGNALS = /^(?:因为|由于|意味着|也就是|换句话说|其实|显然|说明|证明|正是|即|不过是)/u;
 const ABSTRACT_WORDS = /(?:情绪|愤怒|恐惧|悲伤|沉默|妥协|失败|成功|反抗|勇气|希望|绝望|灵魂|命运|意义|感觉|姿态|态度|选择|真相)/u;
 const SOUND_OR_INTERJECTION = /[啊呀哦噢嗯呜哎唉哈嘿嘘喂诶咦嗡轰砰嘎]/u;
+
+/**
+ * 仅这些子类在“过密”时可能升为 error（会拦截提案）。
+ * 普通叙事破折号、同位说明、模糊破折号、事实排除只保留 warning/info。
+ */
+const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
+  "parenthetical_explanation",
+  "cause_or_judgment",
+  "abstract_reframing",
+  "narrator_redefinition",
+]);
 
 /** Context-aware scanner for explanatory dashes and formulaic redefinition frames. */
 export function analyzeProseStyle(text: string): ProseStyleIssue[] {
   const raw = [...scanDashes(text), ...scanContrasts(text)].sort((a, b) => a.start - b.start);
-  const candidates = raw.filter(issue => issue.severity === "warning" && issue.confidence >= 0.75);
-  // A single occurrence is advisory. Repetition is what turns the mannerism into a blocking style problem.
-  if (candidates.length >= 2) {
+  const characters = Math.max(1, text.replace(/\s/g, "").length);
+  // 高置信 + 硬说明子类 才进入升 error 池；阈值按正文长度放宽。
+  const candidates = raw.filter(issue =>
+    issue.severity === "warning"
+    && issue.confidence >= 0.9
+    && HARD_BLOCK_SUBTYPES.has(issue.subtype),
+  );
+  // 约每 2000 字允许 3 处硬说明习惯；至少 5 处才整体升级，避免短章两处破折号就卡死。
+  const limit = Math.max(5, 3 + Math.floor(characters / 2_000));
+  if (candidates.length > limit) {
     for (const issue of candidates) issue.severity = "error";
   }
   return raw;
@@ -64,10 +83,11 @@ export function contrastStyleReport(text: string): ContrastStyleReport {
   const characters = text.replace(/\s/g, "").length;
   return {
     count: counted.length,
-    allowed: 1 + Math.floor(characters / 4_000),
+    // 放宽统计额度：更偏“过密才提醒”
+    allowed: 3 + Math.floor(characters / 2_000),
     examples: counted.map(issue => issue.evidence).slice(0, 5),
     dashCount,
-    dashAllowed: 1 + Math.floor(characters / 8_000),
+    dashAllowed: 3 + Math.floor(characters / 2_500),
     frameCount,
     issues,
   };
@@ -79,8 +99,8 @@ export function contrastStyleError(text: string): string | undefined {
   const located = errors.slice(0, 5).map(issue =>
     `第${issue.line}行${issue.column}列「${issue.evidence}」：${issue.reason}`,
   );
-  return `正文中新增或重复的说明式写法过密（${errors.length}处）：${located.join("；")}。` +
-    "请只改命中句：保留事实和人物声线，优先让动作产生结果、用细节供读者判断，必要因果拆成独立句；对白中的延长、中断和真实纠正可以保留。";
+  return `正文中说明式写法过密（${errors.length}处硬拦截）：${located.join("；")}。` +
+    "请只改命中句：保留事实和人物声线，优先让动作产生结果、用细节供读者判断，必要因果拆成独立句；对白中的延长、中断和真实纠正可以保留。叙事性破折号（停顿、揭示、同位）可保留。";
 }
 
 /** Return only issues introduced by `after`, using a multiset so duplicate mannerisms are detected. */
@@ -98,11 +118,18 @@ export function newProseStyleIssues(before: string, after: string): ProseStyleIs
   });
 }
 
+/**
+ * 提案硬拦截：只拦“新增且被升级为 error”的硬说明问题。
+ * 普通 warning（含多数破折号）不拦截提交。
+ */
 export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undefined {
-  const errors = issues.filter(issue => issue.severity === "error");
+  const errors = issues.filter(issue =>
+    issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
+  );
   if (!errors.length) return undefined;
-  return `本次修改新增 ${errors.length} 处高置信度说明式写法：` + errors.slice(0, 5)
-    .map(issue => `第${issue.line}行「${issue.evidence}」`).join("；") + "。请局部改写命中句。";
+  return `本次修改新增 ${errors.length} 处过密的高置信度说明式写法：` + errors.slice(0, 5)
+    .map(issue => `第${issue.line}行「${issue.evidence}」`).join("；") +
+    "。请局部改写命中句；普通叙事破折号与对白拖音不会拦截提交。";
 }
 
 function scanDashes(text: string): ProseStyleIssue[] {
@@ -116,7 +143,6 @@ function scanDashes(text: string): ProseStyleIssue[] {
     const next = matches[i + 1];
     const lineText = text.slice(text.lastIndexOf("\n", match.start - 1) + 1, lineEnd(text, match.start));
     const insideQuote = quoteDepthAt(text, match.start) > 0;
-    const before = text.slice(bounds.start, match.start).trim();
     const after = text.slice(match.end, bounds.end).trim();
 
     if (isMetadataLine(lineText) || insideFullwidthBracket(text, match.start) || isNumericRange(text, match)) {
@@ -136,6 +162,7 @@ function scanDashes(text: string): ProseStyleIssue[] {
         issues.push(makeIssue(text, match, "dash", closesSoon ? "speech_interruption" : "speech_extension", "info", 0.94,
           "破折号位于对白内部，表示声音延长或话语中断。", []));
       } else if (EXPLANATION_SIGNALS.test(after)) {
+        // 对白内解释：仅 warning，置信度不入硬拦截池（0.78 < 0.9）
         issues.push(makeIssue(text, match, "dash", "cause_or_judgment", "warning", 0.78,
           "虽在对白中，后半句仍以解释信号重新说明前半句。", commonSuggestions()));
       } else {
@@ -147,20 +174,28 @@ function scanDashes(text: string): ProseStyleIssue[] {
 
     if (next && next.start < bounds.end) {
       consumed.add(i + 1);
+      // 成对夹注：保留 warning，置信 0.9 可入硬池，但需过密才 error
       issues.push(makeIssue(text, { start: match.start, end: next.end, text: text.slice(match.start, next.end) },
-        "dash", "parenthetical_explanation", "warning", 0.96,
-        "成对破折号包围插入说明，是高置信度的夹注结构。", commonSuggestions()));
+        "dash", "parenthetical_explanation", "warning", 0.9,
+        "成对破折号包围插入说明；偶发可用，过密时再考虑拆句。", commonSuggestions()));
       continue;
     }
-    const subtype: ProseStyleSubtype = EXPLANATION_SIGNALS.test(after)
-      ? "cause_or_judgment"
-      : after.length <= 18 && /[是为叫称]|(?:一种|一个|一名)/u.test(after)
-        ? "appositive_definition" : "ambiguous_dash";
-    const confidence = subtype === "ambiguous_dash" ? 0.68 : 0.88;
-    issues.push(makeIssue(text, match, "dash", subtype, "warning", confidence,
-      subtype === "ambiguous_dash"
-        ? "破折号位于叙述句中，但仅凭局部结构无法确定是否为说明，应人工复核。"
-        : "后半句对前半句作定义、原因或意义补充。", commonSuggestions()));
+
+    if (EXPLANATION_SIGNALS.test(after)) {
+      issues.push(makeIssue(text, match, "dash", "cause_or_judgment", "warning", 0.9,
+        "后半句以因果/定义信号补充前半句；单次常见于叙事，过密时再改。", commonSuggestions()));
+      continue;
+    }
+
+    // 停顿—揭示、同位、短接续：正常文学手法，不进硬拦截池
+    if (after.length > 0 && after.length <= 24 && /[是为叫称]|(?:一种|一个|一名)/u.test(after)) {
+      issues.push(makeIssue(text, match, "dash", "appositive_definition", "info", 0.7,
+        "短接续更像同位或命名，属常见叙事手法，不拦截。", []));
+      continue;
+    }
+
+    issues.push(makeIssue(text, match, "dash", "ambiguous_dash", "info", 0.55,
+      "叙述中的破折号（停顿、转折或揭示）默认允许；仅在 audit 时供人工复核。", []));
   }
   return issues;
 }
@@ -178,12 +213,16 @@ function scanContrasts(text: string): ProseStyleIssue[] {
     }
     const abstract = /(?:这|那|这种|这一切|他的|她的)/u.test(sentence.slice(0, Math.max(0, match.start - bounds.start + 8)))
       || ABSTRACT_WORDS.test(match.text);
-    issues.push(makeIssue(text, match, "contrast", abstract ? "abstract_reframing" : "factual_exclusion",
-      "warning", abstract ? 0.9 : 0.7,
-      abstract
-        ? "叙述者先否定表象再定义抽象意义，容易形成模板化解释。"
-        : "这是叙述中的否定—肯定结构，可能是事实排除，也可能是说明框架。",
-      ["直接陈述真正成立的事实", "若确有误解需要纠正，把纠正落到人物行动或对白中"]));
+    if (abstract) {
+      // 抽象重定义：warning；置信 0.9 可入硬池，但需过密
+      issues.push(makeIssue(text, match, "contrast", "abstract_reframing", "warning", 0.9,
+        "叙述者先否定表象再定义抽象意义；偶发可用，过密时再改。",
+        ["直接陈述真正成立的事实", "若确有误解需要纠正，把纠正落到人物行动或对白中"]));
+    } else {
+      // 事实排除（不是 A 而是 B）在叙事中极常见，仅 info
+      issues.push(makeIssue(text, match, "contrast", "factual_exclusion", "info", 0.65,
+        "否定—肯定结构更像事实排除或转折，默认允许。", []));
+    }
   }
   return issues;
 }

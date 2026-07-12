@@ -2,18 +2,37 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Box, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import { runAgent } from "./agent.js";
+import {
+  formatTodosForPrompt,
+  isPermissionMode,
+  listProjectSkills,
+  loadAgentSettings,
+  loadProjectInstructions,
+  permissionModeLabel,
+  saveAgentSettings,
+} from "./agent_runtime.js";
 import { parseCharacterCommand, parseCommand, parseStyleCommand, referencedDocumentQuery, SLASH_COMMANDS, suggestCommands } from "./commands.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate, listStyleTemplates } from "./templates.js";
-import type { AgentEvent, Proposal } from "./types.js";
+import type { AgentEvent, AgentTodoItem, PermissionMode, Proposal } from "./types.js";
 
 type Suggestion = { value: string; label: string; detail: string; kind: "command" | "document" };
 
-export function WriterAgentTui(props: { project: WriterProject; store: WriterStore; providers: ProviderManager; sessionId: string }) {
+export function WriterAgentTui(props: {
+  project: WriterProject;
+  store: WriterStore;
+  providers: ProviderManager;
+  sessionId: string;
+  permissionMode?: PermissionMode;
+}) {
   const { exit } = useApp();
   const [sessionId, setSessionId] = useState(props.sessionId);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(
+    () => props.permissionMode ?? loadAgentSettings(props.project).permissionMode,
+  );
+  const [todos, setTodos] = useState<AgentTodoItem[]>(() => props.store.sessionTodos(props.sessionId));
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [connectMode, setConnectMode] = useState(false);
@@ -24,9 +43,11 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
   const [historyIndex, setHistoryIndex] = useState(-1);
   const abortRef = useRef<AbortController | undefined>(undefined);
   const runProposalsRef = useRef<number[]>([]);
+  const instructions = loadProjectInstructions(props.project);
   const [output, setOutput] = useState<string[]>([
     `已打开《${props.project.config().title}》`,
-    "输入 / 查看命令，输入 @ 引用作品文档。",
+    `模式：${permissionModeLabel(permissionMode)} · 输入 / 查看命令，@ 引用文档。`,
+    instructions ? `已加载项目指令：${instructions.path}` : "未找到 WRITER.md / AGENTS.md（可选）",
   ]);
   const pendingProposals = useMemo(() => props.store.proposals("pending"), [output, props.store]);
   const usage = useMemo(() => props.store.usage(sessionId), [output, props.store, sessionId]);
@@ -123,7 +144,13 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
         return copy.slice(-30);
       });
     } else if (event.type === "tool" && showDetails) append(`工具：${event.name}`);
-    else if (event.type === "proposal") append(`提案 #${event.proposal.id}：${event.proposal.path} · ${event.proposal.summary}`);
+    else if (event.type === "proposal") {
+      const mark = event.proposal.status === "accepted" ? "✓ 已写入" : "待审批";
+      append(`${mark}提案 #${event.proposal.id}：${event.proposal.path} · ${event.proposal.summary}`);
+    } else if (event.type === "todos") {
+      setTodos(event.todos);
+      if (showDetails) append(`任务清单：\n${formatTodosForPrompt(event.todos)}`);
+    } else if (event.type === "mode") setPermissionMode(event.mode);
     else if (event.type === "cancelled") append("当前作业已中断，已完成的提案和输出予以保留。");
     else if (event.type === "usage") append(`用量：${event.usage.totalTokens.toLocaleString()} Token · ${event.usage.currency === "CNY" ? "¥" : "$"}${event.usage.cost.toFixed(6)}`);
   }, [showDetails, append]);
@@ -136,19 +163,46 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
       else if (name === "stop") busy ? cancel() : append("当前没有正在执行的作业");
       else if (name === "new") {
         const id = props.store.createSession(args || "新会话");
-        setSessionId(id); setHistory([]); setOutput([`已创建会话：${id.slice(0, 8)}`]);
+        setSessionId(id); setHistory([]); setTodos([]); setOutput([`已创建会话：${id.slice(0, 8)}`]);
       } else if (name === "sessions") {
         append(props.store.listSessions().map(item => `${item.id.slice(0, 8)}  ${item.updatedAt.slice(0, 16).replace("T", " ")}  ${item.title}`).join("\n") || "没有历史会话");
       } else if (name === "resume") {
         const matches = props.store.listSessions().filter(item => item.id.startsWith(args));
         if (!args || matches.length !== 1) throw new Error(matches.length > 1 ? "会话 ID 前缀不唯一" : "找不到指定会话");
         setSessionId(matches[0].id);
+        setTodos(props.store.sessionTodos(matches[0].id));
         const messages = props.store.messages(matches[0].id, 30);
         setHistory(messages.filter(item => item.role === "user").map(item => item.content));
         setOutput(messages.map(item => `${item.role === "user" ? "你" : "AI"}：${item.content}`).slice(-30));
       } else if (name === "status") {
         const provider = props.providers.publicConfig();
-        append(`项目：${props.project.config().title}\n会话：${sessionId}\n模型：${provider.provider}/${provider.model}\n文档：${props.project.listDocuments().length}\n待审批：${pendingProposals.length}`);
+        const todoSummary = todos.length
+          ? `${todos.filter(t => t.status === "completed").length}/${todos.length} 完成`
+          : "无";
+        append(`项目：${props.project.config().title}\n会话：${sessionId}\n模式：${permissionModeLabel(permissionMode)}\n模型：${provider.provider}/${provider.model}\n文档：${props.project.listDocuments().length}\n待审批：${pendingProposals.length}\n任务：${todoSummary}\n指令：${instructions?.path ?? "无"}`);
+      } else if (name === "mode") {
+        if (!args) {
+          append(`当前模式：${permissionModeLabel(permissionMode)}\n可选：ask（审批）· auto（自动写入）· plan（只读规划）`);
+        } else if (!isPermissionMode(args)) {
+          throw new Error("用法：/mode [ask|auto|plan]");
+        } else {
+          const next = saveAgentSettings(props.project, { permissionMode: args });
+          setPermissionMode(next.permissionMode);
+          append(`已切换模式：${permissionModeLabel(next.permissionMode)}`);
+        }
+      } else if (name === "plan") {
+        const next = saveAgentSettings(props.project, { permissionMode: "plan" });
+        setPermissionMode(next.permissionMode);
+        append(`已进入 plan 模式：${permissionModeLabel(next.permissionMode)}`);
+      } else if (name === "todos") {
+        const current = props.store.sessionTodos(sessionId);
+        setTodos(current);
+        append(current.length ? formatTodosForPrompt(current) : "当前会话没有任务清单");
+      } else if (name === "skills") {
+        const skills = listProjectSkills(props.project);
+        append(skills.length
+          ? skills.map(item => `${item.id.padEnd(16)} ${item.name}${item.description ? ` · ${item.description}` : ""}`).join("\n")
+          : "未找到技能。可在 .writer/skills/<id>/SKILL.md 或 .agents/skills/<id>/SKILL.md 添加");
       } else if (name === "context") {
         const pricing = props.providers.publicConfig().pricing;
         append(`最近上下文：${usage.lastPromptTokens.toLocaleString()} / ${pricing.contextWindow.toLocaleString()} Token（${(usage.lastPromptTokens / pricing.contextWindow * 100).toFixed(2)}%）\n包含系统规则、角色卡、写作示例、最近消息、检索片段和 @ 引用文档。`);
@@ -228,7 +282,7 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
       } else if (name === "details") { setShowDetails(value => !value); append(`工具调用详情已${showDetails ? "隐藏" : "显示"}`); }
       else append(`未知命令：/${name}。输入 / 查看命令索引。`);
     } catch (error) { appendError(error); }
-  }, [busy, cancel, exit, append, appendError, acceptProposal, rejectProposal, pendingProposals, usage, props, sessionId, showDetails]);
+  }, [busy, cancel, exit, append, appendError, acceptProposal, rejectProposal, pendingProposals, usage, props, sessionId, showDetails, permissionMode, todos, instructions]);
 
   const submit = useCallback(async (value: string) => {
     const text = value.trim();
@@ -250,17 +304,35 @@ export function WriterAgentTui(props: { project: WriterProject; store: WriterSto
     setBusy(true); append(`你：${text}`);
     const controller = new AbortController(); abortRef.current = controller;
     try {
-      await runAgent({ project: props.project, store: props.store, sessionId, prompt: text, maxTurns: 20, model: props.providers.modelConfig(), signal: controller.signal, onEvent: handleEvent });
+      await runAgent({
+        project: props.project,
+        store: props.store,
+        sessionId,
+        prompt: text,
+        maxTurns: 20,
+        permissionMode,
+        models: {
+          agent: props.providers.modelConfig("agent"),
+          writer: props.providers.modelConfig("writer"),
+          inline: props.providers.modelConfig("inline"),
+          reviewer: props.providers.modelConfig("reviewer"),
+        },
+        signal: controller.signal,
+        onEvent: handleEvent,
+      });
     } catch (error) { appendError(error); }
-    finally { abortRef.current = undefined; setBusy(false); enterReview(); }
-  }, [busy, reviewIndex, connectMode, pendingProposals, sessionId, props, append, appendError, handleEvent, executeCommand, enterReview]);
+    finally { abortRef.current = undefined; setBusy(false); if (permissionMode === "ask") enterReview(); }
+  }, [busy, reviewIndex, connectMode, pendingProposals, sessionId, props, append, appendError, handleEvent, executeCommand, enterReview, permissionMode]);
 
   const reviewing = reviewIndex !== null && pendingProposals.length > 0;
   const current = reviewing ? pendingProposals[reviewIndex!] : undefined;
+  const todoHint = todos.length
+    ? ` · 任务 ${todos.filter(t => t.status === "completed").length}/${todos.length}`
+    : "";
   return <Box flexDirection="column" paddingX={1}>
     <Box borderStyle="round" borderColor="cyan" paddingX={1} flexDirection="column">
       <Text bold color="cyan">Writer Agent</Text>
-      <Text dimColor>会话 {sessionId.slice(0, 8)} · {props.providers.publicConfig().model} · {usage.totalTokens.toLocaleString()} Token · {usage.currency === "CNY" ? "¥" : "$"}{usage.cost.toFixed(4)} · 待审批 {pendingProposals.length}{reviewing ? ` · 审查中 ${reviewIndex! + 1}/${pendingProposals.length}` : ""}</Text>
+      <Text dimColor>会话 {sessionId.slice(0, 8)} · {permissionMode} · {props.providers.publicConfig().model} · {usage.totalTokens.toLocaleString()} Token · {usage.currency === "CNY" ? "¥" : "$"}{usage.cost.toFixed(4)} · 待审批 {pendingProposals.length}{todoHint}{reviewing ? ` · 审查中 ${reviewIndex! + 1}/${pendingProposals.length}` : ""}</Text>
     </Box>
     <Box flexDirection="column" paddingY={1}>{output.map((line, index) => <Text key={`${index}-${line.slice(0, 12)}`}>{line}</Text>)}</Box>
     {reviewing && current && <Box flexDirection="column" borderStyle="single" borderColor="yellow" paddingX={1}>

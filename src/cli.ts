@@ -4,13 +4,18 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
 import process from "node:process";
 import { Command } from "commander";
+import { render } from "ink";
+import React from "react";
 import QRCode from "qrcode";
 import { runAgent } from "./agent.js";
+import { isPermissionMode, loadAgentSettings, permissionModeLabel, saveAgentSettings } from "./agent_runtime.js";
+import { WriterAgentTui } from "./agent_tui.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { startWriterServer } from "./server.js";
 import { WriterStore } from "./store.js";
+import type { PermissionMode } from "./types.js";
 
 const program = new Command();
 program
@@ -36,22 +41,25 @@ program.command("run")
   .argument("<prompt>", "写作指令")
   .option("-p, --project <directory>", "项目目录", ".")
   .option("-s, --session <id>", "继续指定会话")
+  .option("-c, --continue", "继续最近一次会话")
+  .option("--mode <mode>", "权限模式：ask | auto | plan")
   .option("--json", "逐行输出 JSON 事件")
   .option("--debug", "调试：终端打印 step 内容 + 模型请求/响应体")
   .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端")
-  .action(async (prompt: string, options: { project: string; session?: string; json?: boolean; debug?: boolean; debugSteps?: boolean }) => {
+  .action(async (prompt: string, options: { project: string; session?: string; continue?: boolean; mode?: string; json?: boolean; debug?: boolean; debugSteps?: boolean }) => {
     if (options.debug) process.env.WRITER_DEBUG = "1";
     if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
     const { project, store, providers } = openProject(options.project);
     try {
-      const sessionId = resolveSession(store, options.session, false);
+      const permissionMode = resolvePermissionMode(project, options.mode);
+      const sessionId = resolveSession(store, options.session, Boolean(options.continue));
       const stepDebug = createAgentStepDebugLogger({ sessionId, label: "run" });
       if (stepDebugEnabled()) {
-        process.stderr.write(`[WRITER STEP] ▸ run start session=${sessionId.slice(0, 8)}\n[WRITER STEP] prompt: ${prompt.trim().slice(0, 500)}\n`);
+        process.stderr.write(`[WRITER STEP] ▸ run start session=${sessionId.slice(0, 8)} mode=${permissionMode}\n[WRITER STEP] prompt: ${prompt.trim().slice(0, 500)}\n`);
       }
       try {
         await runAgent({
-          project, store, sessionId, prompt,
+          project, store, sessionId, prompt, permissionMode,
           models: {
             agent: providers.modelConfig("agent"), writer: providers.modelConfig("writer"),
             inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),
@@ -60,8 +68,12 @@ program.command("run")
             stepDebug.onEvent(event);
             if (options.json) process.stdout.write(`${JSON.stringify(event)}\n`);
             else if (event.type === "text") process.stdout.write(event.text);
-            else if (event.type === "proposal") process.stdout.write(`\n[待审批提案 #${event.proposal.id}：${event.proposal.path}]\n`);
-            else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
+            else if (event.type === "proposal") {
+              const status = event.proposal.status === "accepted" ? "已写入" : "待审批";
+              process.stdout.write(`\n[${status}提案 #${event.proposal.id}：${event.proposal.path}]\n`);
+            } else if (event.type === "todos") {
+              process.stdout.write(`\n[任务 ${event.todos.filter(t => t.status === "completed").length}/${event.todos.length}]\n`);
+            } else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
           },
         });
       } finally {
@@ -69,6 +81,32 @@ program.command("run")
       }
       if (!options.json) process.stdout.write("\n");
     } finally { store.close(); }
+  });
+
+program.command("chat")
+  .alias("tui")
+  .description("启动交互式终端 Agent（仿 code agent REPL）")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .option("-s, --session <id>", "继续指定会话")
+  .option("-c, --continue", "继续最近一次会话")
+  .option("--mode <mode>", "权限模式：ask | auto | plan")
+  .option("--debug", "调试：打印模型请求/响应体")
+  .option("--debug-steps", "仅打印 Agent step 到终端")
+  .action(async (options: { project: string; session?: string; continue?: boolean; mode?: string; debug?: boolean; debugSteps?: boolean }) => {
+    if (options.debug) process.env.WRITER_DEBUG = "1";
+    if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
+    const { project, store, providers } = openProject(options.project);
+    const permissionMode = resolvePermissionMode(project, options.mode, true);
+    const sessionId = resolveSession(store, options.session, options.continue !== false && !options.session);
+    process.stdout.write(`Writer Agent TUI · ${project.config().title} · ${permissionModeLabel(permissionMode)}\n`);
+    const instance = render(React.createElement(WriterAgentTui, {
+      project, store, providers, sessionId, permissionMode,
+    }));
+    try {
+      await instance.waitUntilExit();
+    } finally {
+      store.close();
+    }
   });
 
 program.command("web")
@@ -154,11 +192,22 @@ function openProject(path: string): { project: WriterProject; store: WriterStore
 
 function resolveSession(store: WriterStore, requested: string | undefined, useLatest: boolean): string {
   if (requested) {
-    if (!store.sessionExists(requested)) throw new Error(`会话不存在：${requested}`);
-    return requested;
+    const exact = store.sessionExists(requested) ? requested : undefined;
+    if (exact) return exact;
+    const matches = store.listSessions().filter(item => item.id.startsWith(requested));
+    if (matches.length === 1) return matches[0].id;
+    if (matches.length > 1) throw new Error(`会话 ID 前缀不唯一：${requested}`);
+    throw new Error(`会话不存在：${requested}`);
   }
   if (useLatest) return store.latestSession() ?? store.createSession();
   return store.createSession();
+}
+
+function resolvePermissionMode(project: WriterProject, requested: string | undefined, persist = false): PermissionMode {
+  if (!requested) return loadAgentSettings(project).permissionMode;
+  if (!isPermissionMode(requested)) throw new Error("权限模式仅支持 ask、auto、plan");
+  if (persist) saveAgentSettings(project, { permissionMode: requested });
+  return requested;
 }
 
 function openBrowser(url: string): void {
