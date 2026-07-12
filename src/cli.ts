@@ -6,6 +6,7 @@ import process from "node:process";
 import { Command } from "commander";
 import QRCode from "qrcode";
 import { runAgent } from "./agent.js";
+import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { startWriterServer } from "./server.js";
@@ -36,25 +37,36 @@ program.command("run")
   .option("-p, --project <directory>", "项目目录", ".")
   .option("-s, --session <id>", "继续指定会话")
   .option("--json", "逐行输出 JSON 事件")
-  .option("--debug", "在终端输出模型请求体和原始返回体")
-  .action(async (prompt: string, options: { project: string; session?: string; json?: boolean; debug?: boolean }) => {
+  .option("--debug", "调试：终端打印 step 内容 + 模型请求/响应体")
+  .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端")
+  .action(async (prompt: string, options: { project: string; session?: string; json?: boolean; debug?: boolean; debugSteps?: boolean }) => {
     if (options.debug) process.env.WRITER_DEBUG = "1";
+    if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
     const { project, store, providers } = openProject(options.project);
     try {
       const sessionId = resolveSession(store, options.session, false);
-      await runAgent({
-        project, store, sessionId, prompt,
-        models: {
-          agent: providers.modelConfig("agent"), writer: providers.modelConfig("writer"),
-          inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),
-        },
-        onEvent: (event) => {
-          if (options.json) process.stdout.write(`${JSON.stringify(event)}\n`);
-          else if (event.type === "text") process.stdout.write(event.text);
-          else if (event.type === "proposal") process.stdout.write(`\n[待审批提案 #${event.proposal.id}：${event.proposal.path}]\n`);
-          else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
-        },
-      });
+      const stepDebug = createAgentStepDebugLogger({ sessionId, label: "run" });
+      if (stepDebugEnabled()) {
+        process.stderr.write(`[WRITER STEP] ▸ run start session=${sessionId.slice(0, 8)}\n[WRITER STEP] prompt: ${prompt.trim().slice(0, 500)}\n`);
+      }
+      try {
+        await runAgent({
+          project, store, sessionId, prompt,
+          models: {
+            agent: providers.modelConfig("agent"), writer: providers.modelConfig("writer"),
+            inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),
+          },
+          onEvent: (event) => {
+            stepDebug.onEvent(event);
+            if (options.json) process.stdout.write(`${JSON.stringify(event)}\n`);
+            else if (event.type === "text") process.stdout.write(event.text);
+            else if (event.type === "proposal") process.stdout.write(`\n[待审批提案 #${event.proposal.id}：${event.proposal.path}]\n`);
+            else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
+          },
+        });
+      } finally {
+        stepDebug.flush();
+      }
       if (!options.json) process.stdout.write("\n");
     } finally { store.close(); }
   });
@@ -68,9 +80,14 @@ program.command("web")
   .option("--port <port>", "监听端口", "4096")
   .option("--share", "创建临时公网访问地址（需要已安装 cloudflared）")
   .option("--no-open", "不自动打开 PC 浏览器")
-  .option("--debug", "在终端输出模型请求体和原始返回体")
-  .action(async (options: { project: string; lan?: boolean; host?: string; port: string; share?: boolean; open: boolean; debug?: boolean }) => {
+  .option("--debug", "调试：终端打印 step 内容 + 模型请求/响应体")
+  .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端，不含模型原文")
+  .action(async (options: { project: string; lan?: boolean; host?: string; port: string; share?: boolean; open: boolean; debug?: boolean; debugSteps?: boolean }) => {
     if (options.debug) process.env.WRITER_DEBUG = "1";
+    if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
+    if (stepDebugEnabled()) {
+      process.stderr.write("[WRITER STEP] step debug enabled — Agent 每步 reasoning/tools/output 会打印到本终端\n");
+    }
     const { project, store, providers } = openProject(options.project);
     const host = options.host || (options.lan ? "0.0.0.0" : "127.0.0.1");
     const port = Number(options.port);

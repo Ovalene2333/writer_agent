@@ -1,7 +1,10 @@
-import type { AgentEvent, Character, ModelConfig } from "./types.js";
+import type { AgentEvent, Character, ModelConfig, StepUsage, UsageSummary } from "./types.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
+import { contrastStyleError } from "./prose_quality.js";
+import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
+import { calculateUsageCost } from "./pricing.js";
 
 export type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
 export type ActionMode = WritingMode | "character";
@@ -111,8 +114,8 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
         mode: draftBase.mode, instruction: draftBase.instruction, path: draftBase.path,
         selection: draftBase.selection, draft: draftResult.draft,
       });
-      if (draftResult.usage && draftBase.draftModel.pricing) {
-        await emit({ type: "usage", usage: draftBase.store.recordUsage(draftBase.sessionId, draftBase.draftModel.model, draftResult.usage, draftBase.draftModel.pricing) });
+      if (draftResult.usage) {
+        await emit(buildUsageEvent(draftBase.store, draftBase.sessionId, draftBase.draftModel, draftResult.usage, 1));
       }
       const report = `${pending ? "草案已修改" : "写作草案已生成"}：\n\n${draftResult.draft}\n\n回复修改要求可继续调整草案；回复“确认开写”后才会调用正文模型。`;
       draftBase.store.addMessage(draftBase.sessionId, "assistant", report);
@@ -128,6 +131,8 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     });
     const generated = cleanModelText(result.content);
     if (!generated) throw new Error("模型没有返回正文");
+    const styleError = contrastStyleError(generated);
+    if (styleError) throw new Error(styleError);
     const path = targetPath(effective);
     const after = applyGeneratedText(effective.mode, before, effective.selection, generated);
     const proposal = effective.store.createProposal(effective.sessionId, path, after, proposalSummary(effective.mode));
@@ -139,8 +144,8 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     }, fallbackSummary, effective.signal);
     effective.store.addMessage(effective.sessionId, "assistant", summary);
     await emit({ type: "text", text: `\n\n${summary}`, channel: "output" });
-    if (result.usage && effective.model.pricing) {
-      await emit({ type: "usage", usage: effective.store.recordUsage(effective.sessionId, effective.model.model, result.usage, effective.model.pricing) });
+    if (result.usage) {
+      await emit(buildUsageEvent(effective.store, effective.sessionId, effective.model, result.usage, 1));
     }
     await emit({ type: "proposal", proposal });
     await emit({ type: "step_done", step: 1 });
@@ -254,13 +259,19 @@ async function buildWritingDraft(
   const existingContext = options.mode === "continue" ? document.slice(-12_000)
     : options.mode === "rewrite_document" ? document.slice(0, 16_000)
       : options.selection?.trim() || document.slice(-6_000);
+  const styleBlock = styleGroundingPrompt(options.project, options.store, {
+    intensive: true,
+    targetPath: options.path,
+    preferredSample: options.selection?.trim() || existingContext.slice(-1_200) || undefined,
+  });
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
 项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
-最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
+最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束（须引用风格锚定中的句长/对白密度要求）、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
+    ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: revision
-      ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。`
-      : `写作动作：${options.mode}\n写作要求：${options.instruction.trim()}\n目标文档：${options.path ?? "新文档"}\n当前必要上下文：\n${existingContext || "（无）"}` },
+      ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。声线约束写进草案供正文作者执行。`
+      : `写作动作：${options.mode}\n写作要求：${options.instruction.trim()}\n目标文档：${options.path ?? "新文档"}\n当前必要上下文：\n${existingContext || "（无）"}\n请在草案中写明须贴合的声线要点（来自风格锚定），供正文模型执行。` },
   ];
   const endpoint = `${options.draftModel.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const usage = { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 };
@@ -338,22 +349,30 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
     rewrite_document: "按要求修改给出的完整文档。只输出修改后的完整正文，不要输出分析、摘要或原文对照。",
     polish: "润色选区，保持事实、视角、时序和人物声线不变。只输出替换选区的新文本。",
   };
+  const styleBlock = styleGroundingPrompt(options.project, options.store, {
+    intensive: isIntensiveWritingMode(options.mode),
+    targetPath: options.path,
+    preferredSample: options.selection?.trim() || (options.mode === "continue" ? document.slice(-2_000) : undefined),
+  });
   return [
     { role: "system", content: `你是小说写作助手。${task[options.mode]}
 正文要求：
 - 先写可观察的动作、选择、代价、对白和有对象的感官细节，避免用抽象性格或情绪标签包办人物。
 - 不在动作、对白或细节之后重复说明人物的心理、潜台词、象征或“这意味着什么”；仅在省略会造成因果断裂时解释。
-- 句长、段长和信息密度服从场景，不追求整齐、对称、三项并列或每段总结。不同人物的词汇、句长、礼貌程度和回避方式应可区分。
-- 避免套语、模板化转折、连续排比以及“不是A，而是B”一类先否定再定义的解释框架。直接写有效的动作、观察或结果。
+- 句长、段长和信息密度服从「风格锚定」与文档上下文的声线，不追求整齐、对称、三项并列或每段总结。不同人物的词汇、句长、礼貌程度和回避方式应可区分。
+- 避免套语、模板化转折、连续排比，以及“不是A，而是B”“不是A，是B”“并非A，是B”一类先否定再定义的解释框架。
+- 禁止句中解释性破折号（“画面/动作——补充说明”）。破折号仅用于对白打断、行末拖腔或【叮——】类系统框。
 - 通过具体且相关的内容差异降低机器感；不要随机换同义词、强行拆句、故意写病句、滥加口语或无关细节。
 - 保留必要的朴素过渡、留白、轻重差别和不对称。新增细节必须来自现有上下文，并服务于行动、空间、因果或伏笔。
-不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡之外的关键设定。` },
+不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡与 lore 之外的关键设定。` },
+    ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
       `作品语言：${options.project.config().language}`,
       characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(characterContext), null, 2)}` : "相关角色卡：无",
       `写作前草案（用于约束情节、事实和必要信息；不要在正文中复述草案）：\n${draft}`,
       context ? `文档上下文：\n${context}` : "",
       `写作要求：${options.instruction.trim()}`,
+      "输出须通过风格锚定自检；声线优先贴合本项目既有正文样本。",
     ].filter(Boolean).join("\n\n") },
   ];
 }
@@ -408,6 +427,36 @@ function characterContext(item: Character) {
 }
 
 function proposalSummary(mode: WritingMode): string { return `${modeLabel(mode)}生成内容，等待确认`; }
+
+function buildUsageEvent(
+  store: WriterStore,
+  sessionId: string,
+  model: ModelConfig,
+  usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number },
+  step?: number,
+): AgentEvent {
+  const cacheMissTokens = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
+  const normalized = { ...usage, cacheMissTokens };
+  const call: StepUsage = {
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    cacheHitTokens: usage.cacheHitTokens,
+    cacheMissTokens,
+    totalTokens: usage.promptTokens + usage.completionTokens,
+    cost: model.pricing ? calculateUsageCost(normalized, model.pricing) : 0,
+    currency: model.pricing?.currency ?? "CNY",
+  };
+  let sessionUsage: UsageSummary = store.usage(sessionId);
+  if (model.pricing) {
+    sessionUsage = store.recordUsage(sessionId, model.model, usage, model.pricing);
+  }
+  return {
+    type: "usage",
+    usage: sessionUsage,
+    call,
+    ...(step !== undefined ? { step } : {}),
+  };
+}
 function modeLabel(mode: WritingMode): string { return ({ write: "新写", continue: "续写", rewrite: "改写选区", rewrite_document: "修改全文档", polish: "润色" })[mode]; }
 function cleanModelText(value: string): string { return value.trim().replace(/^```(?:markdown|md)?\s*/i, "").replace(/\s*```$/, "").trim(); }
 
@@ -442,6 +491,79 @@ async function safeChangeSummary(model: ModelConfig, change: {
     ], signal);
     return result.content.trim() || fallback;
   } catch { return fallback; }
+}
+
+const DEFAULT_SESSION_TITLES = new Set([
+  "新会话",
+  "写作会话",
+  "New session",
+  "Writer session",
+]);
+
+function isDefaultSessionTitle(title: string): boolean {
+  const t = title.trim();
+  if (DEFAULT_SESSION_TITLES.has(t)) return true;
+  // createSession / API may append nothing; also allow bare "Session N" style defaults later
+  return /^新会话\s*\d*$/u.test(t) || /^写作会话\s*\d*$/u.test(t);
+}
+
+/**
+ * Auto-generate a short session title from early conversation messages.
+ * Runs at most once per session (auto_title_done). Skips non-default titles
+ * (manual rename) and marks them done without overwriting.
+ */
+export async function maybeAutoTitleSession(options: {
+  store: WriterStore;
+  model: ModelConfig;
+  sessionId: string;
+  signal?: AbortSignal;
+}): Promise<{ title?: string; skipped?: string }> {
+  const session = options.store.getSession(options.sessionId);
+  if (!session) return { skipped: "missing" };
+  if (session.autoTitleDone) return { skipped: "already_done" };
+
+  if (!isDefaultSessionTitle(session.title)) {
+    options.store.markAutoTitleDone(options.sessionId);
+    return { skipped: "custom_title" };
+  }
+
+  const history = options.store.messages(options.sessionId, 24)
+    .filter((message) => (message.role === "user" || message.role === "assistant") && message.content.trim());
+  if (history.length === 0) return { skipped: "no_messages" };
+
+  // Need at least one user turn with a bit of substance before naming.
+  const userText = history.filter((m) => m.role === "user").map((m) => m.content.trim()).join("\n");
+  if (userText.length < 4) return { skipped: "too_short" };
+
+  const transcript = history.slice(0, 12).map((message) => {
+    const role = message.role === "user" ? "用户" : "助手";
+    const body = message.content.trim().slice(0, 800);
+    return `${role}：${body}`;
+  }).join("\n\n").slice(0, 4_500);
+
+  try {
+    const result = await completeText(options.model, [
+      {
+        role: "system",
+        content: "你是写作应用的会话标题生成器。根据对话内容生成一个简短中文标题，概括本会话的写作任务、主题或场景。要求：8～18个字；不要加书名号/引号/句号；不要输出解释或多行；不要以「会话」「对话」开头。",
+      },
+      { role: "user", content: `请为以下写作会话生成标题：\n\n${transcript}` },
+    ], options.signal);
+
+    let title = result.content.trim().split(/\r?\n/)[0]?.trim() ?? "";
+    title = title
+      .replace(/^["'「『《]+/, "")
+      .replace(/["'」』》]+$/, "")
+      .replace(/^[标题：:]\s*/u, "")
+      .trim();
+    if (!title || title.length > 40) return { skipped: "invalid_title" };
+
+    options.store.renameSession(options.sessionId, title, { fromAutoTitle: true });
+    return { title };
+  } catch {
+    // Leave auto_title_done unset so a later successful turn can still name the session.
+    return { skipped: "model_error" };
+  }
 }
 
 function summaryBefore(mode: WritingMode, before: string, selection?: string): string {

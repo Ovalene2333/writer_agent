@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type { ModelConfig, ProviderId, ProviderPublicConfig, TokenPricing } from "./types.js";
+import { normalizePricing } from "./pricing.js";
 import { WriterProject } from "./project.js";
 
 interface SavedProviderConfig {
@@ -28,7 +29,10 @@ export class ProviderManager {
   private saved: SavedProviderConfig;
 
   constructor(project: WriterProject) {
-    this.path = resolve(project.privateDir, "provider.json");
+    const override = process.env.WRITER_PROVIDERS_FILE?.trim();
+    this.path = override
+      ? (isAbsolute(override) ? override : resolve(project.root, override))
+      : resolve(project.privateDir, "providers.json");
     this.saved = this.load();
   }
 
@@ -75,14 +79,7 @@ export class ProviderManager {
     }
     const apiKey = input.apiKey?.trim() || this.saved.apiKey;
     if (!apiKey) throw new Error("API Key 不能为空");
-    const defaults = defaultPricing(input.provider, model);
-    const pricing = input.pricing ? {
-      cacheHit: validRate(input.pricing.cacheHit, defaults.cacheHit),
-      cacheMiss: validRate(input.pricing.cacheMiss, defaults.cacheMiss),
-      output: validRate(input.pricing.output, defaults.output),
-      currency: input.pricing.currency === "USD" ? "USD" as const : "CNY" as const,
-      contextWindow: Math.max(1_000, Math.round(validRate(input.pricing.contextWindow, defaults.contextWindow))),
-    } : defaults;
+    const pricing = normalizePricing(input.provider, model, input.pricing, this.saved.pricing);
     const temperature = typeof input.temperature === "number" && Number.isFinite(input.temperature) && input.temperature >= 0 && input.temperature <= 2
       ? Math.round(input.temperature * 100) / 100 : this.saved.temperature;
     const topP = typeof input.topP === "number" && Number.isFinite(input.topP) && input.topP >= 0 && input.topP <= 1
@@ -120,7 +117,7 @@ export class ProviderManager {
         baseUrl: normalizeBaseUrl(parsed.baseUrl),
         model: parsed.model,
         apiKey: parsed.apiKey,
-        pricing: parsed.pricing ?? defaultPricing(parsed.provider, parsed.model),
+        pricing: normalizePricing(parsed.provider, parsed.model, undefined, parsed.pricing),
       };
     } catch (error) {
       throw new Error(`模型供应商配置无效：${error instanceof Error ? error.message : String(error)}`);
@@ -128,6 +125,7 @@ export class ProviderManager {
   }
 
   private persist(): void {
+    mkdirSync(dirname(this.path), { recursive: true });
     const temporary = `${this.path}.tmp-${process.pid}`;
     writeFileSync(temporary, `${JSON.stringify(this.saved, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     try {
@@ -138,17 +136,6 @@ export class ProviderManager {
       try { unlinkSync(temporary); } catch { /* Windows 可能短暂锁定临时文件。 */ }
     }
   }
-}
-
-function defaultPricing(provider: ProviderId, model: string): TokenPricing {
-  if (provider !== "deepseek") return { cacheHit: 0, cacheMiss: 0, output: 0, currency: "CNY", contextWindow: 128_000 };
-  return model === "deepseek-v4-pro"
-    ? { cacheHit: 0.025, cacheMiss: 3, output: 6, currency: "CNY", contextWindow: 1_000_000 }
-    : { cacheHit: 0.02, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1_000_000 };
-}
-
-function validRate(value: number | undefined, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function normalizeBaseUrl(value: string): string {

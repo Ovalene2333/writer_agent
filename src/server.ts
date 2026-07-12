@@ -8,7 +8,8 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
-import { generateCharacter, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
+import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
+import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
@@ -44,13 +45,16 @@ class BackgroundAgentJobs {
     };
     this.jobs.set(job.id, job);
     const emit = (event: AgentEvent) => this.emit(job.id, event);
-    void run(job.controller.signal, emit).then(() => {
-      if (job.status === "running") this.finish(job, "completed");
-    }).catch((error) => {
-      if (job.status === "running") {
-        this.emit(job.id, { type: "error", message: errorMessage(error) });
-        this.finish(job, "failed");
-      }
+    // Defer so callers can finish `const job = start(...)` before the runner touches `job`.
+    queueMicrotask(() => {
+      void run(job.controller.signal, emit).then(() => {
+        if (job.status === "running") this.finish(job, "completed");
+      }).catch((error) => {
+        if (job.status === "running") {
+          this.emit(job.id, { type: "error", message: errorMessage(error) });
+          this.finish(job, "failed");
+        }
+      });
     });
     return job;
   }
@@ -157,6 +161,27 @@ export async function startWriterServer(options: {
       const path = context.req.query("path") ?? "";
       const content = options.project.read(path);
       return context.json({ path, content, hash: options.project.hash(content) });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  // Browse-only version history (Web UI). Agent tools only read the live file.
+  app.get("/api/document/versions", (context) => {
+    try {
+      const path = context.req.query("path") ?? "";
+      return context.json({ path, versions: options.store.documentVersions(path) });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.get("/api/document/version", (context) => {
+    try {
+      const path = context.req.query("path") ?? "";
+      const id = Number(context.req.query("id"));
+      if (!Number.isInteger(id) || id <= 0) throw new Error("版本编号无效");
+      return context.json({ version: options.store.documentVersion(path, id) });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }
@@ -286,6 +311,15 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/sessions/batch-delete", async (context) => {
+    try {
+      const body = await context.req.json<{ ids?: string[]; keepSessionId?: string }>();
+      const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0) : [];
+      const result = options.store.deleteSessions(ids, body.keepSessionId);
+      return context.json({ ok: true, ...result });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.post("/api/characters", async (context) => {
     try {
       const body = await context.req.json<{
@@ -395,7 +429,7 @@ export async function startWriterServer(options: {
         baseUrl: string;
         model: string;
         apiKey?: string;
-        pricing?: { cacheHit?: number; cacheMiss?: number; output?: number; currency?: "CNY" | "USD"; contextWindow?: number };
+        pricing?: Partial<import("./types.js").TokenPricing>;
       }>();
       return context.json({ provider: options.providers.save(body) });
     } catch (error) {
@@ -415,8 +449,28 @@ export async function startWriterServer(options: {
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
       : undefined;
     const job = agentJobs.start(body.sessionId, async (signal, emit) => {
+      const stepDebug = createAgentStepDebugLogger({
+        sessionId: body.sessionId,
+        jobId: job.id,
+        label: body.mode === "character" ? "character" : "agent",
+      });
+      if (stepDebugEnabled()) {
+        process.stderr.write(
+          `\n[WRITER STEP] ▸ job start session=${body.sessionId.slice(0, 8)} job=${job.id.slice(0, 8)}\n` +
+          `[WRITER STEP] prompt: ${body.prompt.trim().slice(0, 500)}${body.prompt.trim().length > 500 ? "…" : ""}\n`,
+        );
+      }
       try {
-        const onEvent = async (event: AgentEvent) => emit(event);
+        // Defer terminal success events until auto-title finishes so /api/state refresh sees the new title.
+        const deferred: AgentEvent[] = [];
+        const onEvent = (event: AgentEvent) => {
+          stepDebug.onEvent(event);
+          if (event.type === "done" || event.type === "waiting_for_input") {
+            deferred.push(event);
+            return;
+          }
+          emit(event);
+        };
         if (body.mode === "character") {
           await updateCharacterFromConversation({
             model: options.providers.modelConfig("agent"), summaryModel: options.providers.summaryModelConfig(), store: options.store,
@@ -425,24 +479,43 @@ export async function startWriterServer(options: {
             allowedDocumentPaths: characterContextDocumentPaths(options.project, body.contextDocumentPaths),
             signal, onEvent,
           });
-          return;
+        } else {
+          await runAgent({
+            project: options.project,
+            store: options.store,
+            sessionId: body.sessionId,
+            prompt: body.prompt,
+            selectedDocumentBlocks: body.documentSelections,
+            characterScope,
+            models: {
+              agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
+              inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
+            },
+            signal,
+            onEvent,
+          });
         }
-        await runAgent({
-          project: options.project,
-          store: options.store,
-          sessionId: body.sessionId,
-          prompt: body.prompt,
-          selectedDocumentBlocks: body.documentSelections,
-          characterScope,
-          models: {
-            agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
-            inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
-          },
-          signal,
-          onEvent,
-        });
+        // Auto-title once after a successful turn (never overwrites custom titles; only runs once).
+        if (!signal.aborted && deferred.length > 0) {
+          try {
+            await maybeAutoTitleSession({
+              store: options.store,
+              model: options.providers.summaryModelConfig(),
+              sessionId: body.sessionId,
+              signal,
+            });
+          } catch { /* title is best-effort */ }
+        }
+        for (const event of deferred) {
+          stepDebug.onEvent(event);
+          emit(event);
+        }
       } catch (error) {
-        emit({ type: "error", message: errorMessage(error) });
+        const message = errorMessage(error);
+        stepDebug.onEvent({ type: "error", message });
+        emit({ type: "error", message });
+      } finally {
+        stepDebug.flush();
       }
     });
     return context.json({ jobId: job.id });

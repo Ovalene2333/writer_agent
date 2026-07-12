@@ -2,8 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { Character, Message, Proposal, StyleTemplate, TokenPricing, UsageSummary, WritingExample } from "./types.js";
+import type {
+  Character, DocumentVersionDetail, DocumentVersionMeta, Message, Proposal,
+  StyleTemplate, TokenPricing, UsageSummary, WritingExample,
+} from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
+import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
 
 type Row = Record<string, unknown>;
@@ -30,7 +34,8 @@ export class WriterStore {
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        auto_title_done INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,6 +133,10 @@ export class WriterStore {
     if (!revisionColumns.some(column => column.name === "created_file")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN created_file INTEGER NOT NULL DEFAULT 0");
     }
+    const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as Row[];
+    if (!sessionColumns.some(column => column.name === "auto_title_done")) {
+      this.database.exec("ALTER TABLE sessions ADD COLUMN auto_title_done INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   contextArtifact(sessionId: string, cacheKey: string): { id: number; kind: string; path?: string; sourceHash: string; content: string; digest: string } | undefined {
@@ -135,6 +144,14 @@ export class WriterStore {
       .get(sessionId, cacheKey) as Row | undefined;
     if (!row) return undefined;
     this.database.prepare("UPDATE context_artifacts SET last_used_at=? WHERE id=?").run(new Date().toISOString(), Number(row.id));
+    return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), content: String(row.content), digest: String(row.digest),
+      ...(typeof row.path === "string" ? { path: row.path } : {}) };
+  }
+
+  contextArtifactById(sessionId: string, id: number): { id: number; kind: string; path?: string; sourceHash: string; content: string; digest: string } | undefined {
+    const row = this.database.prepare("SELECT id,kind,path,source_hash,content,digest FROM context_artifacts WHERE session_id=? AND id=?")
+      .get(sessionId, id) as Row | undefined;
+    if (!row) return undefined;
     return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), content: String(row.content), digest: String(row.digest),
       ...(typeof row.path === "string" ? { path: row.path } : {}) };
   }
@@ -373,7 +390,7 @@ export class WriterStore {
   createSession(title = "新会话"): string {
     const id = randomUUID();
     const now = new Date().toISOString();
-    this.database.prepare("INSERT INTO sessions(id,title,created_at,updated_at) VALUES(?,?,?,?)")
+    this.database.prepare("INSERT INTO sessions(id,title,created_at,updated_at,auto_title_done) VALUES(?,?,?,?,0)")
       .run(id, title, now, now);
     return id;
   }
@@ -387,23 +404,72 @@ export class WriterStore {
     return Boolean(this.database.prepare("SELECT 1 AS ok FROM sessions WHERE id=?").get(id));
   }
 
-  listSessions(): Array<{ id: string; title: string; updatedAt: string }> {
-    return this.database.prepare("SELECT id,title,updated_at FROM sessions ORDER BY updated_at DESC").all()
+  getSession(id: string): { id: string; title: string; updatedAt: string; autoTitleDone: boolean } | undefined {
+    const row = this.database.prepare("SELECT id,title,updated_at,auto_title_done FROM sessions WHERE id=?")
+      .get(id) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id as string,
+      title: row.title as string,
+      updatedAt: row.updated_at as string,
+      autoTitleDone: Number(row.auto_title_done ?? 0) === 1,
+    };
+  }
+
+  listSessions(): Array<{ id: string; title: string; updatedAt: string; autoTitleDone: boolean }> {
+    return this.database.prepare("SELECT id,title,updated_at,auto_title_done FROM sessions ORDER BY updated_at DESC").all()
       .map((row) => {
         const item = row as Row;
-        return { id: item.id as string, title: item.title as string, updatedAt: item.updated_at as string };
+        return {
+          id: item.id as string,
+          title: item.title as string,
+          updatedAt: item.updated_at as string,
+          autoTitleDone: Number(item.auto_title_done ?? 0) === 1,
+        };
       });
   }
 
-  renameSession(id: string, title: string): void {
-    const result = this.database.prepare("UPDATE sessions SET title=?, updated_at=? WHERE id=?").run(title, new Date().toISOString(), id);
+  /** Rename session. Manual renames lock auto-title so it never overwrites user titles. */
+  renameSession(id: string, title: string, options?: { fromAutoTitle?: boolean }): void {
+    const trimmed = title.trim();
+    if (!trimmed) throw new Error("会话标题不能为空");
+    const now = new Date().toISOString();
+    const result = options?.fromAutoTitle
+      ? this.database.prepare("UPDATE sessions SET title=?, updated_at=?, auto_title_done=1 WHERE id=?")
+        .run(trimmed, now, id)
+      : this.database.prepare("UPDATE sessions SET title=?, updated_at=?, auto_title_done=1 WHERE id=?")
+        .run(trimmed, now, id);
     if (!result.changes) throw new Error("会话不存在");
+  }
+
+  markAutoTitleDone(id: string): void {
+    this.database.prepare("UPDATE sessions SET auto_title_done=1 WHERE id=?").run(id);
   }
 
   deleteSession(id: string): void {
     const sessions = this.listSessions();
     if (sessions.length <= 1) throw new Error("不能删除唯一的会话");
     this.database.prepare("DELETE FROM sessions WHERE id=?").run(id);
+  }
+
+  /** Batch-delete sessions; always keep at least one. Returns remaining session id (prefer keepId if still present). */
+  deleteSessions(ids: string[], keepId?: string): { deleted: string[]; remainingSessionId: string } {
+    const unique = [...new Set(ids.filter((id) => this.sessionExists(id)))];
+    if (unique.length === 0) throw new Error("没有可删除的会话");
+    const all = this.listSessions();
+    if (all.length - unique.length < 1) {
+      throw new Error("至少保留一个会话，请取消勾选部分会话后再删除");
+    }
+    const deleteSet = new Set(unique);
+    for (const id of unique) {
+      this.database.prepare("DELETE FROM sessions WHERE id=?").run(id);
+    }
+    const remaining = this.listSessions();
+    const remainingSessionId = (keepId && remaining.some((s) => s.id === keepId))
+      ? keepId
+      : remaining[0]?.id;
+    if (!remainingSessionId) throw new Error("删除后没有可用会话");
+    return { deleted: unique, remainingSessionId };
   }
 
   addMessage(sessionId: string, role: Message["role"], content: string): number {
@@ -424,11 +490,11 @@ export class WriterStore {
 
   recordUsage(sessionId: string, model: string, usage: {
     promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number;
-  }, pricing: TokenPricing): UsageSummary {
+  }, pricing: TokenPricing, at: Date = new Date()): UsageSummary {
     const miss = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
-    const cost = (usage.cacheHitTokens * pricing.cacheHit + miss * pricing.cacheMiss + usage.completionTokens * pricing.output) / 1_000_000;
+    const cost = calculateUsageCost({ ...usage, cacheMissTokens: miss }, pricing, at);
     this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at) VALUES(?,?,?,?,?,?,?,?,?)`)
-      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, new Date().toISOString());
+      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString());
     return this.usage(sessionId);
   }
 
@@ -634,6 +700,64 @@ export class WriterStore {
       VALUES(NULL,?,?,?,?,?)
     `).run(path, current, content, this.project.hash(content), new Date().toISOString());
     this.reindex();
+  }
+
+  /**
+   * Browse-only version list for a document. Built from accepted/manual revisions
+   * that are not undone. Agent tools never call this — they only see the live file.
+   */
+  documentVersions(path: string): DocumentVersionMeta[] {
+    if (!path) throw new Error("缺少文档路径");
+    const live = this.project.documentExists(path) ? this.project.read(path) : "";
+    const liveHash = live ? this.project.hash(live) : "";
+    const rows = this.database.prepare(`
+      SELECT r.id, r.path, r.after_hash, r.created_file, r.created_at, r.undone,
+             p.summary AS proposal_summary
+      FROM revisions r
+      LEFT JOIN proposals p ON p.id = r.proposal_id
+      WHERE r.path = ? AND r.undone = 0
+      ORDER BY r.id DESC
+      LIMIT 200
+    `).all(path) as Row[];
+    return rows.map((row) => ({
+      id: Number(row.id),
+      path: String(row.path),
+      createdAt: String(row.created_at),
+      summary: typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+        ? String(row.proposal_summary)
+        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑",
+      isCurrent: liveHash !== "" && String(row.after_hash) === liveHash,
+      createdFile: Number(row.created_file) === 1,
+    }));
+  }
+
+  /** Full before/after snapshot for a single revision (browse-only). */
+  documentVersion(path: string, revisionId: number): DocumentVersionDetail {
+    if (!path) throw new Error("缺少文档路径");
+    if (!Number.isInteger(revisionId) || revisionId <= 0) throw new Error("版本编号无效");
+    const row = this.database.prepare(`
+      SELECT r.id, r.path, r.before_content, r.after_content, r.after_hash,
+             r.created_file, r.created_at, r.undone, p.summary AS proposal_summary
+      FROM revisions r
+      LEFT JOIN proposals p ON p.id = r.proposal_id
+      WHERE r.id = ? AND r.path = ?
+    `).get(revisionId, path) as Row | undefined;
+    if (!row) throw new Error("版本不存在");
+    if (Number(row.undone) === 1) throw new Error("该版本已撤销，仅可浏览有效历史");
+    const live = this.project.documentExists(path) ? this.project.read(path) : "";
+    const liveHash = live ? this.project.hash(live) : "";
+    return {
+      id: Number(row.id),
+      path: String(row.path),
+      createdAt: String(row.created_at),
+      summary: typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+        ? String(row.proposal_summary)
+        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑",
+      isCurrent: liveHash !== "" && String(row.after_hash) === liveHash,
+      createdFile: Number(row.created_file) === 1,
+      beforeContent: String(row.before_content ?? ""),
+      afterContent: String(row.after_content ?? ""),
+    };
   }
 
   renameDocument(fromPath: string, toPath: string): void {

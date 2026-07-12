@@ -86,7 +86,8 @@ writer web --lan                  # 监听 0.0.0.0，允许局域网访问
 writer web --host 0.0.0.0         # 自定义监听地址
 writer web --share                # 通过 cloudflared 创建临时公网地址（含访问令牌）
 writer web --no-open              # 不自动打开浏览器
-writer web --debug                # 打印模型请求/响应体
+writer web --debug                # 打印 step 内容 + 模型请求/响应体
+writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / output（推荐排查 UI step）
 ```
 
 ### `writer run` 常用选项
@@ -96,6 +97,7 @@ writer run "续写第二章" -p ./my-novel
 writer run "润色大纲" --session <会话ID>
 writer run "检查人设一致性" --json    # 逐行输出 JSON 事件
 writer run "..." --debug
+writer run "..." --debug-steps      # 仅 step 调试输出
 ```
 
 ### `writer export`
@@ -125,7 +127,7 @@ my-novel/
 ├── characters/              # 角色卡（jsonl / 单卡 JSON）
 └── .writer/                 # 运行时私有数据（勿手改关键文件）
     ├── writer.db            # 会话、提案、用量等
-    ├── provider.json        # 模型供应商配置（含 API Key）
+    ├── providers.json       # 模型供应商配置（含 API Key；可整文件迁移）
     └── ...
 ```
 
@@ -175,8 +177,31 @@ style: ""   # 可设为风格模板 id，如 light-novel
 | `WRITER_API_KEY` | API Key |
 | `WRITER_BASE_URL` | API Base URL，如 `https://api.deepseek.com` |
 | `WRITER_MODEL` | 模型名 |
-| `WRITER_DEBUG` | 设为 `1` / `true` 时打印模型请求与原始返回 |
+| `WRITER_PROVIDERS_FILE` | 供应商配置文件路径（默认 `.writer/providers.json`；可指向共享文件以便跨项目迁移） |
+| `WRITER_DEBUG` | 设为 `1` / `true` 时打印 **step 内容** 与模型请求/原始返回 |
+| `WRITER_DEBUG_STEPS` | 设为 `1` / `true` 时**仅**打印 Agent step（reasoning / tools / output），不含模型 HTTP 原文 |
 | `WRITER_TUNNEL_PROTOCOL` | cloudflared 传输协议，默认 `http2` |
+
+供应商与计费配置集中在 **单独文件** `.writer/providers.json`（含 API Key、模型单价、峰谷计费、角色分工）。复制该文件即可迁移到另一项目；旧版 `.writer/provider.json` 会在首次启动时自动迁移。
+
+#### Step 调试输出格式（`--debug-steps`）
+
+启动 Web 后在同一终端会看到类似：
+
+```text
+[WRITER STEP] ▸ job start session=a1b2c3d4 job=e5f6g7h8
+[WRITER STEP] prompt: 创建第三章大纲…
+[WRITER STEP] ══ Step 1 start ══  session=a1b2c3d4 job=e5f6g7h8 (agent)
+[WRITER STEP] tool → list_documents
+[WRITER STEP] ══ Step 1 done (1234ms) ══  ...
+[WRITER STEP] tools: list_documents, list_outline_nodes
+[WRITER STEP] --- reasoning ---
+...
+[WRITER STEP] --- output ---
+...
+```
+
+把从 `job start` 到 `done` 的整段复制出来即可用于分析。
 
 ## 写作工作流（Agent 行为）
 
@@ -225,7 +250,7 @@ npm test                    # 编译并跑测试
 
 ## 安全提示
 
-- `.writer/provider.json` 含 API Key，**不要提交到公开仓库**
+- `.writer/providers.json`（或 `WRITER_PROVIDERS_FILE` 指向的文件）含 API Key，**不要提交到公开仓库**
 - `writer web --share` 会把带令牌的公网地址暴露到外网；只发给可信设备，结束进程后隧道关闭
 - `--lan` 会允许同一局域网内的设备访问工作台，请注意网络安全环境
 
