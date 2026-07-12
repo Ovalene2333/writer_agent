@@ -69,6 +69,12 @@ type AgentJob = {
   createdAt: string;
   updatedAt: string;
 };
+type PermissionMode = "ask" | "auto" | "plan";
+type AgentTodoItem = {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+};
 type AgentStreamEvent = {
   type: string;
   step?: number;
@@ -79,9 +85,11 @@ type AgentStreamEvent = {
   sessionId?: string;
   question?: string;
   options?: string[];
-  proposal?: { id: number; path: string; summary: string; beforeContent: string; afterContent: string; status: "pending" };
+  proposal?: { id: number; path: string; summary: string; beforeContent: string; afterContent: string; status: "pending" | "accepted" | "rejected" | "stale" };
   usage?: Usage;
   call?: StepUsage;
+  todos?: AgentTodoItem[];
+  mode?: PermissionMode;
 };
 type Usage = {
   promptTokens: number;
@@ -143,7 +151,24 @@ type State = {
   providerCatalog: ProviderCatalog;
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
+  todos?: AgentTodoItem[];
+  agentSettings?: { permissionMode: PermissionMode };
+  projectInstructions?: string | null;
+  skills?: Array<{ id: string; name: string; description: string }>;
 };
+
+const PERMISSION_MODES: Array<{ id: PermissionMode; label: string; hint: string }> = [
+  { id: "ask", label: "Ask", hint: "提案需审批" },
+  { id: "auto", label: "Auto", hint: "提案自动写入" },
+  { id: "plan", label: "Plan", hint: "只读规划" },
+];
+
+function todoStatusMark(status: AgentTodoItem["status"]): string {
+  if (status === "completed") return "✓";
+  if (status === "in_progress") return "›";
+  if (status === "cancelled") return "–";
+  return "○";
+}
 
 type TreeNode = {
   name: string;
@@ -1230,7 +1255,42 @@ function App() {
       setNotice("");
     }
     if (event.type === "proposal" && event.proposal) {
-      setState((prev) => prev ? { ...prev, proposals: [event.proposal!, ...prev.proposals] } : prev);
+      setState((prev) => {
+        if (!prev) return prev;
+        const rest = prev.proposals.filter((item) => item.id !== event.proposal!.id);
+        return { ...prev, proposals: [event.proposal as Proposal, ...rest] };
+      });
+    }
+    if (event.type === "todos" && event.todos) {
+      setState((prev) => (prev ? { ...prev, todos: event.todos } : prev));
+    }
+    if (event.type === "mode" && event.mode) {
+      setState((prev) =>
+        prev
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask" }), permissionMode: event.mode! } }
+          : prev,
+      );
+    }
+  }
+
+  async function setPermissionMode(mode: PermissionMode) {
+    if (!state || busy) return;
+    const current = state.agentSettings?.permissionMode ?? "ask";
+    if (current === mode) return;
+    setError("");
+    try {
+      const result = await api<{ permissionMode: PermissionMode }>("/api/agent-settings", {
+        method: "POST",
+        body: JSON.stringify({ permissionMode: mode }),
+      });
+      setState((prev) =>
+        prev
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask" }), permissionMode: result.permissionMode } }
+          : prev,
+      );
+      setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
     }
   }
 
@@ -1329,6 +1389,7 @@ function App() {
         body: JSON.stringify({
           sessionId: state.sessionId,
           prompt: text,
+          permissionMode: state.agentSettings?.permissionMode ?? "ask",
         }),
       });
       await subscribeAgentJob(result.jobId, state.sessionId, true);
@@ -2067,6 +2128,51 @@ function App() {
             )}
           </div>
         </div>
+        <div className="agent-control-bar">
+          <div className="permission-mode-switch" role="group" aria-label="Permission mode">
+            {PERMISSION_MODES.map((mode) => {
+              const active = (state.agentSettings?.permissionMode ?? "ask") === mode.id;
+              return (
+                <button
+                  key={mode.id}
+                  type="button"
+                  className={`permission-mode-btn${active ? " active" : ""}`}
+                  title={mode.hint}
+                  disabled={busy}
+                  onClick={() => void setPermissionMode(mode.id)}
+                >
+                  {mode.label}
+                </button>
+              );
+            })}
+          </div>
+          {state.projectInstructions && (
+            <span className="agent-control-meta" title="已加载项目指令">
+              {state.projectInstructions}
+            </span>
+          )}
+        </div>
+        {(state.todos?.length ?? 0) > 0 && (
+          <div className="agent-todos" aria-label="Agent task list">
+            <div className="agent-todos-head">
+              <strong>Tasks</strong>
+              <span>
+                {state.todos!.filter((item) => item.status === "completed").length}/{state.todos!.length}
+              </span>
+            </div>
+            <ul className="agent-todos-list">
+              {state.todos!.map((todo) => (
+                <li key={todo.id} className={`todo-${todo.status}`}>
+                  <span className="todo-mark" aria-hidden="true">{todoStatusMark(todo.status)}</span>
+                  <span className="todo-body">
+                    <code>{todo.id}</code>
+                    {todo.content}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="conversation">
           {visibleMessages.map((msg) => (
             <React.Fragment key={msg.id}>

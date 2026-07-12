@@ -7,9 +7,11 @@
 - **项目化写作**：`writer.yaml` + Markdown 文档树，设定、大纲、正文分目录存放
 - **Web 写作工作台**：浏览器中对话、读文档、审批修改；支持局域网与临时公网分享
 - **终端 REPL（TUI）**：`writer chat` 交互式对话，斜杠命令 / 提案审查，对齐主流 code agent 终端体验
+- **Web 权限与任务条**：Agent 面板可切换 Ask/Auto/Plan，实时显示 `manage_todos` 清单
 - **一次生成（CLI）**：`writer run` 执行单次写作任务后退出，适合脚本或批处理
 - **权限模式**：`ask`（提案审批）/ `auto`（自动写入）/ `plan`（只读规划），类似 code agent 的 auto-run / plan mode
 - **任务清单**：`manage_todos` 多步任务跟踪，会话内可查看
+- **工具模块化**：Agent 工具 schema 与 handler 拆分在 `src/tools/`（documents / outline / characters / proposals / meta）
 - **项目指令**：自动加载 `WRITER.md` / `AGENTS.md` / `CLAUDE.md` / `.writer/instructions.md`
 - **项目技能**：`.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md`，按需 `load_skill`
 - **修改提案与撤销**：Agent 默认不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo

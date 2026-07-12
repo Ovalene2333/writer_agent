@@ -1,0 +1,84 @@
+import type { AgentEvent, PermissionMode, Proposal } from "../types.js";
+import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
+import type { WriterStore } from "../store.js";
+import type { ToolHandlerArgs } from "./types.js";
+import { assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
+
+export function maybeAutoAcceptProposal(
+  store: WriterStore,
+  proposal: { id: number; status: string },
+  permissionMode: PermissionMode,
+  emit: (event: AgentEvent) => void,
+): { proposalId: number; status: string; message: string; autoAccepted?: boolean } {
+  if (permissionMode !== "auto" || proposal.status !== "pending") {
+    return {
+      proposalId: proposal.id,
+      status: proposal.status,
+      message: permissionMode === "plan" ? "plan 模式不应产生提案" : "已等待用户审批",
+    };
+  }
+  try {
+    const accepted = store.acceptProposal(proposal.id);
+    emit({ type: "proposal", proposal: accepted });
+    return {
+      proposalId: accepted.id,
+      status: accepted.status,
+      autoAccepted: true,
+      message: "auto 模式：提案已自动写入文件",
+    };
+  } catch (error) {
+    return {
+      proposalId: proposal.id,
+      status: "pending",
+      message: `自动接受失败：${error instanceof Error ? error.message : String(error)}；提案仍待审批`,
+    };
+  }
+}
+
+export function handleProposeDocument({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): string {
+  assertWritableMode(context.permissionMode, "propose_document");
+  const path = requireString(input.path, "path");
+  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  const proposedContent = requireString(input.content, "content");
+  rejectCompressedPlaceholder(proposedContent, "content");
+  const beforeContent = project.documentExists(path) ? project.read(path) : "";
+  const styleError = proseStyleIssuesError(newProseStyleIssues(beforeContent, proposedContent));
+  if (styleError) throw new Error(styleError);
+  const proposal = store.createProposal(
+    sessionId,
+    path,
+    proposedContent,
+    requireString(input.summary, "summary"),
+  );
+  emit({ type: "proposal", proposal });
+  return JSON.stringify(maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit));
+}
+
+export function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): string {
+  assertWritableMode(context.permissionMode, "propose_document_patch");
+  const path = requireString(input.path, "path");
+  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
+  if (!edits.length) throw new Error("局部修改至少需要一条 edit");
+  const beforeContent = project.read(path);
+  let content = beforeContent;
+  for (const [index, rawEdit] of edits.entries()) {
+    if (!rawEdit || typeof rawEdit !== "object") throw new Error(`第 ${index + 1} 条 edit 格式无效`);
+    const edit = rawEdit as Record<string, unknown>;
+    const search = requireString(edit.search, `edits[${index}].search`);
+    const replace = typeof edit.replace === "string" ? edit.replace : undefined;
+    if (replace === undefined) throw new Error(`缺少有效参数：edits[${index}].replace`);
+    rejectCompressedPlaceholder(search, `edits[${index}].search`);
+    rejectCompressedPlaceholder(replace, `edits[${index}].replace`);
+    const occurrences = countOccurrences(content, search);
+    if (occurrences !== 1) throw new Error(`第 ${index + 1} 条 search 在原文中出现 ${occurrences} 次，必须唯一`);
+    content = content.replace(search, replace);
+  }
+  const styleError = proseStyleIssuesError(newProseStyleIssues(beforeContent, content));
+  if (styleError) throw new Error(styleError);
+  const proposal = store.createProposal(sessionId, path, content, requireString(input.summary, "summary"));
+  emit({ type: "proposal", proposal });
+  return JSON.stringify({ edits: edits.length, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });
+}
+
+export type { Proposal };

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
-    "test": "tsc -p tsconfig.json && node --test --test-isolation=none dist/agent_cache.test.js dist/agent_runtime.test.js dist/creative_outline.test.js dist/outline.test.js dist/pricing.test.js dist/prose_quality.test.js dist/diff.test.js dist/style_grounding.test.js",
+    "test": "tsc -p tsconfig.json && node --test --test-isolation=none dist/agent_cache.test.js dist/agent_runtime.test.js dist/tools/schema.test.js dist/creative_outline.test.js dist/outline.test.js dist/pricing.test.js dist/prose_quality.test.js dist/diff.test.js dist/style_grounding.test.js",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json"
   },
