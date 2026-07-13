@@ -2,7 +2,13 @@ import type { AgentEvent, Character, ModelConfig, StepUsage, UsageSummary } from
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { analyzeProseStyle, contrastStyleError, type ProseStyleIssue } from "./prose_quality.js";
+import {
+  analyzeProseStyle,
+  contrastStyleError,
+  proseMannerismConstraintPrompt,
+  proseMannerismPreflightLine,
+  type ProseStyleIssue,
+} from "./prose_quality.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 
@@ -258,11 +264,12 @@ async function buildWritingDraft(
   const documents = options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)).slice(0, 100);
   const documentSet = new Set(documents);
   const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity }));
+  // Free-form ids/paths keep the tools JSON stable across project growth (better prompt-cache prefix).
   const tools = [
     { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
-    { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡。", parameters: { type: "object", properties: { id: { type: "number", enum: [...allowedCharacterIds] } }, required: ["id"], additionalProperties: false } } },
+    { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡（id 须在获准列表中）。", parameters: { type: "object", properties: { id: { type: "number" } }, required: ["id"], additionalProperties: false } } },
     { type: "function", function: { name: "list_documents", description: "列出可读取文档路径。约定：lore/=设定，outline/=大纲，chapters/=正文。先看目录，只选本次需要的文档。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
-    { type: "function", function: { name: "read_document", description: "读取一份与本次情节或事实核对直接相关的文档。", parameters: { type: "object", properties: { path: { type: "string", enum: documents } }, required: ["path"], additionalProperties: false } } },
+    { type: "function", function: { name: "read_document", description: "读取一份与本次情节或事实核对直接相关的文档（path 须在项目可见文档中）。", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } } },
   ];
   const existingContext = options.mode === "continue" ? document.slice(-12_000)
     : options.mode === "rewrite_document" ? document.slice(0, 16_000)
@@ -276,6 +283,8 @@ async function buildWritingDraft(
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
 项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
 草案语气保持直接：标出冲突、欲望、身体或暴力要点时用准确词，不要改成含蓄代称；不做道德评判。
+${proseMannerismConstraintPrompt({ compact: true })}
+在草案的「声线约束」中写明：正文应避免说明性破折号与抽象「不是…而是」堆砌，并给出 1–2 条正向改写提醒供正文模型执行。
 最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束（须引用风格锚定中的句长/对白密度要求）、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: revision
@@ -375,6 +384,7 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
 - 通过具体且相关的内容差异降低机器感；不要随机换同义词、强行拆句、故意写病句、滥加口语或无关细节。
 - 保留必要的朴素过渡、留白、轻重差别和不对称。新增细节必须来自现有上下文，并服务于行动、空间、因果或伏笔。
 - 需要直写处用准确名词与动作，避免“那方面”“不可描述”等遮掩。
+${proseMannerismConstraintPrompt()}
 不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡与 lore 之外的关键设定。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
@@ -383,7 +393,7 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
       `写作前草案（用于约束情节、事实和必要信息；不要在正文中复述草案）：\n${draft}`,
       context ? `文档上下文：\n${context}` : "",
       `写作要求：${options.instruction.trim()}`,
-      "输出须通过风格锚定自检；声线优先贴合本项目既有正文样本。",
+      `输出须通过风格锚定自检；声线优先贴合本项目既有正文样本。${proseMannerismPreflightLine()}`,
     ].filter(Boolean).join("\n\n") },
   ];
 }

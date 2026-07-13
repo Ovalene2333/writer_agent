@@ -54,3 +54,17 @@ export function assertWritableMode(permissionMode: string, toolName: string): vo
     throw new Error(`plan 模式禁止 ${toolName}；请先用最终回复给出计划，或让用户切换到 ask/auto 模式后再写入`);
   }
 }
+
+/** Block full outline document writes in outline mode until design_creative_outline runs. */
+export function assertCreativeOutlineDesigned(
+  context: { requireCreativeOutlineDesign?: boolean; creativeOutlineDesigned?: boolean },
+  path: string,
+  toolName: string,
+): void {
+  if (!context.requireCreativeOutlineDesign || context.creativeOutlineDesigned) return;
+  if (documentKind(path) !== "outline") return;
+  throw new Error(
+    `${toolName} 写入大纲文档前须先成功调用 design_creative_outline 一次（本轮 outline 模式硬约束）。` +
+    `局部节点字段修补请改用 propose_outline_patch，不受此限。`,
+  );
+}

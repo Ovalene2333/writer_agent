@@ -38,7 +38,7 @@ const SCORECARD = [
   { dimension: "人物压力", weight: 20, question: "进展是否迫使人物暴露价值排序并留下不可逆代价？" },
   { dimension: "新颖与惊奇", weight: 18, question: "转折是否超出题材默认答案，同时回看时有铺垫？" },
   { dimension: "张力曲线", weight: 16, question: "压力、希望、信息与亲密度是否有变化？" },
-  { dimension: "可读性", weight: 12, question: "每章能否用目标—阻力—选择—结果简述？" },
+  { dimension: "可读性", weight: 12, question: "每章能否用前因—行动—结果—状态变化简述，且摘要点明目标与阻力？" },
   { dimension: "主题回响", weight: 10, question: "结局是否用人物代价回答核心价值冲突？" },
 ];
 const ANTI_PATTERNS = [
@@ -48,7 +48,12 @@ const ANTI_PATTERNS = [
   "转折仅对读者保密，却不改变人物接下来的行动",
   "冲突强度单调上升，缺少喘息、假胜利、亲密或信息落差",
   "摘要充满抽象评价词，却说不清谁想做什么、受谁阻止、失去什么",
+  "使用目标/阻力/关键选择/POV/张力等未登记字段名，导致结构化大纲无法解析",
 ];
+/** Fields OutlineStore.parseOutline recognizes (list lines: "字段：值"). */
+export const OUTLINE_CHAPTER_FIELDS = [
+  "摘要", "前因", "行动", "结果", "状态变化", "角色ID", "地点", "时间", "情节线", "伏笔", "回收", "状态", "文档", "正文章节",
+] as const;
 export function createCreativeOutlineBrief(input: CreativeOutlineInput): CreativeOutlineBrief {
   const premise = input.premise.trim();
   if (!premise) throw new Error("premise 不能为空");
@@ -66,8 +71,10 @@ export function createCreativeOutlineBrief(input: CreativeOutlineInput): Creativ
     "以读者、动机审计者、题材编辑三种视角各反驳一次并修订。",
     "先写阶段级因果链再拆章节；章节必须以前章结果为条件。",
     "删除可互换、无状态变化或只解释设定的章节。",
+    "落盘章节只用结构化大纲字段名（摘要/前因/行动/结果/状态变化等），勿自造字段。",
   ];
-  const outputContract = `最终展示选定方案及淘汰证据、3—5阶段因果链、约 ${targetChapters} 章的大纲、因果审计和评分。每章包含：具体标题、POV、目标、阻力、关键选择、结果、状态变化、信息释放、伏笔/回收、张力(1—5)。单章80—160字，不写正文式渲染。`;
+  const fieldList = OUTLINE_CHAPTER_FIELDS.join("、");
+  const outputContract = `最终展示选定方案及淘汰证据、3—5阶段因果链、约 ${targetChapters} 章的大纲、因果审计和评分。落盘或提案时每章用 Markdown 标题（如「第N章 标题」）+ 列表行「字段：值」，字段名必须可被结构化大纲解析，仅允许：${fieldList}。语义映射：摘要=一句话含目标、阻力与主冲突；前因=承接上章结果并说明目标此刻为何成立；行动=阻力下的关键选择与执行（含 POV 视角信息时可写在行动或摘要）；结果与状态变化必填；伏笔/回收分写；状态用 idea 或 planned。信息释放与张力(1—5)写入摘要或行动句内，禁止使用「目标」「阻力」「关键选择」「POV」「张力」等未登记字段名。单章列表合计约 80—160 字，不写正文式渲染。`;
   const base = { premise, targetChapters, routes, workflow, scorecard: SCORECARD, antiPatterns: ANTI_PATTERNS, outputContract };
   return { ...base, generationPrompt: renderPrompt(input, base) };
 }

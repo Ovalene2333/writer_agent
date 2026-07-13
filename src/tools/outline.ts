@@ -20,18 +20,20 @@ export function handleGetOutlineNode({ input, project }: ToolHandlerArgs): strin
   return JSON.stringify(resolveOutlineNodePayload(outline, requireString(input.id, "id")));
 }
 
-export function handleDesignCreativeOutline({ input }: ToolHandlerArgs): string {
+export function handleDesignCreativeOutline({ input, context }: ToolHandlerArgs): string {
   const strings = (value: unknown): string[] => Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20)
     : [];
-  return JSON.stringify(createCreativeOutlineBrief({
+  const brief = createCreativeOutlineBrief({
     premise: requireString(input.premise, "premise"),
     ...(typeof input.genre === "string" ? { genre: input.genre } : {}),
     ...(typeof input.audience === "string" ? { audience: input.audience } : {}),
     ...(typeof input.targetChapters === "number" ? { targetChapters: input.targetChapters } : {}),
     constraints: strings(input.constraints), existingBeats: strings(input.existingBeats),
     ...(typeof input.seed === "string" ? { seed: input.seed } : {}),
-  }));
+  });
+  context.creativeOutlineDesigned = true;
+  return JSON.stringify(brief);
 }
 
 export function handleValidateOutline({ project }: ToolHandlerArgs): string {

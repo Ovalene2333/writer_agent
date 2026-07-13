@@ -79,7 +79,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "design_creative_outline",
-      description: "为新建或重构大纲生成独立的创意规划简报：四条结构差异显著的路线、发散—收敛流程、100分评估表、反俗套约束和最终章节格式。开始创作大纲前调用一次",
+      description: "为新建或重构大纲生成独立的创意规划简报：四条结构差异显著的路线、发散—收敛流程、100分评估表、反俗套约束，以及与结构化大纲一致的章节字段契约（摘要/前因/行动/结果/状态变化等）。outline 模式下对大纲文档的 propose_document/propose_document_patch 前必须先成功调用一次",
       parameters: {
         type: "object",
         properties: {
@@ -99,7 +99,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "audit_prose_style",
-      description: "对指定正文做风格审计（破折号/说明句式分类）。info 与 warning 不拦截提案；仅过密的高置信说明体（error）会拦截。对白拖音/中断/迟疑、叙事停顿—揭示、同位命名默认允许，不要为消符号而改写",
+      description: "对指定正文做风格审计：规则先扫说明性破折号/不是…而是，再对灰区片段用 Flash 二审。info/warning 不拦截提案；仅过密的高置信说明体（error）会拦截。对白拖音、列举、表格、停顿—揭示默认允许，不要为消符号而全文改写",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "项目内正文 Markdown 路径" } },
@@ -297,7 +297,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "manage_todos",
-      description: "维护本轮多步任务清单（对齐 code agent 的 todo 工具）。复杂请求（≥3 步）开始时写入清单，推进时更新状态；同一时刻最多一项 in_progress。简单单步请求不必调用",
+      description: "维护本轮多步任务清单（对齐 code agent 的 todo 工具）。复杂请求（≥3 步）开始时写入清单，推进时更新状态；同一时刻最多一项 in_progress。提交最终文档提案前应把相关项标为 completed。简单单步请求不必调用",
       parameters: {
         type: "object",
         properties: {

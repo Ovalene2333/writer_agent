@@ -63,6 +63,7 @@ program.command("run")
           models: {
             agent: providers.modelConfig("agent"), writer: providers.modelConfig("writer"),
             inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),
+            summarizer: providers.summaryModelConfig(),
           },
           onEvent: (event) => {
             stepDebug.onEvent(event);

@@ -1,4 +1,5 @@
 import { documentKind, WriterProject } from "./project.js";
+import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./prose_quality.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 
@@ -10,6 +11,18 @@ export type StyleGroundingOptions = {
   /** Extra prose already in hand (selection, draft context) to prefer as voice anchor. */
   preferredSample?: string;
 };
+
+/** Stable, positive craft guidance kept in the reusable prompt prefix. */
+export function naturalProseCraftPrompt(): string {
+  return `自然叙事原则（服从项目样本；不要为了显得“自然”故意制造病句或随机变化）：
+- 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现。叙述距离一旦贴近某人，不因解释方便突然跳进他人内心。
+- 场景推进：刺激必须引出反应、选择或代价，动作应改变人物关系、空间位置、掌握的信息或下一步可能性；不要写完动作又用旁白复述其意义。
+- 细节取舍：每处细节至少承担空间定位、人物习惯、冲突、因果或伏笔之一。把“紧张、复杂、压迫感”等通用标签换成此时此地才成立的对象、动作或感官变化。
+- 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改变关系，不是轮流播报设定。允许答非所问、半句、停顿和被动作打断，但须符合人物身份与当下目的。
+- 节奏与留白：保留朴素功能句、轻重差和不对称；重要处才放慢或加强。不要每句都修辞、每段都转折、每个场景都总结，未说尽之处可由后续行动承接。
+- 具体性检查：若一句话换掉人名和地点仍能无损套进多数故事（如泛泛的目光、气氛、情绪、决心），就把它落实为本场景独有的物件、说法、动作或后果；无有效信息则删除。
+- 变化来自内容：句长、段长、修辞和对白密度随人物压力与事件节拍变化，并以样本分布为上限；不要机械轮换长短句、堆同义词或强凑“三段式”。`;
+}
 
 /**
  * Dedicated style / voice grounding block for writing stability.
@@ -66,13 +79,22 @@ export function stableStyleGroundingPrompt(
     );
   }
 
+  sections.push(naturalProseCraftPrompt());
+
+  // Constraint-first: mannerism rules before the model writes (reduces propose → reject loops).
+  sections.push(proseMannerismConstraintPrompt());
+
   sections.push(`提交前自检：
 1. 句长、段长、对白占比是否接近上方指纹（本项目样本优先）。
 2. 人物用词是否符合身份与既有对白习惯；勿把所有角色写成同一语气。
-3. 动作之后不重复解释意义；让细节供读者判断，必要因果拆成独立句。保留人物对白中的拖音、中断、迟疑和真实纠正。
-4. 不引入样本、角色卡、lore 中未支撑的关键设定；空白处用可观察动作推进，勿用作者旁白补课。
-5. 场景落在具体动作、决定、发现或未决问题上，避免段尾总结升华。
-6. 直写检查：关键身体、暴力、情欲、脏话是否被无故换成含蓄说法或道德滤镜；作者未要求收敛时保持直接、具体。`);
+3. 段落是否沿视角人物的注意顺序展开；是否为解释方便跳进了他人内心。
+4. 动作是否产生可见后果；动作之后是否又重复解释意义。必要因果拆成独立句。
+5. 对白是否各有目的与回避方式，而不是角色轮流完整播报信息。
+6. 通用情绪、目光、气氛和总结句能否换成只属于本场景的动作、物件或后果；不能则删。
+7. ${proseMannerismPreflightLine()}
+8. 不引入样本、角色卡、lore 中未支撑的关键设定；空白处用可观察动作推进，勿用作者旁白补课。
+9. 场景落在具体动作、决定、发现或未决问题上，避免段尾总结升华。
+10. 直写检查：关键身体、暴力、情欲、脏话是否被无故换成含蓄说法或道德滤镜；作者未要求收敛时保持直接、具体。`);
 
   return sections.join("\n\n");
 }
@@ -104,17 +126,43 @@ export function dynamicStyleGroundingPrompt(
 export function styleFingerprint(content: string, notes: string): string {
   const paragraphs = content.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
   const sentences = content.split(/[。！？!?]+/).map((item) => item.trim()).filter(Boolean);
-  const averageSentenceLength = sentences.length
-    ? Math.round(sentences.reduce((sum, item) => sum + item.length, 0) / sentences.length)
-    : 0;
+  const sentenceLengths = sentences.map(proseLength).filter(length => length > 0);
+  const paragraphLengths = paragraphs.map(proseLength).filter(length => length > 0);
+  const averageSentenceLength = average(sentenceLengths);
+  const medianSentenceLength = percentile(sentenceLengths, 0.5);
+  const upperSentenceLength = percentile(sentenceLengths, 0.8);
   const dialogueParagraphs = paragraphs.filter((item) => /^[“「『"']/.test(item)).length;
   const dialogueRatio = paragraphs.length ? Math.round((dialogueParagraphs / paragraphs.length) * 100) : 0;
-  const avgParagraphChars = paragraphs.length
-    ? Math.round(paragraphs.reduce((sum, item) => sum + item.length, 0) / paragraphs.length)
+  const singleSentenceParagraphs = paragraphs.filter(item =>
+    item.split(/[。！？!?]+/).map(part => part.trim()).filter(Boolean).length <= 1,
+  ).length;
+  const singleSentenceRatio = paragraphs.length ? Math.round((singleSentenceParagraphs / paragraphs.length) * 100) : 0;
+  const avgParagraphChars = average(paragraphLengths);
+  const shortSentenceRatio = sentenceLengths.length
+    ? Math.round((sentenceLengths.filter(length => length <= 12).length / sentenceLengths.length) * 100)
     : 0;
+  const longSentenceRatio = sentenceLengths.length
+    ? Math.round((sentenceLengths.filter(length => length >= 30).length / sentenceLengths.length) * 100)
+    : 0;
+  const commaCount = (content.match(/[，,；;]/g) ?? []).length;
+  const commaRhythm = sentences.length ? (commaCount / sentences.length).toFixed(1) : "0.0";
   const rhythm = averageSentenceLength <= 16 ? "短促" : averageSentenceLength >= 32 ? "绵长" : "长短适中";
   const density = avgParagraphChars <= 80 ? "段落偏短" : avgParagraphChars >= 200 ? "段落偏长" : "段落适中";
-  return `句法节奏=${rhythm}；平均句长≈${averageSentenceLength}字；${density}；对白段落≈${dialogueRatio}%${notes.trim() ? `；显式要求=${notes.trim().slice(0, 300)}` : ""}`;
+  return `句法节奏=${rhythm}；句长均值≈${averageSentenceLength}字/中位≈${medianSentenceLength}字/八成不超过≈${upperSentenceLength}字；短句(≤12字)≈${shortSentenceRatio}%/长句(≥30字)≈${longSentenceRatio}%；${density}(均值≈${avgParagraphChars}字)；单句段≈${singleSentenceRatio}%；对白起始段≈${dialogueRatio}%；每句逗号/分号≈${commaRhythm}${notes.trim() ? `；显式要求=${notes.trim().slice(0, 300)}` : ""}`;
+}
+
+function proseLength(value: string): number {
+  return [...value.replace(/\s/g, "")].length;
+}
+
+function average(values: number[]): number {
+  return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : 0;
+}
+
+function percentile(values: number[], ratio: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio))];
 }
 
 function pickStyleExamples(

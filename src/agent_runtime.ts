@@ -213,6 +213,43 @@ export function formatTodosForPrompt(todos: AgentTodoItem[]): string {
   }).join("\n");
 }
 
+/**
+ * When a turn ends successfully (final reply or document proposal submitted),
+ * mark remaining open todos completed so the UI does not stay stuck at e.g. 1/3
+ * after "Agent job completed". Cancelled items are left alone.
+ * Proposal success intentionally stops the agent before another manage_todos call.
+ */
+export function finalizeOpenTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
+  let changed = false;
+  const next = todos.map(item => {
+    // Treat anything not already completed/cancelled as open (covers bad model statuses).
+    if (item.status !== "completed" && item.status !== "cancelled") {
+      changed = true;
+      return { ...item, status: "completed" as const };
+    }
+    return item;
+  });
+  return { todos: next, changed };
+}
+
+/** Persist finalized session todos and optionally emit a stream event. */
+export function persistFinalizedSessionTodos(
+  store: {
+    sessionTodos(sessionId: string): AgentTodoItem[];
+    saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void;
+  },
+  sessionId: string,
+  emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
+): AgentTodoItem[] {
+  const current = store.sessionTodos(sessionId);
+  if (!current.length) return current;
+  const { todos, changed } = finalizeOpenTodos(current);
+  if (!changed) return current;
+  store.saveSessionTodos(sessionId, todos);
+  emit?.({ type: "todos", todos });
+  return todos;
+}
+
 export function permissionModeLabel(mode: PermissionMode): string {
   if (mode === "auto") return "auto（提案自动写入）";
   if (mode === "plan") return "plan（只读规划，禁止提交写入提案）";

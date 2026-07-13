@@ -316,6 +316,7 @@ export function WriterAgentTui(props: {
           writer: props.providers.modelConfig("writer"),
           inline: props.providers.modelConfig("inline"),
           reviewer: props.providers.modelConfig("reviewer"),
+          summarizer: props.providers.summaryModelConfig(),
         },
         signal: controller.signal,
         onEvent: handleEvent,

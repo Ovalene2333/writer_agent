@@ -13,6 +13,7 @@ import {
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
+  persistFinalizedSessionTodos,
   saveAgentSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
@@ -534,6 +535,7 @@ export async function startWriterServer(options: {
             models: {
               agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
               inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
+              summarizer: options.providers.summaryModelConfig(),
             },
             signal,
             onEvent,
@@ -549,6 +551,11 @@ export async function startWriterServer(options: {
               signal,
             });
           } catch { /* title is best-effort */ }
+        }
+        // Safety net: proposal success ends the agent before another manage_todos turn,
+        // so the last checklist item is often left open. Close open todos before "done".
+        if (!signal.aborted && deferred.some(event => event.type === "done")) {
+          persistFinalizedSessionTodos(options.store, body.sessionId, emit);
         }
         for (const event of deferred) {
           stepDebug.onEvent(event);

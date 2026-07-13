@@ -1,8 +1,9 @@
 import type { AgentEvent, PermissionMode, Proposal } from "../types.js";
+import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
 import type { WriterStore } from "../store.js";
 import type { ToolHandlerArgs } from "./types.js";
-import { assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
+import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
 
 export function maybeAutoAcceptProposal(
   store: WriterStore,
@@ -35,15 +36,34 @@ export function maybeAutoAcceptProposal(
   }
 }
 
-export function handleProposeDocument({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): string {
+async function gateProseStyle(
+  beforeContent: string,
+  afterContent: string,
+  context: ToolHandlerArgs["context"],
+): Promise<void> {
+  let issues = newProseStyleIssues(beforeContent, afterContent);
+  if (context.proseAdjudicator) {
+    const flash = await adjudicateProseStyleForProposal(
+      afterContent,
+      issues,
+      context.proseAdjudicator.model,
+      { signal: context.proseAdjudicator.signal },
+    );
+    issues = flash.issues;
+  }
+  const styleError = proseStyleIssuesError(issues);
+  if (styleError) throw new Error(styleError);
+}
+
+export async function handleProposeDocument({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  assertCreativeOutlineDesigned(context, path, "propose_document");
   const proposedContent = requireString(input.content, "content");
   rejectCompressedPlaceholder(proposedContent, "content");
   const beforeContent = project.documentExists(path) ? project.read(path) : "";
-  const styleError = proseStyleIssuesError(newProseStyleIssues(beforeContent, proposedContent));
-  if (styleError) throw new Error(styleError);
+  await gateProseStyle(beforeContent, proposedContent, context);
   const proposal = store.createProposal(
     sessionId,
     path,
@@ -54,10 +74,11 @@ export function handleProposeDocument({ input, project, store, sessionId, emit, 
   return JSON.stringify(maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit));
 }
 
-export function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): string {
+export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document_patch");
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  assertCreativeOutlineDesigned(context, path, "propose_document_patch");
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
   const beforeContent = project.read(path);
@@ -74,8 +95,7 @@ export function handleProposeDocumentPatch({ input, project, store, sessionId, e
     if (occurrences !== 1) throw new Error(`第 ${index + 1} 条 search 在原文中出现 ${occurrences} 次，必须唯一`);
     content = content.replace(search, replace);
   }
-  const styleError = proseStyleIssuesError(newProseStyleIssues(beforeContent, content));
-  if (styleError) throw new Error(styleError);
+  await gateProseStyle(beforeContent, content, context);
   const proposal = store.createProposal(sessionId, path, content, requireString(input.summary, "summary"));
   emit({ type: "proposal", proposal });
   return JSON.stringify({ edits: edits.length, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });

@@ -50,29 +50,90 @@ const SOUND_OR_INTERJECTION = /[啊呀哦噢嗯呜哎唉哈嘿嘘喂诶咦嗡轰
  * 仅这些子类在“过密”时可能升为 error（会拦截提案）。
  * 普通叙事破折号、同位说明、模糊破折号、事实排除只保留 warning/info。
  */
-const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
+export const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
   "parenthetical_explanation",
   "cause_or_judgment",
   "abstract_reframing",
   "narrator_redefinition",
 ]);
 
-/** Context-aware scanner for explanatory dashes and formulaic redefinition frames. */
-export function analyzeProseStyle(text: string): ProseStyleIssue[] {
-  const raw = [...scanDashes(text), ...scanContrasts(text)].sort((a, b) => a.start - b.start);
+export function isHardBlockSubtype(subtype: ProseStyleSubtype): boolean {
+  return HARD_BLOCK_SUBTYPES.has(subtype);
+}
+
+/** Density threshold for escalating high-confidence hard mannerisms to error. */
+export function hardMannerismLimit(text: string): number {
   const characters = Math.max(1, text.replace(/\s/g, "").length);
-  // 高置信 + 硬说明子类 才进入升 error 池；阈值按正文长度放宽。
-  const candidates = raw.filter(issue =>
+  return Math.max(5, 3 + Math.floor(characters / 2_000));
+}
+
+/**
+ * Generation-time constraints (constraint-first).
+ * Inject into system prompts before the model writes, so fewer proposals fail the final gate.
+ * Specific negatives + rewrite recipes outperform vague “avoid dashes”.
+ */
+export function proseMannerismConstraintPrompt(options?: { compact?: boolean }): string {
+  if (options?.compact) {
+    return [
+      "句式硬约束（生成时遵守，减少返工）：",
+      "1. 叙述少用破折号做「画面——解释 / 因果补注」；优先句号拆句，或把说明改成可观察动作/细节。",
+      "2. 叙述少用「不是A（而）是B」「并非…而是…」等抽象重定义；直接写成立事实或落到行动/对白。",
+      "3. 允许：对白拖音/中断/迟疑；人物口语纠正；并列列举（头——脚——手）；Markdown 表格；偶发停顿—揭示与短同位。",
+      "4. 禁止堆砌：同一段落反复「——因为/也就是」或密集否定—肯定模板。",
+    ].join("\n");
+  }
+  return `句式与符号约束（生成阶段强制遵守；终审会机器抽查过密说明体）
+
+【破折号 —— / --】
+- 默认策略：叙述中优先不用破折号做补充说明。写成「动作。结果。」或「细节供读者判断」，不要「动作——因为/也就是/意味着…」。
+- 禁止高频：成对夹注（A——插入说明——B）、句中「画面——解释」。
+- 允许保留：对白内拖音/中断/迟疑（「你——你说什么」）；标题/列表/数值区间；Markdown 表格分隔；并列列举（头——脚——手）；偶发停顿后揭示或短同位（桌上只剩钥匙——一把黄铜的）。
+- 改写配方：删破折号后半句的解释，只留可观察结果；因果不可省则拆成下一句独立句。
+
+【「不是…是…」类模板】
+- 叙述少用：不是A而是B / 并非…而是 / 与其说…不如 / 没有…只有 / 不在于…而在于（尤其「这/那不是情绪，而是意义」式抽象重定义）。
+- 允许：对白里纠正事实（「不是老周，是他儿子」）；客观事实排除写清即可，勿叠抽象标签。
+- 改写配方：直接陈述真正成立的事实；若需纠正误解，改由人物行动或对白完成。
+
+【目标】
+一次写对，避免提案被退回后整段重写。提交前快速扫：说明性破折号、抽象「不是…而是」是否成串出现。`;
+}
+
+/** One-line checklist for pre-submit self-check in task workflows. */
+export function proseMannerismPreflightLine(): string {
+  return "句式自检：有无说明性破折号（画面——解释/——因为）、有无叙述里抽象「不是…而是」；有则先改再提交。对白拖音与口语纠正可保留。";
+}
+
+/** Rule scan without density escalation (for pre-model packing). */
+export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
+  return [...scanDashes(text), ...scanContrasts(text)].sort((a, b) => a.start - b.start);
+}
+
+/**
+ * Re-apply density escalation after Flash demotions.
+ * Resets prior error→warning on hard subtypes, then promotes when over limit.
+ */
+export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]): ProseStyleIssue[] {
+  for (const issue of issues) {
+    if (issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype)) {
+      issue.severity = "warning";
+    }
+  }
+  const limit = hardMannerismLimit(text);
+  const candidates = issues.filter(issue =>
     issue.severity === "warning"
     && issue.confidence >= 0.9
     && HARD_BLOCK_SUBTYPES.has(issue.subtype),
   );
-  // 约每 2000 字允许 3 处硬说明习惯；至少 5 处才整体升级，避免短章两处破折号就卡死。
-  const limit = Math.max(5, 3 + Math.floor(characters / 2_000));
   if (candidates.length > limit) {
     for (const issue of candidates) issue.severity = "error";
   }
-  return raw;
+  return issues;
+}
+
+/** Context-aware scanner for explanatory dashes and formulaic redefinition frames. */
+export function analyzeProseStyle(text: string): ProseStyleIssue[] {
+  return escalateHardMannerisms(text, scanProseStyleIssues(text));
 }
 
 export function contrastStyleReport(text: string): ContrastStyleReport {
@@ -96,11 +157,7 @@ export function contrastStyleReport(text: string): ContrastStyleReport {
 export function contrastStyleError(text: string): string | undefined {
   const errors = analyzeProseStyle(text).filter(issue => issue.severity === "error");
   if (!errors.length) return undefined;
-  const located = errors.slice(0, 5).map(issue =>
-    `第${issue.line}行${issue.column}列「${issue.evidence}」：${issue.reason}`,
-  );
-  return `正文中说明式写法过密（${errors.length}处硬拦截）：${located.join("；")}。` +
-    "请只改命中句：保留事实和人物声线，优先让动作产生结果、用细节供读者判断，必要因果拆成独立句；对白中的延长、中断和真实纠正可以保留。叙事性破折号（停顿、揭示、同位）可保留。";
+  return formatProseStyleBlockError(errors, "正文中说明式写法过密");
 }
 
 /** Return only issues introduced by `after`, using a multiset so duplicate mannerisms are detected. */
@@ -127,9 +184,31 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
     issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
   );
   if (!errors.length) return undefined;
-  return `本次修改新增 ${errors.length} 处过密的高置信度说明式写法：` + errors.slice(0, 5)
-    .map(issue => `第${issue.line}行「${issue.evidence}」`).join("；") +
-    "。请局部改写命中句；普通叙事破折号与对白拖音不会拦截提交。";
+  return formatProseStyleBlockError(errors, "本次修改新增过密的高置信度说明式写法");
+}
+
+/** Actionable block message so one local rewrite can pass re-submit. */
+function formatProseStyleBlockError(errors: ProseStyleIssue[], headline: string): string {
+  const located = errors.slice(0, 5).map(issue => {
+    const tip = issue.suggestions[0] ?? rewriteTipForSubtype(issue.subtype);
+    return `第${issue.line}行「${issue.evidence}」→ ${tip}`;
+  });
+  return `${headline}（${errors.length}处硬拦截）：${located.join("；")}。` +
+    "只改命中句，勿全文重写。保留：对白拖音/中断/迟疑、口语纠正、偶发停顿—揭示与短同位。配方：删「——因为/也就是」类补注；抽象「不是…而是」改成直接事实或人物行动。";
+}
+
+function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
+  switch (subtype) {
+    case "parenthetical_explanation":
+      return "去掉成对夹注，改成一句完整叙述或拆成两句";
+    case "cause_or_judgment":
+      return "删破折号后的因果/定义，只留结果；因果拆下一句";
+    case "abstract_reframing":
+    case "narrator_redefinition":
+      return "去掉「不是A而是B」模板，直接写成立事实或落到行动/对白";
+    default:
+      return "改成可观察动作或独立句，去掉说明体";
+  }
 }
 
 function scanDashes(text: string): ProseStyleIssue[] {
@@ -145,9 +224,28 @@ function scanDashes(text: string): ProseStyleIssue[] {
     const insideQuote = quoteDepthAt(text, match.start) > 0;
     const after = text.slice(match.end, bounds.end).trim();
 
-    if (isMetadataLine(lineText) || insideFullwidthBracket(text, match.start) || isNumericRange(text, match)) {
+    // Markdown tables and structural lines: never treat as explanatory prose dashes.
+    if (
+      isMetadataLine(lineText)
+      || isMarkdownTableLine(lineText)
+      || insideFullwidthBracket(text, match.start)
+      || isNumericRange(text, match)
+    ) {
       issues.push(makeIssue(text, match, "dash", "system_or_metadata", "info", 0.99,
-        "标题、列表、系统提示或数值连接中的符号，不属于说明体。", []));
+        "标题、列表、表格、系统提示或数值连接中的符号，不属于说明体。", []));
+      continue;
+    }
+
+    // 列举链：头——脚——手 / 春——夏——秋——冬（短项并列，不是夹注说明）
+    const enumRun = enumerationDashRun(text, matches, i, bounds);
+    if (enumRun) {
+      for (let k = i; k <= enumRun.lastIndex; k += 1) consumed.add(k);
+      issues.push(makeIssue(text, {
+        start: matches[i].start,
+        end: matches[enumRun.lastIndex].end,
+        text: text.slice(matches[i].start, matches[enumRun.lastIndex].end),
+      }, "dash", "system_or_metadata", "info", 0.97,
+        "并列列举用破折号连接短项，不属于说明体。", []));
       continue;
     }
 
@@ -279,6 +377,71 @@ function insideFullwidthBracket(text: string, index: number): boolean {
   return start > end && text.indexOf("】", index) >= 0;
 }
 function isMetadataLine(line: string): boolean { return /^\s*(?:#{1,6}\s|[-*+]\s|---+\s*$|——\s*\S+\s*$)/u.test(line); }
+
+/** GFM/Markdown table rows and alignment separators (often full of --- / ——). */
+function isMarkdownTableLine(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  // Classic pipe table row: | a | b |  or leading/trailing pipe variants
+  if (/^\|.*\|$/.test(t)) return true;
+  // Alignment / separator: |---|:---| or ---|--- without requiring outer pipes
+  if (/^:?-{2,}:?(\s*\|\s*:?-{2,}:?)+$/.test(t)) return true;
+  if (/^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$/.test(t)) return true;
+  // At least two cell dividers (a | b | c) — common loose tables without outer pipes
+  const pipes = t.match(/\|/g);
+  if (pipes && pipes.length >= 2 && !/^「|^『|^"|^'/.test(t)) return true;
+  return false;
+}
+
+/**
+ * Parallel short-item dash lists: 头——脚——手 / 春——夏——秋——冬.
+ * Requires ≥2 dash connectors and every segment short (avoids 这件事——说得不客气些——实在).
+ */
+function enumerationDashRun(
+  text: string,
+  matches: MatchRange[],
+  start: number,
+  bounds: { start: number; end: number },
+): { lastIndex: number } | undefined {
+  // Gather consecutive dash matches inside this sentence starting at `start`.
+  let last = start;
+  while (last + 1 < matches.length && matches[last + 1].start < bounds.end) last += 1;
+  const runCount = last - start + 1;
+  if (runCount < 2) return undefined;
+
+  const parts: string[] = [];
+  // Left of first dash within the sentence (trim leading clause punctuation)
+  let left = text.slice(bounds.start, matches[start].start).trim();
+  left = left.replace(/^.*[，,、；;：:\s]/u, "").trim();
+  parts.push(left);
+  for (let k = start; k <= last; k += 1) {
+    const segEnd = k < last ? matches[k + 1].start : bounds.end;
+    let seg = text.slice(matches[k].end, segEnd).trim();
+    seg = seg.replace(/[。！？!?…]+$/u, "").trim();
+    // Rightmost segment: drop trailing clause after short token if any long tail
+    if (k === last) seg = seg.replace(/[，,、；;].*$/u, "").trim();
+    parts.push(seg);
+  }
+  // ≥3 short parallel tokens (2 dashes) or more
+  if (parts.length < 3) return undefined;
+  if (!parts.every(isShortEnumToken)) return undefined;
+  return { lastIndex: last };
+}
+
+function isShortEnumToken(segment: string): boolean {
+  const t = segment.trim();
+  if (!t) return false;
+  // Use code-point length so CJK counts as 1 each
+  const len = [...t].length;
+  if (len > 4) return false;
+  if (EXPLANATION_SIGNALS.test(t)) return false;
+  // Parenthetical middles often have 得/地/的 + verb-ish; allow pure nouns/names only
+  if (/[因为由于意味着也就是或者说]/.test(t)) return false;
+  // Keep tokens noun/number-like; reject clause fragments
+  if (!/^[\p{Script=Han}A-Za-z0-9·、/／]+$/u.test(t)) return false;
+  return true;
+}
+
 function isNumericRange(text: string, range: MatchRange): boolean { return /\d/u.test(text[range.start - 1] ?? "") && /\d/u.test(text[range.end] ?? ""); }
 function previousHan(text: string, index: number): string { return text.slice(0, index).match(/[\p{Script=Han}A-Za-z]$/u)?.[0] ?? ""; }
 function nextHan(text: string, index: number): string { return text.slice(index).match(/^[\s，、]*(?:([\p{Script=Han}A-Za-z]))/u)?.[1] ?? ""; }

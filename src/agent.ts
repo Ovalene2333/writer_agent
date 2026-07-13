@@ -4,12 +4,14 @@ import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
+import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./prose_quality.js";
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt, styleFingerprint } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 import {
   formatTodosForPrompt,
   loadAgentSettings,
   permissionModeLabel,
+  persistFinalizedSessionTodos,
   projectInstructionsPrompt,
   skillsCatalogPrompt,
 } from "./agent_runtime.js";
@@ -199,6 +201,7 @@ ${stylePointer}
 2. 让动作产生结果、让细节供读者判断；必要因果拆成独立句。保留对白中的拖音、中断、迟疑和真实纠正。
 3. 对白服从人物身份与当下目的；场景落在具体动作、决定、发现或未决问题上。
 4. 不编造 lore/角色卡未支撑的关键设定；区分项目事实与合理创作推断。
+5. ${proseMannerismConstraintPrompt({ compact: true })}
 `;
 }
 
@@ -215,8 +218,8 @@ ${modeRule}
 4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
 5. 管理角色使用 save_character：修改已有卡必须传 id，并先读取完整卡片、保留未要求修改的字段；新建卡省略 id。写作时只读取所需角色字段。
 6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
-7. 资料复用：会话工作记忆、本轮工具结果、带 reused 标记的返回可直接复用，禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
-8. 复杂多步请求（≥3 步）用 manage_todos 维护清单并随进度更新；简单单步不必。同一时刻最多一项 in_progress。
+7. 资料复用：仅复用「本轮任务相关工作记忆」、本轮工具结果、带 reused 标记的返回；禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。上一轮非承接任务的清单与记忆不会自动带入。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
+8. 复杂多步请求（≥3 步）用 manage_todos 维护清单并随进度更新；简单单步不必。清单绑定当前对话任务：切换到不同 mode 的新请求会清空旧清单，承接续写则保留。同一时刻最多一项 in_progress。提交最终文档提案前把清单中剩余项标为 completed（提案成功后本轮会立即结束，之后无法再更新清单）。
 9. 若系统提示列出了项目技能且细则对当前任务必要，先 load_skill 再执行；不要编造不存在的技能。
 10. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。
 当前执行模式：${permissionModeLabel(mode)}`;
@@ -278,22 +281,25 @@ async function planWritingTask(
   const characters = store.characters().map(item => ({ id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity }));
   const activeStyleId = project.config().style;
   const activeStyle = activeStyleId ? getStyleTemplate(activeStyleId) : undefined;
+  // Slim catalogs: paths / id+name only — full notes/examples hurt planner cache and cost.
   const examples = store.writingExamples()
     .filter(item => !item.title.startsWith("[风格模板]") || item.title === `[风格模板] ${activeStyle?.name}`)
-    .map(item => ({ id: item.id, title: item.title, category: item.category, notes: item.notes.slice(0, 160) }));
-  const recent = history.slice(-6).map(item => item.role === "user"
-    ? { content: item.content?.slice(0, 800) ?? "" }
-    : { role: item.role, content: item.content?.slice(0, 800) ?? "" });
+    .map(item => ({ id: item.id, title: item.title, category: item.category }))
+    .slice(0, 40);
+  const slimCharacters = characters.map(item => ({ id: item.id, name: item.name, aliases: item.aliases }));
+  const recent = history.slice(-4).map(item => item.role === "user"
+    ? { content: item.content?.slice(0, 400) ?? "" }
+    : { role: item.role, content: item.content?.slice(0, 400) ?? "" });
   const planningMessages: ApiMessage[] = [{
     role: "system",
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
 字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
 决策原则：当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
 路径约定：lore/=设定事实，outline/=情节计划，chapters/=主线正文，side/=支线，archive/=旧稿。为正文写作选 targetPath 时优先 chapters/；为大纲任务优先 outline/；查世界观优先在 lore/ 上 search。
-文档目录（只有路径，尚未读取正文）：${JSON.stringify(documents)}
-角色目录：${JSON.stringify(characters)}
+文档目录：${JSON.stringify(documents)}
+角色目录：${JSON.stringify(slimCharacters)}
 范文目录：${JSON.stringify(examples)}
-历史对话数据：${JSON.stringify(recent)}`,
+历史摘要：${JSON.stringify(recent)}`,
   }, { role: "user", content: request }];
   const result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, false);
   const firstBrace = result.content.indexOf("{");
@@ -333,20 +339,90 @@ async function planWritingTask(
 function fastRouteWritingTask(project: WriterProject, store: WriterStore, sessionId: string, request: string): WritingTask | undefined {
   const references = explicitReferencePaths(project, request);
   const sessionContext = store.sessionContext(sessionId);
-  const continuation = /^(继续|接着|续写|往下写)(?:[。！!，,\s]|$)/.test(request.trim());
-  const rewrite = /(改写|重写|润色|修改).*(这一段|这段|选区)/.test(request);
-  const audit = /(审阅|检查|校对|找问题)/.test(request) && references.length > 0;
-  const targetPath = references[0] ?? (continuation ? sessionContext.activeDocument ?? store.proposals().find(item => item.sessionId === sessionId)?.path : undefined);
-  if (continuation && targetPath) return { mode: "write_scene", label: TASK_LABELS.write_scene, documentContext: "continuation", targetPath,
-    searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: true };
-  if (rewrite && targetPath) return { mode: "rewrite", label: TASK_LABELS.rewrite, documentContext: "target", targetPath,
-    searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: false };
-  if (audit) return { mode: "audit", label: TASK_LABELS.audit, documentContext: "target", targetPath,
-    searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: false, continuation: false };
+  const trimmed = request.trim();
+  const continuation = /^(继续|接着|续写|往下写)(?:[。！!，,\s]|$)/.test(trimmed)
+    || /^(继续|接着).{0,12}(写|写下去|往下)/.test(trimmed);
+  const rewrite = /(改写|重写|润色|修改).*(这一段|这段|选区|这一章|整章|全文)/.test(request);
+  const audit = /(审阅|检查|校对|找问题|风格审计|audit)/.test(request)
+    && (references.length > 0 || Boolean(sessionContext.activeDocument));
+  const writeChapter = /(写|撰写|创作|扩写).{0,16}(第\s*[一二三四五六七八九十百千零〇\d]+\s*章|正文|场景)/.test(request)
+    || /^(开写|写正文|写一章)/.test(trimmed);
+  const stickyPath = sessionContext.activeDocument
+    ?? store.proposals().find(item => item.sessionId === sessionId)?.path;
+  const targetPath = references[0]
+    ?? (continuation || rewrite || writeChapter || audit ? stickyPath : undefined)
+    ?? (writeChapter ? inferChapterPath(project, request) : undefined);
+
+  if (continuation && targetPath) {
+    return {
+      mode: "write_scene", label: TASK_LABELS.write_scene, documentContext: "continuation", targetPath,
+      searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: true,
+    };
+  }
+  if (rewrite && targetPath) {
+    return {
+      mode: "rewrite", label: TASK_LABELS.rewrite, documentContext: "target", targetPath,
+      searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: false,
+    };
+  }
+  if (audit && targetPath) {
+    return {
+      mode: "audit", label: TASK_LABELS.audit, documentContext: "target", targetPath,
+      searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: false, continuation: false,
+    };
+  }
+  if (writeChapter && targetPath) {
+    return {
+      mode: "write_scene", label: TASK_LABELS.write_scene, documentContext: "target", targetPath,
+      searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: true, continuation: false,
+    };
+  }
   if (references.length === 1) {
-    const writing = /(写|续写|扩写|改写|重写|修改|润色)/.test(request);
-    return { mode: writing ? "write_scene" : "general", label: TASK_LABELS[writing ? "write_scene" : "general"], documentContext: "target",
-      targetPath, searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [], documentProposalRequired: writing, continuation: false };
+    const writing = /(写|续写|扩写|改写|重写|修改|润色|撰写|创作)/.test(request);
+    return {
+      mode: writing ? "write_scene" : "general",
+      label: TASK_LABELS[writing ? "write_scene" : "general"],
+      documentContext: "target",
+      targetPath: references[0],
+      searchQuery: request.slice(0, 200), characterIds: [], exampleIds: [],
+      documentProposalRequired: writing, continuation: false,
+    };
+  }
+  return undefined;
+}
+
+/** Best-effort map 「第N章」 to an existing chapters/*.md path for fastRoute. */
+function inferChapterPath(project: WriterProject, request: string): string | undefined {
+  const match = request.match(/第\s*([一二三四五六七八九十百千零〇\d]+)\s*章/);
+  if (!match) return undefined;
+  const raw = match[1];
+  const arabic = /^\d+$/.test(raw) ? raw : chineseNumeralToInt(raw);
+  if (!arabic) return undefined;
+  const n = Number(arabic);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  const candidates = [
+    `chapters/第${n}章.md`,
+    `chapters/第${String(n).padStart(2, "0")}章.md`,
+    `chapters/ch${n}.md`,
+    `chapters/ch${String(n).padStart(2, "0")}.md`,
+    `chapters/${n}.md`,
+  ];
+  for (const path of candidates) {
+    if (project.documentExists(path) && !project.isDocumentHidden(path)) return path;
+  }
+  return `chapters/第${n}章.md`;
+}
+
+function chineseNumeralToInt(text: string): string | undefined {
+  const map: Record<string, number> = {
+    零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
+  };
+  if (text === "十") return "10";
+  if (text.length === 1 && map[text] !== undefined) return String(map[text]);
+  if (text.startsWith("十") && text.length === 2 && map[text[1]] !== undefined) return String(10 + map[text[1]]);
+  if (text.endsWith("十") && text.length === 2 && map[text[0]] !== undefined) return String(map[text[0]] * 10);
+  if (text.length === 3 && text[1] === "十" && map[text[0]] !== undefined && map[text[2]] !== undefined) {
+    return String(map[text[0]] * 10 + map[text[2]]);
   }
   return undefined;
 }
@@ -357,28 +433,31 @@ function taskInstructions(mode: WritingTaskMode): string {
 - 给出三个真正不同的候选方向，分别说明核心冲突与后续潜力。
 - 不把候选设想写入项目事实，除非作者明确选定。`;
   if (mode === "outline") return `本次工作流：
+- 硬约束：本轮对 outline/（或故事大纲文档）的 propose_document / propose_document_patch 在成功调用 design_creative_outline 之前会被系统拒绝。局部节点字段修补用 propose_outline_patch，不受此限。
 - 新建大纲或大幅重构时，先调用 design_creative_outline 一次取得创意路线与评估表；基于其 generationPrompt 在内部完成发散、比较、反驳和深化，不要把四份半成品全写入项目。仅做局部字段修补时无需调用。
 - 大纲文档在 outline/（旧项目可能是 story/outline.md）。先调用 list_outline_nodes 了解“卷/幕—章—场景”结构；读取或修改具体节点时用 get_outline_node，不要靠全文搜索猜测节点边界。
 - 每个场景节点维护前因、行动、结果和状态变化；同时维护人物弧、信息释放、伏笔埋设与回收。
 - 修改既有节点使用 propose_outline_patch 提交局部提案；结构完整性检查使用 validate_outline。
 - 新建大纲写入 outline/，不要写入 chapters/ 或 lore/。
-- 大纲场景推荐字段格式：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。字段写成 Markdown 列表“字段：值”。`;
+- 大纲场景字段必须与结构化解析一致（列表“字段：值”）：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。创意侧「目标/阻力」写入摘要，「关键选择」写入行动；勿使用未登记字段名。`;
   if (mode === "write_scene") return `本次工作流（内部执行，不输出分析过程）：
 1. 先读「风格锚定」：对齐本项目声线样本与模板节奏，再动笔；禁止写成与样本句长/对白密度明显不同的通用腔。
 2. 「写作线索」只是候选索引。Step 1 最小核对：情节用 get_outline_node（UUID）；衔接用上一章 read_document(lastSection=true)；人设用 get_character 必要字段；目标文档存在则 inspect 或读一次草稿/末段。
 3. 不要通读整本大纲、不要 list_outline_nodes 超过一次、不要对同一路径反复 read。
 4. 落笔前在内部明确：场景开场、人物目标、阻力、不可逆结果；正文默认 chapters/；设定说明不进正文。
 5. 写作时持续对照风格锚定；对白区分人物；不引入未支撑设定。冲突、情欲、暴力等按剧情直写，不自行降级为含蓄暗示或道德旁白。
-6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。叙事性破折号（停顿、揭示、对白拖音）可正常使用，不必回避。
-7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。偶发「因为/也就是」类说明句不会拦截提案；仅说明体过密时系统才会报错，届时再局部改写命中句。`;
+6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。${proseMannerismPreflightLine()}
+7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。偶发一处说明句不拦截；过密的说明性破折号与抽象「不是…而是」会被系统拒绝——只改命中句再提，勿全文重写。`;
   if (mode === "rewrite") return `本次工作流（内部执行，不输出分析过程）：
 - 先读「风格锚定」与原文声线；改写后的句长、对白密度须仍贴近原文/样本，除非作者明确要求换风格。
 - 只改变作者明确要求调整的维度，保持其余事件事实、人物动机和信息顺序不变。
 - 风格变化必须落实到叙述距离、句法节奏、对白比例、感官重点和信息释放，而不是同义替换。
 - 保留原文有辨识度的不规则表达，不把句子统一润色成工整、完整、均匀的书面语；不要把直白改成含蓄，除非作者要求。
 - 优先用具体名词和动词替换泛化情绪、程度副词与装饰性修辞；避免为了“更有文采”新增比喻、总结或升华。
-- 对照原文检查信息损失与新增事实，优先通过局部补丁提案提交。`;
+- ${proseMannerismConstraintPrompt({ compact: true })}
+- 对照原文检查信息损失与新增事实，优先通过局部补丁提案提交。提交前：${proseMannerismPreflightLine()}`;
   if (mode === "audit") return `本次工作流：
+- 先调用 audit_prose_style；优先处理 severity=error 的说明性破折号与抽象「不是…而是」过密问题。
 - 每个问题必须给出严重度、原文证据、违反的既有事实或叙事约束，以及最小修改建议。
 - 没有文本证据的问题不得提出；区分确定矛盾与可能风险。
 - 用户只要求检查时不要创建修改提案；明确要求修复时才提交提案。`;
@@ -396,7 +475,7 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
   const characters = selectedCharacters.map(({ item }) => ({
     id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity,
   }));
-  // Writing tasks always surface style/user examples even if the planner left exampleIds empty.
+  // Writing tasks: only ids/fingerprints here — full example bodies live in stableStyleGroundingPrompt (KV-friendly, no duplicate).
   const writing = isIntensiveWritingMode(task.mode) || task.documentProposalRequired;
   const rankedExamples = store.writingExamples().map((item) => {
     let score = task.exampleIds.includes(item.id) ? 3 : 0;
@@ -404,22 +483,28 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
     if (writing && !item.title.startsWith("[风格模板]") && score === 0) score = 1;
     return { item, score };
   }).sort((a, b) => b.score - a.score || b.item.updatedAt.localeCompare(a.item.updatedAt));
-  const selectedExamples = rankedExamples.filter((entry) => entry.score > 0).slice(0, writing ? 2 : 2);
-  const examples: Array<Record<string, string>> = [];
-  let exampleBudget = writing ? 6_000 : 5_000;
+  const selectedExamples = rankedExamples.filter((entry) => entry.score > 0).slice(0, 2);
+  const examples: Array<Record<string, string | number>> = [];
+  let exampleBudget = writing ? 1_200 : 5_000;
   for (const { item } of selectedExamples) {
-    const content = item.content.slice(0, Math.min(writing ? 1_600 : 2_000, exampleBudget));
-    const entry = {
+    const entry: Record<string, string | number> = {
+      id: item.id,
       title: item.title,
       category: item.category,
       styleFingerprint: styleFingerprint(item.content, item.notes),
-      content,
-      notes: item.notes.slice(0, 400),
       usage: "imitate_voice_not_plot",
     };
+    if (writing) {
+      entry.notes = item.notes.slice(0, 80);
+      // Bodies are in style anchoring; do not re-inject full prose here.
+    } else {
+      entry.content = item.content.slice(0, Math.min(2_000, exampleBudget));
+      entry.notes = item.notes.slice(0, 400);
+    }
     const size = JSON.stringify(entry).length;
-    if (!content || size > exampleBudget) break;
-    examples.push(entry); exampleBudget -= size;
+    if (size > exampleBudget) break;
+    examples.push(entry);
+    exampleBudget -= size;
   }
   return JSON.stringify({ task: task.mode, characters, writingExamples: examples });
 }
@@ -451,7 +536,7 @@ export async function runAgent(options: {
   characterScope?: number[];
   selectedDocumentBlocks?: Array<{ path: string; text?: string }>;
   model?: ModelConfig;
-  models?: Partial<Record<"agent" | "inline" | "writer" | "reviewer", ModelConfig>>;
+  models?: Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
   maxTurns?: number;
   /** 覆盖 .writer/agent.json 中的权限模式 */
   permissionMode?: PermissionMode;
@@ -470,10 +555,9 @@ export async function runAgent(options: {
 
   const permissionMode = options.permissionMode ?? loadAgentSettings(project).permissionMode;
   emit({ type: "mode", mode: permissionMode });
-  const existingTodos = store.sessionTodos(sessionId);
-  if (existingTodos.length) emit({ type: "todos", todos: existingTodos });
 
   const history = compactHistory(store.messages(sessionId, 40).filter((message) => message.role !== "tool" && message.role !== "system"));
+  const previousTaskState = store.sessionContext(sessionId);
   const fastTask = fastRouteWritingTask(project, store, sessionId, prompt);
   const planned = fastTask ? { task: fastTask } : await planWritingTask(model, project, store, prompt, history, signal);
   const task = planned.task;
@@ -489,19 +573,33 @@ export async function runAgent(options: {
   if ("usage" in planned && planned.usage) {
     emitUsageEvent(emit, store, sessionId, model, planned.usage);
   }
+  // Task state binds to the current dialogue, not the session shell.
+  // - continuation: reuse prior active doc / todos / tool memory
+  // - same mode without continuation: keep todos (multi-turn ask_user etc.), but never sticky-inherit a doc via COALESCE
+  // - mode change without continuation: drop prior task residue entirely
+  const previousMode = previousTaskState.currentIntent.split(":")[0]?.trim() ?? "";
   const continuationPath = task.continuation
-    ? task.targetPath ?? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
+    ? task.targetPath ?? previousTaskState.activeDocument ?? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
     : undefined;
-  store.saveSessionContext(sessionId, { activeDocument: task.targetPath ?? continuationPath, currentIntent: `${task.mode}: ${prompt.slice(0, 240)}` });
+  if (!task.continuation && previousMode !== task.mode) {
+    store.clearSessionTaskState(sessionId);
+  }
+  const activeDocument = task.targetPath ?? continuationPath;
+  store.saveSessionContext(sessionId, {
+    activeDocument,
+    currentIntent: `${task.mode}: ${prompt.slice(0, 240)}`,
+  });
+  const turnTodos = store.sessionTodos(sessionId);
+  emit({ type: "todos", todos: turnTodos });
   store.addMessage(sessionId, "user", prompt);
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historicalContext = historicalConversationContext(history);
-  const artifactContext = recentArtifactsContext(store, sessionId, project);
+  const artifactContext = recentArtifactsContext(store, sessionId, project, task);
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task);
   const projectInstructions = projectInstructionsPrompt(project);
   const skillsCatalog = skillsCatalogPrompt(project);
-  const todosPrompt = existingTodos.length
-    ? `本会话未完成任务清单（可用 manage_todos 更新）：\n${formatTodosForPrompt(existingTodos)}`
+  const todosPrompt = turnTodos.length
+    ? `当前对话任务清单（绑定本轮任务，非会话全局残留；可用 manage_todos 更新）：\n${formatTodosForPrompt(turnTodos)}`
     : undefined;
   const preferredSample = options.selectedDocumentBlocks
     ?.map((block) => block.text?.trim() ?? "")
@@ -515,14 +613,31 @@ export async function runAgent(options: {
   };
   const stableStyleContext = stableStyleGroundingPrompt(project, store, styleOptions);
   const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
-  const toolContext: ToolExecutionContext = { permissionMode };
+  // Prefer cheap roles for prose snippet second pass (flash-class models).
+  const adjudicatorModel = options.models?.inline
+    ?? options.models?.summarizer
+    ?? options.models?.reviewer
+    ?? model;
+  const toolContext: ToolExecutionContext = {
+    permissionMode,
+    requireCreativeOutlineDesign: task.mode === "outline",
+    proseAdjudicator: {
+      model: adjudicatorModel,
+      signal,
+    },
+  };
+  // Fixed prefix first (stable across turns when project/mode/permission match), then dynamic tail.
+  // Style slot always present so later blocks do not shift when intensive toggles.
+  const styleSlot = stableStyleContext
+    || "风格锚定：本轮非正文密集任务，无需范文声线块。";
   const messages: ApiMessage[] = [
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt(permissionMode) },
     ...(projectInstructions ? [{ role: "system" as const, content: projectInstructions }] : []),
     ...(skillsCatalog ? [{ role: "system" as const, content: skillsCatalog }] : []),
-    ...(stableStyleContext ? [{ role: "system" as const, content: stableStyleContext }] : []),
+    { role: "system", content: styleSlot },
     ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
+    // Dynamic tail — history/task change every user message; keep after fixed prefix for KV hits.
     ...(historicalContext ? [historicalContext] : []),
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
     ...(dynamicStyleContext ? [{ role: "system" as const, content: dynamicStyleContext }] : []),
@@ -544,7 +659,10 @@ export async function runAgent(options: {
     let turnStart = messages.length;
     for (let turn = 0; turn < maxTurns; turn += 1) {
       compactRuntimeMessages(messages);
-      rehydrateCompactedToolMessages(messages, store, sessionId);
+      // P0: do not rehydrate all digests (that undoes compact and inflates miss tokens).
+      // Only restore the last few tool bodies the model may still be editing against.
+      rehydrateRecentToolMessages(messages, store, sessionId, 2);
+      stripStaleReasoningContent(messages);
       const step = turn + 1;
       const stepModel = documentProposalSubmitted ? model : executionModel;
       emit({ type: "step_start", step });
@@ -559,6 +677,7 @@ export async function runAgent(options: {
         emit({ type: "step_done", step });
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
         store.addMessage(sessionId, "assistant", answer);
+        persistFinalizedSessionTodos(store, sessionId, emit);
         emit({ type: "done", sessionId });
         return;
       }
@@ -586,7 +705,7 @@ export async function runAgent(options: {
             error: `本轮文档读取已达 ${MAX_DOCUMENT_READS_PER_RUN} 次上限；请使用写作引导、工作记忆和已有工具结果继续写作或提交提案，不要再次读取。`,
           });
         } else {
-          toolResult = executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
+          toolResult = await executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
         if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_outline_patch") {
           try {
@@ -603,7 +722,13 @@ export async function runAgent(options: {
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
-      if (documentProposalSubmitted || waitingForUser) break;
+      // Close checklist as soon as the turn-ending action happens. manage_todos in the
+      // same batch may have left the last item open; always re-finalize after all tools.
+      if (documentProposalSubmitted) {
+        persistFinalizedSessionTodos(store, sessionId, emit);
+        break;
+      }
+      if (waitingForUser) break;
       compactCompletedToolCalls(messages);
     }
     if (waitingForUser) {
@@ -646,6 +771,8 @@ export async function runAgent(options: {
           }
         }
       } catch { /* 消息保存失败不影响流程 */ }
+      // Proposal ends the turn immediately (no extra manage_todos turn); close the checklist.
+      persistFinalizedSessionTodos(store, sessionId, emit);
       emit({ type: "done", sessionId });
       return;
     }
@@ -671,8 +798,9 @@ export async function runAgent(options: {
 
 const REVIEW_PROMPT = `你现在是小说终审编辑。目标是降低机器生成感，不是把文字改成另一种统一腔调。
 先调用 audit_prose_style 获取带行列和语境分类的问题。优先处理 severity=error；warning 仅在明显模板化且影响阅读时改；info 一律保留。
+${proseMannerismConstraintPrompt({ compact: true })}
 必须保留：对白拖音/中断/迟疑（speech_*）、对话纠正（dialogue_correction）、系统/元数据、叙事停顿—揭示与同位命名（ambiguous_dash / appositive_definition）。见破折号就删是错误策略。
-逐段检查并修改：模板化转折和连接词；紧跟动作、对白或细节之后的重复解释回声；用单一标签包办人物的写法；整齐但空泛的排比；句长段长过度均匀；无意义的总结升华；角色都说同一种完整书面语。
+逐段检查并修改：模板化转折和连接词；紧跟动作、对白或细节之后的重复解释回声；说明性破折号与抽象「不是…而是」堆砌；用单一标签包办人物的写法；整齐但空泛的排比；句长段长过度均匀；无意义的总结升华；角色都说同一种完整书面语。
 说明类问题优先：让动作产生结果；用可观察细节供读者判断；必要因果拆成独立句。不要为“消说明体”而把有力的停顿、揭示或人物声线抹平。
 在忠于原意的前提下让行文更生动：把笼统判断和情绪说明尽量落到可见动作、选择及其代价、身体反应、环境变化、声音、触感或人物独有的观察上。证据已经足够时直接删掉解释，不必逐句改写。让对白带有身份、关系和当下情绪造成的语气差异；按场景张力调整句长、停顿和段落节奏。优先选择准确、有画面的动词和名词，不要靠密集形容词、副词、华丽比喻、感官清单或连续短句制造虚假的生动感。不得为了增加画面而凭空添加事件、道具、设定、心理动机或角色不知道的信息。
 不要用随机同义替换、强行拆句、故意病句、滥加口语或无关细节伪装成人类写作。机器感应通过减少句法模板、增加语义与观察角度的差异、保留叙事重点造成的轻重和不对称来消除。
@@ -720,11 +848,18 @@ function selectedBlocksContext(project: WriterProject, references?: Array<{ path
   return sections.length ? `用户从网页浏览器明确加入了以下文本选区。只把它们作为本轮上下文，不要自行扩展为整篇文档：\n\n${sections.join("\n\n---\n\n")}` : "";
 }
 
-function recentArtifactsContext(store: WriterStore, sessionId: string, project: WriterProject): string {
-  const artifacts = store.recentContextArtifacts(sessionId, 8);
+function recentArtifactsContext(store: WriterStore, sessionId: string, project: WriterProject, task: WritingTask): string {
   const state = store.sessionContext(sessionId);
+  let artifacts = store.recentContextArtifacts(sessionId, 8);
+  // New dialogue turn (not continuation): never inject whole-session residue — only the current target path, if any.
+  if (!task.continuation) {
+    const focusPath = task.targetPath ?? state.activeDocument;
+    if (!focusPath) return "";
+    artifacts = artifacts.filter(item => item.path === focusPath);
+    if (!artifacts.length) return "";
+  }
   if (!artifacts.length && !state.activeDocument && !state.currentIntent) return "";
-  const activePath = state.activeDocument;
+  const activePath = task.continuation ? state.activeDocument : (task.targetPath ?? state.activeDocument);
   const activeHash = activePath && project.documentExists(activePath)
     ? project.hash(project.read(activePath))
     : undefined;
@@ -750,7 +885,7 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
         block: parsed.block,
         startLine: parsed.startLine,
         endLine: parsed.endLine,
-        ...(content ? { content: content.length > 8_000 ? `${content.slice(0, 8_000)}\n…[已截断，全文在 artifact#${artifact.id}]` : content } : {
+        ...(content ? { content: content.length > 4_000 ? `${content.slice(0, 4_000)}\n…[已截断，全文在 artifact#${artifact.id}]` : content } : {
           opening: parsed.opening,
           ending: parsed.ending,
           headings: parsed.headings,
@@ -764,7 +899,10 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
     } catch { /* 非 JSON 工作记忆条目跳过 */ }
   }
   const catalog = artifacts.map(({ id, kind, path, sourceHash, digest }) => ({ id, kind, path, sourceHash, digest }));
-  return `会话状态与工作记忆（下列资料本会话已读过且文档未变；请直接复用，禁止对相同路径/范围再次 inspect_document、read_document 或重复 list_outline_nodes）：\n${JSON.stringify({ state, artifacts: catalog, restoredReads: restored })}`;
+  const scopeNote = task.continuation
+    ? "承接上一轮：下列资料本对话任务已读过且文档未变；请直接复用，禁止对相同路径/范围再次 inspect_document、read_document 或重复 list_outline_nodes"
+    : "仅当前目标文档相关工作记忆（非会话级残留）；请直接复用，禁止对相同路径/范围再次 inspect_document、read_document";
+  return `本轮任务工作记忆（${scopeNote}）：\n${JSON.stringify({ state, artifacts: catalog, restoredReads: restored })}`;
 }
 
 /**
@@ -879,11 +1017,11 @@ function attachArtifactId(content: string, artifactId: number): string {
   }
 }
 
-function executeToolCached(
+async function executeToolCached(
   call: ToolAccumulator, project: WriterProject, store: WriterStore, sessionId: string,
   emit: (event: AgentEvent) => void, counts: Map<string, number>, characterScope?: number[],
   context: ToolExecutionContext = { permissionMode: "ask" },
-): string {
+): Promise<string> {
   if (!CACHEABLE_TOOLS.has(call.name)) return executeTool(call, project, store, sessionId, emit, characterScope, context);
   let input: Record<string, unknown>;
   try { input = JSON.parse(call.arguments || "{}") as Record<string, unknown>; }
@@ -950,7 +1088,7 @@ function executeToolCached(
         : "相同读取已执行过且文档未变；以下从工作记忆恢复完整结果，请直接使用，禁止再次调用。",
       cached.id);
   }
-  const result = executeTool(call, project, store, sessionId, emit, characterScope, context);
+  const result = await executeTool(call, project, store, sessionId, emit, characterScope, context);
   let digest = `${call.name} 已完成`;
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
@@ -986,13 +1124,14 @@ function compactHistory(messages: Array<{ role: string; content: string }>): Api
   return result;
 }
 
-function compactRuntimeMessages(messages: ApiMessage[]): void {
+/** Exported for unit tests: compact heavy tool bodies into digests (artifactId preserved). */
+export function compactRuntimeMessages(messages: ApiMessage[]): void {
   const toolIndexes = messages.flatMap((message, index) => message.role === "tool" ? [index] : []);
   const totalChars = toolIndexes.reduce((sum, index) => sum + (messages[index].content?.length ?? 0), 0);
-  // Avoid early compaction: the log "结果被压缩了 → 再读一遍" is worse than a larger prompt.
-  if (toolIndexes.length <= 10 && totalChars <= 60_000) return;
+  // Earlier compact once digests stay in the transcript (no full rehydrate of all tools).
+  if (toolIndexes.length <= 4 && totalChars <= 20_000) return;
 
-  const keepRecent = 8;
+  const keepRecent = 2;
   for (const index of toolIndexes.slice(0, -keepRecent)) {
     const message = messages[index];
     if (!message.content || message.content.length <= 800) continue;
@@ -1001,14 +1140,14 @@ function compactRuntimeMessages(messages: ApiMessage[]): void {
       if (parsed.status === "artifact_compacted") continue;
       // Never compact catalogs / search hit lists — losing IDs forces re-list thrashing.
       if ([...NEVER_COMPACT_KEYS].some(key => key in parsed)) continue;
-      if (parsed.reused === true && message.content.length < 12_000) continue;
+      if (parsed.reused === true && message.content.length < 8_000) continue;
 
       const content = typeof parsed.content === "string" ? parsed.content
         : typeof parsed.markdown === "string" ? parsed.markdown : undefined;
       // Only compact heavy document bodies; keep metadata tools intact.
-      if (!content || content.length < 1_200) continue;
+      if (!content || content.length < 800) continue;
 
-      const digestLimit = 2_000;
+      const digestLimit = 1_200;
       message.content = JSON.stringify({
         status: "artifact_compacted",
         artifactId: parsed.artifactId,
@@ -1020,20 +1159,31 @@ function compactRuntimeMessages(messages: ApiMessage[]): void {
         endLine: parsed.endLine,
         sourceHash: parsed.sourceHash,
         digest: content.replace(/\s+/g, " ").slice(0, digestLimit),
-        message: "正文已压缩为 digest；请直接基于 digest 与写作引导继续。禁止因压缩再次 read_document / list_outline_nodes。",
+        message: "正文已压缩为 digest；请直接基于 digest、本轮任务工作记忆与写作引导继续。禁止因压缩再次 read_document / list_outline_nodes。",
       });
     } catch {
-      if (message.content.length > 4_000) {
+      if (message.content.length > 2_500) {
         message.content = JSON.stringify({ status: "artifact_compacted", message: "工具结果已压缩；请继续任务，不要重复调用同一工具。" });
       }
     }
   }
 }
 
-/** Restore compacted tool bodies from session artifacts so the model never needs to re-read. */
-function rehydrateCompactedToolMessages(messages: ApiMessage[], store: WriterStore, sessionId: string): void {
-  for (const message of messages) {
-    if (message.role !== "tool" || !message.content) continue;
+/**
+ * Restore only the most recent compacted tool bodies (default 2).
+ * Older digests stay compact so multi-step prompts stop growing with full chapter text.
+ */
+export function rehydrateRecentToolMessages(
+  messages: ApiMessage[],
+  store: WriterStore,
+  sessionId: string,
+  keepRecent = 2,
+): void {
+  const toolIndexes = messages.flatMap((message, index) => message.role === "tool" ? [index] : []);
+  const restore = new Set(toolIndexes.slice(-Math.max(0, keepRecent)));
+  for (const index of restore) {
+    const message = messages[index];
+    if (!message?.content) continue;
     try {
       const parsed = JSON.parse(message.content) as Record<string, unknown>;
       if (parsed.status !== "artifact_compacted") continue;
@@ -1041,8 +1191,21 @@ function rehydrateCompactedToolMessages(messages: ApiMessage[], store: WriterSto
       if (artifactId === undefined) continue;
       const full = store.contextArtifactById(sessionId, artifactId);
       if (!full?.content) continue;
-      message.content = withReuseMarker(full.content, "已从工作记忆自动恢复完整工具结果；禁止再次读取同一内容。", artifactId);
+      message.content = withReuseMarker(full.content, "已从工作记忆恢复最近工具结果；禁止再次读取同一内容。", artifactId);
     } catch { /* ignore non-JSON tool payloads */ }
+  }
+}
+
+/** Drop reasoning_content on older assistant turns to cut re-sent output-side bulk. */
+export function stripStaleReasoningContent(messages: ApiMessage[]): void {
+  let lastWithReasoning = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    if (messages[index].role === "assistant" && messages[index].reasoning_content) lastWithReasoning = index;
+  }
+  for (let index = 0; index < messages.length; index += 1) {
+    if (index !== lastWithReasoning && messages[index].reasoning_content) {
+      delete messages[index].reasoning_content;
+    }
   }
 }
 
@@ -1290,3 +1453,4 @@ function estimateTokenCount(charCount: number): number {
   // Mixed CJK/Latin heuristic used only as UI fallback when billing usage is absent.
   return Math.max(1, Math.ceil(charCount / 2.2));
 }
+  

@@ -185,11 +185,26 @@ export class WriterStore {
       ...(typeof row?.active_document === "string" ? { activeDocument: row.active_document } : {}) };
   }
 
+  /**
+   * Persist this dialogue turn's task binding. activeDocument is always replaced
+   * (null clears); never inherits a previous turn's document via COALESCE.
+   * todos_json is left untouched here — use saveSessionTodos / clearSessionTaskState.
+   */
   saveSessionContext(sessionId: string, value: { activeDocument?: string; currentIntent: string }): void {
+    const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET active_document=COALESCE(excluded.active_document,session_context.active_document),
+      ON CONFLICT(session_id) DO UPDATE SET active_document=excluded.active_document,
       current_intent=excluded.current_intent,updated_at=excluded.updated_at`)
-      .run(sessionId, value.activeDocument ?? null, value.currentIntent, "[]", new Date().toISOString());
+      .run(sessionId, value.activeDocument ?? null, value.currentIntent, "[]", now);
+  }
+
+  /** Drop sticky task residue (todos / intent / active doc / tool memory) when dialogue is rewound or a new non-continuation turn starts. */
+  clearSessionTaskState(sessionId: string): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET active_document=NULL, current_intent='', todos_json='[]', updated_at=excluded.updated_at`)
+      .run(sessionId, null, "", "[]", now);
+    this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
   }
 
   sessionTodos(sessionId: string): AgentTodoItem[] {
@@ -713,6 +728,8 @@ export class WriterStore {
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
+    // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
+    this.clearSessionTaskState(sessionId);
     const changes = [
       undonePaths.length ? `文档：${undonePaths.join("、")}` : "",
       undoneCharacters.length ? `角色卡：${undoneCharacters.join("、")}` : "",

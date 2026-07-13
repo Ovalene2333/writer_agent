@@ -973,6 +973,10 @@ function App() {
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
   const sessionIdRef = useRef<string | undefined>(undefined);
+  const activePathRef = useRef(activePath);
+  const editingDocumentRef = useRef(editingDocument);
+  activePathRef.current = activePath;
+  editingDocumentRef.current = editingDocument;
   const renameInputRef = useRef<HTMLInputElement>(null);
   const createInputRef = useRef<HTMLInputElement>(null);
   const documentReaderRef = useRef<HTMLDivElement>(null);
@@ -1260,6 +1264,12 @@ function App() {
         const rest = prev.proposals.filter((item) => item.id !== event.proposal!.id);
         return { ...prev, proposals: [event.proposal as Proposal, ...rest] };
       });
+      // Auto mode writes immediately; surface that so it is not mistaken for silent overwrite.
+      if (event.proposal.status === "accepted") {
+        setNotice(`Auto：提案 #${event.proposal.id} 已写入 ${event.proposal.path}`);
+      } else if (event.proposal.status === "pending") {
+        setNotice(`提案 #${event.proposal.id} 待审批：${event.proposal.path}`);
+      }
     }
     if (event.type === "todos" && event.todos) {
       setState((prev) => (prev ? { ...prev, todos: event.todos } : prev));
@@ -1334,7 +1344,44 @@ function App() {
           .reverse()
           .find((msg) => msg.role === "user" && msg.content.trim());
         setStreamStepsAnchorId(lastUser?.id ?? null);
-        if (clearContextOnDone && !waitingForInput) setNotice("Agent job completed.");
+        // Auto mode may have written the open document; reload so the editor matches disk.
+        const pathToReload = activePathRef.current;
+        if (pathToReload && !editingDocumentRef.current) {
+          try {
+            const doc = await api<DocumentData>(`/api/document?path=${encodeURIComponent(pathToReload)}`);
+            setDocument(doc);
+            setDocumentDraft(doc.content);
+            setBrowsingVersion(null);
+          } catch {
+            /* path may be new / deleted; tree refresh is enough */
+          }
+        }
+        if (clearContextOnDone && !waitingForInput) {
+          // Client safety net: if server still has open todos after a successful job, show them closed.
+          // Persist path is server-side; this only heals stale UI if an older process missed finalize.
+          const openTodos = (next.todos ?? []).filter(
+            (item) => item.status === "pending" || item.status === "in_progress",
+          );
+          if (openTodos.length > 0) {
+            setState((prev) => {
+              if (!prev?.todos?.length) return prev;
+              return {
+                ...prev,
+                todos: prev.todos.map((item) =>
+                  item.status === "pending" || item.status === "in_progress"
+                    ? { ...item, status: "completed" as const }
+                    : item,
+                ),
+              };
+            });
+          }
+          const pendingCount = (next.proposals ?? []).filter((item) => item.status === "pending").length;
+          setNotice(
+            pendingCount > 0
+              ? `Agent job completed · ${pendingCount} 条提案待审批（Ask 模式不会直接改文件）`
+              : "Agent job completed.",
+          );
+        }
       }
     } catch (cause) {
       if (!(cause instanceof Error && cause.name === "AbortError")) {

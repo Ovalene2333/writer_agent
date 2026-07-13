@@ -1,4 +1,5 @@
 import { documentBlocks, documentSections } from "../document_blocks.js";
+import { adjudicateProseStyleForAudit } from "../prose_adjudicate.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { documentMap, optionalPositiveInteger, requireString } from "./helpers.js";
@@ -7,17 +8,27 @@ export function handleListDocuments({ project }: ToolHandlerArgs): string {
   return JSON.stringify(documentMap(project));
 }
 
-export function handleAuditProseStyle({ input, project }: ToolHandlerArgs): string {
+export async function handleAuditProseStyle({ input, project, context }: ToolHandlerArgs): Promise<string> {
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const content = project.read(path);
-  const issues = analyzeProseStyle(content);
+  const rules = analyzeProseStyle(content);
+  const flash = await adjudicateProseStyleForAudit(
+    content,
+    rules,
+    context.proseAdjudicator?.model,
+    { signal: context.proseAdjudicator?.signal },
+  );
+  const issues = flash.issues;
   return JSON.stringify({
-    path, sourceHash: project.hash(content),
+    path,
+    sourceHash: project.hash(content),
     summary: {
       errors: issues.filter(issue => issue.severity === "error").length,
       warnings: issues.filter(issue => issue.severity === "warning").length,
       allowedSpeechOrMetadata: issues.filter(issue => issue.severity === "info").length,
+      flashAdjudicated: flash.adjudicated,
+      flashSkipped: flash.skipped,
     },
     issues,
   });

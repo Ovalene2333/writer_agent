@@ -5,8 +5,20 @@ import {
   contrastStyleError,
   contrastStyleReport,
   newProseStyleIssues,
+  proseMannerismConstraintPrompt,
+  proseMannerismPreflightLine,
   proseStyleIssuesError,
 } from "./prose_quality.js";
+
+test("generation-time constraint prompt covers dash and contrast rules", () => {
+  const full = proseMannerismConstraintPrompt();
+  assert.match(full, /破折号/);
+  assert.match(full, /不是/);
+  assert.match(full, /改写配方/);
+  const compact = proseMannerismConstraintPrompt({ compact: true });
+  assert.match(compact, /句式硬约束/);
+  assert.match(proseMannerismPreflightLine(), /句式自检/);
+});
 
 test("classifies speech extension, interruption and hesitation without warnings", () => {
   const samples = [
@@ -28,6 +40,35 @@ test("classifies metadata and system sound without warnings", () => {
     const issues = analyzeProseStyle(text);
     assert.equal(issues.some(issue => issue.severity !== "info"), false, text);
   }
+});
+
+test("enumeration dash chains are not treated as parenthetical explanation", () => {
+  for (const text of ["头——脚——手", "春——夏——秋——冬", "检查：头——躯干——四肢。"]) {
+    const issues = analyzeProseStyle(text).filter(issue => issue.kind === "dash");
+    assert.ok(issues.length >= 1, text);
+    assert.ok(issues.every(issue => issue.severity === "info"), text);
+    assert.ok(issues.every(issue => issue.subtype === "system_or_metadata"), text);
+    assert.equal(proseStyleIssuesError(issues), undefined, text);
+  }
+  // Still classify true parenthetical as warning
+  const paren = analyzeProseStyle("这件事——说得不客气些——实在荒唐。");
+  assert.equal(paren.find(i => i.kind === "dash")?.subtype, "parenthetical_explanation");
+});
+
+test("markdown table dashes are metadata and never hard-fail", () => {
+  const table = `
+| 部位 | 说明 |
+| --- | --- |
+| 头 | 盔 |
+| 手——脚 | 成对 |
+| :--- | ---: |
+`;
+  const issues = analyzeProseStyle(table).filter(issue => issue.kind === "dash");
+  assert.ok(issues.length >= 1);
+  assert.ok(issues.every(issue => issue.severity === "info"));
+  assert.ok(issues.every(issue => issue.subtype === "system_or_metadata"));
+  assert.equal(contrastStyleError(table), undefined);
+  assert.equal(proseStyleIssuesError(issues), undefined);
 });
 
 test("narrative pause-reveal dashes are allowed and do not block proposals", () => {

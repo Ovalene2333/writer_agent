@@ -32,7 +32,7 @@ import {
   handleManageTodos,
 } from "./meta.js";
 
-type Handler = (args: ToolHandlerArgs) => string;
+type Handler = (args: ToolHandlerArgs) => string | Promise<string>;
 
 const HANDLERS: Record<string, Handler> = {
   list_documents: handleListDocuments,
@@ -56,7 +56,7 @@ const HANDLERS: Record<string, Handler> = {
   load_skill: handleLoadSkill,
 };
 
-export function executeTool(
+export async function executeTool(
   call: ToolCall,
   project: WriterProject,
   store: WriterStore,
@@ -64,7 +64,7 @@ export function executeTool(
   emit: (event: AgentEvent) => void,
   characterScope?: number[],
   context: ToolExecutionContext = { permissionMode: "ask" },
-): string {
+): Promise<string> {
   let input: Record<string, unknown>;
   try {
     input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
@@ -74,7 +74,7 @@ export function executeTool(
   const handler = HANDLERS[call.name];
   if (!handler) return JSON.stringify({ error: `未知工具：${call.name}` });
   try {
-    return handler({ input, project, store, sessionId, emit, characterScope, context });
+    return await handler({ input, project, store, sessionId, emit, characterScope, context });
   } catch (error) {
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   }
