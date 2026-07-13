@@ -114,33 +114,38 @@ export interface Message {
   createdAt: string;
 }
 
+export interface CharacterSourceRef { type: "outline" | "document" | "manual"; ref: string; note?: string }
+export interface CharacterTemporal { sourceRefs: CharacterSourceRef[]; validFrom?: string; validUntil?: string }
+export interface CharacterTextEntry extends CharacterTemporal { id: string; label: string; description: string }
+export interface CharacterGoal extends CharacterTemporal {
+  id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown";
+  priority: number; summary: string; stakes: string; obstacles: string[];
+}
+export interface CharacterRelationship extends CharacterTemporal {
+  id: string; characterId: number; type: string; attitude: string;
+  status: "active" | "ended" | "strained" | "unknown"; description: string;
+}
+export interface CharacterCompetency extends CharacterTemporal {
+  id: string; name: string; level: string; description: string; resources: string[]; limitations: string[]; costs: string[];
+}
+export interface CharacterStoryState extends CharacterTemporal {
+  id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string;
+  knowledge: CharacterTextEntry[]; beliefs: CharacterTextEntry[]; intentions: string[]; temporaryGoals: CharacterGoal[]; notes: string;
+}
 export interface Character {
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: number;
-  name: string;
-  aliases: string[];
-  narrativeRole: string;
-  identity: string;
-  appearance: string;
-  personality: string;
-  values: string;
-  speechStyle: string;
-  background: string;
-  longTermGoal: string;
-  currentGoal: string;
-  fears: string;
-  capabilities: string;
-  limitations: string;
+  identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
+  profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
+  psychology: { summary: string; traits: CharacterTextEntry[]; values: CharacterTextEntry[]; fears: CharacterTextEntry[]; conflicts: CharacterTextEntry[] };
+  motivations: CharacterGoal[];
+  voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
+  competencies: CharacterCompetency[];
   relationships: CharacterRelationship[];
+  storyStates: CharacterStoryState[];
   notes: string;
   updatedAt: string;
-}
-
-export interface CharacterRelationship {
-  characterId: number;
-  type: string;
-  description: string;
-  attitude: string;
+  extensions?: Record<string, unknown>;
 }
 
 export interface WritingExample {

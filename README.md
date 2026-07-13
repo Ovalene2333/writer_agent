@@ -111,7 +111,7 @@ writer chat --mode plan             # 只读规划
 writer chat --mode auto             # 提案自动写入
 ```
 
-TUI 斜杠命令要点：`/mode`、`/plan`、`/todos`、`/skills`、`/accept`、`/proposals`、`/status`。
+TUI 斜杠命令要点：`/mode`、`/plan`、`/todos`、`/skills`、`/accept`、`/proposals`、`/status`、`/models`（Ctrl+P）、`/connect`、`/roles`、`/thinking`、`/details`。
 
 ### `writer run` 常用选项
 

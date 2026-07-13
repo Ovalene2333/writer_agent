@@ -7,6 +7,8 @@ import type {
   StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
+import { characterName, emptyCharacter, migrateV2Character, normalizeV3Character, validateCharacters, type CharacterInput } from "./characters.js";
+import { OutlineStore } from "./outline.js";
 import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
 
@@ -18,10 +20,15 @@ export class WriterStore {
   constructor(readonly project: WriterProject) {
     mkdirSync(project.privateDir, { recursive: true });
     this.database = new DatabaseSync(resolve(project.privateDir, "writer.db"));
-    this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
-    this.migrate();
-    this.migrateCharacterCardsToJsonl();
-    this.reindex();
+    try {
+      this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+      this.migrate();
+      this.migrateCharacterCardsToJsonl();
+      this.reindex();
+    } catch (error) {
+      this.database.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -262,49 +269,41 @@ export class WriterStore {
   }
 
   characters(): Character[] {
-    return this.project.readCharacterCardsJsonl().split(/\r?\n/).flatMap(line => {
+    const characters = this.project.readCharacterCardsJsonl().split(/\r?\n/).flatMap((line, index) => {
       if (!line.trim()) return [];
       try {
-        const parsed = JSON.parse(line) as Character;
+        const parsed = JSON.parse(line) as unknown;
         return [this.normalizeCharacter(parsed)];
-      } catch { return []; }
-    }).sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+      } catch (error) { throw new Error(`characters/characters.jsonl:${index + 1}: ${error instanceof Error ? error.message : String(error)}`); }
+    });
+    validateCharacters(characters, this.outlineNodeIds());
+    return characters.sort((a, b) => characterName(a).localeCompare(characterName(b), "zh-CN"));
   }
 
-  saveCharacter(input: Omit<Character, "id" | "updatedAt"> & { id?: number }): Character {
-    const name = input.name.trim();
-    if (!name) throw new Error("角色名称不能为空");
+  saveCharacter(input: CharacterInput): Character {
     const characters = this.characters();
     const existing = input.id ? characters.find(item => item.id === input.id) : undefined;
+    if (input.id && !existing) throw new Error("要修改的角色不存在");
     const id = existing?.id ?? Math.max(0, ...characters.map(item => item.id)) + 1;
-    const availableIds = new Set(characters.map(item => item.id));
-    const relationships = input.relationships.filter((item, index, all) =>
-      Number.isInteger(item.characterId) && item.characterId !== id && availableIds.has(item.characterId)
-      && all.findIndex(candidate => candidate.characterId === item.characterId) === index,
-    ).map(item => ({
-      characterId: item.characterId,
-      type: item.type.trim(),
-      description: item.description.trim(),
-      attitude: item.attitude.trim(),
-    }));
-    const character: Character = {
-      schemaVersion: 2,
-      id, name, aliases: input.aliases.map(value => value.trim()).filter(Boolean).slice(0, 20),
-      narrativeRole: input.narrativeRole.trim(), identity: input.identity.trim(), appearance: input.appearance.trim(),
-      personality: input.personality.trim(), values: input.values.trim(), speechStyle: input.speechStyle.trim(),
-      background: input.background.trim(), longTermGoal: input.longTermGoal.trim(), currentGoal: input.currentGoal.trim(),
-      fears: input.fears.trim(), capabilities: input.capabilities.trim(), limitations: input.limitations.trim(), relationships,
-      notes: input.notes.trim(),
-      updatedAt: new Date().toISOString(),
-    };
-    this.writeCharacters([...characters.filter(item => item.id !== id), character]);
+    const base = existing ?? { ...emptyCharacter(input.identity?.name ?? ""), id, updatedAt: "" };
+    const deleted = input.deleteEntryIds ?? {};
+    const kept = <T extends { id: string }>(section: keyof typeof deleted, values: T[]) => values.filter(value => !deleted[section]?.includes(value.id));
+    const character = normalizeV3Character({ ...base, ...input, id, schemaVersion: 3, updatedAt: new Date().toISOString(),
+      identity: { ...base.identity, ...input.identity }, profile: { ...base.profile, ...input.profile },
+      psychology: { ...base.psychology, ...input.psychology }, voice: { ...base.voice, ...input.voice },
+      motivations: input.motivations ?? kept("motivations", base.motivations), competencies: input.competencies ?? kept("competencies", base.competencies),
+      relationships: input.relationships ?? kept("relationships", base.relationships), storyStates: input.storyStates ?? kept("storyStates", base.storyStates),
+    });
+    const next = [...characters.filter(item => item.id !== id), character];
+    validateCharacters(next, this.outlineNodeIds());
+    this.writeCharacters(next);
     return character;
   }
 
   saveCharacterWithRevision(
     sessionId: string,
     messageId: number,
-    input: Omit<Character, "id" | "updatedAt"> & { id?: number },
+    input: CharacterInput,
   ): Character {
     const before = input.id ? this.characters().find(item => item.id === input.id) : undefined;
     const beforeContent = before ? JSON.stringify(before) : null;
@@ -365,7 +364,7 @@ export class WriterStore {
 
   findCharacter(query: string): Character | undefined {
     const normalized = query.trim().toLowerCase();
-    return this.characters().find(item => String(item.id) === normalized || item.name.toLowerCase() === normalized || item.aliases.some(alias => alias.toLowerCase() === normalized));
+    return this.characters().find(item => String(item.id) === normalized || item.identity.name.toLowerCase() === normalized || item.identity.aliases.some(alias => alias.toLowerCase() === normalized));
   }
 
   private writeCharacters(characters: Character[]): void {
@@ -377,53 +376,40 @@ export class WriterStore {
     const jsonl = this.project.readCharacterCardsJsonl();
     if (jsonl.trim()) {
       const lines = jsonl.split(/\r?\n/).filter(line => line.trim());
-      const characters: Character[] = [];
-      for (const line of lines) {
-        try { characters.push(this.normalizeCharacter(JSON.parse(line) as Character)); }
-        catch { return; }
-      }
-      this.writeCharacters(characters);
+      const raw = lines.map((line, index) => { try { return JSON.parse(line) as unknown; } catch (error) { throw new Error(`characters/characters.jsonl:${index + 1}: ${error instanceof Error ? error.message : String(error)}`); } });
+      const needsMigration = raw.some(value => (value as { schemaVersion?: unknown }).schemaVersion !== 3);
+      const characters = raw.map(value => this.normalizeCharacter(value));
+      validateCharacters(characters, this.outlineNodeIds());
+      if (needsMigration) { this.project.backupV2CharacterCards(jsonl); this.writeCharacters(characters); }
       return;
     }
     const files = this.project.listCharacterCardFiles();
     if (!files.length) return;
-    const characters = files.flatMap(file => {
-      try { return [this.normalizeCharacter(JSON.parse(this.project.readCharacterCard(file)) as Character)]; }
-      catch { return []; }
-    });
+    const characters = files.map(file => { try { return this.normalizeCharacter(JSON.parse(this.project.readCharacterCard(file))); } catch (error) { throw new Error(`characters/${file}: ${error instanceof Error ? error.message : String(error)}`); } });
     if (!characters.length) return;
+    validateCharacters(characters, this.outlineNodeIds());
     this.writeCharacters(characters);
     for (const file of files) this.project.removeCharacterCard(file);
   }
 
-  private normalizeCharacter(input: Character): Character {
-    const legacy = input as unknown as Record<string, unknown>;
-    if (!Number.isInteger(input.id) || !String(input.name ?? "").trim()) throw new Error("角色卡格式无效");
-    const legacyRelatedIds = Array.isArray(legacy.relatedCharacterIds) ? legacy.relatedCharacterIds.map(Number) : [];
-    const relationships = Array.isArray(input.relationships)
-      ? input.relationships.flatMap(item => item && typeof item === "object" && Number.isInteger(Number(item.characterId))
-        ? [{ characterId: Number(item.characterId), type: String(item.type ?? ""), description: String(item.description ?? ""), attitude: String(item.attitude ?? "") }]
-        : [])
-      : legacyRelatedIds.filter(Number.isInteger).map(characterId => ({
-        characterId,
-        type: "",
-        description: typeof legacy.relationships === "string" ? legacy.relationships : "",
-        attitude: "",
-      }));
-    return {
-      schemaVersion: 2,
-      id: input.id, name: String(input.name), aliases: Array.isArray(input.aliases) ? input.aliases.map(String) : [],
-      narrativeRole: String(input.narrativeRole ?? legacy.role ?? ""), identity: String(input.identity ?? ""),
-      appearance: String(input.appearance ?? ""), personality: String(input.personality ?? legacy.traits ?? ""),
-      values: String(input.values ?? ""), speechStyle: String(input.speechStyle ?? ""), background: String(input.background ?? ""),
-      longTermGoal: String(input.longTermGoal ?? legacy.goals ?? ""), currentGoal: String(input.currentGoal ?? ""),
-      fears: String(input.fears ?? ""), capabilities: String(input.capabilities ?? legacy.abilities ?? ""),
-      limitations: String(input.limitations ?? ""),
-      relationships: relationships.filter(item => item.characterId !== input.id),
-      notes: [String(input.notes ?? ""), !legacyRelatedIds.length && typeof legacy.relationships === "string" && legacy.relationships.trim()
-        ? `[旧版关系说明] ${legacy.relationships.trim()}` : ""].filter(Boolean).join("\n"),
-      updatedAt: String(input.updatedAt ?? ""),
-    };
+  private normalizeCharacter(input: unknown): Character {
+    if ((input as { schemaVersion?: unknown })?.schemaVersion !== 3) return migrateV2Character(input);
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("角色卡根节点必须是对象");
+    const raw = input as Record<string, unknown>;
+    for (const section of ["identity", "profile", "psychology", "voice"] as const) {
+      if (!raw[section] || typeof raw[section] !== "object" || Array.isArray(raw[section])) throw new Error(`${section}: 缺少必需对象分区`);
+    }
+    for (const section of ["motivations", "competencies", "relationships", "storyStates"] as const) {
+      if (!Array.isArray(raw[section])) throw new Error(`${section}: 缺少必需数组分区`);
+    }
+    if (typeof raw.notes !== "string") throw new Error("notes: 必须是字符串");
+    if (typeof raw.updatedAt !== "string") throw new Error("updatedAt: 必须是字符串");
+    return normalizeV3Character(input);
+  }
+
+  private outlineNodeIds(): Set<string> | undefined {
+    try { return new Set(new OutlineStore(this.project).sync().nodes.map(node => node.id)); }
+    catch { return undefined; }
   }
 
   private writingExample(id: number): WritingExample {
@@ -724,7 +710,7 @@ export class WriterStore {
       }
       this.writeCharacters(restored);
       this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(row.id as number);
-      undoneCharacters.push(after.name);
+      undoneCharacters.push(after.identity.name);
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);

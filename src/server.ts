@@ -23,6 +23,7 @@ import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate, listStyleTemplates } from "./templates.js";
 import type { AgentEvent, PermissionMode } from "./types.js";
+import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 type StoredAgentEvent = AgentEvent & { index: number };
@@ -336,21 +337,9 @@ export async function startWriterServer(options: {
 
   app.post("/api/characters", async (context) => {
     try {
-      const body = await context.req.json<{
-        id?: number; name: string; aliases?: string[]; narrativeRole?: string; identity?: string; appearance?: string;
-        personality?: string; values?: string; speechStyle?: string; background?: string; longTermGoal?: string; currentGoal?: string;
-        fears?: string; capabilities?: string; limitations?: string;
-        relationships?: Array<{ characterId: number; type: string; description: string; attitude: string }>; notes?: string;
-      }>();
-      if (body.name?.length > 120) throw new Error("角色名称过长");
-      return context.json({ character: options.store.saveCharacter({
-        schemaVersion: 2, id: body.id, name: body.name ?? "", aliases: Array.isArray(body.aliases) ? body.aliases : [],
-        narrativeRole: body.narrativeRole ?? "", identity: body.identity ?? "", appearance: body.appearance ?? "",
-        personality: body.personality ?? "", values: body.values ?? "", speechStyle: body.speechStyle ?? "",
-        background: body.background ?? "", longTermGoal: body.longTermGoal ?? "", currentGoal: body.currentGoal ?? "",
-        fears: body.fears ?? "", capabilities: body.capabilities ?? "", limitations: body.limitations ?? "",
-        relationships: Array.isArray(body.relationships) ? body.relationships : [], notes: body.notes ?? "",
-      }) });
+      const body = await context.req.json<CharacterInput>();
+      if (body.identity?.name && body.identity.name.length > 120) throw new Error("角色名称过长");
+      return context.json({ character: options.store.saveCharacter(body) });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -618,7 +607,7 @@ export async function startWriterServer(options: {
         documents: options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)),
         activePath: body.activePath && !options.project.isDocumentHidden(body.activePath) ? body.activePath : undefined,
         hasSelection: Boolean(body.hasSelection),
-        characters: options.store.characters().map(item => ({ id: item.id, name: item.name, aliases: item.aliases })),
+        characters: options.store.characters().map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases })),
         signal: context.req.raw.signal,
       });
       return context.json({ suggestions });

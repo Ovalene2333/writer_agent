@@ -28,12 +28,19 @@ type DocumentVersionDetail = DocumentVersionMeta & {
   afterContent: string;
 };
 type MarkdownHeading = { id: string; level: number; text: string };
+type Temporal = { sourceRefs: Array<{ type: "outline" | "document" | "manual"; ref: string; note?: string }>; validFrom?: string; validUntil?: string };
+type TextEntry = Temporal & { id: string; label: string; description: string };
+type Goal = Temporal & { id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown"; priority: number; summary: string; stakes: string; obstacles: string[] };
+type Relationship = Temporal & { id: string; characterId: number; type: string; description: string; attitude: string; status: "active" | "ended" | "strained" | "unknown" };
+type Competency = Temporal & { id: string; name: string; level: string; description: string; resources: string[]; limitations: string[]; costs: string[] };
+type StoryState = Temporal & { id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string; knowledge: TextEntry[]; beliefs: TextEntry[]; intentions: string[]; temporaryGoals: Goal[]; notes: string };
 type Character = {
-  schemaVersion: 2; id: number; name: string; aliases: string[]; narrativeRole: string; identity: string; appearance: string;
-  personality: string; values: string; speechStyle: string; background: string; longTermGoal: string;
-  currentGoal: string; fears: string; capabilities: string; limitations: string;
-  relationships: Array<{ characterId: number; type: string; description: string; attitude: string }>;
-  notes: string; updatedAt: string;
+  schemaVersion: 3; id: number;
+  identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
+  profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
+  psychology: { summary: string; traits: TextEntry[]; values: TextEntry[]; fears: TextEntry[]; conflicts: TextEntry[] };
+  motivations: Goal[]; voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
+  competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; notes: string; updatedAt: string;
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StepUsage = {
@@ -179,10 +186,14 @@ type TreeNode = {
 };
 
 const EMPTY_CHARACTER: CharacterDraft = {
-  schemaVersion: 2, name: "", aliases: [], narrativeRole: "", identity: "", appearance: "", personality: "",
-  values: "", speechStyle: "", background: "", longTermGoal: "", currentGoal: "", fears: "",
-  capabilities: "", limitations: "", relationships: [], notes: "",
+  schemaVersion: 3, identity: { name: "", aliases: [], tags: [], narrativeRole: "", summary: "" },
+  profile: { appearanceSummary: "", distinguishingFeatures: [], backgroundSummary: "", biography: "" },
+  psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] }, motivations: [],
+  voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
+  competencies: [], relationships: [], storyStates: [], notes: "",
 };
+const splitList = (value: string) => value.split(/[,，\n]/).map(item => item.trim()).filter(Boolean);
+const entryId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
 /** Agent orb easter-egg lines (shown after multi-tap overdrive). */
 const ORB_EGG_LINES = [
@@ -1666,7 +1677,7 @@ function App() {
   }
 
   async function saveCharacter() {
-    if (!characterDraft?.name.trim()) return;
+    if (!characterDraft?.identity.name.trim()) return;
     await api("/api/characters", { method: "POST", body: JSON.stringify(characterDraft) });
     setCharacterDraft(null);
     await refresh(state?.sessionId);
@@ -1677,7 +1688,7 @@ function App() {
   }
 
   async function deleteCharacter(character: Character) {
-    if (!confirm(`Delete character “${character.name}”?`)) return;
+    if (!confirm(`Delete character “${character.identity.name}”?`)) return;
     await api(`/api/characters/${character.id}`, { method: "DELETE" });
     setCharacterDraft(null);
     await refresh(state?.sessionId);
@@ -2572,11 +2583,11 @@ function App() {
               <div className="character-grid">
                 {state.characters.map((character) => (
                   <button className="character-card" key={character.id} onClick={() => setCharacterDraft({ ...character })}>
-                    <span className="character-avatar">{character.name.slice(0, 1)}</span>
+                    <span className="character-avatar">{character.identity.name.slice(0, 1)}</span>
                     <span className="character-card-body">
-                      <strong>{character.name}</strong>
-                      <small>{[character.narrativeRole, character.identity].filter(Boolean).join(" · ") || "Role not set"}</small>
-                      <span>{character.personality || character.background || "No description yet"}</span>
+                      <strong>{character.identity.name}</strong>
+                      <small>{[character.identity.narrativeRole, character.identity.summary].filter(Boolean).join(" · ") || "Role not set"}</small>
+                      <span>{character.psychology.summary || character.profile.backgroundSummary || "No description yet"}</span>
                     </span>
                   </button>
                 ))}
@@ -2664,21 +2675,64 @@ function App() {
           <section className="modal character-editor" onMouseDown={(e) => e.stopPropagation()}>
             <h2>{characterDraft.id ? "Edit character" : "New character"}</h2>
             <div className="character-form-grid">
-              <label><span>Name</span><input value={characterDraft.name} onChange={(e) => setCharacterDraft({ ...characterDraft, name: e.target.value })} /></label>
-              <label><span>Narrative role</span><input value={characterDraft.narrativeRole} onChange={(e) => setCharacterDraft({ ...characterDraft, narrativeRole: e.target.value })} /></label>
-              <label><span>Identity</span><input value={characterDraft.identity} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: e.target.value })} /></label>
-              <label className="wide"><span>Aliases (comma separated)</span><input value={characterDraft.aliases.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, aliases: e.target.value.split(/[,，]/).map(v => v.trim()).filter(Boolean) })} /></label>
-              {(["appearance", "personality", "values", "speechStyle", "background", "longTermGoal", "currentGoal", "fears", "capabilities", "limitations", "notes"] as const).map((field) => (
-                <label className="wide" key={field}><span>{field[0].toUpperCase() + field.slice(1)}</span><textarea value={characterDraft[field]} onChange={(e) => setCharacterDraft({ ...characterDraft, [field]: e.target.value })} /></label>
-              ))}
+              <h3 className="wide">Identity</h3>
+              <label><span>Name</span><input value={characterDraft.identity.name} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, name: e.target.value } })} /></label>
+              <label><span>Narrative role</span><input value={characterDraft.identity.narrativeRole} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, narrativeRole: e.target.value } })} /></label>
+              <label className="wide"><span>Identity summary</span><textarea value={characterDraft.identity.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, summary: e.target.value } })} /></label>
+              <label><span>Aliases</span><input value={characterDraft.identity.aliases.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, aliases: splitList(e.target.value) } })} /></label>
+              <label><span>Tags</span><input value={characterDraft.identity.tags.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, tags: splitList(e.target.value) } })} /></label>
+              <h3 className="wide">Profile</h3>
+              <label className="wide"><span>Appearance</span><textarea value={characterDraft.profile.appearanceSummary} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, appearanceSummary: e.target.value } })} /></label>
+              <label><span>Distinguishing features</span><input value={characterDraft.profile.distinguishingFeatures.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, distinguishingFeatures: splitList(e.target.value) } })} /></label>
+              <label><span>Background summary</span><textarea value={characterDraft.profile.backgroundSummary} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, backgroundSummary: e.target.value } })} /></label>
+              <label className="wide"><span>Biography</span><textarea value={characterDraft.profile.biography} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, biography: e.target.value } })} /></label>
+              <h3 className="wide">Psychology</h3>
+              <label className="wide"><span>Personality summary</span><textarea value={characterDraft.psychology.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, summary: e.target.value } })} /></label>
+              {(["traits", "values", "fears", "conflicts"] as const).map(group => <React.Fragment key={group}>
+                <div className="wide character-section-title"><strong>{group}</strong><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: [...characterDraft.psychology[group], { id: entryId(group), label: "", description: "", sourceRefs: [] }] } })}>+ Add</button></div>
+                {characterDraft.psychology[group].map(item => <div className="relationship-editor wide" key={item.id}>
+                  <input placeholder="Label" value={item.label} onChange={(e) => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: characterDraft.psychology[group].map(x => x.id === item.id ? { ...x, label: e.target.value } : x) } })} />
+                  <textarea placeholder="Description" value={item.description} onChange={(e) => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: characterDraft.psychology[group].map(x => x.id === item.id ? { ...x, description: e.target.value } : x) } })} />
+                  <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: characterDraft.psychology[group].filter(x => x.id !== item.id) } })}>Remove</button>
+                </div>)}
+              </React.Fragment>)}
+              <h3 className="wide">Voice</h3>
+              <label className="wide"><span>Voice summary</span><textarea value={characterDraft.voice.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, summary: e.target.value } })} /></label>
+              <label><span>Register</span><input value={characterDraft.voice.register} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, register: e.target.value } })} /></label>
+              <label><span>Diction / habits</span><input value={[...characterDraft.voice.diction, ...characterDraft.voice.verbalHabits].join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, diction: splitList(e.target.value), verbalHabits: [] } })} /></label>
+              <label><span>Avoided expressions</span><input value={characterDraft.voice.avoidedExpressions.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, avoidedExpressions: splitList(e.target.value) } })} /></label>
+              <label><span>Example dialogue</span><textarea value={characterDraft.voice.examples.join("\n")} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, examples: splitList(e.target.value) } })} /></label>
+
+              <div className="wide character-section-title"><h3>Goals</h3><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, motivations: [...characterDraft.motivations, { id: entryId("goal"), category: "current", status: "active", priority: 50, summary: "", stakes: "", obstacles: [], sourceRefs: [] }] })}>+ Add goal</button></div>
+              {characterDraft.motivations.map(goal => <div className="relationship-editor wide" key={goal.id}>
+                <select value={goal.category} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, category: e.target.value as Goal["category"] } : x) })}><option value="longTerm">Long term</option><option value="current">Current</option></select>
+                <select value={goal.status} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, status: e.target.value as Goal["status"] } : x) })}>{["active", "achieved", "abandoned", "blocked", "unknown"].map(x => <option key={x}>{x}</option>)}</select>
+                <input type="number" min="0" max="100" value={goal.priority} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, priority: Number(e.target.value) } : x) })} />
+                <textarea placeholder="Goal summary" value={goal.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, summary: e.target.value } : x) })} />
+                <input placeholder="Stakes" value={goal.stakes} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, stakes: e.target.value } : x) })} />
+                <input placeholder="Valid from outline node" value={goal.validFrom ?? ""} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, validFrom: e.target.value || undefined } : x) })} />
+                <input placeholder="Valid until outline node" value={goal.validUntil ?? ""} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, validUntil: e.target.value || undefined } : x) })} />
+                <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.filter(x => x.id !== goal.id) })}>Remove</button>
+              </div>)}
+
+              <div className="wide character-section-title"><h3>Competencies</h3><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, competencies: [...characterDraft.competencies, { id: entryId("skill"), name: "", level: "", description: "", resources: [], limitations: [], costs: [], sourceRefs: [] }] })}>+ Add competency</button></div>
+              {characterDraft.competencies.map(skill => <div className="relationship-editor wide" key={skill.id}>
+                <input placeholder="Name" value={skill.name} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, name: e.target.value } : x) })} />
+                <input placeholder="Level" value={skill.level} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, level: e.target.value } : x) })} />
+                <textarea placeholder="Description" value={skill.description} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, description: e.target.value } : x) })} />
+                <input placeholder="Resources" value={skill.resources.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, resources: splitList(e.target.value) } : x) })} />
+                <input placeholder="Limits / costs" value={[...skill.limitations, ...skill.costs].join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, limitations: splitList(e.target.value), costs: [] } : x) })} />
+                <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.filter(x => x.id !== skill.id) })}>Remove</button>
+              </div>)}
+
               <label className="wide"><span>Related characters</span><div className="relation-picker">
                 {state.characters.filter(item => item.id !== characterDraft.id).map(item => (
                   <button type="button" className={characterDraft.relationships.some(relation => relation.characterId === item.id) ? "selected" : ""} key={item.id} onClick={() => setCharacterDraft({
                     ...characterDraft,
                     relationships: characterDraft.relationships.some(relation => relation.characterId === item.id)
                       ? characterDraft.relationships.filter(relation => relation.characterId !== item.id)
-                      : [...characterDraft.relationships, { characterId: item.id, type: "", description: "", attitude: "" }],
-                  })}>{item.name}</button>
+                      : [...characterDraft.relationships, { id: entryId("rel"), characterId: item.id, type: "关联", description: "", attitude: "", status: "active", sourceRefs: [] }],
+                  })}>{item.identity.name}</button>
                 ))}
               </div></label>
               {characterDraft.relationships.map((relation) => {
@@ -2688,17 +2742,31 @@ function App() {
                   relationships: characterDraft.relationships.map(item => item.characterId === relation.characterId ? { ...item, ...changes } : item),
                 });
                 return <div className="relationship-editor wide" key={relation.characterId}>
-                  <strong>{related?.name ?? `#${relation.characterId}`}</strong>
+                  <strong>{related?.identity.name ?? `#${relation.characterId}`}</strong>
                   <input placeholder="Relationship type" value={relation.type} onChange={(e) => updateRelation({ type: e.target.value })} />
                   <input placeholder="Attitude" value={relation.attitude} onChange={(e) => updateRelation({ attitude: e.target.value })} />
+                  <select value={relation.status} onChange={(e) => updateRelation({ status: e.target.value as Relationship["status"] })}>{["active", "ended", "strained", "unknown"].map(x => <option key={x}>{x}</option>)}</select>
                   <textarea placeholder="Relationship description" value={relation.description} onChange={(e) => updateRelation({ description: e.target.value })} />
                 </div>;
               })}
+              <div className="wide character-section-title"><h3>Story states</h3><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, storyStates: [...characterDraft.storyStates, { id: entryId("state"), unanchored: true, location: "", physical: "", emotion: "", knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [] }] })}>+ Add state</button></div>
+              {characterDraft.storyStates.map(story => <div className="relationship-editor wide" key={story.id}>
+                <input placeholder="Outline node ID" disabled={story.unanchored} value={story.outlineNodeId ?? ""} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, outlineNodeId: e.target.value || undefined } : x) })} />
+                <label><input type="checkbox" checked={Boolean(story.unanchored)} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, unanchored: e.target.checked || undefined, outlineNodeId: e.target.checked ? undefined : x.outlineNodeId } : x) })} /> Unanchored</label>
+                <input placeholder="Location" value={story.location} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, location: e.target.value } : x) })} />
+                <input placeholder="Physical state" value={story.physical} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, physical: e.target.value } : x) })} />
+                <input placeholder="Emotion" value={story.emotion} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, emotion: e.target.value } : x) })} />
+                <input placeholder="Current intentions" value={story.intentions.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, intentions: splitList(e.target.value) } : x) })} />
+                <textarea placeholder="Knowledge (one item per line)" value={story.knowledge.map(x => x.description).join("\n")} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, knowledge: e.target.value.split(/\n/).filter(Boolean).map((description, i) => ({ id: `${story.id}-knowledge-${i + 1}`, label: "", description, sourceRefs: [] })) } : x) })} />
+                <textarea placeholder="State notes" value={story.notes} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, notes: e.target.value } : x) })} />
+                <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.filter(x => x.id !== story.id) })}>Remove</button>
+              </div>)}
+              <label className="wide"><span>Notes</span><textarea value={characterDraft.notes} onChange={(e) => setCharacterDraft({ ...characterDraft, notes: e.target.value })} /></label>
             </div>
             <div className="modal-actions">
               {characterDraft.id && <button className="danger" onClick={() => void deleteCharacter(characterDraft as Character)}>Delete</button>}
               <button onClick={() => setCharacterDraft(null)}>Cancel</button>
-              <button className="primary" disabled={!characterDraft.name.trim()} onClick={() => void saveCharacter()}>Save</button>
+              <button className="primary" disabled={!characterDraft.identity.name.trim()} onClick={() => void saveCharacter()}>Save</button>
             </div>
           </section>
         </div>

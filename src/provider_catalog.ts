@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import type { ModelConfig, ModelUsageRole, ProviderCatalogPublic, ProviderId, ProviderModelPublic, ProviderProfilePublic, ProviderPublicConfig, TokenPricing } from "./types.js";
 import { defaultPricing, normalizePricing } from "./pricing.js";
@@ -15,6 +15,8 @@ export const DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"] as const
 
 /** Canonical provider catalog filename under `.writer/` (portable; copy this file to migrate). */
 export const PROVIDERS_FILENAME = "providers.json";
+/** One-shot previous copy written before each persist (same directory as `path` + `.bak`). */
+export const PROVIDERS_BACKUP_SUFFIX = ".bak";
 /** Legacy single-file config; auto-migrated to `providers.json` on load. */
 export const LEGACY_PROVIDER_FILENAME = "provider.json";
 
@@ -56,7 +58,40 @@ export class ProviderManager {
   select(profileId: string, modelId: string): ProviderPublicConfig { const profile = this.saved.providers.find(item => item.id === profileId); if (!profile?.models.some(item => item.id === modelId)) throw new Error("供应商或模型不存在"); this.saved.activeProviderId = profileId; this.saved.activeModelId = modelId; this.persist(); return this.publicConfig(); }
   assign(role: ModelUsageRole, providerId: string, modelId: string): ProviderCatalogPublic { if (!modelRoles().includes(role)) throw new Error("模型用途无效"); const profile = this.saved.providers.find(item => item.id === providerId); if (!profile?.models.some(item => item.id === modelId)) throw new Error("供应商或模型不存在"); this.saved.assignments[role] = { providerId, modelId }; if (role === "agent") { this.saved.activeProviderId = providerId; this.saved.activeModelId = modelId; } this.persist(); return this.catalog(); }
   deleteProfile(id: string): ProviderCatalogPublic { if (this.saved.providers.length <= 1) throw new Error("至少保留一个供应商"); this.saved.providers = this.saved.providers.filter(item => item.id !== id); const fallback = { providerId: this.saved.providers[0].id, modelId: this.saved.providers[0].models[0].id }; if (this.saved.activeProviderId === id) { this.saved.activeProviderId = fallback.providerId; this.saved.activeModelId = fallback.modelId; } for (const role of modelRoles()) if (this.saved.assignments[role].providerId === id) this.saved.assignments[role] = fallback; this.persist(); return this.catalog(); }
-  save(input: { provider: ProviderId; baseUrl: string; model: string; apiKey?: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }): ProviderPublicConfig { const active = this.active(); this.saveProfile({ id: active.profile.id, name: active.profile.name, provider: input.provider, baseUrl: input.baseUrl, apiKey: input.apiKey, models: [{ id: active.model.id, name: input.model, pricing: input.pricing, temperature: input.temperature, topP: input.topP }] }); return this.publicConfig(); }
+  /**
+   * Legacy single-model update (style temperature, TUI /model, PUT /api/provider).
+   * Only patches the active model — sibling models on the same provider are preserved.
+   */
+  save(input: { provider: ProviderId; baseUrl: string; model: string; apiKey?: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }): ProviderPublicConfig {
+    const { profile, model: activeModel } = this.active();
+    const models = profile.models.map((model) => {
+      if (model.id !== activeModel.id) {
+        return {
+          id: model.id,
+          name: model.name,
+          pricing: model.pricing,
+          temperature: model.temperature,
+          topP: model.topP,
+        };
+      }
+      return {
+        id: model.id,
+        name: input.model,
+        pricing: input.pricing ?? model.pricing,
+        temperature: input.temperature !== undefined ? input.temperature : model.temperature,
+        topP: input.topP !== undefined ? input.topP : model.topP,
+      };
+    });
+    this.saveProfile({
+      id: profile.id,
+      name: profile.name,
+      provider: input.provider,
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      models,
+    });
+    return this.publicConfig();
+  }
   /** 通过 GET /models 探测可达性，不调用 chat/completions，不消耗 token。 */
   async testConnection(profileId = this.saved.activeProviderId, modelId = this.saved.activeModelId): Promise<{ ok: true; message: string; modelListed?: boolean }> {
     const profile = this.saved.providers.find(item => item.id === profileId);
@@ -120,6 +155,14 @@ export class ProviderManager {
 
   private persist() {
     mkdirSync(dirname(this.path), { recursive: true });
+    // Best-effort previous snapshot for recovery after accidental overwrites.
+    if (existsSync(this.path)) {
+      try {
+        copyFileSync(this.path, `${this.path}${PROVIDERS_BACKUP_SUFFIX}`);
+      } catch {
+        /* ignore backup failures — never block config writes */
+      }
+    }
     const temporary = `${this.path}.tmp-${process.pid}`;
     const text = `${JSON.stringify(this.saved, null, 2)}\n`;
     writeFileSync(temporary, text, { encoding: "utf8", mode: 0o600 });

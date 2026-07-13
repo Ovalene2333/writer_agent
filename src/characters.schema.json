@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://writer-agent.local/schema/character-v3.json",
+  "title": "Writer Agent Character v3",
+  "type": "object",
+  "required": ["schemaVersion", "id", "identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyStates", "notes", "updatedAt"],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "id": { "type": "integer", "minimum": 1 },
+    "identity": { "type": "object", "required": ["name", "aliases", "tags", "narrativeRole", "summary"], "properties": { "name": { "type": "string", "minLength": 1 }, "aliases": { "$ref": "#/$defs/strings" }, "tags": { "$ref": "#/$defs/strings" }, "narrativeRole": { "type": "string" }, "summary": { "type": "string" } }, "additionalProperties": false },
+    "profile": { "type": "object", "required": ["appearanceSummary", "distinguishingFeatures", "backgroundSummary", "biography"], "properties": { "appearanceSummary": { "type": "string" }, "distinguishingFeatures": { "$ref": "#/$defs/strings" }, "backgroundSummary": { "type": "string" }, "biography": { "type": "string" } }, "additionalProperties": false },
+    "psychology": { "type": "object", "required": ["summary", "traits", "values", "fears", "conflicts"], "properties": { "summary": { "type": "string" }, "traits": { "$ref": "#/$defs/textEntries" }, "values": { "$ref": "#/$defs/textEntries" }, "fears": { "$ref": "#/$defs/textEntries" }, "conflicts": { "$ref": "#/$defs/textEntries" } }, "additionalProperties": false },
+    "motivations": { "type": "array", "items": { "$ref": "#/$defs/goal" } },
+    "voice": { "type": "object", "required": ["summary", "register", "diction", "verbalHabits", "avoidedExpressions", "examples"], "properties": { "summary": { "type": "string" }, "register": { "type": "string" }, "diction": { "$ref": "#/$defs/strings" }, "verbalHabits": { "$ref": "#/$defs/strings" }, "avoidedExpressions": { "$ref": "#/$defs/strings" }, "examples": { "$ref": "#/$defs/strings" } }, "additionalProperties": false },
+    "competencies": { "type": "array", "items": { "$ref": "#/$defs/competency" } },
+    "relationships": { "type": "array", "items": { "$ref": "#/$defs/relationship" } },
+    "storyStates": { "type": "array", "items": { "$ref": "#/$defs/storyState" } },
+    "notes": { "type": "string" }, "updatedAt": { "type": "string" }, "extensions": { "type": "object" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "strings": { "type": "array", "items": { "type": "string" } },
+    "entryId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "sourceRefs": { "type": "array", "items": { "type": "object", "required": ["type", "ref"], "properties": { "type": { "enum": ["outline", "document", "manual"] }, "ref": { "type": "string", "minLength": 1 }, "note": { "type": "string" } }, "additionalProperties": false } },
+    "temporal": { "type": "object", "required": ["sourceRefs"], "properties": { "sourceRefs": { "$ref": "#/$defs/sourceRefs" }, "validFrom": { "type": "string" }, "validUntil": { "type": "string" } } },
+    "textEntry": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "label", "description"], "properties": { "id": { "$ref": "#/$defs/entryId" }, "label": { "type": "string" }, "description": { "type": "string" } } }] },
+    "textEntries": { "type": "array", "items": { "$ref": "#/$defs/textEntry" } },
+    "goal": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "category", "status", "priority", "summary", "stakes", "obstacles"], "properties": { "id": { "$ref": "#/$defs/entryId" }, "category": { "enum": ["longTerm", "current"] }, "status": { "enum": ["active", "achieved", "abandoned", "blocked", "unknown"] }, "priority": { "type": "number", "minimum": 0, "maximum": 100 }, "summary": { "type": "string", "minLength": 1 }, "stakes": { "type": "string" }, "obstacles": { "$ref": "#/$defs/strings" } } }] },
+    "competency": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "name", "level", "description", "resources", "limitations", "costs"], "properties": { "id": { "$ref": "#/$defs/entryId" }, "name": { "type": "string" }, "level": { "type": "string" }, "description": { "type": "string" }, "resources": { "$ref": "#/$defs/strings" }, "limitations": { "$ref": "#/$defs/strings" }, "costs": { "$ref": "#/$defs/strings" } } }] },
+    "relationship": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "characterId", "type", "attitude", "status", "description"], "properties": { "id": { "$ref": "#/$defs/entryId" }, "characterId": { "type": "integer", "minimum": 1 }, "type": { "type": "string" }, "attitude": { "type": "string" }, "status": { "enum": ["active", "ended", "strained", "unknown"] }, "description": { "type": "string" } } }] },
+    "storyState": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "location", "physical", "emotion", "knowledge", "beliefs", "intentions", "temporaryGoals", "notes"], "anyOf": [{ "required": ["outlineNodeId"] }, { "properties": { "unanchored": { "const": true } }, "required": ["unanchored"] }], "properties": { "id": { "$ref": "#/$defs/entryId" }, "outlineNodeId": { "type": "string", "minLength": 1 }, "unanchored": { "type": "boolean" }, "location": { "type": "string" }, "physical": { "type": "string" }, "emotion": { "type": "string" }, "knowledge": { "$ref": "#/$defs/textEntries" }, "beliefs": { "$ref": "#/$defs/textEntries" }, "intentions": { "$ref": "#/$defs/strings" }, "temporaryGoals": { "type": "array", "items": { "$ref": "#/$defs/goal" } }, "notes": { "type": "string" } } }] }
+  }
+}

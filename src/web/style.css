@@ -1903,6 +1903,9 @@ button.agent-orb:focus-visible {
 }
 .relationship-editor strong { align-self: center; font-size: 13px; }
 .relationship-editor textarea { grid-column: 1 / -1; min-height: 64px; }
+.character-section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
+.character-section-title h3, .character-section-title strong { margin: 0; text-transform: capitalize; }
+.character-form-grid > h3 { margin: 12px 0 0; padding-bottom: 6px; border-bottom: 1px solid var(--border-light); }
 .relation-picker { display: flex; flex-wrap: wrap; gap: 6px; }
 .relation-picker button { padding: 5px 10px; font-size: 11px; }
 .relation-picker button.selected { border-color: var(--accent); background: var(--accent-light); color: var(--accent); }

@@ -392,6 +392,12 @@ export class WriterProject {
     }
   }
 
+  backupV2CharacterCards(content: string): void {
+    mkdirSync(this.charactersDir, { recursive: true });
+    const target = resolve(this.charactersDir, "characters.v2.backup.jsonl");
+    if (!existsSync(target)) writeFileSync(target, content, "utf8");
+  }
+
   readCharacterCard(file: string): string {
     return readFileSync(this.resolveCharacterCard(file), "utf8");
   }

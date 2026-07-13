@@ -216,7 +216,7 @@ function executionRulesPrompt(mode: PermissionMode): string {
 2. 保持既有人物、世界观、视角和 Markdown 结构。局部修改用补丁；大纲节点用大纲补丁；新建或全文重写才提交完整文档。新建设定→lore/，新建大纲→outline/，新建正文→chapters/；不要把设定写进章节，也不要把正文写进 lore。
 ${modeRule}
 4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
-5. 管理角色使用 save_character：修改已有卡必须传 id，并先读取完整卡片、保留未要求修改的字段；新建卡省略 id。写作时只读取所需角色字段。
+5. 管理角色使用 save_character：修改已有卡必须传 id；省略分区会保留原值，提供的数组整体替换，删除条目传 deleteEntryIds。新建卡省略 id 并提供 identity.name。写作时用 sections 只读取所需分区。
 6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
 7. 资料复用：仅复用「本轮任务相关工作记忆」、本轮工具结果、带 reused 标记的返回；禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。上一轮非承接任务的清单与记忆不会自动带入。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
 8. 复杂多步请求（≥3 步）用 manage_todos 维护清单并随进度更新；简单单步不必。清单绑定当前对话任务：切换到不同 mode 的新请求会清空旧清单，承接续写则保留。同一时刻最多一项 in_progress。提交最终文档提案前把清单中剩余项标为 completed（提案成功后本轮会立即结束，之后无法再更新清单）。
@@ -278,7 +278,7 @@ async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const documents = project.listDocuments().filter(path => !project.isDocumentHidden(path));
-  const characters = store.characters().map(item => ({ id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity }));
+  const characters = store.characters().map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
   const activeStyleId = project.config().style;
   const activeStyle = activeStyleId ? getStyleTemplate(activeStyleId) : undefined;
   // Slim catalogs: paths / id+name only — full notes/examples hurt planner cache and cost.
@@ -467,13 +467,13 @@ function taskInstructions(mode: WritingTaskMode): string {
 function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[]): string {
   const rankedCharacters = store.characters().map((item) => ({
     item, score: task.characterIds.includes(item.id) ? 1 : 0,
-  })).sort((a, b) => b.score - a.score || a.item.name.localeCompare(b.item.name, "zh-CN"));
+  })).sort((a, b) => b.score - a.score || a.item.identity.name.localeCompare(b.item.identity.name, "zh-CN"));
   const scopedIds = characterScope === undefined ? undefined : new Set(characterScope);
   const selectedCharacters = scopedIds
     ? rankedCharacters.filter(entry => scopedIds.has(entry.item.id))
     : rankedCharacters.filter((entry) => entry.score > 0).slice(0, 4);
   const characters = selectedCharacters.map(({ item }) => ({
-    id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity,
+    id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary,
   }));
   // Writing tasks: only ids/fingerprints here — full example bodies live in stableStyleGroundingPrompt (KV-friendly, no duplicate).
   const writing = isIntensiveWritingMode(task.mode) || task.documentProposalRequired;
@@ -967,7 +967,7 @@ function writingBootstrapContext(project: WriterProject, store: WriterStore, pro
   const characterIndex = store.characters()
     .filter(item => task.characterIds.includes(item.id) || outlineCharacterIds.includes(item.id))
     .slice(0, 8)
-    .map(item => ({ id: item.id, name: item.name, narrativeRole: item.narrativeRole }));
+    .map(item => ({ id: item.id, name: item.identity.name, narrativeRole: item.identity.narrativeRole }));
 
   if (!outlineNodes?.length && !targetCandidates.length && !prevCandidates.length && !characterIndex.length) {
     return "";
@@ -976,7 +976,7 @@ function writingBootstrapContext(project: WriterProject, store: WriterStore, pro
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
 - 需要情节细节：用 outlineNodes[].id 调用 get_outline_node（id 为 UUID，不是章号）。
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
-- 需要人设：对 characterIndex 中的 id 调用 get_character（可带 fields）。
+- 需要人设：对 characterIndex 中的 id 调用 get_character（可带 sections；场景状态需传 outlineNodeId）。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
 ${JSON.stringify({
@@ -1453,4 +1453,3 @@ function estimateTokenCount(charCount: number): number {
   // Mixed CJK/Latin heuristic used only as UI fallback when billing usage is absent.
   return Math.max(1, Math.ceil(charCount / 2.2));
 }
-  

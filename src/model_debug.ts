@@ -132,7 +132,7 @@ export function createAgentStepDebugLogger(meta?: {
         break;
       }
       case "character": {
-        write(`[WRITER STEP] character saved: ${event.character.name} (#${event.character.id})`);
+        write(`[WRITER STEP] character saved: ${event.character.identity.name} (#${event.character.id})`);
         break;
       }
       case "waiting_for_input": {

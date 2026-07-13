@@ -11,6 +11,8 @@ import {
 } from "./prose_quality.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
+import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
+import { OutlineStore } from "./outline.js";
 
 export type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
 export type ActionMode = WritingMode | "character";
@@ -185,7 +187,7 @@ export async function generateCharacter(input: {
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
-    { role: "system", content: `你是小说角色设计助手。根据用户要求生成或补全角色卡。你可以按需读取获准的参考文档，但不要读取无关资料。完成后只输出一个 JSON 对象，不要 Markdown，不要解释。可用字段：name, aliases, narrativeRole, identity, appearance, personality, values, speechStyle, background, longTermGoal, currentGoal, fears, capabilities, limitations, notes。name 必须提供；其余字段只填写用户已提供或能够可靠归纳的内容，未知内容使用空字符串，不得为了填满表格虚构设定。关系由应用单独维护，不要输出 relationships。` },
+    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/notes；结构化条目必须有稳定 ASCII id，演进记录包含 status/sourceRefs/validFrom/validUntil。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
   const result = input.project && input.allowedDocumentPaths?.length
@@ -224,9 +226,9 @@ export async function updateCharacterFromConversation(input: {
       ...draft, id: existing?.id,
       relationships: existing?.relationships ?? draft.relationships,
     });
-    const fallback = existing ? `已更新角色卡：${character.name}` : `已创建角色卡：${character.name}`;
+    const fallback = existing ? `已更新角色卡：${character.identity.name}` : `已创建角色卡：${character.identity.name}`;
     const message = await safeChangeSummary(input.summaryModel ?? input.model, {
-      kind: "character", action: existing ? "更新角色卡" : "创建角色卡", target: character.name,
+      kind: "character", action: existing ? "更新角色卡" : "创建角色卡", target: character.identity.name,
       instruction: input.instruction,
       before: existing ? JSON.stringify(characterContext(existing), null, 2) : "（新建）",
       after: JSON.stringify(characterContext(character), null, 2),
@@ -263,7 +265,7 @@ async function buildWritingDraft(
   const allowedCharacterIds = new Set(selectedCharacters(options.store, options.characterIds).map(item => item.id));
   const documents = options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)).slice(0, 100);
   const documentSet = new Set(documents);
-  const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity }));
+  const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
   // Free-form ids/paths keep the tools JSON stable across project growth (better prompt-cache prefix).
   const tools = [
     { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
@@ -335,7 +337,7 @@ ${proseMannerismConstraintPrompt({ compact: true })}
           if (!allowedCharacterIds.has(id)) throw new Error("角色不在本次获准范围内");
           const character = options.store.characters().find(item => item.id === id);
           if (!character) throw new Error("角色不存在");
-          result = characterContext(character);
+          result = characterContext(character, options.project, options.path, options.selection);
         } else if (call.function.name === "list_documents") result = documents.map(path => ({ path, characters: options.project.read(path).length }));
         else if (call.function.name === "read_document") {
           const path = typeof args.path === "string" ? args.path : "";
@@ -389,7 +391,7 @@ ${proseMannerismConstraintPrompt()}
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
       `作品语言：${options.project.config().language}`,
-      characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(characterContext), null, 2)}` : "相关角色卡：无",
+      characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(item => characterContext(item, options.project, options.path, options.selection)), null, 2)}` : "相关角色卡：无",
       `写作前草案（用于约束情节、事实和必要信息；不要在正文中复述草案）：\n${draft}`,
       context ? `文档上下文：\n${context}` : "",
       `写作要求：${options.instruction.trim()}`,
@@ -440,11 +442,13 @@ function selectedCharacters(store: WriterStore, ids?: number[]): Character[] {
   return store.characters().filter(item => allowed.has(item.id)).slice(0, 12);
 }
 
-function characterContext(item: Character) {
-  return { id: item.id, name: item.name, aliases: item.aliases, narrativeRole: item.narrativeRole, identity: item.identity,
-    appearance: item.appearance, personality: item.personality, values: item.values, speechStyle: item.speechStyle,
-    background: item.background, longTermGoal: item.longTermGoal, currentGoal: item.currentGoal, fears: item.fears,
-    capabilities: item.capabilities, limitations: item.limitations, relationships: item.relationships, notes: item.notes };
+function characterContext(item: Character, project?: WriterProject, path?: string, selection?: string) {
+  if (!project) return characterPromptViews(item);
+  const nodes = new OutlineStore(project).sync().nodes;
+  const linked = path ? nodes.filter(node => node.documentPath === path) : [];
+  const selected = selection ? linked.find(node => node.documentHeading && selection.includes(node.documentHeading)) : undefined;
+  const target = selected?.id ?? (linked.length === 1 ? linked[0].id : undefined);
+  return characterPromptViews(item, nodes, target);
 }
 
 function proposalSummary(mode: WritingMode): string { return `${modeLabel(mode)}生成内容，等待确认`; }
@@ -675,13 +679,10 @@ function summaryAfter(mode: WritingMode, generated: string): string {
 }
 
 function normalizeCharacterDraft(value: Record<string, unknown>): Omit<Character, "id" | "updatedAt"> {
-  const text = (key: string) => typeof value[key] === "string" ? value[key].trim() : "";
-  const aliases = Array.isArray(value.aliases) ? value.aliases.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20) : [];
-  if (!text("name")) throw new Error("生成的角色卡缺少姓名");
-  return { schemaVersion: 2, name: text("name"), aliases, narrativeRole: text("narrativeRole"), identity: text("identity"),
-    appearance: text("appearance"), personality: text("personality"), values: text("values"), speechStyle: text("speechStyle"),
-    background: text("background"), longTermGoal: text("longTermGoal"), currentGoal: text("currentGoal"), fears: text("fears"),
-    capabilities: text("capabilities"), limitations: text("limitations"), relationships: [], notes: text("notes") };
+  const normalized = normalizeV3Character({ ...emptyCharacter(), ...value, id: 1, updatedAt: "" });
+  if (!normalized.identity.name) throw new Error("生成的角色卡缺少 identity.name");
+  const { id: _id, updatedAt: _updatedAt, ...draft } = normalized;
+  return draft;
 }
 
 async function runReadOnlyToolLoop(
