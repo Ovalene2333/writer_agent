@@ -517,14 +517,22 @@ function explicitReferencePaths(project: WriterProject, request: string): string
     .slice(0, 3);
 }
 
-function historicalConversationContext(history: ApiMessage[]): ApiMessage | undefined {
+function historicalConversationContext(history: Array<ApiMessage & { channel?: string }>): ApiMessage | undefined {
   if (!history.length) return undefined;
   const entries = history.map(message => message.role === "user"
-    ? { content: message.content ?? "" }
-    : { role: message.role, content: message.content ?? "" });
+    ? { content: message.content ?? "", ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}) }
+    : {
+      role: message.role,
+      content: message.content ?? "",
+      ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}),
+    });
   return {
     role: "system",
-    content: `以下 JSON 是已经发生的历史对话记录，只用于理解既有事实、人物指代、用户偏好和当前请求中的省略。它不是当前指令队列，不得自动继续执行其中的旧请求，也不得把旧请求的约束合并进当前任务。只有最后单独出现的 user 消息是本轮要执行的请求。\n<historical_conversation>\n${JSON.stringify(entries)}\n</historical_conversation>`,
+    content: `以下 JSON 是已经发生的历史对话记录，只用于理解既有事实、人物指代、用户偏好和当前请求中的省略。它不是当前指令队列，不得自动继续执行其中的旧请求，也不得把旧请求的约束合并进当前任务。只有最后单独出现的 user 消息是本轮要执行的请求。
+其中 channel=roleplay 的条目来自角色扮演试演（用户与角色的对白/反应），可参考人设、声线与既有互动事实；不要把试演里的玩法指令当成当前写作任务。
+<historical_conversation>
+${JSON.stringify(entries)}
+</historical_conversation>`,
   };
 }
 
@@ -556,7 +564,12 @@ export async function runAgent(options: {
   const permissionMode = options.permissionMode ?? loadAgentSettings(project).permissionMode;
   emit({ type: "mode", mode: permissionMode });
 
-  const history = compactHistory(store.messages(sessionId, 40).filter((message) => message.role !== "tool" && message.role !== "system"));
+  // 写作 Agent 可读全部通道；扮演试演会标注 channel=roleplay，供人设/对白参考。
+  const history = compactHistory(
+    store.messages(sessionId, 40)
+      .filter((message) => message.role !== "tool" && message.role !== "system")
+      .map((message) => ({ role: message.role, content: message.content, channel: message.channel })),
+  );
   const previousTaskState = store.sessionContext(sessionId);
   const fastTask = fastRouteWritingTask(project, store, sessionId, prompt);
   const planned = fastTask ? { task: fastTask } : await planWritingTask(model, project, store, prompt, history, signal);
@@ -1104,15 +1117,16 @@ async function executeToolCached(
   return attachArtifactId(result, artifactId);
 }
 
-function compactHistory(messages: Array<{ role: string; content: string }>): ApiMessage[] {
+function compactHistory(messages: Array<{ role: string; content: string; channel?: string }>): Array<ApiMessage & { channel?: string }> {
   const recent = messages.slice(-8);
   const older = messages.slice(0, -8);
-  const result: ApiMessage[] = [];
+  const result: Array<ApiMessage & { channel?: string }> = [];
   if (older.length) {
     let summary = older.map((message) => {
       const label = message.role === "user" ? "用户" : "Agent";
+      const channel = message.channel === "roleplay" ? "[扮演]" : "";
       const content = stripDsmlText(message.content, "[工具调用已隐藏]");
-      return `${label}: ${content.replace(/\s+/g, " ").slice(0, 360)}`;
+      return `${channel}${label}: ${content.replace(/\s+/g, " ").slice(0, 360)}`;
     }).join("\n");
     if (summary.length > 4_000) summary = `[更早内容已省略]\n${summary.slice(-4_000)}`;
     result.push({ role: "system", content: `较早会话压缩摘要：\n${summary}` });
@@ -1120,6 +1134,7 @@ function compactHistory(messages: Array<{ role: string; content: string }>): Api
   result.push(...recent.map((message) => ({
     role: message.role as "user" | "assistant",
     content: stripDsmlText(message.content, "[工具调用已隐藏]"),
+    ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}),
   })));
   return result;
 }

@@ -2,6 +2,7 @@
 import { createRoot } from "react-dom/client";
 import { Marked, type Token, type Tokens } from "marked";
 import { documentDiff, renderDiffHtml } from "../diff";
+import { CharacterEditor } from "./character_editor";
 import { ModelConfig, type ProviderCatalog } from "./model_config";
 import "./style.css";
 
@@ -13,7 +14,15 @@ type Proposal = {
   afterContent: string;
   status: "pending" | "accepted" | "rejected" | "stale";
 };
-type Message = { id: number; role: string; content: string };
+type Message = { id: number; role: string; content: string; channel?: "agent" | "roleplay" };
+type RoleplayInterlocutor = {
+  name: string;
+  identity: string;
+  relationship: string;
+  knowledge: string;
+  scene: string;
+  goal: string;
+};
 type DocumentData = { content: string; hash: string };
 type DocumentVersionMeta = {
   id: number;
@@ -192,9 +201,6 @@ const EMPTY_CHARACTER: CharacterDraft = {
   voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
   competencies: [], relationships: [], storyStates: [], notes: "",
 };
-const splitList = (value: string) => value.split(/[,，\n]/).map(item => item.trim()).filter(Boolean);
-const entryId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-
 /** Agent orb easter-egg lines (shown after multi-tap overdrive). */
 const ORB_EGG_LINES = [
   "写作核心已过载 · 灵感滤镜开启",
@@ -980,7 +986,9 @@ function App() {
   const [browsingVersion, setBrowsingVersion] = useState<DocumentVersionDetail | null>(null);
   const [versionBusy, setVersionBusy] = useState(false);
   /** Experimental: roleplay voice-test against a character card. */
-  const [roleplay, setRoleplay] = useState<{ characterId: number; name: string } | null>(null);
+  const [roleplay, setRoleplay] = useState<{ characterId: number; name: string; interlocutor: RoleplayInterlocutor } | null>(null);
+  const [roleplaySetup, setRoleplaySetup] = useState<{ characterId: number; name: string; request: string } | null>(null);
+  const [roleplaySetupBusy, setRoleplaySetupBusy] = useState(false);
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
@@ -1437,7 +1445,18 @@ function App() {
     streamOutputRef.current = "";
     setState((value) =>
       value
-        ? { ...value, messages: [...value.messages, { id: tempMessageId, role: "user", content: text }] }
+        ? {
+          ...value,
+          messages: [
+            ...value.messages,
+            {
+              id: tempMessageId,
+              role: "user",
+              content: text,
+              channel: roleplay ? "roleplay" : "agent",
+            },
+          ],
+        }
         : value,
     );
     try {
@@ -1451,7 +1470,7 @@ function App() {
           prompt: text,
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           ...(roleplay
-            ? { mode: "roleplay", characterId: roleplay.characterId }
+            ? { mode: "roleplay", characterId: roleplay.characterId, interlocutor: roleplay.interlocutor }
             : {}),
         }),
       });
@@ -1686,6 +1705,33 @@ function App() {
     await api("/api/characters", { method: "POST", body: JSON.stringify(characterDraft) });
     setCharacterDraft(null);
     await refresh(state?.sessionId);
+  }
+
+  function beginRoleplaySetup(characterId: number, name: string) {
+    setRoleplaySetup({ characterId, name, request: "" });
+    setCharacterDraft(null);
+    setManagementView(null);
+  }
+
+  async function confirmRoleplaySetup() {
+    if (!roleplaySetup || roleplaySetupBusy) return;
+    setRoleplaySetupBusy(true);
+    setError("");
+    try {
+      const interlocutor = await api<RoleplayInterlocutor>("/api/roleplay/interlocutor", {
+        method: "POST",
+        body: JSON.stringify({ characterId: roleplaySetup.characterId, request: roleplaySetup.request }),
+      });
+      setRoleplay({ characterId: roleplaySetup.characterId, name: roleplaySetup.name, interlocutor });
+      setRoleplaySetup(null);
+      setMobileTab("agent");
+      setNotice(`【测试】已进入角色扮演：${roleplaySetup.name}。你将作为“${interlocutor.name}”参与对话。`);
+      requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRoleplaySetupBusy(false);
+    }
   }
 
   function openProviderSettings() {
@@ -2220,11 +2266,25 @@ function App() {
             <div>
               <strong>角色扮演试演</strong>
               <span>正在以「{roleplay.name}」第一人称对话（测试性 · 不改文档）</span>
+              <span title={roleplay.interlocutor.identity}>对话者：{roleplay.interlocutor.name} · {roleplay.interlocutor.relationship}</span>
+              <details className="roleplay-interlocutor-details">
+                <summary>查看对话者设定</summary>
+                <dl>
+                  <div><dt>身份</dt><dd>{roleplay.interlocutor.identity}</dd></div>
+                  <div><dt>关系</dt><dd>{roleplay.interlocutor.relationship}</dd></div>
+                  <div><dt>已知</dt><dd>{roleplay.interlocutor.knowledge}</dd></div>
+                  <div><dt>场景</dt><dd>{roleplay.interlocutor.scene}</dd></div>
+                  <div><dt>目标</dt><dd>{roleplay.interlocutor.goal}</dd></div>
+                </dl>
+              </details>
             </div>
-            <button type="button" disabled={busy} onClick={() => {
-              setRoleplay(null);
-              setNotice(`已退出角色扮演（${roleplay.name}）`);
-            }}>退出扮演</button>
+            <div className="roleplay-banner-actions">
+              <button type="button" disabled={busy} onClick={() => beginRoleplaySetup(roleplay.characterId, roleplay.name)}>重新设定</button>
+              <button type="button" disabled={busy} onClick={() => {
+                setRoleplay(null);
+                setNotice(`已退出角色扮演（${roleplay.name}）`);
+              }}>退出扮演</button>
+            </div>
           </div>
         )}
         {(state.todos?.length ?? 0) > 0 && (
@@ -2251,8 +2311,11 @@ function App() {
         <div className="conversation">
           {visibleMessages.map((msg) => (
             <React.Fragment key={msg.id}>
-            <article className={msg.role}>
-              <div className="msg-label">{msg.role === "assistant" ? "Assistant" : "You"}</div>
+            <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}`}>
+              <div className="msg-label">
+                <span>{msg.role === "assistant" ? (msg.channel === "roleplay" ? "角色" : "Assistant") : "You"}</span>
+                {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
+              </div>
               {msg.role === "assistant" ? (
                 <Markdown content={msg.content} />
               ) : (
@@ -2397,6 +2460,47 @@ function App() {
           ))
         )}
       </section>
+
+      {roleplaySetup && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={() => !roleplaySetupBusy && setRoleplaySetup(null)}
+        >
+          <div
+            className="modal roleplay-setup-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="roleplay-setup-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <span className="eyebrow">Roleplay audition</span>
+            <h2 id="roleplay-setup-title">设定你的对话者身份</h2>
+            <p>你将与「{roleplaySetup.name}」试演。描述你想扮演谁、双方关系和场景；Agent 会按需查询角色卡与世界观后完成设定。</p>
+            <label>
+              <span>身份要求（可留空）</span>
+              <textarea
+                autoFocus
+                rows={6}
+                disabled={roleplaySetupBusy}
+                value={roleplaySetup.request}
+                placeholder="例如：我是她失联三年的旧搭档，刚在泛亚空间站重逢；沿用项目中已有组织与事件设定。"
+                onChange={(event) => setRoleplaySetup({ ...roleplaySetup, request: event.target.value })}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") void confirmRoleplaySetup();
+                }}
+              />
+            </label>
+            <small>留空会使用“身份未知的来访者”，不调用模型查询。</small>
+            <div className="modal-actions">
+              <button type="button" disabled={roleplaySetupBusy} onClick={() => setRoleplaySetup(null)}>取消</button>
+              <button type="button" className="primary" disabled={roleplaySetupBusy} onClick={() => void confirmRoleplaySetup()}>
+                {roleplaySetupBusy ? "正在查询并设定…" : roleplaySetup.request.trim() ? "生成设定并开始" : "直接开始"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showStylePicker && (
         <div
@@ -2558,11 +2662,11 @@ function App() {
             <div className="management-head">
               <div>
                 <span className="eyebrow">Workspace</span>
-                <h2>{managementView === "characters" ? "Character cards" : "Sessions"}</h2>
+                <h2>{managementView === "characters" ? "角色卡" : "会话"}</h2>
               </div>
               <div className="management-actions">
                 {managementView === "characters" ? (
-                  <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}>+ Character</button>
+                  <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}>+ 新建角色</button>
                 ) : (
                   <>
                     <button
@@ -2605,9 +2709,16 @@ function App() {
                     <button className="character-card" onClick={() => setCharacterDraft({ ...character })}>
                       <span className="character-avatar">{character.identity.name.slice(0, 1)}</span>
                       <span className="character-card-body">
-                        <strong>{character.identity.name}</strong>
-                        <small>{[character.identity.narrativeRole, character.identity.summary].filter(Boolean).join(" · ") || "Role not set"}</small>
-                        <span>{character.psychology.summary || character.profile.backgroundSummary || "No description yet"}</span>
+                        <strong title={character.identity.name}>{character.identity.name}</strong>
+                        <small title={character.identity.narrativeRole || undefined}>
+                          {character.identity.narrativeRole.trim() || "未设定位"}
+                        </small>
+                        <span title={character.psychology.summary || character.profile.backgroundSummary || character.identity.summary || undefined}>
+                          {character.psychology.summary
+                            || character.profile.backgroundSummary
+                            || character.identity.summary
+                            || "暂无简介"}
+                        </span>
                       </span>
                     </button>
                     <button
@@ -2617,18 +2728,14 @@ function App() {
                       disabled={busy}
                       onClick={(e) => {
                         e.stopPropagation();
-                        setRoleplay({ characterId: character.id, name: character.identity.name });
-                        setManagementView(null);
-                        setMobileTab("agent");
-                        setNotice(`【测试】已进入角色扮演：${character.identity.name}。直接对话试演人设；点「退出扮演」结束。`);
-                        requestAnimationFrame(() => composerRef.current?.focus());
+                        beginRoleplaySetup(character.id, character.identity.name);
                       }}
                     >
                       试演
                     </button>
                   </div>
                 ))}
-                {state.characters.length === 0 && <div className="management-empty">No character cards yet.</div>}
+                {state.characters.length === 0 && <div className="management-empty">还没有角色卡，点右上角新建。</div>}
               </div>
             ) : (
               <div className="session-manager">
@@ -2708,105 +2815,18 @@ function App() {
       )}
 
       {characterDraft && (
-        <div className="modal-backdrop" onMouseDown={() => setCharacterDraft(null)}>
-          <section className="modal character-editor" onMouseDown={(e) => e.stopPropagation()}>
-            <h2>{characterDraft.id ? "Edit character" : "New character"}</h2>
-            <div className="character-form-grid">
-              <h3 className="wide">Identity</h3>
-              <label><span>Name</span><input value={characterDraft.identity.name} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, name: e.target.value } })} /></label>
-              <label><span>Narrative role</span><input value={characterDraft.identity.narrativeRole} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, narrativeRole: e.target.value } })} /></label>
-              <label className="wide"><span>Identity summary</span><textarea value={characterDraft.identity.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, summary: e.target.value } })} /></label>
-              <label><span>Aliases</span><input value={characterDraft.identity.aliases.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, aliases: splitList(e.target.value) } })} /></label>
-              <label><span>Tags</span><input value={characterDraft.identity.tags.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, identity: { ...characterDraft.identity, tags: splitList(e.target.value) } })} /></label>
-              <h3 className="wide">Profile</h3>
-              <label className="wide"><span>Appearance</span><textarea value={characterDraft.profile.appearanceSummary} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, appearanceSummary: e.target.value } })} /></label>
-              <label><span>Distinguishing features</span><input value={characterDraft.profile.distinguishingFeatures.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, distinguishingFeatures: splitList(e.target.value) } })} /></label>
-              <label><span>Background summary</span><textarea value={characterDraft.profile.backgroundSummary} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, backgroundSummary: e.target.value } })} /></label>
-              <label className="wide"><span>Biography</span><textarea value={characterDraft.profile.biography} onChange={(e) => setCharacterDraft({ ...characterDraft, profile: { ...characterDraft.profile, biography: e.target.value } })} /></label>
-              <h3 className="wide">Psychology</h3>
-              <label className="wide"><span>Personality summary</span><textarea value={characterDraft.psychology.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, summary: e.target.value } })} /></label>
-              {(["traits", "values", "fears", "conflicts"] as const).map(group => <React.Fragment key={group}>
-                <div className="wide character-section-title"><strong>{group}</strong><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: [...characterDraft.psychology[group], { id: entryId(group), label: "", description: "", sourceRefs: [] }] } })}>+ Add</button></div>
-                {characterDraft.psychology[group].map(item => <div className="relationship-editor wide" key={item.id}>
-                  <input placeholder="Label" value={item.label} onChange={(e) => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: characterDraft.psychology[group].map(x => x.id === item.id ? { ...x, label: e.target.value } : x) } })} />
-                  <textarea placeholder="Description" value={item.description} onChange={(e) => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: characterDraft.psychology[group].map(x => x.id === item.id ? { ...x, description: e.target.value } : x) } })} />
-                  <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, psychology: { ...characterDraft.psychology, [group]: characterDraft.psychology[group].filter(x => x.id !== item.id) } })}>Remove</button>
-                </div>)}
-              </React.Fragment>)}
-              <h3 className="wide">Voice</h3>
-              <label className="wide"><span>Voice summary</span><textarea value={characterDraft.voice.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, summary: e.target.value } })} /></label>
-              <label><span>Register</span><input value={characterDraft.voice.register} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, register: e.target.value } })} /></label>
-              <label><span>Diction / habits</span><input value={[...characterDraft.voice.diction, ...characterDraft.voice.verbalHabits].join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, diction: splitList(e.target.value), verbalHabits: [] } })} /></label>
-              <label><span>Avoided expressions</span><input value={characterDraft.voice.avoidedExpressions.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, avoidedExpressions: splitList(e.target.value) } })} /></label>
-              <label><span>Example dialogue</span><textarea value={characterDraft.voice.examples.join("\n")} onChange={(e) => setCharacterDraft({ ...characterDraft, voice: { ...characterDraft.voice, examples: splitList(e.target.value) } })} /></label>
-
-              <div className="wide character-section-title"><h3>Goals</h3><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, motivations: [...characterDraft.motivations, { id: entryId("goal"), category: "current", status: "active", priority: 50, summary: "", stakes: "", obstacles: [], sourceRefs: [] }] })}>+ Add goal</button></div>
-              {characterDraft.motivations.map(goal => <div className="relationship-editor wide" key={goal.id}>
-                <select value={goal.category} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, category: e.target.value as Goal["category"] } : x) })}><option value="longTerm">Long term</option><option value="current">Current</option></select>
-                <select value={goal.status} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, status: e.target.value as Goal["status"] } : x) })}>{["active", "achieved", "abandoned", "blocked", "unknown"].map(x => <option key={x}>{x}</option>)}</select>
-                <input type="number" min="0" max="100" value={goal.priority} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, priority: Number(e.target.value) } : x) })} />
-                <textarea placeholder="Goal summary" value={goal.summary} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, summary: e.target.value } : x) })} />
-                <input placeholder="Stakes" value={goal.stakes} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, stakes: e.target.value } : x) })} />
-                <input placeholder="Valid from outline node" value={goal.validFrom ?? ""} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, validFrom: e.target.value || undefined } : x) })} />
-                <input placeholder="Valid until outline node" value={goal.validUntil ?? ""} onChange={(e) => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.map(x => x.id === goal.id ? { ...x, validUntil: e.target.value || undefined } : x) })} />
-                <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, motivations: characterDraft.motivations.filter(x => x.id !== goal.id) })}>Remove</button>
-              </div>)}
-
-              <div className="wide character-section-title"><h3>Competencies</h3><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, competencies: [...characterDraft.competencies, { id: entryId("skill"), name: "", level: "", description: "", resources: [], limitations: [], costs: [], sourceRefs: [] }] })}>+ Add competency</button></div>
-              {characterDraft.competencies.map(skill => <div className="relationship-editor wide" key={skill.id}>
-                <input placeholder="Name" value={skill.name} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, name: e.target.value } : x) })} />
-                <input placeholder="Level" value={skill.level} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, level: e.target.value } : x) })} />
-                <textarea placeholder="Description" value={skill.description} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, description: e.target.value } : x) })} />
-                <input placeholder="Resources" value={skill.resources.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, resources: splitList(e.target.value) } : x) })} />
-                <input placeholder="Limits / costs" value={[...skill.limitations, ...skill.costs].join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.map(x => x.id === skill.id ? { ...x, limitations: splitList(e.target.value), costs: [] } : x) })} />
-                <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, competencies: characterDraft.competencies.filter(x => x.id !== skill.id) })}>Remove</button>
-              </div>)}
-
-              <label className="wide"><span>Related characters</span><div className="relation-picker">
-                {state.characters.filter(item => item.id !== characterDraft.id).map(item => (
-                  <button type="button" className={characterDraft.relationships.some(relation => relation.characterId === item.id) ? "selected" : ""} key={item.id} onClick={() => setCharacterDraft({
-                    ...characterDraft,
-                    relationships: characterDraft.relationships.some(relation => relation.characterId === item.id)
-                      ? characterDraft.relationships.filter(relation => relation.characterId !== item.id)
-                      : [...characterDraft.relationships, { id: entryId("rel"), characterId: item.id, type: "关联", description: "", attitude: "", status: "active", sourceRefs: [] }],
-                  })}>{item.identity.name}</button>
-                ))}
-              </div></label>
-              {characterDraft.relationships.map((relation) => {
-                const related = state?.characters.find(item => item.id === relation.characterId);
-                const updateRelation = (changes: Partial<typeof relation>) => setCharacterDraft({
-                  ...characterDraft,
-                  relationships: characterDraft.relationships.map(item => item.characterId === relation.characterId ? { ...item, ...changes } : item),
-                });
-                return <div className="relationship-editor wide" key={relation.characterId}>
-                  <strong>{related?.identity.name ?? `#${relation.characterId}`}</strong>
-                  <input placeholder="Relationship type" value={relation.type} onChange={(e) => updateRelation({ type: e.target.value })} />
-                  <input placeholder="Attitude" value={relation.attitude} onChange={(e) => updateRelation({ attitude: e.target.value })} />
-                  <select value={relation.status} onChange={(e) => updateRelation({ status: e.target.value as Relationship["status"] })}>{["active", "ended", "strained", "unknown"].map(x => <option key={x}>{x}</option>)}</select>
-                  <textarea placeholder="Relationship description" value={relation.description} onChange={(e) => updateRelation({ description: e.target.value })} />
-                </div>;
-              })}
-              <div className="wide character-section-title"><h3>Story states</h3><button type="button" onClick={() => setCharacterDraft({ ...characterDraft, storyStates: [...characterDraft.storyStates, { id: entryId("state"), unanchored: true, location: "", physical: "", emotion: "", knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [] }] })}>+ Add state</button></div>
-              {characterDraft.storyStates.map(story => <div className="relationship-editor wide" key={story.id}>
-                <input placeholder="Outline node ID" disabled={story.unanchored} value={story.outlineNodeId ?? ""} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, outlineNodeId: e.target.value || undefined } : x) })} />
-                <label><input type="checkbox" checked={Boolean(story.unanchored)} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, unanchored: e.target.checked || undefined, outlineNodeId: e.target.checked ? undefined : x.outlineNodeId } : x) })} /> Unanchored</label>
-                <input placeholder="Location" value={story.location} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, location: e.target.value } : x) })} />
-                <input placeholder="Physical state" value={story.physical} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, physical: e.target.value } : x) })} />
-                <input placeholder="Emotion" value={story.emotion} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, emotion: e.target.value } : x) })} />
-                <input placeholder="Current intentions" value={story.intentions.join(", ")} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, intentions: splitList(e.target.value) } : x) })} />
-                <textarea placeholder="Knowledge (one item per line)" value={story.knowledge.map(x => x.description).join("\n")} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, knowledge: e.target.value.split(/\n/).filter(Boolean).map((description, i) => ({ id: `${story.id}-knowledge-${i + 1}`, label: "", description, sourceRefs: [] })) } : x) })} />
-                <textarea placeholder="State notes" value={story.notes} onChange={(e) => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.map(x => x.id === story.id ? { ...x, notes: e.target.value } : x) })} />
-                <button type="button" className="danger" onClick={() => setCharacterDraft({ ...characterDraft, storyStates: characterDraft.storyStates.filter(x => x.id !== story.id) })}>Remove</button>
-              </div>)}
-              <label className="wide"><span>Notes</span><textarea value={characterDraft.notes} onChange={(e) => setCharacterDraft({ ...characterDraft, notes: e.target.value })} /></label>
-            </div>
-            <div className="modal-actions">
-              {characterDraft.id && <button className="danger" onClick={() => void deleteCharacter(characterDraft as Character)}>Delete</button>}
-              <button onClick={() => setCharacterDraft(null)}>Cancel</button>
-              <button className="primary" disabled={!characterDraft.identity.name.trim()} onClick={() => void saveCharacter()}>Save</button>
-            </div>
-          </section>
-        </div>
+        <CharacterEditor
+          draft={characterDraft}
+          characters={state?.characters ?? []}
+          busy={busy}
+          onChange={setCharacterDraft}
+          onClose={() => setCharacterDraft(null)}
+          onSave={() => void saveCharacter()}
+          onDelete={characterDraft.id ? () => void deleteCharacter(characterDraft as Character) : undefined}
+          onRoleplay={characterDraft.id ? () => {
+            beginRoleplaySetup(characterDraft.id!, characterDraft.identity.name);
+          } : undefined}
+        />
       )}
 
       {showModelConfig && <ModelConfig initialCatalog={state.providerCatalog} request={api} onClose={() => setShowModelConfig(false)} onChanged={() => { void refresh(state.sessionId); }} />}

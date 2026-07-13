@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, Proposal,
+  AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal,
   StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
@@ -147,6 +147,10 @@ export class WriterStore {
     const contextColumns = this.database.prepare("PRAGMA table_info(session_context)").all() as Row[];
     if (!contextColumns.some(column => column.name === "todos_json")) {
       this.database.exec("ALTER TABLE session_context ADD COLUMN todos_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    const messageColumns = this.database.prepare("PRAGMA table_info(messages)").all() as Row[];
+    if (!messageColumns.some(column => column.name === "channel")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'agent'");
     }
   }
 
@@ -510,19 +514,26 @@ export class WriterStore {
     return { deleted: unique, remainingSessionId };
   }
 
-  addMessage(sessionId: string, role: Message["role"], content: string): number {
+  addMessage(sessionId: string, role: Message["role"], content: string, channel: MessageChannel = "agent"): number {
     const now = new Date().toISOString();
-    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at) VALUES(?,?,?,?)")
-      .run(sessionId, role, content, now);
+    const normalized = channel === "roleplay" ? "roleplay" : "agent";
+    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel) VALUES(?,?,?,?,?)")
+      .run(sessionId, role, content, now, normalized);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
     return Number(result.lastInsertRowid);
   }
 
-  messages(sessionId: string, limit = 30): Message[] {
-    const rows = this.database.prepare(`
-      SELECT * FROM (SELECT id,session_id,role,content,created_at FROM messages
-      WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
-    `).all(sessionId, limit);
+  messages(sessionId: string, limit = 30, options?: { channel?: MessageChannel }): Message[] {
+    const channel = options?.channel;
+    const rows = channel
+      ? this.database.prepare(`
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+          WHERE session_id=? AND channel=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
+        `).all(sessionId, channel, limit)
+      : this.database.prepare(`
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+          WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
+        `).all(sessionId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
   }
 
@@ -563,6 +574,7 @@ export class WriterStore {
       role: row.role as Message["role"],
       content: row.content as string,
       createdAt: row.created_at as string,
+      channel: row.channel === "roleplay" ? "roleplay" : "agent",
     };
   }
 
@@ -730,7 +742,7 @@ export class WriterStore {
 
   addSystemMessage(sessionId: string, content: string): void {
     const now = new Date().toISOString();
-    this.database.prepare("INSERT INTO messages(session_id,role,content,created_at) VALUES(?,'system',?,?)")
+    this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel) VALUES(?,'system',?,?,'agent')")
       .run(sessionId, content, now);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
   }

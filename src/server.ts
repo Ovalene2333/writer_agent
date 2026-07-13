@@ -17,7 +17,7 @@ import {
   saveAgentSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
-import { runRoleplayChat } from "./roleplay.js";
+import { generateRoleplayInterlocutor, runRoleplayChat, type RoleplayInterlocutor } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -473,8 +473,25 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.post("/api/roleplay/interlocutor", async (context) => {
+    try {
+      const body = await context.req.json<{ characterId?: number; request?: string }>();
+      if (!Number.isInteger(body.characterId)) return context.json({ error: "角色扮演需要指定 characterId" }, 400);
+      const interlocutor = await generateRoleplayInterlocutor({
+        project: options.project,
+        store: options.store,
+        characterId: body.characterId!,
+        request: body.request ?? "",
+        model: options.providers.modelConfig("agent"),
+      });
+      return context.json(interlocutor);
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; characterId?: number; interlocutor?: RoleplayInterlocutor; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
@@ -521,6 +538,7 @@ export async function startWriterServer(options: {
             store: options.store,
             sessionId: body.sessionId,
             characterId: body.characterId!,
+            interlocutor: body.interlocutor,
             prompt: body.prompt,
             model: options.providers.modelConfig("agent"),
             signal,

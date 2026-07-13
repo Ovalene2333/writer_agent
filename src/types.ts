@@ -106,12 +106,17 @@ export interface StyleTemplate {
   exampleNotes: string;
 }
 
+/** 消息来源通道：写作 Agent 与角色扮演试演分流上下文。 */
+export type MessageChannel = "agent" | "roleplay";
+
 export interface Message {
   id: number;
   sessionId: string;
   role: "user" | "assistant" | "tool" | "system";
   content: string;
   createdAt: string;
+  /** agent=写作协作；roleplay=角色扮演试演。默认 agent。 */
+  channel: MessageChannel;
 }
 
 export interface CharacterSourceRef { type: "outline" | "document" | "manual"; ref: string; note?: string }
