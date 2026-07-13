@@ -979,6 +979,8 @@ function App() {
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [browsingVersion, setBrowsingVersion] = useState<DocumentVersionDetail | null>(null);
   const [versionBusy, setVersionBusy] = useState(false);
+  /** Experimental: roleplay voice-test against a character card. */
+  const [roleplay, setRoleplay] = useState<{ characterId: number; name: string } | null>(null);
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
@@ -1448,6 +1450,9 @@ function App() {
           sessionId: state.sessionId,
           prompt: text,
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
+          ...(roleplay
+            ? { mode: "roleplay", characterId: roleplay.characterId }
+            : {}),
         }),
       });
       await subscribeAgentJob(result.jobId, state.sessionId, true);
@@ -2196,7 +2201,7 @@ function App() {
                   type="button"
                   className={`permission-mode-btn${active ? " active" : ""}`}
                   title={mode.hint}
-                  disabled={busy}
+                  disabled={busy || Boolean(roleplay)}
                   onClick={() => void setPermissionMode(mode.id)}
                 >
                   {mode.label}
@@ -2210,6 +2215,18 @@ function App() {
             </span>
           )}
         </div>
+        {roleplay && (
+          <div className="roleplay-banner" role="status">
+            <div>
+              <strong>角色扮演试演</strong>
+              <span>正在以「{roleplay.name}」第一人称对话（测试性 · 不改文档）</span>
+            </div>
+            <button type="button" disabled={busy} onClick={() => {
+              setRoleplay(null);
+              setNotice(`已退出角色扮演（${roleplay.name}）`);
+            }}>退出扮演</button>
+          </div>
+        )}
         {(state.todos?.length ?? 0) > 0 && (
           <div className="agent-todos" aria-label="Agent task list">
             <div className="agent-todos-head">
@@ -2317,11 +2334,13 @@ function App() {
                   stop();
                 }
               }}
-              placeholder="Describe your writing task… (Ctrl+Enter to send)"
+              placeholder={roleplay
+                ? `对「${roleplay.name}」说话…（Ctrl+Enter 发送 · 测试性扮演）`
+                : "Describe your writing task… (Ctrl+Enter to send)"}
               disabled={busy}
             />
             <div className="composer-actions">
-              <span className="composer-hint">{busy ? "Esc to stop" : "Ctrl+Enter"}</span>
+              <span className="composer-hint">{busy ? "Esc to stop" : roleplay ? "RP · Ctrl+Enter" : "Ctrl+Enter"}</span>
               <button
                 className={`composer-send ${busy ? "stop" : "primary"}`}
                 onClick={busy ? stop : () => void sendChat()}
@@ -2582,14 +2601,32 @@ function App() {
             {managementView === "characters" ? (
               <div className="character-grid">
                 {state.characters.map((character) => (
-                  <button className="character-card" key={character.id} onClick={() => setCharacterDraft({ ...character })}>
-                    <span className="character-avatar">{character.identity.name.slice(0, 1)}</span>
-                    <span className="character-card-body">
-                      <strong>{character.identity.name}</strong>
-                      <small>{[character.identity.narrativeRole, character.identity.summary].filter(Boolean).join(" · ") || "Role not set"}</small>
-                      <span>{character.psychology.summary || character.profile.backgroundSummary || "No description yet"}</span>
-                    </span>
-                  </button>
+                  <div className="character-card-wrap" key={character.id}>
+                    <button className="character-card" onClick={() => setCharacterDraft({ ...character })}>
+                      <span className="character-avatar">{character.identity.name.slice(0, 1)}</span>
+                      <span className="character-card-body">
+                        <strong>{character.identity.name}</strong>
+                        <small>{[character.identity.narrativeRole, character.identity.summary].filter(Boolean).join(" · ") || "Role not set"}</small>
+                        <span>{character.psychology.summary || character.profile.backgroundSummary || "No description yet"}</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="character-roleplay-btn"
+                      title="测试性：以该角色第一人称对话试演人设"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRoleplay({ characterId: character.id, name: character.identity.name });
+                        setManagementView(null);
+                        setMobileTab("agent");
+                        setNotice(`【测试】已进入角色扮演：${character.identity.name}。直接对话试演人设；点「退出扮演」结束。`);
+                        requestAnimationFrame(() => composerRef.current?.focus());
+                      }}
+                    >
+                      试演
+                    </button>
+                  </div>
                 ))}
                 {state.characters.length === 0 && <div className="management-empty">No character cards yet.</div>}
               </div>

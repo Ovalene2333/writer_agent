@@ -22,6 +22,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "context", usage: "/context", description: "显示当前上下文组成", category: "上下文" },
   { name: "usage", usage: "/usage", description: "显示会话 Token 用量与费用", category: "上下文" },
   { name: "character", usage: "/character <create|list|show|delete>", description: "创建和管理目录中的角色卡", category: "创作" },
+  { name: "roleplay", usage: "/roleplay <角色|off>", description: "【测试】进入/退出角色扮演试演（纯对话，不改文档）", category: "创作", aliases: ["rp", "扮演"] },
   { name: "style", usage: "/style [list|set <id>|off]", description: "列出或切换写作风格模板", category: "创作" },
   { name: "docs", usage: "/docs [关键词]", description: "索引作品中的全部文档", category: "上下文" },
   { name: "read", usage: "/read <文档路径>", description: "直接读取一份作品文档", category: "上下文" },

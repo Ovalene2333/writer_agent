@@ -15,6 +15,7 @@ import { parseCharacterCommand, parseCommand, parseStyleCommand, referencedDocum
 import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
+import { runRoleplayChat, type RoleplayTarget } from "./roleplay.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate, listStyleTemplates } from "./templates.js";
 import {
@@ -72,6 +73,7 @@ export function WriterAgentTui(props: {
   const [overlay, setOverlay] = useState<Overlay | null>(null);
   const [steps, setSteps] = useState<UiStep[]>([]);
   const [modelTick, setModelTick] = useState(0);
+  const [roleplay, setRoleplay] = useState<RoleplayTarget | null>(null);
   const [history, setHistory] = useState(() => props.store.messages(props.sessionId, 100).filter(item => item.role === "user").map(item => item.content));
   const [historyIndex, setHistoryIndex] = useState(-1);
   const abortRef = useRef<AbortController | undefined>(undefined);
@@ -83,6 +85,7 @@ export function WriterAgentTui(props: {
     `模式：${permissionModeLabel(permissionMode)} · 输入 / 查看命令，@ 引用文档。`,
     instructions ? `已加载项目指令：${instructions.path}` : "未找到 WRITER.md / AGENTS.md（可选）",
     "模型：/models 选择 · /connect 添加供应商 · /roles 分工 · /thinking 思考过程",
+    "测试：/roleplay <角色> 进入角色扮演试演 · /roleplay off 退出",
   ]);
 
   const pendingProposals = useMemo(() => props.store.proposals("pending"), [output, props.store]);
@@ -313,7 +316,7 @@ export function WriterAgentTui(props: {
       else if (name === "stop") busy ? cancel() : append("当前没有正在执行的作业");
       else if (name === "new") {
         const id = props.store.createSession(args || "新会话");
-        setSessionId(id); setHistory([]); setTodos([]); setSteps([]); setOutput([`已创建会话：${id.slice(0, 8)}`]);
+        setSessionId(id); setHistory([]); setTodos([]); setSteps([]); setRoleplay(null); setOutput([`已创建会话：${id.slice(0, 8)}`]);
       } else if (name === "sessions") {
         append(props.store.listSessions().map(item => `${item.id.slice(0, 8)}  ${item.updatedAt.slice(0, 16).replace("T", " ")}  ${item.title}`).join("\n") || "没有历史会话");
       } else if (name === "resume") {
@@ -322,6 +325,7 @@ export function WriterAgentTui(props: {
         setSessionId(matches[0].id);
         setTodos(props.store.sessionTodos(matches[0].id));
         setSteps([]);
+        setRoleplay(null);
         const messages = props.store.messages(matches[0].id, 30);
         setHistory(messages.filter(item => item.role === "user").map(item => item.content));
         setOutput(messages.map(item => `${item.role === "user" ? "你" : "AI"}：${item.content}`).slice(-OUTPUT_LIMIT));
@@ -329,7 +333,22 @@ export function WriterAgentTui(props: {
         const todoSummary = todos.length
           ? `${todos.filter(t => t.status === "completed").length}/${todos.length} 完成`
           : "无";
-        append(`项目：${props.project.config().title}\n会话：${sessionId}\n模式：${permissionModeLabel(permissionMode)}\n模型：${publicConfig.provider}/${publicConfig.model}\n文档：${props.project.listDocuments().length}\n待审批：${pendingProposals.length}\n任务：${todoSummary}\n指令：${instructions?.path ?? "无"}`);
+        const roleplayLine = roleplay ? `扮演：${roleplay.name}（#${roleplay.characterId}）` : "扮演：关闭";
+        append(`项目：${props.project.config().title}\n会话：${sessionId}\n模式：${permissionModeLabel(permissionMode)}\n${roleplayLine}\n模型：${publicConfig.provider}/${publicConfig.model}\n文档：${props.project.listDocuments().length}\n待审批：${pendingProposals.length}\n任务：${todoSummary}\n指令：${instructions?.path ?? "无"}`);
+      } else if (name === "roleplay") {
+        const query = args.trim();
+        if (!query || /^(off|exit|quit|end|退出|结束|关闭)$/i.test(query)) {
+          if (!roleplay) append("当前未在角色扮演中。用法：/roleplay <角色名或ID>");
+          else {
+            setRoleplay(null);
+            append(`已退出角色扮演（${roleplay.name}）。`);
+          }
+        } else {
+          const item = props.store.findCharacter(query);
+          if (!item) throw new Error(`找不到角色卡：${query}。可用 /character list 查看`);
+          setRoleplay({ characterId: item.id, name: item.identity.name });
+          append(`【测试】已进入角色扮演：${item.identity.name}（#${item.id}）\n直接说话即可试演人设；/roleplay off 退出。纯对话，不会改文档。`);
+        }
       } else if (name === "mode") {
         if (!args) {
           append(`当前模式：${permissionModeLabel(permissionMode)}\n可选：ask（审批）· auto（自动写入）· plan（只读规划）`);
@@ -487,7 +506,7 @@ export function WriterAgentTui(props: {
     } catch (error) { appendError(error); }
   }, [
     busy, cancel, exit, append, appendError, acceptProposal, rejectProposal, pendingProposals, usage, props,
-    sessionId, showDetails, showThinking, permissionMode, todos, instructions, publicConfig, openModels, selectModel, assignRoleModel, refreshModels,
+    sessionId, showDetails, showThinking, permissionMode, roleplay, todos, instructions, publicConfig, openModels, selectModel, assignRoleModel, refreshModels,
   ]);
 
   const handleOverlaySubmit = useCallback((raw: string) => {
@@ -670,34 +689,47 @@ export function WriterAgentTui(props: {
     setBusy(true); append(`你：${text}`);
     const controller = new AbortController(); abortRef.current = controller;
     try {
-      await runAgent({
-        project: props.project,
-        store: props.store,
-        sessionId,
-        prompt: text,
-        maxTurns: 20,
-        permissionMode,
-        models: {
-          agent: props.providers.modelConfig("agent"),
-          writer: props.providers.modelConfig("writer"),
-          inline: props.providers.modelConfig("inline"),
-          reviewer: props.providers.modelConfig("reviewer"),
-          summarizer: props.providers.summaryModelConfig(),
-        },
-        signal: controller.signal,
-        onEvent: handleEvent,
-      });
+      if (roleplay) {
+        await runRoleplayChat({
+          project: props.project,
+          store: props.store,
+          sessionId,
+          characterId: roleplay.characterId,
+          prompt: text,
+          model: props.providers.modelConfig("agent"),
+          signal: controller.signal,
+          onEvent: handleEvent,
+        });
+      } else {
+        await runAgent({
+          project: props.project,
+          store: props.store,
+          sessionId,
+          prompt: text,
+          maxTurns: 20,
+          permissionMode,
+          models: {
+            agent: props.providers.modelConfig("agent"),
+            writer: props.providers.modelConfig("writer"),
+            inline: props.providers.modelConfig("inline"),
+            reviewer: props.providers.modelConfig("reviewer"),
+            summarizer: props.providers.summaryModelConfig(),
+          },
+          signal: controller.signal,
+          onEvent: handleEvent,
+        });
+      }
     } catch (error) { appendError(error); }
     finally {
       abortRef.current = undefined;
       setBusy(false);
       // Force usage refresh in header
       setOutput(lines => [...lines]);
-      if (permissionMode === "ask") enterReview();
+      if (!roleplay && permissionMode === "ask") enterReview();
     }
   }, [
     overlay, handleOverlaySubmit, busy, reviewIndex, pendingProposals, sessionId, props, append, appendError,
-    handleEvent, executeCommand, enterReview, permissionMode,
+    handleEvent, executeCommand, enterReview, permissionMode, roleplay,
   ]);
 
   const reviewing = reviewIndex !== null && pendingProposals.length > 0;
@@ -717,6 +749,7 @@ export function WriterAgentTui(props: {
     if (overlay?.kind === "connect-url") return "Base URL：";
     if (overlay?.kind === "connect-key") return "API Key：";
     if (overlay?.kind === "connect-model") return "模型名（逗号分隔）：";
+    if (roleplay) return `[RP ${roleplay.name}] `;
     return "> ";
   })();
 
@@ -728,10 +761,12 @@ export function WriterAgentTui(props: {
         {" · "}{usage.totalTokens.toLocaleString()} Token · {usage.currency === "CNY" ? "¥" : "$"}{usage.cost.toFixed(4)}
         {" · "}待审批 {pendingProposals.length}{todoHint}{stepHint}
         {reviewing ? ` · 审查中 ${reviewIndex! + 1}/${pendingProposals.length}` : ""}
+        {roleplay ? ` · RP ${roleplay.name}` : ""}
       </Text>
       <Text dimColor>
         details {showDetails ? "on" : "off"} · thinking {showThinking ? "on" : "off"}
         {publicConfig.apiKeyConfigured ? "" : " · ⚠ 未配置 API Key（/connect）"}
+        {roleplay ? " · 角色扮演试演中（/roleplay off 退出）" : ""}
       </Text>
     </Box>
 

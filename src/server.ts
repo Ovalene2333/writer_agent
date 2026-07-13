@@ -17,6 +17,7 @@ import {
   saveAgentSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
+import { runRoleplayChat } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -473,7 +474,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character"; permissionMode?: string; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; characterId?: number; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
@@ -481,15 +482,16 @@ export async function startWriterServer(options: {
     const permissionMode = body.permissionMode && isPermissionMode(body.permissionMode)
       ? body.permissionMode
       : loadAgentSettings(options.project).permissionMode;
+    const jobLabel = body.mode === "character" ? "character" : body.mode === "roleplay" ? "roleplay" : "agent";
     const job = agentJobs.start(body.sessionId, async (signal, emit) => {
       const stepDebug = createAgentStepDebugLogger({
         sessionId: body.sessionId,
         jobId: job.id,
-        label: body.mode === "character" ? "character" : "agent",
+        label: jobLabel,
       });
       if (stepDebugEnabled()) {
         process.stderr.write(
-          `\n[WRITER STEP] ▸ job start session=${body.sessionId.slice(0, 8)} job=${job.id.slice(0, 8)}\n` +
+          `\n[WRITER STEP] ▸ job start session=${body.sessionId.slice(0, 8)} job=${job.id.slice(0, 8)} mode=${jobLabel}\n` +
           `[WRITER STEP] prompt: ${body.prompt.trim().slice(0, 500)}${body.prompt.trim().length > 500 ? "…" : ""}\n`,
         );
       }
@@ -511,6 +513,18 @@ export async function startWriterServer(options: {
             characterId: Number.isInteger(body.characterId) ? body.characterId : undefined,
             allowedDocumentPaths: characterContextDocumentPaths(options.project, body.contextDocumentPaths),
             signal, onEvent,
+          });
+        } else if (body.mode === "roleplay") {
+          if (!Number.isInteger(body.characterId)) throw new Error("角色扮演需要指定 characterId");
+          await runRoleplayChat({
+            project: options.project,
+            store: options.store,
+            sessionId: body.sessionId,
+            characterId: body.characterId!,
+            prompt: body.prompt,
+            model: options.providers.modelConfig("agent"),
+            signal,
+            onEvent,
           });
         } else {
           await runAgent({
