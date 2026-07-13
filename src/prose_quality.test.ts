@@ -155,3 +155,32 @@ test("typical chapter snippet with mixed dashes does not block", () => {
   assert.equal(contrastStyleError(chapter), undefined);
   assert.equal(proseStyleIssuesError(newProseStyleIssues("", chapter)), undefined);
 });
+
+test("classifies adjacent explanatory labels as semantic echo candidates", () => {
+  const text = "她把门链挂上，隔着门问他还有什么事。这说明她根本不想让他进来。";
+  const issues = analyzeProseStyle(text).filter(issue => issue.kind === "explanation");
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].subtype, "semantic_echo");
+  assert.equal(issues[0].severity, "warning");
+  assert.equal(proseStyleIssuesError(issues), undefined);
+});
+
+test("recognizes explanation categories without treating them as immediate hard failures", () => {
+  const samples = [
+    ["真正重要的是他终于做出了选择。", "narrator_redefinition"],
+    ["直到此刻他才明白，回去已经太晚。", "thematic_summary"],
+    ["他真正想说的是，他不会再回来。", "intent_translation"],
+    ["他显然感到恐惧。", "emotion_label"],
+    ["原因在于门锁昨夜已经换过。", "causal_gloss"],
+  ] as const;
+  for (const [text, subtype] of samples) {
+    const issue = analyzeProseStyle(text).find(item => item.kind === "explanation");
+    assert.equal(issue?.subtype, subtype, text);
+    assert.notEqual(issue?.severity, "error", text);
+  }
+});
+
+test("does not scan dialogue explanation as narrator voice", () => {
+  const issues = analyzeProseStyle("「这说明你根本没看信。」她说。");
+  assert.equal(issues.some(issue => issue.kind === "explanation"), false);
+});

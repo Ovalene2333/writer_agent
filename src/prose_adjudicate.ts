@@ -27,15 +27,34 @@ export type ProseAdjudicationVerdict = {
   reason?: string;
 };
 
+export type ProseDiscoveryPassage = {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  reason: string;
+};
+
+export type ProseAdjudicationDiscovery = {
+  passageId: string;
+  sentence: string;
+  subtype: "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss" | "narrator_redefinition";
+  verdict: "warn" | "block";
+  reason?: string;
+};
+
 export type ProseAdjudicationResult = {
   issues: ProseStyleIssue[];
   adjudicated: number;
   skipped?: string;
   verdicts?: ProseAdjudicationVerdict[];
+  discoveries?: ProseAdjudicationDiscovery[];
 };
 
 const MAX_ITEMS = 15;
+const MAX_DISCOVERY_PASSAGES = 8;
 const DEFAULT_TIMEOUT_MS = 12_000;
+const DISCOVERY_SIGNAL = /(?:这(?:说明|意味着|表明)|显然|无疑|根本|其实|当然|换句话说|也就是说|说到底|归根结底|真正(?:重要|关键|可怕)的|感到|意识到|明白|害怕|恐惧|愤怒|悲伤|绝望|在乎|信任|拒绝|意味着|标志着|是因为)/gu;
 
 /**
  * Pick grey-zone / hard-mannerism candidates for Flash second pass.
@@ -86,6 +105,35 @@ export function packProseSnippets(text: string, issues: ProseStyleIssue[]): Pros
 }
 
 /**
+ * Select paragraph/line windows for open-ended discovery, including passages that
+ * were not matched by a deterministic rule. This is audit context, not a verdict.
+ */
+export function selectDiscoveryPassages(text: string): ProseDiscoveryPassage[] {
+  const lines = lineRanges(text).filter(item => item.text.trim() && !/^\s*(?:#{1,6}\s|[-*+]\s|\|)/u.test(item.text));
+  const ranked = lines.flatMap((line, index) => {
+    const matches = line.text.match(DISCOVERY_SIGNAL)?.length ?? 0;
+    const sentences = line.text.split(/[。！？!?]+/u).filter(part => part.trim()).length;
+    const previous = lines[index - 1];
+    const canIncludePrevious = previous && line.start - previous.end <= 2 && previous.text.length + line.text.length <= 500;
+    const score = matches + (matches > 0 && (sentences >= 2 || canIncludePrevious) ? 1 : 0);
+    if (score < 2) return [];
+    const start = canIncludePrevious ? previous.start : line.start;
+    return [{
+      id: `passage:${line.start}`,
+      start,
+      end: line.end,
+      text: text.slice(start, line.end).trim().slice(0, 500),
+      reason: `解释/评价信号 ${matches} 处，句子 ${sentences} 个`,
+      score,
+    }];
+  });
+  return ranked
+    .sort((a, b) => b.score - a.score || a.start - b.start)
+    .slice(0, MAX_DISCOVERY_PASSAGES)
+    .map(({ score: _score, ...passage }) => passage);
+}
+
+/**
  * Apply Flash verdicts then re-escalate density.
  * allow → info; warn → warning (cap conf); block → warning conf 0.95 (hard subtypes eligible for error).
  */
@@ -129,22 +177,34 @@ export async function adjudicateProseStyleForAudit(
   text: string,
   issues: ProseStyleIssue[],
   model: ModelConfig | undefined,
-  options?: { signal?: AbortSignal; timeoutMs?: number },
+  options?: { signal?: AbortSignal; timeoutMs?: number; discover?: boolean },
 ): Promise<ProseAdjudicationResult> {
   if (!model) return { issues, adjudicated: 0, skipped: "no_model" };
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     return { issues, adjudicated: 0, skipped: "no_model" };
   }
   const candidates = selectAdjudicationCandidates(issues);
-  if (!candidates.length) return { issues, adjudicated: 0, skipped: "no_candidates" };
+  const passages = options?.discover === false ? [] : selectDiscoveryPassages(text);
+  if (!candidates.length && !passages.length) return { issues, adjudicated: 0, skipped: "no_candidates" };
   const packed = packProseSnippets(text, candidates);
   try {
-    const verdicts = await requestProseVerdicts(model, packed, options?.signal, options?.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    if (!verdicts.length) return { issues, adjudicated: 0, skipped: "empty_verdicts" };
+    const decision = await requestProseAdjudication(
+      model,
+      packed,
+      passages,
+      options?.signal,
+      options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    );
+    if (!decision.verdicts.length && !decision.discoveries.length) {
+      return { issues, adjudicated: 0, skipped: "empty_verdicts" };
+    }
+    const next = applyProseVerdicts(text, issues, decision.verdicts);
+    next.push(...materializeProseDiscoveries(text, next, passages, decision.discoveries));
     return {
-      issues: applyProseVerdicts(text, issues, verdicts),
-      adjudicated: verdicts.length,
-      verdicts,
+      issues: escalateHardMannerisms(text, next).sort((a, b) => a.start - b.start),
+      adjudicated: decision.verdicts.length + decision.discoveries.length,
+      verdicts: decision.verdicts,
+      discoveries: decision.discoveries,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -163,7 +223,10 @@ export async function adjudicateProseStyleForProposal(
   if (!shouldAdjudicateForProposal(text, issues)) {
     return { issues, adjudicated: 0, skipped: "below_threshold" };
   }
-  return adjudicateProseStyleForAudit(text, issues, model, options);
+  // Proposal issues have already been diffed against the old document. Open-ended
+  // discovery over the whole `after` text could re-introduce old issues and violate
+  // the new-only gate, so active discovery remains an audit-only capability.
+  return adjudicateProseStyleForAudit(text, issues, model, { ...options, discover: false });
 }
 
 function severityRank(severity: ProseStyleIssue["severity"]): number {
@@ -182,29 +245,93 @@ function neighborContext(text: string, start: number, end: number): { before: st
   return { before, after };
 }
 
-async function requestProseVerdicts(
+export function materializeProseDiscoveries(
+  text: string,
+  existing: ProseStyleIssue[],
+  passages: ProseDiscoveryPassage[],
+  discoveries: ProseAdjudicationDiscovery[],
+): ProseStyleIssue[] {
+  const passageMap = new Map(passages.map(item => [item.id, item]));
+  const fingerprints = new Set(existing.map(item => normalizeSentence(item.sentence)));
+  const created: ProseStyleIssue[] = [];
+  for (const discovery of discoveries) {
+    const passage = passageMap.get(discovery.passageId);
+    if (!passage) continue;
+    const start = text.indexOf(discovery.sentence, passage.start);
+    if (start < passage.start || start + discovery.sentence.length > passage.end) continue;
+    const fingerprint = normalizeSentence(discovery.sentence);
+    if (fingerprints.has(fingerprint)) continue;
+    fingerprints.add(fingerprint);
+    const prefix = text.slice(0, start);
+    const lastLine = prefix.lastIndexOf("\n");
+    const sentence = discovery.sentence.trim();
+    created.push({
+      id: `explanation:${discovery.subtype}:${start}`,
+      kind: "explanation",
+      subtype: discovery.subtype,
+      severity: "warning",
+      confidence: discovery.verdict === "block" ? 0.95 : 0.84,
+      start,
+      end: start + discovery.sentence.length,
+      line: prefix.split("\n").length,
+      column: start - lastLine,
+      sentence,
+      evidence: sentence.length <= 90 ? sentence : `${sentence.slice(0, 87)}…`,
+      reason: `Flash 主动发现：${discovery.reason?.trim() || "可能重复解释前文已经呈现的信息"}`,
+      suggestions: ["若没有增加新事实，删除该解释句", "若含必要信息，只保留新增事实或后果"],
+    });
+  }
+  return created;
+}
+
+function normalizeSentence(value: string): string {
+  return value.replace(/\s+/gu, "").slice(0, 160);
+}
+
+function lineRanges(text: string): Array<{ start: number; end: number; text: string }> {
+  const ranges: Array<{ start: number; end: number; text: string }> = [];
+  let start = 0;
+  for (const line of text.split("\n")) {
+    const end = start + line.length;
+    ranges.push({ start, end, text: line });
+    start = end + 1;
+  }
+  return ranges;
+}
+
+async function requestProseAdjudication(
   model: ModelConfig,
   items: ProseAdjudicationItem[],
+  passages: ProseDiscoveryPassage[],
   outerSignal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-): Promise<ProseAdjudicationVerdict[]> {
-  const system = `你是中文小说句式二审器。只根据规则初筛片段判定是否为有害「说明体」，不要改写全文。
-对每条给出 verdict：
+): Promise<{ verdicts: ProseAdjudicationVerdict[]; discoveries: ProseAdjudicationDiscovery[] }> {
+  const system = `你是中文小说解释腔二审器。既要复核规则候选，也要在高风险段落中主动发现规则漏掉的解释回声，不要改写全文。
+对 candidates 中每条给出 verdict：
 - allow：应放行（对白拖音/中断、停顿—揭示、短同位、列举、表格/元数据、口语纠正、客观事实排除等）
 - warn：略模板化但不必拦截
-- block：说明性破折号（画面——解释/——因为）、抽象「不是A而是B」重定义等，建议局部改写
-只输出 JSON 数组，元素形如 {"id":"...","verdict":"allow|warn|block","reason":"不超过40字"}。不要 Markdown 围栏。`;
+- block：明确的重复解释，建议局部改写
+对 passages 主动检查：若后一完整句没有增加新事实，只给前文动作/对白贴情绪、意图、因果或主题标签，写入 discoveries。必要概述、转场、新因果事实、人物特色评论应放行。sentence 必须逐字复制段落中的一个完整句子；不要把整段当 sentence。
+只输出 JSON 对象：{"verdicts":[{"id":"...","verdict":"allow|warn|block","reason":"不超过40字"}],"discoveries":[{"passageId":"...","sentence":"逐字原句","subtype":"semantic_echo|emotion_label|intent_translation|thematic_summary|causal_gloss|narrator_redefinition","verdict":"warn|block","reason":"不超过40字"}]}。不要 Markdown 围栏。`;
 
-  const user = `请判定以下 ${items.length} 条候选：\n${JSON.stringify(items, null, 0)}`;
+  const user = JSON.stringify({ candidates: items, passages }, null, 0);
   const content = await completeJsonChat(model, [
     { role: "system", content: system },
     { role: "user", content: user },
   ], outerSignal, timeoutMs);
 
-  return parseVerdicts(content, new Set(items.map(item => item.id)));
+  return parseProseAdjudication(
+    content,
+    new Set(items.map(item => item.id)),
+    new Map(passages.map(item => [item.id, item])),
+  );
 }
 
-function parseVerdicts(raw: string, allowedIds: Set<string>): ProseAdjudicationVerdict[] {
+export function parseProseAdjudication(
+  raw: string,
+  allowedIds: Set<string>,
+  passages: Map<string, ProseDiscoveryPassage>,
+): { verdicts: ProseAdjudicationVerdict[]; discoveries: ProseAdjudicationDiscovery[] } {
   const text = raw.trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
@@ -214,16 +341,20 @@ function parseVerdicts(raw: string, allowedIds: Set<string>): ProseAdjudicationV
     parsed = JSON.parse(text);
   } catch {
     const match = text.match(/\[[\s\S]*\]/);
-    if (!match) return [];
+    if (!match) return { verdicts: [], discoveries: [] };
     try {
       parsed = JSON.parse(match[0]);
     } catch {
-      return [];
+      return { verdicts: [], discoveries: [] };
     }
   }
-  if (!Array.isArray(parsed)) return [];
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).verdicts)
+      ? (parsed as Record<string, unknown>).verdicts as unknown[]
+      : [];
   const out: ProseAdjudicationVerdict[] = [];
-  for (const row of parsed) {
+  for (const row of rows) {
     if (!row || typeof row !== "object") continue;
     const item = row as Record<string, unknown>;
     const id = typeof item.id === "string" ? item.id : "";
@@ -241,7 +372,27 @@ function parseVerdicts(raw: string, allowedIds: Set<string>): ProseAdjudicationV
     const reason = typeof item.reason === "string" ? item.reason.trim().slice(0, 80) : undefined;
     out.push({ id, verdict, ...(reason ? { reason } : {}) });
   }
-  return out;
+  const discoveryRows = !Array.isArray(parsed) && parsed && typeof parsed === "object"
+    && Array.isArray((parsed as Record<string, unknown>).discoveries)
+    ? (parsed as Record<string, unknown>).discoveries as unknown[]
+    : [];
+  const discoveries: ProseAdjudicationDiscovery[] = [];
+  const allowedSubtypes = new Set<ProseAdjudicationDiscovery["subtype"]>([
+    "semantic_echo", "emotion_label", "intent_translation", "thematic_summary", "causal_gloss", "narrator_redefinition",
+  ]);
+  for (const row of discoveryRows) {
+    if (!row || typeof row !== "object") continue;
+    const item = row as Record<string, unknown>;
+    const passageId = typeof item.passageId === "string" ? item.passageId : "";
+    const passage = passages.get(passageId);
+    const sentence = typeof item.sentence === "string" ? item.sentence.trim() : "";
+    const subtype = typeof item.subtype === "string" ? item.subtype as ProseAdjudicationDiscovery["subtype"] : undefined;
+    const verdict = item.verdict === "block" ? "block" : item.verdict === "warn" ? "warn" : undefined;
+    if (!passage || !sentence || !passage.text.includes(sentence) || !subtype || !allowedSubtypes.has(subtype) || !verdict) continue;
+    const reason = typeof item.reason === "string" ? item.reason.trim().slice(0, 80) : undefined;
+    discoveries.push({ passageId, sentence, subtype, verdict, ...(reason ? { reason } : {}) });
+  }
+  return { verdicts: out, discoveries };
 }
 
 async function completeJsonChat(

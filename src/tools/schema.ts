@@ -99,7 +99,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "audit_prose_style",
-      description: "对指定正文做风格审计：规则先扫说明性破折号/不是…而是，再对灰区片段用 Flash 二审。info/warning 不拦截提案；仅过密的高置信说明体（error）会拦截。对白拖音、列举、表格、停顿—揭示默认允许，不要为消符号而全文改写",
+      description: "对指定正文做风格审计：规则先扫说明性破折号、否定重定义、情绪/意图翻译、因果补注和主题总结，再由 Flash 复核候选并主动检查高风险段落中的解释回声。info/warning 不拦截提案；仅过密的高置信说明体（error）会拦截。对白拖音、列举、表格、停顿—揭示默认允许，不要为消符号而全文改写",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "项目内正文 Markdown 路径" } },

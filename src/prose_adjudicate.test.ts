@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   applyProseVerdicts,
+  materializeProseDiscoveries,
+  parseProseAdjudication,
   packProseSnippets,
   selectAdjudicationCandidates,
+  selectDiscoveryPassages,
   shouldAdjudicateForProposal,
 } from "./prose_adjudicate.js";
 import { analyzeProseStyle, proseStyleIssuesError } from "./prose_quality.js";
@@ -59,4 +62,57 @@ test("shouldAdjudicateForProposal when dense hard mannerisms exist", () => {
   ].join("");
   const denseIssues = analyzeProseStyle(dense);
   assert.equal(shouldAdjudicateForProposal(dense, denseIssues), true);
+});
+
+test("selectDiscoveryPassages finds unruled explanatory paragraph windows", () => {
+  const text = "她把门链挂上，隔着门问他还有什么事。她根本不想让他进来。\n\n街灯亮了。";
+  assert.equal(analyzeProseStyle(text).some(issue => issue.kind === "explanation"), false);
+  const passages = selectDiscoveryPassages(text);
+  assert.equal(passages.length, 1);
+  assert.ok(passages[0].text.includes("根本不想"));
+});
+
+test("materializeProseDiscoveries anchors exact sentences and deduplicates", () => {
+  const text = "她把门链挂上。她根本不想让他进来。";
+  const passages = selectDiscoveryPassages(text);
+  const discoveries = [{
+    passageId: passages[0].id,
+    sentence: "她根本不想让他进来。",
+    subtype: "semantic_echo" as const,
+    verdict: "block" as const,
+    reason: "重复翻译门链动作",
+  }];
+  const created = materializeProseDiscoveries(text, [], passages, discoveries);
+  assert.equal(created.length, 1);
+  assert.equal(created[0].kind, "explanation");
+  assert.equal(created[0].confidence, 0.95);
+  assert.equal(materializeProseDiscoveries(text, created, passages, discoveries).length, 0);
+});
+
+test("parseProseAdjudication accepts verdict and active discovery object", () => {
+  const passage = {
+    id: "passage:0", start: 0, end: 20,
+    text: "她挂上门链。她根本不想让他进来。", reason: "test",
+  };
+  const parsed = parseProseAdjudication(JSON.stringify({
+    verdicts: [{ id: "contrast:0", verdict: "allow", reason: "事实纠正" }],
+    discoveries: [{
+      passageId: passage.id,
+      sentence: "她根本不想让他进来。",
+      subtype: "semantic_echo",
+      verdict: "block",
+      reason: "重复解释动作",
+    }],
+  }), new Set(["contrast:0"]), new Map([[passage.id, passage]]));
+  assert.equal(parsed.verdicts.length, 1);
+  assert.equal(parsed.discoveries.length, 1);
+  assert.equal(parsed.discoveries[0].subtype, "semantic_echo");
+});
+
+test("selectDiscoveryPassages combines a following explanation line with its evidence", () => {
+  const text = "她挂上门链。\n她显然不想让他进来。";
+  const passages = selectDiscoveryPassages(text);
+  assert.equal(passages.length, 1);
+  assert.ok(passages[0].text.includes("挂上门链"));
+  assert.ok(passages[0].text.includes("显然不想"));
 });

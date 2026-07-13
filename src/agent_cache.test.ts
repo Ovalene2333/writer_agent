@@ -16,7 +16,7 @@ import { WriterStore } from "./store.js";
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
-  assert.equal(agentToolSchemaHash(), "a5b68a0876a6f2d8");
+  assert.equal(agentToolSchemaHash(), "52ba93c0d6ed2e67");
 });
 
 type Msg = {

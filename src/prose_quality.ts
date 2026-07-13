@@ -3,11 +3,12 @@ export type ProseStyleSubtype =
   | "speech_extension" | "speech_interruption" | "speech_hesitation"
   | "system_or_metadata" | "parenthetical_explanation" | "appositive_definition"
   | "cause_or_judgment" | "ambiguous_dash"
-  | "narrator_redefinition" | "abstract_reframing" | "dialogue_correction" | "factual_exclusion";
+  | "narrator_redefinition" | "abstract_reframing" | "dialogue_correction" | "factual_exclusion"
+  | "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss";
 
 export interface ProseStyleIssue {
   id: string;
-  kind: "dash" | "contrast";
+  kind: "dash" | "contrast" | "explanation";
   subtype: ProseStyleSubtype;
   severity: ProseStyleSeverity;
   confidence: number;
@@ -45,6 +46,12 @@ const CONTRAST_PATTERNS = [
 const EXPLANATION_SIGNALS = /^(?:因为|由于|意味着|也就是|换句话说|其实|显然|说明|证明|正是|即|不过是)/u;
 const ABSTRACT_WORDS = /(?:情绪|愤怒|恐惧|悲伤|沉默|妥协|失败|成功|反抗|勇气|希望|绝望|灵魂|命运|意义|感觉|姿态|态度|选择|真相)/u;
 const SOUND_OR_INTERJECTION = /[啊呀哦噢嗯呜哎唉哈嘿嘘喂诶咦嗡轰砰嘎]/u;
+const EXPLANATORY_ANAPHORA = /^(?:这|那|这一切|这一幕|这种(?:反应|举动|沉默|态度)|如此|由此)(?:无疑|显然|恰恰)?(?:说明|意味着|表明|证明|代表|显示)/u;
+const NARRATOR_REDEFINITION = /^(?:换句话说|也就是说|说到底|归根结底|从本质上说|实质上|本质上|真正(?:重要|关键|可怕|危险|困难|残酷)的(?:是|在于))/u;
+const THEMATIC_SUMMARY = /^(?:直到(?:这时|此刻|现在)[，,]?(?:他|她|他们|她们)?才(?:明白|意识到|懂得)|这一刻(?:意味着|标志着)|从(?:这天|这一刻|此刻)起|真正重要的(?:是|从来不是)|归根结底)/u;
+const INTENT_TRANSLATION = /^(?:(?:他|她|他们|她们)(?:这么|这样)做(?:并)?(?:不是|只是|是为了)|(?:他|她|他们|她们)真正想(?:说|要|表达)的(?:是|不过是)|这句话真正的意思是)/u;
+const EMOTION_LABEL = /^(?:(?:他|她|他们|她们)(?:显然|无疑|其实)?(?:感到|意识到|明白|知道)|(?:愤怒|恐惧|悲伤|绝望|不安|紧张|羞耻|内疚|委屈|嫉妒|慌乱)(?:在|从).{0,12}(?:升起|蔓延|涌出|滋生))/u;
+const CAUSAL_GLOSS = /^(?:(?:这|那|之所以如此)(?:只是|正是)?因为|原因(?:其实|恰恰)?(?:是|在于)|之所以.{0,36}(?:是因为|只因))/u;
 
 /**
  * 仅这些子类在“过密”时可能升为 error（会拦截提案）。
@@ -55,6 +62,11 @@ export const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
   "cause_or_judgment",
   "abstract_reframing",
   "narrator_redefinition",
+  "semantic_echo",
+  "emotion_label",
+  "intent_translation",
+  "thematic_summary",
+  "causal_gloss",
 ]);
 
 export function isHardBlockSubtype(subtype: ProseStyleSubtype): boolean {
@@ -78,8 +90,9 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
       "句式硬约束（生成时遵守，减少返工）：",
       "1. 叙述少用破折号做「画面——解释 / 因果补注」；优先句号拆句，或把说明改成可观察动作/细节。",
       "2. 叙述少用「不是A（而）是B」「并非…而是…」等抽象重定义；直接写成立事实或落到行动/对白。",
-      "3. 允许：对白拖音/中断/迟疑；人物口语纠正；并列列举（头——脚——手）；Markdown 表格；偶发停顿—揭示与短同位。",
-      "4. 禁止堆砌：同一段落反复「——因为/也就是」或密集否定—肯定模板。",
+      "3. 动作、对白或细节已经传达情绪/意图时，不再追加「这说明…」「他显然感到…」「真正重要的是…」等解释回声。",
+      "4. 允许：对白拖音/中断/迟疑；人物口语纠正；并列列举（头——脚——手）；Markdown 表格；偶发停顿—揭示与短同位。",
+      "5. 禁止堆砌：同一段落反复因果补注、否定—肯定、情绪标签或主题总结模板。",
     ].join("\n");
   }
   return `句式与符号约束（生成阶段强制遵守；终审会机器抽查过密说明体）
@@ -95,18 +108,24 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
 - 允许：对白里纠正事实（「不是老周，是他儿子」）；客观事实排除写清即可，勿叠抽象标签。
 - 改写配方：直接陈述真正成立的事实；若需纠正误解，改由人物行动或对白完成。
 
+【解释回声】
+- 动作、对白或细节已经足以传达情绪、意图、关系或主题时，不再追加「这说明…」「他显然感到…」「真正重要的是…」「直到此刻才明白…」。
+- 必要的新因果、转场和时间概述可以直接写清；不要为了“展示”把所有信息改成身体反应。
+- 改写配方：删去没有新信息的解释句；若含新事实，只保留事实、行动条件或后果。
+
 【目标】
 一次写对，避免提案被退回后整段重写。提交前快速扫：说明性破折号、抽象「不是…而是」是否成串出现。`;
 }
 
 /** One-line checklist for pre-submit self-check in task workflows. */
 export function proseMannerismPreflightLine(): string {
-  return "句式自检：有无说明性破折号（画面——解释/——因为）、有无叙述里抽象「不是…而是」；有则先改再提交。对白拖音与口语纠正可保留。";
+  return "句式自检：有无说明性破折号、抽象「不是…而是」，以及动作/对白后重复翻译情绪、意图、因果或主题的解释回声；有则先改再提交。对白拖音、口语纠正和必要新事实可保留。";
 }
 
 /** Rule scan without density escalation (for pre-model packing). */
 export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
-  return [...scanDashes(text), ...scanContrasts(text)].sort((a, b) => a.start - b.start);
+  return [...scanDashes(text), ...scanContrasts(text), ...scanExplanationCandidates(text)]
+    .sort((a, b) => a.start - b.start);
 }
 
 /**
@@ -206,6 +225,16 @@ function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
     case "abstract_reframing":
     case "narrator_redefinition":
       return "去掉「不是A而是B」模板，直接写成立事实或落到行动/对白";
+    case "semantic_echo":
+      return "若前文证据已经充分，删除重复解释；否则只保留新增事实";
+    case "emotion_label":
+      return "避免在动作之后重复命名情绪，保留会改变后续行动的部分";
+    case "intent_translation":
+      return "不要替对白或动作翻译意图，让后续选择呈现人物目的";
+    case "thematic_summary":
+      return "删去即时总结，让意义由场景后果或后续回收形成";
+    case "causal_gloss":
+      return "必要因果写成新事实；若只是复述前文则删除";
     default:
       return "改成可观察动作或独立句，去掉说明体";
   }
@@ -325,7 +354,63 @@ function scanContrasts(text: string): ProseStyleIssue[] {
   return issues;
 }
 
-function makeIssue(text: string, range: MatchRange, kind: "dash" | "contrast", subtype: ProseStyleSubtype,
+/**
+ * High-recall candidates for explanatory voice beyond punctuation/templates.
+ * These remain sub-threshold warnings until a context pass confirms redundancy.
+ */
+function scanExplanationCandidates(text: string): ProseStyleIssue[] {
+  const issues: ProseStyleIssue[] = [];
+  const sentences = sentenceRanges(text);
+  for (let index = 0; index < sentences.length; index += 1) {
+    const current = sentences[index];
+    const rawBody = current.text.trim();
+    const body = rawBody.replace(/^[“「『"']+/u, "");
+    if (!body || /^[“「『"']/u.test(rawBody) || quoteDepthAt(text, current.start) > 0 || isMetadataLine(body)) continue;
+    const category = explanationCategory(body);
+    if (!category) continue;
+
+    const previous = sentences[index - 1];
+    const adjacent = previous && sameParagraph(text, previous.end, current.start);
+    const echoLike = adjacent && (
+      EXPLANATORY_ANAPHORA.test(body)
+      || INTENT_TRANSLATION.test(body)
+      || EMOTION_LABEL.test(body)
+      || CAUSAL_GLOSS.test(body)
+    );
+    const subtype: ProseStyleSubtype = echoLike ? "semantic_echo" : category;
+    const confidence = echoLike ? 0.88 : 0.78;
+    const reason = echoLike
+      ? "当前句紧跟前句并显式命名其情绪、意图、因果或意义，可能只是重复读者已经能推断的信息。"
+      : explanationReason(category);
+    issues.push(makeIssue(text, current, "explanation", subtype, "warning", confidence, reason, [
+      "先判断该句是否增加新事实；没有则删除",
+      "必要信息保留为事实、行动条件或后果，不要只给抽象结论",
+    ]));
+  }
+  return issues;
+}
+
+function explanationCategory(sentence: string): ProseStyleSubtype | undefined {
+  if (EXPLANATORY_ANAPHORA.test(sentence) || NARRATOR_REDEFINITION.test(sentence)) return "narrator_redefinition";
+  if (THEMATIC_SUMMARY.test(sentence)) return "thematic_summary";
+  if (INTENT_TRANSLATION.test(sentence)) return "intent_translation";
+  if (EMOTION_LABEL.test(sentence)) return "emotion_label";
+  if (CAUSAL_GLOSS.test(sentence)) return "causal_gloss";
+  return undefined;
+}
+
+function explanationReason(subtype: ProseStyleSubtype): string {
+  switch (subtype) {
+    case "narrator_redefinition": return "叙述者显式重述刚发生之事的意义，需结合上下文判断是否增加信息。";
+    case "thematic_summary": return "句子即时总结场景主题或成长意义，可能提前替读者完成判断。";
+    case "intent_translation": return "句子直接翻译人物动作或对白的真实意图，可能形成解释回声。";
+    case "emotion_label": return "句子显式命名人物情绪或认知，需检查前文是否已经充分呈现。";
+    case "causal_gloss": return "句子追加因果说明，需区分必要新事实与重复补注。";
+    default: return "句子带有显式解释信号，需结合上下文复核。";
+  }
+}
+
+function makeIssue(text: string, range: MatchRange, kind: ProseStyleIssue["kind"], subtype: ProseStyleSubtype,
   severity: ProseStyleSeverity, confidence: number, reason: string, suggestions: string[]): ProseStyleIssue {
   const bounds = sentenceBounds(text, range.start);
   const sentence = text.slice(bounds.start, bounds.end).trim();
@@ -335,6 +420,24 @@ function makeIssue(text: string, range: MatchRange, kind: "dash" | "contrast", s
     id: `${kind}:${subtype}:${range.start}`, kind, subtype, severity, confidence,
     start: range.start, end: range.end, line, column, sentence, evidence, reason, suggestions,
   };
+}
+
+function sentenceRanges(text: string): MatchRange[] {
+  const ranges: MatchRange[] = [];
+  const pattern = /[^。！？!?\n]+[。！？!?]?/gu;
+  for (const match of text.matchAll(pattern)) {
+    const raw = match[0];
+    const leading = raw.search(/\S/u);
+    if (leading < 0) continue;
+    const start = (match.index ?? 0) + leading;
+    const value = raw.slice(leading).trimEnd();
+    ranges.push({ start, end: start + value.length, text: value });
+  }
+  return ranges;
+}
+
+function sameParagraph(text: string, leftEnd: number, rightStart: number): boolean {
+  return !/\n\s*\n/u.test(text.slice(leftEnd, rightStart));
 }
 
 function collectMatches(text: string, ...patterns: RegExp[]): MatchRange[] {
