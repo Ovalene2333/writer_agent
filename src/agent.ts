@@ -44,6 +44,58 @@ type ApiToolCall = {
 
 export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
 
+/**
+ * =============================================================================
+ * PROMPT / PREFIX-CACHE CONTRACT (read before editing any agent prompt)
+ * =============================================================================
+ * Providers (e.g. DeepSeek) bill cache hits far cheaper than misses. Hits require
+ * a byte-stable longest common prefix on the request. Follow these rules whenever
+ * you add or rewrite prompts, system slots, tools, or message assembly:
+ *
+ * 1) MESSAGE ORDER — stable first, dynamic last
+ *    [buildStableSystemPrefix: 6 fixed system slots]
+ *    [buildDynamicTurnMessages: 8 fixed system slots + 1 user]
+ *    [assistant / tool turns appended during the job]
+ *    Never insert optional system messages *between* stable slots; use the
+ *    existing placeholder text when a block is empty so slot indices never shift.
+ *
+ * 2) STABLE PREFIX (cross-turn cache)
+ *    writingSystemPrompt, executionRulesPrompt, project instructions, skills
+ *    catalog, stableStyleGroundingPrompt, mode-extra (audit REVIEW or placeholder).
+ *    Prefer timeless project rules here. Avoid per-request paths, chapter text,
+ *    timestamps, todos, or “当前任务”. Style sample *bodies* that change with
+ *    the target chapter belong in dynamicStyleGroundingPrompt, not here.
+ *    Frequent copy edits to stable text invalidate everyone's cache — batch them.
+ *
+ * 3) DYNAMIC TAIL (always miss-priced — keep short)
+ *    history preview, archive stats, task/dynamicContext, dynamic style evidence,
+ *    bootstrap index, todos, work-memory catalog, user selection, current user.
+ *    Prefer digests / ids / paths; full prose belongs in tool results or
+ *    read_conversation paging, not automatic injection.
+ *
+ * 4) APPEND-ONLY WITHIN ONE runAgent JOB
+ *    After the first streamCompletion, do not mutate earlier messages (no mid-job
+ *    compactRuntimeMessages / rehydrate / stripStaleReasoning / compactCompletedToolCalls).
+ *    Compactors are only for rebuilding a transcript outside an active job.
+ *
+ * 5) TOOLS SCHEMA
+ *    src/tools/schema.ts TOOLS must stay order-stable and free of project-specific
+ *    path/id lists. Do not swap tool sets per task mode mid-session unless the
+ *    whole session uses one fixed set (changing tools breaks the tools-side prefix).
+ *
+ * 6) PLANNER
+ *    planWritingTask: immutable rules in system; request + catalogs + short history
+ *    in the user message only.
+ *
+ * 7) DEDUPE
+ *    Prefer one compact rule + cross-reference over pasting the same mannerism /
+ *    craft checklist into system + style + task workflow + review.
+ *
+ * Roleplay (src/roleplay.ts) is a separate path and does not use this assembly.
+ * Long archives: inspect_conversation + read_conversation, not a fat auto-history.
+ * =============================================================================
+ */
+
 type ToolAccumulator = ToolCall;
 
 type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "simple_character" | "general";
@@ -169,11 +221,16 @@ export function modelConfigFromEnv(): ModelConfig {
   };
 }
 
+/**
+ * Stable-prefix slot 0. Project/language-level identity and hard rules only.
+ * CACHE: Keep text stable; put turn-specific instructions in dynamicContextPrompt /
+ * taskInstructions, not here. Style details → style_grounding (stable vs dynamic split).
+ */
 function writingSystemPrompt(project: WriterProject): string {
   const config = project.config();
   const styleTemplate = config.style ? getStyleTemplate(config.style) : undefined;
-  // Keep only a short pointer here; full style rules + few-shot live in styleGroundingPrompt
-  // so writing turns get a salient, dedicated block (and static prefix stays more stable).
+  // Short pointer only; full style rules + few-shot live in styleGroundingPrompt
+  // so writing turns get a dedicated block and this prefix stays cache-stable.
   const stylePointer = styleTemplate
     ? `\n当前激活风格模板：${styleTemplate.name}（细则、范文与本项目声线样本见后续「风格锚定」区块，写正文时以该区块为准）。\n`
     : "\n未激活风格模板时，写正文须贴合本项目既有章节声线（见「风格锚定」）。\n";
@@ -205,6 +262,11 @@ ${stylePointer}
 `;
 }
 
+/**
+ * Stable-prefix slot 1. Tool/workflow policy by permission mode.
+ * CACHE: Only permissionMode should change this string within a session; do not
+ * embed the current user request, paths, or chapter excerpts.
+ */
 function executionRulesPrompt(mode: PermissionMode): string {
   const archiveRule = "When the user asks to use the complete or long conversation/roleplay history, the automatically injected history is only a recent preview. You MUST call inspect_conversation, then page read_conversation from afterId=0 through nextAfterId until hasMore=false for the relevant channel. Never claim the full archive was read from the preview alone. Read simple cards with list_simple_characters/get_simple_character; they are separate from normal cards.";
   const modeRule = mode === "plan"
@@ -227,6 +289,11 @@ ${archiveRule}
 当前执行模式：${permissionModeLabel(mode)}`;
 }
 
+/**
+ * Dynamic-tail task block (miss-priced every turn). Mode workflows + scope only.
+ * CACHE: OK to be turn-specific; keep structuredCreativeContext slim (ids/fingerprints,
+ * not full example bodies — those belong in stableStyleGroundingPrompt when intensive).
+ */
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, characterScope?: number[], continuationPath?: string): string {
   const explicitReferences = explicitReferencePaths(project, request);
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
@@ -278,6 +345,12 @@ const TASK_LABELS: Record<WritingTaskMode, string> = {
   audit: "一致性与质量审校", simple_character: "创建或更新简易角色卡", general: "通用写作协作",
 };
 
+/**
+ * Task planner (separate completion; tools off).
+ * CACHE: Keep the system string free of project catalogs and request text so the
+ * rules prefix can hit across turns. Put request + slim catalogs + short history
+ * only in the user message. Do not re-merge catalogs into system when editing.
+ */
 async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
@@ -285,7 +358,7 @@ async function planWritingTask(
   const characters = store.characters().map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
   const activeStyleId = project.config().style;
   const activeStyle = activeStyleId ? getStyleTemplate(activeStyleId) : undefined;
-  // Slim catalogs: paths / id+name only — full notes/examples hurt planner cache and cost.
+  // Slim catalogs: paths / id+name only — full notes/examples inflate the miss-priced user payload.
   const examples = store.writingExamples()
     .filter(item => !item.title.startsWith("[风格模板]") || item.title === `[风格模板] ${activeStyle?.name}`)
     .map(item => ({ id: item.id, title: item.title, category: item.category }))
@@ -294,9 +367,9 @@ async function planWritingTask(
   const recent = history.slice(-4).map(item => item.role === "user"
     ? { content: item.content?.slice(0, 200) ?? "" }
     : { role: item.role, content: item.content?.slice(0, 160) ?? "" });
-  // Stable planner rules first (cacheable across turns); project catalogs + history in the user message.
   const planningMessages: ApiMessage[] = [{
     role: "system",
+    // CACHE: stable planner rules only — no documents/characters/history here.
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
 字段：mode（brainstorm/outline/write_scene/rewrite/audit/simple_character/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
 决策原则：创建或更新“简易角色/简易角色卡/简略角色卡”必须使用 simple_character，并设 documentContext=search，以便核对已有普通角色卡和 lore/outline 设定；不得因为用户没有明确说“读取文档”而使用 none。当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
@@ -453,6 +526,11 @@ function chineseNumeralToInt(text: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Per-mode workflow text inside the dynamic task block (not the stable prefix).
+ * CACHE: Safe to be mode-specific. Prefer references to style/system rules over
+ * re-pasting long mannerism/craft checklists already in the stable prefix.
+ */
 function taskInstructions(mode: WritingTaskMode): string {
   if (mode === "simple_character") return `本次工作流：
 - 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终必须调用 save_simple_character 保存。
@@ -551,7 +629,13 @@ function explicitReferencePaths(project: WriterProject, request: string): string
     .slice(0, 3);
 }
 
-/** Dynamic-tail history: keep a short index so this miss-priced segment stays small. */
+/**
+ * Dynamic-tail history *preview* for the writing Agent only (not roleplay).
+ * CACHE: Always miss-priced — keep short (recent caps + char limits below).
+ * Full / long roleplay or agent archives must use inspect_conversation +
+ * read_conversation (see executionRulesPrompt archiveRule). Roleplay chat
+ * (src/roleplay.ts) injects its own channel history and is unaffected here.
+ */
 function historicalConversationContext(history: Array<ApiMessage & { channel?: string }>): string {
   if (!history.length) {
     return `历史对话：（无）
@@ -586,9 +670,19 @@ ${JSON.stringify(entries)}
 }
 
 /**
- * Fixed-count stable system prefix (same slot count every turn).
- * Optional project instructions / skills / audit rules use placeholders so later
- * dynamic messages never shift indices — critical for provider prefix cache.
+ * Fixed-count stable system prefix (exactly 6 system messages every turn).
+ *
+ * Slot map (do not reorder, do not splice optional messages between slots):
+ *   0 writingSystemPrompt
+ *   1 executionRulesPrompt(permissionMode)
+ *   2 project instructions OR fixed empty placeholder
+ *   3 skills catalog OR fixed empty placeholder
+ *   4 stableStyleGroundingPrompt OR non-intensive placeholder
+ *   5 REVIEW_PROMPT (audit) OR non-audit placeholder
+ *
+ * CACHE: When adding a new *stable* rule, put it inside an existing slot (or
+ * extend this function with a new trailing stable slot and always fill it).
+ * Never `...(cond ? [msg] : [])` here — that shifts later messages and kills prefix hits.
  */
 export function buildStableSystemPrefix(
   project: WriterProject,
@@ -616,7 +710,23 @@ export function buildStableSystemPrefix(
   ];
 }
 
-/** Fixed-count dynamic system tail + current user message (always same length). */
+/**
+ * Fixed-count dynamic tail (exactly 8 system + 1 user every turn).
+ *
+ * Slot map (miss-priced — keep each body small when editing):
+ *   0 history preview
+ *   1 archive metadata
+ *   2 task / dynamicContext
+ *   3 dynamic style evidence OR placeholder
+ *   4 bootstrap index OR placeholder
+ *   5 todos OR placeholder
+ *   6 work-memory catalog OR placeholder
+ *   7 user selection OR placeholder
+ *   8 user: current request
+ *
+ * CACHE: Place new turn-specific prompts in an existing slot or add a slot with
+ * a permanent placeholder; do not omit slots. Prefer digests over full chapter text.
+ */
 export function buildDynamicTurnMessages(parts: {
   historyText: string;
   archiveContext: string;
@@ -742,10 +852,9 @@ export async function runAgent(options: {
       signal,
     },
   };
-  // Fixed slot counts: stable prefix then dynamic tail. Never omit optional slots (use placeholders)
-  // so message indices stay aligned for provider prefix / KV cache across turns.
-  // Within this job the messages array is append-only — do not compact/rehydrate/strip
-  // already-sent messages between tool steps (that would invalidate step-to-step cache hits).
+  // Assemble per PROMPT / PREFIX-CACHE CONTRACT (top of this file):
+  // stable 6 + dynamic 9, then append-only tool loop. See buildStableSystemPrefix /
+  // buildDynamicTurnMessages for slot maps when adding new prompt material.
   const messages: ApiMessage[] = [
     ...buildStableSystemPrefix(project, store, permissionMode, styleOptions, task.mode),
     ...buildDynamicTurnMessages({
@@ -770,6 +879,8 @@ export async function runAgent(options: {
   try {
     const maxTurns = options.maxTurns ?? 20;
     let turnStart = messages.length;
+    // CACHE: append-only for the whole job — never rewrite prior message bodies
+    // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; turn < maxTurns; turn += 1) {
       const step = turn + 1;
       const stepModel = documentProposalSubmitted ? model : executionModel;
@@ -904,6 +1015,11 @@ export async function runAgent(options: {
   }
 }
 
+/**
+ * Stable-prefix slot 5 when task.mode === "audit"; otherwise a short placeholder.
+ * CACHE: Treat as relatively stable review policy; put chapter-specific findings
+ * in tools / user text, not by growing this block every turn.
+ */
 const REVIEW_PROMPT = `你现在是小说终审编辑。目标是降低机器生成感，不是把文字改成另一种统一腔调。
 先调用 audit_prose_style 获取带行列和语境分类的问题。优先处理 severity=error；warning 仅在明显模板化且影响阅读时改；info 一律保留。
 ${proseMannerismConstraintPrompt({ compact: true })}
@@ -956,6 +1072,10 @@ function selectedBlocksContext(project: WriterProject, references?: Array<{ path
   return sections.length ? `用户从网页浏览器明确加入了以下文本选区。只把它们作为本轮上下文，不要自行扩展为整篇文档：\n\n${sections.join("\n\n---\n\n")}` : "";
 }
 
+/**
+ * Dynamic-tail work memory. CACHE: miss-priced — default to catalog + digests;
+ * restore at most one body on continuation. Do not re-inject multi-chapter prose here.
+ */
 function recentArtifactsContext(store: WriterStore, sessionId: string, project: WriterProject, task: WritingTask): string {
   const state = store.sessionContext(sessionId);
   let artifacts = store.recentContextArtifacts(sessionId, 8);
@@ -1030,7 +1150,8 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
 }
 
 /**
- * Conservative write hints: index only (ids/paths), no full prose or character cards.
+ * Dynamic-tail write index only (ids/paths/short summaries).
+ * CACHE: miss-priced — never dump full outline prose or character cards here;
  * Step 1 tool reads remain the source of truth for actual content.
  */
 function writingBootstrapContext(project: WriterProject, store: WriterStore, prompt: string, task: WritingTask): string {
@@ -1228,8 +1349,9 @@ async function executeToolCached(
   return attachArtifactId(result, artifactId);
 }
 
+/** Windowing for agent history preview only (roleplay uses its own limit). CACHE: keep small. */
 function compactHistory(messages: Array<{ role: string; content: string; channel?: string }>): Array<ApiMessage & { channel?: string }> {
-  // Slimmer window: dynamic-tail history is miss-priced every turn.
+  // Dynamic-tail history is miss-priced every turn — prefer short windows.
   const recent = messages.slice(-6);
   const older = messages.slice(0, -6);
   const result: Array<ApiMessage & { channel?: string }> = [];
@@ -1253,8 +1375,11 @@ function compactHistory(messages: Array<{ role: string; content: string; channel
 
 /**
  * Compact heavy tool bodies into digests (artifactId preserved).
- * Use only when *rebuilding* a transcript for a new user turn — never mid-job between
- * tool steps, or step-to-step prompt-cache prefixes will miss.
+ *
+ * CACHE / APPEND-ONLY: Use only when *rebuilding* a transcript outside an active
+ * runAgent job (e.g. tests or future cross-turn rebuild). Never call between
+ * multi-step tool turns in the same job — mutating earlier messages invalidates
+ * the provider prefix cache for all subsequent steps.
  */
 export function compactRuntimeMessages(messages: ApiMessage[]): void {
   const toolIndexes = messages.flatMap((message, index) => message.role === "tool" ? [index] : []);
@@ -1302,7 +1427,8 @@ export function compactRuntimeMessages(messages: ApiMessage[]): void {
 
 /**
  * Restore only the most recent compacted tool bodies (default 2).
- * Older digests stay compact so multi-step prompts stop growing with full chapter text.
+ * CACHE: Same append-only rule as compactRuntimeMessages — do not rehydrate in the
+ * live multi-step loop (it rewrites message bytes and breaks prefix continuity).
  */
 export function rehydrateRecentToolMessages(
   messages: ApiMessage[],
@@ -1327,7 +1453,10 @@ export function rehydrateRecentToolMessages(
   }
 }
 
-/** Drop reasoning_content on older assistant turns to cut re-sent output-side bulk. */
+/**
+ * Drop reasoning_content on older assistant turns.
+ * CACHE: Mutates history — only safe outside the live multi-step job loop.
+ */
 export function stripStaleReasoningContent(messages: ApiMessage[]): void {
   let lastWithReasoning = -1;
   for (let index = 0; index < messages.length; index += 1) {
@@ -1341,8 +1470,8 @@ export function stripStaleReasoningContent(messages: ApiMessage[]): void {
 }
 
 /**
- * Strip older propose_* payloads when rebuilding a multi-proposal transcript outside
- * an active job. Not used mid-job (append-only) so prefix cache stays intact.
+ * Strip older propose_* payloads when rebuilding a multi-proposal transcript.
+ * CACHE: Not used mid-job (append-only) so prefix cache stays intact.
  */
 export function compactCompletedToolCalls(messages: ApiMessage[]): void {
   let latestProposalMessage = -1;
@@ -1438,6 +1567,11 @@ function emitUsageEvent(
   });
 }
 
+/**
+ * Low-level chat completion. CACHE: when toolsEnabled, always pass the frozen
+ * global TOOLS set from schema.ts — do not build per-request tool lists with
+ * project paths/ids (that destroys the tools-side of the prefix cache).
+ */
 async function streamCompletion(
   model: ModelConfig,
   messages: ApiMessage[],
@@ -1448,6 +1582,7 @@ async function streamCompletion(
 ): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({
+    // TOOLS is deep-frozen and project-agnostic — keep it that way for cache.
     model: model.model, messages, ...(toolsEnabled ? { tools: TOOLS } : {}), stream: true,
     stream_options: { include_usage: true },
     ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),

@@ -3,6 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+/**
+ * Cache / prompt-assembly guards. When changing agent prompts, keep the contract
+ * documented at the top of agent.ts (PROMPT / PREFIX-CACHE CONTRACT) and extend
+ * these tests if you change fixed slot counts or mid-job mutators.
+ */
 import {
   agentToolNames,
   agentToolSchemaHash,

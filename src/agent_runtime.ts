@@ -88,6 +88,11 @@ export function loadProjectInstructions(project: WriterProject): { path: string;
   return undefined;
 }
 
+/**
+ * Injected into agent stable-prefix slot 2 (or a fixed empty placeholder if absent).
+ * CACHE: File content is project-stable; avoid baking turn-specific task text into
+ * WRITER.md that must change every chapter. Cap is intentional for cost control.
+ */
 export function projectInstructionsPrompt(project: WriterProject): string | undefined {
   const loaded = loadProjectInstructions(project);
   if (!loaded) return undefined;
@@ -162,6 +167,11 @@ export function listProjectSkills(project: WriterProject): ProjectSkill[] {
   return skills.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/**
+ * Injected into agent stable-prefix slot 3 (catalog only).
+ * CACHE: id + name + short description — never the full SKILL.md body (load_skill
+ * pulls details on demand so the stable prefix stays small and stable).
+ */
 export function skillsCatalogPrompt(project: WriterProject): string | undefined {
   const skills = listProjectSkills(project);
   if (!skills.length) return undefined;

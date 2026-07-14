@@ -1,6 +1,20 @@
 import { createHash } from "node:crypto";
 import type { ToolDefinition } from "./types.js";
 
+/**
+ * Agent tool definitions (prompt-cache critical).
+ *
+ * CACHE RULES (see agent.ts PROMPT / PREFIX-CACHE CONTRACT):
+ * - Keep names, order, and parameter schemas stable; tools JSON is sent every step.
+ * - Descriptions may document conventions (lore/outline/chapters) but must not embed
+ *   live project path lists, character ids, or session state.
+ * - Prefer free-form string/number parameters over enums that grow with the project.
+ * - Do not build a per-mode or per-project tool subset for the main agent unless that
+ *   subset is fixed for the whole session — swapping tools mid-session breaks the
+ *   tools-side of the provider prefix cache.
+ * - After structural changes, update agentToolSchemaHash expectations in tests.
+ */
+
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);

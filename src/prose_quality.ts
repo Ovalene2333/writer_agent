@@ -54,6 +54,15 @@ const EMOTION_LABEL = /^(?:(?:他|她|他们|她们)(?:显然|无疑|其实)?(?:
 const CAUSAL_GLOSS = /^(?:(?:这|那|之所以如此)(?:只是|正是)?因为|原因(?:其实|恰恰)?(?:是|在于)|之所以.{0,36}(?:是因为|只因))/u;
 
 /**
+ * Prompt usage (CACHE — see agent.ts PROMPT / PREFIX-CACHE CONTRACT):
+ * - Prefer `proseMannerismConstraintPrompt({ compact: true })` in stable system /
+ *   short task lines so the same full block is not pasted into every slot.
+ * - Full prompt is for stable style grounding / review once; avoid also dumping it
+ *   into dynamicContext, bootstrap, and every taskInstructions branch.
+ * - `proseMannerismPreflightLine()` is the one-line cross-reference for workflows.
+ */
+
+/**
  * 仅这些子类在“过密”时可能升为 error（会拦截提案）。
  * 普通叙事破折号、同位说明、模糊破折号、事实排除只保留 warning/info。
  */

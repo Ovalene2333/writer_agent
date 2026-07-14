@@ -95,7 +95,10 @@ export async function runRoleplayChat(options: {
   options.store.addMessage(options.sessionId, "user", userText, "roleplay");
   emit({ type: "step_start", step: 1 });
 
-  // 只读本通道历史：写作 Agent 对话不对扮演开放。
+  // Roleplay history is independent of the writing Agent prompt assembly
+  // (agent.ts PROMPT / PREFIX-CACHE CONTRACT does not apply here).
+  // Only this channel; full message bodies; last 24 turns (not the agent history preview).
+  // Long archives for writing must use inspect_conversation / read_conversation on the agent path.
   const history = options.store.messages(options.sessionId, 24, { channel: "roleplay" })
     .filter(message => message.role === "user" || message.role === "assistant")
     .slice(0, -1) // exclude the user message just written

@@ -266,7 +266,8 @@ async function buildWritingDraft(
   const documents = options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)).slice(0, 100);
   const documentSet = new Set(documents);
   const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
-  // Free-form ids/paths keep the tools JSON stable across project growth (better prompt-cache prefix).
+  // CACHE: free-form ids/paths (no project enum) keep this small tools JSON stable across growth.
+  // Prefer the same discipline as agent TOOLS: do not inject live path lists into tool schemas.
   const tools = [
     { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡（id 须在获准列表中）。", parameters: { type: "object", properties: { id: { type: "number" } }, required: ["id"], additionalProperties: false } } },

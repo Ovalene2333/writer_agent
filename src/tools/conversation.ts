@@ -1,6 +1,11 @@
 import type { MessageChannel } from "../types.js";
 import type { ToolHandlerArgs } from "./types.js";
 
+/**
+ * Long-history retrieval for the writing Agent. Prefer these tools over fat
+ * automatic history injection (agent dynamic tail is intentionally a short preview).
+ * Roleplay chat does not call these; it injects last-N roleplay messages itself.
+ */
 const MAX_PAGE_CHARACTERS = 16_000;
 
 export function handleInspectConversation({ store, sessionId }: ToolHandlerArgs): string {

@@ -3,6 +3,17 @@ import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./p
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 
+/**
+ * Style prompt cache split (see also PROMPT / PREFIX-CACHE CONTRACT in agent.ts):
+ * - stableStyleGroundingPrompt → agent stable-prefix slot 4 (project template +
+ *   default examples + craft/mannerism rules). Must not depend on targetPath /
+ *   selection / this-turn sample windows.
+ * - dynamicStyleGroundingPrompt → agent dynamic-tail slot 3 (chapter/selection
+ *   voice evidence). OK to change every turn; keep short.
+ * When adding style rules: put timeless constraints in stable; put live chapter
+ * excerpts only in dynamic. Avoid duplicating the same long checklist in both.
+ */
+
 export type StyleGroundingOptions = {
   /** Writing-related task modes get full grounding; others get a lighter block or nothing. */
   intensive: boolean;
@@ -12,7 +23,7 @@ export type StyleGroundingOptions = {
   preferredSample?: string;
 };
 
-/** Stable, positive craft guidance kept in the reusable prompt prefix. */
+/** Craft rules for the stable style block (cacheable project-level guidance). */
 export function naturalProseCraftPrompt(): string {
   return `自然叙事原则（服从项目样本；不要为了显得“自然”故意制造病句或随机变化）：
 - 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现。叙述距离一旦贴近某人，不因解释方便突然跳进他人内心。
@@ -40,7 +51,12 @@ export function styleGroundingPrompt(
   ].filter(Boolean).join("\n\n");
 }
 
-/** Project-stable rules and default examples. Keep this before all per-turn context for KV-cache reuse. */
+/**
+ * Project-stable style block for agent stable-prefix slot 4.
+ * CACHE: Only `intensive` (and project-level template/examples) may affect output.
+ * Do not read targetPath / preferredSample here — that belongs in dynamicStyleGroundingPrompt.
+ * Empty intensive=false is replaced by a fixed placeholder in buildStableSystemPrefix.
+ */
 export function stableStyleGroundingPrompt(
   project: WriterProject,
   store: WriterStore,
@@ -99,7 +115,10 @@ export function stableStyleGroundingPrompt(
   return sections.join("\n\n");
 }
 
-/** Per-turn voice evidence. It intentionally follows history/task data because it changes frequently. */
+/**
+ * Per-turn voice evidence for agent dynamic-tail (after history/task).
+ * CACHE: Always miss-priced — prefer one short sample window over multi-chapter dumps.
+ */
 export function dynamicStyleGroundingPrompt(
   project: WriterProject,
   store: WriterStore,
