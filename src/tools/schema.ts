@@ -243,13 +243,20 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_character",
-      description: "按 ID 分区读取 v3 角色卡。省略 sections 时返回完整卡；storyState 可结合 outlineNodeId 解析当前场景状态。未解锁能力只返回 name、summary 和 unlocked=false；不得推断隐藏字段或将其视为当前可用能力",
+      description: "按 ID 分区读取 v3 角色卡。省略 sections 时返回完整卡；storyState/experiences/psychology 可结合 outlineNodeId 解析当前场景可见内容。未解锁能力只返回 name、summary 和 unlocked=false；不得推断隐藏字段或将其视为当前可用能力",
       parameters: {
         type: "object",
         properties: {
           id: { type: "number", description: "角色 ID；先调用 list_characters 获取" },
-          sections: { type: "array", description: "要读取的顶层分区；省略则读取完整角色卡", items: { type: "string", enum: ["identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyState", "notes"] } },
-          outlineNodeId: { type: "string", description: "读取 storyState 时的目标 outline 节点 ID；省略时不注入演进状态" },
+          sections: {
+            type: "array",
+            description: "要读取的顶层分区；省略则读取完整角色卡",
+            items: {
+              type: "string",
+              enum: ["identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyState", "experiences", "notes"],
+            },
+          },
+          outlineNodeId: { type: "string", description: "读取 storyState / 带时间边界的 experiences 与 psychology 时的目标 outline 节点 ID" },
         },
         required: ["id"],
         additionalProperties: false,
@@ -260,22 +267,58 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "save_character",
-      description: "创建或嵌套更新 schema v3 角色卡。省略分区保持原值；提供的数组整体替换；删除条目使用 deleteEntryIds。剧情已确认发生能力获得、觉醒、学会、恢复、封印或失去时可同步 competencies[].unlocked；伏笔或仅提及不能改变它。新建必须提供 identity.name",
+      description: "创建或嵌套更新 schema v3 角色卡。省略分区保持原值；数组分区按 id upsert（不抹掉未提及条目）；删除用 deleteEntryIds；整节重写用 replaceSections。情节小改优先 apply_character_changes。新建必须提供 identity.name",
       parameters: {
         type: "object",
         properties: {
           id: { type: "number", description: "要更新的角色 ID（修改已有角色时必填，新建角色时省略）" },
           identity: { type: "object", description: "姓名、别名、标签、叙事角色和身份摘要", additionalProperties: true },
           profile: { type: "object", description: "外貌、辨识特征、背景摘要和人物小传", additionalProperties: true },
-          psychology: { type: "object", description: "性格摘要及 traits/values/fears/conflicts 结构化条目", additionalProperties: true },
-          motivations: { type: "array", description: "目标记录（id/category/status/priority/summary/stakes/obstacles/sourceRefs/validFrom/validUntil）", items: { type: "object", additionalProperties: true } },
+          psychology: { type: "object", description: "性格摘要；traits/values/fears/conflicts 按 id upsert", additionalProperties: true },
+          motivations: { type: "array", description: "目标记录（按 id upsert）", items: { type: "object", additionalProperties: true } },
           voice: { type: "object", description: "声线摘要、语域、措辞与示例对白", additionalProperties: true },
-          competencies: { type: "array", description: "能力记录；每项应填写 name、summary、unlocked。summary 是未解锁时仍会展示的简短概述；unlocked 是随已确认剧情推进变化的当前状态。该数组整体替换，更新单项前须读取并保留其他条目", items: { type: "object", additionalProperties: true } },
+          competencies: { type: "array", description: "能力记录（按 id upsert）；含 name/summary/unlocked", items: { type: "object", additionalProperties: true } },
           relationships: { type: "array", description: "单向关系记录；characterId 必须指向现有可读角色", items: { type: "object", additionalProperties: true } },
           storyStates: { type: "array", description: "剧情状态；每项必须有 outlineNodeId 或 unanchored=true", items: { type: "object", additionalProperties: true } },
-          deleteEntryIds: { type: "object", description: "按 motivations/competencies/relationships/storyStates 显式删除条目 ID", additionalProperties: true },
+          experiences: { type: "array", description: "已确认经历（id/label/description/sourceRefs/validFrom/validUntil），按 id upsert", items: { type: "object", additionalProperties: true } },
+          deleteEntryIds: {
+            type: "object",
+            description: "按 motivations/competencies/relationships/storyStates/experiences/traits/values/fears/conflicts 删除条目 ID",
+            additionalProperties: true,
+          },
+          replaceSections: {
+            type: "array",
+            description: "对这些分区整组替换而非 upsert：motivations/competencies/relationships/storyStates/experiences/traits/values/fears/conflicts",
+            items: { type: "string" },
+          },
           notes: { type: "string", description: "补充说明" },
         },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_character_changes",
+      description: "对已有角色卡应用结构化演进：解锁/封印能力、改性格、加经历、更新目标/关系/场景状态。仅用于已确认剧情事实（正文已落盘或用户确认）；伏笔、传闻、未接受提案禁止。新建角色用 save_character。ops：set_unlocked、upsert_competency、set_psychology_summary、upsert_psychology_entry、delete_psychology_entry、add_experience/upsert_experience、delete_experience、upsert_motivation、upsert_relationship、upsert_story_state、delete_entry",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "number", description: "已有角色 ID" },
+          reason: { type: "string", description: "已确认的剧情事实摘要（必填）" },
+          sourceRef: {
+            type: "object",
+            description: "可选来源：type=outline|document|manual，ref 为节点 ID 或文档路径",
+            additionalProperties: true,
+          },
+          changes: {
+            type: "array",
+            description: "结构化变更列表；每项含 op 及对应字段",
+            items: { type: "object", additionalProperties: true },
+          },
+        },
+        required: ["id", "reason", "changes"],
         additionalProperties: false,
       },
     },

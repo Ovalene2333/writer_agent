@@ -72,6 +72,7 @@ export type CharacterDraft = {
   competencies: Competency[];
   relationships: Relationship[];
   storyStates: StoryState[];
+  experiences: TextEntry[];
   notes: string;
 };
 
@@ -89,18 +90,20 @@ type SectionId =
   | "goals"
   | "skills"
   | "relations"
+  | "experiences"
   | "states"
   | "notes";
 
 const SECTIONS: Array<{ id: SectionId; label: string; hint: string }> = [
   { id: "overview", label: "概览", hint: "快速扫读" },
   { id: "identity", label: "身份", hint: "姓名定位" },
-  { id: "profile", label: "外形背景", hint: "外貌经历" },
+  { id: "profile", label: "外形背景", hint: "外貌身世" },
   { id: "psychology", label: "心理", hint: "性格价值" },
   { id: "voice", label: "声线", hint: "对白口吻" },
   { id: "goals", label: "目标", hint: "动机赌注" },
   { id: "skills", label: "能力", hint: "技能资源" },
   { id: "relations", label: "关系", hint: "人际网络" },
+  { id: "experiences", label: "经历", hint: "已确认事件" },
   { id: "states", label: "故事状态", hint: "场景切片" },
   { id: "notes", label: "备注", hint: "自由记录" },
 ];
@@ -222,7 +225,11 @@ export function CharacterEditor(props: {
   onDelete?: () => void;
   onSummarizeCompetency?: (competency: CharacterDraft["competencies"][number]) => Promise<string>;
 }) {
-  const { draft, onChange } = props;
+  const draft: CharacterDraft = {
+    ...props.draft,
+    experiences: Array.isArray(props.draft.experiences) ? props.draft.experiences : [],
+  };
+  const onChange = props.onChange;
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const [section, setSection] = useState<SectionId>("overview");
@@ -259,6 +266,7 @@ export function CharacterEditor(props: {
       goals: draft.motivations.length,
       skills: draft.competencies.length,
       relations: draft.relationships.length,
+      experiences: draft.experiences.length,
       states: draft.storyStates.length,
       notes: filled(draft.notes) ? 1 : 0,
     } satisfies Record<SectionId, number>;
@@ -446,6 +454,22 @@ export function CharacterEditor(props: {
                             </li>
                           );
                         })}
+                      </ul>
+                    )}
+                  </OverviewCard>
+                  <OverviewCard
+                    title="经历"
+                    badge={`${draft.experiences.length}`}
+                    empty={draft.experiences.length === 0}
+                    onJump={() => setSection("experiences")}
+                  >
+                    {draft.experiences.length === 0 ? (
+                      <p>暂无已确认经历</p>
+                    ) : (
+                      <ul>
+                        {draft.experiences.slice(-3).map(exp => (
+                          <li key={exp.id}>{clip(exp.label || exp.description, 80) || "（空经历）"}</li>
+                        ))}
                       </ul>
                     )}
                   </OverviewCard>
@@ -785,6 +809,73 @@ export function CharacterEditor(props: {
                             ...draft,
                             competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, limitations: splitList(e.target.value), costs: [] } : x),
                           })} /></Field>
+                        </div>
+                      </EntryCard>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {section === "experiences" && (
+              <div className="ce-panel">
+                <SectionHead
+                  title="已确认经历"
+                  description="随剧情推进写入的事件节点；不是完整传记散文。写作 Agent 可用 apply_character_changes 同步。"
+                  action={(
+                    <button type="button" onClick={() => onChange({
+                      ...draft,
+                      experiences: [...draft.experiences, { id: entryId("exp"), label: "", description: "", sourceRefs: [] }],
+                    })}>+ 添加经历</button>
+                  )}
+                />
+                {draft.experiences.length === 0 ? (
+                  <EmptyHint text="暂无结构化经历。觉醒、背叛、关键选择等可在此记录。" />
+                ) : (
+                  <div className="ce-entry-list">
+                    {draft.experiences.map((exp, index) => (
+                      <EntryCard
+                        key={exp.id}
+                        title={exp.label.trim() || `经历 ${index + 1}`}
+                        onRemove={() => onChange({
+                          ...draft,
+                          experiences: draft.experiences.filter(x => x.id !== exp.id),
+                        })}
+                      >
+                        <div className="ce-form-grid">
+                          <Field label="标题">
+                            <input
+                              value={exp.label}
+                              onChange={e => onChange({
+                                ...draft,
+                                experiences: draft.experiences.map(x => x.id === exp.id ? { ...x, label: e.target.value } : x),
+                              })}
+                              placeholder="短标题，如：灵视觉醒"
+                            />
+                          </Field>
+                          <Field label="生效自（大纲节点）">
+                            <input
+                              value={exp.validFrom ?? ""}
+                              onChange={e => onChange({
+                                ...draft,
+                                experiences: draft.experiences.map(x => x.id === exp.id
+                                  ? { ...x, validFrom: e.target.value || undefined }
+                                  : x),
+                              })}
+                              placeholder="可选 outline 节点 ID"
+                            />
+                          </Field>
+                          <Field label="说明" wide>
+                            <textarea
+                              value={exp.description}
+                              onChange={e => onChange({
+                                ...draft,
+                                experiences: draft.experiences.map(x => x.id === exp.id ? { ...x, description: e.target.value } : x),
+                              })}
+                              rows={3}
+                              placeholder="事件摘要与对角色的影响"
+                            />
+                          </Field>
                         </div>
                       </EntryCard>
                     ))}

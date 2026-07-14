@@ -25,7 +25,7 @@ import { WriterStore } from "./store.js";
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
-  assert.equal(agentToolSchemaHash(), "78cf26987dc78a3e");
+  assert.equal(agentToolSchemaHash(), "cd117b3ddccbcbca");
 });
 
 test("simple character card requests use the dedicated route", () => {
@@ -55,7 +55,7 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     // Placeholders keep slot count when project has no instructions/skills.
     assert.match(a[2].content ?? "", /项目指令/);
     assert.match(a[3].content ?? "", /项目技能/);
-    assert.match(a[0].content ?? "", /competencies\[\]\.unlocked 表示随剧情推进变化的当前解锁状态/);
+    assert.match(a[0].content ?? "", /apply_character_changes 同步能力解锁/);
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
     assert.equal(audit.length, 6);
     assert.notEqual(audit[5].content, a[5].content);

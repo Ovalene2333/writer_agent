@@ -93,6 +93,10 @@ export function slimRoleplayCharacterViews(
         conflicts: views.stable.psychology.conflicts.slice(0, 4),
       },
       competencies: views.stable.competencies,
+      experiences: (views.stable.experiences ?? []).slice(-3).map(item => ({
+        label: item.label,
+        description: item.description.slice(0, 160),
+      })),
       notes: views.stable.notes.slice(0, 300),
     },
     dialogue: {

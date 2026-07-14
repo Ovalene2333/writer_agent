@@ -3,7 +3,7 @@
   "$id": "https://writer-agent.local/schema/character-v3.json",
   "title": "Writer Agent Character v3",
   "type": "object",
-  "required": ["schemaVersion", "id", "identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyStates", "notes", "updatedAt"],
+  "required": ["schemaVersion", "id", "identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyStates", "experiences", "notes", "updatedAt"],
   "properties": {
     "schemaVersion": { "const": 3 },
     "id": { "type": "integer", "minimum": 1 },
@@ -15,6 +15,7 @@
     "competencies": { "type": "array", "items": { "$ref": "#/$defs/competency" } },
     "relationships": { "type": "array", "items": { "$ref": "#/$defs/relationship" } },
     "storyStates": { "type": "array", "items": { "$ref": "#/$defs/storyState" } },
+    "experiences": { "$ref": "#/$defs/textEntries" },
     "notes": { "type": "string" }, "updatedAt": { "type": "string" }, "extensions": { "type": "object" }
   },
   "additionalProperties": false,

@@ -7,7 +7,19 @@ import type {
   RoleplayInterlocutor, RoleplayParticipant, RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
-import { characterName, emptyCharacter, migrateV2Character, normalizeV3Character, validateCharacters, type CharacterInput } from "./characters.js";
+import {
+  applyCharacterChanges as applyCharacterChangesCore,
+  applyCharacterInput,
+  characterName,
+  emptyCharacter,
+  migrateV2Character,
+  normalizeV3Character,
+  validateCharacters,
+  type AppliedCharacterChange,
+  type ApplyCharacterChangesInput,
+  type CharacterInput,
+  type SkippedCharacterChange,
+} from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
@@ -317,19 +329,30 @@ export class WriterStore {
     const existing = input.id ? characters.find(item => item.id === input.id) : undefined;
     if (input.id && !existing) throw new Error("要修改的角色不存在");
     const id = existing?.id ?? Math.max(0, ...characters.map(item => item.id)) + 1;
-    const base = existing ?? { ...emptyCharacter(input.identity?.name ?? ""), id, updatedAt: "" };
-    const deleted = input.deleteEntryIds ?? {};
-    const kept = <T extends { id: string }>(section: keyof typeof deleted, values: T[]) => values.filter(value => !deleted[section]?.includes(value.id));
-    const character = normalizeV3Character({ ...base, ...input, id, schemaVersion: 3, updatedAt: new Date().toISOString(),
-      identity: { ...base.identity, ...input.identity }, profile: { ...base.profile, ...input.profile },
-      psychology: { ...base.psychology, ...input.psychology }, voice: { ...base.voice, ...input.voice },
-      motivations: input.motivations ?? kept("motivations", base.motivations), competencies: input.competencies ?? kept("competencies", base.competencies),
-      relationships: input.relationships ?? kept("relationships", base.relationships), storyStates: input.storyStates ?? kept("storyStates", base.storyStates),
-    });
+    const base: Character = existing ?? { ...emptyCharacter(input.identity?.name ?? ""), id, updatedAt: "" };
+    const character = applyCharacterInput(base, { ...input, id });
     const next = [...characters.filter(item => item.id !== id), character];
     validateCharacters(next, this.outlineNodeIds());
     this.writeCharacters(next);
     return character;
+  }
+
+  /**
+   * Apply semantic character evolution ops (unlock, personality, experiences, …)
+   * then persist through the normal validation path.
+   */
+  applyCharacterChanges(
+    id: number,
+    input: ApplyCharacterChangesInput,
+  ): { character: Character; applied: AppliedCharacterChange[]; skipped: SkippedCharacterChange[] } {
+    const characters = this.characters();
+    const existing = characters.find(item => item.id === id);
+    if (!existing) throw new Error("要修改的角色不存在");
+    const result = applyCharacterChangesCore(existing, input);
+    const next = [...characters.filter(item => item.id !== id), result.character];
+    validateCharacters(next, this.outlineNodeIds());
+    this.writeCharacters(next);
+    return result;
   }
 
   saveCharacterWithRevision(

@@ -148,6 +148,8 @@ export interface Character {
   competencies: CharacterCompetency[];
   relationships: CharacterRelationship[];
   storyStates: CharacterStoryState[];
+  /** Confirmed plot events / formative history (structured; not free-text biography). */
+  experiences: CharacterTextEntry[];
   notes: string;
   updatedAt: string;
   extensions?: Record<string, unknown>;

@@ -95,7 +95,7 @@ type Character = {
   profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
   psychology: { summary: string; traits: TextEntry[]; values: TextEntry[]; fears: TextEntry[]; conflicts: TextEntry[] };
   motivations: Goal[]; voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
-  competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; notes: string; updatedAt: string;
+  competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; experiences: TextEntry[]; notes: string; updatedAt: string;
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StepUsage = {
@@ -248,7 +248,7 @@ const EMPTY_CHARACTER: CharacterDraft = {
   profile: { appearanceSummary: "", distinguishingFeatures: [], backgroundSummary: "", biography: "" },
   psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] }, motivations: [],
   voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
-  competencies: [], relationships: [], storyStates: [], notes: "",
+  competencies: [], relationships: [], storyStates: [], experiences: [], notes: "",
 };
 /** Agent orb easter-egg lines (shown after multi-tap overdrive). */
 const ORB_EGG_LINES = [
@@ -3291,7 +3291,7 @@ function App() {
               <div className="character-grid">
                 {state.characters.map((character) => (
                   <div className="character-card-wrap" key={character.id}>
-                    <button className="character-card" onClick={() => setCharacterDraft({ ...character })}>
+                    <button className="character-card" onClick={() => setCharacterDraft({ ...character, experiences: character.experiences ?? [] })}>
                       <span className="character-avatar">{character.identity.name.slice(0, 1)}</span>
                       <span className="character-card-body">
                         <strong title={character.identity.name}>{character.identity.name}</strong>

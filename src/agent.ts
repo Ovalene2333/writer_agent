@@ -260,7 +260,7 @@ ${stylePointer}
 2. 让动作产生结果、让细节供读者判断；必要因果拆成独立句。保留对白中的拖音、中断、迟疑和真实纠正。
 3. 对白服从人物身份与当下目的；场景落在具体动作、决定、发现或未决问题上。
 4. 不编造 lore/角色卡未支撑的关键设定；区分项目事实与合理创作推断。
-5. 角色卡 competencies[].unlocked 表示随剧情推进变化的当前解锁状态。正文已存在或用户已确认的剧情明确发生能力获得、觉醒、学会、恢复、封印或失去时，应考虑用 save_character 同步该状态；伏笔、传闻、尝试失败、仅提及能力或尚未接受的写作提案不能改变 unlocked。更新前先读取完整 competencies，并保留其他能力条目，因为该数组按整组替换。
+5. 角色卡演进（仅已确认剧情事实：正文已落盘、用户确认，或大纲节点已是既成事实）：可用 apply_character_changes 同步能力解锁/封印、性格（psychology）、结构化经历（experiences）、目标/关系/场景状态。伏笔、传闻、尝试失败、仅提及或尚未接受的写作提案禁止改卡。情节小改优先 apply_character_changes；新建或大改用 save_character（数组按 id upsert，删除用 deleteEntryIds，整节重写才用 replaceSections）。
 6. ${proseMannerismConstraintPrompt({ compact: true })}
 `;
 }
@@ -273,7 +273,7 @@ ${stylePointer}
 function executionRulesPrompt(mode: PermissionMode): string {
   const archiveRule = "When the user asks to use the complete or long conversation/roleplay history, the automatically injected history is only a recent preview. You MUST call inspect_conversation, then page read_conversation from afterId=0 through nextAfterId until hasMore=false for the relevant channel. Never claim the full archive was read from the preview alone. Read simple cards with list_simple_characters/get_simple_character; they are separate from normal cards.";
   const modeRule = mode === "plan"
-    ? "3. 当前为 plan 模式：只做检索、分析与计划，禁止调用 propose_document / propose_document_patch / propose_outline_patch / save_character / save_simple_character；用最终回复给出可执行计划与待确认点。"
+    ? "3. 当前为 plan 模式：只做检索、分析与计划，禁止调用 propose_document / propose_document_patch / propose_outline_patch / save_character / apply_character_changes / save_simple_character；用最终回复给出可执行计划与待确认点。"
     : mode === "auto"
       ? "3. 当前为 auto 模式：写正文、续写、扩写或改写必须提交文档提案（会自动写入文件），不能用最终回复代替正文。提案成功后立即停止。"
       : "3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。";
@@ -283,7 +283,7 @@ function executionRulesPrompt(mode: PermissionMode): string {
 ${modeRule}
 ${archiveRule}
 4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
-5. 普通角色卡使用 save_character；简易角色卡使用 save_simple_character。创建角色卡前，只要请求涉及项目中的既有人物、组织、地点、装备、事件或职责，就必须先用 list_characters/get_character 与 search_project 核对相关资料，不得因用户未显式要求“读取文档”而跳过。修改普通卡必须传 id；新建普通卡省略 id 并提供 identity.name。
+5. 普通角色卡：情节演进用 apply_character_changes；新建/大改用 save_character。简易卡用 save_simple_character。创建前若涉及既有人物或设定，须 list_characters/get_character 与 search_project 核对。修改已有普通卡必须传 id；新建省略 id 并提供 identity.name。
 6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
 7. 资料复用：仅复用「本轮任务相关工作记忆」、本轮工具结果、带 reused 标记的返回；禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。上一轮非承接任务的清单与记忆不会自动带入。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
 8. 复杂多步请求（≥3 步）用 manage_todos 维护清单并随进度更新；简单单步不必。清单绑定当前对话任务：切换到不同 mode 的新请求会清空旧清单，承接续写则保留。同一时刻最多一项 in_progress。提交最终文档提案前把清单中剩余项标为 completed（提案成功后本轮会立即结束，之后无法再更新清单）。
@@ -304,9 +304,9 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   const creativeContext = structuredCreativeContext(store, task, characterScope);
   // Scope only gates reading/listing *existing* cards and relationship targets — not prose NPCs or new cards.
   const characterScopeInstruction = characterScope === undefined
-    ? "角色资料按任务相关性自动筛选。list_characters / get_character 可读全部已有普通角色卡；可用 save_character 管理普通卡、save_simple_character 管理简易卡。创建简易角色卡时应先检查同名或相关普通角色卡。"
+    ? "角色资料按任务相关性自动筛选。list_characters / get_character 可读全部已有普通角色卡；情节演进用 apply_character_changes，新建/大改用 save_character，简易卡用 save_simple_character。创建简易角色卡时应先检查同名或相关普通角色卡。"
     : characterScope.length
-      ? `本次可读取/列出的已有角色卡 ID：${characterScope.join("、")}。不得 get_character / 在 relationships 中关联范围外的*已有*角色。这不禁止：① 在正文中写无名或一次性配角（无需建卡）；② 用 save_character 省略 id 新建角色卡（新建后该 ID 即可读取）；③ 更新范围内已有角色卡。不要把「范围外」理解成禁止创作新人物。`
+      ? `本次可读取/列出的已有角色卡 ID：${characterScope.join("、")}。不得 get_character / 在 relationships 中关联范围外的*已有*角色。这不禁止：① 在正文中写无名或一次性配角（无需建卡）；② 用 save_character 省略 id 新建角色卡（新建后该 ID 即可读取）；③ 用 apply_character_changes / save_character 更新范围内已有角色卡。不要把「范围外」理解成禁止创作新人物。`
       : "本次不加载任何已有角色卡：不得 list_characters / get_character 读取既有资料。仍可在正文中写人物；若用户要求或情节需要稳定人设，可用 save_character 省略 id 新建角色卡。";
   const documentInstruction = task.documentProposalRequired
     ? `本次请求必须产生文档提案后才能结束。不得把正文直接作为最终回复；须基于目标 Markdown 文档提交 propose_document_patch 或 propose_document。若工作记忆或本轮工具结果已含目标文档相关原文且文档未变，可直接提案，不必再次读取。${continuationPath ? `本次是承接上一轮的简短续写，默认目标文档为 ${continuationPath}。` : ""}`
@@ -559,13 +559,15 @@ function taskInstructions(mode: WritingTaskMode): string {
 4. 落笔前在内部明确：场景开场、人物目标、阻力、不可逆结果；正文默认 chapters/；设定说明不进正文。
 5. 写作时持续对照风格锚定；对白区分人物；不引入未支撑设定。冲突、情欲、暴力等按剧情直写，不自行降级为含蓄暗示或道德旁白。
 6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。${proseMannerismPreflightLine()}
-7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。偶发一处说明句不拦截；过密的说明性破折号与抽象「不是…而是」会被系统拒绝——只改命中句再提，勿全文重写。`;
+7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。偶发一处说明句不拦截；过密的说明性破折号与抽象「不是…而是」会被系统拒绝——只改命中句再提，勿全文重写。
+8. 若本轮用户已确认、或磁盘正文/大纲已明确发生能力解锁、性格转折或关键经历，在提交提案前用 apply_character_changes 同步；仅草稿想象或未接受提案不要改卡。`;
   if (mode === "rewrite") return `本次工作流（内部执行，不输出分析过程）：
 - 先读「风格锚定」与原文声线；改写后的句长、对白密度须仍贴近原文/样本，除非作者明确要求换风格。
 - 只改变作者明确要求调整的维度，保持其余事件事实、人物动机和信息顺序不变。
 - 风格变化必须落实到叙述距离、句法节奏、对白比例、感官重点和信息释放，而不是同义替换。
 - 保留原文有辨识度的不规则表达，不把句子统一润色成工整、完整、均匀的书面语；不要把直白改成含蓄，除非作者要求。
 - 优先用具体名词和动词替换泛化情绪、程度副词与装饰性修辞；避免为了“更有文采”新增比喻、总结或升华。
+- 若改写落实了已确认的人设/能力/经历变化，用 apply_character_changes 同步角色卡。
 - ${proseMannerismConstraintPrompt({ compact: true })}
 - 对照原文检查信息损失与新增事实，优先通过局部补丁提案提交。提交前：${proseMannerismPreflightLine()}`;
   if (mode === "audit") return `本次工作流：
@@ -573,7 +575,7 @@ function taskInstructions(mode: WritingTaskMode): string {
 - 每个问题必须给出严重度、原文证据、违反的既有事实或叙事约束，以及最小修改建议。
 - 没有文本证据的问题不得提出；区分确定矛盾与可能风险。
 - 用户只要求检查时不要创建修改提案；明确要求修复时才提交提案。`;
-  return "本次工作流：先判断任务属于构思、规划、写作、改写或审校，再遵循对应流程。涉及正文修改时必须先读取原文并提交提案。";
+  return "本次工作流：先判断任务属于构思、规划、写作、改写或审校，再遵循对应流程。涉及正文修改时必须先读取原文并提交提案。若用户确认或已落盘正文/大纲发生能力解锁、性格转折或关键经历，主动 apply_character_changes 同步角色卡。";
 }
 
 function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[]): string {

@@ -18,6 +18,7 @@ import {
   handleValidateOutline,
 } from "./outline.js";
 import {
+  handleApplyCharacterChanges,
   handleGetCharacter,
   handleGetSimpleCharacter,
   handleListCharacters,
@@ -57,6 +58,7 @@ const HANDLERS: Record<string, Handler> = {
   list_simple_characters: handleListSimpleCharacters,
   get_simple_character: handleGetSimpleCharacter,
   save_character: handleSaveCharacter,
+  apply_character_changes: handleApplyCharacterChanges,
   save_simple_character: handleSaveSimpleCharacter,
   inspect_conversation: handleInspectConversation,
   read_conversation: handleReadConversation,
