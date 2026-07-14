@@ -7,6 +7,7 @@ import {
   agentToolNames,
   agentToolSchemaHash,
   compactRuntimeMessages,
+  isSimpleCharacterCardRequest,
   rehydrateRecentToolMessages,
   stripStaleReasoningContent,
 } from "./agent.js";
@@ -16,7 +17,13 @@ import { WriterStore } from "./store.js";
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
-  assert.equal(agentToolSchemaHash(), "7006bfa8a38227b5");
+  assert.equal(agentToolSchemaHash(), "0561540146c06635");
+});
+
+test("simple character card requests use the dedicated route", () => {
+  assert.equal(isSimpleCharacterCardRequest("创建一个简易角色：负责检查和调节展开后武装的李技术员"), true);
+  assert.equal(isSimpleCharacterCardRequest("把简略人物卡更新一下"), true);
+  assert.equal(isSimpleCharacterCardRequest("解释什么是简易角色卡"), false);
 });
 
 type Msg = {

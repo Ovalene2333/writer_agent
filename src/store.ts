@@ -3,8 +3,8 @@ import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal,
-  StyleTemplate, TokenPricing, UsageSummary, WritingExample,
+  ActiveRoleplayState, AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal,
+  RoleplayInterlocutor, RoleplayParticipant, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
 import { characterName, emptyCharacter, migrateV2Character, normalizeV3Character, validateCharacters, type CharacterInput } from "./characters.js";
@@ -79,6 +79,24 @@ export class WriterStore {
         category TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
         notes TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS roleplay_interlocutors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_character_id INTEGER,
+        name TEXT NOT NULL,
+        identity TEXT NOT NULL DEFAULT '',
+        relationship TEXT NOT NULL DEFAULT '',
+        knowledge TEXT NOT NULL DEFAULT '',
+        scene TEXT NOT NULL DEFAULT '',
+        goal TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS active_roleplays (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        character_id INTEGER NOT NULL,
+        interlocutor_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS model_usage (
@@ -331,6 +349,144 @@ export class WriterStore {
     })));
   }
 
+  roleplayInterlocutors(): SavedRoleplayInterlocutor[] {
+    return this.database.prepare("SELECT * FROM roleplay_interlocutors ORDER BY updated_at DESC, id DESC").all()
+      .map(raw => this.roleplayInterlocutorFromRow(raw as Row));
+  }
+
+  saveRoleplayInterlocutor(input: RoleplayInterlocutor & { id?: number; targetCharacterId?: number }): SavedRoleplayInterlocutor {
+    const value: RoleplayInterlocutor = {
+      name: roleplayField(input.name, "名称", 120, true),
+      identity: roleplayField(input.identity, "身份"),
+      relationship: roleplayField(input.relationship, "关系"),
+      knowledge: roleplayField(input.knowledge, "已知信息"),
+      scene: roleplayField(input.scene, "场景"),
+      goal: roleplayField(input.goal, "目标"),
+    };
+    if (input.targetCharacterId !== undefined && (!Number.isInteger(input.targetCharacterId) || input.targetCharacterId < 1)) {
+      throw new Error("关联的试演角色 ID 无效");
+    }
+    const targetCharacterId = input.targetCharacterId;
+    if (targetCharacterId && !this.characters().some(item => item.id === targetCharacterId)) throw new Error("关联的试演角色不存在");
+    const now = new Date().toISOString();
+    if (input.id !== undefined && (!Number.isInteger(input.id) || input.id < 1)) throw new Error("试演身份 ID 无效");
+    let id = input.id;
+    if (id) {
+      const result = this.database.prepare(`UPDATE roleplay_interlocutors SET
+        target_character_id=?,name=?,identity=?,relationship=?,knowledge=?,scene=?,goal=?,updated_at=? WHERE id=?`)
+        .run(targetCharacterId ?? null, value.name, value.identity, value.relationship, value.knowledge, value.scene, value.goal, now, id);
+      if (!result.changes) throw new Error("试演身份不存在");
+    } else {
+      id = Number(this.database.prepare(`INSERT INTO roleplay_interlocutors(
+        target_character_id,name,identity,relationship,knowledge,scene,goal,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+        targetCharacterId ?? null, value.name, value.identity, value.relationship, value.knowledge, value.scene, value.goal, now, now,
+      ).lastInsertRowid);
+    }
+    const row = this.database.prepare("SELECT * FROM roleplay_interlocutors WHERE id=?").get(id) as Row | undefined;
+    if (!row) throw new Error("试演身份保存失败");
+    return this.roleplayInterlocutorFromRow(row);
+  }
+
+  deleteRoleplayInterlocutor(id: number): void {
+    if (!this.database.prepare("DELETE FROM roleplay_interlocutors WHERE id=?").run(id).changes) {
+      throw new Error("试演身份不存在");
+    }
+  }
+
+  activeRoleplay(sessionId: string): ActiveRoleplayState | undefined {
+    const row = this.database.prepare("SELECT character_id,interlocutor_json FROM active_roleplays WHERE session_id=?")
+      .get(sessionId) as Row | undefined;
+    if (!row) return undefined;
+    const characterId = Number(row.character_id);
+    let parsed: unknown;
+    try { parsed = JSON.parse(String(row.interlocutor_json)); }
+    catch {
+      this.clearActiveRoleplay(sessionId);
+      return undefined;
+    }
+    const raw = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+    if (raw.performer && raw.identity) {
+      const performer = this.resolveRoleplayParticipant(raw.performer);
+      const identity = this.resolveRoleplayParticipant(raw.identity);
+      if (!performer || !identity) {
+        this.clearActiveRoleplay(sessionId);
+        return undefined;
+      }
+      return { performer, identity };
+    }
+    // Compatibility with the previous shape: normal performer + interlocutor JSON.
+    const character = this.characters().find(item => item.id === characterId);
+    if (!character) {
+      this.clearActiveRoleplay(sessionId);
+      return undefined;
+    }
+    const base = normalizeStoredInterlocutor(parsed);
+    const savedId = Number(raw.id);
+    const saved = Number.isInteger(savedId) && savedId > 0
+      ? this.roleplayInterlocutors().find(item => item.id === savedId)
+      : undefined;
+    return {
+      performer: normalRoleplayParticipant(character),
+      identity: saved ? simpleRoleplayParticipant(saved) : { kind: "generated", name: base.name, card: base },
+    };
+  }
+
+  saveActiveRoleplay(
+    sessionId: string,
+    performerInput: number | RoleplayParticipant,
+    identityInput: RoleplayParticipant | RoleplayInterlocutor | SavedRoleplayInterlocutor,
+  ): ActiveRoleplayState {
+    if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
+    const performer = typeof performerInput === "number"
+      ? this.characters().find(item => item.id === performerInput)
+      : undefined;
+    const normalizedPerformer = typeof performerInput === "number"
+      ? (performer ? normalRoleplayParticipant(performer) : undefined)
+      : this.resolveRoleplayParticipant(performerInput);
+    if (!normalizedPerformer || normalizedPerformer.kind === "generated") throw new Error("扮演者角色卡不存在");
+    let identity: RoleplayParticipant | undefined;
+    if ("kind" in identityInput) identity = this.resolveRoleplayParticipant(identityInput);
+    else if ("id" in identityInput) {
+      const saved = this.roleplayInterlocutors().find(item => item.id === identityInput.id);
+      if (saved) identity = simpleRoleplayParticipant(saved);
+    } else {
+      const base = normalizeStoredInterlocutor(identityInput);
+      identity = { kind: "generated", name: base.name, card: base };
+    }
+    if (!identity) throw new Error("当前身份角色卡不存在");
+    const active = { performer: normalizedPerformer, identity };
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO active_roleplays(session_id,character_id,interlocutor_json,updated_at)
+      VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+      character_id=excluded.character_id,interlocutor_json=excluded.interlocutor_json,updated_at=excluded.updated_at`)
+      .run(sessionId, normalizedPerformer.kind === "normal" ? (normalizedPerformer.id ?? 0) : 0, JSON.stringify(active), now);
+    return active;
+  }
+
+  private resolveRoleplayParticipant(value: unknown): RoleplayParticipant | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const raw = value as Record<string, unknown>;
+    const id = Number(raw.id);
+    if (raw.kind === "normal" && Number.isInteger(id)) {
+      const character = this.characters().find(item => item.id === id);
+      return character ? normalRoleplayParticipant(character) : undefined;
+    }
+    if (raw.kind === "simple" && Number.isInteger(id)) {
+      const card = this.roleplayInterlocutors().find(item => item.id === id);
+      return card ? simpleRoleplayParticipant(card) : undefined;
+    }
+    if (raw.kind === "generated") {
+      const card = normalizeStoredInterlocutor(raw.card);
+      return { kind: "generated", name: card.name, card };
+    }
+    return undefined;
+  }
+
+  clearActiveRoleplay(sessionId: string): void {
+    this.database.prepare("DELETE FROM active_roleplays WHERE session_id=?").run(sessionId);
+  }
+
   writingExamples(): WritingExample[] {
     return this.database.prepare("SELECT * FROM writing_examples ORDER BY updated_at DESC, id DESC").all()
       .map(row => this.exampleFromRow(row as Row));
@@ -426,6 +582,22 @@ export class WriterStore {
     return {
       id: row.id as number, title: row.title as string, category: row.category as string,
       content: row.content as string, notes: row.notes as string, updatedAt: row.updated_at as string,
+    };
+  }
+
+  private roleplayInterlocutorFromRow(row: Row): SavedRoleplayInterlocutor {
+    return {
+      id: Number(row.id),
+      ...(Number.isInteger(Number(row.target_character_id)) && Number(row.target_character_id) > 0
+        ? { targetCharacterId: Number(row.target_character_id) } : {}),
+      name: String(row.name),
+      identity: String(row.identity),
+      relationship: String(row.relationship),
+      knowledge: String(row.knowledge),
+      scene: String(row.scene),
+      goal: String(row.goal),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
     };
   }
 
@@ -534,6 +706,56 @@ export class WriterStore {
           SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
           WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, limit);
+    return rows.map((row) => this.messageFromRow(row as Row));
+  }
+
+  /** Lightweight archive metadata for conversations that exceed the model context window. */
+  conversationStats(sessionId: string): {
+    total: number; agent: number; roleplay: number; characters: number;
+    firstMessageId?: number; lastMessageId?: number;
+  } {
+    const row = this.database.prepare(`SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN channel='agent' THEN 1 ELSE 0 END),0) AS agent,
+      COALESCE(SUM(CASE WHEN channel='roleplay' THEN 1 ELSE 0 END),0) AS roleplay,
+      COALESCE(SUM(LENGTH(content)),0) AS characters,
+      MIN(id) AS first_id, MAX(id) AS last_id
+      FROM messages WHERE session_id=? AND role IN ('user','assistant')`).get(sessionId) as Row;
+    return {
+      total: Number(row.total), agent: Number(row.agent), roleplay: Number(row.roleplay),
+      characters: Number(row.characters),
+      ...(row.first_id === null ? {} : { firstMessageId: Number(row.first_id) }),
+      ...(row.last_id === null ? {} : { lastMessageId: Number(row.last_id) }),
+    };
+  }
+
+  /** Read an archive page in chronological order. `afterId=0` starts at the beginning. */
+  conversationMessages(
+    sessionId: string,
+    options: { channel?: MessageChannel; afterId?: number; limit?: number } = {},
+  ): Message[] {
+    const afterId = Number.isInteger(options.afterId) && (options.afterId ?? 0) > 0 ? options.afterId! : 0;
+    const limit = Math.max(1, Math.min(100, Math.round(options.limit ?? 40)));
+    const rows = options.channel
+      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel FROM messages
+          WHERE session_id=? AND channel=? AND role IN ('user','assistant') AND id>?
+          ORDER BY id ASC LIMIT ?`).all(sessionId, options.channel, afterId, limit)
+      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel FROM messages
+          WHERE session_id=? AND role IN ('user','assistant') AND id>?
+          ORDER BY id ASC LIMIT ?`).all(sessionId, afterId, limit);
+    return rows.map((row) => this.messageFromRow(row as Row));
+  }
+
+  /** Read the page immediately before `beforeId`; omit it to get the newest page. */
+  conversationMessagesBefore(sessionId: string, beforeId?: number, limit = 50): Message[] {
+    const normalizedLimit = Math.max(1, Math.min(100, Math.round(limit)));
+    const rows = beforeId !== undefined && Number.isInteger(beforeId) && beforeId > 0
+      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+          WHERE session_id=? AND role IN ('user','assistant') AND id<? ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
+          .all(sessionId, beforeId, normalizedLimit)
+      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+          WHERE session_id=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
+          .all(sessionId, normalizedLimit);
     return rows.map((row) => this.messageFromRow(row as Row));
   }
 
@@ -948,4 +1170,46 @@ function searchFragments(terms: string[]): string[] {
     }
   }
   return [...fragments].slice(0, 40);
+}
+
+function roleplayField(value: unknown, label: string, max = 2_000, required = false): string {
+  if (typeof value !== "string") throw new Error(`试演身份的${label}必须是字符串`);
+  const normalized = value.trim();
+  if (required && !normalized) throw new Error(`试演身份的${label}不能为空`);
+  if (normalized.length > max) throw new Error(`试演身份的${label}过长`);
+  return normalized;
+}
+
+function normalizeStoredInterlocutor(input: unknown): RoleplayInterlocutor {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("当前试演人设格式无效");
+  const value = input as Record<string, unknown>;
+  return {
+    name: roleplayField(value.name, "名称", 120, true),
+    identity: roleplayField(value.identity, "身份"),
+    relationship: roleplayField(value.relationship, "关系"),
+    knowledge: roleplayField(value.knowledge, "已知信息"),
+    scene: roleplayField(value.scene, "场景"),
+    goal: roleplayField(value.goal, "目标"),
+  };
+}
+
+function simpleRoleplayParticipant(value: SavedRoleplayInterlocutor): RoleplayParticipant {
+  const card = normalizeStoredInterlocutor(value);
+  return { kind: "simple", id: value.id, name: card.name, card };
+}
+
+function normalRoleplayParticipant(character: Character): RoleplayParticipant {
+  return {
+    kind: "normal",
+    id: character.id,
+    name: character.identity.name,
+    card: {
+      name: character.identity.name,
+      identity: character.identity.summary || character.identity.narrativeRole,
+      relationship: "",
+      knowledge: "",
+      scene: "",
+      goal: character.motivations.find(item => item.status === "active")?.summary ?? "",
+    },
+  };
 }

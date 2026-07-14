@@ -16,10 +16,10 @@
 - **项目技能**：`.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md`，按需 `load_skill`
 - **修改提案与撤销**：Agent 默认不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo
 - **角色卡**：结构化角色资料，可供检索与写作引用
-- **角色扮演试演（测试性）**：`/roleplay <角色>` 或 Web 角色卡「试演」——以角色第一人称对话，检验声线与人设；Web 试演可先描述对话者身份，由 Agent 按需查询角色卡与世界观生成设定；纯对话、不改文档
+- **角色扮演试演（测试性）**：`/roleplay <角色>` 或 Web 顶部「扮演」——扮演者和当前身份都可选简易/普通角色卡，当前身份也可由 Agent 按需查询角色卡与世界观生成（默认保存为简易角色卡）；当前试演按会话保存，刷新后自动恢复；纯对话、不改文档
 - **结构化大纲**：幕 / 章 / 场景节点，可与正文对照校验
 - **风格模板**：内置网文爽文、传统文学、轻小说、悬疑推理、玄幻仙侠等
-- **多模型分工**：可为 agent / writer / reviewer 等角色配置不同供应商与模型
+- **多模型分工**：可为 agent / roleplay / writer / reviewer 等角色配置不同供应商与模型
 - **导出**：按章节顺序导出完整作品为 Markdown 或纯文本
 
 ## 环境要求
@@ -96,7 +96,7 @@ writer web -p ./my-novel          # 指定项目目录
 writer web --port 4096            # 端口，默认 4096
 writer web --lan                  # 监听 0.0.0.0，允许局域网访问
 writer web --host 0.0.0.0         # 自定义监听地址
-writer web --share                # 通过 cloudflared 创建临时公网地址（含访问令牌）
+writer web --share                # 局域网 + cloudflared；扫一次码，进出家自动切换通道
 writer web --no-open              # 不自动打开浏览器
 writer web --debug                # 打印 step 内容 + 模型请求/响应体
 writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / output（推荐排查 UI step）
@@ -217,6 +217,7 @@ style: ""   # 可设为风格模板 id，如 light-novel
 | 角色 | 用途 |
 |------|------|
 | `agent` | 任务规划与工具调用 |
+| `roleplay` | 角色试演、身份设定与沉浸式对白 |
 | `writer` | 正文生成 |
 | `inline` | 局部改写等 |
 | `reviewer` | 审阅 / 质检 |
@@ -305,6 +306,8 @@ npm test                    # 编译并跑测试
 
 - `.writer/providers.json`（或 `WRITER_PROVIDERS_FILE` 指向的文件）含 API Key，**不要提交到公开仓库**
 - `writer web --share` 会把带令牌的公网地址暴露到外网；只发给可信设备，结束进程后隧道关闭
+- `--share` 会同时监听局域网：终端二维码为**局域网入口**（hash 里带公网地址）。手机在家扫一次后，Web 端会探测 `/api/health`，在家走局域网、出门自动改打 Cloudflare；下次重启 Writer 需重新扫码（临时隧道地址会变）
+- 请在**家中 Wi‑Fi** 下扫推荐二维码。若先打开纯公网 HTTPS 页，浏览器会拦截对局域网 HTTP 的探测（混合内容），无法自动切回局域网
 - `--lan` 会允许同一局域网内的设备访问工作台，请注意网络安全环境
 
 ## 许可证

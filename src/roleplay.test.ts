@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { describe, test } from "node:test";
 import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
-import { buildRoleplaySystemPrompt, isRoleplayExitCommand } from "./roleplay.js";
+import { buildRoleplaySystemPrompt, isRoleplayExitCommand, roleplaySampling } from "./roleplay.js";
 import { WriterStore } from "./store.js";
+import { handleGetSimpleCharacter, handleListSimpleCharacters, handleSaveSimpleCharacter } from "./tools/characters.js";
+import { handleInspectConversation, handleReadConversation } from "./tools/conversation.js";
 import type { Character } from "./types.js";
 
 function sampleCharacter(): Character {
@@ -46,7 +48,16 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /第一人称/);
     assert.match(prompt, /看不到写作 Agent/);
     assert.match(prompt, /未透露姓名的来访者/);
+    assert.match(prompt, /实时对手戏，不是问答/);
+    assert.match(prompt, /写出潜台词/);
+    assert.match(prompt, /不要每轮都用问题收尾/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
+  });
+
+  test("roleplay sampling stays lively without allowing incoherent extremes", () => {
+    assert.deepEqual(roleplaySampling({}), { temperature: 0.95, topP: 0.95 });
+    assert.deepEqual(roleplaySampling({ temperature: 0.2, topP: 0.5 }), { temperature: 0.85, topP: 0.9 });
+    assert.deepEqual(roleplaySampling({ temperature: 1.8, topP: 1.2 }), { temperature: 1.3, topP: 1 });
   });
 
   test("system prompt fixes the generated interlocutor identity without controlling the user", () => {
@@ -97,6 +108,176 @@ describe("message channel isolation", () => {
       const agentOnly = store.messages(sessionId, 20, { channel: "agent" });
       assert.equal(agentOnly.length, 2);
       assert.ok(agentOnly.every(item => item.channel === "agent"));
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("saved roleplay interlocutors", () => {
+  test("agent tool saves a generated simple character card", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-simple-character-tool-"));
+    try {
+      const project = WriterProject.init(root, "简易角色工具");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("创建简易角色");
+      const result = JSON.parse(handleSaveSimpleCharacter({
+        input: {
+          name: "李技术员", identity: "夏展展开后武装的检修技术员", relationship: "负责支援夏展",
+          knowledge: "了解展开后武装的检查流程", scene: "整备区", goal: "完成检查与调节",
+        },
+        project, store, sessionId, emit: () => undefined, context: { permissionMode: "auto" },
+      })) as { kind: string; created: boolean };
+      assert.equal(result.kind, "simple");
+      assert.equal(result.created, true);
+      assert.equal(store.roleplayInterlocutors()[0].name, "李技术员");
+      assert.equal(store.characters().length, 0);
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("agent tools list and read complete simple character cards", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-simple-character-read-"));
+    try {
+      const project = WriterProject.init(root, "simple read");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("read");
+      const saved = store.saveRoleplayInterlocutor({
+        name: "Technician Li", identity: "maintenance technician", relationship: "supports the lead",
+        knowledge: "inspection procedure", scene: "hangar", goal: "finish calibration",
+      });
+      const args = { project, store, sessionId, emit: () => undefined, context: { permissionMode: "auto" as const } };
+      const listed = JSON.parse(handleListSimpleCharacters({ ...args, input: {} })) as Array<{ id: number }>;
+      assert.equal(listed[0].id, saved.id);
+      const card = JSON.parse(handleGetSimpleCharacter({ ...args, input: { id: saved.id } })) as { knowledge: string };
+      assert.equal(card.knowledge, "inspection procedure");
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("persist separately from full character cards and support update/delete", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-card-"));
+    try {
+      const project = WriterProject.init(root, "试演身份库");
+      const store = new WriterStore(project);
+      const characterCount = store.characters().length;
+      const saved = store.saveRoleplayInterlocutor({
+        name: "苏远",
+        identity: "基地教官",
+        relationship: "林千夏的搭档",
+        knowledge: "知道训练安排",
+        scene: "医务室",
+        goal: "确认她的状态",
+      });
+      assert.ok(saved.id > 0);
+      assert.equal(store.characters().length, characterCount);
+      assert.equal(store.roleplayInterlocutors()[0].name, "苏远");
+
+      const updated = store.saveRoleplayInterlocutor({ ...saved, identity: "泛亚基地教官" });
+      assert.equal(updated.id, saved.id);
+      assert.equal(store.roleplayInterlocutors()[0].identity, "泛亚基地教官");
+
+      store.deleteRoleplayInterlocutor(saved.id);
+      assert.deepEqual(store.roleplayInterlocutors(), []);
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("active roleplay survives store reopen and clears on exit", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-active-roleplay-"));
+    try {
+      const project = WriterProject.init(root, "当前试演");
+      let store = new WriterStore(project);
+      const character = store.saveCharacter({ identity: emptyCharacter("林千夏").identity });
+      const sessionId = store.createSession("试演会话");
+      store.saveActiveRoleplay(sessionId, character.id, {
+        name: "苏远",
+        identity: "基地教官",
+        relationship: "林千夏的搭档",
+        knowledge: "知道训练安排",
+        scene: "医务室",
+        goal: "确认她的状态",
+      });
+      store.close();
+
+      store = new WriterStore(project);
+      const restored = store.activeRoleplay(sessionId);
+      assert.equal(restored?.performer.id, character.id);
+      assert.equal(restored?.performer.name, "林千夏");
+      assert.equal(restored?.identity.name, "苏远");
+      store.clearActiveRoleplay(sessionId);
+      assert.equal(store.activeRoleplay(sessionId), undefined);
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("simple and normal cards can be selected on either side", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-participants-"));
+    try {
+      const project = WriterProject.init(root, "双向角色卡");
+      let store = new WriterStore(project);
+      const normal = store.saveCharacter({ identity: emptyCharacter("林千夏").identity });
+      const simple = store.saveRoleplayInterlocutor({
+        name: "苏远", identity: "基地教官", relationship: "搭档",
+        knowledge: "知道训练安排", scene: "医务室", goal: "确认她的状态",
+      });
+      const sessionId = store.createSession("双向选择");
+      store.saveActiveRoleplay(
+        sessionId,
+        { kind: "simple", id: simple.id, name: simple.name, card: simple },
+        { kind: "normal", id: normal.id, name: normal.identity.name, card: { name: normal.identity.name, identity: "", relationship: "", knowledge: "", scene: "", goal: "" } },
+      );
+      store.close();
+
+      store = new WriterStore(project);
+      const restored = store.activeRoleplay(sessionId);
+      assert.equal(restored?.performer.kind, "simple");
+      assert.equal(restored?.performer.name, "苏远");
+      assert.equal(restored?.identity.kind, "normal");
+      assert.equal(restored?.identity.name, "林千夏");
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("conversation archive retrieval", () => {
+  test("pages roleplay history from the beginning without mixing agent messages", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-conversation-archive-"));
+    try {
+      const project = WriterProject.init(root, "archive");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("archive");
+      store.addMessage(sessionId, "user", "agent-only", "agent");
+      store.addMessage(sessionId, "user", "roleplay-one", "roleplay");
+      store.addMessage(sessionId, "assistant", "roleplay-two", "roleplay");
+      store.addMessage(sessionId, "user", "roleplay-three", "roleplay");
+      const args = { project, store, sessionId, emit: () => undefined, context: { permissionMode: "auto" as const } };
+      const stats = JSON.parse(handleInspectConversation({ ...args, input: {} })) as { roleplay: number; agent: number };
+      assert.equal(stats.roleplay, 3);
+      assert.equal(stats.agent, 1);
+      const newest = store.conversationMessagesBefore(sessionId, undefined, 2);
+      assert.deepEqual(newest.map(message => message.content), ["roleplay-two", "roleplay-three"]);
+      const older = store.conversationMessagesBefore(sessionId, newest[0].id, 2);
+      assert.deepEqual(older.map(message => message.content), ["agent-only", "roleplay-one"]);
+      const first = JSON.parse(handleReadConversation({ ...args, input: { channel: "roleplay", afterId: 0, limit: 2 } })) as { content: string; hasMore: boolean; nextAfterId: number };
+      assert.match(first.content, /roleplay-one/);
+      assert.match(first.content, /roleplay-two/);
+      assert.doesNotMatch(first.content, /agent-only/);
+      assert.equal(first.hasMore, true);
+      const second = JSON.parse(handleReadConversation({ ...args, input: { channel: "roleplay", afterId: first.nextAfterId, limit: 2 } })) as { content: string; hasMore: boolean };
+      assert.match(second.content, /roleplay-three/);
+      assert.equal(second.hasMore, false);
       store.close();
     } finally {
       rmSync(root, { recursive: true, force: true });

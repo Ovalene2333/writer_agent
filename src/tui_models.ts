@@ -44,6 +44,7 @@ export const CONNECT_PRESETS: ConnectPreset[] = [
 
 export const MODEL_ROLES: Array<{ id: Exclude<ModelUsageRole, "drafter">; name: string; detail: string }> = [
   { id: "agent", name: "Agent 调度", detail: "理解请求、规划任务与调用工具" },
+  { id: "roleplay", name: "角色扮演", detail: "角色试演、对话者设定与沉浸式对白" },
   { id: "inline", name: "行内生成", detail: "短文本补全与局部快速修改" },
   { id: "writer", name: "正文写作", detail: "续写、重写与长篇内容生成" },
   { id: "reviewer", name: "审阅校对", detail: "质量检查、润色与修改建议" },

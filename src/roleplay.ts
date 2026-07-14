@@ -1,4 +1,4 @@
-import type { AgentEvent, Character, ModelConfig, StepUsage, UsageSummary } from "./types.js";
+import type { AgentEvent, Character, ModelConfig, RoleplayInterlocutor, RoleplayParticipant, StepUsage, UsageSummary } from "./types.js";
 import { characterName, characterPromptViews } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
@@ -15,16 +15,6 @@ type SetupMessage = {
   tool_calls?: ToolCall[];
 };
 
-/** Agent 根据试演要求生成的对话者身份；只在当前试演状态中使用。 */
-export type RoleplayInterlocutor = {
-  name: string;
-  identity: string;
-  relationship: string;
-  knowledge: string;
-  scene: string;
-  goal: string;
-};
-
 /** 会话内角色扮演状态（测试性子功能，不落库）。 */
 export type RoleplayTarget = { characterId: number; name: string };
 
@@ -35,16 +25,20 @@ export function isRoleplayExitCommand(text: string): boolean {
     || normalized === "/rp off";
 }
 
-export function buildRoleplaySystemPrompt(character: Character, project?: WriterProject, interlocutor?: RoleplayInterlocutor): string {
+export function buildRoleplaySystemPrompt(character: Character | RoleplayInterlocutor, project?: WriterProject, interlocutor?: RoleplayInterlocutor | Character): string {
   const nodes = project ? new OutlineStore(project).sync().nodes : [];
-  const views = characterPromptViews(character, nodes);
-  const name = characterName(character);
+  const full = "schemaVersion" in character;
+  const views = full ? characterPromptViews(character, nodes) : { simple: character };
+  const name = full ? characterName(character) : character.name;
+  const interlocutorData = interlocutor && "schemaVersion" in interlocutor
+    ? characterPromptViews(interlocutor, nodes)
+    : interlocutorView(interlocutor ?? defaultInterlocutor());
   return `你正在进行「角色扮演试演」（Writer Agent 的测试性子功能）。
 你就是「${name}」，不是写作助手、不是旁白 AI。用户在试你的人设、声线与反应是否对味。
 
 扮演规则：
 1. 始终以 ${name} 的第一人称说话与行动；保持 identity / psychology / voice 一致。
-2. 对白优先；必要时用简短动作/神态描写（*…* 或括号均可），不要写成章回体大段正文。
+2. 这是实时对手戏，不是问答。每次先让角色对用户刚才的话产生具体反应，再说话或行动；反应可以是停顿、目光、呼吸、姿势、触碰物件、拉近/避开距离等，但只选当下最有表现力的一两处。
 3. 只使用角色卡中已有的设定与合理推断；不知道的事就表现为不知道，不要编造关键背景来“圆场”。
 4. 不要修改项目文档、不要提交提案、不要输出工具调用；这是纯对话试演。
 5. 用户若用 OOC / （） / 【】 进行出戏说明，可短暂用 OOC 回答后立刻回到角色。
@@ -53,8 +47,17 @@ export function buildRoleplaySystemPrompt(character: Character, project?: Writer
 8. 上下文仅包含本角色扮演通道的历史对白与角色卡；看不到写作 Agent 的任务讨论，也不要假装记得那些内容。
 9. 用户在本次试演中固定扮演下述“对话者”；按设定理解用户的身份、双方关系、已知信息和当前处境。不要替用户决定动作、台词或内心。
 
+演出要求：
+- 保持主动性：角色有自己的欲望、顾虑和当下目标。合乎人设时可转移话题、追问、试探、回避、撒谎、打断或采取一个小行动，不要永远等用户推动。
+- 写出潜台词：不要直接宣布“我很紧张/生气/害羞”，优先让措辞、迟疑、动作和注意力落点泄露情绪。说出口的话可以与真实意图不完全一致。
+- 保持现场连续：记住双方距离、姿势、已经出现的物件与刚发生的动作；环境只在能影响互动时落一笔，不凭空切换场景。
+- 对白要像人在说话：句长和节奏随情绪变化，可有半句话、改口、沉默和打断；沿用 voice 中的措辞习惯，但不要机械复读口头禅或示例台词。
+- 默认写 1–4 个短段，篇幅随情绪与事件变化。不要为了“简短”砍掉关键反应，也不要扩写成旁白主导的小说章节。
+- 不要复述用户刚说的话，不要总结角色卡，不要使用客服式确认，不要每轮都用问题收尾。用户输入很短时，也应直接给出符合场景的鲜明反应，而不是出戏索要更多说明。
+- 动作、对白、感官细节不必每轮全部出现；宁可抓住一个准确细节，也不要堆砌表情、形容词或舞台指示。
+
 对话者设定（JSON）：
-${JSON.stringify(interlocutor ?? defaultInterlocutor(), null, 2)}
+${JSON.stringify(interlocutorData, null, 2)}
 
 角色资料（JSON，stable=稳定人设，dialogue=声线，scene=当前场景切片）：
 ${JSON.stringify(views, null, 2)}
@@ -65,7 +68,9 @@ export async function runRoleplayChat(options: {
   project: WriterProject;
   store: WriterStore;
   sessionId: string;
-  characterId: number;
+  performer?: RoleplayParticipant;
+  characterId?: number;
+  identity?: RoleplayParticipant;
   interlocutor?: RoleplayInterlocutor;
   prompt: string;
   model: ModelConfig;
@@ -74,8 +79,12 @@ export async function runRoleplayChat(options: {
 }): Promise<void> {
   const emit = options.onEvent ?? (() => undefined);
   if (!options.store.sessionExists(options.sessionId)) throw new Error("会话不存在");
-  const character = options.store.characters().find(item => item.id === options.characterId);
-  if (!character) throw new Error("目标角色卡不存在");
+  const participant = options.performer ?? (Number.isInteger(options.characterId) ? participantFromNormal(options.store, options.characterId!) : undefined);
+  if (!participant) throw new Error("扮演者角色卡不存在");
+  const character = participant.kind === "normal" && participant.id
+    ? options.store.characters().find(item => item.id === participant.id)
+    : participant.card;
+  if (!character) throw new Error("扮演者角色卡不存在");
   if (!options.model.apiKey && !options.model.baseUrl.includes("localhost") && !options.model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未设置模型 API Key");
   }
@@ -92,8 +101,11 @@ export async function runRoleplayChat(options: {
     .slice(0, -1) // exclude the user message just written
     .map(message => ({ role: message.role as "user" | "assistant", content: message.content }));
 
+  const identity = options.identity?.kind === "normal" && options.identity.id
+    ? options.store.characters().find(item => item.id === options.identity!.id)
+    : options.identity?.card ?? options.interlocutor;
   const messages: ChatMessage[] = [
-    { role: "system", content: buildRoleplaySystemPrompt(character, options.project, options.interlocutor) },
+    { role: "system", content: buildRoleplaySystemPrompt(character, options.project, identity) },
     ...history,
     { role: "user", content: userText },
   ];
@@ -104,7 +116,7 @@ export async function runRoleplayChat(options: {
       full += text;
       emit({ type: "text", text, channel: "output" });
     });
-    const reply = (full || result.content).trim() || `（${characterName(character)} 沉默了一会儿）`;
+    const reply = (full || result.content).trim() || `（${participant.name} 沉默了一会儿）`;
     if (!full.trim() && result.content.trim()) {
       emit({ type: "text", text: result.content, channel: "output" });
     }
@@ -136,17 +148,33 @@ export function defaultInterlocutor(): RoleplayInterlocutor {
   };
 }
 
+function interlocutorView(value: RoleplayInterlocutor): RoleplayInterlocutor {
+  return {
+    name: value.name,
+    identity: value.identity,
+    relationship: value.relationship,
+    knowledge: value.knowledge,
+    scene: value.scene,
+    goal: value.goal,
+  };
+}
+
 /** 根据自然语言要求建立试演对话者；模型可按需查询角色卡与世界观，但不会写入项目。 */
 export async function generateRoleplayInterlocutor(options: {
   project: WriterProject;
   store: WriterStore;
-  characterId: number;
+  performer?: RoleplayParticipant;
+  characterId?: number;
   request: string;
   model: ModelConfig;
   signal?: AbortSignal;
 }): Promise<RoleplayInterlocutor> {
-  const target = options.store.characters().find(item => item.id === options.characterId);
-  if (!target) throw new Error("目标角色卡不存在");
+  const performer = options.performer ?? (Number.isInteger(options.characterId) ? participantFromNormal(options.store, options.characterId!) : undefined);
+  if (!performer) throw new Error("扮演者角色卡不存在");
+  const target = performer.kind === "normal" && performer.id
+    ? options.store.characters().find(item => item.id === performer.id)
+    : performer.card;
+  if (!target) throw new Error("扮演者角色卡不存在");
   const request = options.request.trim();
   if (!request) return defaultInterlocutor();
   if (!options.model.apiKey && !options.model.baseUrl.includes("localhost") && !options.model.baseUrl.includes("127.0.0.1")) {
@@ -163,7 +191,7 @@ export async function generateRoleplayInterlocutor(options: {
 
 最终只输出 JSON 对象，且恰好包含这些字符串字段：name、identity、relationship、knowledge、scene、goal。内容应具体、简洁；资料没有定义的细节明确保留为空白或写“未明确”。` },
     { role: "user", content: `被试演角色：
-${JSON.stringify(characterPromptViews(target, new OutlineStore(options.project).sync().nodes), null, 2)}
+${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new OutlineStore(options.project).sync().nodes) : { simple: target }, null, 2)}
 
 对话者设定要求：${request}` },
   ];
@@ -237,6 +265,24 @@ function parseInterlocutor(text: string): RoleplayInterlocutor {
   return { name: field("name"), identity: field("identity"), relationship: field("relationship"), knowledge: field("knowledge"), scene: field("scene"), goal: field("goal") };
 }
 
+export function participantFromNormal(store: WriterStore, id: number): RoleplayParticipant | undefined {
+  const character = store.characters().find(item => item.id === id);
+  if (!character) return undefined;
+  return {
+    kind: "normal",
+    id: character.id,
+    name: character.identity.name,
+    card: {
+      name: character.identity.name,
+      identity: character.identity.summary || character.identity.narrativeRole,
+      relationship: "",
+      knowledge: "",
+      scene: "",
+      goal: character.motivations.find(item => item.status === "active")?.summary ?? "",
+    },
+  };
+}
+
 function emitUsage(
   emit: (event: AgentEvent) => void,
   store: WriterStore,
@@ -263,6 +309,14 @@ function emitUsage(
   emit({ type: "usage", usage: sessionUsage, call, step });
 }
 
+/** Roleplay stays warmer than task-oriented agent calls, while avoiding incoherent extremes. */
+export function roleplaySampling(model: Pick<ModelConfig, "temperature" | "topP">): { temperature: number; topP: number } {
+  return {
+    temperature: Math.min(1.3, Math.max(0.85, model.temperature ?? 0.95)),
+    topP: Math.min(1, Math.max(0.9, model.topP ?? 0.95)),
+  };
+}
+
 async function streamRoleplayText(
   model: ModelConfig,
   messages: ChatMessage[],
@@ -270,15 +324,14 @@ async function streamRoleplayText(
   onText: (text: string) => void,
 ): Promise<{ content: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  // Slightly warmer default for voice testing when profile has no explicit sampling.
-  const temperature = model.temperature ?? 0.9;
+  const sampling = roleplaySampling(model);
   const requestBody = JSON.stringify({
     model: model.model,
     messages,
     stream: true,
     stream_options: { include_usage: true },
-    temperature,
-    ...(model.topP === undefined ? {} : { top_p: model.topP }),
+    temperature: sampling.temperature,
+    top_p: sampling.topP,
   });
   logModelRequest(endpoint, requestBody);
   const response = await fetch(endpoint, {

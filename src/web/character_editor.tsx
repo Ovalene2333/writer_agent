@@ -218,7 +218,6 @@ export function CharacterEditor(props: {
   onClose: () => void;
   onSave: () => void;
   onDelete?: () => void;
-  onRoleplay?: () => void;
 }) {
   const { draft, onChange } = props;
   const [section, setSection] = useState<SectionId>("overview");
@@ -305,11 +304,6 @@ export function CharacterEditor(props: {
             </div>
           </div>
           <div className="ce-header-actions">
-            {props.onRoleplay && draft.id ? (
-              <button type="button" className="ghost" disabled={props.busy} onClick={props.onRoleplay} title="以该角色第一人称试演">
-                试演
-              </button>
-            ) : null}
             {props.onDelete && draft.id ? (
               <button type="button" className="danger ghost" disabled={props.busy} onClick={props.onDelete}>
                 删除

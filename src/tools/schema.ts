@@ -269,6 +269,72 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "list_simple_characters",
+      description: "List simple character cards. These are stored separately from normal v3 character cards and are commonly used by roleplay participants",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_simple_character",
+      description: "Read a complete simple character card by id, including identity, relationship, knowledge, scene, and goal",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "number", description: "Simple character id from list_simple_characters" } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "save_simple_character",
+      description: "创建或更新简易角色卡。它只包含角色扮演所需的名称、身份、关系、已知信息、场景和目标；创建前应按需检索已有角色卡与项目设定，避免与项目事实冲突。",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "number", description: "更新已有简易角色卡时填写；新建时省略" },
+          name: { type: "string", description: "角色名称" },
+          identity: { type: "string", description: "身份、职责、阵营与必要背景" },
+          relationship: { type: "string", description: "与相关角色的关系" },
+          knowledge: { type: "string", description: "当前已知信息与认知边界" },
+          scene: { type: "string", description: "当前场景或常用出场环境" },
+          goal: { type: "string", description: "当前目标" },
+        },
+        required: ["name", "identity", "relationship", "knowledge", "scene", "goal"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "inspect_conversation",
+      description: "Inspect counts, channels, character size, and message id range for the complete current conversation archive",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_conversation",
+      description: "Read the complete current conversation archive in chronological pages. For long roleplay-based writing, start with afterId=0 and channel=roleplay, then follow nextAfterId until hasMore=false",
+      parameters: {
+        type: "object",
+        properties: {
+          channel: { type: "string", enum: ["roleplay", "agent"], description: "Omit for all channels; use roleplay for roleplay history" },
+          afterId: { type: "number", description: "Only read after this message id; use 0 first and nextAfterId for later pages" },
+          limit: { type: "number", description: "Messages per page, 1-80, default 40, also bounded by 16000 characters" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description: "缺少目标文档、既有事实或会改变结果的关键选择，且无法从当前上下文可靠推断时，向用户提一个简短问题并暂停。情节、对白、描写等可逆创作选择应自行作合理决定，不要过度询问；不要与其他工具同时调用",
       parameters: {

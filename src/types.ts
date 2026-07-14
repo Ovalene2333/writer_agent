@@ -93,7 +93,7 @@ export interface ProviderCatalogPublic {
 
 // "drafter" is retained for compatibility with existing providers.json files;
 // the writing pipeline no longer assigns or invokes it.
-export type ModelUsageRole = "agent" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
+export type ModelUsageRole = "agent" | "roleplay" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 
 export interface StyleTemplate {
   id: string;
@@ -250,6 +250,40 @@ export interface AgentTodoItem {
   id: string;
   content: string;
   status: AgentTodoStatus;
+}
+
+/** A compact character card containing only the essentials needed for roleplay. */
+export interface SimpleCharacterCard {
+  name: string;
+  identity: string;
+  relationship: string;
+  knowledge: string;
+  scene: string;
+  goal: string;
+}
+
+/** Backward-compatible name used by the roleplay generation pipeline. */
+export type RoleplayInterlocutor = SimpleCharacterCard;
+
+/** Persisted roleplay-only persona; intentionally separate from full character cards. */
+export interface SavedRoleplayInterlocutor extends SimpleCharacterCard {
+  id: number;
+  targetCharacterId?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type RoleplayParticipant = {
+  kind: "simple" | "normal" | "generated";
+  id?: number;
+  name: string;
+  card: SimpleCharacterCard;
+};
+
+/** Session-scoped roleplay selection restored after refresh/session switching. */
+export interface ActiveRoleplayState {
+  performer: RoleplayParticipant;
+  identity: RoleplayParticipant;
 }
 
 export type PermissionMode = "ask" | "auto" | "plan";

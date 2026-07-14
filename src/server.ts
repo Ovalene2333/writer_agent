@@ -17,13 +17,13 @@ import {
   saveAgentSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
-import { generateRoleplayInterlocutor, runRoleplayChat, type RoleplayInterlocutor } from "./roleplay.js";
+import { generateRoleplayInterlocutor, runRoleplayChat } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate, listStyleTemplates } from "./templates.js";
-import type { AgentEvent, PermissionMode } from "./types.js";
+import type { AgentEvent, PermissionMode, RoleplayInterlocutor, RoleplayParticipant } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
@@ -118,12 +118,28 @@ export async function startWriterServer(options: {
   providers: ProviderManager;
   host?: string;
   port?: number;
-}): Promise<{ url: string; token: string; close: () => Promise<void> }> {
+  /** 是否在终端打印访问地址 / 二维码，默认 true。`--share` 时由 CLI 统一打印双端点二维码。 */
+  announce?: boolean;
+}): Promise<{ url: string; origin: string; token: string; close: () => Promise<void> }> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4096;
   const token = randomBytes(24).toString("base64url");
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs();
+
+  // CORS：手机页在局域网 HTTP 打开时，离开家后 API 会跨域打到 Cloudflare HTTPS。
+  app.use("/api/*", async (context, next) => {
+    const origin = context.req.header("origin");
+    if (origin) {
+      context.header("Access-Control-Allow-Origin", origin);
+      context.header("Access-Control-Allow-Credentials", "true");
+      context.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+      context.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+      context.header("Vary", "Origin");
+    }
+    if (context.req.method === "OPTIONS") return context.body(null, 204);
+    await next();
+  });
 
   app.use("/api/*", async (context, next) => {
     const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
@@ -134,6 +150,8 @@ export async function startWriterServer(options: {
     }
     await next();
   });
+
+  app.get("/api/health", (context) => context.json({ ok: true, ts: Date.now() }));
 
   app.get("/api/state", (context) => {
     const requested = context.req.query("session");
@@ -148,14 +166,23 @@ export async function startWriterServer(options: {
       hiddenFolders: options.project.hiddenFolders(),
       sessions: options.store.listSessions(),
       sessionId,
-      messages: options.store.messages(sessionId, 50)
+      messages: options.store.conversationMessagesBefore(sessionId, undefined, 50)
         .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
         .map(message => ({
           ...message,
           content: stripDsmlText(message.content, "[工具调用已隐藏]"),
         })),
+      messagesHasMore: (() => {
+        const visible = options.store.conversationMessagesBefore(sessionId, undefined, 50)
+          .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim());
+        const firstId = visible[0]?.id;
+        const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
+        return firstId !== undefined && firstArchiveId !== undefined && firstId > firstArchiveId;
+      })(),
       proposals: options.store.proposals(),
       characters: options.store.characters(),
+      roleplayInterlocutors: options.store.roleplayInterlocutors(),
+      activeRoleplay: options.store.activeRoleplay(sessionId) ?? null,
       examples: options.store.writingExamples(),
       provider: options.providers.publicConfig(),
       providerCatalog: options.providers.catalog(),
@@ -310,6 +337,26 @@ export async function startWriterServer(options: {
     return context.json({ sessionId: options.store.createSession(body.title || "写作会话") });
   });
 
+  app.get("/api/session/:id/messages", (context) => {
+    try {
+      const sessionId = context.req.param("id");
+      if (!options.store.sessionExists(sessionId)) throw new Error("Session not found");
+      const rawBefore = context.req.query("before");
+      const beforeId = rawBefore ? Number(rawBefore) : undefined;
+      if (rawBefore && (!Number.isInteger(beforeId) || beforeId! < 1)) throw new Error("Invalid before cursor");
+      const rawLimit = Number(context.req.query("limit") || 50);
+      const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 50;
+      const messages = options.store.conversationMessagesBefore(sessionId, beforeId, limit)
+        .filter(message => message.content.trim())
+        .map(message => ({ ...message, content: stripDsmlText(message.content, "[tool call hidden]") }));
+      const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
+      const hasMore = Boolean(messages.length && firstArchiveId !== undefined && messages[0].id > firstArchiveId);
+      return context.json({ messages, hasMore });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.put("/api/session/:id", async (context) => {
     try {
       const body: { title?: string } = await context.req.json<{ title?: string }>().catch(() => ({}));
@@ -417,7 +464,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/providers/assign", async (context) => {
-    try { const body = await context.req.json<{ role: "agent" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer"; providerId: string; modelId: string }>(); return context.json({ catalog: options.providers.assign(body.role, body.providerId, body.modelId), provider: options.providers.publicConfig() }); }
+    try { const body = await context.req.json<{ role: "agent" | "roleplay" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer"; providerId: string; modelId: string }>(); return context.json({ catalog: options.providers.assign(body.role, body.providerId, body.modelId), provider: options.providers.publicConfig() }); }
     catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -475,14 +522,15 @@ export async function startWriterServer(options: {
 
   app.post("/api/roleplay/interlocutor", async (context) => {
     try {
-      const body = await context.req.json<{ characterId?: number; request?: string }>();
-      if (!Number.isInteger(body.characterId)) return context.json({ error: "角色扮演需要指定 characterId" }, 400);
+      const body = await context.req.json<{ performer?: RoleplayParticipant; characterId?: number; request?: string }>();
+      if (!body.performer && !Number.isInteger(body.characterId)) return context.json({ error: "角色扮演需要指定扮演者" }, 400);
       const interlocutor = await generateRoleplayInterlocutor({
         project: options.project,
         store: options.store,
-        characterId: body.characterId!,
+        performer: body.performer,
+        characterId: body.characterId,
         request: body.request ?? "",
-        model: options.providers.modelConfig("agent"),
+        model: options.providers.modelConfig("roleplay"),
       });
       return context.json(interlocutor);
     } catch (error) {
@@ -490,8 +538,53 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.post("/api/roleplay/interlocutors", async (context) => {
+    try {
+      const body = await context.req.json<RoleplayInterlocutor & { id?: number; targetCharacterId?: number }>();
+      return context.json(options.store.saveRoleplayInterlocutor(body));
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.delete("/api/roleplay/interlocutors/:id", (context) => {
+    try {
+      const id = Number(context.req.param("id"));
+      if (!Number.isInteger(id)) throw new Error("试演身份 ID 无效");
+      options.store.deleteRoleplayInterlocutor(id);
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.put("/api/roleplay/state", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor }>();
+      if (!body.sessionId) throw new Error("缺少会话 ID");
+      const performer = body.performer ?? body.characterId;
+      const identity = body.identity ?? body.interlocutor;
+      if (!performer) throw new Error("缺少扮演者角色卡");
+      if (!identity) throw new Error("缺少当前身份角色卡");
+      return context.json(options.store.saveActiveRoleplay(body.sessionId, performer, identity));
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.delete("/api/roleplay/state/:sessionId", (context) => {
+    try {
+      const sessionId = context.req.param("sessionId");
+      if (!options.store.sessionExists(sessionId)) throw new Error("会话不存在");
+      options.store.clearActiveRoleplay(sessionId);
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; characterId?: number; interlocutor?: RoleplayInterlocutor; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
@@ -532,15 +625,17 @@ export async function startWriterServer(options: {
             signal, onEvent,
           });
         } else if (body.mode === "roleplay") {
-          if (!Number.isInteger(body.characterId)) throw new Error("角色扮演需要指定 characterId");
+          if (!body.performer && !Number.isInteger(body.characterId)) throw new Error("角色扮演需要指定扮演者");
           await runRoleplayChat({
             project: options.project,
             store: options.store,
             sessionId: body.sessionId,
-            characterId: body.characterId!,
+            performer: body.performer,
+            characterId: body.characterId,
+            identity: body.identity,
             interlocutor: body.interlocutor,
             prompt: body.prompt,
-            model: options.providers.modelConfig("agent"),
+            model: options.providers.modelConfig("roleplay"),
             signal,
             onEvent,
           });
@@ -748,15 +843,19 @@ export async function startWriterServer(options: {
     server.once("error", onError);
   });
   const address = host === "0.0.0.0" ? findLanAddress() : host;
-  const url = `http://${address}:${port}/#token=${token}`;
-  if (host === "0.0.0.0") {
-    process.stdout.write(`\n手机访问：${url}\n`);
-    process.stdout.write(await QRCode.toString(url, { type: "terminal", small: true }));
-  } else {
-    process.stdout.write(`Writer Web：${url}\n`);
+  const origin = `http://${address}:${port}`;
+  const url = `${origin}/#token=${token}`;
+  if (options.announce !== false) {
+    if (host === "0.0.0.0") {
+      process.stdout.write(`\n手机访问：${url}\n`);
+      process.stdout.write(await QRCode.toString(url, { type: "terminal", small: true }));
+    } else {
+      process.stdout.write(`Writer Web：${url}\n`);
+    }
   }
   return {
     url,
+    origin,
     token,
     close: () => new Promise((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose())),
   };

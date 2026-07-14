@@ -117,7 +117,7 @@ program.command("web")
   .option("--lan", "允许局域网设备访问")
   .option("--host <host>", "监听地址")
   .option("--port <port>", "监听端口", "4096")
-  .option("--share", "创建临时公网访问地址（需要已安装 cloudflared）")
+  .option("--share", "创建临时公网访问地址（需要已安装 cloudflared；默认同时开局域网，扫一次码可自动切换）")
   .option("--no-open", "不自动打开 PC 浏览器")
   .option("--debug", "调试：终端打印 step 内容 + 模型请求/响应体")
   .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端，不含模型原文")
@@ -128,11 +128,15 @@ program.command("web")
       process.stderr.write("[WRITER STEP] step debug enabled — Agent 每步 reasoning/tools/output 会打印到本终端\n");
     }
     const { project, store, providers } = openProject(options.project);
-    const host = options.host || (options.lan ? "0.0.0.0" : "127.0.0.1");
+    // --share 默认绑定 0.0.0.0，便于手机扫码后在局域网/公网间自动切换
+    const host = options.host || (options.lan || options.share ? "0.0.0.0" : "127.0.0.1");
     const port = Number(options.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口必须是 1 至 65535 的整数");
-    const server = await startWriterServer({ project, store, providers, host, port });
-    const tunnel = options.share ? startShareTunnel(port, server.token) : undefined;
+    const server = await startWriterServer({
+      project, store, providers, host, port,
+      announce: !options.share,
+    });
+    const tunnel = options.share ? startShareTunnel(port, server.token, server.origin) : undefined;
     if (options.open) openBrowser(server.url);
     const stop = async () => {
       tunnel?.kill();
@@ -225,8 +229,9 @@ function openBrowser(url: string): void {
   }
 }
 
-function startShareTunnel(port: number, token: string): ChildProcessWithoutNullStreams {
+function startShareTunnel(port: number, token: string, lanOrigin: string): ChildProcessWithoutNullStreams {
   process.stdout.write("正在创建公网临时访问地址（cloudflared）...\n");
+  process.stdout.write(`本机/局域网源：${lanOrigin}\n`);
   const tunnel = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
     windowsHide: true,
     stdio: "pipe",
@@ -236,27 +241,32 @@ function startShareTunnel(port: number, token: string): ChildProcessWithoutNullS
     },
   });
   let printed = false;
-  let publicUrl = "";
+  let publicOrigin = "";
   let outputBuffer = "";
   let readinessTimer: NodeJS.Timeout | undefined;
   const printAccess = () => {
-    if (printed || !publicUrl) return;
+    if (printed || !publicOrigin) return;
     printed = true;
     if (readinessTimer) clearTimeout(readinessTimer);
-    process.stdout.write(`公网访问：${publicUrl}\n`);
-    void QRCode.toString(publicUrl, { type: "terminal", small: true })
+    // 二维码走局域网入口：页在 HTTP 上，才能在局域网/Cloudflare 间自动切 API（HTTPS 页无法探测 HTTP 局域网）。
+    const dualEntry = `${lanOrigin}/#token=${encodeURIComponent(token)}&public=${encodeURIComponent(publicOrigin)}`;
+    const publicOnly = `${publicOrigin}/#token=${encodeURIComponent(token)}&lan=${encodeURIComponent(lanOrigin)}`;
+    process.stdout.write("\n手机扫码（推荐，一次即可；在家走局域网，出门自动切 Cloudflare）：\n");
+    process.stdout.write(`${dualEntry}\n`);
+    void QRCode.toString(dualEntry, { type: "terminal", small: true })
       .then(qr => {
         process.stdout.write(qr);
-        process.stdout.write("注意：这个地址会暴露你的写作工作台。只发给自己可信设备，结束终端进程后隧道会关闭。\n");
+        process.stdout.write(`仅公网备用（不在家 Wi‑Fi 时打开）：\n${publicOnly}\n`);
+        process.stdout.write("注意：公网地址会暴露写作工作台。只给可信设备；结束进程后隧道关闭。下次启动需重新扫码。\n");
       })
-      .catch(() => process.stdout.write("二维码生成失败，请直接复制上方公网地址。\n"));
+      .catch(() => process.stdout.write("二维码生成失败，请直接复制上方地址。\n"));
   };
   const handleOutput = (chunk: Buffer) => {
     const text = chunk.toString("utf8");
     outputBuffer = `${outputBuffer}${text}`.slice(-16_000);
     const match = outputBuffer.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-    if (match && !publicUrl) {
-      publicUrl = `${match[0]}/#token=${token}`;
+    if (match && !publicOrigin) {
+      publicOrigin = match[0];
       process.stdout.write("公网地址已分配，正在等待隧道连接就绪...\n");
       readinessTimer = setTimeout(() => {
         if (!printed) process.stderr.write("公网隧道尚未连接到 Cloudflare；暂不显示二维码，以免访问时出现 Error 1033。请检查下方 cloudflared 错误或网络防火墙。\n");

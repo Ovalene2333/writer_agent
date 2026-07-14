@@ -19,9 +19,13 @@ import {
 } from "./outline.js";
 import {
   handleGetCharacter,
+  handleGetSimpleCharacter,
   handleListCharacters,
+  handleListSimpleCharacters,
   handleSaveCharacter,
+  handleSaveSimpleCharacter,
 } from "./characters.js";
+import { handleInspectConversation, handleReadConversation } from "./conversation.js";
 import {
   handleProposeDocument,
   handleProposeDocumentPatch,
@@ -50,7 +54,12 @@ const HANDLERS: Record<string, Handler> = {
   propose_document_patch: handleProposeDocumentPatch,
   list_characters: handleListCharacters,
   get_character: handleGetCharacter,
+  list_simple_characters: handleListSimpleCharacters,
+  get_simple_character: handleGetSimpleCharacter,
   save_character: handleSaveCharacter,
+  save_simple_character: handleSaveSimpleCharacter,
+  inspect_conversation: handleInspectConversation,
+  read_conversation: handleReadConversation,
   ask_user: handleAskUser,
   manage_todos: handleManageTodos,
   load_skill: handleLoadSkill,

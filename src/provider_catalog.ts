@@ -190,7 +190,8 @@ function parseCatalog(raw: string): SavedCatalog {
   if ("version" in parsed && parsed.version === 2 && parsed.providers?.length) {
     const fallback = { providerId: parsed.activeProviderId, modelId: parsed.activeModelId };
     parsed.assignments = parsed.assignments ?? {} as SavedCatalog["assignments"];
-    for (const role of modelRoles()) parsed.assignments[role] ??= fallback;
+    const agentFallback = parsed.assignments.agent ?? fallback;
+    for (const role of modelRoles()) parsed.assignments[role] ??= role === "roleplay" ? agentFallback : fallback;
     for (const profile of parsed.providers) {
       for (const model of profile.models) {
         model.pricing = normalizePricing(profile.provider, model.name, undefined, model.pricing);
@@ -211,6 +212,7 @@ function parseCatalog(raw: string): SavedCatalog {
     activeModelId: modelId,
     assignments: {
       agent: fallback,
+      roleplay: fallback,
       drafter: fallback,
       inline: fallback,
       writer: fallback,
@@ -234,8 +236,8 @@ function parseCatalog(raw: string): SavedCatalog {
   };
 }
 
-function defaultCatalog(): SavedCatalog { const profileId = randomUUID(), modelId = randomUUID(), fallback = { providerId: profileId, modelId }; return { version: 2, activeProviderId: profileId, activeModelId: modelId, assignments: { agent: fallback, drafter: fallback, inline: fallback, writer: fallback, reviewer: fallback, summarizer: fallback }, providers: [{ id: profileId, name: "OpenAI", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "", models: [{ id: modelId, name: "gpt-4.1-mini", pricing: defaultPricing("openai-compatible", "gpt-4.1-mini") }] }] }; }
-function modelRoles(): ModelUsageRole[] { return ["agent", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
+function defaultCatalog(): SavedCatalog { const profileId = randomUUID(), modelId = randomUUID(), fallback = { providerId: profileId, modelId }; return { version: 2, activeProviderId: profileId, activeModelId: modelId, assignments: { agent: fallback, roleplay: fallback, drafter: fallback, inline: fallback, writer: fallback, reviewer: fallback, summarizer: fallback }, providers: [{ id: profileId, name: "OpenAI", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "", models: [{ id: modelId, name: "gpt-4.1-mini", pricing: defaultPricing("openai-compatible", "gpt-4.1-mini") }] }] }; }
+function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
 function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();
   if (!name) throw new Error("模型名称不能为空");

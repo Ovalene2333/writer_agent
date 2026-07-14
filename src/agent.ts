@@ -46,7 +46,7 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
 
 type ToolAccumulator = ToolCall;
 
-type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "general";
+type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "simple_character" | "general";
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
 
 interface WritingTask {
@@ -206,8 +206,9 @@ ${stylePointer}
 }
 
 function executionRulesPrompt(mode: PermissionMode): string {
+  const archiveRule = "When the user asks to use the complete or long conversation/roleplay history, the automatically injected history is only a recent preview. You MUST call inspect_conversation, then page read_conversation from afterId=0 through nextAfterId until hasMore=false for the relevant channel. Never claim the full archive was read from the preview alone. Read simple cards with list_simple_characters/get_simple_character; they are separate from normal cards.";
   const modeRule = mode === "plan"
-    ? "3. 当前为 plan 模式：只做检索、分析与计划，禁止调用 propose_document / propose_document_patch / propose_outline_patch / save_character；用最终回复给出可执行计划与待确认点。"
+    ? "3. 当前为 plan 模式：只做检索、分析与计划，禁止调用 propose_document / propose_document_patch / propose_outline_patch / save_character / save_simple_character；用最终回复给出可执行计划与待确认点。"
     : mode === "auto"
       ? "3. 当前为 auto 模式：写正文、续写、扩写或改写必须提交文档提案（会自动写入文件），不能用最终回复代替正文。提案成功后立即停止。"
       : "3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。";
@@ -215,8 +216,9 @@ function executionRulesPrompt(mode: PermissionMode): string {
 1. 按本轮任务计划决定是否读取项目资料。需要项目事实时先 search_project（世界观/专名 scope=lore，情节计划 scope=outline，已写正文 scope=chapters），再读取最小相关片段；每轮最多搜索两次。区分项目事实与推测。
 2. 保持既有人物、世界观、视角和 Markdown 结构。局部修改用补丁；大纲节点用大纲补丁；新建或全文重写才提交完整文档。新建设定→lore/，新建大纲→outline/，新建正文→chapters/；不要把设定写进章节，也不要把正文写进 lore。
 ${modeRule}
+${archiveRule}
 4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
-5. 管理角色使用 save_character：修改已有卡必须传 id；省略分区会保留原值，提供的数组整体替换，删除条目传 deleteEntryIds。新建卡省略 id 并提供 identity.name。写作时用 sections 只读取所需分区。
+5. 普通角色卡使用 save_character；简易角色卡使用 save_simple_character。创建角色卡前，只要请求涉及项目中的既有人物、组织、地点、装备、事件或职责，就必须先用 list_characters/get_character 与 search_project 核对相关资料，不得因用户未显式要求“读取文档”而跳过。修改普通卡必须传 id；新建普通卡省略 id 并提供 identity.name。
 6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
 7. 资料复用：仅复用「本轮任务相关工作记忆」、本轮工具结果、带 reused 标记的返回；禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。上一轮非承接任务的清单与记忆不会自动带入。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
 8. 复杂多步请求（≥3 步）用 manage_todos 维护清单并随进度更新；简单单步不必。清单绑定当前对话任务：切换到不同 mode 的新请求会清空旧清单，承接续写则保留。同一时刻最多一项 in_progress。提交最终文档提案前把清单中剩余项标为 completed（提案成功后本轮会立即结束，之后无法再更新清单）。
@@ -232,7 +234,7 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   const creativeContext = structuredCreativeContext(store, task, characterScope);
   // Scope only gates reading/listing *existing* cards and relationship targets — not prose NPCs or new cards.
   const characterScopeInstruction = characterScope === undefined
-    ? "角色资料按任务相关性自动筛选。list_characters / get_character 可读全部已有角色卡；可用 save_character 新建卡（省略 id）或更新已有卡（传 id）。路人配角可只写正文、不建卡。"
+    ? "角色资料按任务相关性自动筛选。list_characters / get_character 可读全部已有普通角色卡；可用 save_character 管理普通卡、save_simple_character 管理简易卡。创建简易角色卡时应先检查同名或相关普通角色卡。"
     : characterScope.length
       ? `本次可读取/列出的已有角色卡 ID：${characterScope.join("、")}。不得 get_character / 在 relationships 中关联范围外的*已有*角色。这不禁止：① 在正文中写无名或一次性配角（无需建卡）；② 用 save_character 省略 id 新建角色卡（新建后该 ID 即可读取）；③ 更新范围内已有角色卡。不要把「范围外」理解成禁止创作新人物。`
       : "本次不加载任何已有角色卡：不得 list_characters / get_character 读取既有资料。仍可在正文中写人物；若用户要求或情节需要稳定人设，可用 save_character 省略 id 新建角色卡。";
@@ -241,7 +243,9 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
     : "本次请求不强制产生文档提案，按用户意图执行。";
   const contextInstruction: Record<DocumentContextMode, string> = {
     none: "无需读取项目文档。直接使用当前对话完成任务；不要调用 list_documents、search_project、inspect_document 或 read_document。",
-    search: `需要核对项目资料。先调用 search_project，查询：${task.searchQuery || request.slice(0, 120)}。仅在检索片段不足时继续 inspect_document/read_document；同一路径只读取一次最小范围。`,
+    search: task.mode === "simple_character"
+      ? `创建简易角色卡必须核对项目资料。先调用 list_characters 检查同名或相关普通角色卡，必要时 get_character；再调用 search_project 检索 lore/ 与 outline/，查询：${task.searchQuery || request.slice(0, 120)}。检索片段不足时继续 inspect_document/read_document 读取最小相关范围。完成核对后调用 save_simple_character。`
+      : `需要核对项目资料。先调用 search_project，查询：${task.searchQuery || request.slice(0, 120)}。仅在检索片段不足时继续 inspect_document/read_document；同一路径只读取一次最小范围。`,
     target: `需要目标文档上下文。${references.length ? `候选路径：${references.join("、")}。` : "先定位目标路径。"}工作记忆已有该路径且文档未变时直接复用；否则 inspect_document 一次，再 read_document 一次最小必要块，之后禁止重复读取同一路径。`,
     continuation: `需要承接已有正文。${continuationPath ? `目标路径：${continuationPath}。` : "先从对话和提案记录确定目标路径；无法确定时询问用户。"}工作记忆已有该路径末尾原文且文档未变时直接续写；否则 inspect_document 一次，再用 read_document 的 lastSection=true 读最后一节（无标题时读最后一块），之后禁止重复读取。`,
   };
@@ -271,7 +275,7 @@ ${inferredTargets.length ? inferredTargets.map(path => `- ${path}`).join("\n") :
 const TASK_LABELS: Record<WritingTaskMode, string> = {
   brainstorm: "创意构思与候选方案", outline: "动态大纲与情节规划",
   write_scene: "场景或章节写作", rewrite: "定向改写",
-  audit: "一致性与质量审校", general: "通用写作协作",
+  audit: "一致性与质量审校", simple_character: "创建或更新简易角色卡", general: "通用写作协作",
 };
 
 async function planWritingTask(
@@ -293,8 +297,8 @@ async function planWritingTask(
   const planningMessages: ApiMessage[] = [{
     role: "system",
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
-字段：mode（brainstorm/outline/write_scene/rewrite/audit/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
-决策原则：当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
+字段：mode（brainstorm/outline/write_scene/rewrite/audit/simple_character/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
+决策原则：创建或更新“简易角色/简易角色卡/简略角色卡”必须使用 simple_character，并设 documentContext=search，以便核对已有普通角色卡和 lore/outline 设定；不得因为用户没有明确说“读取文档”而使用 none。当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
 路径约定：lore/=设定事实，outline/=情节计划，chapters/=主线正文，side/=支线，archive/=旧稿。为正文写作选 targetPath 时优先 chapters/；为大纲任务优先 outline/；查世界观优先在 lore/ 上 search。
 文档目录：${JSON.stringify(documents)}
 角色目录：${JSON.stringify(slimCharacters)}
@@ -306,7 +310,7 @@ async function planWritingTask(
   const lastBrace = result.content.lastIndexOf("}");
   if (firstBrace < 0 || lastBrace <= firstBrace) throw new Error("任务规划器没有返回有效 JSON");
   const parsed = JSON.parse(result.content.slice(firstBrace, lastBrace + 1)) as Partial<WritingTask>;
-  const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "general"];
+  const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "simple_character", "general"];
   const mode = modes.includes(parsed.mode as WritingTaskMode) ? parsed.mode as WritingTaskMode : "general";
   const contextModes: DocumentContextMode[] = ["none", "search", "target", "continuation"];
   const documentContext = contextModes.includes(parsed.documentContext as DocumentContextMode)
@@ -317,7 +321,9 @@ async function planWritingTask(
   const validDocumentPaths = new Set(documents);
   const continuation = parsed.continuation === true;
   const documentProposalRequired = parsed.documentProposalRequired === true;
-  const normalizedDocumentContext = continuation
+  const normalizedDocumentContext = mode === "simple_character"
+    ? "search"
+    : continuation
     ? "continuation"
     : documentProposalRequired && documentContext === "none" ? "target" : documentContext;
   return {
@@ -340,6 +346,14 @@ function fastRouteWritingTask(project: WriterProject, store: WriterStore, sessio
   const references = explicitReferencePaths(project, request);
   const sessionContext = store.sessionContext(sessionId);
   const trimmed = request.trim();
+  const simpleCharacter = isSimpleCharacterCardRequest(request);
+  if (simpleCharacter) return {
+    mode: "simple_character",
+    label: TASK_LABELS.simple_character,
+    documentContext: "search",
+    searchQuery: request.slice(0, 200),
+    characterIds: [], exampleIds: [], documentProposalRequired: false, continuation: false,
+  };
   const continuation = /^(继续|接着|续写|往下写)(?:[。！!，,\s]|$)/.test(trimmed)
     || /^(继续|接着).{0,12}(写|写下去|往下)/.test(trimmed);
   const rewrite = /(改写|重写|润色|修改).*(这一段|这段|选区|这一章|整章|全文)/.test(request);
@@ -391,6 +405,11 @@ function fastRouteWritingTask(project: WriterProject, store: WriterStore, sessio
   return undefined;
 }
 
+export function isSimpleCharacterCardRequest(request: string): boolean {
+  return /(?:创建|新建|生成|制作|补充|修改|更新).{0,16}(?:简易|简略)(?:角色卡|角色|人物卡)/.test(request)
+    || /(?:简易|简略)(?:角色卡|角色|人物卡).{0,16}(?:创建|新建|生成|制作|补充|修改|更新)/.test(request);
+}
+
 /** Best-effort map 「第N章」 to an existing chapters/*.md path for fastRoute. */
 function inferChapterPath(project: WriterProject, request: string): string | undefined {
   const match = request.match(/第\s*([一二三四五六七八九十百千零〇\d]+)\s*章/);
@@ -428,6 +447,11 @@ function chineseNumeralToInt(text: string): string | undefined {
 }
 
 function taskInstructions(mode: WritingTaskMode): string {
+  if (mode === "simple_character") return `本次工作流：
+- 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终必须调用 save_simple_character 保存。
+- 先调用 list_characters 检查同名或相关普通角色卡；若存在相关角色，用 get_character 读取必要分区。
+- 按上下文决策调用 search_project 检索相关 lore/ 与 outline/；结果不足时只读取最小相关片段。用户未明确要求读取资料不等于可以跳过核对。
+- 将查到的项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定的信息留空或明确写“未明确”，不要凭空补关键设定。`;
   if (mode === "brainstorm") return `本次工作流：
 - 先明确人物欲望、阻力、失败代价和不可逆后果。
 - 给出三个真正不同的候选方向，分别说明核心冲突与后续潜力。
@@ -475,6 +499,9 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
   const characters = selectedCharacters.map(({ item }) => ({
     id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary,
   }));
+  const simpleCharacters = store.roleplayInterlocutors().slice(0, 20).map(item => ({
+    id: item.id, name: item.name, identity: item.identity.slice(0, 160), targetCharacterId: item.targetCharacterId,
+  }));
   // Writing tasks: only ids/fingerprints here — full example bodies live in stableStyleGroundingPrompt (KV-friendly, no duplicate).
   const writing = isIntensiveWritingMode(task.mode) || task.documentProposalRequired;
   const rankedExamples = store.writingExamples().map((item) => {
@@ -506,7 +533,7 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
     examples.push(entry);
     exampleBudget -= size;
   }
-  return JSON.stringify({ task: task.mode, characters, writingExamples: examples });
+  return JSON.stringify({ task: task.mode, characters, simpleCharacters, writingExamples: examples });
 }
 
 function explicitReferencePaths(project: WriterProject, request: string): string[] {
@@ -605,6 +632,7 @@ export async function runAgent(options: {
   const turnTodos = store.sessionTodos(sessionId);
   emit({ type: "todos", todos: turnTodos });
   store.addMessage(sessionId, "user", prompt);
+  const archiveContext = `Complete conversation archive metadata (the injected history is only a preview):\n${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historicalContext = historicalConversationContext(history);
   const artifactContext = recentArtifactsContext(store, sessionId, project, task);
@@ -652,6 +680,7 @@ export async function runAgent(options: {
     ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
     // Dynamic tail — history/task change every user message; keep after fixed prefix for KV hits.
     ...(historicalContext ? [historicalContext] : []),
+    { role: "system", content: archiveContext },
     { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
     ...(dynamicStyleContext ? [{ role: "system" as const, content: dynamicStyleContext }] : []),
     ...(bootstrapContext ? [{ role: "system" as const, content: bootstrapContext }] : []),

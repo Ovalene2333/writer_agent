@@ -464,7 +464,7 @@ export function WriterAgentTui(props: {
         }
         const roleId = parts[0].toLowerCase() as Exclude<ModelUsageRole, "drafter">;
         if (!MODEL_ROLES.some(item => item.id === roleId)) {
-          throw new Error(`用法：/roles [agent|inline|writer|reviewer|summarizer] [模型]\n${formatRoleAssignments(props.providers)}`);
+          throw new Error(`用法：/roles [agent|roleplay|inline|writer|reviewer|summarizer] [模型]\n${formatRoleAssignments(props.providers)}`);
         }
         if (parts.length === 1) {
           setOverlay({ kind: "role-models", role: roleId, index: 0 });
@@ -696,7 +696,7 @@ export function WriterAgentTui(props: {
           sessionId,
           characterId: roleplay.characterId,
           prompt: text,
-          model: props.providers.modelConfig("agent"),
+          model: props.providers.modelConfig("roleplay"),
           signal: controller.signal,
           onEvent: handleEvent,
         });

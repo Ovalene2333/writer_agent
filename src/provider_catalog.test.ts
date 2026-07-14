@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,7 +28,12 @@ test("save() updates active model only and keeps sibling models", () => {
     assert.ok(profile);
     assert.equal(profile!.models.length, 3);
     const active = profile!.models.find((item) => item.name === "model-a")!;
+    const roleplay = profile!.models.find((item) => item.name === "model-b")!;
     providers.select(profile!.id, active.id);
+    providers.assign("agent", profile!.id, active.id);
+    providers.assign("roleplay", profile!.id, roleplay.id);
+    assert.equal(providers.modelConfig("agent").model, "model-a");
+    assert.equal(providers.modelConfig("roleplay").model, "model-b");
 
     // Style-template path: only temperature/topP for the active model.
     providers.save({
@@ -51,6 +56,7 @@ test("save() updates active model only and keeps sibling models", () => {
     const sibling = after.models.find((item) => item.name === "model-b")!;
     assert.equal(sibling.temperature, 0.6);
     assert.equal(sibling.topP, 0.9);
+    assert.equal(providers.modelConfig("roleplay").model, "model-b");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -83,6 +89,33 @@ test("persist writes providers.json.bak before overwrite", () => {
     assert.ok(existsSync(bak), "backup file should exist");
     assert.equal(readFileSync(bak, "utf8"), firstRaw);
     assert.ok(providers.catalog().providers[0].models.some((item) => item.name === "second"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy v2 catalog without roleplay assignment inherits agent model", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-roleplay-migration-"));
+  try {
+    const project = WriterProject.init(root, "角色扮演模型迁移");
+    const providers = new ProviderManager(project);
+    const catalog = providers.saveProfile({
+      name: "独立模型",
+      provider: "openai-compatible",
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "sk-roleplay-test",
+      models: [{ name: "agent-model" }, { name: "roleplay-model" }],
+    });
+    const profile = catalog.providers.find(item => item.name === "独立模型")!;
+    providers.assign("agent", profile.id, profile.models[0].id);
+
+    const raw = JSON.parse(readFileSync(providers.path, "utf8")) as { assignments: Record<string, unknown> };
+    delete raw.assignments.roleplay;
+    writeFileSync(providers.path, JSON.stringify(raw), "utf8");
+
+    const migrated = new ProviderManager(project);
+    assert.deepEqual(migrated.catalog().assignments.roleplay, migrated.catalog().assignments.agent);
+    assert.equal(migrated.modelConfig("roleplay").model, "agent-model");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

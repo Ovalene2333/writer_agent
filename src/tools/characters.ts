@@ -31,6 +31,21 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
   return JSON.stringify(selected);
 }
 
+export function handleListSimpleCharacters({ store }: ToolHandlerArgs): string {
+  return JSON.stringify(store.roleplayInterlocutors().map(card => ({
+    id: card.id, name: card.name, identity: card.identity,
+    targetCharacterId: card.targetCharacterId, updatedAt: card.updatedAt,
+  })));
+}
+
+export function handleGetSimpleCharacter({ input, store }: ToolHandlerArgs): string {
+  const id = optionalPositiveInteger(input.id, "id");
+  if (!id) throw new Error("Missing valid simple character id");
+  const card = store.roleplayInterlocutors().find(item => item.id === id);
+  if (!card) throw new Error("Simple character card not found");
+  return JSON.stringify(card);
+}
+
 export function handleSaveCharacter({ input, store, characterScope, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "save_character");
   const id = typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined;
@@ -46,4 +61,19 @@ export function handleSaveCharacter({ input, store, characterScope, context }: T
   const character = store.saveCharacter({ ...(input as CharacterInput), id, identity });
   if (!id && characterScope && !characterScope.includes(character.id)) characterScope.push(character.id);
   return JSON.stringify({ id: character.id, name: character.identity.name, message: id ? "角色卡已更新" : "角色卡已新建；本轮可继续读取该 ID", created: !id });
+}
+
+export function handleSaveSimpleCharacter({ input, store, context }: ToolHandlerArgs): string {
+  assertWritableMode(context.permissionMode, "save_simple_character");
+  const id = optionalPositiveInteger(input.id, "id");
+  const saved = store.saveRoleplayInterlocutor({
+    ...(id ? { id } : {}),
+    name: typeof input.name === "string" ? input.name : "",
+    identity: typeof input.identity === "string" ? input.identity : "",
+    relationship: typeof input.relationship === "string" ? input.relationship : "",
+    knowledge: typeof input.knowledge === "string" ? input.knowledge : "",
+    scene: typeof input.scene === "string" ? input.scene : "",
+    goal: typeof input.goal === "string" ? input.goal : "",
+  });
+  return JSON.stringify({ id: saved.id, name: saved.name, kind: "simple", message: id ? "简易角色卡已更新" : "简易角色卡已创建", created: !id });
 }
