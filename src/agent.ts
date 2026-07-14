@@ -292,19 +292,26 @@ async function planWritingTask(
     .slice(0, 40);
   const slimCharacters = characters.map(item => ({ id: item.id, name: item.name, aliases: item.aliases }));
   const recent = history.slice(-4).map(item => item.role === "user"
-    ? { content: item.content?.slice(0, 400) ?? "" }
-    : { role: item.role, content: item.content?.slice(0, 400) ?? "" });
+    ? { content: item.content?.slice(0, 200) ?? "" }
+    : { role: item.role, content: item.content?.slice(0, 160) ?? "" });
+  // Stable planner rules first (cacheable across turns); project catalogs + history in the user message.
   const planningMessages: ApiMessage[] = [{
     role: "system",
     content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
 字段：mode（brainstorm/outline/write_scene/rewrite/audit/simple_character/general）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）。
 决策原则：创建或更新“简易角色/简易角色卡/简略角色卡”必须使用 simple_character，并设 documentContext=search，以便核对已有普通角色卡和 lore/outline 设定；不得因为用户没有明确说“读取文档”而使用 none。当前 user 消息是唯一的当前任务，优先级高于“最近对话”；最近对话只用于解析“继续、按刚才方案、改一下它”等省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。
 路径约定：lore/=设定事实，outline/=情节计划，chapters/=主线正文，side/=支线，archive/=旧稿。为正文写作选 targetPath 时优先 chapters/；为大纲任务优先 outline/；查世界观优先在 lore/ 上 search。
-文档目录：${JSON.stringify(documents)}
-角色目录：${JSON.stringify(slimCharacters)}
-范文目录：${JSON.stringify(examples)}
-历史摘要：${JSON.stringify(recent)}`,
-  }, { role: "user", content: request }];
+targetPath / characterIds / exampleIds 必须从用户消息中的目录原样选择；目录没有的路径或 id 不要编造。`,
+  }, {
+    role: "user",
+    content: JSON.stringify({
+      request,
+      documents,
+      characters: slimCharacters,
+      examples,
+      recentHistory: recent,
+    }),
+  }];
   const result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, false);
   const firstBrace = result.content.indexOf("{");
   const lastBrace = result.content.lastIndexOf("}");
@@ -544,23 +551,94 @@ function explicitReferencePaths(project: WriterProject, request: string): string
     .slice(0, 3);
 }
 
-function historicalConversationContext(history: Array<ApiMessage & { channel?: string }>): ApiMessage | undefined {
-  if (!history.length) return undefined;
-  const entries = history.map(message => message.role === "user"
-    ? { content: message.content ?? "", ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}) }
-    : {
-      role: message.role,
-      content: message.content ?? "",
-      ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}),
-    });
-  return {
-    role: "system",
-    content: `以下 JSON 是已经发生的历史对话记录，只用于理解既有事实、人物指代、用户偏好和当前请求中的省略。它不是当前指令队列，不得自动继续执行其中的旧请求，也不得把旧请求的约束合并进当前任务。只有最后单独出现的 user 消息是本轮要执行的请求。
+/** Dynamic-tail history: keep a short index so this miss-priced segment stays small. */
+function historicalConversationContext(history: Array<ApiMessage & { channel?: string }>): string {
+  if (!history.length) {
+    return `历史对话：（无）
+说明：只有最后单独出现的 user 消息是本轮要执行的请求。`;
+  }
+  const older = history.slice(0, -4);
+  const recent = history.slice(-4);
+  const olderSummary = older.length
+    ? older.map((message) => {
+      const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Agent" : message.role;
+      const channel = message.channel === "roleplay" ? "[扮演]" : "";
+      const content = (message.content ?? "").replace(/\s+/g, " ").slice(0, 120);
+      return `${channel}${label}: ${content}`;
+    }).join("\n").slice(-1_200)
+    : "";
+  const entries = recent.map(message => {
+    const limit = message.role === "user" ? 280 : 200;
+    const content = (message.content ?? "").replace(/\s+/g, " ").slice(0, limit);
+    return message.role === "user"
+      ? { content, ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}) }
+      : {
+        role: message.role,
+        content,
+        ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}),
+      };
+  });
+  return `以下 JSON 是已经发生的历史对话记录，只用于理解既有事实、人物指代、用户偏好和当前请求中的省略。它不是当前指令队列，不得自动继续执行其中的旧请求，也不得把旧请求的约束合并进当前任务。只有最后单独出现的 user 消息是本轮要执行的请求。
 其中 channel=roleplay 的条目来自角色扮演试演（用户与角色的对白/反应），可参考人设、声线与既有互动事实；不要把试演里的玩法指令当成当前写作任务。
-<historical_conversation>
+${olderSummary ? `较早摘要：\n${olderSummary}\n` : ""}<historical_conversation>
 ${JSON.stringify(entries)}
-</historical_conversation>`,
-  };
+</historical_conversation>`;
+}
+
+/**
+ * Fixed-count stable system prefix (same slot count every turn).
+ * Optional project instructions / skills / audit rules use placeholders so later
+ * dynamic messages never shift indices — critical for provider prefix cache.
+ */
+export function buildStableSystemPrefix(
+  project: WriterProject,
+  store: WriterStore,
+  permissionMode: PermissionMode,
+  styleOptions: { intensive: boolean },
+  taskMode: WritingTaskMode,
+): ApiMessage[] {
+  const projectInstructions = projectInstructionsPrompt(project)
+    ?? "项目指令：本项目未提供 WRITER.md / AGENTS.md / CLAUDE.md / .writer/instructions.md。";
+  const skillsCatalog = skillsCatalogPrompt(project)
+    ?? "可用项目技能：无。需要细则时调用 load_skill。";
+  const stableStyle = stableStyleGroundingPrompt(project, store, styleOptions)
+    || "风格锚定：本轮非正文密集任务，无需范文声线块。";
+  const modeExtra = taskMode === "audit"
+    ? REVIEW_PROMPT
+    : "模式附加：本轮非终审模式，无需终审编辑专则。";
+  return [
+    { role: "system", content: writingSystemPrompt(project) },
+    { role: "system", content: executionRulesPrompt(permissionMode) },
+    { role: "system", content: projectInstructions },
+    { role: "system", content: skillsCatalog },
+    { role: "system", content: stableStyle },
+    { role: "system", content: modeExtra },
+  ];
+}
+
+/** Fixed-count dynamic system tail + current user message (always same length). */
+export function buildDynamicTurnMessages(parts: {
+  historyText: string;
+  archiveContext: string;
+  taskContext: string;
+  dynamicStyleContext?: string;
+  bootstrapContext?: string;
+  todosPrompt?: string;
+  artifactContext?: string;
+  selectedContext?: string;
+  prompt: string;
+}): ApiMessage[] {
+  return [
+    { role: "system", content: parts.historyText },
+    { role: "system", content: parts.archiveContext },
+    { role: "system", content: parts.taskContext },
+    { role: "system", content: parts.dynamicStyleContext || "本轮动态声线证据：无。" },
+    { role: "system", content: parts.bootstrapContext || "写作线索：本轮无启发式索引。" },
+    { role: "system", content: parts.todosPrompt || "当前对话任务清单：（空）" },
+    { role: "system", content: parts.artifactContext || "本轮任务工作记忆：无。" },
+    { role: "system", content: parts.selectedContext || "用户选区：无。" },
+    { role: "user", content: parts.prompt },
+  ];
 }
 
 export async function runAgent(options: {
@@ -634,11 +712,9 @@ export async function runAgent(options: {
   store.addMessage(sessionId, "user", prompt);
   const archiveContext = `Complete conversation archive metadata (the injected history is only a preview):\n${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
-  const historicalContext = historicalConversationContext(history);
+  const historyText = historicalConversationContext(history);
   const artifactContext = recentArtifactsContext(store, sessionId, project, task);
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task);
-  const projectInstructions = projectInstructionsPrompt(project);
-  const skillsCatalog = skillsCatalogPrompt(project);
   const todosPrompt = turnTodos.length
     ? `当前对话任务清单（绑定本轮任务，非会话全局残留；可用 manage_todos 更新）：\n${formatTodosForPrompt(turnTodos)}`
     : undefined;
@@ -652,7 +728,6 @@ export async function runAgent(options: {
     exampleIds: task.exampleIds,
     preferredSample: preferredSample || undefined,
   };
-  const stableStyleContext = stableStyleGroundingPrompt(project, store, styleOptions);
   const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
   // Prefer cheap roles for prose snippet second pass (flash-class models).
   const adjudicatorModel = options.models?.inline
@@ -667,27 +742,23 @@ export async function runAgent(options: {
       signal,
     },
   };
-  // Fixed prefix first (stable across turns when project/mode/permission match), then dynamic tail.
-  // Style slot always present so later blocks do not shift when intensive toggles.
-  const styleSlot = stableStyleContext
-    || "风格锚定：本轮非正文密集任务，无需范文声线块。";
+  // Fixed slot counts: stable prefix then dynamic tail. Never omit optional slots (use placeholders)
+  // so message indices stay aligned for provider prefix / KV cache across turns.
+  // Within this job the messages array is append-only — do not compact/rehydrate/strip
+  // already-sent messages between tool steps (that would invalidate step-to-step cache hits).
   const messages: ApiMessage[] = [
-    { role: "system", content: writingSystemPrompt(project) },
-    { role: "system", content: executionRulesPrompt(permissionMode) },
-    ...(projectInstructions ? [{ role: "system" as const, content: projectInstructions }] : []),
-    ...(skillsCatalog ? [{ role: "system" as const, content: skillsCatalog }] : []),
-    { role: "system", content: styleSlot },
-    ...(task.mode === "audit" ? [{ role: "system" as const, content: REVIEW_PROMPT }] : []),
-    // Dynamic tail — history/task change every user message; keep after fixed prefix for KV hits.
-    ...(historicalContext ? [historicalContext] : []),
-    { role: "system", content: archiveContext },
-    { role: "system", content: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath) },
-    ...(dynamicStyleContext ? [{ role: "system" as const, content: dynamicStyleContext }] : []),
-    ...(bootstrapContext ? [{ role: "system" as const, content: bootstrapContext }] : []),
-    ...(todosPrompt ? [{ role: "system" as const, content: todosPrompt }] : []),
-    ...(artifactContext ? [{ role: "system" as const, content: artifactContext }] : []),
-    ...(selectedContext ? [{ role: "system" as const, content: selectedContext }] : []),
-    { role: "user", content: prompt },
+    ...buildStableSystemPrefix(project, store, permissionMode, styleOptions, task.mode),
+    ...buildDynamicTurnMessages({
+      historyText,
+      archiveContext,
+      taskContext: dynamicContextPrompt(project, store, prompt, task, characterScope, continuationPath),
+      dynamicStyleContext: dynamicStyleContext || undefined,
+      bootstrapContext: bootstrapContext || undefined,
+      todosPrompt,
+      artifactContext: artifactContext || undefined,
+      selectedContext: selectedContext || undefined,
+      prompt,
+    }),
   ];
   let transcript = "";
   let documentProposalSubmitted = false;
@@ -700,11 +771,6 @@ export async function runAgent(options: {
     const maxTurns = options.maxTurns ?? 20;
     let turnStart = messages.length;
     for (let turn = 0; turn < maxTurns; turn += 1) {
-      compactRuntimeMessages(messages);
-      // P0: do not rehydrate all digests (that undoes compact and inflates miss tokens).
-      // Only restore the last few tool bodies the model may still be editing against.
-      rehydrateRecentToolMessages(messages, store, sessionId, 2);
-      stripStaleReasoningContent(messages);
       const step = turn + 1;
       const stepModel = documentProposalSubmitted ? model : executionModel;
       emit({ type: "step_start", step });
@@ -771,7 +837,7 @@ export async function runAgent(options: {
         break;
       }
       if (waitingForUser) break;
-      compactCompletedToolCalls(messages);
+      // Append-only: do not mutate prior tool_calls / tool bodies mid-job (preserves prefix cache).
     }
     if (waitingForUser) {
       let waitingEvent: { question: string; options?: string[] } | undefined;
@@ -905,46 +971,62 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
   const activeHash = activePath && project.documentExists(activePath)
     ? project.hash(project.read(activePath))
     : undefined;
+  // Prefer catalog + digests in the miss-priced dynamic tail. Only restore one body on
+  // continuation (tail of the active doc) so the model can keep writing without a re-read.
   const restored: Array<Record<string, unknown>> = [];
-  for (const artifact of artifacts) {
-    if (artifact.kind !== "read_document" && artifact.kind !== "inspect_document" && artifact.kind !== "get_outline_node" && artifact.kind !== "list_outline_nodes") continue;
-    if (artifact.path && activePath && artifact.path !== activePath && artifact.kind.startsWith("read")) continue;
-    if (activeHash && artifact.sourceHash !== activeHash && artifact.kind !== "list_outline_nodes" && artifact.kind !== "get_outline_node") continue;
-    const full = store.contextArtifactById(sessionId, artifact.id);
-    if (!full) continue;
-    try {
-      const parsed = JSON.parse(full.content) as Record<string, unknown>;
-      if (typeof parsed.error === "string") continue;
-      const content = typeof parsed.content === "string" ? parsed.content
-        : typeof parsed.markdown === "string" ? parsed.markdown : undefined;
-      restored.push({
-        artifactId: artifact.id,
-        kind: artifact.kind,
-        path: artifact.path,
-        sourceHash: artifact.sourceHash,
-        section: parsed.section,
-        heading: parsed.heading,
-        block: parsed.block,
-        startLine: parsed.startLine,
-        endLine: parsed.endLine,
-        ...(content ? { content: content.length > 4_000 ? `${content.slice(0, 4_000)}\n…[已截断，全文在 artifact#${artifact.id}]` : content } : {
-          opening: parsed.opening,
-          ending: parsed.ending,
-          headings: parsed.headings,
-          lineCount: parsed.lineCount,
-          blockCount: parsed.blockCount,
-          nodes: Array.isArray(parsed.nodes) ? (parsed.nodes as unknown[]).slice(0, 40) : undefined,
-          node: parsed.node,
-        }),
-      });
-      if (restored.length >= 3) break;
-    } catch { /* 非 JSON 工作记忆条目跳过 */ }
+  if (task.continuation) {
+    for (const artifact of artifacts) {
+      if (artifact.kind !== "read_document" && artifact.kind !== "inspect_document") continue;
+      if (artifact.path && activePath && artifact.path !== activePath) continue;
+      if (activeHash && artifact.sourceHash !== activeHash) continue;
+      const full = store.contextArtifactById(sessionId, artifact.id);
+      if (!full) continue;
+      try {
+        const parsed = JSON.parse(full.content) as Record<string, unknown>;
+        if (typeof parsed.error === "string") continue;
+        const content = typeof parsed.content === "string" ? parsed.content
+          : typeof parsed.markdown === "string" ? parsed.markdown : undefined;
+        const bodyLimit = 2_000;
+        restored.push({
+          artifactId: artifact.id,
+          kind: artifact.kind,
+          path: artifact.path,
+          sourceHash: artifact.sourceHash,
+          section: parsed.section,
+          heading: parsed.heading,
+          block: parsed.block,
+          startLine: parsed.startLine,
+          endLine: parsed.endLine,
+          ...(content
+            ? { content: content.length > bodyLimit ? `${content.slice(-bodyLimit)}\n…[末尾截取，全文在 artifact#${artifact.id}]` : content }
+            : {
+              opening: typeof parsed.opening === "string" ? String(parsed.opening).slice(0, 400) : parsed.opening,
+              ending: typeof parsed.ending === "string" ? String(parsed.ending).slice(0, 800) : parsed.ending,
+              headings: Array.isArray(parsed.headings) ? (parsed.headings as unknown[]).slice(0, 20) : parsed.headings,
+              lineCount: parsed.lineCount,
+              blockCount: parsed.blockCount,
+            }),
+        });
+        break;
+      } catch { /* 非 JSON 工作记忆条目跳过 */ }
+    }
   }
-  const catalog = artifacts.map(({ id, kind, path, sourceHash, digest }) => ({ id, kind, path, sourceHash, digest }));
+  const catalog = artifacts
+    .filter(item => item.kind === "read_document" || item.kind === "inspect_document"
+      || item.kind === "get_outline_node" || item.kind === "list_outline_nodes")
+    .map(({ id, kind, path, sourceHash, digest }) => ({
+      id, kind, path, sourceHash,
+      digest: digest.replace(/\s+/g, " ").slice(0, 240),
+    }));
+  if (!catalog.length && !restored.length) return "";
   const scopeNote = task.continuation
-    ? "承接上一轮：下列资料本对话任务已读过且文档未变；请直接复用，禁止对相同路径/范围再次 inspect_document、read_document 或重复 list_outline_nodes"
-    : "仅当前目标文档相关工作记忆（非会话级残留）；请直接复用，禁止对相同路径/范围再次 inspect_document、read_document";
-  return `本轮任务工作记忆（${scopeNote}）：\n${JSON.stringify({ state, artifacts: catalog, restoredReads: restored })}`;
+    ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
+    : "仅当前目标文档相关索引（非会话级残留）；正文未注入时请按需 read 最小片段，或对相同 path+sourceHash 使用已有工具结果";
+  return `本轮任务工作记忆（${scopeNote}）：\n${JSON.stringify({
+    state: { activeDocument: state.activeDocument, currentIntent: state.currentIntent.slice(0, 160) },
+    artifacts: catalog,
+    restoredReads: restored,
+  })}`;
 }
 
 /**
@@ -1147,17 +1229,18 @@ async function executeToolCached(
 }
 
 function compactHistory(messages: Array<{ role: string; content: string; channel?: string }>): Array<ApiMessage & { channel?: string }> {
-  const recent = messages.slice(-8);
-  const older = messages.slice(0, -8);
+  // Slimmer window: dynamic-tail history is miss-priced every turn.
+  const recent = messages.slice(-6);
+  const older = messages.slice(0, -6);
   const result: Array<ApiMessage & { channel?: string }> = [];
   if (older.length) {
     let summary = older.map((message) => {
       const label = message.role === "user" ? "用户" : "Agent";
       const channel = message.channel === "roleplay" ? "[扮演]" : "";
       const content = stripDsmlText(message.content, "[工具调用已隐藏]");
-      return `${channel}${label}: ${content.replace(/\s+/g, " ").slice(0, 360)}`;
+      return `${channel}${label}: ${content.replace(/\s+/g, " ").slice(0, 160)}`;
     }).join("\n");
-    if (summary.length > 4_000) summary = `[更早内容已省略]\n${summary.slice(-4_000)}`;
+    if (summary.length > 1_600) summary = `[更早内容已省略]\n${summary.slice(-1_600)}`;
     result.push({ role: "system", content: `较早会话压缩摘要：\n${summary}` });
   }
   result.push(...recent.map((message) => ({
@@ -1168,7 +1251,11 @@ function compactHistory(messages: Array<{ role: string; content: string; channel
   return result;
 }
 
-/** Exported for unit tests: compact heavy tool bodies into digests (artifactId preserved). */
+/**
+ * Compact heavy tool bodies into digests (artifactId preserved).
+ * Use only when *rebuilding* a transcript for a new user turn — never mid-job between
+ * tool steps, or step-to-step prompt-cache prefixes will miss.
+ */
 export function compactRuntimeMessages(messages: ApiMessage[]): void {
   const toolIndexes = messages.flatMap((message, index) => message.role === "tool" ? [index] : []);
   const totalChars = toolIndexes.reduce((sum, index) => sum + (messages[index].content?.length ?? 0), 0);
@@ -1253,7 +1340,11 @@ export function stripStaleReasoningContent(messages: ApiMessage[]): void {
   }
 }
 
-function compactCompletedToolCalls(messages: ApiMessage[]): void {
+/**
+ * Strip older propose_* payloads when rebuilding a multi-proposal transcript outside
+ * an active job. Not used mid-job (append-only) so prefix cache stays intact.
+ */
+export function compactCompletedToolCalls(messages: ApiMessage[]): void {
   let latestProposalMessage = -1;
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
@@ -1263,8 +1354,7 @@ function compactCompletedToolCalls(messages: ApiMessage[]): void {
   }
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
-    // The newest failed proposal is the model's repair context for the next turn.
-    // Successful proposals exit before this compactor runs.
+    // Keep the newest proposal intact as repair context; strip older ones.
     if (index === latestProposalMessage) continue;
     if (message.role !== "assistant" || !message.tool_calls) continue;
     for (const call of message.tool_calls) {

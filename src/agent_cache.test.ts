@@ -6,6 +6,9 @@ import test from "node:test";
 import {
   agentToolNames,
   agentToolSchemaHash,
+  buildDynamicTurnMessages,
+  buildStableSystemPrefix,
+  compactCompletedToolCalls,
   compactRuntimeMessages,
   isSimpleCharacterCardRequest,
   rehydrateRecentToolMessages,
@@ -30,8 +33,57 @@ type Msg = {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
   tool_call_id?: string;
+  tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
   reasoning_content?: string;
 };
+
+test("stable system prefix uses fixed slots and is byte-stable across empty optional files", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-prefix-"));
+  try {
+    const project = WriterProject.init(root, "前缀");
+    const store = new WriterStore(project);
+    const a = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "general");
+    const b = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "general");
+    assert.equal(a.length, 6);
+    assert.ok(a.every(message => message.role === "system"));
+    assert.deepEqual(a.map(m => m.content), b.map(m => m.content));
+    // Placeholders keep slot count when project has no instructions/skills.
+    assert.match(a[2].content ?? "", /项目指令/);
+    assert.match(a[3].content ?? "", /项目技能/);
+    const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
+    assert.equal(audit.length, 6);
+    assert.notEqual(audit[5].content, a[5].content);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dynamic turn messages always expose the same slot count", () => {
+  const full = buildDynamicTurnMessages({
+    historyText: "历史",
+    archiveContext: "归档",
+    taskContext: "任务",
+    dynamicStyleContext: "声线",
+    bootstrapContext: "线索",
+    todosPrompt: "清单",
+    artifactContext: "记忆",
+    selectedContext: "选区",
+    prompt: "写一章",
+  });
+  const empty = buildDynamicTurnMessages({
+    historyText: "历史对话：（无）",
+    archiveContext: "归档",
+    taskContext: "任务",
+    prompt: "闲聊",
+  });
+  assert.equal(full.length, 9);
+  assert.equal(empty.length, 9);
+  assert.equal(full.at(-1)?.role, "user");
+  assert.equal(empty.at(-1)?.content, "闲聊");
+  assert.match(empty[3].content ?? "", /动态声线/);
+  assert.match(empty[6].content ?? "", /工作记忆/);
+});
 
 test("compactRuntimeMessages digests older heavy tool bodies and keeps recent full", () => {
   const heavy = JSON.stringify({
@@ -101,4 +153,30 @@ test("stripStaleReasoningContent keeps only the latest reasoning block", () => {
   stripStaleReasoningContent(messages as never);
   assert.equal(messages[0].reasoning_content, undefined);
   assert.equal(messages[2].reasoning_content, "think2");
+});
+
+test("compactCompletedToolCalls keeps only the latest propose payload", () => {
+  const messages: Msg[] = [
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "1", type: "function",
+        function: { name: "propose_document", arguments: JSON.stringify({ path: "a.md", summary: "old", content: "旧正文很长".repeat(20) }) },
+      }],
+    },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "2", type: "function",
+        function: { name: "propose_document", arguments: JSON.stringify({ path: "a.md", summary: "new", content: "新正文" }) },
+      }],
+    },
+  ];
+  compactCompletedToolCalls(messages as never);
+  const first = JSON.parse(messages[0].tool_calls![0].function.arguments) as { content: string };
+  const second = JSON.parse(messages[1].tool_calls![0].function.arguments) as { content: string };
+  assert.match(first.content, /已压缩/);
+  assert.equal(second.content, "新正文");
 });
