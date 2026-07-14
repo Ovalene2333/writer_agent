@@ -5,15 +5,18 @@ import { documentDiff, renderDiffHtml } from "../diff";
 import { CharacterEditor } from "./character_editor";
 import {
   apiUrl,
+  buildEntryUrl,
   ensureConnection,
   failoverFrom,
   getAccessToken,
   getActiveBase,
   getConnectionInfo,
   initConnection,
+  setConnectionPreference,
   startConnectionMonitor,
   subscribeConnection,
   type ConnectionInfo,
+  type ConnectionPreference,
 } from "./connection";
 import { ModelConfig, type ProviderCatalog } from "./model_config";
 import "./style.css";
@@ -84,7 +87,7 @@ type Temporal = { sourceRefs: Array<{ type: "outline" | "document" | "manual"; r
 type TextEntry = Temporal & { id: string; label: string; description: string };
 type Goal = Temporal & { id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown"; priority: number; summary: string; stakes: string; obstacles: string[] };
 type Relationship = Temporal & { id: string; characterId: number; type: string; description: string; attitude: string; status: "active" | "ended" | "strained" | "unknown" };
-type Competency = Temporal & { id: string; name: string; level: string; description: string; resources: string[]; limitations: string[]; costs: string[] };
+type Competency = Temporal & { id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[] };
 type StoryState = Temporal & { id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string; knowledge: TextEntry[]; beliefs: TextEntry[]; intentions: string[]; temporaryGoals: Goal[]; notes: string };
 type Character = {
   schemaVersion: 3; id: number;
@@ -1083,6 +1086,9 @@ function App() {
   const [todosCollapsed, setTodosCollapsed] = useState(false);
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const [connection, setConnection] = useState<ConnectionInfo>(() => getConnectionInfo());
+  const [showConnectionPanel, setShowConnectionPanel] = useState(false);
+  const [connectionBusy, setConnectionBusy] = useState(false);
+  const [connectionPanelMsg, setConnectionPanelMsg] = useState("");
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
@@ -1870,6 +1876,14 @@ function App() {
     await refresh(state?.sessionId);
   }
 
+  async function summarizeCompetency(competency: Competency): Promise<string> {
+    const result = await api<{ summary: string }>("/api/characters/competencies/summarize", {
+      method: "POST",
+      body: JSON.stringify({ competency }),
+    });
+    return result.summary;
+  }
+
   function normalParticipant(character: Character): RoleplayParticipant {
     return {
       kind: "normal", id: character.id, name: character.identity.name,
@@ -2104,17 +2118,19 @@ function App() {
             <h1>{state.config.title || "Writer Agent"}</h1>
           </div>
           {connection.dualMode && (
-            <span
+            <button
+              type="button"
               className={`connection-pill route-${connection.route}${connection.lanBlockedByMixedContent ? " mixed-block" : ""}`}
-              title={
-                connection.lanBlockedByMixedContent
-                  ? "当前为 HTTPS 公网页，无法探测局域网 HTTP。在家请扫终端里的局域网二维码以启用自动切换。"
-                  : `API 通道：${connection.label}（${connection.base}）。离开/进入局域网会自动切换。`
-              }
+              title="连接通道：点击查看说明与切换"
+              aria-label={`当前${connection.label}，打开连接设置`}
+              onClick={() => {
+                setConnectionPanelMsg("");
+                setShowConnectionPanel(true);
+              }}
             >
               <i aria-hidden="true" />
-              {connection.label}
-            </span>
+              <span className="connection-pill-label">{connection.label}</span>
+            </button>
           )}
         </div>
         <div className="header-right">
@@ -2981,6 +2997,175 @@ function App() {
         </div>
       )}
 
+      {showConnectionPanel && connection.dualMode && (
+        <div
+          className="theme-picker-backdrop"
+          onMouseDown={() => setShowConnectionPanel(false)}
+          role="presentation"
+        >
+          <div
+            className="theme-picker connection-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label="连接通道"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="theme-picker-head">
+              <div>
+                <span className="eyebrow">Network</span>
+                <h2>连接通道</h2>
+                <p>
+                  当前走 <strong>{connection.label}</strong>
+                  {connection.preference !== "auto" ? `（已锁定，偏好：${connection.preference === "lan" ? "局域网" : "公网"}）` : "（自动）"}
+                  。在家优先局域网，出门自动切公网；也可手动锁定或打开对应链接。
+                </p>
+              </div>
+              <button className="icon" aria-label="关闭" onClick={() => setShowConnectionPanel(false)}>×</button>
+            </div>
+
+            <div className="connection-status-row">
+              <span className={`connection-status-dot route-${connection.route}`} aria-hidden="true" />
+              <div className="connection-status-meta">
+                <strong>{connection.label}</strong>
+                <small title={connection.base}>{connection.base}</small>
+              </div>
+              <button
+                type="button"
+                className="ghost"
+                disabled={connectionBusy}
+                onClick={() => {
+                  setConnectionBusy(true);
+                  setConnectionPanelMsg("");
+                  void ensureConnection()
+                    .then((info) => {
+                      setConnection(info);
+                      setConnectionPanelMsg(`已重新探测：${info.label}`);
+                    })
+                    .catch((e) => setConnectionPanelMsg(String(e)))
+                    .finally(() => setConnectionBusy(false));
+                }}
+              >
+                重新探测
+              </button>
+            </div>
+
+            <div className="connection-section">
+              <h3>通道偏好</h3>
+              <div className="connection-pref-grid">
+                {(
+                  [
+                    { id: "auto" as const, name: "自动", desc: "局域网优先，不可达则公网" },
+                    { id: "lan" as const, name: "局域网", desc: "尽量锁定，低延迟" },
+                    { id: "public" as const, name: "公网", desc: "Cloudflare 隧道" },
+                  ] satisfies Array<{ id: ConnectionPreference; name: string; desc: string }>
+                ).map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`connection-pref-card${connection.preference === item.id ? " active" : ""}${connection.route === item.id ? " live" : ""}`}
+                    disabled={connectionBusy}
+                    onClick={() => {
+                      setConnectionBusy(true);
+                      setConnectionPanelMsg("");
+                      void setConnectionPreference(item.id)
+                        .then((result) => {
+                          setConnection(getConnectionInfo());
+                          if (result.needNavigate) {
+                            setConnectionPanelMsg(result.error || "请用下方入口链接打开对应通道");
+                            return;
+                          }
+                          if (result.error) {
+                            setConnectionPanelMsg(result.error);
+                            return;
+                          }
+                          setConnectionPanelMsg(
+                            item.id === "auto"
+                              ? `已设为自动 · 当前 ${result.label}`
+                              : `已切换到${item.name}`,
+                          );
+                        })
+                        .finally(() => setConnectionBusy(false));
+                    }}
+                  >
+                    <strong>{item.name}</strong>
+                    <small>{item.desc}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="connection-section">
+              <h3>入口链接</h3>
+              <p className="connection-hint">
+                推荐在家 Wi‑Fi 用<strong>局域网</strong>入口（可自动切换）。仅公网页无法探测局域网 HTTP（浏览器混合内容限制）。
+              </p>
+              {connection.lanBlockedByMixedContent && (
+                <p className="connection-warn">
+                  当前是 HTTPS 公网页，无法在页内切到局域网 API。回家后请打开下方局域网链接（或重新扫终端二维码）。
+                </p>
+              )}
+              {(
+                [
+                  { kind: "lan" as const, name: "局域网", base: connection.lanBase },
+                  { kind: "public" as const, name: "公网", base: connection.publicBase },
+                ]
+              ).map((item) => {
+                const entry = buildEntryUrl(item.kind);
+                return (
+                  <div key={item.kind} className="connection-link-row">
+                    <div className="connection-link-meta">
+                      <strong>{item.name}</strong>
+                      <small title={item.base || undefined}>{item.base || "未配置"}</small>
+                    </div>
+                    <div className="connection-link-actions">
+                      <button
+                        type="button"
+                        className="ghost"
+                        disabled={!entry}
+                        onClick={() => {
+                          if (!entry) return;
+                          void navigator.clipboard?.writeText(entry)
+                            .then(() => setConnectionPanelMsg(`已复制${item.name}链接`))
+                            .catch(() => setConnectionPanelMsg(entry));
+                        }}
+                      >
+                        复制
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost"
+                        disabled={!entry}
+                        onClick={() => {
+                          if (!entry) return;
+                          window.open(entry, "_blank", "noopener,noreferrer");
+                        }}
+                      >
+                        新标签
+                      </button>
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={!entry}
+                        onClick={() => {
+                          if (!entry) return;
+                          window.location.assign(entry);
+                        }}
+                      >
+                        打开
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {connectionPanelMsg && (
+              <p className="connection-panel-msg" role="status">{connectionPanelMsg}</p>
+            )}
+          </div>
+        </div>
+      )}
+
       {showThemePicker && (
         <div
           className="theme-picker-backdrop"
@@ -3222,6 +3407,7 @@ function App() {
           onChange={setCharacterDraft}
           onClose={() => setCharacterDraft(null)}
           onSave={() => void saveCharacter()}
+          onSummarizeCompetency={summarizeCompetency}
           onDelete={characterDraft.id ? () => void deleteCharacter(characterDraft as Character) : undefined}
         />
       )}

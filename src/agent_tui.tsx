@@ -697,6 +697,7 @@ export function WriterAgentTui(props: {
           characterId: roleplay.characterId,
           prompt: text,
           model: props.providers.modelConfig("roleplay"),
+          summarizer: props.providers.summaryModelConfig(),
           signal: controller.signal,
           onEvent: handleEvent,
         });

@@ -1,12 +1,17 @@
 /** 局域网 / Cloudflare 双通道：扫一次码后按可达性自动切换 API 基址。 */
 
 export type ConnectionRoute = "lan" | "public" | "local";
+/** 用户偏好：自动择优，或锁定某一通道。 */
+export type ConnectionPreference = "auto" | "lan" | "public";
 
 export type ConnectionInfo = {
   route: ConnectionRoute;
   label: string;
   dualMode: boolean;
   base: string;
+  lanBase: string | null;
+  publicBase: string | null;
+  preference: ConnectionPreference;
   /** 当前页是 HTTPS 时无法探测/调用局域网 HTTP（混合内容），仅能走公网。 */
   lanBlockedByMixedContent: boolean;
 };
@@ -15,6 +20,7 @@ type StoredConnection = {
   token: string;
   lanBase?: string;
   publicBase?: string;
+  preference?: ConnectionPreference;
 };
 
 const STORAGE_KEY = "writer-connection-v1";
@@ -29,6 +35,7 @@ let lanBase: string | null = null;
 let publicBase: string | null = null;
 let activeBase = "";
 let route: ConnectionRoute = "local";
+let preference: ConnectionPreference = "auto";
 let selecting: Promise<void> | null = null;
 const listeners = new Set<Listener>();
 
@@ -93,7 +100,7 @@ function writeStored(data: StoredConnection): void {
 
 function routeLabel(next: ConnectionRoute): string {
   if (next === "lan") return "局域网";
-  if (next === "public") return "Cloudflare";
+  if (next === "public") return "公网";
   return "本机";
 }
 
@@ -107,8 +114,21 @@ function currentInfo(): ConnectionInfo {
     label: routeLabel(route),
     dualMode,
     base: activeBase || (typeof location !== "undefined" ? location.origin : ""),
+    lanBase,
+    publicBase,
+    preference,
     lanBlockedByMixedContent,
   };
+}
+
+function persist(): void {
+  if (!token) return;
+  writeStored({
+    token,
+    ...(lanBase ? { lanBase } : {}),
+    ...(publicBase ? { publicBase } : {}),
+    preference,
+  });
 }
 
 function emit(): void {
@@ -180,13 +200,12 @@ export function initConnection(): string {
   else if (publicBase && activeBase === publicBase) route = "public";
   else route = "local";
 
-  if (token) {
-    writeStored({
-      token,
-      ...(lanBase ? { lanBase } : {}),
-      ...(publicBase ? { publicBase } : {}),
-    });
-  }
+  const storedPref = stored?.preference;
+  preference = storedPref === "lan" || storedPref === "public" || storedPref === "auto"
+    ? storedPref
+    : "auto";
+
+  if (token) persist();
 
   if (boot.token || boot.lan || boot.public) {
     try {
@@ -239,16 +258,83 @@ async function probe(base: string): Promise<boolean> {
   }
 }
 
-/** 按优先级选择可达基址：局域网 > 公网 > 当前页。 */
+/** 带 token 的入口链接（可复制 / 在新标签打开 / 整页跳转）。 */
+export function buildEntryUrl(kind: "lan" | "public"): string | null {
+  if (!token) return null;
+  if (kind === "lan") {
+    if (!lanBase) return null;
+    const params = new URLSearchParams();
+    params.set("token", token);
+    if (publicBase) params.set("public", publicBase);
+    return `${lanBase}/#${params.toString()}`;
+  }
+  if (!publicBase) return null;
+  const params = new URLSearchParams();
+  params.set("token", token);
+  if (lanBase) params.set("lan", lanBase);
+  return `${publicBase}/#${params.toString()}`;
+}
+
+/**
+ * 用户手动指定通道偏好。
+ * - auto：局域网优先，失败走公网
+ * - lan / public：尽量锁定；若本页因混合内容无法调用，会返回 needNavigate 让 UI 引导整页打开
+ */
+export async function setConnectionPreference(
+  next: ConnectionPreference,
+): Promise<ConnectionInfo & { needNavigate?: "lan" | "public"; error?: string }> {
+  preference = next;
+  persist();
+  emit();
+
+  if (next === "auto") {
+    await ensureConnection();
+    return currentInfo();
+  }
+
+  const base = next === "lan" ? lanBase : publicBase;
+  if (!base) {
+    return { ...currentInfo(), error: next === "lan" ? "未配置局域网地址" : "未配置公网地址" };
+  }
+  if (!canFetchBase(base)) {
+    return { ...currentInfo(), needNavigate: next, error: "当前页无法直接调用该通道（混合内容），请用下方链接打开" };
+  }
+  if (!(await probe(base))) {
+    return { ...currentInfo(), error: next === "lan" ? "局域网不可达，请确认在同一 Wi‑Fi" : "公网隧道不可达" };
+  }
+  setRoute(next, base);
+  return currentInfo();
+}
+
+/** 按优先级选择可达基址：偏好锁定 > 局域网 > 公网 > 当前页。 */
 export async function ensureConnection(): Promise<ConnectionInfo> {
   if (selecting) {
     await selecting;
     return currentInfo();
   }
   selecting = (async () => {
-    if (lanBase && canFetchBase(lanBase) && await probe(lanBase)) {
-      setRoute("lan", lanBase);
-      return;
+    if (preference === "lan" && lanBase && canFetchBase(lanBase)) {
+      if (await probe(lanBase)) {
+        setRoute("lan", lanBase);
+        return;
+      }
+      // 锁定局域网但不可达：若公网可用则降级并保留偏好（回家后监控会再试局域网）
+      if (publicBase && canFetchBase(publicBase) && await probe(publicBase)) {
+        setRoute("public", publicBase);
+        return;
+      }
+    }
+    if (preference === "public" && publicBase && canFetchBase(publicBase)) {
+      if (await probe(publicBase)) {
+        setRoute("public", publicBase);
+        return;
+      }
+    }
+    if (preference === "auto" || preference === "lan") {
+      if (lanBase && canFetchBase(lanBase) && await probe(lanBase)) {
+        setRoute("lan", lanBase);
+        return;
+      }
     }
     if (publicBase && canFetchBase(publicBase) && await probe(publicBase)) {
       setRoute("public", publicBase);

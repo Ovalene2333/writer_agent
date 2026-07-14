@@ -391,17 +391,28 @@ header {
 }
 
 .connection-pill {
-  display: inline-flex; align-items: center; gap: 6px;
-  flex-shrink: 0; margin-left: 4px;
-  padding: 4px 10px; border-radius: 999px;
-  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  display: inline-flex; align-items: center; gap: 5px;
+  flex-shrink: 0; margin-left: 2px;
+  padding: 3px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 650; letter-spacing: .02em;
   border: 1px solid var(--border-light);
   background: var(--surface2); color: var(--text-dim);
-  white-space: nowrap;
+  white-space: nowrap; line-height: 1;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color var(--transition), background var(--transition), transform .12s ease;
+}
+.connection-pill:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  transform: translateY(-0.5px);
+}
+.connection-pill:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
 }
 .connection-pill > i {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--text-faint);
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-faint); flex-shrink: 0;
 }
 .connection-pill.route-lan {
   color: #1f6b45; background: color-mix(in srgb, #2f9e64 14%, var(--surface));
@@ -414,6 +425,102 @@ header {
 }
 .connection-pill.route-public > i { background: #f59e0b; box-shadow: 0 0 0 3px color-mix(in srgb, #f59e0b 22%, transparent); }
 .connection-pill.mixed-block { opacity: .85; }
+
+/* 连接通道面板 */
+.connection-panel { max-width: min(520px, 100%); }
+.connection-status-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; margin-bottom: 16px;
+  border-radius: 14px; border: 1px solid var(--border-light);
+  background: var(--surface2);
+}
+.connection-status-dot {
+  width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text-faint);
+}
+.connection-status-dot.route-lan {
+  background: #2f9e64;
+  box-shadow: 0 0 0 4px color-mix(in srgb, #2f9e64 24%, transparent);
+}
+.connection-status-dot.route-public {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px color-mix(in srgb, #f59e0b 24%, transparent);
+}
+.connection-status-meta {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.connection-status-meta strong { font-size: 14px; }
+.connection-status-meta small,
+.connection-link-meta small {
+  font-size: 11px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.connection-section { margin-bottom: 18px; }
+.connection-section h3 {
+  margin: 0 0 8px; font-size: 12px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--text-dim);
+}
+.connection-hint {
+  margin: 0 0 10px; font-size: 12px; line-height: 1.5; color: var(--text-dim);
+}
+.connection-warn {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 10px;
+  font-size: 12px; line-height: 1.5;
+  color: #92400e;
+  background: color-mix(in srgb, #f59e0b 14%, var(--surface));
+  border: 1px solid color-mix(in srgb, #f59e0b 35%, var(--border));
+}
+.connection-pref-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+}
+.connection-pref-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  text-align: left; padding: 12px 10px; border-radius: 12px;
+  border: 1px solid var(--border-light); background: var(--surface2);
+  cursor: pointer; font-family: inherit;
+  transition: border-color var(--transition), box-shadow var(--transition), background var(--transition);
+}
+.connection-pref-card strong { font-size: 13px; color: var(--text); }
+.connection-pref-card small { font-size: 11px; color: var(--text-faint); line-height: 1.35; }
+.connection-pref-card:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.connection-pref-card.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-light) 70%, var(--surface));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.connection-pref-card:disabled { opacity: .55; cursor: not-allowed; }
+.connection-link-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-light);
+}
+.connection-link-row:first-of-type { border-top: 0; }
+.connection-link-meta {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.connection-link-meta strong { font-size: 13px; }
+.connection-link-actions {
+  display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0;
+}
+.connection-link-actions .primary {
+  padding: 6px 12px; border-radius: 8px; border: 0;
+  background: var(--accent); color: var(--accent-text);
+  font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit;
+}
+.connection-link-actions .primary:disabled,
+.connection-link-actions .ghost:disabled {
+  opacity: .45; cursor: not-allowed;
+}
+.connection-panel-msg {
+  margin: 4px 0 0; padding: 10px 12px; border-radius: 10px;
+  font-size: 12px; line-height: 1.45; color: var(--text);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+}
 
 .header-right {
   display: flex; align-items: center; gap: 8px; flex-shrink: 0;
@@ -1875,12 +1982,15 @@ button.agent-orb:focus-visible {
 .roleplay-progress-head strong { color: var(--text); font-size: 13px; }
 .roleplay-progress-head small { color: var(--text-faint); font-size: 11px; }
 .roleplay-progress-spinner {
+  display: block;
+  box-sizing: border-box;
   width: 22px;
   height: 22px;
   flex: 0 0 auto;
   border: 2px solid color-mix(in srgb, var(--accent) 18%, transparent);
   border-top-color: var(--accent);
   border-radius: 50%;
+  transform-origin: center;
   animation: roleplay-progress-spin .8s linear infinite;
 }
 .roleplay-progress-track {
@@ -1896,6 +2006,7 @@ button.agent-orb:focus-visible {
   height: 100%;
   border-radius: inherit;
   background: var(--accent);
+  will-change: transform;
   animation: roleplay-progress-slide 1.35s ease-in-out infinite;
 }
 .roleplay-progress-steps {
@@ -1918,19 +2029,24 @@ button.agent-orb:focus-visible {
 .roleplay-progress-steps .active { color: var(--accent); font-weight: 700; }
 .roleplay-progress-steps .active::before { animation: roleplay-progress-pulse 1s ease-in-out infinite; }
 .roleplay-progress-steps .done { color: color-mix(in srgb, var(--accent) 68%, var(--text-dim)); }
-@keyframes roleplay-progress-spin { to { transform: rotate(360deg); } }
+@keyframes roleplay-progress-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 @keyframes roleplay-progress-slide {
   from { transform: translateX(-105%); }
   to { transform: translateX(270%); }
 }
 @keyframes roleplay-progress-pulse { 50% { opacity: .35; transform: scale(.72); } }
 
+/* Loading progress is functional status feedback, not decorative chrome.
+   Windows "Animation effects" maps to prefers-reduced-motion and used to freeze
+   the whole indicator (icons only). Keep motion so PC matches mobile; only
+   soften the decorative step-dot pulse under reduced motion. */
 @media (prefers-reduced-motion: reduce) {
-  .roleplay-progress-spinner,
-  .roleplay-progress-track span,
-  .roleplay-progress-steps .active::before { animation: none; }
-  .roleplay-progress-spinner { border-color: var(--accent); }
-  .roleplay-progress-track span { width: 100%; opacity: .4; }
+  .roleplay-progress-spinner { animation-duration: 1.4s; }
+  .roleplay-progress-track span { animation-duration: 2.2s; }
+  .roleplay-progress-steps .active::before { animation: none; opacity: 1; }
 }
 
 
@@ -2380,6 +2496,15 @@ button.agent-orb:focus-visible {
   font-weight: 600;
 }
 .ce-field.wide { grid-column: 1 / -1; }
+.ce-field-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: -4px;
+}
+.ce-field-actions.wide { grid-column: 1 / -1; }
+.ce-field-actions small { color: var(--danger); font-weight: 500; }
 .ce-field-head {
   display: flex;
   flex-direction: column;
@@ -2989,6 +3114,27 @@ header { padding-inline: 18px; }
   .logo-mark { width: 32px; height: 32px; }
   header .title-stack .product-line { display: none; }
   header h1 { font-size: 15px; }
+  /* 窄屏：通道指示收成可点圆点，避免和右侧按钮抢宽 */
+  header .header-left { gap: 8px; }
+  header .connection-pill {
+    width: 28px; height: 28px; min-width: 28px; padding: 0; margin: 0 2px 0 0;
+    border: 0; background: transparent; gap: 0;
+    justify-content: center; align-items: center;
+  }
+  header .connection-pill-label { display: none; }
+  header .connection-pill > i {
+    width: 10px; height: 10px;
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+  }
+  header .connection-pill.route-lan > i {
+    box-shadow: 0 0 0 3px color-mix(in srgb, #2f9e64 28%, transparent);
+  }
+  header .connection-pill.route-public > i {
+    box-shadow: 0 0 0 3px color-mix(in srgb, #f59e0b 28%, transparent);
+  }
+  .connection-pref-grid { grid-template-columns: 1fr; }
+  .connection-link-row { flex-direction: column; align-items: stretch; gap: 8px; }
+  .connection-link-actions { justify-content: flex-end; }
   header .header-right { gap: 2px; }
   header .header-right > .ghost:not(.nav-action) { display: none; }
   header .header-right .nav-action { padding: 6px 8px; font-size: 12px; min-height: 38px; }

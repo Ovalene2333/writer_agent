@@ -187,7 +187,7 @@ export async function generateCharacter(input: {
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
-    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/notes；结构化条目必须有稳定 ASCII id，演进记录包含 status/sourceRefs/validFrom/validUntil。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
+    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/notes；结构化条目必须有稳定 ASCII id，演进记录包含 status/sourceRefs/validFrom/validUntil。competencies 每项必须填写 name、summary 和 unlocked；summary 是无论是否解锁都会展示的简短能力概述，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
   const result = input.project && input.allowedDocumentPaths?.length
@@ -195,6 +195,47 @@ export async function generateCharacter(input: {
     : await completeText(input.model, messages, input.signal);
   const parsed = parseJsonObject(result.content);
   return normalizeCharacterDraft(parsed);
+}
+
+export async function summarizeCharacterCompetency(input: {
+  model: ModelConfig;
+  competency: {
+    name?: string;
+    level?: string;
+    description?: string;
+    resources?: string[];
+    limitations?: string[];
+    costs?: string[];
+  };
+  signal?: AbortSignal;
+}): Promise<string> {
+  const competency = {
+    name: String(input.competency.name ?? "").trim().slice(0, 160),
+    level: String(input.competency.level ?? "").trim().slice(0, 160),
+    description: String(input.competency.description ?? "").trim().slice(0, 4_000),
+    resources: (input.competency.resources ?? []).filter(item => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20),
+    limitations: (input.competency.limitations ?? []).filter(item => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20),
+    costs: (input.competency.costs ?? []).filter(item => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 20),
+  };
+  if (![competency.name, competency.level, competency.description, ...competency.resources, ...competency.limitations, ...competency.costs].some(Boolean)) {
+    throw new Error("能力内容不能为空");
+  }
+  const result = await completeText(input.model, [
+    {
+      role: "system",
+      content: "你是角色卡能力摘要器。根据给定能力资料写一条简洁中文 summary，概括能力性质和核心效果。summary 即使能力未解锁也会展示，因此只写高层概述，不泄露具体机制、精确数值、资源清单、限制细节或代价细节。要求 20～80 个中文字符；只输出摘要正文，不加标题、引号、列表或解释；资料不足时忠实概括，不补造设定。",
+    },
+    { role: "user", content: JSON.stringify(competency) },
+  ], input.signal);
+  const summary = result.content
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(?:能力)?摘要[:：]\s*/, "")
+    .replace(/^["“]|["”]$/g, "")
+    .trim()
+    .slice(0, 200);
+  if (!summary) throw new Error("摘要模型没有返回有效内容");
+  return summary;
 }
 
 export async function updateCharacterFromConversation(input: {

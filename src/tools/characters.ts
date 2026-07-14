@@ -1,4 +1,4 @@
-import { resolveCharacterAt, type CharacterInput, type CharacterSection } from "../characters.js";
+import { characterPromptCard, competencyPromptView, resolveCharacterAt, type CharacterInput, type CharacterSection } from "../characters.js";
 import { OutlineStore } from "../outline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertWritableMode, optionalPositiveInteger } from "./helpers.js";
@@ -20,12 +20,14 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
   const character = store.characters().find(item => item.id === id);
   if (!character) throw new Error("角色不存在");
   const sections = Array.isArray(input.sections) ? [...new Set(input.sections.filter((x): x is CharacterSection => typeof x === "string" && SECTIONS.has(x as CharacterSection)))] : [];
-  if (!sections.length) return JSON.stringify(character);
+  if (!sections.length) return JSON.stringify(characterPromptCard(character));
   const selected: Record<string, unknown> = { id: character.id, name: character.identity.name };
   for (const section of sections) {
     if (section === "storyState") {
       const nodes = new OutlineStore(project).sync().nodes;
       selected.storyState = resolveCharacterAt(character, nodes, typeof input.outlineNodeId === "string" ? input.outlineNodeId : undefined);
+    } else if (section === "competencies") {
+      selected.competencies = character.competencies.map(competencyPromptView);
     } else selected[section] = character[section];
   }
   return JSON.stringify(selected);

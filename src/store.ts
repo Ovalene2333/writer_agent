@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   ActiveRoleplayState, AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal,
-  RoleplayInterlocutor, RoleplayParticipant, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
+  RoleplayInterlocutor, RoleplayParticipant, RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
 import { characterName, emptyCharacter, migrateV2Character, normalizeV3Character, validateCharacters, type CharacterInput } from "./characters.js";
@@ -97,6 +97,16 @@ export class WriterStore {
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
         character_id INTEGER NOT NULL,
         interlocutor_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS roleplay_memory (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        performer_key TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        summarized_through_id INTEGER NOT NULL DEFAULT 0,
+        state_json TEXT NOT NULL DEFAULT '{}',
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        same_beat_turns INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS model_usage (
@@ -485,6 +495,59 @@ export class WriterStore {
 
   clearActiveRoleplay(sessionId: string): void {
     this.database.prepare("DELETE FROM active_roleplays WHERE session_id=?").run(sessionId);
+    this.clearRoleplayMemory(sessionId);
+  }
+
+  roleplayMemory(sessionId: string): RoleplaySessionMemory | undefined {
+    const row = this.database.prepare(
+      "SELECT performer_key,summary,summarized_through_id,state_json,turn_count,same_beat_turns,updated_at FROM roleplay_memory WHERE session_id=?",
+    ).get(sessionId) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      performerKey: String(row.performer_key ?? ""),
+      summary: String(row.summary ?? ""),
+      summarizedThroughId: Number(row.summarized_through_id) || 0,
+      state: normalizeRoleplayWorkingState(row.state_json),
+      turnCount: Number(row.turn_count) || 0,
+      sameBeatTurns: Number(row.same_beat_turns) || 0,
+      updatedAt: String(row.updated_at ?? ""),
+    };
+  }
+
+  saveRoleplayMemory(sessionId: string, memory: RoleplaySessionMemory): RoleplaySessionMemory {
+    if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
+    const now = new Date().toISOString();
+    const state = normalizeRoleplayWorkingState(memory.state);
+    const saved: RoleplaySessionMemory = {
+      performerKey: memory.performerKey.trim(),
+      summary: memory.summary.trim().slice(0, 4_000),
+      summarizedThroughId: Math.max(0, Math.round(memory.summarizedThroughId) || 0),
+      state,
+      turnCount: Math.max(0, Math.round(memory.turnCount) || 0),
+      sameBeatTurns: Math.max(0, Math.round(memory.sameBeatTurns) || 0),
+      updatedAt: now,
+    };
+    this.database.prepare(`INSERT INTO roleplay_memory(
+      session_id,performer_key,summary,summarized_through_id,state_json,turn_count,same_beat_turns,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+      performer_key=excluded.performer_key, summary=excluded.summary,
+      summarized_through_id=excluded.summarized_through_id, state_json=excluded.state_json,
+      turn_count=excluded.turn_count, same_beat_turns=excluded.same_beat_turns, updated_at=excluded.updated_at`)
+      .run(
+        sessionId,
+        saved.performerKey,
+        saved.summary,
+        saved.summarizedThroughId,
+        JSON.stringify(saved.state),
+        saved.turnCount,
+        saved.sameBeatTurns,
+        now,
+      );
+    return saved;
+  }
+
+  clearRoleplayMemory(sessionId: string): void {
+    this.database.prepare("DELETE FROM roleplay_memory WHERE session_id=?").run(sessionId);
   }
 
   writingExamples(): WritingExample[] {
@@ -1190,6 +1253,49 @@ function normalizeStoredInterlocutor(input: unknown): RoleplayInterlocutor {
     knowledge: roleplayField(value.knowledge, "已知信息"),
     scene: roleplayField(value.scene, "场景"),
     goal: roleplayField(value.goal, "目标"),
+  };
+}
+
+export function emptyRoleplayWorkingState(): RoleplayWorkingState {
+  return {
+    scene: "",
+    proximity: "",
+    mood: "",
+    openThreads: [],
+    promises: [],
+    revealed: [],
+    relationshipDelta: "",
+    beat: "",
+    timeInScene: "",
+  };
+}
+
+function normalizeRoleplayWorkingState(input: unknown): RoleplayWorkingState {
+  let raw: Record<string, unknown> = {};
+  if (typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>;
+    } catch { /* keep empty */ }
+  } else if (input && typeof input === "object" && !Array.isArray(input)) {
+    raw = input as Record<string, unknown>;
+  }
+  const str = (key: keyof RoleplayWorkingState, max = 400) =>
+    typeof raw[key] === "string" ? raw[key].trim().slice(0, max) : "";
+  const list = (key: "openThreads" | "promises" | "revealed") =>
+    Array.isArray(raw[key])
+      ? raw[key].filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 12)
+      : [];
+  return {
+    scene: str("scene"),
+    proximity: str("proximity", 200),
+    mood: str("mood", 200),
+    openThreads: list("openThreads"),
+    promises: list("promises"),
+    revealed: list("revealed"),
+    relationshipDelta: str("relationshipDelta"),
+    beat: str("beat", 80),
+    timeInScene: str("timeInScene", 120),
   };
 }
 

@@ -131,7 +131,7 @@ export interface CharacterRelationship extends CharacterTemporal {
   status: "active" | "ended" | "strained" | "unknown"; description: string;
 }
 export interface CharacterCompetency extends CharacterTemporal {
-  id: string; name: string; level: string; description: string; resources: string[]; limitations: string[]; costs: string[];
+  id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[];
 }
 export interface CharacterStoryState extends CharacterTemporal {
   id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string;
@@ -284,6 +284,38 @@ export type RoleplayParticipant = {
 export interface ActiveRoleplayState {
   performer: RoleplayParticipant;
   identity: RoleplayParticipant;
+}
+
+/** Structured on-stage facts for long roleplay (not prose / not style templates). */
+export interface RoleplayWorkingState {
+  scene: string;
+  proximity: string;
+  mood: string;
+  openThreads: string[];
+  promises: string[];
+  revealed: string[];
+  relationshipDelta: string;
+  /** Dramatic beat label, e.g. 试探 / 僵持 / 缓和 / 冲突升级 */
+  beat: string;
+  timeInScene: string;
+}
+
+/**
+ * Long-term roleplay memory for one session+performer.
+ * Summary holds cold facts; working state holds live stage continuity.
+ */
+export interface RoleplaySessionMemory {
+  /** "normal:1" | "simple:2" | "generated:Name" — reset when performer changes */
+  performerKey: string;
+  summary: string;
+  /** Last message id folded into summary (0 = none). */
+  summarizedThroughId: number;
+  state: RoleplayWorkingState;
+  /** Assistant replies produced while this memory is active. */
+  turnCount: number;
+  /** Consecutive turns that stayed on the same beat label. */
+  sameBeatTurns: number;
+  updatedAt: string;
 }
 
 export type PermissionMode = "ask" | "auto" | "plan";

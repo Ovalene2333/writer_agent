@@ -1,10 +1,20 @@
-import type { AgentEvent, Character, ModelConfig, RoleplayInterlocutor, RoleplayParticipant, StepUsage, UsageSummary } from "./types.js";
-import { characterName, characterPromptViews } from "./characters.js";
+import type {
+  AgentEvent,
+  Character,
+  ModelConfig,
+  RoleplayInterlocutor,
+  RoleplayParticipant,
+  RoleplaySessionMemory,
+  RoleplayWorkingState,
+  StepUsage,
+  UsageSummary,
+} from "./types.js";
+import { characterName, characterPromptCard, characterPromptViews } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { calculateUsageCost } from "./pricing.js";
 import { documentKind, WriterProject } from "./project.js";
-import { WriterStore } from "./store.js";
+import { emptyRoleplayWorkingState, WriterStore } from "./store.js";
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
@@ -14,6 +24,22 @@ type SetupMessage = {
   tool_call_id?: string;
   tool_calls?: ToolCall[];
 };
+
+/** Recent full user/assistant messages kept in the roleplay prompt (not turns). ~8 dialogue turns. */
+export const ROLEPLAY_RECENT_MESSAGES = 16;
+/** When older-than-window unsummarized messages reach this count, fold them into the rolling summary. */
+export const ROLEPLAY_SUMMARY_BATCH = 8;
+/** Refresh working-state via model every N assistant replies when no batch summary is needed. */
+export const ROLEPLAY_STATE_REFRESH_EVERY = 4;
+
+/**
+ * Roleplay prompt / prefix-cache contract (separate from agent.ts):
+ * 1) Fixed system slots first: rules+cards | summary | memory card | anti-formula
+ * 2) Never omit a slot — use stable placeholder text so indices do not shift
+ * 3) Stable slot 0 must stay byte-stable within a session (no live scene / turn counters)
+ * 4) Recent history is short; older facts live in summary + memory, not full transcripts
+ * 5) Anti-formula is dynamic-tail only and must stay short
+ */
 
 /** 会话内角色扮演状态（测试性子功能，不落库）。 */
 export type RoleplayTarget = { characterId: number; name: string };
@@ -25,43 +51,254 @@ export function isRoleplayExitCommand(text: string): boolean {
     || normalized === "/rp off";
 }
 
-export function buildRoleplaySystemPrompt(character: Character | RoleplayInterlocutor, project?: WriterProject, interlocutor?: RoleplayInterlocutor | Character): string {
+export function roleplayPerformerKey(participant: RoleplayParticipant): string {
+  if (participant.kind === "normal" && participant.id) return `normal:${participant.id}`;
+  if (participant.kind === "simple" && participant.id) return `simple:${participant.id}`;
+  return `generated:${participant.name}`;
+}
+
+/** Slim stable character payload: voice boundaries, not example-line machines. */
+export function slimRoleplayCharacterViews(
+  character: Character | RoleplayInterlocutor,
+  project?: WriterProject,
+): unknown {
+  if (!("schemaVersion" in character)) {
+    return {
+      simple: {
+        name: character.name,
+        identity: character.identity,
+        relationship: character.relationship,
+        knowledge: character.knowledge,
+        scene: character.scene,
+        goal: character.goal,
+      },
+    };
+  }
   const nodes = project ? new OutlineStore(project).sync().nodes : [];
-  const full = "schemaVersion" in character;
-  const views = full ? characterPromptViews(character, nodes) : { simple: character };
-  const name = full ? characterName(character) : character.name;
-  const interlocutorData = interlocutor && "schemaVersion" in interlocutor
-    ? characterPromptViews(interlocutor, nodes)
-    : interlocutorView(interlocutor ?? defaultInterlocutor());
+  const views = characterPromptViews(character, nodes);
+  return {
+    stable: {
+      id: views.stable.id,
+      identity: views.stable.identity,
+      profile: {
+        appearanceSummary: views.stable.profile.appearanceSummary,
+        distinguishingFeatures: views.stable.profile.distinguishingFeatures.slice(0, 6),
+        backgroundSummary: views.stable.profile.backgroundSummary.slice(0, 400),
+      },
+      psychology: {
+        summary: views.stable.psychology.summary,
+        traits: views.stable.psychology.traits.slice(0, 6),
+        values: views.stable.psychology.values.slice(0, 4),
+        fears: views.stable.psychology.fears.slice(0, 4),
+        conflicts: views.stable.psychology.conflicts.slice(0, 4),
+      },
+      competencies: views.stable.competencies,
+      notes: views.stable.notes.slice(0, 300),
+    },
+    dialogue: {
+      name: views.dialogue.name,
+      voice: {
+        summary: views.dialogue.voice.summary,
+        register: views.dialogue.voice.register,
+        diction: views.dialogue.voice.diction.slice(0, 8),
+        verbalHabits: views.dialogue.voice.verbalHabits.slice(0, 4),
+        avoidedExpressions: views.dialogue.voice.avoidedExpressions.slice(0, 6),
+        // Examples are boundaries, not per-turn templates — keep at most one.
+        exampleHint: views.dialogue.voice.examples[0]?.slice(0, 80) ?? "",
+      },
+    },
+  };
+}
+
+function interlocutorBaseline(value: RoleplayInterlocutor | Character | undefined): unknown {
+  if (!value) return interlocutorView(defaultInterlocutor());
+  if ("schemaVersion" in value) {
+    return {
+      name: value.identity.name,
+      identity: value.identity.summary || value.identity.narrativeRole,
+      relationship: "",
+      knowledge: "",
+      scene: "",
+      goal: value.motivations.find(item => item.status === "active")?.summary ?? "",
+    };
+  }
+  return interlocutorView(value);
+}
+
+/** Stable system slot 0: rules + slim cards. CACHE: keep session-stable. */
+export function buildRoleplayStablePrefix(
+  character: Character | RoleplayInterlocutor,
+  project?: WriterProject,
+  interlocutor?: RoleplayInterlocutor | Character,
+): string {
+  const name = "schemaVersion" in character ? characterName(character) : character.name;
+  const views = slimRoleplayCharacterViews(character, project);
+  const interlocutorData = interlocutorBaseline(interlocutor);
   return `你正在进行「角色扮演试演」（Writer Agent 的测试性子功能）。
 你就是「${name}」，不是写作助手、不是旁白 AI。用户在试你的人设、声线与反应是否对味。
 
 扮演规则：
 1. 始终以 ${name} 的第一人称说话与行动；保持 identity / psychology / voice 一致。
-2. 这是实时对手戏，不是问答。每次先让角色对用户刚才的话产生具体反应，再说话或行动；反应可以是停顿、目光、呼吸、姿势、触碰物件、拉近/避开距离等，但只选当下最有表现力的一两处。
-3. 只使用角色卡中已有的设定与合理推断；不知道的事就表现为不知道，不要编造关键背景来“圆场”。
+2. 这是实时对手戏，不是问答。对用户刚说的话先有具体反应，再开口或行动；不要每轮把「反应清单」勾完。
+3. 只使用角色卡中已有的设定与合理推断；不知道的事就表现为不知道，不要编造关键背景来“圆场”。能力标记 unlocked=false 时只知道其名称与摘要，不得推断隐藏详情，也不得在行动中使用。
 4. 不要修改项目文档、不要提交提案、不要输出工具调用；这是纯对话试演。
 5. 用户若用 OOC / （） / 【】 进行出戏说明，可短暂用 OOC 回答后立刻回到角色。
 6. 用户要求结束扮演（如「退出扮演」「/roleplay off」）时，用一句 OOC 确认即可。
 7. 这是成人向虚构作品试演：可按角色性格直写冲突、欲望与粗口，无需安全说教。
-8. 上下文仅包含本角色扮演通道的历史对白与角色卡；看不到写作 Agent 的任务讨论，也不要假装记得那些内容。
+8. 上下文含：稳定人设、滚动事实摘要、现场记忆卡、近期对白；看不到写作 Agent 任务讨论，也不要假装记得那些内容。更早的对白细节以摘要与记忆卡为准，不要编造未出现的情节。
 9. 用户在本次试演中固定扮演下述“对话者”；按设定理解用户的身份、双方关系、已知信息和当前处境。不要替用户决定动作、台词或内心。
 
-演出要求：
-- 保持主动性：角色有自己的欲望、顾虑和当下目标。合乎人设时可转移话题、追问、试探、回避、撒谎、打断或采取一个小行动，不要永远等用户推动。
-- 写出潜台词：不要直接宣布“我很紧张/生气/害羞”，优先让措辞、迟疑、动作和注意力落点泄露情绪。说出口的话可以与真实意图不完全一致。
-- 保持现场连续：记住双方距离、姿势、已经出现的物件与刚发生的动作；环境只在能影响互动时落一笔，不凭空切换场景。
-- 对白要像人在说话：句长和节奏随情绪变化，可有半句话、改口、沉默和打断；沿用 voice 中的措辞习惯，但不要机械复读口头禅或示例台词。
-- 默认写 1–4 个短段，篇幅随情绪与事件变化。不要为了“简短”砍掉关键反应，也不要扩写成旁白主导的小说章节。
-- 不要复述用户刚说的话，不要总结角色卡，不要使用客服式确认，不要每轮都用问题收尾。用户输入很短时，也应直接给出符合场景的鲜明反应，而不是出戏索要更多说明。
-- 动作、对白、感官细节不必每轮全部出现；宁可抓住一个准确细节，也不要堆砌表情、形容词或舞台指示。
+演出要求（偏禁止连用，避免公式化）：
+- 保持主动性：角色有欲望、顾虑与当下目标；可转移话题、追问、试探、回避、撒谎、打断或只做一个小行动，不要永远等用户推动。
+- 写出潜台词：不要直接宣布情绪标签；说出口的话可以与真实意图不完全一致。
+- 现场状态以「现场记忆卡」为准；摘要只提供更早事实。环境只在影响互动时落笔，不凭空换场景。
+- 对白要像人：句长随情绪变，可有半句、改口、沉默、打断。voice 是用词边界，不是每句要贴的标签；不要机械复读 verbalHabits 或 exampleHint。
+- 篇幅默认可以很短（一句话或一个动作即可）。只有冲击大时才写 2–4 短段。禁止扩成旁白主导的小说章。
+- 不要复述用户刚说的话，不要总结角色卡，不要客服式确认，不要每轮用问题收尾。
+- 禁止把「动作→对白→再动作→反问」当成每轮固定配方。连续两轮已有微动作/眼神/呼吸描写时，本轮优先纯对白或沉默，除非冲突明显升级。
+- 动作、对白、感官不必每轮齐全；宁可一个准细节，也不要堆砌舞台指示。
 
-对话者设定（JSON）：
+对话者设定（JSON，基线；现场变化见记忆卡）：
 ${JSON.stringify(interlocutorData, null, 2)}
 
-角色资料（JSON，stable=稳定人设，dialogue=声线，scene=当前场景切片）：
+角色资料（JSON，stable=人设，dialogue=声线边界）：
 ${JSON.stringify(views, null, 2)}
 `;
+}
+
+/** @deprecated Prefer buildRoleplayStablePrefix + fixed slots; kept for callers/tests. */
+export function buildRoleplaySystemPrompt(
+  character: Character | RoleplayInterlocutor,
+  project?: WriterProject,
+  interlocutor?: RoleplayInterlocutor | Character,
+): string {
+  return buildRoleplayStablePrefix(character, project, interlocutor);
+}
+
+export function formatRoleplaySummarySlot(summary: string): string {
+  const text = summary.trim();
+  return text
+    ? `滚动事实摘要（更早对白已压缩；只含事件/关系/承诺/已暴露信息，不含句式模板）：\n${text}`
+    : "滚动事实摘要：无。";
+}
+
+export function formatRoleplayMemorySlot(state: RoleplayWorkingState, sameBeatTurns = 0): string {
+  const empty = !state.scene && !state.proximity && !state.mood && !state.beat
+    && !state.relationshipDelta && !state.timeInScene
+    && !state.openThreads.length && !state.promises.length && !state.revealed.length;
+  if (empty) return "现场记忆卡：无。开场后根据互动自行建立现场，并在后续轮次与记忆卡保持连续。";
+  const beatHint = sameBeatTurns >= 3
+    ? `\n节拍提示：已连续 ${sameBeatTurns} 轮停留在「${state.beat || "同一节拍"}」。本轮须在人设内推进或打破（摊牌、撒谎、拒绝、离场、换话题、沉默拒答等），禁止温吞重复。`
+    : "";
+  return `现场记忆卡（舞台连续性以本卡为准）：
+${JSON.stringify(state, null, 2)}${beatHint}`;
+}
+
+const GESTURE_RE = /目光|眼神|视线|呼吸|嘴角|唇|手指|指尖|攥|握拳|沉默|顿了|停顿|抬眼|低头|偏头|咬唇|吞咽|喉结|肩膀|后退|靠近|皱眉|眯眼|笑了笑|轻笑/g;
+
+/** Extract short anti-template hints from the model's own recent replies. */
+export function extractAntiFormulaHints(recentAssistantReplies: string[]): {
+  openings: string[];
+  gestures: string[];
+  usedQuestionEnd: boolean;
+  usedActionThenSpeech: boolean;
+} {
+  const openings: string[] = [];
+  const gestureCounts = new Map<string, number>();
+  let usedQuestionEnd = false;
+  let usedActionThenSpeech = false;
+
+  for (const raw of recentAssistantReplies.slice(-2)) {
+    const text = raw.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const opening = text.slice(0, 24).trim();
+    if (opening) openings.push(opening);
+    if (/[？?]\s*$/.test(text) || /[？?][^。！!]{0,12}$/.test(text)) usedQuestionEnd = true;
+    if (/^[（(【\[]/.test(text) || /[）)】\]]\s*[「"‘']?/.test(text.slice(0, 40))) usedActionThenSpeech = true;
+    const matches = text.match(GESTURE_RE) ?? [];
+    for (const match of matches) gestureCounts.set(match, (gestureCounts.get(match) ?? 0) + 1);
+  }
+
+  const gestures = [...gestureCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([word]) => word);
+
+  return { openings, gestures, usedQuestionEnd, usedActionThenSpeech };
+}
+
+export function formatRoleplayAntiFormulaSlot(recentAssistantReplies: string[]): string {
+  if (!recentAssistantReplies.length) {
+    return "本轮反公式：开场可自由；避免客服腔与每轮完整小舞台段。";
+  }
+  const hints = extractAntiFormulaHints(recentAssistantReplies);
+  const lines = [
+    "本轮反公式（打断自我模仿；只约束结构，不改人设）：",
+    "- 禁止重复你最近回复的开场结构与骨架；本轮只选一种主表达：对白主导 / 动作主导 / 沉默主导 / 转移话题。",
+  ];
+  if (hints.openings.length) {
+    lines.push(`- 禁用开场（勿再以相同开头起笔）：${hints.openings.map(item => `「${item}」`).join("、")}`);
+  }
+  if (hints.gestures.length) {
+    lines.push(`- 近期已用微动作/感官词，本轮尽量避开：${hints.gestures.join("、")}`);
+  }
+  if (hints.usedActionThenSpeech) {
+    lines.push("- 最近用过「动作/括号→对白」骨架，本轮改用其他形态。");
+  }
+  if (hints.usedQuestionEnd) {
+    lines.push("- 最近以问句收尾过，本轮不要再用问题收束。");
+  }
+  lines.push("- 若无新信息，宁可短促，不要写完整的“一小节表演”。");
+  return lines.join("\n");
+}
+
+/**
+ * Fixed-count roleplay message assembly.
+ * Slot map: 0 stable | 1 summary | 2 memory | 3 anti-formula | recent history | current user
+ */
+export function buildRoleplayChatMessages(parts: {
+  stablePrefix: string;
+  summary: string;
+  state: RoleplayWorkingState;
+  sameBeatTurns?: number;
+  recentAssistantReplies: string[];
+  history: Array<{ role: "user" | "assistant"; content: string }>;
+  userText: string;
+}): ChatMessage[] {
+  return [
+    { role: "system", content: parts.stablePrefix },
+    { role: "system", content: formatRoleplaySummarySlot(parts.summary) },
+    { role: "system", content: formatRoleplayMemorySlot(parts.state, parts.sameBeatTurns ?? 0) },
+    { role: "system", content: formatRoleplayAntiFormulaSlot(parts.recentAssistantReplies) },
+    ...parts.history,
+    { role: "user", content: parts.userText },
+  ];
+}
+
+export function emptyRoleplaySessionMemory(performerKey: string): RoleplaySessionMemory {
+  return {
+    performerKey,
+    summary: "",
+    summarizedThroughId: 0,
+    state: emptyRoleplayWorkingState(),
+    turnCount: 0,
+    sameBeatTurns: 0,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function seedStateFromInterlocutor(interlocutor?: RoleplayInterlocutor | Character): RoleplayWorkingState {
+  const state = emptyRoleplayWorkingState();
+  if (!interlocutor) return state;
+  if ("schemaVersion" in interlocutor) {
+    state.scene = "";
+    return state;
+  }
+  state.scene = interlocutor.scene.slice(0, 400);
+  state.relationshipDelta = interlocutor.relationship.slice(0, 400);
+  if (interlocutor.goal) state.openThreads = [interlocutor.goal.slice(0, 200)];
+  state.beat = "开场";
+  return state;
 }
 
 export async function runRoleplayChat(options: {
@@ -74,6 +311,8 @@ export async function runRoleplayChat(options: {
   interlocutor?: RoleplayInterlocutor;
   prompt: string;
   model: ModelConfig;
+  /** Optional cheaper model for rolling summary / working-state refresh. */
+  summarizer?: ModelConfig;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }): Promise<void> {
@@ -95,23 +334,73 @@ export async function runRoleplayChat(options: {
   options.store.addMessage(options.sessionId, "user", userText, "roleplay");
   emit({ type: "step_start", step: 1 });
 
-  // Roleplay history is independent of the writing Agent prompt assembly
-  // (agent.ts PROMPT / PREFIX-CACHE CONTRACT does not apply here).
-  // Only this channel; full message bodies; last 24 turns (not the agent history preview).
-  // Long archives for writing must use inspect_conversation / read_conversation on the agent path.
-  const history = options.store.messages(options.sessionId, 24, { channel: "roleplay" })
-    .filter(message => message.role === "user" || message.role === "assistant")
-    .slice(0, -1) // exclude the user message just written
-    .map(message => ({ role: message.role as "user" | "assistant", content: message.content }));
-
-  const identity = options.identity?.kind === "normal" && options.identity.id
+  const identitySource = options.identity?.kind === "normal" && options.identity.id
     ? options.store.characters().find(item => item.id === options.identity!.id)
     : options.identity?.card ?? options.interlocutor;
-  const messages: ChatMessage[] = [
-    { role: "system", content: buildRoleplaySystemPrompt(character, options.project, identity) },
-    ...history,
-    { role: "user", content: userText },
-  ];
+
+  const performerKey = roleplayPerformerKey(participant);
+  let memory: RoleplaySessionMemory = options.store.roleplayMemory(options.sessionId)
+    ?? emptyRoleplaySessionMemory(performerKey);
+  if (memory.performerKey !== performerKey) {
+    memory = emptyRoleplaySessionMemory(performerKey);
+    memory.state = seedStateFromInterlocutor(identitySource ?? options.interlocutor);
+    options.store.saveRoleplayMemory(options.sessionId, memory);
+  } else if (memory.turnCount === 0 && !memory.summary && !memory.state.scene) {
+    memory = {
+      ...memory,
+      state: seedStateFromInterlocutor(identitySource ?? options.interlocutor),
+    };
+    options.store.saveRoleplayMemory(options.sessionId, memory);
+  }
+
+  // Full archive stays in DB; prompt only loads a short recent window + memory.
+  const channelAll = options.store.messages(options.sessionId, 500, { channel: "roleplay" })
+    .filter(message => message.role === "user" || message.role === "assistant");
+  // Exclude the user message just written from "history" pairs shown before current user.
+  const prior = channelAll.slice(0, -1);
+  const recent = prior.slice(-ROLEPLAY_RECENT_MESSAGES);
+  const history = recent.map(message => ({
+    role: message.role as "user" | "assistant",
+    content: message.content,
+  }));
+  const recentAssistantReplies = recent
+    .filter(message => message.role === "assistant")
+    .map(message => message.content);
+
+  // Fold older turns into rolling summary before the main completion when needed.
+  const firstRecentId = recent[0]?.id ?? channelAll[channelAll.length - 1]?.id ?? 0;
+  const needsSummary = prior.some(message => message.id < firstRecentId && message.id > memory.summarizedThroughId);
+  const dueStateRefresh = memory.turnCount > 0 && memory.turnCount % ROLEPLAY_STATE_REFRESH_EVERY === 0;
+  if (needsSummary || dueStateRefresh) {
+    try {
+      memory = await refreshRoleplayMemory({
+        store: options.store,
+        sessionId: options.sessionId,
+        memory,
+        prior,
+        firstRecentId,
+        model: options.summarizer ?? options.model,
+        signal: options.signal,
+        forceStateOnly: !needsSummary && dueStateRefresh,
+      });
+    } catch {
+      // Memory refresh is best-effort; roleplay reply still proceeds.
+      if (needsSummary) {
+        memory = foldExtractiveSummary(memory, prior, firstRecentId);
+        options.store.saveRoleplayMemory(options.sessionId, memory);
+      }
+    }
+  }
+
+  const messages = buildRoleplayChatMessages({
+    stablePrefix: buildRoleplayStablePrefix(character, options.project, identitySource),
+    summary: memory.summary,
+    state: memory.state,
+    sameBeatTurns: memory.sameBeatTurns,
+    recentAssistantReplies,
+    history,
+    userText,
+  });
 
   let full = "";
   try {
@@ -124,6 +413,16 @@ export async function runRoleplayChat(options: {
       emit({ type: "text", text: result.content, channel: "output" });
     }
     options.store.addMessage(options.sessionId, "assistant", reply, "roleplay");
+
+    // Lightweight post-turn bookkeeping (no extra model call).
+    memory = {
+      ...memory,
+      turnCount: memory.turnCount + 1,
+      sameBeatTurns: memory.state.beat ? memory.sameBeatTurns + 1 : 0,
+      updatedAt: new Date().toISOString(),
+    };
+    options.store.saveRoleplayMemory(options.sessionId, memory);
+
     if (result.usage) {
       emitUsage(emit, options.store, options.sessionId, options.model, result.usage, 1);
     }
@@ -236,7 +535,7 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
           const id = Number(args.id);
           const character = characters.find(item => item.id === id);
           if (!character) throw new Error("角色不存在");
-          result = character;
+          result = characterPromptCard(character);
         } else if (call.function.name === "search_worldview") {
           const query = typeof args.query === "string" ? args.query.trim() : "";
           if (!query) throw new Error("检索词不能为空");
@@ -335,6 +634,9 @@ async function streamRoleplayText(
     stream_options: { include_usage: true },
     temperature: sampling.temperature,
     top_p: sampling.topP,
+    // Mild de-echo for long chats; structure still relies on anti-formula slots.
+    frequency_penalty: 0.3,
+    presence_penalty: 0.15,
   });
   logModelRequest(endpoint, requestBody);
   const response = await fetch(endpoint, {
@@ -403,4 +705,166 @@ async function streamRoleplayText(
   const completed = { content, usage };
   logModelResponse(endpoint, JSON.stringify(completed, null, 2));
   return completed;
+}
+
+type RoleplayHistoryMessage = { id: number; role: string; content: string };
+
+async function refreshRoleplayMemory(options: {
+  store: WriterStore;
+  sessionId: string;
+  memory: RoleplaySessionMemory;
+  prior: RoleplayHistoryMessage[];
+  firstRecentId: number;
+  model: ModelConfig;
+  signal?: AbortSignal;
+  forceStateOnly?: boolean;
+}): Promise<RoleplaySessionMemory> {
+  const { memory, prior, firstRecentId, model } = options;
+  const older = prior.filter(message => message.id < firstRecentId && message.id > memory.summarizedThroughId);
+  const batch = older.slice(0, Math.max(ROLEPLAY_SUMMARY_BATCH, older.length));
+  const recentForState = prior.slice(-ROLEPLAY_RECENT_MESSAGES);
+  const transcript = (options.forceStateOnly ? recentForState : batch.length ? batch : recentForState)
+    .map(message => `${message.role === "user" ? "用户" : "角色"}: ${message.content.replace(/\s+/g, " ").slice(0, 220)}`)
+    .join("\n");
+
+  if (!transcript.trim()) return memory;
+
+  const canCall = Boolean(model.apiKey) || model.baseUrl.includes("localhost") || model.baseUrl.includes("127.0.0.1");
+  if (!canCall) {
+    return options.forceStateOnly ? memory : foldExtractiveSummary(memory, prior, firstRecentId);
+  }
+
+  const previousBeat = memory.state.beat;
+  const system = `你维护角色扮演试演的长期记忆。只输出 JSON，不要 markdown。
+字段：
+- summary: string，滚动事实摘要（事件/关系变化/承诺/已暴露信息/未决线索）。合并旧摘要与新对白，控制在 600 字内。禁止描写句式模板或逐句复述。
+- state: object，字段 scene, proximity, mood, openThreads(string[]), promises(string[]), revealed(string[]), relationshipDelta, beat, timeInScene。简洁。
+若 forceStateOnly，summary 可原样返回旧摘要并主要更新 state。`;
+
+  const user = `旧摘要：
+${memory.summary || "（无）"}
+
+旧现场记忆卡：
+${JSON.stringify(memory.state)}
+
+模式：${options.forceStateOnly ? "forceStateOnly" : "mergeSummaryAndState"}
+
+新对白：
+${transcript}`;
+
+  const content = await completeJsonText(model, [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ], options.signal);
+
+  const parsed = parseMemoryRefresh(content, memory);
+  const beatChanged = Boolean(parsed.state.beat) && parsed.state.beat !== previousBeat;
+  const summarizedThroughId = options.forceStateOnly || !batch.length
+    ? memory.summarizedThroughId
+    : Math.max(memory.summarizedThroughId, batch[batch.length - 1].id);
+
+  const next: RoleplaySessionMemory = {
+    ...memory,
+    summary: options.forceStateOnly
+      ? (parsed.summary.trim() || memory.summary).slice(0, 4_000)
+      : parsed.summary.slice(0, 4_000),
+    summarizedThroughId,
+    state: parsed.state,
+    sameBeatTurns: beatChanged ? 0 : memory.sameBeatTurns,
+    updatedAt: new Date().toISOString(),
+  };
+  return options.store.saveRoleplayMemory(options.sessionId, next);
+}
+
+function foldExtractiveSummary(
+  memory: RoleplaySessionMemory,
+  prior: RoleplayHistoryMessage[],
+  firstRecentId: number,
+): RoleplaySessionMemory {
+  const older = prior.filter(message => message.id < firstRecentId && message.id > memory.summarizedThroughId);
+  if (!older.length) return memory;
+  const batch = older.slice(0, ROLEPLAY_SUMMARY_BATCH * 2);
+  const lines = batch.map(message => {
+    const label = message.role === "user" ? "用户" : "角色";
+    return `- ${label}: ${message.content.replace(/\s+/g, " ").slice(0, 100)}`;
+  });
+  const merged = [memory.summary.trim(), "更早对白要点：", ...lines].filter(Boolean).join("\n").slice(-2_400);
+  return {
+    ...memory,
+    summary: merged,
+    summarizedThroughId: batch[batch.length - 1].id,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function parseMemoryRefresh(text: string, fallback: RoleplaySessionMemory): { summary: string; state: RoleplayWorkingState } {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return { summary: fallback.summary || cleaned.slice(0, 800), state: fallback.state };
+  }
+  try {
+    const value = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
+    const summary = typeof value.summary === "string" && value.summary.trim()
+      ? value.summary.trim()
+      : fallback.summary;
+    const stateRaw = value.state && typeof value.state === "object" && !Array.isArray(value.state)
+      ? value.state
+      : value;
+    const base = emptyRoleplayWorkingState();
+    const str = (key: keyof RoleplayWorkingState) => {
+      const v = (stateRaw as Record<string, unknown>)[key];
+      return typeof v === "string" ? v.trim().slice(0, 400) : "";
+    };
+    const list = (key: "openThreads" | "promises" | "revealed") => {
+      const v = (stateRaw as Record<string, unknown>)[key];
+      return Array.isArray(v)
+        ? v.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, 12)
+        : fallback.state[key];
+    };
+    const state: RoleplayWorkingState = {
+      scene: str("scene") || fallback.state.scene || base.scene,
+      proximity: str("proximity") || fallback.state.proximity,
+      mood: str("mood") || fallback.state.mood,
+      openThreads: list("openThreads"),
+      promises: list("promises"),
+      revealed: list("revealed"),
+      relationshipDelta: str("relationshipDelta") || fallback.state.relationshipDelta,
+      beat: str("beat") || fallback.state.beat,
+      timeInScene: str("timeInScene") || fallback.state.timeInScene,
+    };
+    return { summary, state };
+  } catch {
+    return { summary: fallback.summary || cleaned.slice(0, 800), state: fallback.state };
+  }
+}
+
+async function completeJsonText(
+  model: ModelConfig,
+  messages: ChatMessage[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const requestBody = JSON.stringify({
+    model: model.model,
+    messages,
+    stream: false,
+    temperature: 0.2,
+  });
+  logModelRequest(endpoint, requestBody);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    signal,
+    headers: {
+      "content-type": "application/json",
+      ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
+    },
+    body: requestBody,
+  });
+  const responseBody = await response.text();
+  logModelResponse(endpoint, responseBody);
+  if (!response.ok) throw new Error(`扮演记忆刷新失败（${response.status}）：${responseBody.slice(0, 300)}`);
+  const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null } }> };
+  return payload.choices?.[0]?.message?.content ?? "";
 }

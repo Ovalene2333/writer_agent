@@ -91,8 +91,10 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *    Prefer one compact rule + cross-reference over pasting the same mannerism /
  *    craft checklist into system + style + task workflow + review.
  *
- * Roleplay (src/roleplay.ts) is a separate path and does not use this assembly.
- * Long archives: inspect_conversation + read_conversation, not a fat auto-history.
+ * Roleplay (src/roleplay.ts) is a separate path with its own fixed 4-slot system
+ * prefix (stable cards | summary | memory card | anti-formula) + short recent
+ * window; long archives still use inspect_conversation + read_conversation on
+ * the agent path, not a fat auto-history.
  * =============================================================================
  */
 
@@ -258,7 +260,8 @@ ${stylePointer}
 2. 让动作产生结果、让细节供读者判断；必要因果拆成独立句。保留对白中的拖音、中断、迟疑和真实纠正。
 3. 对白服从人物身份与当下目的；场景落在具体动作、决定、发现或未决问题上。
 4. 不编造 lore/角色卡未支撑的关键设定；区分项目事实与合理创作推断。
-5. ${proseMannerismConstraintPrompt({ compact: true })}
+5. 角色卡 competencies[].unlocked 表示随剧情推进变化的当前解锁状态。正文已存在或用户已确认的剧情明确发生能力获得、觉醒、学会、恢复、封印或失去时，应考虑用 save_character 同步该状态；伏笔、传闻、尝试失败、仅提及能力或尚未接受的写作提案不能改变 unlocked。更新前先读取完整 competencies，并保留其他能力条目，因为该数组按整组替换。
+6. ${proseMannerismConstraintPrompt({ compact: true })}
 `;
 }
 
@@ -634,7 +637,7 @@ function explicitReferencePaths(project: WriterProject, request: string): string
  * CACHE: Always miss-priced — keep short (recent caps + char limits below).
  * Full / long roleplay or agent archives must use inspect_conversation +
  * read_conversation (see executionRulesPrompt archiveRule). Roleplay chat
- * (src/roleplay.ts) injects its own channel history and is unaffected here.
+ * (src/roleplay.ts) uses summary + memory card + a short recent window.
  */
 function historicalConversationContext(history: Array<ApiMessage & { channel?: string }>): string {
   if (!history.length) {

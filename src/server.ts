@@ -16,7 +16,7 @@ import {
   persistFinalizedSessionTodos,
   saveAgentSettings,
 } from "./agent_runtime.js";
-import { generateCharacter, maybeAutoTitleSession, suggestActions, updateCharacterFromConversation, type WritingMode } from "./generation.js";
+import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
 import { generateRoleplayInterlocutor, runRoleplayChat } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
@@ -391,6 +391,22 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/characters/competencies/summarize", async (context) => {
+    try {
+      const body = await context.req.json<{ competency?: {
+        name?: string; level?: string; description?: string;
+        resources?: string[]; limitations?: string[]; costs?: string[];
+      } }>();
+      if (!body.competency || typeof body.competency !== "object") throw new Error("缺少能力内容");
+      const summary = await summarizeCharacterCompetency({
+        model: options.providers.summaryModelConfig(),
+        competency: body.competency,
+        signal: context.req.raw.signal,
+      });
+      return context.json({ summary });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.delete("/api/characters/:id", (context) => {
     try {
       const id = Number(context.req.param("id"));
@@ -636,6 +652,7 @@ export async function startWriterServer(options: {
             interlocutor: body.interlocutor,
             prompt: body.prompt,
             model: options.providers.modelConfig("roleplay"),
+            summarizer: options.providers.summaryModelConfig(),
             signal,
             onEvent,
           });

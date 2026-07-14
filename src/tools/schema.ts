@@ -243,7 +243,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_character",
-      description: "按 ID 分区读取 v3 角色卡。省略 sections 时返回完整卡；storyState 可结合 outlineNodeId 解析当前场景状态",
+      description: "按 ID 分区读取 v3 角色卡。省略 sections 时返回完整卡；storyState 可结合 outlineNodeId 解析当前场景状态。未解锁能力只返回 name、summary 和 unlocked=false；不得推断隐藏字段或将其视为当前可用能力",
       parameters: {
         type: "object",
         properties: {
@@ -260,7 +260,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "save_character",
-      description: "创建或嵌套更新 schema v3 角色卡。省略分区保持原值；提供的数组整体替换；删除条目使用 deleteEntryIds。新建必须提供 identity.name",
+      description: "创建或嵌套更新 schema v3 角色卡。省略分区保持原值；提供的数组整体替换；删除条目使用 deleteEntryIds。剧情已确认发生能力获得、觉醒、学会、恢复、封印或失去时可同步 competencies[].unlocked；伏笔或仅提及不能改变它。新建必须提供 identity.name",
       parameters: {
         type: "object",
         properties: {
@@ -270,7 +270,7 @@ export const TOOLS = deepFreeze([
           psychology: { type: "object", description: "性格摘要及 traits/values/fears/conflicts 结构化条目", additionalProperties: true },
           motivations: { type: "array", description: "目标记录（id/category/status/priority/summary/stakes/obstacles/sourceRefs/validFrom/validUntil）", items: { type: "object", additionalProperties: true } },
           voice: { type: "object", description: "声线摘要、语域、措辞与示例对白", additionalProperties: true },
-          competencies: { type: "array", description: "能力、资源、限制与代价记录", items: { type: "object", additionalProperties: true } },
+          competencies: { type: "array", description: "能力记录；每项应填写 name、summary、unlocked。summary 是未解锁时仍会展示的简短概述；unlocked 是随已确认剧情推进变化的当前状态。该数组整体替换，更新单项前须读取并保留其他条目", items: { type: "object", additionalProperties: true } },
           relationships: { type: "array", description: "单向关系记录；characterId 必须指向现有可读角色", items: { type: "object", additionalProperties: true } },
           storyStates: { type: "array", description: "剧情状态；每项必须有 outlineNodeId 或 unanchored=true", items: { type: "object", additionalProperties: true } },
           deleteEntryIds: { type: "object", description: "按 motivations/competencies/relationships/storyStates 显式删除条目 ID", additionalProperties: true },

@@ -3,10 +3,36 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { emptyCharacter, resolveCharacterAt } from "./characters.js";
+import { competencyPromptView, emptyCharacter, normalizeV3Character, resolveCharacterAt } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import type { Character, OutlineNode } from "./types.js";
+
+test("competency unlock state is normalized and defaults to locked", () => {
+  const base = emptyCharacter("Tester");
+  const locked = normalizeV3Character({
+    ...base,
+    id: 1,
+    updatedAt: "",
+    competencies: [{
+      id: "skill-locked", name: "Locked", summary: "Public hint", level: "", description: "Secret detail",
+      resources: [], limitations: [], costs: [], sourceRefs: [],
+    }],
+  });
+  const unlocked = normalizeV3Character({
+    ...base,
+    id: 1,
+    updatedAt: "",
+    competencies: [{
+      id: "skill-unlocked", name: "Unlocked", summary: "Public hint", level: "", unlocked: true, description: "Full detail",
+      resources: [], limitations: [], costs: [], sourceRefs: [],
+    }],
+  });
+  assert.equal(locked.competencies[0].unlocked, false);
+  assert.equal(unlocked.competencies[0].unlocked, true);
+  assert.deepEqual(competencyPromptView(locked.competencies[0]), { name: "Locked", summary: "Public hint", unlocked: false });
+  assert.deepEqual(competencyPromptView(unlocked.competencies[0]), unlocked.competencies[0]);
+});
 
 test("v2 cards migrate once with deterministic entries and backup", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-character-migrate-"));

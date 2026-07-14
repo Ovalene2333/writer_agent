@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 
 type Temporal = {
   sourceRefs: Array<{ type: "outline" | "document" | "manual"; ref: string; note?: string }>;
@@ -26,7 +26,9 @@ type Relationship = Temporal & {
 type Competency = Temporal & {
   id: string;
   name: string;
+  summary: string;
   level: string;
+  unlocked: boolean;
   description: string;
   resources: string[];
   limitations: string[];
@@ -218,9 +220,14 @@ export function CharacterEditor(props: {
   onClose: () => void;
   onSave: () => void;
   onDelete?: () => void;
+  onSummarizeCompetency?: (competency: CharacterDraft["competencies"][number]) => Promise<string>;
 }) {
   const { draft, onChange } = props;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   const [section, setSection] = useState<SectionId>("overview");
+  const [summarizingSkillId, setSummarizingSkillId] = useState<string | null>(null);
+  const [summaryError, setSummaryError] = useState<{ id: string; message: string } | null>(null);
   const name = draft.identity.name.trim() || "未命名角色";
   const avatar = name.slice(0, 1);
 
@@ -414,7 +421,7 @@ export function CharacterEditor(props: {
                     ) : (
                       <ul>
                         {draft.competencies.slice(0, 4).map(skill => (
-                          <li key={skill.id}>{skill.name || "未命名"}{skill.level ? ` · ${skill.level}` : ""}</li>
+                          <li key={skill.id}>{skill.name || "未命名"}{skill.level ? ` · ${skill.level}` : ""} · {skill.unlocked ? "已解锁" : "未解锁"}</li>
                         ))}
                       </ul>
                     )}
@@ -698,7 +705,7 @@ export function CharacterEditor(props: {
                     <button type="button" onClick={() => onChange({
                       ...draft,
                       competencies: [...draft.competencies, {
-                        id: entryId("skill"), name: "", level: "", description: "",
+                        id: entryId("skill"), name: "", summary: "", level: "", unlocked: false, description: "",
                         resources: [], limitations: [], costs: [], sourceRefs: [],
                       }],
                     })}>+ 添加能力</button>
@@ -723,7 +730,48 @@ export function CharacterEditor(props: {
                             ...draft,
                             competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, level: e.target.value } : x),
                           })} placeholder="精通 / S 级…" /></Field>
-                          <Field label="说明" wide>
+                          <Field label="是否解锁">
+                            <select value={skill.unlocked ? "yes" : "no"} onChange={e => onChange({
+                              ...draft,
+                              competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, unlocked: e.target.value === "yes" } : x),
+                            })}>
+                              <option value="no">否</option>
+                              <option value="yes">是</option>
+                            </select>
+                          </Field>
+                          <Field label="能力摘要" hint="未解锁时智能体仍可见" wide>
+                            <textarea value={skill.summary} onChange={e => onChange({
+                              ...draft,
+                              competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, summary: e.target.value } : x),
+                            })} rows={2} />
+                          </Field>
+                          {props.onSummarizeCompetency && (
+                            <div className="ce-field-actions wide">
+                              <button
+                                type="button"
+                                className="ghost"
+                                disabled={summarizingSkillId !== null}
+                                onClick={() => {
+                                  setSummarizingSkillId(skill.id);
+                                  setSummaryError(null);
+                                  void props.onSummarizeCompetency!(skill)
+                                    .then(summary => {
+                                      const current = draftRef.current;
+                                      onChange({
+                                        ...current,
+                                        competencies: current.competencies.map(x => x.id === skill.id ? { ...x, summary } : x),
+                                      });
+                                    })
+                                    .catch(error => setSummaryError({ id: skill.id, message: String(error) }))
+                                    .finally(() => setSummarizingSkillId(null));
+                                }}
+                              >
+                                {summarizingSkillId === skill.id ? "摘要模型归纳中…" : "用摘要模型生成"}
+                              </button>
+                              {summaryError?.id === skill.id && <small role="alert">{summaryError.message}</small>}
+                            </div>
+                          )}
+                          <Field label="详细说明" hint="仅解锁后向智能体暴露" wide>
                             <textarea value={skill.description} onChange={e => onChange({
                               ...draft,
                               competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, description: e.target.value } : x),

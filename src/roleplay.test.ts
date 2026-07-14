@@ -5,7 +5,21 @@ import { join } from "node:path";
 import { describe, test } from "node:test";
 import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
-import { buildRoleplaySystemPrompt, isRoleplayExitCommand, roleplaySampling } from "./roleplay.js";
+import {
+  buildRoleplayChatMessages,
+  buildRoleplayStablePrefix,
+  buildRoleplaySystemPrompt,
+  emptyRoleplaySessionMemory,
+  extractAntiFormulaHints,
+  formatRoleplayAntiFormulaSlot,
+  formatRoleplayMemorySlot,
+  formatRoleplaySummarySlot,
+  isRoleplayExitCommand,
+  ROLEPLAY_RECENT_MESSAGES,
+  roleplayPerformerKey,
+  roleplaySampling,
+  slimRoleplayCharacterViews,
+} from "./roleplay.js";
 import { WriterStore } from "./store.js";
 import { handleGetSimpleCharacter, handleListSimpleCharacters, handleSaveSimpleCharacter } from "./tools/characters.js";
 import { handleInspectConversation, handleReadConversation } from "./tools/conversation.js";
@@ -29,29 +43,53 @@ function sampleCharacter(): Character {
       summary: "简洁、略带吐槽",
       register: "口语",
       verbalHabits: ["……嗯"],
-      examples: ["别盯着我看。"],
+      examples: ["别盯着我看。", "第二条例句不应整卡注入。"],
     },
     psychology: {
       ...base.psychology,
       summary: "外表冷静，内里紧绷",
     },
+    competencies: [{
+      id: "locked-skill", name: "终焉协议", summary: "尚未掌握的禁忌能力",
+      level: "绝密", unlocked: false, description: "未解锁能力的秘密说明",
+      resources: ["秘密资源"], limitations: ["秘密限制"], costs: ["秘密代价"], sourceRefs: [],
+    }],
   };
 }
 
 describe("roleplay prompts", () => {
-  test("system prompt embeds character voice and experimental rules", () => {
-    const prompt = buildRoleplaySystemPrompt(sampleCharacter());
+  test("stable prefix embeds character voice without formula checklist or multi examples", () => {
+    const prompt = buildRoleplayStablePrefix(sampleCharacter());
     assert.match(prompt, /角色扮演试演/);
     assert.match(prompt, /林千夏/);
     assert.match(prompt, /简洁、略带吐槽/);
     assert.match(prompt, /不要修改项目文档/);
     assert.match(prompt, /第一人称/);
     assert.match(prompt, /看不到写作 Agent/);
+    assert.match(prompt, /"name": "终焉协议"/);
+    assert.match(prompt, /"summary": "尚未掌握的禁忌能力"/);
+    assert.match(prompt, /"unlocked": false/);
+    assert.doesNotMatch(prompt, /未解锁能力的秘密说明|绝密|秘密资源|秘密限制|秘密代价/);
     assert.match(prompt, /未透露姓名的来访者/);
     assert.match(prompt, /实时对手戏，不是问答/);
     assert.match(prompt, /写出潜台词/);
-    assert.match(prompt, /不要每轮都用问题收尾/);
+    assert.match(prompt, /不要每轮用问题收尾/);
+    assert.match(prompt, /禁止把「动作→对白/);
+    assert.match(prompt, /滚动事实摘要/);
+    assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
+    assert.match(prompt, /exampleHint/);
+    assert.doesNotMatch(prompt, /第二条例句不应整卡注入/);
+    // Backward-compatible alias still works.
+    assert.equal(buildRoleplaySystemPrompt(sampleCharacter()), prompt);
+  });
+
+  test("slim views keep at most one voice example as hint", () => {
+    const views = slimRoleplayCharacterViews(sampleCharacter()) as {
+      dialogue: { voice: { exampleHint: string; verbalHabits: string[] } };
+    };
+    assert.equal(views.dialogue.voice.exampleHint, "别盯着我看。");
+    assert.deepEqual(views.dialogue.voice.verbalHabits, ["……嗯"]);
   });
 
   test("roleplay sampling stays lively without allowing incoherent extremes", () => {
@@ -60,8 +98,8 @@ describe("roleplay prompts", () => {
     assert.deepEqual(roleplaySampling({ temperature: 1.8, topP: 1.2 }), { temperature: 1.3, topP: 1 });
   });
 
-  test("system prompt fixes the generated interlocutor identity without controlling the user", () => {
-    const prompt = buildRoleplaySystemPrompt(sampleCharacter(), undefined, {
+  test("stable prefix fixes the generated interlocutor identity without controlling the user", () => {
+    const prompt = buildRoleplayStablePrefix(sampleCharacter(), undefined, {
       name: "苏远",
       identity: "泛亚基地教官",
       relationship: "林千夏信任的搭档",
@@ -81,6 +119,119 @@ describe("roleplay prompts", () => {
     assert.equal(isRoleplayExitCommand("扮演 退出"), true);
     assert.equal(isRoleplayExitCommand("你好"), false);
     assert.equal(isRoleplayExitCommand("/roleplay 林千夏"), false);
+  });
+
+  test("fixed slots keep four system messages before history", () => {
+    const messages = buildRoleplayChatMessages({
+      stablePrefix: "STABLE",
+      summary: "用户提到训练事故",
+      state: {
+        scene: "医务室",
+        proximity: "一臂",
+        mood: "紧绷",
+        openThreads: ["事故"],
+        promises: [],
+        revealed: ["手在抖"],
+        relationshipDelta: "试探性信任",
+        beat: "试探",
+        timeInScene: "数分钟后",
+      },
+      sameBeatTurns: 3,
+      recentAssistantReplies: ["（目光移开）……你说什么？"],
+      history: [
+        { role: "user", content: "你还好吗？" },
+        { role: "assistant", content: "还行。" },
+      ],
+      userText: "看着我。",
+    });
+    assert.equal(messages.length, 7);
+    assert.deepEqual(messages.map(item => item.role), [
+      "system", "system", "system", "system", "user", "assistant", "user",
+    ]);
+    assert.equal(messages[0].content, "STABLE");
+    assert.match(messages[1].content, /滚动事实摘要/);
+    assert.match(messages[1].content, /训练事故/);
+    assert.match(messages[2].content, /现场记忆卡/);
+    assert.match(messages[2].content, /已连续 3 轮/);
+    assert.match(messages[3].content, /本轮反公式/);
+    assert.equal(messages[6].content, "看着我。");
+  });
+
+  test("empty summary and memory use stable placeholders", () => {
+    assert.equal(formatRoleplaySummarySlot(""), "滚动事实摘要：无。");
+    assert.match(formatRoleplayMemorySlot({
+      scene: "", proximity: "", mood: "", openThreads: [], promises: [],
+      revealed: [], relationshipDelta: "", beat: "", timeInScene: "",
+    }), /现场记忆卡：无/);
+    assert.match(formatRoleplayAntiFormulaSlot([]), /本轮反公式/);
+  });
+
+  test("anti-formula extracts openings and repeated gestures", () => {
+    const hints = extractAntiFormulaHints([
+      "（目光低垂，呼吸一滞）你说完了。",
+      "（嘴角动了动）……算了。",
+    ]);
+    assert.ok(hints.openings.some(item => item.includes("目光") || item.includes("（")));
+    assert.ok(hints.gestures.includes("目光") || hints.gestures.includes("呼吸") || hints.gestures.includes("嘴角"));
+    assert.equal(hints.usedQuestionEnd, false);
+    assert.equal(hints.usedActionThenSpeech, true);
+    const slot = formatRoleplayAntiFormulaSlot([
+      "（目光低垂）你到底想怎样？",
+    ]);
+    assert.match(slot, /禁用开场|本轮反公式/);
+    assert.match(slot, /不要再用问题收束|问句/);
+  });
+
+  test("recent window constant stays short for cache and anti-echo", () => {
+    assert.ok(ROLEPLAY_RECENT_MESSAGES <= 20);
+    assert.ok(ROLEPLAY_RECENT_MESSAGES >= 8);
+  });
+});
+
+describe("roleplay memory store", () => {
+  test("persists memory and clears with active roleplay exit", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-memory-"));
+    try {
+      const project = WriterProject.init(root, "扮演记忆");
+      const store = new WriterStore(project);
+      const character = store.saveCharacter({ identity: emptyCharacter("林千夏").identity });
+      const sessionId = store.createSession("记忆会话");
+      store.saveActiveRoleplay(sessionId, character.id, {
+        name: "苏远",
+        identity: "基地教官",
+        relationship: "搭档",
+        knowledge: "训练安排",
+        scene: "医务室",
+        goal: "确认状态",
+      });
+      const key = roleplayPerformerKey({
+        kind: "normal",
+        id: character.id,
+        name: "林千夏",
+        card: { name: "林千夏", identity: "", relationship: "", knowledge: "", scene: "", goal: "" },
+      });
+      const memory = emptyRoleplaySessionMemory(key);
+      memory.summary = "用户提到训练事故；角色回避细节。";
+      memory.summarizedThroughId = 12;
+      memory.state.scene = "医务室";
+      memory.state.beat = "试探";
+      memory.turnCount = 5;
+      memory.sameBeatTurns = 3;
+      store.saveRoleplayMemory(sessionId, memory);
+
+      const restored = store.roleplayMemory(sessionId);
+      assert.equal(restored?.performerKey, `normal:${character.id}`);
+      assert.match(restored?.summary ?? "", /训练事故/);
+      assert.equal(restored?.summarizedThroughId, 12);
+      assert.equal(restored?.state.scene, "医务室");
+      assert.equal(restored?.sameBeatTurns, 3);
+
+      store.clearActiveRoleplay(sessionId);
+      assert.equal(store.roleplayMemory(sessionId), undefined);
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
