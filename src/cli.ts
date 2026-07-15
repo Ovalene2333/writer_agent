@@ -4,11 +4,8 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import process from "node:process";
 import { Command } from "commander";
-import { render } from "ink";
-import React from "react";
 import { runAgent } from "./agent.js";
-import { isPermissionMode, loadAgentSettings, permissionModeLabel, saveAgentSettings } from "./agent_runtime.js";
-import { WriterAgentTui } from "./agent_tui.js";
+import { isPermissionMode, loadAgentSettings, saveAgentSettings } from "./agent_runtime.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -20,7 +17,7 @@ import type { PermissionMode } from "./types.js";
 const program = new Command();
 program
   .name("writer")
-  .description("面向长篇创作的终端写作 Agent")
+  .description("面向长篇创作的 Web 写作 Agent")
   .version("0.1.0");
 
 program.command("init")
@@ -84,35 +81,9 @@ program.command("run")
     } finally { store.close(); }
   });
 
-program.command("chat")
-  .alias("tui")
-  .description("启动交互式终端 Agent（仿 code agent REPL）")
-  .option("-p, --project <directory>", "项目目录", ".")
-  .option("-s, --session <id>", "继续指定会话")
-  .option("-c, --continue", "继续最近一次会话")
-  .option("--mode <mode>", "权限模式：ask | auto | plan")
-  .option("--debug", "调试：打印模型请求/响应体")
-  .option("--debug-steps", "仅打印 Agent step 到终端")
-  .action(async (options: { project: string; session?: string; continue?: boolean; mode?: string; debug?: boolean; debugSteps?: boolean }) => {
-    if (options.debug) process.env.WRITER_DEBUG = "1";
-    if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
-    const { project, store, providers } = openProject(options.project);
-    const permissionMode = resolvePermissionMode(project, options.mode, true);
-    const sessionId = resolveSession(store, options.session, options.continue !== false && !options.session);
-    process.stdout.write(`Writer Agent TUI · ${project.config().title} · ${permissionModeLabel(permissionMode)}\n`);
-    const instance = render(React.createElement(WriterAgentTui, {
-      project, store, providers, sessionId, permissionMode,
-    }));
-    try {
-      await instance.waitUntilExit();
-    } finally {
-      store.close();
-    }
-  });
-
 program.command("web")
   .alias("serve")
-  .description("启动常驻 Web 写作工作台")
+  .description("启动 Web 写作工作台")
   .option("-p, --project <directory>", "项目目录", ".")
   .option("--lan", "允许局域网设备访问")
   .option("--host <host>", "监听地址")

@@ -1,22 +1,23 @@
 # Writer Agent
 
-面向长篇创作的写作 Agent。以项目目录管理设定、大纲、章节与角色，通过 Web 工作台或命令行与模型协作；对正文的修改以**提案**形式提交，经作者审批后再写入文件。
+面向长篇创作的写作 Agent。以项目目录管理设定、大纲、章节与角色，通过 **Web 工作台** 与模型协作；对正文的修改以**提案**形式提交，经作者审批后再写入文件。
+
+本分支（`web`）以 Web 为唯一交互界面；终端仅保留 `init` / `web` / `run` / `export` / `session` 等 CLI 入口，不再提供 TUI。
 
 ## 功能概览
 
 - **项目化写作**：`writer.yaml` + Markdown 文档树，设定、大纲、正文分目录存放
 - **Web 写作工作台**：浏览器中对话、读文档、审批修改；支持局域网与临时公网分享
-- **终端 REPL（TUI）**：`writer chat` 交互式对话，斜杠命令 / 提案审查，对齐主流 code agent 终端体验
 - **Web 权限与任务条**：Agent 面板可切换 Ask/Auto/Plan，实时显示 `manage_todos` 清单
 - **一次生成（CLI）**：`writer run` 执行单次写作任务后退出，适合脚本或批处理
-- **权限模式**：`ask`（提案审批）/ `auto`（自动写入）/ `plan`（只读规划），类似 code agent 的 auto-run / plan mode
+- **权限模式**：`ask`（提案审批）/ `auto`（自动写入）/ `plan`（只读规划）
 - **任务清单**：`manage_todos` 多步任务跟踪，会话内可查看
 - **工具模块化**：Agent 工具 schema 与 handler 拆分在 `src/tools/`（documents / outline / characters / proposals / meta）
 - **项目指令**：自动加载 `WRITER.md` / `AGENTS.md` / `CLAUDE.md` / `.writer/instructions.md`
 - **项目技能**：`.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md`，按需 `load_skill`
 - **修改提案与撤销**：Agent 默认不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo
 - **角色卡**：结构化角色资料，可供检索与写作引用
-- **角色扮演试演（测试性）**：`/roleplay <角色>` 或 Web 顶部「扮演」——扮演者和当前身份都可选简易/普通角色卡，当前身份也可由 Agent 按需查询角色卡与世界观生成（默认保存为简易角色卡）；当前试演按会话保存，刷新后自动恢复；纯对话、不改文档
+- **角色扮演试演（测试性）**：Web 顶部「扮演」——扮演者和当前身份都可选简易/普通角色卡，当前身份也可由 Agent 按需查询角色卡与世界观生成（默认保存为简易角色卡）；当前试演按会话保存，刷新后自动恢复；纯对话、不改文档
 - **结构化大纲**：幕 / 章 / 场景节点，可与正文对照校验
 - **风格模板**：内置网文爽文、传统文学、轻小说、悬疑推理、玄幻仙侠等
 - **多模型分工**：可为 agent / roleplay / writer / reviewer 等角色配置不同供应商与模型
@@ -60,16 +61,13 @@ writer init ./my-novel
 writer init ./my-novel --title "我的小说"
 cd my-novel
 
-# 2a. 终端 REPL（推荐，类 code agent）
-writer chat
-
-# 2b. 或启动 Web 工作台
+# 2. 启动 Web 工作台（推荐）
 writer web
 
-# 3. 配置 API Key（/connect 或 Web 设置），开始对话创作
+# 3. 在浏览器中配置 API Key，开始对话创作
 ```
 
-也可在不进入交互界面的情况下做一次生成：
+也可在不进入浏览器的情况下做一次生成：
 
 ```bash
 writer run "根据大纲写第一章开场，约 1500 字"
@@ -83,8 +81,7 @@ writer run "续写并自动落盘" --mode auto -c   # -c 继续最近会话
 |------|------|
 | `writer [项目目录]` | 启动本地 Web 工作台并打开浏览器（默认当前目录） |
 | `writer init [目录] [--title 名称]` | 初始化写作项目 |
-| `writer chat` / `writer tui` | 交互式终端 Agent（默认续接最近会话） |
-| `writer web` / `writer serve` | 启动常驻 Web 工作台 |
+| `writer web` / `writer serve` | 启动 Web 写作工作台 |
 | `writer run <指令>` | 执行一次写作生成后退出 |
 | `writer export` | 按章节顺序导出作品 |
 | `writer session list` | 列出会话 |
@@ -103,18 +100,6 @@ writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / o
 ```
 
 `--share` 会让 cloudflared 先自行切换边缘节点；若进程仍退出，Writer 会按 2 秒、5 秒退避自动重建，连续 3 次未连接后输出故障分类、恢复建议和最近日志。已经注册成功的隧道若稍后中断，会开启新一轮恢复并提示旧公网地址失效。
-
-### `writer chat` 常用选项
-
-```bash
-writer chat -p ./my-novel
-writer chat -c                      # 续接最近会话（默认行为）
-writer chat -s <会话ID>
-writer chat --mode plan             # 只读规划
-writer chat --mode auto             # 提案自动写入
-```
-
-TUI 斜杠命令要点：`/mode`、`/plan`、`/todos`、`/skills`、`/accept`、`/proposals`、`/status`、`/models`（Ctrl+P）、`/connect`、`/roles`、`/thinking`、`/details`、`/roleplay`（测试性角色扮演）。
 
 ### `writer run` 常用选项
 
@@ -277,12 +262,15 @@ Agent 可用的主要能力包括：列出与检视文档、按块 / 节 / 行�
 | `mystery` | 悬疑推理 | 推理、悬疑、犯罪 |
 | `xianxia` | 玄幻仙侠 | 修仙、东方玄幻 |
 
-在项目配置中设置 `style`，或在 Web / 会话中切换风格模板。
+在项目配置中设置 `style`，或在 Web 工作台中切换风格模板。
 
 ## 开发
 
+本分支以 Web 为主开发面；不要重新引入 TUI / ink 依赖。
+
 ```bash
-npm run dev -- <cli 参数>   # 用 tsx 直接跑 CLI
+npm run dev -- web          # 用 tsx 启动 Web 工作台
+npm run dev -- <cli 参数>   # 其他 CLI 子命令
 npm run build               # 编译 Node 端 + 构建 Web 静态资源
 npm run typecheck           # 类型检查
 npm test                    # 编译并跑测试
@@ -292,7 +280,7 @@ npm test                    # 编译并跑测试
 
 | 路径 | 说明 |
 |------|------|
-| `src/cli.ts` | 命令行入口 |
+| `src/cli.ts` | 命令行入口（web / run / init / export） |
 | `src/agent.ts` | 写作 Agent 与工具 |
 | `src/server.ts` | Web API（Hono + SSE） |
 | `src/project.ts` | 项目文件与安全路径 |
