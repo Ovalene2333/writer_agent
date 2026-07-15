@@ -188,7 +188,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "compile_write_pack",
-      description: "写前编译：把大纲/设定/衔接笔记编译为故事内可写材料；写场景提案前必调",
+      description: "非章节正文写前编译：把大纲/设定/衔接笔记编译为故事内可写材料",
       parameters: {
         type: "object",
         properties: {
@@ -198,7 +198,6 @@ export const TOOLS = deepFreeze([
           },
           targetPath: { type: "string", description: "目标正文路径（仅脱敏，不注入）" },
           instruction: { type: "string", description: "本轮写作要求摘要（可选）" },
-          sceneId: { type: "string", description: "逐场景章节草稿中的场景 id" },
         },
         required: ["notes"],
         additionalProperties: false,
@@ -219,7 +218,7 @@ export const TOOLS = deepFreeze([
           chapterGoal: { type: "string", description: "整章结束后真正改变什么" },
           scenes: {
             type: "array", minItems: 1, maxItems: 8,
-            description: "有因果承接的场景链；通常 3—6 场，不为凑数拆场",
+            description: "有因果承接的场景链；数量遵循当前场景链设置，不为凑数拆场",
             items: {
               type: "object",
               properties: {
@@ -249,11 +248,15 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "write_chapter_scene",
-      description: "写入或重写一场到内存草稿；同 sceneId 须先 compile_write_pack",
+      description: "编译本场故事内笔记，并把正文与实际离场状态写入内存草稿；一次完成",
       parameters: {
         type: "object",
         properties: {
           sceneId: { type: "string" },
+          notes: {
+            type: "string",
+            description: "仅含本场目标、人物当下、事件顺序、已知事实、自然落地信息和勿擅自补写项的故事内笔记",
+          },
           content: { type: "string", description: "仅本场正文，不含章节一级标题" },
           actualState: {
             type: "object",
@@ -270,7 +273,7 @@ export const TOOLS = deepFreeze([
             additionalProperties: false,
           },
         },
-        required: ["sceneId", "content", "actualState"],
+        required: ["sceneId", "notes", "content", "actualState"],
         additionalProperties: false,
       },
     },
@@ -279,7 +282,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_chapter_draft",
-      description: "返回组装整章与逐场状态账本；最终提案前必调",
+      description: "检查内存整章并返回逐场状态账本；不重复回传正文，最终提案前必调",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },

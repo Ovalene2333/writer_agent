@@ -51,16 +51,18 @@ export type BeginChapterSceneDraftInput = {
   baseContent: string;
   baseHash: string;
   scenes: unknown[];
+  maxScenes?: number;
 };
 
-const MAX_SCENES = 8;
+const DEFAULT_MAX_SCENES = 5;
 const MAX_SCENE_CHARACTERS = 12_000;
 
 export function beginChapterSceneDraft(input: BeginChapterSceneDraftInput): ChapterSceneDraft {
   const heading = cleanString(input.heading);
+  const maxScenes = Number.isInteger(input.maxScenes) ? Math.min(8, Math.max(1, Number(input.maxScenes))) : DEFAULT_MAX_SCENES;
   if (input.mode !== "append" && !heading) throw new Error("新建或全文重写章节时必须提供 heading");
-  if (!Array.isArray(input.scenes) || input.scenes.length < 1 || input.scenes.length > MAX_SCENES) {
-    throw new Error(`场景链须包含 1—${MAX_SCENES} 个场景；通常 3—6 个，但不要为凑数拆场`);
+  if (!Array.isArray(input.scenes) || input.scenes.length < 1 || input.scenes.length > maxScenes) {
+    throw new Error(`场景链须包含 1—${maxScenes} 个场景；不要为凑数拆场`);
   }
   const scenes = input.scenes.map((raw, index) => normalizeSceneCard(raw, index));
   const ids = new Set(scenes.map(scene => scene.id));

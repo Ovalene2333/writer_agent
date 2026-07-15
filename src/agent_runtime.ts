@@ -5,8 +5,17 @@ import type { WriterProject } from "./project.js";
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
 export type PermissionMode = "ask" | "auto" | "plan";
 
+export const ABSOLUTE_MAX_SCENES = 8;
+
+export interface ScenePipelineSettings {
+  preferredMinScenes: number;
+  preferredMaxScenes: number;
+  maxScenes: number;
+}
+
 export interface AgentRuntimeSettings {
   permissionMode: PermissionMode;
+  scenePipeline: ScenePipelineSettings;
 }
 
 export interface AgentTodoItem {
@@ -23,8 +32,29 @@ export interface ProjectSkill {
   body: string;
 }
 
+export type ScenePipelineMilestone = "draft_started" | "draft_complete";
+
+const DEFAULT_SCENE_PIPELINE_TODOS = [
+  "核对本章必要事实与衔接",
+  "建立本章场景链",
+  "逐场写作并传递状态",
+  "整章审阅并提交提案",
+] as const;
+
+const LEGACY_SCENE_PIPELINE_TODOS = [
+  "核对大纲、人设与衔接",
+  "建立章节场景链",
+  "逐场编译、写作并传递状态",
+  "整章审阅并提交提案",
+] as const;
+
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
+  scenePipeline: {
+    preferredMinScenes: 3,
+    preferredMaxScenes: 5,
+    maxScenes: 5,
+  },
 };
 
 const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
@@ -37,6 +67,16 @@ export function settingsPath(project: WriterProject): string {
   return resolve(project.privateDir, "agent.json");
 }
 
+export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSettings>): ScenePipelineSettings {
+  const integer = (candidate: unknown, fallback: number) => Number.isInteger(candidate)
+    ? Math.min(ABSOLUTE_MAX_SCENES, Math.max(1, Number(candidate)))
+    : fallback;
+  const maxScenes = integer(value?.maxScenes, DEFAULT_SETTINGS.scenePipeline.maxScenes);
+  const preferredMaxScenes = Math.min(maxScenes, integer(value?.preferredMaxScenes, DEFAULT_SETTINGS.scenePipeline.preferredMaxScenes));
+  const preferredMinScenes = Math.min(preferredMaxScenes, integer(value?.preferredMinScenes, DEFAULT_SETTINGS.scenePipeline.preferredMinScenes));
+  return { preferredMinScenes, preferredMaxScenes, maxScenes };
+}
+
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {
   const path = settingsPath(project);
   if (!existsSync(path)) return { ...DEFAULT_SETTINGS };
@@ -45,7 +85,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
     const mode = typeof raw.permissionMode === "string" && isPermissionMode(raw.permissionMode)
       ? raw.permissionMode
       : DEFAULT_SETTINGS.permissionMode;
-    return { permissionMode: mode };
+    return { permissionMode: mode, scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline) };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -57,6 +97,9 @@ export function saveAgentSettings(project: WriterProject, patch: Partial<AgentRu
     permissionMode: patch.permissionMode && isPermissionMode(patch.permissionMode)
       ? patch.permissionMode
       : current.permissionMode,
+    scenePipeline: patch.scenePipeline
+      ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
+      : current.scenePipeline,
   };
   mkdirSync(project.privateDir, { recursive: true });
   writeFileSync(settingsPath(project), `${JSON.stringify(next, null, 2)}\n`, "utf8");
@@ -210,6 +253,62 @@ export function normalizeTodos(input: unknown): AgentTodoItem[] {
     for (let i = 1; i < inProgress.length; i += 1) inProgress[i].status = "pending";
   }
   return todos;
+}
+
+/**
+ * Advance the built-in four-stage chapter workflow from structured tool results.
+ * This is deliberately exact-match based: custom/model-authored plans remain under
+ * manage_todos control and are never guessed from keywords.
+ */
+export function advanceScenePipelineTodos(
+  todos: AgentTodoItem[],
+  milestone: ScenePipelineMilestone,
+): { todos: AgentTodoItem[]; changed: boolean } {
+  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
+    .map(contents => contents.map(content => todos.findIndex(item => item.content === content)))
+    .find(indexes => indexes.every(index => index >= 0));
+  if (!signature) return { todos, changed: false };
+  const indexes = signature;
+  const completedThrough = milestone === "draft_started" ? 1 : 2;
+  const activeIndex = indexes[completedThrough + 1];
+  let changed = false;
+  const next = todos.map(item => ({ ...item }));
+  for (let phase = 0; phase <= completedThrough; phase += 1) {
+    const item = next[indexes[phase]];
+    if (item.status !== "completed" && item.status !== "cancelled") {
+      item.status = "completed";
+      changed = true;
+    }
+  }
+  for (const item of next) {
+    if (item.status === "in_progress" && item !== next[activeIndex]) {
+      item.status = "pending";
+      changed = true;
+    }
+  }
+  const active = next[activeIndex];
+  if (active.status !== "in_progress" && active.status !== "completed" && active.status !== "cancelled") {
+    active.status = "in_progress";
+    changed = true;
+  }
+  return { todos: next, changed };
+}
+
+export function persistScenePipelineTodos(
+  store: {
+    sessionTodos(sessionId: string): AgentTodoItem[];
+    saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void;
+  },
+  sessionId: string,
+  milestone: ScenePipelineMilestone,
+  emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
+): AgentTodoItem[] {
+  const result = advanceScenePipelineTodos(store.sessionTodos(sessionId), milestone);
+  if (result.changed) {
+    store.saveSessionTodos(sessionId, result.todos);
+    emit?.({ type: "todos", todos: result.todos });
+  }
+  return result.todos;
 }
 
 export function formatTodosForPrompt(todos: AgentTodoItem[]): string {

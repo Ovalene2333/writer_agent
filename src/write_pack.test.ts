@@ -214,9 +214,35 @@ test("scene pipeline rejects empty state change and repeated scene functions", (
       ...sceneChain[1], goal: sceneChain[0].goal, turn: sceneChain[0].turn, outcome: sceneChain[0].outcome,
     }],
   }), /完全重复/);
+  assert.throws(() => beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
+    baseContent: "", baseHash: "empty",
+    scenes: Array.from({ length: 6 }, (_, index) => ({
+      ...sceneChain[0],
+      id: `scene-${index + 1}`,
+      goal: `目标 ${index + 1}`,
+      turn: `转折 ${index + 1}`,
+      outcome: `结果 ${index + 1}`,
+      handoff: index === 5 ? "" : `交给场景 ${index + 2}`,
+    })),
+  }), /1—5/);
+
+  const expanded = beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
+    baseContent: "", baseHash: "empty", maxScenes: 7,
+    scenes: Array.from({ length: 6 }, (_, index) => ({
+      ...sceneChain[0],
+      id: `expanded-${index + 1}`,
+      goal: `扩展目标 ${index + 1}`,
+      turn: `扩展转折 ${index + 1}`,
+      outcome: `扩展结果 ${index + 1}`,
+      handoff: index === 5 ? "" : `交给扩展场景 ${index + 2}`,
+    })),
+  });
+  assert.equal(expanded.scenes.length, 6);
 });
 
-test("chapter scene tools require one write pack per scene and submit only after inspection", async () => {
+test("chapter scene tool compiles notes inline and submits only after inspection", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-scene-pipeline-"));
   let store: WriterStore | undefined;
   try {
@@ -234,22 +260,32 @@ test("chapter scene tools require one write pack per scene and submit only after
       path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变", scenes: [sceneChain[0]],
     })) as Record<string, unknown>;
     assert.equal(begun.status, "started");
-    const premature = JSON.parse(await call("write_chapter_scene", {
+    assert.equal(begun.sceneCount, 1);
+    assert.equal("scenes" in begun, false, "begin result must not echo the full scene chain");
+    const missingNotes = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival", content: "门禁灯变红。".repeat(20), actualState: actualState("违规进入"),
     })) as Record<string, unknown>;
-    assert.match(String(premature.error), /compile_write_pack/);
-    await call("compile_write_pack", {
-      sceneId: "arrival", targetPath: "chapters/第一章.md", notes: "## 场景目标\n主角违规进入训练区。",
-    });
+    assert.match(String(missingNotes.error), /notes/);
+    const sceneContent = "门禁灯从绿变红。".repeat(20);
     const written = JSON.parse(await call("write_chapter_scene", {
-      sceneId: "arrival", content: "门禁灯从绿变红。".repeat(20), actualState: actualState("主角违规进入训练区"),
+      sceneId: "arrival",
+      notes: "## 场景目标\n主角违规进入训练区。\n## 已知事实\n门禁灯会在违规时变红。",
+      content: sceneContent,
+      actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
     assert.equal(written.complete, true);
+    assert.equal(typeof written.writePackCharacters, "number");
     const beforeInspect = JSON.parse(await call("propose_chapter_draft", {
       summary: "新建第一章", chapterChange: "关系改变", reviewNotes: "已检查",
     })) as Record<string, unknown>;
     assert.match(String(beforeInspect.error), /inspect_chapter_draft/);
-    await call("inspect_chapter_draft", {});
+    const inspectedRaw = await call("inspect_chapter_draft", {});
+    const inspected = JSON.parse(inspectedRaw) as Record<string, unknown>;
+    assert.equal(inspected.status, "inspection_required");
+    assert.equal(typeof inspected.contentCharacters, "number");
+    assert.equal("content" in inspected, false, "inspect result must not duplicate the assembled chapter");
+    const legacyInspectResult = JSON.stringify({ ...inspected, content: `# 第一章\n\n${sceneContent}` });
+    assert.ok(legacyInspectResult.length - inspectedRaw.length >= sceneContent.length);
     const proposed = JSON.parse(await call("propose_chapter_draft", {
       summary: "新建第一章", chapterChange: "主角从服从转为违规", reviewNotes: "单场章无需接缝；目标与结果一致",
     })) as Record<string, unknown>;

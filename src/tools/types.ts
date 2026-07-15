@@ -2,6 +2,7 @@ import type { AgentEvent, ModelConfig, PermissionMode } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ChapterSceneDraft } from "../scene_pipeline.js";
+import type { ScenePipelineSettings } from "../agent_runtime.js";
 
 export type ToolCall = {
   id: string;
@@ -34,6 +35,8 @@ export type ToolExecutionContext = {
   writePackSceneId?: string;
   /** Full-chapter delivery uses the scene pipeline instead of a one-shot proposal. */
   requireScenePipeline?: boolean;
+  /** Current project scene-chain guidance and enforced per-chapter limit. */
+  scenePipelineSettings?: ScenePipelineSettings;
   /** In-run chapter draft; never writes a partial chapter to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**

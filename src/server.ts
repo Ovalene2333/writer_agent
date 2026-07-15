@@ -10,12 +10,14 @@ import { streamSSE } from "hono/streaming";
 import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
 import {
+  ABSOLUTE_MAX_SCENES,
   isPermissionMode,
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
   persistFinalizedSessionTodos,
   saveAgentSettings,
+  type ScenePipelineSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
 import { generateRoleplayInterlocutor, runRoleplayChat } from "./roleplay.js";
@@ -554,6 +556,7 @@ export async function startWriterServer(options: {
     const instructions = loadProjectInstructions(options.project);
     return context.json({
       permissionMode: settings.permissionMode,
+      scenePipeline: settings.scenePipeline,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description, path: skill.path,
@@ -563,14 +566,25 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string }>();
+      const body = await context.req.json<{ permissionMode?: string; scenePipeline?: Partial<ScenePipelineSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
+      if (body.scenePipeline !== undefined) {
+        const values = [
+          body.scenePipeline.preferredMinScenes,
+          body.scenePipeline.preferredMaxScenes,
+          body.scenePipeline.maxScenes,
+        ].filter(value => value !== undefined);
+        if (values.some(value => !Number.isInteger(value) || Number(value) < 1 || Number(value) > ABSOLUTE_MAX_SCENES)) {
+          return context.json({ error: `场景链参数须为 1—${ABSOLUTE_MAX_SCENES} 的整数` }, 400);
+        }
+      }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
+        ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
       });
-      return context.json({ permissionMode: settings.permissionMode });
+      return context.json({ permissionMode: settings.permissionMode, scenePipeline: settings.scenePipeline });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }
@@ -651,9 +665,10 @@ export async function startWriterServer(options: {
     const variantGroupId = typeof body.variantGroupId === "string" && body.variantGroupId.length <= 100
       ? body.variantGroupId
       : undefined;
+    const runtimeSettings = loadAgentSettings(options.project);
     const permissionMode = body.permissionMode && isPermissionMode(body.permissionMode)
       ? body.permissionMode
-      : loadAgentSettings(options.project).permissionMode;
+      : runtimeSettings.permissionMode;
     const jobLabel = body.mode === "character" ? "character" : body.mode === "roleplay" ? "roleplay" : "agent";
     const job = agentJobs.start(body.sessionId, async (signal, emit) => {
       const stepDebug = createAgentStepDebugLogger({
@@ -714,6 +729,7 @@ export async function startWriterServer(options: {
             characterScope,
             simpleCharacterScope,
             permissionMode,
+            scenePipelineSettings: runtimeSettings.scenePipeline,
             models: {
               agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
               inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
@@ -766,17 +782,28 @@ export async function startWriterServer(options: {
       for (const event of job.events) await write(event);
       if (job.status !== "running") return;
       await new Promise<void>((resolve) => {
-        const unsubscribe = agentJobs.subscribe(job.id, async (event) => {
-          await write(event);
+        let writeChain = Promise.resolve();
+        let finished = false;
+        const finishAfterQueuedWrites = () => {
+          if (finished) return;
+          finished = true;
+          void writeChain.then(resolve, resolve);
+        };
+        const unsubscribe = agentJobs.subscribe(job.id, (event) => {
+          // Background jobs emit synchronously, while SSE writes are async. Queue every
+          // live write so usage/tool/proposal events cannot be overtaken by terminal done.
+          writeChain = writeChain.then(() => write(event)).catch(() => {
+            closed = true;
+          });
           if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
             unsubscribe?.();
-            resolve();
+            finishAfterQueuedWrites();
           }
         });
         context.req.raw.signal.addEventListener("abort", () => {
           closed = true;
           unsubscribe?.();
-          resolve();
+          finishAfterQueuedWrites();
         }, { once: true });
       });
     });

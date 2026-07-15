@@ -18,6 +18,7 @@ export type ProviderModel = { id: string; name: string; pricing: Pricing; temper
 export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
 export type ModelRole = "agent" | "roleplay" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
+export type ScenePipelineSettings = { preferredMinScenes: number; preferredMaxScenes: number; maxScenes: number };
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
@@ -69,16 +70,32 @@ function TestStatusIcon({ status }: { status: TestStatus }) {
   </svg>;
 }
 
-export function ModelConfig({ initialCatalog, request, onClose, onChanged }: { initialCatalog: ProviderCatalog; request: Request; onClose: () => void; onChanged: () => void | Promise<void> }) {
+type ModelConfigProps = {
+  initialCatalog: ProviderCatalog;
+  scenePipeline: ScenePipelineSettings;
+  request: Request;
+  onClose: () => void;
+  onChanged: () => void | Promise<void>;
+  onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
+};
+
+export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, onChanged, onScenePipelineChanged }: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
+  const [tab, setTab] = useState<"models" | "scene-pipeline">("models");
+  const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [testStatus, setTestStatus] = useState<Record<string, TestStatus>>({});
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
+  useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
+  const sceneDraftValid = [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
+    .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
+    && sceneDraft.preferredMinScenes <= sceneDraft.preferredMaxScenes
+    && sceneDraft.preferredMaxScenes <= sceneDraft.maxScenes;
   const choices = useMemo(() => catalog.providers.flatMap(provider => provider.models.map(model => ({ value: `${provider.id}:${model.id}`, label: `${provider.name} / ${model.name}` }))), [catalog]);
   const editProfile = (profile: ProviderProfile) => setEditing({ id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, apiKey: "", models: profile.models.map(model => ({ ...model, pricing: { ...model.pricing } })) });
   const updateModel = (index: number, change: Partial<ModelDraft>) => setEditing(current => current ? { ...current, models: current.models.map((model, i) => i === index ? { ...model, ...change } : model) } : current);
@@ -159,11 +176,32 @@ export function ModelConfig({ initialCatalog, request, onClose, onChanged }: { i
     else setMessage(summary);
   }
 
+  async function saveScenePipeline() {
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const result = await request("/api/agent-settings", {
+        method: "POST",
+        body: JSON.stringify({ scenePipeline: sceneDraft }),
+      }) as { scenePipeline: ScenePipelineSettings };
+      setSceneDraft(result.scenePipeline);
+      onScenePipelineChanged(result.scenePipeline);
+      setMessage("场景链设置已保存，将从下一次 Agent 任务开始生效");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return <div className="model-config-backdrop">
     <section className="model-config-view">
-      <div className="management-head"><div><span className="eyebrow">AI infrastructure</span><h2>模型与写作流程</h2><p>管理供应商、模型及各写作环节的模型分工。测试连接仅请求模型列表，不消耗 token。</p></div><div className="management-actions"><button onClick={() => setEditing(emptyProfile())}>+ 添加供应商</button><button className="primary" onClick={onClose}>完成</button></div></div>
+      <div className="management-head"><div><span className="eyebrow">Settings</span><h2>设置</h2><p>统一管理模型分工与章节场景链策略。</p></div><div className="management-actions">{tab === "models" && <button onClick={() => setEditing(emptyProfile())}>+ 添加供应商</button>}<button className="primary" onClick={onClose}>完成</button></div></div>
+      <nav className="settings-tabs" aria-label="设置分类">
+        <button className={tab === "models" ? "active" : ""} onClick={() => { setTab("models"); setError(""); setMessage(""); }}>模型</button>
+        <button className={tab === "scene-pipeline" ? "active" : ""} onClick={() => { setTab("scene-pipeline"); setError(""); setMessage(""); }}>场景链</button>
+      </nav>
       {(error || message) && <div className={error ? "config-feedback error" : "config-feedback"} style={{ whiteSpace: "pre-wrap" }}>{error || message}</div>}
-      <div className="model-config-layout">
+      {tab === "models" && <div className="model-config-layout">
         <div className="provider-column">
           <h3>供应商与模型</h3>
           {catalog.providers.map(provider => {
@@ -217,7 +255,21 @@ export function ModelConfig({ initialCatalog, request, onClose, onChanged }: { i
           })}
         </div>
         <div className="role-column"><h3>写作流程分工</h3><p className="section-note">不同环节可使用不同供应商下的模型。</p>{ROLES.map(role => { const ref = catalog.assignments[role.id]; return <label className="role-card" key={role.id}><span><strong>{role.name}</strong><small>{role.detail}</small></span><select value={`${ref.providerId}:${ref.modelId}`} onChange={event => void assign(role.id, event.target.value)}>{choices.map(choice => <option value={choice.value} key={choice.value}>{choice.label}</option>)}</select></label>; })}</div>
-      </div>
+      </div>}
+      {tab === "scene-pipeline" && <div className="scene-settings">
+        <div className="scene-settings-copy">
+          <span className="eyebrow">Chapter pipeline</span>
+          <h3>章节场景链</h3>
+          <p>推荐范围会写入每轮动态任务提示；允许最多场数由工具强制校验。场景越多，模型调用和累计 input 通常越高。</p>
+        </div>
+        <div className="scene-settings-grid">
+          <label><span>推荐最少场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><small>短章或单一冲突可以低于此值。</small></label>
+          <label><span>推荐最多场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/><small>模型默认在推荐区间内规划。</small></label>
+          <label><span>允许最多场数</span><input type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>硬上限为 8；超过时 begin_chapter_draft 会拒绝。</small></label>
+        </div>
+        <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"}>{sceneDraftValid ? `当前策略：推荐 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。` : "请确保：推荐最少 ≤ 推荐最多 ≤ 允许最多，且都在 1—8 之间。"}</div>
+        <div className="scene-settings-actions"><button onClick={() => setSceneDraft(scenePipeline)} disabled={busy}>恢复当前值</button><button className="primary" onClick={() => void saveScenePipeline()} disabled={busy || !sceneDraftValid}>{busy ? "保存中…" : "保存场景链设置"}</button></div>
+      </div>}
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>
       <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" onClick={() => setEditing(null)}>×</button></div>

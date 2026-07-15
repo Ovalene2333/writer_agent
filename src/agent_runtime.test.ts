@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  advanceScenePipelineTodos,
   advanceTodosAfterProposal,
   finalizeDanglingInProgressTodos,
   finalizeOpenTodos,
@@ -30,6 +31,42 @@ test("normalizeTodos enforces single in_progress", () => {
   assert.equal(todos[0].status, "in_progress");
   assert.equal(todos[1].status, "pending");
   assert.match(formatTodosForPrompt(todos), /t1/);
+});
+
+test("scene pipeline milestones advance the built-in chapter todos without model bookkeeping", () => {
+  const initial: AgentTodoItem[] = [
+    { id: "t1", content: "核对本章必要事实与衔接", status: "in_progress" },
+    { id: "t2", content: "建立本章场景链", status: "pending" },
+    { id: "t3", content: "逐场写作并传递状态", status: "pending" },
+    { id: "t4", content: "整章审阅并提交提案", status: "pending" },
+  ];
+  const started = advanceScenePipelineTodos(initial, "draft_started");
+  assert.equal(started.changed, true);
+  assert.deepEqual(started.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
+  const complete = advanceScenePipelineTodos(started.todos, "draft_complete");
+  assert.deepEqual(complete.todos.map(item => item.status), ["completed", "completed", "completed", "in_progress"]);
+});
+
+test("scene pipeline milestones do not infer phases from custom todo wording", () => {
+  const custom: AgentTodoItem[] = [
+    { id: "x1", content: "看看资料", status: "in_progress" },
+    { id: "x2", content: "写正文", status: "pending" },
+  ];
+  const result = advanceScenePipelineTodos(custom, "draft_started");
+  assert.equal(result.changed, false);
+  assert.equal(result.todos, custom);
+});
+
+test("scene pipeline milestones migrate the legacy chapter todo labels", () => {
+  const legacy: AgentTodoItem[] = [
+    { id: "t1", content: "核对大纲、人设与衔接", status: "completed" },
+    { id: "t2", content: "建立章节场景链", status: "in_progress" },
+    { id: "t3", content: "逐场编译、写作并传递状态", status: "pending" },
+    { id: "t4", content: "整章审阅并提交提案", status: "pending" },
+  ];
+  const result = advanceScenePipelineTodos(legacy, "draft_started");
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
 });
 
 test("finalizeOpenTodos completes pending and in_progress, keeps cancelled", () => {
@@ -142,13 +179,22 @@ test("project instructions prefer WRITER.md", () => {
   }
 });
 
-test("agent settings round-trip permission mode", () => {
+test("agent settings round-trip permission mode and scene pipeline", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
     const project = WriterProject.init(root, "测试");
-    assert.equal(loadAgentSettings(project).permissionMode, "ask");
-    saveAgentSettings(project, { permissionMode: "plan" });
-    assert.equal(loadAgentSettings(project).permissionMode, "plan");
+    assert.deepEqual(loadAgentSettings(project), {
+      permissionMode: "ask",
+      scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 },
+    });
+    saveAgentSettings(project, {
+      permissionMode: "plan",
+      scenePipeline: { preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6 },
+    });
+    assert.deepEqual(loadAgentSettings(project), {
+      permissionMode: "plan",
+      scenePipeline: { preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6 },
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

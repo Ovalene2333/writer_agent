@@ -18,7 +18,7 @@ function assertWritePackReady(context: ToolHandlerArgs["context"], toolName: str
 function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], path: string, toolName: string): void {
   if (!context.requireScenePipeline || documentKind(path) !== "chapter") return;
   throw new Error(
-    `${toolName} 不能跳过逐场景章节流水线：先 begin_chapter_draft，逐场 compile_write_pack + write_chapter_scene，` +
+    `${toolName} 不能跳过逐场景章节流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
     "再 inspect_chapter_draft 与 propose_chapter_draft。",
   );
 }

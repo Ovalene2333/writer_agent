@@ -28,7 +28,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "48a72d67b353d5fe");
+  assert.equal(agentToolSchemaHash(), "6ce73c10312388ed");
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -86,8 +86,9 @@ test("prebuilt todo plans start with one active step", () => {
 test("chapter workflow uses the model-driven scene tool chain", () => {
   const instructions = taskInstructions("write_scene", "deliver", "ask", true);
   assert.match(instructions, /begin_chapter_draft/);
-  assert.match(instructions, /compile_write_pack/);
   assert.match(instructions, /write_chapter_scene/);
+  assert.match(instructions, /每场只调用一次 write_chapter_scene/);
+  assert.match(instructions, /工具内部完成 notes 编译/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);
   assert.match(instructions, /actualState/);

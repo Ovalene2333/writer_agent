@@ -18,7 +18,7 @@ import {
   type ConnectionInfo,
   type ConnectionPreference,
 } from "./connection";
-import { ModelConfig, type ProviderCatalog } from "./model_config";
+import { ModelConfig, type ProviderCatalog, type ScenePipelineSettings } from "./model_config";
 import "./style.css";
 
 type Proposal = {
@@ -235,7 +235,7 @@ type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode };
+  agentSettings?: { permissionMode: PermissionMode; scenePipeline: ScenePipelineSettings };
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;
 };
@@ -1116,7 +1116,7 @@ function App() {
   } | null>(null);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
-  const [showModelConfig, setShowModelConfig] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<{ path: string; kind: "file" | "folder" } | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -1612,7 +1612,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask" }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -1630,7 +1630,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask" }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -1655,6 +1655,7 @@ function App() {
       let buffer = "";
       let terminal = false;
       let terminalType: AgentStreamEvent["type"] | null = null;
+      let completedProposal: NonNullable<AgentStreamEvent["proposal"]> | undefined;
       for (;;) {
         const { done, value } = await reader.read();
         buffer += decoder.decode(value, { stream: !done });
@@ -1665,6 +1666,7 @@ function App() {
           if (!line) continue;
           const event = JSON.parse(line.slice(5)) as AgentStreamEvent;
           handleAgentEvent(event);
+          if (event.type === "proposal" && event.proposal) completedProposal = event.proposal;
           if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
             terminal = true;
             terminalType = event.type;
@@ -1713,7 +1715,11 @@ function App() {
           }
           const pendingCount = (next.proposals ?? []).filter((item) => item.status === "pending").length;
           setNotice(
-            pendingCount > 0
+            completedProposal?.status === "accepted"
+              ? `Agent job completed · 已写入 ${completedProposal.path}`
+              : completedProposal?.status === "pending"
+                ? `Agent job completed · 提案 #${completedProposal.id} 待审批：${completedProposal.path}`
+                : pendingCount > 0
               ? `Agent job completed · ${pendingCount} 条提案待审批（Ask 模式不会直接改文件）`
               : "Agent job completed.",
           );
@@ -2270,7 +2276,7 @@ function App() {
   }
 
   function openProviderSettings() {
-    setShowModelConfig(true);
+    setShowSettings(true);
   }
 
   async function deleteCharacter(character: Character) {
@@ -2378,7 +2384,7 @@ function App() {
           )}
         </div>
         <div className="header-right">
-          <button className="usage-strip" onClick={openProviderSettings} title="Open model configuration">
+          <button className="usage-strip" onClick={openProviderSettings} title="打开设置">
             <span className="model-name">{state.provider.model}</span>
             <span className="context-meter" title={`${usagePct}% context`} aria-hidden="true">
               <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
@@ -3877,7 +3883,20 @@ function App() {
         />
       )}
 
-      {showModelConfig && <ModelConfig initialCatalog={state.providerCatalog} request={api} onClose={() => setShowModelConfig(false)} onChanged={() => { void refresh(state.sessionId); }} />}
+      {showSettings && <ModelConfig
+        initialCatalog={state.providerCatalog}
+        scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 }}
+        request={api}
+        onClose={() => setShowSettings(false)}
+        onChanged={() => { void refresh(state.sessionId); }}
+        onScenePipelineChanged={scenePipeline => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            scenePipeline,
+          },
+        } : previous)}
+      />}
     </div>
   );
 }

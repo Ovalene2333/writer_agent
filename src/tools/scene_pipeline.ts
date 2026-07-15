@@ -1,4 +1,5 @@
 import { documentKind } from "../project.js";
+import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
   beginChapterSceneDraft,
@@ -33,6 +34,7 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
     baseContent,
     baseHash: project.hash(baseContent),
     scenes: Array.isArray(input.scenes) ? input.scenes : [],
+    maxScenes: context.scenePipelineSettings?.maxScenes,
   });
   context.chapterSceneDraft = draft;
   context.writePackCompiled = false;
@@ -44,9 +46,9 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
     mode,
     chapterGoal: draft.chapterGoal,
     sceneCount: draft.scenes.length,
-    scenes: draft.scenes,
+    scenePolicy: context.scenePipelineSettings,
     nextScene: sceneCardForTool(nextChapterScene(draft)),
-    message: "场景链已锁定。按顺序为每场 compile_write_pack(sceneId) 后调用 write_chapter_scene；每场正文须产生实际状态变化。",
+    message: "场景链已锁定并保存在内存草稿中。按顺序为每场调用一次 write_chapter_scene，同时提交故事内 notes、正文和 actualState。",
   });
 }
 
@@ -55,9 +57,10 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
   const sceneId = requireString(input.sceneId, "sceneId");
-  if (!context.writePackCompiled || context.writePackSceneId !== sceneId) {
-    throw new Error(`写 ${sceneId} 前须先为同一 sceneId 调用 compile_write_pack`);
-  }
+  const notes = requireString(input.notes, "notes");
+  if (notes.length > 24_000) throw new Error("notes 过长（上限 24000 字）；请压缩为本场目标、事实与事件顺序");
+  const writePack = formatWritePackForWriter(compileWritePack(notes, { targetPath: draft.path }));
+  if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const content = requireString(input.content, "content");
   rejectCompressedPlaceholder(content, "content");
   const result = writeChapterScene(draft, sceneId, content, input.actualState);
@@ -73,11 +76,12 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
     completedScenes: result.draft.completed.length,
     totalScenes: result.draft.scenes.length,
     invalidatedSceneIds: result.invalidatedSceneIds,
+    writePackCharacters: writePack.length,
     actualState: result.draft.completed.at(-1)?.actualState,
     nextScene: sceneCardForTool(next),
     complete: chapterSceneDraftComplete(result.draft),
     message: next
-      ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面后，重新 compile_write_pack。`
+      ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 write_chapter_scene 中提交新的 notes。`
       : "全部场景已写完；调用 inspect_chapter_draft 做整章接缝、重复功能与总变化审阅。",
   });
 }
@@ -94,7 +98,8 @@ export function handleInspectChapterDraft({ context }: ToolHandlerArgs): string 
     status: "inspection_required",
     path: draft.path,
     chapterGoal: draft.chapterGoal,
-    content,
+    contentCharacters: content.length,
+    sceneCount: draft.completed.length,
     ledger: chapterSceneLedger(draft),
     reviewChecklist: [
       "相邻场景是否因果承接，而非只按时间并列",
@@ -103,7 +108,7 @@ export function handleInspectChapterDraft({ context }: ToolHandlerArgs): string 
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
     ],
-    message: "先通读整章。发现问题时为目标 sceneId 重新 compile_write_pack 并 write_chapter_scene；修改会使后续场景失效。确认无误后再 propose_chapter_draft。",
+    message: "请依据本轮历史中各次 write_chapter_scene 的正文通读整章；正文已保存在内存草稿中，不在此重复返回。发现问题时直接为目标 sceneId 重新调用 write_chapter_scene（同时提供新 notes）；确认无误后再 propose_chapter_draft。",
   });
 }
 
