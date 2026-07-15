@@ -249,3 +249,47 @@ test("corrupt JSONL reports a visible line diagnostic", () => {
   try { const project = WriterProject.init(root, "损坏"); project.writeCharacterCardsJsonl("{broken}\n"); assert.throws(() => new WriterStore(project), /characters\.jsonl:1/); }
   finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("proposal approval applies deferred ability unlock and undo keeps it atomic", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-proposal-"));
+  try {
+    const project = WriterProject.init(root, "渐进解锁");
+    const store = new WriterStore(project);
+    const character = store.saveCharacter({
+      ...emptyCharacter("闻溪"),
+      competencies: [{
+        id: "spirit-sight", name: "灵视", summary: "偶尔看见异常轮廓", level: "初阶", unlocked: false,
+        description: "能够稳定辨认灵体", resources: [], limitations: [], costs: [], sourceRefs: [],
+      }],
+    });
+    const sessionId = store.createSession("能力解锁");
+    const change = [{
+      characterId: character.id,
+      reason: "正文中付出代价后首次稳定辨认灵体",
+      changes: [{ op: "set_unlocked", competencyId: "spirit-sight", unlocked: true }],
+    }];
+
+    const rejected = store.createProposal(sessionId, "chapters/弃案.md", "未采用的版本", "候选场景", change);
+    assert.equal(store.characters()[0].competencies[0].unlocked, false);
+    store.rejectProposal(rejected.id);
+    assert.equal(store.characters()[0].competencies[0].unlocked, false);
+
+    const proposal = store.createProposal(sessionId, "chapters/觉醒.md", "她终于看清了门后的影子。", "完成灵视觉醒场景", change);
+    assert.equal(store.characters()[0].competencies[0].unlocked, false);
+    store.acceptProposal(proposal.id);
+    let competency = store.characters()[0].competencies[0];
+    assert.equal(competency.unlocked, true);
+    assert.ok(competency.sourceRefs.some(ref => ref.type === "document" && ref.ref === "chapters/觉醒.md"));
+
+    store.undo(sessionId);
+    assert.equal(store.characters()[0].competencies[0].unlocked, false);
+    assert.equal(project.documentExists("chapters/觉醒.md"), false);
+    store.redo(sessionId);
+    competency = store.characters()[0].competencies[0];
+    assert.equal(competency.unlocked, true);
+    assert.equal(project.documentExists("chapters/觉醒.md"), true);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

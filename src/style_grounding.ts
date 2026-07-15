@@ -1,7 +1,6 @@
 import { documentKind, WriterProject } from "./project.js";
 import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./prose_quality.js";
 import { WriterStore } from "./store.js";
-import { getStyleTemplate } from "./templates.js";
 
 /**
  * Style prompt cache split (see also PROMPT / PREFIX-CACHE CONTRACT in agent.ts):
@@ -65,7 +64,7 @@ export function stableStyleGroundingPrompt(
   if (!options.intensive) return "";
 
   const config = project.config();
-  const template = config.style ? getStyleTemplate(config.style) : undefined;
+  const template = config.style ? project.styleTemplate(config.style) : undefined;
   const examples = pickStyleExamples(store, template?.name);
 
   const sections: string[] = [

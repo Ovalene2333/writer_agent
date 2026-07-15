@@ -49,6 +49,46 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
     exampleNotes: "细节描写承载情感，自由间接引语传达人物心理。注意节奏的从容铺陈和意象的使用。",
   },
   {
+    id: "modern-commercial",
+    name: "现代商业文学",
+    description: "好读、有趣、有内容，兼顾人物深度与情节推进 — 适合都市、职场、家庭、成长与类型融合故事",
+    systemPromptAddition: `写作风格指令（现代商业文学）：
+- 核心体验：以清晰、流畅、具有当代感的叙事承载有分量的人物和议题。既要让读者愿意翻页，也要让事件留下认识、情感或价值上的余味；深度来自人物选择及后果，不靠旁白讲道理。
+- 场景价值：每个场景至少完成两项功能：推进事件、改变关系、暴露人物、增加有效信息、制造选择或回收伏笔。进入场景要早，离开场景要及时；寒暄、赶路、重复回忆和已知信息复述能删则删。
+- 人物：主要人物同时拥有欲望、能力、局限和自我辩护。避免纯工具人、脸谱反派和靠误会强行拖延；让冲突来自各自合理但不兼容的诉求。心理描写应补充行动无法表达的矛盾，不重复翻译表情和对白。
+- 情节与信息：开篇尽早给出具体变化、难题或关系裂缝。章节持续产生信息增量和局面变化，但不强制每节反转或每章悬崖；伏笔应融入物件、习惯、决定和对话，在后文产生实际作用。
+- 对白与趣味：对白有目的、潜台词和身份差异，允许打断、回避、答非所问。趣味来自人物观察、关系错位、现实细节和意外反应；不用网络热梗、段子拼贴、刻意卖萌或所有角色轮流抖机灵。
+- 语言与节奏：使用准确、具体、富有动作感的现代汉语。句长和段长随压力变化，关键处放慢，过渡处利落；允许机敏的比喻和轻微幽默，但不堆金句、形容词、感官清单或整齐排比。保持可读性，不把通俗误写成浅薄，也不把深刻误写成晦涩。
+- 内容密度：背景、行业知识和社会议题必须进入人物正在处理的问题，并影响决定或代价。专业信息讲到足以理解冲突即可，避免资料陈列；同一情绪、动机、因果或主题只表达一次。
+- 避免：注水式日常、重复内心独白、无后果冲突、模板化打脸、廉价反转、强行升华、作者替人物总结人生，以及频繁使用“不是A而是B”给抽象意义重新命名。`,
+    suggestedTemperature: 0.8,
+    suggestedTopP: 0.92,
+    exampleContent: `周一早上九点零七分，许知遥在公司前台看见了自己的工牌。
+
+工牌挂在一个陌生男人胸前。照片是她，名字是她，职位却从“产品总监”变成了“项目顾问”。
+
+“打印机坏了。”前台姑娘压低声音，“行政说先拿旧卡顶一下。”
+
+许知遥看着那张卡。塑封边缘有一道裂口，是她去年出差时摔的。旧卡没有被销毁，也没有留在行政抽屉里。它被交给了一个即将坐进她办公室的人。
+
+男人顺着她的目光低头，摘下工牌递过来。“抱歉，我不知道是谁的。”
+
+“现在知道了。”许知遥接过来，没有立刻戴上，“你叫什么？”
+
+“程野。总部派来的。”
+
+电梯门在身后打开。她的老板站在里面，手里端着两杯咖啡，其中一杯显然不是给她的。
+
+“正好，都到了。”老板笑得很忙，“十点开会，组织调整。知遥，你先带程野熟悉一下团队。”
+
+许知遥也笑了笑。她把旧工牌放进外套口袋，按住电梯开门键。
+
+“当然。先从财务开始吧。”她说，“他接手的项目，上周刚多出八百万缺口。”
+
+程野第一次露出了不像总部来人的表情。`,
+    exampleNotes: "用具体职场异常迅速建立问题，以物件、对白和关系反应传递信息；节奏明快但不跳过人物判断，幽默来自权力关系与现场反应。",
+  },
+  {
     id: "light-novel",
     name: "轻小说",
     description: "对话为主、画面感强、语气轻松、年轻化 — 适合校园、日常、恋爱喜剧",
@@ -138,4 +178,40 @@ export function getStyleTemplate(id: string): StyleTemplate | undefined {
 
 export function listStyleTemplates(): StyleTemplate[] {
   return BUILTIN_STYLE_TEMPLATES;
+}
+
+export function normalizeStyleTemplate(
+  input: Partial<StyleTemplate>,
+  options?: { fallbackId?: string },
+): StyleTemplate {
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+  if (!name) throw new Error("模板名称不能为空");
+  if (name.length > 80) throw new Error("模板名称不能超过 80 个字符");
+  const rawId = typeof input.id === "string" ? input.id.trim() : "";
+  const id = rawId || options?.fallbackId || `custom-${Date.now().toString(36)}`;
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/u.test(id)) {
+    throw new Error("模板 ID 只能使用小写字母、数字和连字符，最长 64 位");
+  }
+  const description = typeof input.description === "string" ? input.description.trim() : "";
+  const systemPromptAddition = typeof input.systemPromptAddition === "string" ? input.systemPromptAddition.trim() : "";
+  const exampleContent = typeof input.exampleContent === "string" ? input.exampleContent.trim() : "";
+  const exampleNotes = typeof input.exampleNotes === "string" ? input.exampleNotes.trim() : "";
+  if (!description) throw new Error("模板简介不能为空");
+  if (description.length > 500) throw new Error("模板简介不能超过 500 个字符");
+  if (!systemPromptAddition) throw new Error("模板写作指令不能为空");
+  if (systemPromptAddition.length > 20_000) throw new Error("模板写作指令不能超过 20000 个字符");
+  if (exampleContent.length > 50_000) throw new Error("模板范文不能超过 50000 个字符");
+  if (exampleNotes.length > 5_000) throw new Error("范文备注不能超过 5000 个字符");
+  const suggestedTemperature = Number(input.suggestedTemperature);
+  const suggestedTopP = Number(input.suggestedTopP);
+  if (!Number.isFinite(suggestedTemperature) || suggestedTemperature < 0 || suggestedTemperature > 2) {
+    throw new Error("temperature 必须在 0 到 2 之间");
+  }
+  if (!Number.isFinite(suggestedTopP) || suggestedTopP <= 0 || suggestedTopP > 1) {
+    throw new Error("topP 必须大于 0 且不超过 1");
+  }
+  return {
+    id, name, description, systemPromptAddition,
+    suggestedTemperature, suggestedTopP, exampleContent, exampleNotes,
+  };
 }

@@ -3,7 +3,7 @@ export type ProseStyleSubtype =
   | "speech_extension" | "speech_interruption" | "speech_hesitation"
   | "system_or_metadata" | "parenthetical_explanation" | "appositive_definition"
   | "cause_or_judgment" | "ambiguous_dash"
-  | "narrator_redefinition" | "abstract_reframing" | "dialogue_correction" | "factual_exclusion"
+  | "narrator_redefinition" | "abstract_reframing" | "split_redefinition" | "dialogue_correction" | "factual_exclusion"
   | "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss";
 
 export interface ProseStyleIssue {
@@ -36,6 +36,7 @@ type MatchRange = { start: number; end: number; text: string };
 const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const CONTRAST_PATTERNS = [
   /(?:并)?不是[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
+  /(?:并)?不是[^\n。！？!?]{1,48}[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
   /并非[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
   /与其(?:说)?[^\n。！？!?]{0,48}不如(?:说)?/gu,
   /没有[^\n。！？!?]{0,40}只有/gu,
@@ -70,6 +71,7 @@ export const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
   "parenthetical_explanation",
   "cause_or_judgment",
   "abstract_reframing",
+  "split_redefinition",
   "narrator_redefinition",
   "semantic_echo",
   "emotion_label",
@@ -88,6 +90,25 @@ export function hardMannerismLimit(text: string): number {
   return Math.max(5, 3 + Math.floor(characters / 2_000));
 }
 
+function hardMannerismFamily(subtype: ProseStyleSubtype): "dash" | "contrast" | "explanation" {
+  if (subtype === "parenthetical_explanation" || subtype === "cause_or_judgment") return "dash";
+  if (subtype === "abstract_reframing" || subtype === "split_redefinition" || subtype === "narrator_redefinition") return "contrast";
+  return "explanation";
+}
+
+/**
+ * A repeated sentence frame becomes noticeable before unrelated mannerisms do.
+ * Keep dashes comparatively permissive, but stop two or three abstract
+ * negation/redefinition or explanatory-echo frames from hiding under one shared
+ * chapter-wide allowance.
+ */
+function hardMannerismFamilyLimit(text: string, family: "dash" | "contrast" | "explanation"): number {
+  const characters = Math.max(1, text.replace(/\s/g, "").length);
+  if (family === "contrast") return Math.max(1, Math.floor(characters / 3_000));
+  if (family === "explanation") return Math.max(2, 1 + Math.floor(characters / 2_500));
+  return hardMannerismLimit(text);
+}
+
 /**
  * Generation-time constraints (constraint-first).
  * Inject into system prompts before the model writes, so fewer proposals fail the final gate.
@@ -98,7 +119,7 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
     return [
       "句式硬约束（生成时遵守，减少返工）：",
       "1. 叙述少用破折号做「画面——解释 / 因果补注」；优先句号拆句，或把说明改成可观察动作/细节。",
-      "2. 叙述少用「不是A（而）是B」「并非…而是…」等抽象重定义；直接写成立事实或落到行动/对白。",
+      "2. 叙述少用「不是A（而）是B」「不是A。是B。」「并非…而是…」等否定—肯定重定义；直接写成立事实或落到行动/对白。",
       "3. 动作、对白或细节已经传达情绪/意图时，不再追加「这说明…」「他显然感到…」「真正重要的是…」等解释回声。",
       "4. 允许：对白拖音/中断/迟疑；人物口语纠正；并列列举（头——脚——手）；Markdown 表格；偶发停顿—揭示与短同位。",
       "5. 禁止堆砌：同一段落反复因果补注、否定—肯定、情绪标签或主题总结模板。",
@@ -113,7 +134,7 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
 - 改写配方：删破折号后半句的解释，只留可观察结果；因果不可省则拆成下一句独立句。
 
 【「不是…是…」类模板】
-- 叙述少用：不是A而是B / 并非…而是 / 与其说…不如 / 没有…只有 / 不在于…而在于（尤其「这/那不是情绪，而是意义」式抽象重定义）。
+- 叙述少用：不是A而是B / 不是A。是B。 / 并非…而是 / 与其说…不如 / 没有…只有 / 不在于…而在于（尤其「这/那不是情绪，而是意义」式抽象重定义）。不要用句号把同一否定—肯定模板伪装成两个短句。
 - 允许：对白里纠正事实（「不是老周，是他儿子」）；客观事实排除写清即可，勿叠抽象标签。
 - 改写配方：直接陈述真正成立的事实；若需纠正误解，改由人物行动或对白完成。
 
@@ -153,8 +174,17 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     && issue.confidence >= 0.9
     && HARD_BLOCK_SUBTYPES.has(issue.subtype),
   );
-  if (candidates.length > limit) {
-    for (const issue of candidates) issue.severity = "error";
+  const crowdedFamilies = new Set<ReturnType<typeof hardMannerismFamily>>();
+  for (const family of ["dash", "contrast", "explanation"] as const) {
+    const familyCount = candidates.filter(issue => hardMannerismFamily(issue.subtype) === family).length;
+    if (familyCount > hardMannerismFamilyLimit(text, family)) crowdedFamilies.add(family);
+  }
+  if (candidates.length > limit || crowdedFamilies.size) {
+    for (const issue of candidates) {
+      if (candidates.length > limit || crowdedFamilies.has(hardMannerismFamily(issue.subtype))) {
+        issue.severity = "error";
+      }
+    }
   }
   return issues;
 }
@@ -209,7 +239,8 @@ export function newProseStyleIssues(before: string, after: string): ProseStyleIs
  */
 export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undefined {
   const errors = issues.filter(issue =>
-    issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
+    (issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype))
+    || (issue.subtype === "split_redefinition" && issue.severity === "warning" && issue.confidence >= 0.95),
   );
   if (!errors.length) return undefined;
   return formatProseStyleBlockError(errors, "本次修改新增过密的高置信度说明式写法");
@@ -232,6 +263,7 @@ function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
     case "cause_or_judgment":
       return "删破折号后的因果/定义，只留结果；因果拆下一句";
     case "abstract_reframing":
+    case "split_redefinition":
     case "narrator_redefinition":
       return "去掉「不是A而是B」模板，直接写成立事实或落到行动/对白";
     case "semantic_echo":
@@ -347,6 +379,13 @@ function scanContrasts(text: string): ProseStyleIssue[] {
         "结构位于对白中，优先视为人物纠正事实或反驳误解。", []));
       continue;
     }
+    const split = /[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是/u.test(match.text);
+    if (split) {
+      issues.push(makeIssue(text, match, "contrast", "split_redefinition", "warning", 0.92,
+        "叙述者用句号拆开同一否定—肯定框架，容易形成刻意顿挫和机器化重定义；需结合语境区分必要事实澄清。",
+        ["直接写真正成立的动作或事实", "若确需纠正误解，让人物通过对白或后续反应完成"]));
+      continue;
+    }
     const abstract = /(?:这|那|这种|这一切|他的|她的)/u.test(sentence.slice(0, Math.max(0, match.start - bounds.start + 8)))
       || ABSTRACT_WORDS.test(match.text);
     if (abstract) {
@@ -422,7 +461,8 @@ function explanationReason(subtype: ProseStyleSubtype): string {
 function makeIssue(text: string, range: MatchRange, kind: ProseStyleIssue["kind"], subtype: ProseStyleSubtype,
   severity: ProseStyleSeverity, confidence: number, reason: string, suggestions: string[]): ProseStyleIssue {
   const bounds = sentenceBounds(text, range.start);
-  const sentence = text.slice(bounds.start, bounds.end).trim();
+  const endBounds = sentenceBounds(text, Math.max(range.start, range.end - 1));
+  const sentence = text.slice(bounds.start, Math.max(bounds.end, endBounds.end)).trim();
   const { line, column } = lineColumn(text, range.start);
   const evidence = sentence.length <= 90 ? sentence : `${sentence.slice(0, 87)}…`;
   return {

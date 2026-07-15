@@ -107,8 +107,38 @@ test("distinguishes dialogue correction from narrator abstract reframing", () =>
   assert.equal(contrastStyleError(narrationText), undefined);
 });
 
-test("does not join cross-sentence contrast fragments", () => {
-  assert.equal(contrastStyleReport("他不是坏人。他是个逃兵。").frameCount, 0);
+test("repeated abstract contrast frames trip their own density limit", () => {
+  const text = [
+    "这不是愤怒，而是一种更深的恐惧。",
+    "那不是退让，只是另一种形式的反抗。",
+  ].join("\n");
+  const contrastIssues = analyzeProseStyle(text).filter(issue => issue.subtype === "abstract_reframing");
+  assert.equal(contrastIssues.length, 2);
+  assert.ok(contrastIssues.every(issue => issue.severity === "error"));
+  assert.ok(contrastStyleError(text));
+});
+
+test("a single abstract contrast remains advisory", () => {
+  const text = "这不是愤怒，而是一种更深的恐惧。";
+  const issue = analyzeProseStyle(text).find(item => item.subtype === "abstract_reframing");
+  assert.equal(issue?.severity, "warning");
+  assert.equal(contrastStyleError(text), undefined);
+});
+
+test("detects split not-A-is-B narration as a semantic review candidate", () => {
+  const text = "她不是被叫醒。是自己醒的。";
+  const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
+  assert.ok(issue);
+  assert.equal(issue.severity, "warning");
+  assert.equal(issue.sentence, text);
+  assert.equal(proseStyleIssuesError([issue]), undefined);
+});
+
+test("keeps a single factual split contrast advisory until semantic review", () => {
+  const text = "他不是坏人。他是个逃兵。";
+  const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
+  assert.equal(issue?.severity, "warning");
+  assert.equal(contrastStyleError(text), undefined);
 });
 
 test("reports only newly introduced issues for patches", () => {

@@ -10,6 +10,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Optional UI-selected scope for compact/simple character cards. */
+  simpleCharacterScope?: number[];
   /**
    * When true (outline mode), propose_document / propose_document_patch targeting
    * outline paths require a successful design_creative_outline earlier in this run.

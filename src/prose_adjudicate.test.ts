@@ -64,6 +64,23 @@ test("shouldAdjudicateForProposal when dense hard mannerisms exist", () => {
   assert.equal(shouldAdjudicateForProposal(dense, denseIssues), true);
 });
 
+test("split not-A-is-B narration always receives semantic proposal review", () => {
+  const text = "她不是被叫醒。是自己醒的。";
+  const issues = analyzeProseStyle(text);
+  const split = issues.find(item => item.subtype === "split_redefinition");
+  assert.ok(split);
+  assert.equal(shouldAdjudicateForProposal(text, issues), true);
+
+  const blocked = applyProseVerdicts(text, issues, [{ id: split.id, verdict: "block", reason: "刻意拆句重定义" }]);
+  assert.ok(proseStyleIssuesError(blocked));
+
+  const fresh = analyzeProseStyle(text);
+  const freshSplit = fresh.find(item => item.subtype === "split_redefinition");
+  assert.ok(freshSplit);
+  const allowed = applyProseVerdicts(text, fresh, [{ id: freshSplit.id, verdict: "allow", reason: "必要事实排除" }]);
+  assert.equal(proseStyleIssuesError(allowed), undefined);
+});
+
 test("selectDiscoveryPassages finds unruled explanatory paragraph windows", () => {
   const text = "她把门链挂上，隔着门问他还有什么事。她根本不想让他进来。\n\n街灯亮了。";
   assert.equal(analyzeProseStyle(text).some(issue => issue.kind === "explanation"), false);

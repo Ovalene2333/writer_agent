@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal,
+  ActiveRoleplayState, AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
   RoleplayInterlocutor, RoleplayParticipant, RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
@@ -25,6 +25,33 @@ import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
 
 type Row = Record<string, unknown>;
+type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
+
+function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[] {
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is ProposalCharacterChange => Boolean(
+      item && typeof item === "object" && !Array.isArray(item)
+      && Number.isInteger((item as { characterId?: unknown }).characterId)
+      && typeof (item as { reason?: unknown }).reason === "string"
+      && Array.isArray((item as { changes?: unknown }).changes),
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function parseProposalCharacterRevisions(value: unknown): ProposalCharacterRevision[] {
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed as ProposalCharacterRevision[] : [];
+  } catch {
+    return [];
+  }
+}
 
 export class WriterStore {
   readonly database: DatabaseSync;
@@ -63,6 +90,16 @@ export class WriterStore {
         content TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS message_variants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        group_id TEXT NOT NULL,
+        version_index INTEGER NOT NULL,
+        prompt TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(session_id, group_id, version_index)
+      );
       CREATE TABLE IF NOT EXISTS proposals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -71,6 +108,7 @@ export class WriterStore {
         before_content TEXT NOT NULL,
         after_content TEXT NOT NULL,
         base_hash TEXT NOT NULL,
+        character_changes_json TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL DEFAULT 'pending',
         created_at TEXT NOT NULL
       );
@@ -82,6 +120,7 @@ export class WriterStore {
         after_content TEXT NOT NULL,
         after_hash TEXT NOT NULL,
         created_file INTEGER NOT NULL DEFAULT 0,
+        character_revisions_json TEXT NOT NULL DEFAULT '[]',
         undone INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
@@ -180,6 +219,13 @@ export class WriterStore {
     if (!revisionColumns.some(column => column.name === "created_file")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN created_file INTEGER NOT NULL DEFAULT 0");
     }
+    if (!revisionColumns.some(column => column.name === "character_revisions_json")) {
+      this.database.exec("ALTER TABLE revisions ADD COLUMN character_revisions_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    const proposalColumns = this.database.prepare("PRAGMA table_info(proposals)").all() as Row[];
+    if (!proposalColumns.some(column => column.name === "character_changes_json")) {
+      this.database.exec("ALTER TABLE proposals ADD COLUMN character_changes_json TEXT NOT NULL DEFAULT '[]'");
+    }
     const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as Row[];
     if (!sessionColumns.some(column => column.name === "auto_title_done")) {
       this.database.exec("ALTER TABLE sessions ADD COLUMN auto_title_done INTEGER NOT NULL DEFAULT 0");
@@ -191,6 +237,13 @@ export class WriterStore {
     const messageColumns = this.database.prepare("PRAGMA table_info(messages)").all() as Row[];
     if (!messageColumns.some(column => column.name === "channel")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'agent'");
+    }
+    if (!messageColumns.some(column => column.name === "variant_group_id")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN variant_group_id TEXT");
+    }
+    const variantColumns = this.database.prepare("PRAGMA table_info(message_variants)").all() as Row[];
+    if (!variantColumns.some(column => column.name === "prompt")) {
+      this.database.exec("ALTER TABLE message_variants ADD COLUMN prompt TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -772,11 +825,11 @@ export class WriterStore {
     return { deleted: unique, remainingSessionId };
   }
 
-  addMessage(sessionId: string, role: Message["role"], content: string, channel: MessageChannel = "agent"): number {
+  addMessage(sessionId: string, role: Message["role"], content: string, channel: MessageChannel = "agent", variantGroupId?: string): number {
     const now = new Date().toISOString();
     const normalized = channel === "roleplay" ? "roleplay" : "agent";
-    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel) VALUES(?,?,?,?,?)")
-      .run(sessionId, role, content, now, normalized);
+    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id) VALUES(?,?,?,?,?,?)")
+      .run(sessionId, role, content, now, normalized, variantGroupId ?? null);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
     return Number(result.lastInsertRowid);
   }
@@ -785,11 +838,11 @@ export class WriterStore {
     const channel = options?.channel;
     const rows = channel
       ? this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
           WHERE session_id=? AND channel=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, channel, limit)
       : this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
           WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -823,10 +876,10 @@ export class WriterStore {
     const afterId = Number.isInteger(options.afterId) && (options.afterId ?? 0) > 0 ? options.afterId! : 0;
     const limit = Math.max(1, Math.min(100, Math.round(options.limit ?? 40)));
     const rows = options.channel
-      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel FROM messages
+      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
           WHERE session_id=? AND channel=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, options.channel, afterId, limit)
-      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel FROM messages
+      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, afterId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -836,10 +889,10 @@ export class WriterStore {
   conversationMessagesBefore(sessionId: string, beforeId?: number, limit = 50): Message[] {
     const normalizedLimit = Math.max(1, Math.min(100, Math.round(limit)));
     const rows = beforeId !== undefined && Number.isInteger(beforeId) && beforeId > 0
-      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id<? ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, beforeId, normalizedLimit)
-      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel FROM messages
+      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
           WHERE session_id=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, normalizedLimit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -883,18 +936,69 @@ export class WriterStore {
       content: row.content as string,
       createdAt: row.created_at as string,
       channel: row.channel === "roleplay" ? "roleplay" : "agent",
+      ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
     };
   }
 
-  createProposal(sessionId: string, path: string, content: string, summary: string): Proposal {
+  withMessageVariantInfo(messages: Message[]): Message[] {
+    const counts = new Map<string, { user: number; assistant: number }>();
+    for (const message of messages) {
+      if ((message.role !== "user" && message.role !== "assistant") || !message.variantGroupId) continue;
+      if (!counts.has(message.variantGroupId)) {
+        const archived = this.database.prepare("SELECT COUNT(*) AS total, COUNT(DISTINCT CASE WHEN prompt<>'' THEN prompt END) AS prompts FROM message_variants WHERE session_id=? AND group_id=?")
+          .get(message.sessionId, message.variantGroupId) as Row;
+        const currentUser = this.database.prepare("SELECT content FROM messages WHERE session_id=? AND variant_group_id=? AND role='user' ORDER BY id DESC LIMIT 1")
+          .get(message.sessionId, message.variantGroupId) as Row | undefined;
+        const promptAlreadyArchived = currentUser
+          ? this.database.prepare("SELECT 1 AS ok FROM message_variants WHERE session_id=? AND group_id=? AND prompt=? LIMIT 1")
+            .get(message.sessionId, message.variantGroupId, String(currentUser.content)) as Row | undefined
+          : undefined;
+        counts.set(message.variantGroupId, {
+          assistant: Number(archived.total) + 1,
+          user: Number(archived.prompts) + (currentUser && !promptAlreadyArchived ? 1 : 0),
+        });
+      }
+    }
+    return messages.map(message => message.variantGroupId && (message.role === "user" || message.role === "assistant")
+      ? { ...message, variantCount: counts.get(message.variantGroupId)?.[message.role] ?? 1 }
+      : message);
+  }
+
+  createProposal(sessionId: string, path: string, content: string, summary: string, characterChanges: ProposalCharacterChange[] = []): Proposal {
     const exists = this.project.documentExists(path);
     const before = exists ? this.project.read(path) : "";
+    this.evolveCharactersForProposal(path, summary, characterChanges);
     const now = new Date().toISOString();
     const result = this.database.prepare(`
-      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,status,created_at)
-      VALUES(?,?,?,?,?,?,'pending',?)
-    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", now);
+      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,status,created_at)
+      VALUES(?,?,?,?,?,?,?,'pending',?)
+    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), now);
     return this.proposal(Number(result.lastInsertRowid));
+  }
+
+  private evolveCharactersForProposal(
+    path: string,
+    summary: string,
+    changes: ProposalCharacterChange[],
+  ): { characters: Character[]; revisions: ProposalCharacterRevision[] } {
+    let characters = this.characters();
+    const revisions: ProposalCharacterRevision[] = [];
+    for (const change of changes) {
+      const before = characters.find(item => item.id === change.characterId);
+      if (!before) throw new Error(`延迟角色演进失败：角色 ${change.characterId} 不存在`);
+      const result = applyCharacterChangesCore(before, {
+        reason: change.reason,
+        sourceRef: { type: "document", ref: path, note: summary },
+        changes: change.changes,
+      });
+      if (result.skipped.length) {
+        throw new Error(`延迟角色演进包含无效操作：${result.skipped.map(item => `${item.op}: ${item.reason}`).join("；")}`);
+      }
+      characters = [...characters.filter(item => item.id !== before.id), result.character];
+      revisions.push({ characterId: before.id, before, after: result.character });
+    }
+    validateCharacters(characters, this.outlineNodeIds());
+    return { characters, revisions };
   }
 
   proposal(id: number): Proposal {
@@ -921,6 +1025,7 @@ export class WriterStore {
       baseHash: row.base_hash as string,
       status: row.status as Proposal["status"],
       createdAt: row.created_at as string,
+      characterChanges: parseProposalCharacterChanges(row.character_changes_json),
     };
   }
 
@@ -935,13 +1040,18 @@ export class WriterStore {
       this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
       throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
     }
+    const evolved = this.evolveCharactersForProposal(proposal.path, proposal.summary, proposal.characterChanges);
     this.project.writeRaw(proposal.path, proposal.afterContent);
     this.project.registerChapter(proposal.path);
+    if (evolved.revisions.length) this.writeCharacters(evolved.characters);
     const now = new Date().toISOString();
     this.database.prepare(`
-      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_file,created_at)
-      VALUES(?,?,?,?,?,?,?)
-    `).run(id, proposal.path, current, proposal.afterContent, this.project.hash(proposal.afterContent), createdFile ? 1 : 0, now);
+      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_file,character_revisions_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?)
+    `).run(
+      id, proposal.path, current, proposal.afterContent, this.project.hash(proposal.afterContent), createdFile ? 1 : 0,
+      JSON.stringify(evolved.revisions), now,
+    );
     this.database.prepare("UPDATE proposals SET status='accepted' WHERE id=?").run(id);
     this.reindex();
     return this.proposal(id);
@@ -960,8 +1070,21 @@ export class WriterStore {
     const path = row.path as string;
     const current = this.project.read(path);
     if (this.project.hash(current) !== row.after_hash) throw new Error("文档已在修改后发生变化，无法安全撤销");
+    const characterRevisions = parseProposalCharacterRevisions(row.character_revisions_json);
+    let restoredCharacters = this.characters();
+    for (const revision of characterRevisions) {
+      const expected = this.normalizeCharacter(revision.after);
+      const currentCharacter = restoredCharacters.find(item => item.id === revision.characterId);
+      if (!currentCharacter || JSON.stringify(currentCharacter) !== JSON.stringify(expected)) {
+        throw new Error(`角色卡 ${revision.characterId} 已在提案通过后发生变化，无法安全撤销`);
+      }
+      const before = this.normalizeCharacter(revision.before);
+      restoredCharacters = [...restoredCharacters.filter(item => item.id !== revision.characterId), before];
+    }
+    if (characterRevisions.length) validateCharacters(restoredCharacters, this.outlineNodeIds());
     if (row.created_file === 1) this.project.removeDocument(path);
     else this.project.writeRaw(path, row.before_content as string);
+    if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(row.id as number);
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已撤销文档修改：${path}`);
@@ -977,8 +1100,21 @@ export class WriterStore {
     if (createdFile ? exists : !exists || this.project.hash(this.project.read(path)) !== this.project.hash(row.before_content as string)) {
       throw new Error("文档已发生变化，无法安全重做");
     }
+    const characterRevisions = parseProposalCharacterRevisions(row.character_revisions_json);
+    let restoredCharacters = this.characters();
+    for (const revision of characterRevisions) {
+      const expected = this.normalizeCharacter(revision.before);
+      const currentCharacter = restoredCharacters.find(item => item.id === revision.characterId);
+      if (!currentCharacter || JSON.stringify(currentCharacter) !== JSON.stringify(expected)) {
+        throw new Error(`角色卡 ${revision.characterId} 已在撤销后发生变化，无法安全重做`);
+      }
+      const after = this.normalizeCharacter(revision.after);
+      restoredCharacters = [...restoredCharacters.filter(item => item.id !== revision.characterId), after];
+    }
+    if (characterRevisions.length) validateCharacters(restoredCharacters, this.outlineNodeIds());
     this.project.writeRaw(path, row.after_content as string);
     this.project.registerChapter(path);
+    if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=0 WHERE id=?").run(row.id as number);
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已重做文档修改：${path}`);
@@ -990,7 +1126,7 @@ export class WriterStore {
     const target = this.database.prepare("SELECT id FROM messages WHERE id=? AND session_id=?").get(targetId, sessionId) as Row | undefined;
     if (!target) throw new Error("消息不存在");
     const userRow = this.database.prepare(
-      "SELECT id, content, created_at FROM messages WHERE session_id=? AND role='user' AND id<=? ORDER BY id DESC LIMIT 1",
+      "SELECT id, content, created_at, channel FROM messages WHERE session_id=? AND role='user' AND id<=? ORDER BY id DESC LIMIT 1",
     ).get(sessionId, targetId) as Row | undefined;
     if (!userRow) throw new Error("该位置之前没有可重新编辑的用户指令");
     const fromId = userRow.id as number;
@@ -1036,6 +1172,7 @@ export class WriterStore {
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
     // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
+    if (userRow.channel === "roleplay") this.clearRoleplayMemory(sessionId);
     const changes = [
       undonePaths.length ? `文档：${undonePaths.join("、")}` : "",
       undoneCharacters.length ? `角色卡：${undoneCharacters.join("、")}` : "",
@@ -1046,6 +1183,68 @@ export class WriterStore {
     this.addSystemMessage(sessionId, summary);
     this.reindex();
     return { fromId, prompt: String(userRow.content) };
+  }
+
+  prepareMessageRerun(sessionId: string, targetId: number): {
+    fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string;
+  } {
+    if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
+    const target = this.database.prepare("SELECT id FROM messages WHERE id=? AND session_id=?").get(targetId, sessionId) as Row | undefined;
+    if (!target) throw new Error("消息不存在");
+    const user = this.database.prepare(`SELECT id,content,channel,variant_group_id FROM messages
+      WHERE session_id=? AND role='user' AND id<=? ORDER BY id DESC LIMIT 1`).get(sessionId, targetId) as Row | undefined;
+    if (!user) throw new Error("该位置之前没有可重新运行的用户指令");
+    const fromId = Number(user.id);
+    const groupId = typeof user.variant_group_id === "string" ? user.variant_group_id : randomUUID();
+    const assistant = this.database.prepare(`SELECT id,content FROM messages
+      WHERE session_id=? AND role='assistant' AND id>? AND id<(SELECT COALESCE(MIN(id),9223372036854775807) FROM messages WHERE session_id=? AND role='user' AND id>?)
+      ORDER BY id DESC LIMIT 1`).get(sessionId, fromId, sessionId, fromId) as Row | undefined;
+    this.database.prepare("UPDATE messages SET variant_group_id=? WHERE session_id=? AND id>=? AND id<=?")
+      .run(groupId, sessionId, fromId, assistant ? Number(assistant.id) : fromId);
+    if (assistant) {
+      const duplicate = this.database.prepare("SELECT id FROM message_variants WHERE session_id=? AND group_id=? AND prompt=? AND content=? LIMIT 1")
+        .get(sessionId, groupId, String(user.content), String(assistant.content)) as Row | undefined;
+      if (!duplicate) {
+        const max = this.database.prepare("SELECT COALESCE(MAX(version_index),0) AS value FROM message_variants WHERE session_id=? AND group_id=?")
+          .get(sessionId, groupId) as Row;
+        this.database.prepare("INSERT INTO message_variants(session_id,group_id,version_index,prompt,content,created_at) VALUES(?,?,?,?,?,?)")
+          .run(sessionId, groupId, Number(max.value) + 1, String(user.content), String(assistant.content), new Date().toISOString());
+      }
+    }
+    const channel: MessageChannel = user.channel === "roleplay" ? "roleplay" : "agent";
+    const prompt = String(user.content);
+    const rewound = this.rewindFromMessage(sessionId, fromId);
+    return { fromId: rewound.fromId, prompt, channel, variantGroupId: groupId };
+  }
+
+  messageVersions(sessionId: string, messageId: number): {
+    current: number;
+    versions: Array<{ key: string; content: string; createdAt: string }>;
+  } {
+    const message = this.database.prepare(`SELECT id,role,content,created_at,variant_group_id FROM messages
+      WHERE session_id=? AND id=? AND role IN ('user','assistant')`).get(sessionId, messageId) as Row | undefined;
+    if (!message) throw new Error("消息不存在");
+    const groupId = typeof message.variant_group_id === "string" ? message.variant_group_id : undefined;
+    if (!groupId) return { current: 0, versions: [{ key: `current:${messageId}`, content: String(message.content), createdAt: String(message.created_at) }] };
+    const archived = this.database.prepare(`SELECT id,prompt,content,created_at FROM message_variants
+      WHERE session_id=? AND group_id=? ORDER BY version_index ASC`).all(sessionId, groupId) as Row[];
+    if (message.role === "user") {
+      const seen = new Set<string>();
+      const versions = archived.flatMap(row => {
+        const content = String(row.prompt);
+        if (!content || seen.has(content)) return [];
+        seen.add(content);
+        return [{ key: `archive:${row.id}`, content, createdAt: String(row.created_at) }];
+      });
+      const live = String(message.content);
+      const current = versions.findIndex(version => version.content === live);
+      if (current >= 0) return { current, versions };
+      versions.push({ key: `current:${messageId}`, content: live, createdAt: String(message.created_at) });
+      return { current: versions.length - 1, versions };
+    }
+    const versions = archived.map(row => ({ key: `archive:${row.id}`, content: String(row.content), createdAt: String(row.created_at) }));
+    versions.push({ key: `current:${messageId}`, content: String(message.content), createdAt: String(message.created_at) });
+    return { current: versions.length - 1, versions };
   }
 
   addSystemMessage(sessionId: string, content: string): void {

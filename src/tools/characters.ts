@@ -69,8 +69,9 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
   return JSON.stringify(selected);
 }
 
-export function handleListSimpleCharacters({ store }: ToolHandlerArgs): string {
-  return JSON.stringify(store.roleplayInterlocutors().map(card => ({
+export function handleListSimpleCharacters({ store, context }: ToolHandlerArgs): string {
+  const allowed = context.simpleCharacterScope === undefined ? undefined : new Set(context.simpleCharacterScope);
+  return JSON.stringify(store.roleplayInterlocutors().filter(card => !allowed || allowed.has(card.id)).map(card => ({
     id: card.id,
     name: card.name,
     identity: card.identity,
@@ -79,9 +80,12 @@ export function handleListSimpleCharacters({ store }: ToolHandlerArgs): string {
   })));
 }
 
-export function handleGetSimpleCharacter({ input, store }: ToolHandlerArgs): string {
+export function handleGetSimpleCharacter({ input, store, context }: ToolHandlerArgs): string {
   const id = optionalPositiveInteger(input.id, "id");
   if (!id) throw new Error("Missing valid simple character id");
+  if (context.simpleCharacterScope !== undefined && !context.simpleCharacterScope.includes(id)) {
+    throw new Error("该简易角色不在本次可读范围内");
+  }
   const card = store.roleplayInterlocutors().find(item => item.id === id);
   if (!card) throw new Error("Simple character card not found");
   return JSON.stringify(card);
@@ -175,6 +179,9 @@ export function handleApplyCharacterChanges({ input, store, characterScope, cont
 export function handleSaveSimpleCharacter({ input, store, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "save_simple_character");
   const id = optionalPositiveInteger(input.id, "id");
+  if (id && context.simpleCharacterScope !== undefined && !context.simpleCharacterScope.includes(id)) {
+    throw new Error("不能修改范围外的已有简易角色卡；新建请省略 id");
+  }
   const saved = store.saveRoleplayInterlocutor({
     ...(id ? { id } : {}),
     name: typeof input.name === "string" ? input.name : "",
@@ -184,6 +191,9 @@ export function handleSaveSimpleCharacter({ input, store, context }: ToolHandler
     scene: typeof input.scene === "string" ? input.scene : "",
     goal: typeof input.goal === "string" ? input.goal : "",
   });
+  if (!id && context.simpleCharacterScope && !context.simpleCharacterScope.includes(saved.id)) {
+    context.simpleCharacterScope.push(saved.id);
+  }
   return JSON.stringify({
     id: saved.id,
     name: saved.name,

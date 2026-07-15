@@ -173,3 +173,50 @@ test("rewind clears dialogue-bound task residue", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("message rerun archives answers and exposes navigable versions", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-message-versions-"));
+  try {
+    const project = WriterProject.init(root, "测试");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("versions");
+    const userId = store.addMessage(sessionId, "user", "写一个开场");
+    const assistantId = store.addMessage(sessionId, "assistant", "版本一");
+    store.addMessage(sessionId, "user", "继续");
+    store.addMessage(sessionId, "assistant", "后续内容");
+
+    const rerun = store.prepareMessageRerun(sessionId, assistantId);
+    assert.equal(rerun.fromId, userId);
+    assert.equal(rerun.prompt, "写一个开场");
+    assert.equal(rerun.channel, "agent");
+    assert.ok(rerun.variantGroupId);
+
+    const secondUserId = store.addMessage(sessionId, "user", rerun.prompt, "agent", rerun.variantGroupId);
+    const secondId = store.addMessage(sessionId, "assistant", "版本二", "agent", rerun.variantGroupId);
+    const messagesAfterRerun = store.withMessageVariantInfo(store.messages(sessionId, 20));
+    const current = messagesAfterRerun
+      .find(message => message.id === secondId);
+    assert.equal(current?.variantCount, 2);
+    assert.equal(messagesAfterRerun.find(message => message.id === secondUserId)?.variantCount, 1);
+    const versions = store.messageVersions(sessionId, secondId);
+    assert.equal(versions.current, 1);
+    assert.deepEqual(versions.versions.map(version => version.content), ["版本一", "版本二"]);
+
+    const rerunAgain = store.prepareMessageRerun(sessionId, secondId);
+    const editedUserId = store.addMessage(sessionId, "user", "换个开场", "agent", rerunAgain.variantGroupId);
+    const thirdId = store.addMessage(sessionId, "assistant", "版本三", "agent", rerunAgain.variantGroupId);
+    assert.deepEqual(
+      store.messageVersions(sessionId, thirdId).versions.map(version => version.content),
+      ["版本一", "版本二", "版本三"],
+    );
+    const editedMessages = store.withMessageVariantInfo(store.messages(sessionId, 20));
+    assert.equal(editedMessages.find(message => message.id === editedUserId)?.variantCount, 2);
+    assert.deepEqual(
+      store.messageVersions(sessionId, editedUserId).versions.map(version => version.content),
+      ["写一个开场", "换个开场"],
+    );
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

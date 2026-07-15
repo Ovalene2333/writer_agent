@@ -22,11 +22,21 @@ import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
-import { getStyleTemplate, listStyleTemplates } from "./templates.js";
-import type { AgentEvent, PermissionMode, RoleplayInterlocutor, RoleplayParticipant } from "./types.js";
+import { getStyleTemplate } from "./templates.js";
+import type { AgentEvent, PermissionMode, RoleplayInterlocutor, RoleplayParticipant, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
+
+function styleTemplatesForClient(project: WriterProject) {
+  const customIds = new Set(project.customStyleTemplates().map(template => template.id));
+  return project.styleTemplates().map(template => ({
+    ...template,
+    builtIn: Boolean(getStyleTemplate(template.id)),
+    customized: customIds.has(template.id),
+  }));
+}
+
 type StoredAgentEvent = AgentEvent & { index: number };
 type AgentJob = {
   id: string;
@@ -166,12 +176,12 @@ export async function startWriterServer(options: {
       hiddenFolders: options.project.hiddenFolders(),
       sessions: options.store.listSessions(),
       sessionId,
-      messages: options.store.conversationMessagesBefore(sessionId, undefined, 50)
+      messages: options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, undefined, 50)
         .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
         .map(message => ({
           ...message,
           content: stripDsmlText(message.content, "[工具调用已隐藏]"),
-        })),
+        }))),
       messagesHasMore: (() => {
         const visible = options.store.conversationMessagesBefore(sessionId, undefined, 50)
           .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim());
@@ -195,7 +205,7 @@ export async function startWriterServer(options: {
       })),
       activeJobs: agentJobs.activeJobs(sessionId),
       characterDirectory: "characters/",
-      styleTemplates: listStyleTemplates(),
+      styleTemplates: styleTemplatesForClient(options.project),
     });
   });
 
@@ -346,9 +356,9 @@ export async function startWriterServer(options: {
       if (rawBefore && (!Number.isInteger(beforeId) || beforeId! < 1)) throw new Error("Invalid before cursor");
       const rawLimit = Number(context.req.query("limit") || 50);
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 50;
-      const messages = options.store.conversationMessagesBefore(sessionId, beforeId, limit)
+      const messages = options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, beforeId, limit)
         .filter(message => message.content.trim())
-        .map(message => ({ ...message, content: stripDsmlText(message.content, "[tool call hidden]") }));
+        .map(message => ({ ...message, content: stripDsmlText(message.content, "[tool call hidden]") })));
       const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
       const hasMore = Boolean(messages.length && firstArchiveId !== undefined && messages[0].id > firstArchiveId);
       return context.json({ messages, hasMore });
@@ -418,8 +428,26 @@ export async function startWriterServer(options: {
 
   app.get("/api/style", (context) => {
     const activeStyleId = options.project.config().style || "";
-    const activeTemplate = activeStyleId ? getStyleTemplate(activeStyleId) : undefined;
-    return context.json({ templates: listStyleTemplates(), active: activeTemplate ?? null });
+    const activeTemplate = activeStyleId ? options.project.styleTemplate(activeStyleId) : undefined;
+    return context.json({ templates: styleTemplatesForClient(options.project), active: activeTemplate ?? null });
+  });
+
+  app.post("/api/style/templates", async (context) => {
+    try {
+      const body = await context.req.json<Partial<StyleTemplate>>();
+      const template = options.project.saveStyleTemplate(body);
+      if (options.project.config().style === template.id) {
+        options.store.seedStyleExample(template);
+        const current = options.providers.publicConfig();
+        if (current.apiKeyConfigured) {
+          options.providers.save({
+            provider: current.provider, baseUrl: current.baseUrl, model: current.model,
+            temperature: template.suggestedTemperature, topP: template.suggestedTopP,
+          });
+        }
+      }
+      return context.json({ template, templates: styleTemplatesForClient(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
   app.put("/api/style", async (context) => {
@@ -427,17 +455,20 @@ export async function startWriterServer(options: {
       const body: { styleId?: string } = await context.req.json<{ styleId?: string }>().catch(() => ({}));
       const styleId = (body.styleId ?? "").trim();
       if (styleId) {
-        const template = getStyleTemplate(styleId);
+        const template = options.project.styleTemplate(styleId);
         if (!template) throw new Error(`未知的风格模板：${styleId}`);
         options.project.setStyle(styleId);
         options.store.seedStyleExample(template);
-        options.providers.save({
-          provider: options.providers.publicConfig().provider,
-          baseUrl: options.providers.publicConfig().baseUrl,
-          model: options.providers.publicConfig().model,
-          temperature: template.suggestedTemperature,
-          topP: template.suggestedTopP,
-        });
+        const current = options.providers.publicConfig();
+        if (current.apiKeyConfigured) {
+          options.providers.save({
+            provider: current.provider,
+            baseUrl: current.baseUrl,
+            model: current.model,
+            temperature: template.suggestedTemperature,
+            topP: template.suggestedTopP,
+          });
+        }
         return context.json({ active: template });
       } else {
         options.project.setStyle("");
@@ -600,10 +631,16 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; contextDocumentPaths?: string[]; characterScope?: number[]; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
+      : undefined;
+    const simpleCharacterScope = Array.isArray(body.simpleCharacterScope)
+      ? [...new Set(body.simpleCharacterScope.map(Number).filter(Number.isInteger))]
+      : undefined;
+    const variantGroupId = typeof body.variantGroupId === "string" && body.variantGroupId.length <= 100
+      ? body.variantGroupId
       : undefined;
     const permissionMode = body.permissionMode && isPermissionMode(body.permissionMode)
       ? body.permissionMode
@@ -651,6 +688,7 @@ export async function startWriterServer(options: {
             identity: body.identity,
             interlocutor: body.interlocutor,
             prompt: body.prompt,
+            variantGroupId,
             model: options.providers.modelConfig("roleplay"),
             summarizer: options.providers.summaryModelConfig(),
             signal,
@@ -662,8 +700,10 @@ export async function startWriterServer(options: {
             store: options.store,
             sessionId: body.sessionId,
             prompt: body.prompt,
+            variantGroupId,
             selectedDocumentBlocks: body.documentSelections,
             characterScope,
+            simpleCharacterScope,
             permissionMode,
             models: {
               agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
@@ -813,6 +853,32 @@ export async function startWriterServer(options: {
       const targetId = Number(context.req.query("target"));
       if (!sessionId || !Number.isInteger(targetId) || targetId < 0) throw new Error("参数无效");
       return context.json(options.store.rewindFromMessage(sessionId, targetId));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/messages/:id/rerun", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string }>();
+      const sessionId = body.sessionId ?? "";
+      const targetId = Number(context.req.param("id"));
+      if (!sessionId || !Number.isInteger(targetId) || targetId < 1) throw new Error("参数无效");
+      return context.json(options.store.prepareMessageRerun(sessionId, targetId));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.get("/api/messages/:id/versions", (context) => {
+    try {
+      const sessionId = context.req.query("session") ?? "";
+      const messageId = Number(context.req.param("id"));
+      if (!sessionId || !Number.isInteger(messageId) || messageId < 1) throw new Error("参数无效");
+      const bundle = options.store.messageVersions(sessionId, messageId);
+      return context.json({
+        ...bundle,
+        versions: bundle.versions.map(version => ({
+          ...version,
+          content: stripDsmlText(version.content, "[工具调用已隐藏]"),
+        })),
+      });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 

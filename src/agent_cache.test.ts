@@ -15,9 +15,10 @@ import {
   buildStableSystemPrefix,
   compactCompletedToolCalls,
   compactRuntimeMessages,
-  isSimpleCharacterCardRequest,
+  initialTodos,
   rehydrateRecentToolMessages,
   stripStaleReasoningContent,
+  taskInstructions,
 } from "./agent.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -25,13 +26,34 @@ import { WriterStore } from "./store.js";
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
-  assert.equal(agentToolSchemaHash(), "cd117b3ddccbcbca");
+  assert.equal(agentToolSchemaHash(), "2ec6561dd676e009");
 });
 
-test("simple character card requests use the dedicated route", () => {
-  assert.equal(isSimpleCharacterCardRequest("创建一个简易角色：负责检查和调节展开后武装的李技术员"), true);
-  assert.equal(isSimpleCharacterCardRequest("把简略人物卡更新一下"), true);
-  assert.equal(isSimpleCharacterCardRequest("解释什么是简易角色卡"), false);
+test("plan workflows stay read-only and use bounded creative pacing", () => {
+  const outline = taskInstructions("outline", "explore", "plan", false);
+  assert.match(outline, /200—400 字/);
+  assert.match(outline, /不强制调用 design_creative_outline/);
+  assert.doesNotMatch(outline, /提交.*提案/);
+
+  const character = taskInstructions("simple_character", "shape", "plan", false);
+  assert.match(character, /不得调用任何保存工具/);
+  assert.doesNotMatch(character, /最终必须调用 save_simple_character/);
+
+  const audit = taskInstructions("audit", "shape", "plan", false);
+  assert.match(audit, /不提交修改提案/);
+});
+
+test("audit workflow separates review-only from repair", () => {
+  assert.match(taskInstructions("audit", "shape", "ask", false), /不得创建修改提案/);
+  assert.match(taskInstructions("audit", "shape", "ask", true), /提交最小修改提案/);
+});
+
+test("prebuilt todo plans start with one active step", () => {
+  assert.deepEqual(initialTodos(["核对资料", "完成写作", "提交提案"]), [
+    { id: "t1", content: "核对资料", status: "in_progress" },
+    { id: "t2", content: "完成写作", status: "pending" },
+    { id: "t3", content: "提交提案", status: "pending" },
+  ]);
 });
 
 type Msg = {
@@ -55,10 +77,12 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     // Placeholders keep slot count when project has no instructions/skills.
     assert.match(a[2].content ?? "", /项目指令/);
     assert.match(a[3].content ?? "", /项目技能/);
-    assert.match(a[0].content ?? "", /apply_character_changes 同步能力解锁/);
+    assert.match(a[0].content ?? "", /characterChanges/);
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
     assert.equal(audit.length, 6);
     assert.notEqual(audit[5].content, a[5].content);
+    assert.match(audit[5].content ?? "", /只审阅时输出有证据的结论/);
+    assert.doesNotMatch(audit[5].content ?? "", /必须针对.*提交修改提案/);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

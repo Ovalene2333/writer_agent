@@ -195,6 +195,19 @@ export const TOOLS = deepFreeze([
           path: { type: "string", description: "已读取的 Markdown 文档路径" },
           content: { type: "string", description: "修改后的完整 Markdown 内容" },
           summary: { type: "string", description: "一句话概括修改目的" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            description: "可选：正文/大纲在获批落盘后才生效的角色演进。只记录提案内容明确造成的能力解锁、经历、心理或状态变化；拒绝提案时不应用",
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number", description: "已读取的角色 ID" },
+                reason: { type: "string", description: "提案正文中确立该变化的简短事实依据" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
         },
         required: ["path", "content", "summary"],
         additionalProperties: false,
@@ -225,6 +238,18 @@ export const TOOLS = deepFreeze([
             },
           },
           summary: { type: "string", description: "一句话概括修改目的" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            description: "可选：本次补丁获批落盘后才生效的角色演进；格式同 propose_document.characterChanges",
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
         },
         required: ["path", "edits", "summary"],
         additionalProperties: false,

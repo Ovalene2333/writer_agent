@@ -314,6 +314,7 @@ export async function runRoleplayChat(options: {
   identity?: RoleplayParticipant;
   interlocutor?: RoleplayInterlocutor;
   prompt: string;
+  variantGroupId?: string;
   model: ModelConfig;
   /** Optional cheaper model for rolling summary / working-state refresh. */
   summarizer?: ModelConfig;
@@ -335,7 +336,7 @@ export async function runRoleplayChat(options: {
   const userText = options.prompt.trim();
   if (!userText) throw new Error("扮演消息不能为空");
 
-  options.store.addMessage(options.sessionId, "user", userText, "roleplay");
+  options.store.addMessage(options.sessionId, "user", userText, "roleplay", options.variantGroupId);
   emit({ type: "step_start", step: 1 });
 
   const identitySource = options.identity?.kind === "normal" && options.identity.id
@@ -416,7 +417,7 @@ export async function runRoleplayChat(options: {
     if (!full.trim() && result.content.trim()) {
       emit({ type: "text", text: result.content, channel: "output" });
     }
-    options.store.addMessage(options.sessionId, "assistant", reply, "roleplay");
+    options.store.addMessage(options.sessionId, "assistant", reply, "roleplay", options.variantGroupId);
 
     // Lightweight post-turn bookkeeping (no extra model call).
     memory = {

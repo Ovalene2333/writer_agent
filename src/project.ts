@@ -12,8 +12,8 @@ import {
 } from "node:fs";
 import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import YAML from "yaml";
-import type { WriterConfig } from "./types.js";
-import { getStyleTemplate } from "./templates.js";
+import type { StyleTemplate, WriterConfig } from "./types.js";
+import { getStyleTemplate, listStyleTemplates, normalizeStyleTemplate } from "./templates.js";
 
 const DEFAULT_CONFIG: WriterConfig = {
   title: "未命名作品",
@@ -135,6 +135,48 @@ export class WriterProject {
       chapters: parsed.chapters.filter((item): item is string => typeof item === "string"),
       style: typeof parsed.style === "string" ? parsed.style : "",
     };
+  }
+
+  customStyleTemplates(): StyleTemplate[] {
+    const path = resolve(this.privateDir, "style-templates.json");
+    if (!existsSync(path)) return [];
+    let parsed: unknown;
+    try { parsed = JSON.parse(readFileSync(path, "utf8")); }
+    catch { throw new Error(".writer/style-templates.json 格式无效"); }
+    if (!Array.isArray(parsed)) throw new Error(".writer/style-templates.json 必须是模板数组");
+    return parsed.map((item, index) => {
+      try { return normalizeStyleTemplate(item && typeof item === "object" ? item as Partial<StyleTemplate> : {}); }
+      catch (error) { throw new Error(`自定义模板第 ${index + 1} 项无效：${error instanceof Error ? error.message : String(error)}`); }
+    });
+  }
+
+  styleTemplates(): StyleTemplate[] {
+    const merged = new Map(listStyleTemplates().map(template => [template.id, template]));
+    for (const template of this.customStyleTemplates()) merged.set(template.id, template);
+    return [...merged.values()];
+  }
+
+  styleTemplate(id: string): StyleTemplate | undefined {
+    return this.customStyleTemplates().find(template => template.id === id) ?? getStyleTemplate(id);
+  }
+
+  saveStyleTemplate(input: Partial<StyleTemplate>): StyleTemplate {
+    const template = normalizeStyleTemplate(input);
+    const custom = this.customStyleTemplates();
+    const index = custom.findIndex(item => item.id === template.id);
+    if (index >= 0) custom[index] = template;
+    else custom.push(template);
+    mkdirSync(this.privateDir, { recursive: true });
+    const target = resolve(this.privateDir, "style-templates.json");
+    const temporary = `${target}.writer-tmp-${process.pid}`;
+    writeFileSync(temporary, `${JSON.stringify(custom, null, 2)}\n`, "utf8");
+    try { renameSync(temporary, target); }
+    catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM") throw error;
+      writeFileSync(target, `${JSON.stringify(custom, null, 2)}\n`, "utf8");
+      try { unlinkSync(temporary); } catch { /* 临时文件不影响模板，下次保存时覆盖。 */ }
+    }
+    return template;
   }
 
   resolveSafe(path: string): string {
@@ -460,7 +502,7 @@ export class WriterProject {
   }
 
   setStyle(styleId: string): string {
-    if (styleId && !getStyleTemplate(styleId)) throw new Error(`未知的风格模板：${styleId}`);
+    if (styleId && !this.styleTemplate(styleId)) throw new Error(`未知的风格模板：${styleId}`);
     const config = this.config();
     config.style = styleId || "";
     this.writeRaw("writer.yaml", YAML.stringify(config));

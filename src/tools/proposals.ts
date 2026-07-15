@@ -1,9 +1,37 @@
-import type { AgentEvent, PermissionMode, Proposal } from "../types.js";
+import type { AgentEvent, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
 import type { WriterStore } from "../store.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
+
+function deferredCharacterChanges(value: unknown, characterScope?: number[]): ProposalCharacterChange[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("characterChanges 必须是数组");
+  const seen = new Set<number>();
+  return value.slice(0, 8).map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`characterChanges[${index}] 格式无效`);
+    const item = raw as Record<string, unknown>;
+    const characterId = Number(item.characterId);
+    if (!Number.isInteger(characterId) || characterId <= 0) throw new Error(`characterChanges[${index}].characterId 无效`);
+    if (seen.has(characterId)) throw new Error(`角色 ${characterId} 在 characterChanges 中重复；请合并为一项`);
+    if (characterScope !== undefined && !characterScope.includes(characterId)) throw new Error(`角色 ${characterId} 不在本次可读范围内`);
+    seen.add(characterId);
+    const reason = requireString(item.reason, `characterChanges[${index}].reason`).slice(0, 400);
+    if (!Array.isArray(item.changes) || !item.changes.length) throw new Error(`characterChanges[${index}].changes 不能为空`);
+    const changes = item.changes.slice(0, 12).map((change, changeIndex) => {
+      if (!change || typeof change !== "object" || Array.isArray(change)) {
+        throw new Error(`characterChanges[${index}].changes[${changeIndex}] 格式无效`);
+      }
+      const op = typeof (change as Record<string, unknown>).op === "string"
+        ? String((change as Record<string, unknown>).op).trim()
+        : "";
+      if (!op) throw new Error(`characterChanges[${index}].changes[${changeIndex}].op 不能为空`);
+      return { ...(change as Record<string, unknown>), op };
+    });
+    return { characterId, reason, changes };
+  });
+}
 
 export function maybeAutoAcceptProposal(
   store: WriterStore,
@@ -55,7 +83,7 @@ async function gateProseStyle(
   if (styleError) throw new Error(styleError);
 }
 
-export async function handleProposeDocument({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): Promise<string> {
+export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
@@ -69,12 +97,13 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
     path,
     proposedContent,
     requireString(input.summary, "summary"),
+    deferredCharacterChanges(input.characterChanges, characterScope),
   );
   emit({ type: "proposal", proposal });
   return JSON.stringify(maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit));
 }
 
-export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): Promise<string> {
+export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document_patch");
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
@@ -96,7 +125,10 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     content = content.replace(search, replace);
   }
   await gateProseStyle(beforeContent, content, context);
-  const proposal = store.createProposal(sessionId, path, content, requireString(input.summary, "summary"));
+  const proposal = store.createProposal(
+    sessionId, path, content, requireString(input.summary, "summary"),
+    deferredCharacterChanges(input.characterChanges, characterScope),
+  );
   emit({ type: "proposal", proposal });
   return JSON.stringify({ edits: edits.length, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });
 }

@@ -17,7 +17,6 @@ import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { runRoleplayChat, type RoleplayTarget } from "./roleplay.js";
 import { WriterStore } from "./store.js";
-import { getStyleTemplate, listStyleTemplates } from "./templates.js";
 import {
   CONNECT_PRESETS,
   filterModelChoices,
@@ -403,21 +402,23 @@ export function WriterAgentTui(props: {
         const command = parseStyleCommand(args);
         if (command.action === "list") {
           const active = props.project.config().style || "";
-          append(listStyleTemplates().map(item => `${active === item.id ? "* " : "  "}${item.id.padEnd(18)} ${item.name} · ${item.description}`).join("\n") || "没有可用风格模板");
+          append(props.project.styleTemplates().map(item => `${active === item.id ? "* " : "  "}${item.id.padEnd(18)} ${item.name} · ${item.description}`).join("\n") || "没有可用风格模板");
         } else if (command.action === "set") {
           if (!command.styleId) throw new Error("用法：/style set <模板ID>");
-          const template = getStyleTemplate(command.styleId);
+          const template = props.project.styleTemplate(command.styleId);
           if (!template) throw new Error(`未知风格模板：${command.styleId}`);
           props.project.setStyle(command.styleId);
           props.store.seedStyleExample(template);
           const current = props.providers.publicConfig();
-          props.providers.save({
-            provider: current.provider,
-            baseUrl: current.baseUrl,
-            model: current.model,
-            temperature: template.suggestedTemperature,
-            topP: template.suggestedTopP,
-          });
+          if (current.apiKeyConfigured) {
+            props.providers.save({
+              provider: current.provider,
+              baseUrl: current.baseUrl,
+              model: current.model,
+              temperature: template.suggestedTemperature,
+              topP: template.suggestedTopP,
+            });
+          }
           refreshModels();
           append(`已激活风格模板：${template.name}\n已注入写作示例：${template.exampleContent.slice(0, 80)}…\n建议 temperature=${template.suggestedTemperature} topP=${template.suggestedTopP} 已自动应用`);
         } else if (command.action === "off") {

@@ -9,6 +9,7 @@ import {
   proseMannerismPreflightLine,
   type ProseStyleIssue,
 } from "./prose_quality.js";
+import { adjudicateProseStyleForAudit } from "./prose_adjudicate.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
@@ -538,7 +539,17 @@ async function repairGeneratedProse(
   let repairedIssues = 0;
   const usages: ModelUsage[] = [];
   for (let round = 0; round < 2; round += 1) {
-    const issues = analyzeProseStyle(text).filter(issue => issue.severity === "error").slice(0, 8);
+    const scanned = analyzeProseStyle(text);
+    let issues: ProseStyleIssue[];
+    if (round === 0 && scanned.some(issue => issue.severity !== "info")) {
+      const reviewed = await adjudicateProseStyleForAudit(text, scanned, model, { signal });
+      issues = reviewed.issues.filter(issue =>
+        issue.severity === "error"
+        || (issue.severity === "warning" && issue.confidence >= 0.95),
+      ).slice(0, 8);
+    } else {
+      issues = scanned.filter(issue => issue.severity === "error").slice(0, 8);
+    }
     if (!issues.length) break;
     const result = await completeText(model, repairMessages(text, issues), signal);
     if (result.usage) usages.push(result.usage);

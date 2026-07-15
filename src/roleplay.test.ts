@@ -311,6 +311,31 @@ describe("saved roleplay interlocutors", () => {
     }
   });
 
+  test("agent tools honor the UI visibility scope for simple character cards", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-simple-character-scope-"));
+    try {
+      const project = WriterProject.init(root, "simple scope");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("scope");
+      const visible = store.saveRoleplayInterlocutor({
+        name: "Visible", identity: "visible identity", relationship: "", knowledge: "", scene: "", goal: "",
+      });
+      const hidden = store.saveRoleplayInterlocutor({
+        name: "Hidden", identity: "hidden identity", relationship: "", knowledge: "", scene: "", goal: "",
+      });
+      const args = {
+        project, store, sessionId, emit: () => undefined,
+        context: { permissionMode: "auto" as const, simpleCharacterScope: [visible.id] },
+      };
+      const listed = JSON.parse(handleListSimpleCharacters({ ...args, input: {} })) as Array<{ id: number }>;
+      assert.deepEqual(listed.map(card => card.id), [visible.id]);
+      assert.throws(() => handleGetSimpleCharacter({ ...args, input: { id: hidden.id } }), /不在本次可读范围/);
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persist separately from full character cards and support update/delete", () => {
     const root = mkdtempSync(join(tmpdir(), "writer-roleplay-card-"));
     try {

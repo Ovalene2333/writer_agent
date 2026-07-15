@@ -117,6 +117,10 @@ export interface Message {
   createdAt: string;
   /** agent=写作协作；roleplay=角色扮演试演。默认 agent。 */
   channel: MessageChannel;
+  /** Stable group shared by regenerated copies of the same turn. */
+  variantGroupId?: string;
+  /** Number of saved/live assistant answers in this regeneration group. */
+  variantCount?: number;
 }
 
 export interface CharacterSourceRef { type: "outline" | "document" | "manual"; ref: string; note?: string }
@@ -211,6 +215,14 @@ export interface Proposal {
   baseHash: string;
   status: "pending" | "accepted" | "rejected" | "stale";
   createdAt: string;
+  /** Applied only when the linked document proposal is accepted. */
+  characterChanges: ProposalCharacterChange[];
+}
+
+export interface ProposalCharacterChange {
+  characterId: number;
+  reason: string;
+  changes: Array<{ op: string; [key: string]: unknown }>;
 }
 
 /** Metadata for a document snapshot in browse-only version history. */

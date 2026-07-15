@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 import { existsSync, writeFileSync } from "node:fs";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import process from "node:process";
 import { Command } from "commander";
 import { render } from "ink";
 import React from "react";
-import QRCode from "qrcode";
 import { runAgent } from "./agent.js";
 import { isPermissionMode, loadAgentSettings, permissionModeLabel, saveAgentSettings } from "./agent_runtime.js";
 import { WriterAgentTui } from "./agent_tui.js";
@@ -14,6 +13,7 @@ import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { startWriterServer } from "./server.js";
+import { startShareTunnel } from "./share_tunnel.js";
 import { WriterStore } from "./store.js";
 import type { PermissionMode } from "./types.js";
 
@@ -137,7 +137,7 @@ program.command("web")
       announce: !options.share,
     });
     const tunnel = options.share ? startShareTunnel(port, server.token, server.origin) : undefined;
-    if (options.open) openBrowser(server.url);
+    if (options.open && !options.lan && !options.share) openBrowser(server.url);
     const stop = async () => {
       tunnel?.kill();
       await server.close();
@@ -227,63 +227,4 @@ function openBrowser(url: string): void {
   } catch {
     process.stderr.write(`无法自动打开浏览器，请手动访问：${url}\n`);
   }
-}
-
-function startShareTunnel(port: number, token: string, lanOrigin: string): ChildProcessWithoutNullStreams {
-  process.stdout.write("正在创建公网临时访问地址（cloudflared）...\n");
-  process.stdout.write(`本机/局域网源：${lanOrigin}\n`);
-  const tunnel = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
-    windowsHide: true,
-    stdio: "pipe",
-    env: {
-      ...process.env,
-      TUNNEL_TRANSPORT_PROTOCOL: process.env.WRITER_TUNNEL_PROTOCOL || "http2",
-    },
-  });
-  let printed = false;
-  let publicOrigin = "";
-  let outputBuffer = "";
-  let readinessTimer: NodeJS.Timeout | undefined;
-  const printAccess = () => {
-    if (printed || !publicOrigin) return;
-    printed = true;
-    if (readinessTimer) clearTimeout(readinessTimer);
-    // 二维码走局域网入口：页在 HTTP 上，才能在局域网/Cloudflare 间自动切 API（HTTPS 页无法探测 HTTP 局域网）。
-    const dualEntry = `${lanOrigin}/#token=${encodeURIComponent(token)}&public=${encodeURIComponent(publicOrigin)}`;
-    const publicOnly = `${publicOrigin}/#token=${encodeURIComponent(token)}&lan=${encodeURIComponent(lanOrigin)}`;
-    process.stdout.write("\n手机扫码（推荐，一次即可；在家走局域网，出门自动切 Cloudflare）：\n");
-    process.stdout.write(`${dualEntry}\n`);
-    void QRCode.toString(dualEntry, { type: "terminal", small: true })
-      .then(qr => {
-        process.stdout.write(qr);
-        process.stdout.write(`仅公网备用（不在家 Wi‑Fi 时打开）：\n${publicOnly}\n`);
-        process.stdout.write("注意：公网地址会暴露写作工作台。只给可信设备；结束进程后隧道关闭。下次启动需重新扫码。\n");
-      })
-      .catch(() => process.stdout.write("二维码生成失败，请直接复制上方地址。\n"));
-  };
-  const handleOutput = (chunk: Buffer) => {
-    const text = chunk.toString("utf8");
-    outputBuffer = `${outputBuffer}${text}`.slice(-16_000);
-    const match = outputBuffer.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-    if (match && !publicOrigin) {
-      publicOrigin = match[0];
-      process.stdout.write("公网地址已分配，正在等待隧道连接就绪...\n");
-      readinessTimer = setTimeout(() => {
-        if (!printed) process.stderr.write("公网隧道尚未连接到 Cloudflare；暂不显示二维码，以免访问时出现 Error 1033。请检查下方 cloudflared 错误或网络防火墙。\n");
-      }, 15_000);
-    }
-    if (/Registered tunnel connection/i.test(outputBuffer)) printAccess();
-    if (/\bERR\b|failed to connect|Unable to establish connection/i.test(text)) process.stderr.write(text);
-  };
-  tunnel.stdout.on("data", handleOutput);
-  tunnel.stderr.on("data", handleOutput);
-  tunnel.once("error", (error) => {
-    process.stderr.write(`无法启动 cloudflared：${error.message}\n`);
-    process.stderr.write("请先安装 Cloudflare Tunnel 客户端，或改用 `writer web --lan` 只在局域网访问。\n");
-  });
-  tunnel.once("exit", (code) => {
-    if (readinessTimer) clearTimeout(readinessTimer);
-    if (!printed) process.stderr.write(`cloudflared 隧道未成功连接或已提前退出（代码 ${code ?? "未知"}）。请确认 cloudflared 已更新、网络可访问 Cloudflare，且 ~/.cloudflared/config.yaml 未干扰 Quick Tunnel。\n`);
-  });
-  return tunnel;
 }

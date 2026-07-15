@@ -29,7 +29,18 @@ type Proposal = {
   afterContent: string;
   status: "pending" | "accepted" | "rejected" | "stale";
 };
-type Message = { id: number; role: string; content: string; channel?: "agent" | "roleplay" };
+type Message = {
+  id: number;
+  role: string;
+  content: string;
+  channel?: "agent" | "roleplay";
+  variantGroupId?: string;
+  variantCount?: number;
+};
+type MessageVersionBundle = {
+  current: number;
+  versions: Array<{ key: string; content: string; createdAt: string }>;
+};
 type RoleplayInterlocutor = {
   name: string;
   identity: string;
@@ -192,11 +203,15 @@ type StyleTemplateInfo = {
   id: string;
   name: string;
   description: string;
-  exampleContent?: string;
-  exampleNotes?: string;
-  suggestedTemperature?: number;
-  suggestedTopP?: number;
+  systemPromptAddition: string;
+  exampleContent: string;
+  exampleNotes: string;
+  suggestedTemperature: number;
+  suggestedTopP: number;
+  builtIn?: boolean;
+  customized?: boolean;
 };
+type StyleTemplateDraft = StyleTemplateInfo & { isNew: boolean };
 type State = {
   config: { title: string; style?: string };
   documents: string[];
@@ -332,6 +347,16 @@ const UI_THEMES: UiTheme[] = [
 ];
 
 const UI_THEME_IDS = new Set<string>(UI_THEMES.map((item) => item.id));
+const AGENT_HIDDEN_CHARACTER_CARDS_KEY = "writer-agent-hidden-character-cards";
+
+function loadAgentHiddenCharacterCards(): Set<string> {
+  try {
+    const stored = JSON.parse(localStorage.getItem(AGENT_HIDDEN_CHARACTER_CARDS_KEY) || "[]") as unknown;
+    return new Set(Array.isArray(stored) ? stored.filter((value): value is string => typeof value === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
 
 function loadUiTheme(): UiThemeId {
   const stored = localStorage.getItem("writer-ui-theme") || localStorage.getItem("writer-theme");
@@ -562,6 +587,21 @@ function restoreTrailSteps(trail: StoredStepTrail): StreamStep[] {
     expanded: false,
     ...(step.usage ? { usage: step.usage } : {}),
   }));
+}
+
+/** One-line plain preview for collapsed assistant bubbles. */
+function messagePreview(content: string, max = 140): string {
+  const plain = content
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`\n]+`/g, " ")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_~>#`|-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!plain) return "（空回复）";
+  return plain.length <= max ? plain : `${plain.slice(0, max)}…`;
 }
 
 function escapeHtml(text: string): string {
@@ -1045,9 +1085,17 @@ function App() {
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [showStylePicker, setShowStylePicker] = useState(false);
   const [styleBusy, setStyleBusy] = useState(false);
+  const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
   const [managementView, setManagementView] = useState<"characters" | "sessions" | null>(null);
   const [sessionBatchMode, setSessionBatchMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
+  const [messageVersionViews, setMessageVersionViews] = useState<Record<number, MessageVersionBundle>>({});
+  const [composerBranch, setComposerBranch] = useState<{
+    variantGroupId: string;
+    channel: "agent" | "roleplay";
+    fromId: number;
+  } | null>(null);
+  const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
   const [showModelConfig, setShowModelConfig] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
@@ -1084,6 +1132,8 @@ function App() {
   const [roleplaySetupPhase, setRoleplaySetupPhase] = useState<RoleplaySetupPhase | null>(null);
   const [roleplaySetupElapsed, setRoleplaySetupElapsed] = useState(0);
   const [todosCollapsed, setTodosCollapsed] = useState(false);
+  /** Collapsed final Assistant bubbles (steps already have their own expand state). */
+  const [collapsedAssistantIds, setCollapsedAssistantIds] = useState<Set<number>>(() => new Set());
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const [connection, setConnection] = useState<ConnectionInfo>(() => getConnectionInfo());
   const [showConnectionPanel, setShowConnectionPanel] = useState(false);
@@ -1194,6 +1244,50 @@ function App() {
     }
   }, [refresh, state?.sessionId]);
 
+  const editStyleTemplate = useCallback((template?: StyleTemplateInfo) => {
+    setStyleDraft(template ? { ...template, isNew: false } : {
+      id: "",
+      name: "",
+      description: "",
+      systemPromptAddition: "写作风格指令：\n- ",
+      exampleContent: "",
+      exampleNotes: "",
+      suggestedTemperature: 0.8,
+      suggestedTopP: 0.92,
+      builtIn: false,
+      customized: true,
+      isNew: true,
+    });
+    setShowStylePicker(false);
+  }, []);
+
+  const saveStyleTemplate = useCallback(async () => {
+    if (!styleDraft) return;
+    setStyleBusy(true);
+    setError("");
+    try {
+      const payload = {
+        ...styleDraft,
+        id: styleDraft.id || undefined,
+        isNew: undefined,
+        builtIn: undefined,
+        customized: undefined,
+      };
+      const result = await api<{ template: StyleTemplateInfo }>("/api/style/templates", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      await refresh(state?.sessionId);
+      setStyleDraft(null);
+      setShowStylePicker(true);
+      setNotice(`${styleDraft.isNew ? "已创建" : "已保存"}写作模板：${result.template.name}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setStyleBusy(false);
+    }
+  }, [refresh, state?.sessionId, styleDraft]);
+
   useEffect(() => {
     const stopMonitor = startConnectionMonitor();
     const unsubscribe = subscribeConnection(setConnection);
@@ -1218,6 +1312,7 @@ function App() {
       currentJobRef.current = undefined;
       setBusy(false);
       streamOutputRef.current = "";
+      setCollapsedAssistantIds(new Set());
       const trail = loadStepTrail(nextId);
       if (trail) {
         setStreamSteps(restoreTrailSteps(trail));
@@ -1228,6 +1323,8 @@ function App() {
       }
       setNotice("");
       setError("");
+      setComposerBranch(null);
+      setMessageVersionViews({});
     }
   }, [state?.sessionId]);
 
@@ -1600,11 +1697,24 @@ function App() {
     void subscribeAgentJob(job.id, job.sessionId);
   }, [state?.activeJobs?.[0]?.id]);
 
-  async function sendChat() {
-    if (!state || busy || !prompt.trim()) return;
-    const text = prompt.trim();
+  async function sendChat(options?: {
+    text?: string;
+    channel?: "agent" | "roleplay";
+    variantGroupId?: string;
+    replaceFromId?: number;
+  }) {
+    const text = (options?.text ?? prompt).trim();
+    const requestedChannel = options?.channel ?? composerBranch?.channel;
+    const activeRoleplay = requestedChannel === undefined ? roleplay : requestedChannel === "roleplay" ? roleplay : null;
+    const variantGroupId = options?.variantGroupId ?? composerBranch?.variantGroupId;
+    const replaceFromId = options?.replaceFromId ?? composerBranch?.fromId;
+    if (!state || busy || !text) return;
+    if (requestedChannel === "roleplay" && !activeRoleplay) {
+      setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
+      return;
+    }
     const tempMessageId = -Date.now();
-    setPrompt("");
+    if (options?.text === undefined) setPrompt("");
     setError("");
     setNotice("");
     // New turn replaces the previous trail for this session.
@@ -1617,38 +1727,63 @@ function App() {
         ? {
           ...value,
           messages: [
-            ...value.messages,
+            ...value.messages.filter((message) => replaceFromId === undefined || message.id < replaceFromId),
             {
               id: tempMessageId,
               role: "user",
               content: text,
-              channel: roleplay ? "roleplay" : "agent",
+              channel: activeRoleplay ? "roleplay" : "agent",
             },
           ],
         }
         : value,
     );
     try {
-      // Do not send characterScope unless the user explicitly restricts which existing
-      // cards may be read. Passing every known ID made the agent treat "IDs 1,2 only"
-      // as a ban on creating or writing new NPCs (e.g. a walk-on repairman).
+      // Keep the default unrestricted behavior byte-for-byte: only send a scope when
+      // the user has hidden at least one card of that kind.
+      const characterScope = state.characters.some((character) => agentHiddenCharacterCards.has(`normal:${character.id}`))
+        ? state.characters
+          .filter((character) => !agentHiddenCharacterCards.has(`normal:${character.id}`))
+          .map((character) => character.id)
+        : undefined;
+      const simpleCharacterScope = state.roleplayInterlocutors.some((card) => agentHiddenCharacterCards.has(`simple:${card.id}`))
+        ? state.roleplayInterlocutors
+          .filter((card) => !agentHiddenCharacterCards.has(`simple:${card.id}`))
+          .map((card) => card.id)
+        : undefined;
       const result = await api<{ jobId: string }>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           sessionId: state.sessionId,
           prompt: text,
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
-          ...(roleplay
-            ? { mode: "roleplay", performer: roleplay.performer, identity: roleplay.identity }
+          ...(variantGroupId ? { variantGroupId } : {}),
+          ...(!activeRoleplay ? {
+            ...(characterScope !== undefined ? { characterScope } : {}),
+            ...(simpleCharacterScope !== undefined ? { simpleCharacterScope } : {}),
+          } : {}),
+          ...(activeRoleplay
+            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity }
             : {}),
         }),
       });
+      setComposerBranch(null);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
       clearAgentStream();
     }
+  }
+
+  function toggleAgentCharacterVisibility(key: string) {
+    setAgentHiddenCharacterCards((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      localStorage.setItem(AGENT_HIDDEN_CHARACTER_CARDS_KEY, JSON.stringify([...next]));
+      return next;
+    });
   }
 
   function stop() {
@@ -1695,16 +1830,31 @@ function App() {
 
   async function rewindMessage(message: Message) {
     if (!state || busy || message.role !== "user") return;
-    if (!window.confirm("从这条消息重新编辑？此消息之后的对话、已接受文档修改和角色卡修改将一并回退。")) return;
+    if (message.channel === "roleplay" && !roleplay) {
+      setError("当前角色扮演身份已退出，无法编辑这条扮演消息。");
+      return;
+    }
+    if (!window.confirm("从这条消息创建编辑分支？当前回答会保存为历史版本；此消息之后的对话、已接受文档修改和角色卡修改将一并回退。")) return;
     setError("");
     setNotice("");
     // Edit/rewind: drop step trail from UI and localStorage.
     clearAgentStream({ abort: true, clearStorage: true, sessionId: state.sessionId });
     try {
-      const result = await api<{ prompt: string }>(
-        `/api/messages?session=${encodeURIComponent(state.sessionId)}&target=${message.id}`,
-        { method: "DELETE" },
-      );
+      const result = await api<{
+        fromId: number;
+        prompt: string;
+        channel: "agent" | "roleplay";
+        variantGroupId: string;
+      }>(`/api/messages/${message.id}/rerun`, {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setComposerBranch({
+        variantGroupId: result.variantGroupId,
+        channel: result.channel,
+        fromId: result.fromId,
+      });
+      setMessageVersionViews({});
       setPrompt(result.prompt);
       await refresh(state.sessionId);
       if (activePath) {
@@ -1718,6 +1868,66 @@ function App() {
         }
       }
       requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function rerunMessage(message: Message) {
+    if (!state || busy || message.id < 1) return;
+    if (message.channel === "roleplay" && !roleplay) {
+      setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
+      return;
+    }
+    if (!window.confirm("重新运行这条消息所在的对话轮次？其后的对话、已接受文档修改和角色卡修改将回退；当前回答会保留为历史版本。")) return;
+    setError("");
+    setNotice("");
+    clearAgentStream({ abort: true, clearStorage: true, sessionId: state.sessionId });
+    try {
+      const result = await api<{
+        fromId: number;
+        prompt: string;
+        channel: "agent" | "roleplay";
+        variantGroupId: string;
+      }>(`/api/messages/${message.id}/rerun`, {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setMessageVersionViews({});
+      setComposerBranch(null);
+      if (activePath) {
+        try {
+          const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
+          setDocument(next);
+          setDocumentDraft(next.content);
+        } catch {
+          setDocument({ content: "", hash: "" });
+          setDocumentDraft("");
+        }
+      }
+      await sendChat({
+        text: result.prompt,
+        channel: result.channel,
+        variantGroupId: result.variantGroupId,
+        replaceFromId: result.fromId,
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      await refresh(state.sessionId);
+    }
+  }
+
+  async function shiftMessageVersion(message: Message, delta: -1 | 1) {
+    if (!state || (message.role !== "user" && message.role !== "assistant") || message.id < 1) return;
+    try {
+      const bundle = messageVersionViews[message.id] ?? await api<MessageVersionBundle>(
+        `/api/messages/${message.id}/versions?session=${encodeURIComponent(state.sessionId)}`,
+      );
+      const nextIndex = Math.max(0, Math.min(bundle.versions.length - 1, bundle.current + delta));
+      setMessageVersionViews((current) => ({
+        ...current,
+        [message.id]: { ...bundle, current: nextIndex },
+      }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -2640,22 +2850,67 @@ function App() {
           )}
           {visibleMessages.map((msg) => (
             <React.Fragment key={msg.id}>
-            <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}`}>
-              <div className="msg-label">
-                <span>{msg.role === "assistant" ? (msg.channel === "roleplay" ? "角色" : "Assistant") : "You"}</span>
-                {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
-              </div>
+            {(() => {
+              const displayContent = messageVersionViews[msg.id]?.versions[messageVersionViews[msg.id].current]?.content ?? msg.content;
+              const assistantCollapsed = msg.role === "assistant" && collapsedAssistantIds.has(msg.id);
+              return (
+            <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}${assistantCollapsed ? " collapsed" : ""}`}>
               {msg.role === "assistant" ? (
-                <Markdown content={msg.content} />
+                <button
+                  type="button"
+                  className="msg-label msg-label-toggle"
+                  aria-expanded={!assistantCollapsed}
+                  title={assistantCollapsed ? "展开回复" : "折叠回复"}
+                  onClick={() =>
+                    setCollapsedAssistantIds((current) => {
+                      const next = new Set(current);
+                      if (next.has(msg.id)) next.delete(msg.id);
+                      else next.add(msg.id);
+                      return next;
+                    })
+                  }
+                >
+                  <span>{msg.channel === "roleplay" ? "角色" : "Assistant"}</span>
+                  {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
+                  <span className="msg-chevron" aria-hidden="true">{assistantCollapsed ? "▾" : "▴"}</span>
+                </button>
               ) : (
-                <>
-                  <div>{msg.content}</div>
-                  {msg.id > 0 && <div className="message-actions">
-                    <button disabled={busy} onClick={() => void rewindMessage(msg)} title="Edit from this message">Edit</button>
-                  </div>}
-                </>
+                <div className="msg-label">
+                  <span>You</span>
+                  {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
+                </div>
               )}
+              {msg.role === "assistant" ? (
+                assistantCollapsed
+                  ? <p className="msg-preview">{messagePreview(displayContent)}</p>
+                  : <Markdown content={displayContent} />
+              ) : (
+                <div>{displayContent}</div>
+              )}
+              {msg.id > 0 && <div className="message-actions">
+                {(msg.variantCount ?? 1) > 1 && (() => {
+                  const current = messageVersionViews[msg.id]?.current ?? (msg.variantCount ?? 1) - 1;
+                  const total = messageVersionViews[msg.id]?.versions.length ?? msg.variantCount ?? 1;
+                  return <span className="message-version-nav" title="查看此分支的不同消息版本">
+                    <button
+                      disabled={busy || current <= 0}
+                      onClick={() => void shiftMessageVersion(msg, -1)}
+                      aria-label="上一个消息版本"
+                    >‹</button>
+                    <span>{current + 1}/{total}</span>
+                    <button
+                      disabled={busy || current >= total - 1}
+                      onClick={() => void shiftMessageVersion(msg, 1)}
+                      aria-label="下一个消息版本"
+                    >›</button>
+                  </span>;
+                })()}
+                {msg.role === "user" && <button disabled={busy} onClick={() => void rewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
+                <button disabled={busy} onClick={() => void rerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
+              </div>}
             </article>
+              );
+            })()}
             {streamStepsAnchorId === msg.id && (
               <>
                 {streamSteps.map((step) => (
@@ -2944,6 +3199,14 @@ function App() {
               >×</button>
             </div>
             <div className="style-picker-actions">
+              <button type="button" className="primary" disabled={styleBusy} onClick={() => editStyleTemplate()}>
+                新建模板
+              </button>
+              {activeStyle && (
+                <button type="button" disabled={styleBusy} onClick={() => editStyleTemplate(activeStyle)}>
+                  编辑当前模板
+                </button>
+              )}
               <button
                 type="button"
                 className={`style-off${activeStyleId ? "" : " active"}`}
@@ -2958,23 +3221,27 @@ function App() {
             </div>
             <div className="theme-grid style-grid">
               {styleTemplates.length === 0 ? (
-                <div className="management-empty">暂无内置风格模板</div>
+                <div className="management-empty">暂无写作风格模板</div>
               ) : (
                 styleTemplates.map((item) => {
                   const selected = item.id === activeStyleId;
                   const preview = (item.exampleContent ?? "").replace(/\s+/g, " ").trim().slice(0, 96);
                   return (
-                    <button
+                    <div
                       key={item.id}
-                      type="button"
                       className={`theme-card style-card${selected ? " active" : ""}`}
-                      disabled={styleBusy}
-                      onClick={() => void applyWritingStyle(item.id, item.name)}
                     >
-                      <div className="theme-card-meta">
+                      <button
+                        type="button"
+                        className="style-card-select"
+                        disabled={styleBusy}
+                        onClick={() => void applyWritingStyle(item.id, item.name)}
+                      >
+                        <div className="theme-card-meta">
                         <strong>
                           {item.name}
                           {selected && <span className="theme-tag">使用中</span>}
+                          {item.customized && <span className="theme-tag">自定义</span>}
                         </strong>
                         <small>{item.description}</small>
                         {preview && (
@@ -2987,11 +3254,68 @@ function App() {
                             {item.suggestedTopP != null && `topP ${item.suggestedTopP}`}
                           </span>
                         )}
-                      </div>
-                    </button>
+                        </div>
+                      </button>
+                      <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => editStyleTemplate(item)}>
+                        编辑
+                      </button>
+                    </div>
                   );
                 })
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {styleDraft && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => !styleBusy && setStyleDraft(null)}>
+          <div className="modal style-template-editor" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+            <span className="eyebrow">Writing style template</span>
+            <h2>{styleDraft.isNew ? "新建写作模板" : `编辑模板 · ${styleDraft.name}`}</h2>
+            <p>{styleDraft.builtIn ? "保存后会在当前项目中覆盖内置模板，内置原版不会被改写。" : "模板保存在当前项目的 .writer 目录中。"}</p>
+            <div className="style-template-form">
+              <label>
+                <span>名称</span>
+                <input autoFocus value={styleDraft.name} maxLength={80} onChange={(event) => setStyleDraft({ ...styleDraft, name: event.target.value })} />
+              </label>
+              <label>
+                <span>模板 ID {styleDraft.isNew ? "（可留空自动生成）" : ""}</span>
+                <input value={styleDraft.id} disabled={!styleDraft.isNew} placeholder="modern-drama" onChange={(event) => setStyleDraft({ ...styleDraft, id: event.target.value.toLowerCase() })} />
+              </label>
+              <label className="wide">
+                <span>简介</span>
+                <textarea rows={2} value={styleDraft.description} maxLength={500} onChange={(event) => setStyleDraft({ ...styleDraft, description: event.target.value })} />
+              </label>
+              <label className="wide">
+                <span>写作指令</span>
+                <textarea rows={10} value={styleDraft.systemPromptAddition} onChange={(event) => setStyleDraft({ ...styleDraft, systemPromptAddition: event.target.value })} />
+              </label>
+              <label className="wide">
+                <span>正向范文</span>
+                <textarea rows={8} value={styleDraft.exampleContent} onChange={(event) => setStyleDraft({ ...styleDraft, exampleContent: event.target.value })} />
+              </label>
+              <label className="wide">
+                <span>范文备注</span>
+                <textarea rows={3} value={styleDraft.exampleNotes} onChange={(event) => setStyleDraft({ ...styleDraft, exampleNotes: event.target.value })} />
+              </label>
+              <label>
+                <span>Temperature（0–2）</span>
+                <input type="number" min="0" max="2" step="0.05" value={styleDraft.suggestedTemperature} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTemperature: Number(event.target.value) })} />
+              </label>
+              <label>
+                <span>Top P（0–1）</span>
+                <input type="number" min="0.05" max="1" step="0.01" value={styleDraft.suggestedTopP} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTopP: Number(event.target.value) })} />
+              </label>
+            </div>
+            <div className="modal-actions">
+              <button type="button" disabled={styleBusy} onClick={() => { setStyleDraft(null); setShowStylePicker(true); }}>取消</button>
+              <button
+                type="button"
+                className="primary"
+                disabled={styleBusy || !styleDraft.name.trim() || !styleDraft.description.trim() || !styleDraft.systemPromptAddition.trim()}
+                onClick={() => void saveStyleTemplate()}
+              >{styleBusy ? "保存中…" : "保存模板"}</button>
             </div>
           </div>
         </div>
@@ -3290,7 +3614,7 @@ function App() {
             {managementView === "characters" ? (
               <div className="character-grid">
                 {state.characters.map((character) => (
-                  <div className="character-card-wrap" key={character.id}>
+                  <div className={`character-card-wrap${agentHiddenCharacterCards.has(`normal:${character.id}`) ? " agent-hidden" : ""}`} key={character.id}>
                     <button className="character-card" onClick={() => setCharacterDraft({ ...character, experiences: character.experiences ?? [] })}>
                       <span className="character-avatar">{character.identity.name.slice(0, 1)}</span>
                       <span className="character-card-body">
@@ -3306,10 +3630,20 @@ function App() {
                         </span>
                       </span>
                     </button>
+                    <button
+                      className="character-agent-visibility"
+                      type="button"
+                      aria-pressed={!agentHiddenCharacterCards.has(`normal:${character.id}`)}
+                      title={agentHiddenCharacterCards.has(`normal:${character.id}`) ? "允许 Agent 读取这张角色卡" : "对 Agent 隐藏这张角色卡"}
+                      onClick={() => toggleAgentCharacterVisibility(`normal:${character.id}`)}
+                    >
+                      <span aria-hidden="true">{agentHiddenCharacterCards.has(`normal:${character.id}`) ? "○" : "●"}</span>
+                      {agentHiddenCharacterCards.has(`normal:${character.id}`) ? "Agent 隐藏" : "Agent 可见"}
+                    </button>
                   </div>
                 ))}
                 {state.roleplayInterlocutors.map((card) => (
-                  <div className="character-card-wrap simple" key={`simple-${card.id}`}>
+                  <div className={`character-card-wrap simple${agentHiddenCharacterCards.has(`simple:${card.id}`) ? " agent-hidden" : ""}`} key={`simple-${card.id}`}>
                     <button className="character-card" onClick={() => setSimpleCardDraft({ ...card })}>
                       <span className="character-avatar">{card.name.slice(0, 1)}</span>
                       <span className="character-card-body">
@@ -3317,6 +3651,16 @@ function App() {
                         <small>简易角色卡</small>
                         <span title={card.identity || undefined}>{card.identity || "暂无身份简介"}</span>
                       </span>
+                    </button>
+                    <button
+                      className="character-agent-visibility"
+                      type="button"
+                      aria-pressed={!agentHiddenCharacterCards.has(`simple:${card.id}`)}
+                      title={agentHiddenCharacterCards.has(`simple:${card.id}`) ? "允许 Agent 读取这张简易角色卡" : "对 Agent 隐藏这张简易角色卡"}
+                      onClick={() => toggleAgentCharacterVisibility(`simple:${card.id}`)}
+                    >
+                      <span aria-hidden="true">{agentHiddenCharacterCards.has(`simple:${card.id}`) ? "○" : "●"}</span>
+                      {agentHiddenCharacterCards.has(`simple:${card.id}`) ? "Agent 隐藏" : "Agent 可见"}
                     </button>
                   </div>
                 ))}

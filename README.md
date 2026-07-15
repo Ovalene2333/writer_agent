@@ -102,6 +102,8 @@ writer web --debug                # 打印 step 内容 + 模型请求/响应体
 writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / output（推荐排查 UI step）
 ```
 
+`--share` 会让 cloudflared 先自行切换边缘节点；若进程仍退出，Writer 会按 2 秒、5 秒退避自动重建，连续 3 次未连接后输出故障分类、恢复建议和最近日志。已经注册成功的隧道若稍后中断，会开启新一轮恢复并提示旧公网地址失效。
+
 ### `writer chat` 常用选项
 
 ```bash

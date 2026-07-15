@@ -77,6 +77,7 @@ export function selectAdjudicationCandidates(issues: ProseStyleIssue[]): ProseSt
 /** Whether proposal path should spend a Flash call (hard fail or near density limit). */
 export function shouldAdjudicateForProposal(text: string, issues: ProseStyleIssue[]): boolean {
   if (issues.some(issue => issue.severity === "error")) return true;
+  if (issues.some(issue => issue.subtype === "split_redefinition" && issue.severity === "warning")) return true;
   const limit = hardMannerismLimit(text);
   const hardWarnings = issues.filter(issue =>
     (issue.severity === "warning" || issue.severity === "error")
@@ -306,7 +307,7 @@ async function requestProseAdjudication(
   outerSignal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<{ verdicts: ProseAdjudicationVerdict[]; discoveries: ProseAdjudicationDiscovery[] }> {
-  const system = `你是中文小说解释腔二审器。既要复核规则候选，也要在高风险段落中主动发现规则漏掉的解释回声，不要改写全文。
+  const system = `你是中文小说解释腔二审器。既要复核规则候选，也要在高风险段落中主动发现规则漏掉的解释回声，不要改写全文。特别检查用句号拆开的“不是A。是B。”：若只是刻意制造顿挫或重新命名同一事实，应 block；若是人物对白纠错、必要的客观排除或确有语境作用，则 allow/warn。
 对 candidates 中每条给出 verdict：
 - allow：应放行（对白拖音/中断、停顿—揭示、短同位、列举、表格/元数据、口语纠正、客观事实排除等）
 - warn：略模板化但不必拦截
