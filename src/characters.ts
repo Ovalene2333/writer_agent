@@ -152,14 +152,54 @@ function competency(v: unknown): CharacterCompetency {
   };
 }
 
-export type CharacterCompetencyPromptView = CharacterCompetency | { name: string; summary: string; unlocked: false };
+export type CharacterCompetencyPromptView =
+  | CharacterCompetency
+  | { name: string; summary: string; unlocked: false };
 
+/**
+ * Planning/tool view: locked skills keep a public name/summary only (no mechanism dump).
+ * Still exposes unlocked=false so apply_character_changes / scene planning can see status.
+ */
 export function competencyPromptView(item: CharacterCompetency): CharacterCompetencyPromptView {
   return item.unlocked ? item : { name: item.name, summary: item.summary, unlocked: false };
 }
 
+/** One-line rule attached to any character payload that may reach a prose model. */
+export const COMPETENCY_WRITING_RULE =
+  "能力写法：仅 inPlay 可在正文用动作/后果兑现；notInPlay 本场不得使用，且禁止写成卡面/系统腔（「未解锁」「还锁着」「档案上…锁着」「不是A不是B——还锁着」点名否定列举）。角色尚不知的武装专名不要提前点名。";
+
+/**
+ * Writing-facing competency split: never feed unlocked:false flags into prose context.
+ * Locked entries are planning constraints only — not inventory HUD lines for the narrator.
+ */
+export function competenciesWritingPayload(competencies: CharacterCompetency[]) {
+  const inPlay = competencies.filter(item => item.unlocked).map(item => ({
+    id: item.id,
+    name: item.name,
+    summary: item.summary,
+    level: item.level,
+    description: item.description,
+    resources: item.resources,
+    limitations: item.limitations,
+    costs: item.costs,
+  }));
+  const notInPlay = competencies.filter(item => !item.unlocked).map(item => ({
+    name: item.name,
+    summary: item.summary,
+  }));
+  return {
+    inPlay,
+    notInPlay,
+    rule: COMPETENCY_WRITING_RULE,
+  };
+}
+
 export function characterPromptCard(character: Character) {
-  return { ...character, competencies: character.competencies.map(competencyPromptView) };
+  return {
+    ...character,
+    competencies: character.competencies.map(competencyPromptView),
+    competencyWritingRule: COMPETENCY_WRITING_RULE,
+  };
 }
 
 function relationship(v: unknown): CharacterRelationship {
@@ -875,7 +915,8 @@ export function characterPromptViews(character: Character, nodes: OutlineNode[] 
       identity: character.identity,
       profile: character.profile,
       psychology: targetNodeId ? scene.psychology : character.psychology,
-      competencies: character.competencies.map(competencyPromptView),
+      // Prose-bound: no unlocked:false flags (those become「还锁着」inventory diction).
+      competencies: competenciesWritingPayload(character.competencies),
       experiences,
       notes: character.notes,
     },

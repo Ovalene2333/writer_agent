@@ -1032,10 +1032,15 @@ export class WriterStore {
   acceptProposal(id: number): Proposal {
     const proposal = this.proposal(id);
     if (proposal.status !== "pending") throw new Error("该提案已处理");
-    const createdFile = proposal.baseHash === "__missing__";
+    const intendedCreate = proposal.baseHash === "__missing__";
     const exists = this.project.documentExists(proposal.path);
     const current = exists ? this.project.read(proposal.path) : "";
-    const unchanged = createdFile ? !exists : exists && this.project.hash(current) === proposal.baseHash;
+    // File present with content → always treat as update so history chains
+    // (e.g. keep-changes re-run rewriting 第一章.md after the first draft stayed).
+    const createdFile = intendedCreate && !exists;
+    const unchanged = intendedCreate
+      ? !exists
+      : exists && this.project.hash(current) === proposal.baseHash;
     if (!unchanged) {
       this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
       throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
@@ -1121,7 +1126,11 @@ export class WriterStore {
     return path;
   }
 
-  rewindFromMessage(sessionId: string, targetId: number): { fromId: number; prompt: string } {
+  rewindFromMessage(
+    sessionId: string,
+    targetId: number,
+    options?: { keepChanges?: boolean },
+  ): { fromId: number; prompt: string; keepChanges: boolean } {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
     const target = this.database.prepare("SELECT id FROM messages WHERE id=? AND session_id=?").get(targetId, sessionId) as Row | undefined;
     if (!target) throw new Error("消息不存在");
@@ -1131,62 +1140,74 @@ export class WriterStore {
     if (!userRow) throw new Error("该位置之前没有可重新编辑的用户指令");
     const fromId = userRow.id as number;
     const fromTime = userRow.created_at as string;
-    const proposalsToUndo = (this.database.prepare(
-      "SELECT id, status FROM proposals WHERE session_id=? AND created_at>=? AND status='accepted' ORDER BY id DESC",
-    ).all(sessionId, fromTime) as Row[]);
+    const keepChanges = Boolean(options?.keepChanges);
     const undonePaths: string[] = [];
-    for (const row of proposalsToUndo) {
-      const revRow = this.database.prepare(
-        "SELECT * FROM revisions WHERE proposal_id=? AND undone=0 ORDER BY id DESC LIMIT 1",
-      ).get(row.id as number) as Row | undefined;
-      if (!revRow) continue;
-      const path = revRow.path as string;
-      const current = this.project.documentExists(path) ? this.project.read(path) : "";
-      if (this.project.hash(current) !== revRow.after_hash) continue;
-      if (revRow.created_file === 1) this.project.removeDocument(path);
-      else this.project.writeRaw(path, revRow.before_content as string);
-      this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(revRow.id as number);
-      undonePaths.push(path);
-    }
-    const characterRows = this.database.prepare(
-      "SELECT * FROM character_revisions WHERE session_id=? AND message_id>=? AND undone=0 ORDER BY id DESC",
-    ).all(sessionId, fromId) as Row[];
     const undoneCharacters: string[] = [];
-    for (const row of characterRows) {
-      let after: Character;
-      try { after = this.normalizeCharacter(JSON.parse(row.after_content as string) as Character); }
-      catch { continue; }
-      const characters = this.characters();
-      const current = characters.find(item => item.id === after.id);
-      if (!current || JSON.stringify(current) !== JSON.stringify(after)) continue;
-      let restored = characters.filter(item => item.id !== after.id);
-      if (typeof row.before_content === "string") {
-        try { restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character)); }
-        catch { continue; }
+    if (!keepChanges) {
+      const proposalsToUndo = (this.database.prepare(
+        "SELECT id, status FROM proposals WHERE session_id=? AND created_at>=? AND status='accepted' ORDER BY id DESC",
+      ).all(sessionId, fromTime) as Row[]);
+      for (const row of proposalsToUndo) {
+        const revRow = this.database.prepare(
+          "SELECT * FROM revisions WHERE proposal_id=? AND undone=0 ORDER BY id DESC LIMIT 1",
+        ).get(row.id as number) as Row | undefined;
+        if (!revRow) continue;
+        const path = revRow.path as string;
+        const current = this.project.documentExists(path) ? this.project.read(path) : "";
+        if (this.project.hash(current) !== revRow.after_hash) continue;
+        if (revRow.created_file === 1) this.project.removeDocument(path);
+        else this.project.writeRaw(path, revRow.before_content as string);
+        this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(revRow.id as number);
+        undonePaths.push(path);
       }
-      this.writeCharacters(restored);
-      this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(row.id as number);
-      undoneCharacters.push(after.identity.name);
+      const characterRows = this.database.prepare(
+        "SELECT * FROM character_revisions WHERE session_id=? AND message_id>=? AND undone=0 ORDER BY id DESC",
+      ).all(sessionId, fromId) as Row[];
+      for (const row of characterRows) {
+        let after: Character;
+        try { after = this.normalizeCharacter(JSON.parse(row.after_content as string) as Character); }
+        catch { continue; }
+        const characters = this.characters();
+        const current = characters.find(item => item.id === after.id);
+        if (!current || JSON.stringify(current) !== JSON.stringify(after)) continue;
+        let restored = characters.filter(item => item.id !== after.id);
+        if (typeof row.before_content === "string") {
+          try { restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character)); }
+          catch { continue; }
+        }
+        this.writeCharacters(restored);
+        this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(row.id as number);
+        undoneCharacters.push(after.identity.name);
+      }
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
     // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
     if (userRow.channel === "roleplay") this.clearRoleplayMemory(sessionId);
-    const changes = [
-      undonePaths.length ? `文档：${undonePaths.join("、")}` : "",
-      undoneCharacters.length ? `角色卡：${undoneCharacters.join("、")}` : "",
-    ].filter(Boolean).join("；");
-    const summary = changes
-      ? `已撤销用户指令 #${fromId} 及其后续上下文，回退 ${changes}。`
-      : `已撤销用户指令 #${fromId} 及其后续上下文，无关联修改。`;
+    let summary: string;
+    if (keepChanges) {
+      summary = `已撤销用户指令 #${fromId} 及其后续对话；已接受的文档与角色卡修改已按选择保留。`;
+    } else {
+      const changes = [
+        undonePaths.length ? `文档：${undonePaths.join("、")}` : "",
+        undoneCharacters.length ? `角色卡：${undoneCharacters.join("、")}` : "",
+      ].filter(Boolean).join("；");
+      summary = changes
+        ? `已撤销用户指令 #${fromId} 及其后续上下文，回退 ${changes}。`
+        : `已撤销用户指令 #${fromId} 及其后续上下文，无关联修改。`;
+    }
     this.addSystemMessage(sessionId, summary);
     this.reindex();
-    return { fromId, prompt: String(userRow.content) };
+    return { fromId, prompt: String(userRow.content), keepChanges };
   }
 
-  prepareMessageRerun(sessionId: string, targetId: number): {
-    fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string;
+  prepareMessageRerun(
+    sessionId: string,
+    targetId: number,
+    options?: { keepChanges?: boolean },
+  ): {
+    fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string; keepChanges: boolean;
   } {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
     const target = this.database.prepare("SELECT id FROM messages WHERE id=? AND session_id=?").get(targetId, sessionId) as Row | undefined;
@@ -1213,8 +1234,14 @@ export class WriterStore {
     }
     const channel: MessageChannel = user.channel === "roleplay" ? "roleplay" : "agent";
     const prompt = String(user.content);
-    const rewound = this.rewindFromMessage(sessionId, fromId);
-    return { fromId: rewound.fromId, prompt, channel, variantGroupId: groupId };
+    const rewound = this.rewindFromMessage(sessionId, fromId, options);
+    return {
+      fromId: rewound.fromId,
+      prompt,
+      channel,
+      variantGroupId: groupId,
+      keepChanges: rewound.keepChanges,
+    };
   }
 
   messageVersions(sessionId: string, messageId: number): {
@@ -1266,8 +1293,9 @@ export class WriterStore {
   }
 
   /**
-   * Browse-only version list for a document. Built from accepted/manual revisions
-   * that are not undone. Agent tools never call this — they only see the live file.
+   * Browse-only version list for a document.
+   * Includes rolled-back (undone) snapshots so re-runs / keep-changes rewrites
+   * do not make earlier drafts unreadable. Agent tools never call this.
    */
   documentVersions(path: string): DocumentVersionMeta[] {
     if (!path) throw new Error("缺少文档路径");
@@ -1278,23 +1306,28 @@ export class WriterStore {
              p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
-      WHERE r.path = ? AND r.undone = 0
+      WHERE r.path = ?
       ORDER BY r.id DESC
       LIMIT 200
     `).all(path) as Row[];
-    return rows.map((row) => ({
-      id: Number(row.id),
-      path: String(row.path),
-      createdAt: String(row.created_at),
-      summary: typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+    return rows.map((row) => {
+      const undone = Number(row.undone) === 1;
+      const baseSummary = typeof row.proposal_summary === "string" && row.proposal_summary.trim()
         ? String(row.proposal_summary)
-        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑",
-      isCurrent: liveHash !== "" && String(row.after_hash) === liveHash,
-      createdFile: Number(row.created_file) === 1,
-    }));
+        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
+      return {
+        id: Number(row.id),
+        path: String(row.path),
+        createdAt: String(row.created_at),
+        summary: undone ? `已回退 · ${baseSummary}` : baseSummary,
+        isCurrent: !undone && liveHash !== "" && String(row.after_hash) === liveHash,
+        createdFile: Number(row.created_file) === 1,
+        undone,
+      };
+    });
   }
 
-  /** Full before/after snapshot for a single revision (browse-only). */
+  /** Full before/after snapshot for a single revision (browse-only; includes rolled-back). */
   documentVersion(path: string, revisionId: number): DocumentVersionDetail {
     if (!path) throw new Error("缺少文档路径");
     if (!Number.isInteger(revisionId) || revisionId <= 0) throw new Error("版本编号无效");
@@ -1306,18 +1339,20 @@ export class WriterStore {
       WHERE r.id = ? AND r.path = ?
     `).get(revisionId, path) as Row | undefined;
     if (!row) throw new Error("版本不存在");
-    if (Number(row.undone) === 1) throw new Error("该版本已撤销，仅可浏览有效历史");
     const live = this.project.documentExists(path) ? this.project.read(path) : "";
     const liveHash = live ? this.project.hash(live) : "";
+    const undone = Number(row.undone) === 1;
+    const baseSummary = typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+      ? String(row.proposal_summary)
+      : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
     return {
       id: Number(row.id),
       path: String(row.path),
       createdAt: String(row.created_at),
-      summary: typeof row.proposal_summary === "string" && row.proposal_summary.trim()
-        ? String(row.proposal_summary)
-        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑",
-      isCurrent: liveHash !== "" && String(row.after_hash) === liveHash,
+      summary: undone ? `已回退 · ${baseSummary}` : baseSummary,
+      isCurrent: !undone && liveHash !== "" && String(row.after_hash) === liveHash,
       createdFile: Number(row.created_file) === 1,
+      undone,
       beforeContent: String(row.before_content ?? ""),
       afterContent: String(row.after_content ?? ""),
     };

@@ -13,6 +13,8 @@ import { characterName, characterPromptCard, characterPromptViews } from "./char
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { calculateUsageCost } from "./pricing.js";
+import { modelSupportsToolChoice } from "./model_compat.js";
+import { modelFetch } from "./model_fetch.js";
 import { documentKind, WriterProject } from "./project.js";
 import { emptyRoleplayWorkingState, WriterStore } from "./store.js";
 
@@ -23,6 +25,7 @@ type SetupMessage = {
   content: string | null;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  reasoning_content?: string;
 };
 
 /** Recent full user/assistant messages kept in the roleplay prompt (not turns). ~8 dialogue turns. */
@@ -511,25 +514,27 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
   const endpoint = `${options.model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   for (let turn = 0; turn < 6; turn += 1) {
     const requestBody = JSON.stringify({
-      model: options.model.model, messages, tools, tool_choice: "auto", stream: false,
+      model: options.model.model, messages, tools,
+      ...(modelSupportsToolChoice(options.model) ? { tool_choice: "auto" } : {}),
+      stream: false,
       temperature: options.model.temperature ?? 0.4,
       ...(options.model.topP === undefined ? {} : { top_p: options.model.topP }),
     });
     logModelRequest(endpoint, requestBody);
-    const response = await fetch(endpoint, {
+    const response = await modelFetch(endpoint, {
       method: "POST", signal: options.signal,
       headers: { "content-type": "application/json", ...(options.model.apiKey ? { authorization: `Bearer ${options.model.apiKey}` } : {}) },
       body: requestBody,
-    });
+    }, options.model.proxyUrl);
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`对话者设定失败（${response.status}）：${responseBody.slice(0, 500)}`);
-    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }> };
+    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string; tool_calls?: ToolCall[] } }> };
     const message = payload.choices?.[0]?.message;
     if (!message) throw new Error("模型没有返回对话者设定");
     const calls = message.tool_calls ?? [];
     if (!calls.length) return parseInterlocutor(message.content ?? "");
-    messages.push({ role: "assistant", content: message.content ?? null, tool_calls: calls });
+    messages.push({ role: "assistant", content: message.content ?? "", ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}), tool_calls: calls });
     for (const call of calls) {
       let result: unknown;
       try {
@@ -644,7 +649,7 @@ async function streamRoleplayText(
     presence_penalty: 0.15,
   });
   logModelRequest(endpoint, requestBody);
-  const response = await fetch(endpoint, {
+  const response = await modelFetch(endpoint, {
     method: "POST",
     signal,
     headers: {
@@ -652,7 +657,7 @@ async function streamRoleplayText(
       ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
     },
     body: requestBody,
-  });
+  }, model.proxyUrl);
   if (!response.ok) {
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
@@ -858,7 +863,7 @@ async function completeJsonText(
     temperature: 0.2,
   });
   logModelRequest(endpoint, requestBody);
-  const response = await fetch(endpoint, {
+  const response = await modelFetch(endpoint, {
     method: "POST",
     signal,
     headers: {
@@ -866,7 +871,7 @@ async function completeJsonText(
       ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
     },
     body: requestBody,
-  });
+  }, model.proxyUrl);
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) throw new Error(`扮演记忆刷新失败（${response.status}）：${responseBody.slice(0, 300)}`);

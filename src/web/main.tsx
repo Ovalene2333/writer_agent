@@ -88,6 +88,7 @@ type DocumentVersionMeta = {
   summary: string;
   isCurrent: boolean;
   createdFile: boolean;
+  undone?: boolean;
 };
 type DocumentVersionDetail = DocumentVersionMeta & {
   beforeContent: string;
@@ -210,6 +211,8 @@ type StyleTemplateInfo = {
   suggestedTopP: number;
   builtIn?: boolean;
   customized?: boolean;
+  /** Built-in templates cannot be edited or overridden. */
+  readOnly?: boolean;
 };
 type StyleTemplateDraft = StyleTemplateInfo & { isNew: boolean };
 type State = {
@@ -1011,15 +1014,26 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
         <span className="agent-step-indicator" />
         <strong>{label}</strong>
         <StepTokenBadge usage={step.usage} pending={step.status === "running"} />
-        {step.tools.length > 0 && (
-          <span className="agent-step-tools">
-            {step.tools.map((tool) => (
-              <span className="tool-chip" key={tool} title={tool}>
-                {tool}
-              </span>
-            ))}
-          </span>
-        )}
+        {step.tools.length > 0 && (() => {
+          const maxVisible = 2;
+          const visible = step.tools.slice(0, maxVisible);
+          const hidden = step.tools.length - visible.length;
+          const allTitle = step.tools.join(" · ");
+          return (
+            <span className="agent-step-tools" title={allTitle}>
+              {visible.map((tool, index) => (
+                <span className="tool-chip" key={`${step.id}-${index}-${tool}`} title={tool}>
+                  {tool}
+                </span>
+              ))}
+              {hidden > 0 && (
+                <span className="tool-chip tool-chip-more" title={step.tools.slice(maxVisible).join(" · ")}>
+                  +{hidden}
+                </span>
+              )}
+            </span>
+          );
+        })()}
         <span className="agent-step-chevron" aria-hidden="true">
           {step.expanded ? "▴" : "▾"}
         </span>
@@ -1094,6 +1108,11 @@ function App() {
     variantGroupId: string;
     channel: "agent" | "roleplay";
     fromId: number;
+  } | null>(null);
+  /** Edit / re-run confirmation: choose whether to keep accepted document & character changes. */
+  const [branchConfirm, setBranchConfirm] = useState<{
+    mode: "edit" | "rerun";
+    message: Message;
   } | null>(null);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
@@ -1230,12 +1249,23 @@ function App() {
     setStyleBusy(true);
     setError("");
     try {
-      await api("/api/style", {
+      const result = await api<{
+        active?: StyleTemplateInfo | null;
+        sampling?: { temperature: number; topP: number; updatedModels: number } | null;
+      }>("/api/style", {
         method: "PUT",
         body: JSON.stringify({ styleId }),
       });
       await refresh(state?.sessionId);
-      setNotice(styleId ? `已激活写作风格：${label || styleId}` : "已关闭写作风格模板");
+      if (!styleId) {
+        setNotice("已关闭写作风格模板");
+      } else {
+        const sampling = result.sampling;
+        const samplingHint = sampling
+          ? ` · 已写入 sampling temp ${sampling.temperature} / topP ${sampling.topP}${sampling.updatedModels ? `（${sampling.updatedModels} 个模型）` : ""}`
+          : "";
+        setNotice(`已激活写作风格：${label || styleId}${samplingHint}`);
+      }
       setShowStylePicker(false);
     } catch (e) {
       setError(String(e));
@@ -1244,25 +1274,41 @@ function App() {
     }
   }, [refresh, state?.sessionId]);
 
-  const editStyleTemplate = useCallback((template?: StyleTemplateInfo) => {
-    setStyleDraft(template ? { ...template, isNew: false } : {
-      id: "",
-      name: "",
-      description: "",
-      systemPromptAddition: "写作风格指令：\n- ",
-      exampleContent: "",
-      exampleNotes: "",
-      suggestedTemperature: 0.8,
-      suggestedTopP: 0.92,
-      builtIn: false,
-      customized: true,
-      isNew: true,
+  /** Open editor for custom templates, or read-only viewer for built-ins. */
+  const openStyleTemplate = useCallback((template?: StyleTemplateInfo) => {
+    if (!template) {
+      setStyleDraft({
+        id: "",
+        name: "",
+        description: "",
+        systemPromptAddition: "写作风格指令：\n- ",
+        exampleContent: "",
+        exampleNotes: "",
+        suggestedTemperature: 0.8,
+        suggestedTopP: 0.92,
+        builtIn: false,
+        customized: true,
+        readOnly: false,
+        isNew: true,
+      });
+      setShowStylePicker(false);
+      return;
+    }
+    const readOnly = Boolean(template.readOnly || template.builtIn);
+    setStyleDraft({
+      ...template,
+      readOnly,
+      isNew: false,
     });
     setShowStylePicker(false);
   }, []);
 
   const saveStyleTemplate = useCallback(async () => {
     if (!styleDraft) return;
+    if (styleDraft.readOnly || styleDraft.builtIn) {
+      setError("内置模板不可编辑；请新建自定义模板。");
+      return;
+    }
     setStyleBusy(true);
     setError("");
     try {
@@ -1272,6 +1318,7 @@ function App() {
         isNew: undefined,
         builtIn: undefined,
         customized: undefined,
+        readOnly: undefined,
       };
       const result = await api<{ template: StyleTemplateInfo }>("/api/style/templates", {
         method: "POST",
@@ -1607,7 +1654,7 @@ function App() {
       const decoder = new TextDecoder();
       let buffer = "";
       let terminal = false;
-      let waitingForInput = false;
+      let terminalType: AgentStreamEvent["type"] | null = null;
       for (;;) {
         const { done, value } = await reader.read();
         buffer += decoder.decode(value, { stream: !done });
@@ -1618,8 +1665,10 @@ function App() {
           if (!line) continue;
           const event = JSON.parse(line.slice(5)) as AgentStreamEvent;
           handleAgentEvent(event);
-          if (event.type === "waiting_for_input") waitingForInput = true;
-          if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") terminal = true;
+          if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
+            terminal = true;
+            terminalType = event.type;
+          }
         }
         if (done) break;
       }
@@ -1643,7 +1692,7 @@ function App() {
             /* path may be new / deleted; tree refresh is enough */
           }
         }
-        if (clearContextOnDone && !waitingForInput) {
+        if (clearContextOnDone && terminalType === "done") {
           // Client safety net: if server still has open todos after a successful job, show them closed.
           // Persist path is server-side; this only heals stale UI if an older process missed finalize.
           const openTodos = (next.todos ?? []).filter(
@@ -1668,6 +1717,8 @@ function App() {
               ? `Agent job completed · ${pendingCount} 条提案待审批（Ask 模式不会直接改文件）`
               : "Agent job completed.",
           );
+        } else if (terminalType === "cancelled") {
+          setNotice("Agent job cancelled.");
         }
       }
     } catch (cause) {
@@ -1828,13 +1879,28 @@ function App() {
     if (orbEggTimerRef.current) clearTimeout(orbEggTimerRef.current);
   }, []);
 
-  async function rewindMessage(message: Message) {
+  function requestRewindMessage(message: Message) {
     if (!state || busy || message.role !== "user") return;
     if (message.channel === "roleplay" && !roleplay) {
       setError("当前角色扮演身份已退出，无法编辑这条扮演消息。");
       return;
     }
-    if (!window.confirm("从这条消息创建编辑分支？当前回答会保存为历史版本；此消息之后的对话、已接受文档修改和角色卡修改将一并回退。")) return;
+    setBranchConfirm({ mode: "edit", message });
+  }
+
+  function requestRerunMessage(message: Message) {
+    if (!state || busy || message.id < 1) return;
+    if (message.channel === "roleplay" && !roleplay) {
+      setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
+      return;
+    }
+    setBranchConfirm({ mode: "rerun", message });
+  }
+
+  async function confirmBranchAction(keepChanges: boolean) {
+    if (!state || !branchConfirm) return;
+    const { mode, message } = branchConfirm;
+    setBranchConfirm(null);
     setError("");
     setNotice("");
     // Edit/rewind: drop step trail from UI and localStorage.
@@ -1845,18 +1911,12 @@ function App() {
         prompt: string;
         channel: "agent" | "roleplay";
         variantGroupId: string;
+        keepChanges?: boolean;
       }>(`/api/messages/${message.id}/rerun`, {
         method: "POST",
-        body: JSON.stringify({ sessionId: state.sessionId }),
-      });
-      setComposerBranch({
-        variantGroupId: result.variantGroupId,
-        channel: result.channel,
-        fromId: result.fromId,
+        body: JSON.stringify({ sessionId: state.sessionId, keepChanges }),
       });
       setMessageVersionViews({});
-      setPrompt(result.prompt);
-      await refresh(state.sessionId);
       if (activePath) {
         try {
           const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
@@ -1867,44 +1927,18 @@ function App() {
           setDocumentDraft("");
         }
       }
-      requestAnimationFrame(() => composerRef.current?.focus());
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }
-
-  async function rerunMessage(message: Message) {
-    if (!state || busy || message.id < 1) return;
-    if (message.channel === "roleplay" && !roleplay) {
-      setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
-      return;
-    }
-    if (!window.confirm("重新运行这条消息所在的对话轮次？其后的对话、已接受文档修改和角色卡修改将回退；当前回答会保留为历史版本。")) return;
-    setError("");
-    setNotice("");
-    clearAgentStream({ abort: true, clearStorage: true, sessionId: state.sessionId });
-    try {
-      const result = await api<{
-        fromId: number;
-        prompt: string;
-        channel: "agent" | "roleplay";
-        variantGroupId: string;
-      }>(`/api/messages/${message.id}/rerun`, {
-        method: "POST",
-        body: JSON.stringify({ sessionId: state.sessionId }),
-      });
-      setMessageVersionViews({});
+      if (mode === "edit") {
+        setComposerBranch({
+          variantGroupId: result.variantGroupId,
+          channel: result.channel,
+          fromId: result.fromId,
+        });
+        setPrompt(result.prompt);
+        await refresh(state.sessionId);
+        requestAnimationFrame(() => composerRef.current?.focus());
+        return;
+      }
       setComposerBranch(null);
-      if (activePath) {
-        try {
-          const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
-          setDocument(next);
-          setDocumentDraft(next.content);
-        } catch {
-          setDocument({ content: "", hash: "" });
-          setDocumentDraft("");
-        }
-      }
       await sendChat({
         text: result.prompt,
         channel: result.channel,
@@ -2645,13 +2679,15 @@ function App() {
                       <li key={item.id}>
                         <button
                           type="button"
-                          className={`version-item${browsingVersion?.id === item.id ? " active" : ""}`}
+                          className={`version-item${browsingVersion?.id === item.id ? " active" : ""}${item.undone ? " version-undone" : ""}`}
                           disabled={versionBusy}
                           onClick={() => void openVersion(item)}
                         >
                           <span className="version-item-title">
                             #{item.id}
                             {item.isCurrent && <em className="version-tag">当前</em>}
+                            {item.undone && <em className="version-tag version-tag-undone">已回退</em>}
+                            {item.createdFile && !item.undone && <em className="version-tag">新建</em>}
                           </span>
                           <span className="version-item-meta">
                             {formatVersionTime(item.createdAt)} · {item.summary}
@@ -2905,8 +2941,8 @@ function App() {
                     >›</button>
                   </span>;
                 })()}
-                {msg.role === "user" && <button disabled={busy} onClick={() => void rewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
-                <button disabled={busy} onClick={() => void rerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
+                {msg.role === "user" && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
+                <button disabled={busy} onClick={() => requestRerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
               </div>}
             </article>
               );
@@ -3044,6 +3080,50 @@ function App() {
           ))
         )}
       </section>
+
+      {branchConfirm && (
+        <div
+          className="modal-backdrop nested"
+          role="presentation"
+          onMouseDown={() => setBranchConfirm(null)}
+        >
+          <div
+            className="modal branch-confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="branch-confirm-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <span className="eyebrow">{branchConfirm.mode === "edit" ? "Edit branch" : "Rerun turn"}</span>
+            <h2 id="branch-confirm-title">
+              {branchConfirm.mode === "edit" ? "编辑这条消息" : "重新运行这一轮"}
+            </h2>
+            <p>
+              当前回答会保存为历史版本；此消息之后的对话会撤销。
+              已接受的<strong>文档修改</strong>与<strong>角色卡修改</strong>可选择保留或回退。
+            </p>
+            <div className="modal-actions branch-confirm-actions">
+              <button type="button" onClick={() => setBranchConfirm(null)}>取消</button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => void confirmBranchAction(false)}
+                title="回退该轮之后已接受的文档与角色卡修改"
+              >
+                回退更改
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void confirmBranchAction(true)}
+                title="保留该轮之后已接受的文档与角色卡修改"
+              >
+                保留更改
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {roleplaySetup && (
         <div
@@ -3199,12 +3279,12 @@ function App() {
               >×</button>
             </div>
             <div className="style-picker-actions">
-              <button type="button" className="primary" disabled={styleBusy} onClick={() => editStyleTemplate()}>
+              <button type="button" className="primary" disabled={styleBusy} onClick={() => openStyleTemplate()}>
                 新建模板
               </button>
               {activeStyle && (
-                <button type="button" disabled={styleBusy} onClick={() => editStyleTemplate(activeStyle)}>
-                  编辑当前模板
+                <button type="button" disabled={styleBusy} onClick={() => openStyleTemplate(activeStyle)}>
+                  {(activeStyle.readOnly || activeStyle.builtIn) ? "浏览当前模板" : "编辑当前模板"}
                 </button>
               )}
               <button
@@ -3216,7 +3296,12 @@ function App() {
                 不使用模板
               </button>
               {activeStyle && (
-                <span className="style-active-hint">当前：{activeStyle.name}</span>
+                <span className="style-active-hint">
+                  当前：{activeStyle.name}
+                  {(activeStyle.readOnly || activeStyle.builtIn) ? "（内置·只读）" : ""}
+                  {activeStyle.suggestedTemperature != null && ` · temp ${activeStyle.suggestedTemperature}`}
+                  {activeStyle.suggestedTopP != null && ` · topP ${activeStyle.suggestedTopP}`}
+                </span>
               )}
             </div>
             <div className="theme-grid style-grid">
@@ -3225,6 +3310,7 @@ function App() {
               ) : (
                 styleTemplates.map((item) => {
                   const selected = item.id === activeStyleId;
+                  const readOnly = Boolean(item.readOnly || item.builtIn);
                   const preview = (item.exampleContent ?? "").replace(/\s+/g, " ").trim().slice(0, 96);
                   return (
                     <div
@@ -3241,7 +3327,8 @@ function App() {
                         <strong>
                           {item.name}
                           {selected && <span className="theme-tag">使用中</span>}
-                          {item.customized && <span className="theme-tag">自定义</span>}
+                          {readOnly && <span className="theme-tag">内置</span>}
+                          {!readOnly && item.customized && <span className="theme-tag">自定义</span>}
                         </strong>
                         <small>{item.description}</small>
                         {preview && (
@@ -3256,8 +3343,13 @@ function App() {
                         )}
                         </div>
                       </button>
-                      <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => editStyleTemplate(item)}>
-                        编辑
+                      <button
+                        type="button"
+                        className="style-card-edit"
+                        disabled={styleBusy}
+                        onClick={() => openStyleTemplate(item)}
+                      >
+                        {readOnly ? "浏览" : "编辑"}
                       </button>
                     </div>
                   );
@@ -3268,58 +3360,87 @@ function App() {
         </div>
       )}
 
-      {styleDraft && (
+      {styleDraft && (() => {
+        const viewing = Boolean(styleDraft.readOnly || styleDraft.builtIn) && !styleDraft.isNew;
+        return (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => !styleBusy && setStyleDraft(null)}>
           <div className="modal style-template-editor" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
             <span className="eyebrow">Writing style template</span>
-            <h2>{styleDraft.isNew ? "新建写作模板" : `编辑模板 · ${styleDraft.name}`}</h2>
-            <p>{styleDraft.builtIn ? "保存后会在当前项目中覆盖内置模板，内置原版不会被改写。" : "模板保存在当前项目的 .writer 目录中。"}</p>
+            <h2>
+              {styleDraft.isNew
+                ? "新建写作模板"
+                : viewing
+                  ? `浏览模板 · ${styleDraft.name}`
+                  : `编辑模板 · ${styleDraft.name}`}
+            </h2>
+            <p>
+              {viewing
+                ? "内置模板只读。可查看完整写作指令与范文；激活后会把建议 temperature / topP 写入当前各角色模型。"
+                : "自定义模板保存在当前项目的 .writer 目录中。内置模板不可编辑或覆盖，请使用新的模板 ID。"}
+            </p>
             <div className="style-template-form">
               <label>
                 <span>名称</span>
-                <input autoFocus value={styleDraft.name} maxLength={80} onChange={(event) => setStyleDraft({ ...styleDraft, name: event.target.value })} />
+                <input autoFocus={!viewing} value={styleDraft.name} maxLength={80} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, name: event.target.value })} />
               </label>
               <label>
                 <span>模板 ID {styleDraft.isNew ? "（可留空自动生成）" : ""}</span>
-                <input value={styleDraft.id} disabled={!styleDraft.isNew} placeholder="modern-drama" onChange={(event) => setStyleDraft({ ...styleDraft, id: event.target.value.toLowerCase() })} />
+                <input value={styleDraft.id} disabled={!styleDraft.isNew || viewing} placeholder="modern-drama" onChange={(event) => setStyleDraft({ ...styleDraft, id: event.target.value.toLowerCase() })} />
               </label>
               <label className="wide">
                 <span>简介</span>
-                <textarea rows={2} value={styleDraft.description} maxLength={500} onChange={(event) => setStyleDraft({ ...styleDraft, description: event.target.value })} />
+                <textarea rows={2} value={styleDraft.description} maxLength={500} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, description: event.target.value })} />
               </label>
               <label className="wide">
                 <span>写作指令</span>
-                <textarea rows={10} value={styleDraft.systemPromptAddition} onChange={(event) => setStyleDraft({ ...styleDraft, systemPromptAddition: event.target.value })} />
+                <textarea rows={12} value={styleDraft.systemPromptAddition} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, systemPromptAddition: event.target.value })} />
               </label>
               <label className="wide">
                 <span>正向范文</span>
-                <textarea rows={8} value={styleDraft.exampleContent} onChange={(event) => setStyleDraft({ ...styleDraft, exampleContent: event.target.value })} />
+                <textarea rows={8} value={styleDraft.exampleContent} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, exampleContent: event.target.value })} />
               </label>
               <label className="wide">
                 <span>范文备注</span>
-                <textarea rows={3} value={styleDraft.exampleNotes} onChange={(event) => setStyleDraft({ ...styleDraft, exampleNotes: event.target.value })} />
+                <textarea rows={3} value={styleDraft.exampleNotes} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, exampleNotes: event.target.value })} />
               </label>
               <label>
                 <span>Temperature（0–2）</span>
-                <input type="number" min="0" max="2" step="0.05" value={styleDraft.suggestedTemperature} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTemperature: Number(event.target.value) })} />
+                <input type="number" min="0" max="2" step="0.05" value={styleDraft.suggestedTemperature} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTemperature: Number(event.target.value) })} />
               </label>
               <label>
                 <span>Top P（0–1）</span>
-                <input type="number" min="0.05" max="1" step="0.01" value={styleDraft.suggestedTopP} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTopP: Number(event.target.value) })} />
+                <input type="number" min="0.05" max="1" step="0.01" value={styleDraft.suggestedTopP} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTopP: Number(event.target.value) })} />
               </label>
             </div>
             <div className="modal-actions">
-              <button type="button" disabled={styleBusy} onClick={() => { setStyleDraft(null); setShowStylePicker(true); }}>取消</button>
-              <button
-                type="button"
-                className="primary"
-                disabled={styleBusy || !styleDraft.name.trim() || !styleDraft.description.trim() || !styleDraft.systemPromptAddition.trim()}
-                onClick={() => void saveStyleTemplate()}
-              >{styleBusy ? "保存中…" : "保存模板"}</button>
+              <button type="button" disabled={styleBusy} onClick={() => { setStyleDraft(null); setShowStylePicker(true); }}>
+                {viewing ? "返回" : "取消"}
+              </button>
+              {viewing ? (
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={styleBusy}
+                  onClick={() => {
+                    setStyleDraft(null);
+                    void applyWritingStyle(styleDraft.id, styleDraft.name);
+                  }}
+                >
+                  激活此模板
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={styleBusy || !styleDraft.name.trim() || !styleDraft.description.trim() || !styleDraft.systemPromptAddition.trim()}
+                  onClick={() => void saveStyleTemplate()}
+                >{styleBusy ? "保存中…" : "保存模板"}</button>
+              )}
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {showConnectionPanel && connection.dualMode && (
         <div

@@ -7,6 +7,7 @@ export interface WriterConfig {
 
 export interface ModelConfig {
   baseUrl: string;
+  proxyUrl?: string;
   apiKey: string;
   model: string;
   provider?: ProviderId;
@@ -57,6 +58,7 @@ export interface ProviderPublicConfig {
   modelId?: string;
   provider: ProviderId;
   baseUrl: string;
+  proxyUrl?: string;
   model: string;
   apiKeyConfigured: boolean;
   apiKeyHint: string;
@@ -79,6 +81,7 @@ export interface ProviderProfilePublic {
   name: string;
   provider: ProviderId;
   baseUrl: string;
+  proxyUrl?: string;
   apiKeyConfigured: boolean;
   apiKeyHint: string;
   models: ProviderModelPublic[];
@@ -235,6 +238,8 @@ export interface DocumentVersionMeta {
   /** True when this revision's after content matches the live file. */
   isCurrent: boolean;
   createdFile: boolean;
+  /** True when this revision was rolled back (still browsable). */
+  undone?: boolean;
 }
 
 /** Full revision payload for browse-only diff (not exposed to the agent). */

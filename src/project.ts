@@ -151,18 +151,25 @@ export class WriterProject {
   }
 
   styleTemplates(): StyleTemplate[] {
-    const merged = new Map(listStyleTemplates().map(template => [template.id, template]));
-    for (const template of this.customStyleTemplates()) merged.set(template.id, template);
-    return [...merged.values()];
+    const builtIns = listStyleTemplates();
+    const builtInIds = new Set(builtIns.map(template => template.id));
+    // Built-ins are read-only: project overrides with the same id are ignored.
+    const custom = this.customStyleTemplates().filter(template => !builtInIds.has(template.id));
+    return [...builtIns, ...custom];
   }
 
   styleTemplate(id: string): StyleTemplate | undefined {
-    return this.customStyleTemplates().find(template => template.id === id) ?? getStyleTemplate(id);
+    const builtIn = getStyleTemplate(id);
+    if (builtIn) return builtIn;
+    return this.customStyleTemplates().find(template => template.id === id);
   }
 
   saveStyleTemplate(input: Partial<StyleTemplate>): StyleTemplate {
     const template = normalizeStyleTemplate(input);
-    const custom = this.customStyleTemplates();
+    if (getStyleTemplate(template.id)) {
+      throw new Error(`内置模板「${template.id}」不可编辑；请新建自定义模板（使用不同 ID）`);
+    }
+    const custom = this.customStyleTemplates().filter(item => !getStyleTemplate(item.id));
     const index = custom.findIndex(item => item.id === template.id);
     if (index >= 0) custom[index] = template;
     else custom.push(template);

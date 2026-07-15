@@ -12,8 +12,11 @@ import {
 import { adjudicateProseStyleForAudit } from "./prose_adjudicate.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
+import { modelSupportsToolChoice } from "./model_compat.js";
+import { modelFetch } from "./model_fetch.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
 import { OutlineStore } from "./outline.js";
+import { compileWritePack, formatWritePackForWriter, writePackDraftContractPrompt } from "./write_pack.js";
 
 export type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
 export type ActionMode = WritingMode | "character";
@@ -295,6 +298,7 @@ type ToolLoopMessage = {
   content: string | null;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  reasoning_content?: string;
 };
 type ChatMessage = ToolLoopMessage;
 
@@ -326,31 +330,33 @@ async function buildWritingDraft(
   });
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
-项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
+项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文（分区名仅用于你选文档，不得写入草案正文）。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
 草案语气保持直接：标出冲突、欲望、身体或暴力要点时用准确词，不要改成含蓄代称；不做道德评判。
 ${proseMannerismConstraintPrompt({ compact: true })}
-在草案的「声线约束」中写明：正文应避免说明性破折号与抽象「不是…而是」堆砌，并给出 1–2 条正向改写提醒供正文模型执行。
-最终输出一份给正文作者使用的紧凑草案，包含：本次场景目标与推进、人物当下动机和关系张力、关键事件顺序、必须保持的已知事实、需要自然带出的必要信息、叙事视角与声线约束（须引用风格锚定中的句长/对白密度要求）、明确禁止擅自补充的空白。区分“资料已确认”和“本次合理创作决定”，不要伪造资料来源。不要写成小说正文。` },
+${writePackDraftContractPrompt()}
+不要伪造资料来源。不要写成小说正文。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: revision
-      ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。声线约束写进草案供正文作者执行。`
-      : `写作动作：${options.mode}\n写作要求：${options.instruction.trim()}\n目标文档：${options.path ?? "新文档"}\n当前必要上下文：\n${existingContext || "（无）"}\n请在草案中写明须贴合的声线要点（来自风格锚定），供正文模型执行。` },
+      ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。事实与回忆须用故事内锚点，禁止「比序章里…」等文档指称。`
+      : `写作动作：${options.mode}\n写作要求：${options.instruction.trim()}\n目标文档（仅定位，勿写入草案）：${options.path ?? "新文档"}\n当前必要上下文：\n${existingContext || "（无）"}\n请按合同小标题输出草案；回忆先前情节时写故事内锚点，不要写章节名。` },
   ];
   const endpoint = `${options.draftModel.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const usage = { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 };
   let hasUsage = false;
   for (let turn = 0; turn < 7; turn += 1) {
     const requestBody = JSON.stringify({
-      model: options.draftModel.model, messages, tools, tool_choice: "auto", stream: false,
+      model: options.draftModel.model, messages, tools,
+      ...(modelSupportsToolChoice(options.draftModel) ? { tool_choice: "auto" } : {}),
+      stream: false,
       ...(options.draftModel.temperature === undefined ? {} : { temperature: options.draftModel.temperature }),
       ...(options.draftModel.topP === undefined ? {} : { top_p: options.draftModel.topP }),
     });
     logModelRequest(endpoint, requestBody);
-    const response = await fetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody });
+    const response = await modelFetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody }, options.draftModel.proxyUrl);
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`草案模型请求失败（${response.status}）：${responseBody.slice(0, 500)}`);
-    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; prompt_cache_hit_tokens?: number } };
+    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string; tool_calls?: ToolCall[] } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; prompt_cache_hit_tokens?: number } };
     if (payload.usage) {
       hasUsage = true;
       const promptTokens = Number(payload.usage.prompt_tokens ?? 0);
@@ -368,7 +374,7 @@ ${proseMannerismConstraintPrompt({ compact: true })}
       if (!draft) throw new Error("草案模型没有生成写作草案");
       return { draft, ...(hasUsage ? { usage } : {}) };
     }
-    messages.push({ role: "assistant", content: message.content ?? null, tool_calls: calls });
+    messages.push({ role: "assistant", content: message.content ?? "", ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}), tool_calls: calls });
     for (const call of calls) {
       await onTool(call.function.name);
       let result: unknown;
@@ -417,6 +423,12 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
     targetPath: options.path,
     preferredSample: options.selection?.trim() || (options.mode === "continue" ? document.slice(-2_000) : undefined),
   });
+  // Write-pre compile: author draft → diegetic write pack (never inject raw draft chrome).
+  const writePack = compileWritePack(draft, {
+    targetPath: options.path,
+    instruction: options.instruction,
+  });
+  const packText = formatWritePackForWriter(writePack);
   return [
     { role: "system", content: `你是小说写作助手。${task[options.mode]}
 创作立场：成人向虚构写作；暴力、情欲、残酷、粗口等按剧情与作者要求直写，不做道德说教，不自行含蓄化或降级冲突。不协助现实犯罪；不写真实未成年人的性内容。
@@ -429,16 +441,17 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
 - 通过具体且相关的内容差异降低机器感；不要随机换同义词、强行拆句、故意写病句、滥加口语或无关细节。
 - 保留必要的朴素过渡、留白、轻重差别和不对称。新增细节必须来自现有上下文，并服务于行动、空间、因果或伏笔。
 - 需要直写处用准确名词与动作，避免“那方面”“不可描述”等遮掩。
-${proseMannerismConstraintPrompt()}
-不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡与 lore 之外的关键设定。` },
+- 禁止在正文出现文档/流程元信息：章节名作指称（「序章里」「第一章中」）、路径、大纲/草案/分区名；回忆先前情节只用故事内时间、对白或物件。
+${proseMannerismConstraintPrompt({ compact: true })}
+不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡与已给材料之外的关键设定。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
       `作品语言：${options.project.config().language}`,
       characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(item => characterContext(item, options.project, options.path, options.selection)), null, 2)}` : "相关角色卡：无",
-      `写作前草案（用于约束情节、事实和必要信息；不要在正文中复述草案）：\n${draft}`,
-      context ? `文档上下文：\n${context}` : "",
+      packText,
+      context ? `文档上下文（纯正文，用于衔接声线与事实）：\n${context}` : "",
       `写作要求：${options.instruction.trim()}`,
-      `输出须通过风格锚定自检；声线优先贴合本项目既有正文样本。${proseMannerismPreflightLine()}`,
+      `只输出正文。声线优先贴合文档上下文与风格样本。${proseMannerismPreflightLine()}`,
     ].filter(Boolean).join("\n\n") },
   ];
 }
@@ -756,24 +769,25 @@ async function runReadOnlyToolLoop(
   } }];
   for (let turn = 0; turn < 4; turn += 1) {
     const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-    const requestBody = JSON.stringify({ model: model.model, messages, tools, tool_choice: "auto", stream: false,
+    const requestBody = JSON.stringify({ model: model.model, messages, tools,
+      ...(modelSupportsToolChoice(model) ? { tool_choice: "auto" } : {}), stream: false,
       ...(model.temperature === undefined ? {} : { temperature: model.temperature }),
       ...(model.topP === undefined ? {} : { top_p: model.topP }) });
     logModelRequest(endpoint, requestBody);
-    const response = await fetch(endpoint, {
+    const response = await modelFetch(endpoint, {
       method: "POST", signal,
       headers: { "content-type": "application/json", authorization: `Bearer ${model.apiKey}` },
       body: requestBody,
-    });
+    }, model.proxyUrl);
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`角色卡上下文读取失败（${response.status}）：${responseBody.slice(0, 500)}`);
-    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }> };
+    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string; tool_calls?: ToolCall[] } }> };
     const message = payload.choices?.[0]?.message;
     if (!message) throw new Error("角色模型没有返回有效响应");
     const calls = message.tool_calls ?? [];
     if (!calls.length) return { content: message.content ?? "" };
-    messages.push({ role: "assistant", content: message.content ?? null, tool_calls: calls });
+    messages.push({ role: "assistant", content: message.content ?? "", ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}), tool_calls: calls });
     for (const call of calls) {
       let result: Record<string, unknown>;
       try {
@@ -805,11 +819,11 @@ async function streamText(model: ModelConfig, messages: ChatMessage[], signal: A
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({ model: model.model, messages, stream: true, stream_options: { include_usage: true }, ...(model.temperature === undefined ? {} : { temperature: model.temperature }), ...(model.topP === undefined ? {} : { top_p: model.topP }) });
   logModelRequest(endpoint, requestBody);
-  const response = await fetch(endpoint, {
+  const response = await modelFetch(endpoint, {
     method: "POST", signal,
     headers: { "content-type": "application/json", authorization: `Bearer ${model.apiKey}` },
     body: requestBody,
-  });
+  }, model.proxyUrl);
   if (!response.ok) {
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   applyCharacterChanges,
   applyCharacterInput,
+  competenciesWritingPayload,
   competencyPromptView,
   emptyCharacter,
   normalizeV3Character,
@@ -40,6 +41,26 @@ test("competency unlock state is normalized and defaults to locked", () => {
   assert.equal(unlocked.competencies[0].unlocked, true);
   assert.deepEqual(competencyPromptView(locked.competencies[0]), { name: "Locked", summary: "Public hint", unlocked: false });
   assert.deepEqual(competencyPromptView(unlocked.competencies[0]), unlocked.competencies[0]);
+});
+
+test("competenciesWritingPayload splits inPlay without unlocked:false flags", () => {
+  const comps = [
+    {
+      id: "a", name: "可用", summary: "s", level: "", unlocked: true, description: "d",
+      resources: [] as string[], limitations: [] as string[], costs: [] as string[], sourceRefs: [] as [],
+    },
+    {
+      id: "b", name: "专属武装——「霜烬」", summary: "剑", level: "", unlocked: false, description: "secret",
+      resources: [] as string[], limitations: [] as string[], costs: [] as string[], sourceRefs: [] as [],
+    },
+  ];
+  const payload = competenciesWritingPayload(comps);
+  assert.equal(payload.inPlay.length, 1);
+  assert.equal(payload.inPlay[0].name, "可用");
+  assert.equal(payload.notInPlay.length, 1);
+  assert.equal(payload.notInPlay[0].name, "专属武装——「霜烬」");
+  assert.equal("unlocked" in payload.notInPlay[0], false);
+  assert.match(payload.rule, /还锁着|未解锁/);
 });
 
 test("experiences default to empty and normalize from partial cards", () => {

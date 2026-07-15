@@ -1,9 +1,39 @@
 import type { AgentEvent, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
+import { documentKind } from "../project.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
+import { findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
 import type { WriterStore } from "../store.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
+
+function assertWritePackReady(context: ToolHandlerArgs["context"], toolName: string): void {
+  if (!context.requireWritePack) return;
+  if (context.writePackCompiled) return;
+  throw new Error(
+    `${toolName} 前须先调用 compile_write_pack：把大纲/设定/衔接笔记编译为故事内「可写材料」，再据此提交正文。禁止跳过编译直接提案。`,
+  );
+}
+
+function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], path: string, toolName: string): void {
+  if (!context.requireScenePipeline || documentKind(path) !== "chapter") return;
+  throw new Error(
+    `${toolName} 不能跳过逐场景章节流水线：先 begin_chapter_draft，逐场 compile_write_pack + write_chapter_scene，` +
+    "再 inspect_chapter_draft 与 propose_chapter_draft。",
+  );
+}
+
+/** Auto-fix referential meta leaks; block if residual high-confidence leaks remain. */
+function gateProseMetaLeaks(content: string, path: string): { content: string; stripped: string[] } {
+  const cleaned = sanitizeProseMetaLeaks(content, { targetPath: path });
+  const residual = findProseMetaLeaks(cleaned.text);
+  if (residual.length) {
+    throw new Error(
+      `正文含非叙事元信息污染（${residual.join("、")}）。请改写后重提：勿用章节/路径/大纲指称；勿把角色卡写成「未解锁/还锁着/档案锁定」或「不是A不是B——还锁着」点名列举；本场不能用的能力直接不写，或只写可感限制。`,
+    );
+  }
+  return { content: cleaned.text, stripped: cleaned.stripped };
+}
 
 function deferredCharacterChanges(value: unknown, characterScope?: number[]): ProposalCharacterChange[] {
   if (value === undefined) return [];
@@ -86,40 +116,69 @@ async function gateProseStyle(
 export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
+  assertDirectChapterWriteAllowed(context, path, "propose_document");
+  return submitFullDocumentProposal(
+    { input, project, store, sessionId, emit, context, characterScope },
+    path,
+    requireString(input.content, "content"),
+    requireString(input.summary, "summary"),
+    input.characterChanges,
+  );
+}
+
+export async function submitFullDocumentProposal(
+  { project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs,
+  path: string,
+  proposedContent: string,
+  summary: string,
+  characterChanges: unknown,
+  scenePipelineAssembled = false,
+): Promise<string> {
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document");
-  const proposedContent = requireString(input.content, "content");
+  if (!scenePipelineAssembled) assertWritePackReady(context, "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
   const beforeContent = project.documentExists(path) ? project.read(path) : "";
-  await gateProseStyle(beforeContent, proposedContent, context);
+  const meta = gateProseMetaLeaks(proposedContent, path);
+  await gateProseStyle(beforeContent, meta.content, context);
   const proposal = store.createProposal(
     sessionId,
     path,
-    proposedContent,
-    requireString(input.summary, "summary"),
-    deferredCharacterChanges(input.characterChanges, characterScope),
+    meta.content,
+    summary,
+    deferredCharacterChanges(characterChanges, characterScope),
   );
   emit({ type: "proposal", proposal });
-  return JSON.stringify(maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit));
+  return JSON.stringify({
+    ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
+  });
 }
 
 export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document_patch");
   const path = requireString(input.path, "path");
+  assertDirectChapterWriteAllowed(context, path, "propose_document_patch");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document_patch");
+  assertWritePackReady(context, "propose_document_patch");
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
   const beforeContent = project.read(path);
   let content = beforeContent;
+  const strippedMeta: string[] = [];
   for (const [index, rawEdit] of edits.entries()) {
     if (!rawEdit || typeof rawEdit !== "object") throw new Error(`第 ${index + 1} 条 edit 格式无效`);
     const edit = rawEdit as Record<string, unknown>;
     const search = requireString(edit.search, `edits[${index}].search`);
-    const replace = typeof edit.replace === "string" ? edit.replace : undefined;
+    let replace = typeof edit.replace === "string" ? edit.replace : undefined;
     if (replace === undefined) throw new Error(`缺少有效参数：edits[${index}].replace`);
     rejectCompressedPlaceholder(search, `edits[${index}].search`);
     rejectCompressedPlaceholder(replace, `edits[${index}].replace`);
+    // Only gate newly written text — do not re-scan pre-existing body for legacy leaks.
+    const cleaned = gateProseMetaLeaks(replace, path);
+    replace = cleaned.content;
+    strippedMeta.push(...cleaned.stripped);
     const occurrences = countOccurrences(content, search);
     if (occurrences !== 1) throw new Error(`第 ${index + 1} 条 search 在原文中出现 ${occurrences} 次，必须唯一`);
     content = content.replace(search, replace);
@@ -130,7 +189,12 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     deferredCharacterChanges(input.characterChanges, characterScope),
   );
   emit({ type: "proposal", proposal });
-  return JSON.stringify({ edits: edits.length, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });
+  const uniqueStripped = [...new Set(strippedMeta)];
+  return JSON.stringify({
+    edits: edits.length,
+    ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...(uniqueStripped.length ? { metaSanitized: uniqueStripped } : {}),
+  });
 }
 
 export type { Proposal };

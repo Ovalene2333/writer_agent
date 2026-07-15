@@ -31,6 +31,13 @@ import {
   handleProposeDocument,
   handleProposeDocumentPatch,
 } from "./proposals.js";
+import { handleCompileWritePack } from "./write_pack.js";
+import {
+  handleBeginChapterDraft,
+  handleInspectChapterDraft,
+  handleProposeChapterDraft,
+  handleWriteChapterScene,
+} from "./scene_pipeline.js";
 import {
   handleAskUser,
   handleLoadSkill,
@@ -51,6 +58,11 @@ const HANDLERS: Record<string, Handler> = {
   validate_outline: handleValidateOutline,
   compare_outline_with_draft: handleCompareOutlineWithDraft,
   propose_outline_patch: handleProposeOutlinePatch,
+  compile_write_pack: handleCompileWritePack,
+  begin_chapter_draft: handleBeginChapterDraft,
+  write_chapter_scene: handleWriteChapterScene,
+  inspect_chapter_draft: handleInspectChapterDraft,
+  propose_chapter_draft: handleProposeChapterDraft,
   propose_document: handleProposeDocument,
   propose_document_patch: handleProposeDocumentPatch,
   list_characters: handleListCharacters,

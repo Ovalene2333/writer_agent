@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  advanceTodosAfterProposal,
+  finalizeDanglingInProgressTodos,
   finalizeOpenTodos,
   formatTodosForPrompt,
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
   normalizeTodos,
+  persistAdvancedTodosAfterProposal,
   persistFinalizedSessionTodos,
   saveAgentSettings,
 } from "./agent_runtime.js";
@@ -44,6 +47,41 @@ test("finalizeOpenTodos completes pending and in_progress, keeps cancelled", () 
   assert.equal(finalizeOpenTodos(todos).changed, false);
 });
 
+test("advanceTodosAfterProposal keeps multi-chapter pending open and continues", () => {
+  const { todos, shouldContinue, changed } = advanceTodosAfterProposal([
+    { id: "t1", content: "阅读大纲和世界观设定", status: "completed" },
+    { id: "t2", content: "撰写第1章初稿", status: "in_progress" },
+    { id: "t3", content: "撰写第2章初稿", status: "pending" },
+    { id: "t4", content: "撰写第3章初稿", status: "pending" },
+  ]);
+  assert.equal(changed, true);
+  assert.equal(shouldContinue, true);
+  assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
+  assert.equal(todos.find(item => item.id === "t3")?.status, "in_progress");
+  assert.equal(todos.find(item => item.id === "t4")?.status, "pending");
+});
+
+test("advanceTodosAfterProposal closes single-scene soft checklist and stops", () => {
+  const { todos, shouldContinue } = advanceTodosAfterProposal([
+    { id: "t1", content: "核对大纲、人设与衔接", status: "completed" },
+    { id: "t2", content: "完成正文并自检", status: "in_progress" },
+    { id: "t3", content: "提交文档提案", status: "pending" },
+  ]);
+  assert.equal(shouldContinue, false);
+  assert.equal(todos.every(item => item.status === "completed"), true);
+});
+
+test("finalizeDanglingInProgressTodos does not close pending chapters", () => {
+  const { todos, changed } = finalizeDanglingInProgressTodos([
+    { id: "t1", content: "撰写第1章初稿", status: "completed" },
+    { id: "t2", content: "撰写第2章初稿", status: "in_progress" },
+    { id: "t3", content: "撰写第3章初稿", status: "pending" },
+  ]);
+  assert.equal(changed, true);
+  assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
+  assert.equal(todos.find(item => item.id === "t3")?.status, "pending");
+});
+
 test("persistFinalizedSessionTodos closes last open item after proposal-like turn", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
@@ -62,6 +100,29 @@ test("persistFinalizedSessionTodos closes last open item after proposal-like tur
     assert.equal(todos.every(item => item.status === "completed"), true);
     assert.equal(store.sessionTodos(sessionId).at(-1)?.status, "completed");
     assert.equal(emitted.at(-1)?.at(-1)?.status, "completed");
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persistAdvancedTodosAfterProposal leaves later chapters open", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-multi-"));
+  try {
+    const project = WriterProject.init(root, "多章");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("todos-multi");
+    store.saveSessionTodos(sessionId, [
+      { id: "t1", content: "阅读大纲和世界观设定", status: "completed" },
+      { id: "t2", content: "撰写第1章初稿", status: "in_progress" },
+      { id: "t3", content: "撰写第2章初稿", status: "pending" },
+      { id: "t4", content: "撰写第3章初稿", status: "pending" },
+    ]);
+    const { todos, shouldContinue } = persistAdvancedTodosAfterProposal(store, sessionId);
+    assert.equal(shouldContinue, true);
+    assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
+    assert.equal(todos.find(item => item.id === "t3")?.status, "in_progress");
+    assert.equal(store.sessionTodos(sessionId).find(item => item.id === "t4")?.status, "pending");
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -189,6 +250,7 @@ test("message rerun archives answers and exposes navigable versions", () => {
     assert.equal(rerun.fromId, userId);
     assert.equal(rerun.prompt, "写一个开场");
     assert.equal(rerun.channel, "agent");
+    assert.equal(rerun.keepChanges, false);
     assert.ok(rerun.variantGroupId);
 
     const secondUserId = store.addMessage(sessionId, "user", rerun.prompt, "agent", rerun.variantGroupId);
@@ -215,6 +277,111 @@ test("message rerun archives answers and exposes navigable versions", () => {
       store.messageVersions(sessionId, editedUserId).versions.map(version => version.content),
       ["写一个开场", "换个开场"],
     );
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("message rerun can keep accepted document changes", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-message-keep-changes-"));
+  try {
+    const project = WriterProject.init(root, "保留更改");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("keep-changes");
+    const userId = store.addMessage(sessionId, "user", "写第一章");
+    store.addMessage(sessionId, "assistant", "已提交提案");
+    const proposal = store.createProposal(sessionId, "chapters/第1章.md", "# 第一章\n\n正文内容。", "写第一章");
+    store.acceptProposal(proposal.id);
+    assert.equal(project.documentExists("chapters/第1章.md"), true);
+    assert.match(project.read("chapters/第1章.md"), /正文内容/);
+
+    const keep = store.prepareMessageRerun(sessionId, userId, { keepChanges: true });
+    assert.equal(keep.keepChanges, true);
+    assert.equal(project.documentExists("chapters/第1章.md"), true);
+    assert.match(project.read("chapters/第1章.md"), /正文内容/);
+    assert.equal(store.messages(sessionId, 50).some(item => item.role === "user" && item.content === "写第一章"), false);
+
+    // A fresh run that rolls back should still undo accepted files.
+    const userAgain = store.addMessage(sessionId, "user", "写第一章");
+    store.addMessage(sessionId, "assistant", "再跑一次");
+    const proposal2 = store.createProposal(sessionId, "chapters/第2章.md", "# 第二章\n\n另一章。", "写第二章");
+    store.acceptProposal(proposal2.id);
+    store.prepareMessageRerun(sessionId, userAgain, { keepChanges: false });
+    assert.equal(project.documentExists("chapters/第2章.md"), false);
+    // Chapter 1 was kept earlier and not part of this second rewind scope after new messages only undid ch2.
+    assert.equal(project.documentExists("chapters/第1章.md"), true);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("keep-changes re-run that rewrites a chapter chains document history", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-keep-history-"));
+  try {
+    const project = WriterProject.init(root, "版本链");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("history-chain");
+    const userId = store.addMessage(sessionId, "user", "写第一章");
+    store.addMessage(sessionId, "assistant", "第一稿");
+    const first = store.createProposal(sessionId, "chapters/第一章.md", "# 第一章\n\n旧稿内容。", "第一稿");
+    store.acceptProposal(first.id);
+    assert.match(project.read("chapters/第一章.md"), /旧稿内容/);
+
+    store.prepareMessageRerun(sessionId, userId, { keepChanges: true });
+    assert.equal(project.documentExists("chapters/第一章.md"), true);
+
+    const user2 = store.addMessage(sessionId, "user", "写第一章");
+    store.addMessage(sessionId, "assistant", "第二稿");
+    const second = store.createProposal(sessionId, "chapters/第一章.md", "# 第一章\n\n新稿内容。", "第二稿");
+    // Existing file → proposal must not look like a brand-new create for history.
+    assert.notEqual(second.baseHash, "__missing__");
+    store.acceptProposal(second.id);
+    assert.match(project.read("chapters/第一章.md"), /新稿内容/);
+
+    const versions = store.documentVersions("chapters/第一章.md");
+    assert.ok(versions.length >= 2, "keep-changes rewrite must keep both revisions");
+    assert.equal(versions.filter(item => !item.undone).length, 2);
+    assert.ok(versions.some(item => item.isCurrent));
+    const detailNew = store.documentVersion("chapters/第一章.md", versions.find(item => item.isCurrent)!.id);
+    assert.match(detailNew.afterContent, /新稿内容/);
+    assert.match(detailNew.beforeContent, /旧稿内容/);
+    const older = versions.find(item => !item.isCurrent && !item.undone)!;
+    const detailOld = store.documentVersion("chapters/第一章.md", older.id);
+    assert.match(detailOld.afterContent, /旧稿内容/);
+    void user2;
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rolled-back chapter versions remain browsable in document history", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-undone-history-"));
+  try {
+    const project = WriterProject.init(root, "回退可浏览");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("undone-browse");
+    const userId = store.addMessage(sessionId, "user", "写第一章");
+    store.addMessage(sessionId, "assistant", "稿");
+    const first = store.createProposal(sessionId, "chapters/第一章.md", "# 第一章\n\n会被回退的稿。", "初稿");
+    store.acceptProposal(first.id);
+
+    store.prepareMessageRerun(sessionId, userId, { keepChanges: false });
+    assert.equal(project.documentExists("chapters/第一章.md"), false);
+
+    store.addMessage(sessionId, "user", "写第一章");
+    store.addMessage(sessionId, "assistant", "新稿");
+    const second = store.createProposal(sessionId, "chapters/第一章.md", "# 第一章\n\n重写稿。", "重写");
+    store.acceptProposal(second.id);
+
+    const versions = store.documentVersions("chapters/第一章.md");
+    assert.ok(versions.some(item => item.undone && /会被回退的稿|已回退/.test(item.summary) || item.undone));
+    const undone = versions.find(item => item.undone)!;
+    const detail = store.documentVersion("chapters/第一章.md", undone.id);
+    assert.match(detail.afterContent, /会被回退的稿/);
+    assert.equal(detail.undone, true);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

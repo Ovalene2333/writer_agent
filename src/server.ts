@@ -1,8 +1,9 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { serve } from "@hono/node-server";
+import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -29,12 +30,16 @@ import type { CharacterInput } from "./characters.js";
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
 function styleTemplatesForClient(project: WriterProject) {
-  const customIds = new Set(project.customStyleTemplates().map(template => template.id));
-  return project.styleTemplates().map(template => ({
-    ...template,
-    builtIn: Boolean(getStyleTemplate(template.id)),
-    customized: customIds.has(template.id),
-  }));
+  return project.styleTemplates().map(template => {
+    const builtIn = Boolean(getStyleTemplate(template.id));
+    return {
+      ...template,
+      builtIn,
+      // Built-ins are never project-customized (overrides are ignored).
+      customized: !builtIn,
+      readOnly: builtIn,
+    };
+  });
 }
 
 type StoredAgentEvent = AgentEvent & { index: number };
@@ -130,10 +135,11 @@ export async function startWriterServer(options: {
   port?: number;
   /** 是否在终端打印访问地址 / 二维码，默认 true。`--share` 时由 CLI 统一打印双端点二维码。 */
   announce?: boolean;
-}): Promise<{ url: string; origin: string; token: string; close: () => Promise<void> }> {
+}): Promise<{ url: string; origin: string; localOrigin: string; token: string; close: () => Promise<void> }> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4096;
   const token = randomBytes(24).toString("base64url");
+  const localBypassToken = randomBytes(24).toString("base64url");
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs();
 
@@ -153,9 +159,8 @@ export async function startWriterServer(options: {
 
   app.use("/api/*", async (context, next) => {
     const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
-    const expectedBuffer = Buffer.from(token);
-    const providedBuffer = Buffer.from(provided);
-    if (providedBuffer.length !== expectedBuffer.length || !timingSafeEqual(providedBuffer, expectedBuffer)) {
+    const localBypass = context.req.header("x-writer-local-access") ?? "";
+    if (!tokensEqual(provided, token) && !tokensEqual(localBypass, localBypassToken)) {
       return context.json({ error: "访问令牌无效或已失效" }, 401);
     }
     await next();
@@ -436,17 +441,21 @@ export async function startWriterServer(options: {
     try {
       const body = await context.req.json<Partial<StyleTemplate>>();
       const template = options.project.saveStyleTemplate(body);
+      let sampling: ReturnType<ProviderManager["applySamplingDefaults"]> | null = null;
       if (options.project.config().style === template.id) {
         options.store.seedStyleExample(template);
-        const current = options.providers.publicConfig();
-        if (current.apiKeyConfigured) {
-          options.providers.save({
-            provider: current.provider, baseUrl: current.baseUrl, model: current.model,
-            temperature: template.suggestedTemperature, topP: template.suggestedTopP,
-          });
-        }
+        sampling = options.providers.applySamplingDefaults(
+          template.suggestedTemperature,
+          template.suggestedTopP,
+        );
       }
-      return context.json({ template, templates: styleTemplatesForClient(options.project) });
+      return context.json({
+        template,
+        templates: styleTemplatesForClient(options.project),
+        sampling,
+        provider: options.providers.publicConfig(),
+        catalog: options.providers.catalog(),
+      });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -459,20 +468,20 @@ export async function startWriterServer(options: {
         if (!template) throw new Error(`未知的风格模板：${styleId}`);
         options.project.setStyle(styleId);
         options.store.seedStyleExample(template);
-        const current = options.providers.publicConfig();
-        if (current.apiKeyConfigured) {
-          options.providers.save({
-            provider: current.provider,
-            baseUrl: current.baseUrl,
-            model: current.model,
-            temperature: template.suggestedTemperature,
-            topP: template.suggestedTopP,
-          });
-        }
-        return context.json({ active: template });
+        // Always write suggested sampling onto role-assigned models (no API key required).
+        const sampling = options.providers.applySamplingDefaults(
+          template.suggestedTemperature,
+          template.suggestedTopP,
+        );
+        return context.json({
+          active: template,
+          sampling,
+          provider: sampling.provider,
+          catalog: sampling.catalog,
+        });
       } else {
         options.project.setStyle("");
-        return context.json({ active: null });
+        return context.json({ active: null, sampling: null });
       }
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
@@ -725,10 +734,10 @@ export async function startWriterServer(options: {
             });
           } catch { /* title is best-effort */ }
         }
-        // Safety net: proposal success ends the agent before another manage_todos turn,
-        // so the last checklist item is often left open. Close open todos before "done".
+        // Safety net: only close a dangling in_progress item. Never auto-complete
+        // pending multi-chapter writing steps (those must stay open until written).
         if (!signal.aborted && deferred.some(event => event.type === "done")) {
-          persistFinalizedSessionTodos(options.store, body.sessionId, emit);
+          persistFinalizedSessionTodos(options.store, body.sessionId, emit, "dangling_in_progress");
         }
         for (const event of deferred) {
           stepDebug.onEvent(event);
@@ -851,18 +860,21 @@ export async function startWriterServer(options: {
     try {
       const sessionId = context.req.query("session") ?? "";
       const targetId = Number(context.req.query("target"));
+      const keepChanges = context.req.query("keepChanges") === "1" || context.req.query("keepChanges") === "true";
       if (!sessionId || !Number.isInteger(targetId) || targetId < 0) throw new Error("参数无效");
-      return context.json(options.store.rewindFromMessage(sessionId, targetId));
+      return context.json(options.store.rewindFromMessage(sessionId, targetId, { keepChanges }));
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
   app.post("/api/messages/:id/rerun", async (context) => {
     try {
-      const body = await context.req.json<{ sessionId?: string }>();
+      const body = await context.req.json<{ sessionId?: string; keepChanges?: boolean }>();
       const sessionId = body.sessionId ?? "";
       const targetId = Number(context.req.param("id"));
       if (!sessionId || !Number.isInteger(targetId) || targetId < 1) throw new Error("参数无效");
-      return context.json(options.store.prepareMessageRerun(sessionId, targetId));
+      return context.json(options.store.prepareMessageRerun(sessionId, targetId, {
+        keepChanges: Boolean(body.keepChanges),
+      }));
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -911,8 +923,61 @@ export async function startWriterServer(options: {
   app.use("/*", serveStatic({ root: webRoot }));
   app.get("/*", serveStatic({ path: resolve(webRoot, "index.html") }));
 
-  const server = serve({ fetch: app.fetch, hostname: host, port });
-  await new Promise<void>((resolveReady, rejectReady) => {
+  const localFetch = (request: Request) => {
+    const headers = new Headers(request.headers);
+    headers.set("x-writer-local-access", localBypassToken);
+    return app.fetch(new Request(request, { headers }));
+  };
+  const primaryIsLocal = host === "127.0.0.1";
+  const server = serve({ fetch: primaryIsLocal ? localFetch : app.fetch, hostname: host, port });
+  await waitForListening(server);
+
+  let localServer: ServerType | undefined;
+  try {
+    if (!primaryIsLocal) {
+      const startedLocalServer = serve({ fetch: localFetch, hostname: "127.0.0.1", port: 0 });
+      await waitForListening(startedLocalServer);
+      localServer = startedLocalServer;
+    }
+  } catch (error) {
+    await closeServer(server);
+    throw error;
+  }
+  const address = host === "0.0.0.0" ? findLanAddress() : host;
+  const boundPort = (server.address() as AddressInfo).port;
+  const origin = `http://${address}:${boundPort}`;
+  const protectedUrl = `${origin}/#token=${token}`;
+  const localPort = localServer ? (localServer.address() as AddressInfo).port : boundPort;
+  const localOrigin = `http://127.0.0.1:${localPort}`;
+  const url = localOrigin;
+  process.stdout.write(`Writer Web（本机免令牌）：${localOrigin}\n`);
+  if (options.announce !== false) {
+    if (host === "0.0.0.0") {
+      process.stdout.write(`\n手机访问：${protectedUrl}\n`);
+      process.stdout.write(await QRCode.toString(protectedUrl, { type: "terminal", small: true }));
+    } else if (!primaryIsLocal) {
+      process.stdout.write(`Writer Web：${protectedUrl}\n`);
+    }
+  }
+  return {
+    url,
+    origin,
+    localOrigin,
+    token,
+    close: async () => {
+      await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);
+    },
+  };
+}
+
+function tokensEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function waitForListening(server: ServerType): Promise<void> {
+  return new Promise((resolveReady, rejectReady) => {
     if (server.listening) return resolveReady();
     const onListening = () => {
       server.off("error", onError);
@@ -925,23 +990,12 @@ export async function startWriterServer(options: {
     server.once("listening", onListening);
     server.once("error", onError);
   });
-  const address = host === "0.0.0.0" ? findLanAddress() : host;
-  const origin = `http://${address}:${port}`;
-  const url = `${origin}/#token=${token}`;
-  if (options.announce !== false) {
-    if (host === "0.0.0.0") {
-      process.stdout.write(`\n手机访问：${url}\n`);
-      process.stdout.write(await QRCode.toString(url, { type: "terminal", small: true }));
-    } else {
-      process.stdout.write(`Writer Web：${url}\n`);
-    }
-  }
-  return {
-    url,
-    origin,
-    token,
-    close: () => new Promise((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose())),
-  };
+}
+
+function closeServer(server: ServerType): Promise<void> {
+  return new Promise((resolveClose, reject) => {
+    server.close(error => error ? reject(error) : resolveClose());
+  });
 }
 
 function findLanAddress(): string {
@@ -975,5 +1029,13 @@ function characterContextDocumentPaths(project: WriterProject, paths?: string[])
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause === undefined) return error.message;
+  const causeMessage = cause instanceof Error ? cause.message : String(cause);
+  const code = typeof cause === "object" && cause !== null && "code" in cause
+    ? String((cause as { code?: unknown }).code ?? "")
+    : "";
+  const detail = code && !causeMessage.includes(code) ? `${code}: ${causeMessage}` : causeMessage;
+  return detail && !error.message.includes(detail) ? `${error.message}（${detail}）` : error.message;
 }

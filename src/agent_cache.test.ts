@@ -17,6 +17,7 @@ import {
   compactRuntimeMessages,
   initialTodos,
   rehydrateRecentToolMessages,
+  requestNeedsProjectFactSearch,
   stripStaleReasoningContent,
   taskInstructions,
 } from "./agent.js";
@@ -26,7 +27,8 @@ import { WriterStore } from "./store.js";
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
-  assert.equal(agentToolSchemaHash(), "2ec6561dd676e009");
+  // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
+  assert.equal(agentToolSchemaHash(), "48a72d67b353d5fe");
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -44,8 +46,33 @@ test("plan workflows stay read-only and use bounded creative pacing", () => {
 });
 
 test("audit workflow separates review-only from repair", () => {
-  assert.match(taskInstructions("audit", "shape", "ask", false), /不得创建修改提案/);
-  assert.match(taskInstructions("audit", "shape", "ask", true), /提交最小修改提案/);
+  assert.match(taskInstructions("audit", "shape", "ask", false), /不提案/);
+  assert.match(taskInstructions("audit", "shape", "ask", true), /最小提案/);
+});
+
+test("lore entity discussion upgrades to project fact search", () => {
+  const catalog = {
+    documents: ["lore/超国家实体.md", "lore/军工复合体.md", "chapters/第1章.md"],
+    characterNames: ["林雪"],
+  };
+  assert.equal(
+    requestNeedsProjectFactSearch(
+      "有人想除掉三大超国家实体里的白鸦，因为会影响军工复合体的利益。我们讨论一下这个点。",
+      catalog,
+    ),
+    true,
+  );
+  assert.equal(
+    requestNeedsProjectFactSearch("白鸦组织的立场是什么？", {
+      documents: ["lore/白鸦.md"],
+      characterNames: [],
+    }),
+    true,
+  );
+  assert.equal(
+    requestNeedsProjectFactSearch("怎么写更自然的对白节奏？", catalog),
+    false,
+  );
 });
 
 test("prebuilt todo plans start with one active step", () => {
@@ -54,6 +81,20 @@ test("prebuilt todo plans start with one active step", () => {
     { id: "t2", content: "完成写作", status: "pending" },
     { id: "t3", content: "提交提案", status: "pending" },
   ]);
+});
+
+test("chapter workflow uses the model-driven scene tool chain", () => {
+  const instructions = taskInstructions("write_scene", "deliver", "ask", true);
+  assert.match(instructions, /begin_chapter_draft/);
+  assert.match(instructions, /compile_write_pack/);
+  assert.match(instructions, /write_chapter_scene/);
+  assert.match(instructions, /inspect_chapter_draft/);
+  assert.match(instructions, /propose_chapter_draft/);
+  assert.match(instructions, /actualState/);
+  assert.match(instructions, /禁止直接 propose_document/);
+  assert.match(instructions, /大纲不是章节写作的前置条件/);
+  assert.match(instructions, /禁止 design_creative_outline/);
+  assert.match(instructions, /重心放在因果场景链/);
 });
 
 type Msg = {
@@ -78,11 +119,16 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.match(a[2].content ?? "", /项目指令/);
     assert.match(a[3].content ?? "", /项目技能/);
     assert.match(a[0].content ?? "", /characterChanges/);
+    // Slot 4/5 must not flip with intensive or audit — those go in the dynamic tail.
+    const intensive = buildStableSystemPrefix(project, store, "ask", { intensive: true }, "write_scene");
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
     assert.equal(audit.length, 6);
-    assert.notEqual(audit[5].content, a[5].content);
-    assert.match(audit[5].content ?? "", /只审阅时输出有证据的结论/);
-    assert.doesNotMatch(audit[5].content ?? "", /必须针对.*提交修改提案/);
+    assert.equal(a[4].content, intensive[4].content);
+    assert.equal(a[5].content, audit[5].content);
+    assert.equal(a[5].content, intensive[5].content);
+    assert.match(a[4].content ?? "", /风格锚定/);
+    assert.match(a[5].content ?? "", /当前任务/);
+    assert.doesNotMatch(a[5].content ?? "", /终审专则/);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

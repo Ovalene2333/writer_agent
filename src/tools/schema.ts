@@ -28,7 +28,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "list_documents",
-      description: "列出作品中的 Markdown 文档（含 kind：lore 设定 / outline 大纲 / chapter 正文 / archive 旧稿 / side 支线 / other）",
+      description: "列出 Markdown 文档及 kind（lore/outline/chapter/archive/side/other）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -36,10 +36,10 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_document",
-      description: "查看文档行数、字符数、标题结构和首尾预览，不读取完整正文。长文档应先调用此工具",
+      description: "查看行数、标题结构与首尾预览；长文档先调用",
       parameters: {
         type: "object",
-        properties: { path: { type: "string", description: "项目内相对路径" } },
+        properties: { path: { type: "string", description: "相对路径" } },
         required: ["path"],
         additionalProperties: false,
       },
@@ -49,16 +49,16 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "read_document",
-      description: "按 Markdown 标题节、自然边界块或行范围截取文档。搜索结果已有行号时优先读取最小行范围；长文档先用 inspect_document 查看结构",
+      description: "按节/块/行范围截取；有行号时读最小范围；长文先 inspect",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "项目内相对路径" },
-          block: { type: "number", description: "块编号，1 开始；默认读取第 1 块" },
-          section: { type: "string", description: "按 Markdown 标题读取一节；填写 inspect_document 返回的标题文字（不含 #）" },
-          lastSection: { type: "boolean", description: "读取文档最后一个 Markdown 标题节；续写时优先使用" },
-          startLine: { type: "number", description: "起始行，1 开始；必须与 endLine 同时提供" },
-          endLine: { type: "number", description: "结束行（包含）；最多读取 200 行和 12000 字符" },
+          path: { type: "string", description: "相对路径" },
+          block: { type: "number", description: "块号，从 1 起" },
+          section: { type: "string", description: "Markdown 标题文本（不含 #）" },
+          lastSection: { type: "boolean", description: "读最后一节；续写优先" },
+          startLine: { type: "number", description: "起始行，与 endLine 同用" },
+          endLine: { type: "number", description: "结束行；最多 200 行/12000 字" },
         },
         required: ["path"],
         additionalProperties: false,
@@ -69,20 +69,20 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "search_project",
-      description: "像代码搜索一样在项目 Markdown 中定位概念或设定，返回路径、所属标题、行号和上下文。需要逐字事实时再用 read_document 截取",
+      description: "在项目 Markdown 中搜索概念/设定，返回路径、标题、行号与上下文",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "概念、专有名词或短查询" },
+          query: { type: "string", description: "短查询" },
           scope: {
             type: "string",
             enum: ["all", "lore", "story", "outline", "chapters"],
-            description: "文档范围：lore=设定（story 为旧别名）、outline=大纲、chapters=正文；世界观/专名优先 lore",
+            description: "范围；story≡lore",
           },
-          pathPrefix: { type: "string", description: "可选相对目录前缀，例如 lore、outline、chapters" },
-          mode: { type: "string", enum: ["any", "all", "exact"], description: "任一词、全部词或精确短语" },
-          contextLines: { type: "number", description: "匹配行前后上下文，0～12，默认 2" },
-          limit: { type: "number", description: "结果数，1～12，默认 8" },
+          pathPrefix: { type: "string", description: "目录前缀" },
+          mode: { type: "string", enum: ["any", "all", "exact"], description: "匹配模式" },
+          contextLines: { type: "number", description: "上下文行 0–12，默认 2" },
+          limit: { type: "number", description: "结果数 1–12，默认 8" },
         },
         required: ["query"],
         additionalProperties: false,
@@ -93,17 +93,17 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "design_creative_outline",
-      description: "为新建或重构大纲生成独立的创意规划简报：四条结构差异显著的路线、发散—收敛流程、100分评估表、反俗套约束，以及与结构化大纲一致的章节字段契约（摘要/前因/行动/结果/状态变化等）。outline 模式下对大纲文档的 propose_document/propose_document_patch 前必须先成功调用一次",
+      description: "仅当用户明确要求大纲/卷纲/全书章节规划时使用；单章正文禁止调用。未给总章数时只生成轻量方向引导，不展开全书章节表",
       parameters: {
         type: "object",
         properties: {
-          premise: { type: "string", description: "故事前提或本次大纲任务的核心矛盾" },
-          genre: { type: "string", description: "可选类型与气质" },
-          audience: { type: "string", description: "可选目标读者" },
-          targetChapters: { type: "number", description: "期望章节数，3—80" },
-          constraints: { type: "array", items: { type: "string" }, description: "必须遵守的设定或形式约束" },
-          existingBeats: { type: "array", items: { type: "string" }, description: "重构时必须保留的既有节拍" },
-          seed: { type: "string", description: "可选路线种子；相同输入与种子得到相同设计镜头" },
+          premise: { type: "string", description: "前提或核心矛盾" },
+          genre: { type: "string", description: "类型气质" },
+          audience: { type: "string", description: "读者" },
+          targetChapters: { type: "number", description: "章数 3–80" },
+          constraints: { type: "array", items: { type: "string" }, description: "硬约束" },
+          existingBeats: { type: "array", items: { type: "string" }, description: "须保留节拍" },
+          seed: { type: "string", description: "路线种子" },
         },
         required: ["premise"], additionalProperties: false,
       },
@@ -113,10 +113,10 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "audit_prose_style",
-      description: "对指定正文做风格审计：规则先扫说明性破折号、否定重定义、情绪/意图翻译、因果补注和主题总结，再由 Flash 复核候选并主动检查高风险段落中的解释回声。info/warning 不拦截提案；仅过密的高置信说明体（error）会拦截。对白拖音、列举、表格、停顿—揭示默认允许，不要为消符号而全文改写",
+      description: "风格审计（说明体/解释回声等）；仅过密 error 拦截提案",
       parameters: {
         type: "object",
-        properties: { path: { type: "string", description: "项目内正文 Markdown 路径" } },
+        properties: { path: { type: "string", description: "正文路径" } },
         required: ["path"], additionalProperties: false,
       },
     },
@@ -125,12 +125,12 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "list_outline_nodes",
-      description: "读取结构化故事大纲目录，返回稳定节点 ID、层级、摘要、状态和正文关联。规划、续写或检查情节时优先使用",
+      description: "大纲节点目录（id/层级/摘要/状态/正文关联）",
       parameters: {
         type: "object",
         properties: {
-          type: { type: "string", enum: ["act", "chapter", "scene"], description: "可选节点类型过滤" },
-          status: { type: "string", enum: ["idea", "planned", "drafted", "diverged"], description: "可选状态过滤" },
+          type: { type: "string", enum: ["act", "chapter", "scene"], description: "类型过滤" },
+          status: { type: "string", enum: ["idea", "planned", "drafted", "diverged"], description: "状态过滤" },
         },
         additionalProperties: false,
       },
@@ -140,10 +140,10 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_outline_node",
-      description: "读取大纲节点的结构化字段和 Markdown 原文。优先使用写作引导或 list_outline_nodes 返回的 UUID；也可用精确标题。不要用纯章号数字当 id（系统会尝试解析但可能歧义）",
+      description: "读取大纲节点字段与原文；id 用 UUID 或唯一标题，勿用纯章号",
       parameters: {
         type: "object",
-        properties: { id: { type: "string", description: "大纲节点 UUID，或唯一标题；不要把“5”当作 id" } },
+        properties: { id: { type: "string", description: "节点 UUID 或唯一标题" } },
         required: ["id"], additionalProperties: false,
       },
     },
@@ -152,14 +152,14 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "propose_outline_patch",
-      description: "针对一个已读取的大纲节点提交局部 Markdown 搜索替换提案。修改仍需作者审批；search 必须在该节点原文内且在整篇大纲中唯一",
+      description: "对已读大纲节点做 search/replace 提案；search 须在节点内唯一",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "string", description: "已通过 get_outline_node 读取的节点 ID" },
-          search: { type: "string", description: "节点原文中的唯一精确文本" },
-          replace: { type: "string", description: "替换后的 Markdown" },
-          summary: { type: "string", description: "一句话概括修改目的" },
+          id: { type: "string", description: "节点 ID" },
+          search: { type: "string", description: "唯一原文" },
+          replace: { type: "string", description: "替换 Markdown" },
+          summary: { type: "string", description: "修改摘要" },
         },
         required: ["id", "search", "replace", "summary"], additionalProperties: false,
       },
@@ -169,7 +169,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "validate_outline",
-      description: "检查场景节点是否缺少前因、行动、结果、状态变化、人物或正文关联，并检查未回收伏笔",
+      description: "检查场景缺字段与未回收伏笔",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -177,7 +177,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "compare_outline_with_draft",
-      description: "将一个已关联正文的大纲场景与对应正文做基础偏离检查，返回正文证据和需要人工确认的差异",
+      description: "大纲场景与关联正文的基础偏离检查",
       parameters: {
         type: "object", properties: { id: { type: "string", description: "场景节点 ID" } },
         required: ["id"], additionalProperties: false,
@@ -187,22 +187,149 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
-      name: "propose_document",
-      description: "提交文档完整新版本；仅用于新建文档或全文重写，局部修改应使用 propose_document_patch",
+      name: "compile_write_pack",
+      description: "写前编译：把大纲/设定/衔接笔记编译为故事内可写材料；写场景提案前必调",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "已读取的 Markdown 文档路径" },
-          content: { type: "string", description: "修改后的完整 Markdown 内容" },
-          summary: { type: "string", description: "一句话概括修改目的" },
-          characterChanges: {
-            type: "array", maxItems: 8,
-            description: "可选：正文/大纲在获批落盘后才生效的角色演进。只记录提案内容明确造成的能力解锁、经历、心理或状态变化；拒绝提案时不应用",
+          notes: {
+            type: "string",
+            description: "情节笔记（可用 ## 场景目标/人物当下/事件顺序/已知事实/须自然落地/勿擅自补写/声线提醒）",
+          },
+          targetPath: { type: "string", description: "目标正文路径（仅脱敏，不注入）" },
+          instruction: { type: "string", description: "本轮写作要求摘要（可选）" },
+          sceneId: { type: "string", description: "逐场景章节草稿中的场景 id" },
+        },
+        required: ["notes"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "begin_chapter_draft",
+      description: "建立整章场景链与内存草稿；不写项目文件",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "chapters/ 下目标路径" },
+          mode: { type: "string", enum: ["create", "replace", "append"] },
+          heading: { type: "string", description: "create/replace 时的章节标题（不含 #）" },
+          chapterGoal: { type: "string", description: "整章结束后真正改变什么" },
+          scenes: {
+            type: "array", minItems: 1, maxItems: 8,
+            description: "有因果承接的场景链；通常 3—6 场，不为凑数拆场",
             items: {
               type: "object",
               properties: {
-                characterId: { type: "number", description: "已读取的角色 ID" },
-                reason: { type: "string", description: "提案正文中确立该变化的简短事实依据" },
+                id: { type: "string", description: "本章内唯一短 id" },
+                title: { type: "string", description: "内部场景名，不写入正文" },
+                goal: { type: "string", description: "本场要完成的变化" },
+                entryState: { type: "array", items: { type: "string" }, description: "入场局面" },
+                characterIntent: { type: "array", items: { type: "string" }, description: "人物各自诉求" },
+                obstacle: { type: "string", description: "直接阻力" },
+                turn: { type: "string", description: "预期落空/代价/关系或目标变化" },
+                outcome: { type: "string", description: "本场直接结果" },
+                handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
+                dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
+                targetCharacters: { type: "number", description: "预计字数 200—8000" },
+              },
+              required: ["id", "goal", "obstacle", "turn", "outcome"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["path", "mode", "chapterGoal", "scenes"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_chapter_scene",
+      description: "写入或重写一场到内存草稿；同 sceneId 须先 compile_write_pack",
+      parameters: {
+        type: "object",
+        properties: {
+          sceneId: { type: "string" },
+          content: { type: "string", description: "仅本场正文，不含章节一级标题" },
+          actualState: {
+            type: "object",
+            description: "从实际正文归纳的离场状态；不可照抄计划",
+            properties: {
+              situation: { type: "array", items: { type: "string" } },
+              physical: { type: "array", items: { type: "string" } },
+              knowledge: { type: "array", items: { type: "string" } },
+              relationships: { type: "array", items: { type: "string" } },
+              goals: { type: "array", items: { type: "string" } },
+              openLoops: { type: "array", items: { type: "string" } },
+              usedMotifs: { type: "array", items: { type: "string" } },
+            },
+            additionalProperties: false,
+          },
+        },
+        required: ["sceneId", "content", "actualState"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "inspect_chapter_draft",
+      description: "返回组装整章与逐场状态账本；最终提案前必调",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_chapter_draft",
+      description: "提交已逐场完成并整章审阅的章节；只在最后一次写场后 inspect 过才可用",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "修改摘要" },
+          chapterChange: { type: "string", description: "一句话说明章首到章尾的总变化" },
+          reviewNotes: { type: "string", description: "接缝、重复功能与转折多样性审阅结论" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["summary", "chapterChange", "reviewNotes"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_document",
+      description: "提交完整文档新版本（新建或全文重写）；局部改用 patch",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文档路径" },
+          content: { type: "string", description: "完整 Markdown" },
+          summary: { type: "string", description: "修改摘要" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            description: "可选：提案获批后才生效的角色演进",
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number", description: "角色 ID" },
+                reason: { type: "string", description: "正文依据" },
                 changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
@@ -218,11 +345,11 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "propose_document_patch",
-      description: "用精确搜索替换提交局部修改提案，避免输出整篇文档。每段 search 必须在原文中唯一出现。续写时读取文档末尾，将唯一尾段作为 search，并把原尾段与新增正文共同作为 replace",
+      description: "精确 search/replace 局部提案；每段 search 须唯一。续写用末段作 search",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "已读取相关片段的 Markdown 文档路径" },
+          path: { type: "string", description: "文档路径" },
           edits: {
             type: "array",
             minItems: 1,
@@ -230,17 +357,17 @@ export const TOOLS = deepFreeze([
             items: {
               type: "object",
               properties: {
-                search: { type: "string", description: "原文中唯一存在的精确文本" },
-                replace: { type: "string", description: "替换后的文本；空字符串表示删除" },
+                search: { type: "string", description: "唯一原文" },
+                replace: { type: "string", description: "替换文本；空=删除" },
               },
               required: ["search", "replace"],
               additionalProperties: false,
             },
           },
-          summary: { type: "string", description: "一句话概括修改目的" },
+          summary: { type: "string", description: "修改摘要" },
           characterChanges: {
             type: "array", maxItems: 8,
-            description: "可选：本次补丁获批落盘后才生效的角色演进；格式同 propose_document.characterChanges",
+            description: "可选：补丁获批后生效的角色演进",
             items: {
               type: "object",
               properties: {
@@ -260,7 +387,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "list_characters",
-      description: "列出本次可读取的已有角色卡目录（若用户限制了角色范围则只返回范围内角色；本轮新建的角色也会出现）",
+      description: "列出可读普通角色卡（含本轮新建；受角色范围限制）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -268,20 +395,20 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_character",
-      description: "按 ID 分区读取 v3 角色卡。省略 sections 时返回完整卡；storyState/experiences/psychology 可结合 outlineNodeId 解析当前场景可见内容。未解锁能力只返回 name、summary 和 unlocked=false；不得推断隐藏字段或将其视为当前可用能力",
+      description: "按 ID 读 v3 角色卡；可 sections 分区。locked 能力不可当已用",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "number", description: "角色 ID；先调用 list_characters 获取" },
+          id: { type: "number", description: "角色 ID" },
           sections: {
             type: "array",
-            description: "要读取的顶层分区；省略则读取完整角色卡",
+            description: "顶层分区；省略=全卡",
             items: {
               type: "string",
               enum: ["identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyState", "experiences", "notes"],
             },
           },
-          outlineNodeId: { type: "string", description: "读取 storyState / 带时间边界的 experiences 与 psychology 时的目标 outline 节点 ID" },
+          outlineNodeId: { type: "string", description: "场景态/经历用的大纲节点 ID" },
         },
         required: ["id"],
         additionalProperties: false,
@@ -292,31 +419,31 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "save_character",
-      description: "创建或嵌套更新 schema v3 角色卡。省略分区保持原值；数组分区按 id upsert（不抹掉未提及条目）；删除用 deleteEntryIds；整节重写用 replaceSections。情节小改优先 apply_character_changes。新建必须提供 identity.name",
+      description: "创建/嵌套更新 v3 角色卡；数组按 id upsert。情节小改优先 apply_character_changes。新建须 identity.name",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "number", description: "要更新的角色 ID（修改已有角色时必填，新建角色时省略）" },
-          identity: { type: "object", description: "姓名、别名、标签、叙事角色和身份摘要", additionalProperties: true },
-          profile: { type: "object", description: "外貌、辨识特征、背景摘要和人物小传", additionalProperties: true },
-          psychology: { type: "object", description: "性格摘要；traits/values/fears/conflicts 按 id upsert", additionalProperties: true },
-          motivations: { type: "array", description: "目标记录（按 id upsert）", items: { type: "object", additionalProperties: true } },
-          voice: { type: "object", description: "声线摘要、语域、措辞与示例对白", additionalProperties: true },
-          competencies: { type: "array", description: "能力记录（按 id upsert）；含 name/summary/unlocked", items: { type: "object", additionalProperties: true } },
-          relationships: { type: "array", description: "单向关系记录；characterId 必须指向现有可读角色", items: { type: "object", additionalProperties: true } },
-          storyStates: { type: "array", description: "剧情状态；每项必须有 outlineNodeId 或 unanchored=true", items: { type: "object", additionalProperties: true } },
-          experiences: { type: "array", description: "已确认经历（id/label/description/sourceRefs/validFrom/validUntil），按 id upsert", items: { type: "object", additionalProperties: true } },
+          id: { type: "number", description: "更新时必填；新建省略" },
+          identity: { type: "object", description: "身份", additionalProperties: true },
+          profile: { type: "object", description: "外貌/背景", additionalProperties: true },
+          psychology: { type: "object", description: "心理", additionalProperties: true },
+          motivations: { type: "array", description: "目标", items: { type: "object", additionalProperties: true } },
+          voice: { type: "object", description: "声线", additionalProperties: true },
+          competencies: { type: "array", description: "能力", items: { type: "object", additionalProperties: true } },
+          relationships: { type: "array", description: "关系", items: { type: "object", additionalProperties: true } },
+          storyStates: { type: "array", description: "剧情状态", items: { type: "object", additionalProperties: true } },
+          experiences: { type: "array", description: "经历", items: { type: "object", additionalProperties: true } },
           deleteEntryIds: {
             type: "object",
-            description: "按 motivations/competencies/relationships/storyStates/experiences/traits/values/fears/conflicts 删除条目 ID",
+            description: "按分区删条目 ID",
             additionalProperties: true,
           },
           replaceSections: {
             type: "array",
-            description: "对这些分区整组替换而非 upsert：motivations/competencies/relationships/storyStates/experiences/traits/values/fears/conflicts",
+            description: "整节替换的分区名",
             items: { type: "string" },
           },
-          notes: { type: "string", description: "补充说明" },
+          notes: { type: "string", description: "备注" },
         },
         additionalProperties: false,
       },
@@ -326,20 +453,20 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "apply_character_changes",
-      description: "对已有角色卡应用结构化演进：解锁/封印能力、改性格、加经历、更新目标/关系/场景状态。仅用于已确认剧情事实（正文已落盘或用户确认）；伏笔、传闻、未接受提案禁止。新建角色用 save_character。ops：set_unlocked、upsert_competency、set_psychology_summary、upsert_psychology_entry、delete_psychology_entry、add_experience/upsert_experience、delete_experience、upsert_motivation、upsert_relationship、upsert_story_state、delete_entry",
+      description: "已确认事实的角色演进（解锁/经历/心理/目标/关系/场景态）。ops 见系统约定；新建用 save_character",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "number", description: "已有角色 ID" },
-          reason: { type: "string", description: "已确认的剧情事实摘要（必填）" },
+          id: { type: "number", description: "角色 ID" },
+          reason: { type: "string", description: "已确认事实摘要" },
           sourceRef: {
             type: "object",
-            description: "可选来源：type=outline|document|manual，ref 为节点 ID 或文档路径",
+            description: "来源 type+ref",
             additionalProperties: true,
           },
           changes: {
             type: "array",
-            description: "结构化变更列表；每项含 op 及对应字段",
+            description: "含 op 的变更列表",
             items: { type: "object", additionalProperties: true },
           },
         },
@@ -352,7 +479,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "list_simple_characters",
-      description: "List simple character cards. These are stored separately from normal v3 character cards and are commonly used by roleplay participants",
+      description: "列出简易角色卡（与 v3 普通卡分离，常用于扮演）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -360,10 +487,10 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_simple_character",
-      description: "Read a complete simple character card by id, including identity, relationship, knowledge, scene, and goal",
+      description: "按 id 读简易角色卡全字段",
       parameters: {
         type: "object",
-        properties: { id: { type: "number", description: "Simple character id from list_simple_characters" } },
+        properties: { id: { type: "number", description: "简易卡 ID" } },
         required: ["id"],
         additionalProperties: false,
       },
@@ -373,17 +500,17 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "save_simple_character",
-      description: "创建或更新简易角色卡。它只包含角色扮演所需的名称、身份、关系、已知信息、场景和目标；创建前应按需检索已有角色卡与项目设定，避免与项目事实冲突。",
+      description: "创建/更新简易角色卡（name/identity/relationship/knowledge/scene/goal）",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "number", description: "更新已有简易角色卡时填写；新建时省略" },
-          name: { type: "string", description: "角色名称" },
-          identity: { type: "string", description: "身份、职责、阵营与必要背景" },
-          relationship: { type: "string", description: "与相关角色的关系" },
-          knowledge: { type: "string", description: "当前已知信息与认知边界" },
-          scene: { type: "string", description: "当前场景或常用出场环境" },
-          goal: { type: "string", description: "当前目标" },
+          id: { type: "number", description: "更新时填写" },
+          name: { type: "string", description: "名称" },
+          identity: { type: "string", description: "身份" },
+          relationship: { type: "string", description: "关系" },
+          knowledge: { type: "string", description: "已知信息" },
+          scene: { type: "string", description: "场景" },
+          goal: { type: "string", description: "目标" },
         },
         required: ["name", "identity", "relationship", "knowledge", "scene", "goal"],
         additionalProperties: false,
@@ -394,7 +521,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_conversation",
-      description: "Inspect counts, channels, character size, and message id range for the complete current conversation archive",
+      description: "查看完整会话归档的计数、通道与 id 范围",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -402,13 +529,13 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "read_conversation",
-      description: "Read the complete current conversation archive in chronological pages. For long roleplay-based writing, start with afterId=0 and channel=roleplay, then follow nextAfterId until hasMore=false",
+      description: "分页读完整会话归档；长扮演史 from afterId=0 channel=roleplay 直至 hasMore=false",
       parameters: {
         type: "object",
         properties: {
-          channel: { type: "string", enum: ["roleplay", "agent"], description: "Omit for all channels; use roleplay for roleplay history" },
-          afterId: { type: "number", description: "Only read after this message id; use 0 first and nextAfterId for later pages" },
-          limit: { type: "number", description: "Messages per page, 1-80, default 40, also bounded by 16000 characters" },
+          channel: { type: "string", enum: ["roleplay", "agent"], description: "通道；省略=全部" },
+          afterId: { type: "number", description: "从此 id 之后读；首页 0" },
+          limit: { type: "number", description: "每页 1–80，默认 40" },
         },
         additionalProperties: false,
       },
@@ -418,12 +545,12 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "ask_user",
-      description: "缺少目标文档、既有事实或会改变结果的关键选择，且无法从当前上下文可靠推断时，向用户提一个简短问题并暂停。情节、对白、描写等可逆创作选择应自行作合理决定，不要过度询问；不要与其他工具同时调用",
+      description: "缺关键事实/目标且无法推断时提问并暂停；可逆创作选择勿滥用。勿与其他工具同轮",
       parameters: {
         type: "object",
         properties: {
-          question: { type: "string", description: "向用户提出的问题（简短，不超过 120 字）" },
-          options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 5, description: "可选答案列表；如不需要选项则省略" },
+          question: { type: "string", description: "问题（≤120 字）" },
+          options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 5, description: "可选选项" },
         },
         required: ["question"],
         additionalProperties: false,
@@ -434,7 +561,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "manage_todos",
-      description: "维护本轮多步任务清单（对齐 code agent 的 todo 工具）。复杂请求（≥3 步）开始时写入清单，推进时更新状态；同一时刻最多一项 in_progress。提交最终文档提案前应把相关项标为 completed。简单单步请求不必调用",
+      description: "维护本轮多步 todos；同时至多一项 in_progress",
       parameters: {
         type: "object",
         properties: {
@@ -444,8 +571,8 @@ export const TOOLS = deepFreeze([
             items: {
               type: "object",
               properties: {
-                id: { type: "string", description: "稳定短 id，如 t1" },
-                content: { type: "string", description: "任务描述" },
+                id: { type: "string", description: "如 t1" },
+                content: { type: "string", description: "描述" },
                 status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
               },
               required: ["id", "content", "status"],
@@ -462,11 +589,11 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "load_skill",
-      description: "加载项目技能全文（.writer/skills 或 .agents/skills 下的 SKILL.md）。仅当技能目录中有匹配项且细则对当前任务必要时调用",
+      description: "加载项目技能全文（.writer/skills 或 .agents/skills）",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "string", description: "技能 id（目录名）或 name" },
+          id: { type: "string", description: "技能 id 或 name" },
         },
         required: ["id"],
         additionalProperties: false,

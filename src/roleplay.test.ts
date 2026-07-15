@@ -68,7 +68,8 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /看不到写作 Agent/);
     assert.match(prompt, /"name": "终焉协议"/);
     assert.match(prompt, /"summary": "尚未掌握的禁忌能力"/);
-    assert.match(prompt, /"unlocked": false/);
+    assert.match(prompt, /"notInPlay"/);
+    assert.doesNotMatch(prompt, /"unlocked": false/);
     assert.doesNotMatch(prompt, /未解锁能力的秘密说明|绝密|秘密资源|秘密限制|秘密代价/);
     assert.match(prompt, /未透露姓名的来访者/);
     assert.match(prompt, /实时对手戏，不是问答/);

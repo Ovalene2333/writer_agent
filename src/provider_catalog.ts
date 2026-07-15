@@ -3,13 +3,14 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSy
 import { dirname, isAbsolute, resolve } from "node:path";
 import type { ModelConfig, ModelUsageRole, ProviderCatalogPublic, ProviderId, ProviderModelPublic, ProviderProfilePublic, ProviderPublicConfig, TokenPricing } from "./types.js";
 import { defaultPricing, normalizePricing } from "./pricing.js";
+import { modelFetch, normalizeProxyUrl } from "./model_fetch.js";
 import { WriterProject } from "./project.js";
 
 type SavedModel = ProviderModelPublic;
-type SavedProfile = { id: string; name: string; provider: ProviderId; baseUrl: string; apiKey: string; models: SavedModel[] };
+type SavedProfile = { id: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey: string; models: SavedModel[] };
 type ModelReference = { providerId: string; modelId: string };
 type SavedCatalog = { version: 2; activeProviderId: string; activeModelId: string; assignments: Record<ModelUsageRole, ModelReference>; providers: SavedProfile[] };
-type LegacyConfig = { provider: ProviderId; baseUrl: string; model: string; apiKey: string; pricing?: TokenPricing; temperature?: number; topP?: number };
+type LegacyConfig = { provider: ProviderId; baseUrl: string; proxyUrl?: string; model: string; apiKey: string; pricing?: TokenPricing; temperature?: number; topP?: number };
 
 export const DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"] as const;
 
@@ -32,20 +33,20 @@ export class ProviderManager {
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
     const { profile, model } = this.assigned(role); const baseUrl = process.env.WRITER_BASE_URL || profile.baseUrl;
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, baseUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
+    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
   }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {
     const { profile, model } = this.active(); const config = this.modelConfig();
     const environmentConfigured = Boolean(process.env.WRITER_API_KEY || process.env.WRITER_BASE_URL || process.env.WRITER_MODEL);
-    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP };
+    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, proxyUrl: config.proxyUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP };
   }
   catalog(): ProviderCatalogPublic { return { activeProviderId: this.saved.activeProviderId, activeModelId: this.saved.activeModelId, assignments: this.saved.assignments, providers: this.saved.providers.map(profile => this.publicProfile(profile)) }; }
 
-  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }> }): ProviderCatalogPublic {
+  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }> }): ProviderCatalogPublic {
     if (!input.models?.length) throw new Error("每个供应商至少需要一个模型");
     const existing = input.id ? this.saved.providers.find(item => item.id === input.id) : undefined;
-    const profile: SavedProfile = { id: existing?.id ?? randomUUID(), name: input.name.trim() || providerLabel(input.provider), provider: validateProvider(input.provider), baseUrl: normalizeBaseUrl(input.baseUrl), apiKey: input.apiKey?.trim() || existing?.apiKey || "", models: [] };
+    const profile: SavedProfile = { id: existing?.id ?? randomUUID(), name: input.name.trim() || providerLabel(input.provider), provider: validateProvider(input.provider), baseUrl: normalizeBaseUrl(input.baseUrl), proxyUrl: normalizeProxyUrl(input.proxyUrl), apiKey: input.apiKey?.trim() || existing?.apiKey || "", models: [] };
     if (!profile.apiKey) throw new Error("API Key 不能为空");
     profile.models = input.models.map(item => normalizeModel(item, profile.provider, existing?.models.find(model => model.id === item.id)));
     const index = this.saved.providers.findIndex(item => item.id === profile.id);
@@ -92,6 +93,49 @@ export class ProviderManager {
     });
     return this.publicConfig();
   }
+
+  /**
+   * Apply style-template sampling to every model currently used by a role
+   * (and the catalog active model). Does not require API keys — only patches
+   * temperature / topP and persists the catalog.
+   */
+  applySamplingDefaults(temperature: number, topP: number): {
+    temperature: number;
+    topP: number;
+    updatedModels: number;
+    provider: ProviderPublicConfig;
+    catalog: ProviderCatalogPublic;
+  } {
+    const nextTemp = optional(temperature, 0, 2);
+    const nextTopP = optional(topP, 0, 1);
+    if (nextTemp === undefined || nextTopP === undefined) {
+      throw new Error("temperature / topP 无效");
+    }
+    const targets = new Set<string>();
+    targets.add(`${this.saved.activeProviderId}:${this.saved.activeModelId}`);
+    for (const role of modelRoles()) {
+      const ref = this.saved.assignments[role];
+      if (ref) targets.add(`${ref.providerId}:${ref.modelId}`);
+    }
+    let updatedModels = 0;
+    for (const profile of this.saved.providers) {
+      for (const model of profile.models) {
+        if (!targets.has(`${profile.id}:${model.id}`)) continue;
+        if (model.temperature === nextTemp && model.topP === nextTopP) continue;
+        model.temperature = nextTemp;
+        model.topP = nextTopP;
+        updatedModels += 1;
+      }
+    }
+    if (updatedModels > 0) this.persist();
+    return {
+      temperature: nextTemp,
+      topP: nextTopP,
+      updatedModels,
+      provider: this.publicConfig(),
+      catalog: this.catalog(),
+    };
+  }
   /** 通过 GET /models 探测可达性，不调用 chat/completions，不消耗 token。 */
   async testConnection(profileId = this.saved.activeProviderId, modelId = this.saved.activeModelId): Promise<{ ok: true; message: string; modelListed?: boolean }> {
     const profile = this.saved.providers.find(item => item.id === profileId);
@@ -99,10 +143,10 @@ export class ProviderManager {
     if (!profile || !model) throw new Error("供应商或模型不存在");
     if (!profile.apiKey) throw new Error("请先配置 API Key");
     const base = profile.baseUrl.replace(/\/+$/, "");
-    const response = await fetch(`${base}/models`, {
+    const response = await modelFetch(`${base}/models`, {
       headers: { authorization: `Bearer ${profile.apiKey}` },
       signal: AbortSignal.timeout(15_000),
-    });
+    }, profile.proxyUrl);
     if (!response.ok) {
       throw new Error(`${profile.name} / ${model.name} 不可达（${response.status}）：${(await response.text()).slice(0, 300)}`);
     }
@@ -126,7 +170,7 @@ export class ProviderManager {
 
   private active() { const profile = this.saved.providers.find(item => item.id === this.saved.activeProviderId) ?? this.saved.providers[0]; const model = profile.models.find(item => item.id === this.saved.activeModelId) ?? profile.models[0]; return { profile, model }; }
   private assigned(role: ModelUsageRole) { const ref = this.saved.assignments[role]; const profile = this.saved.providers.find(item => item.id === ref?.providerId) ?? this.active().profile; const model = profile.models.find(item => item.id === ref?.modelId) ?? profile.models[0]; return { profile, model }; }
-  private publicProfile(profile: SavedProfile): ProviderProfilePublic { return { id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, apiKeyConfigured: Boolean(profile.apiKey), apiKeyHint: maskKey(profile.apiKey), models: profile.models }; }
+  private publicProfile(profile: SavedProfile): ProviderProfilePublic { return { id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, proxyUrl: profile.proxyUrl, apiKeyConfigured: Boolean(profile.apiKey), apiKeyHint: maskKey(profile.apiKey), models: profile.models }; }
   private load(): SavedCatalog {
     const sourcePath = existsSync(this.path)
       ? this.path
@@ -193,6 +237,7 @@ function parseCatalog(raw: string): SavedCatalog {
     const agentFallback = parsed.assignments.agent ?? fallback;
     for (const role of modelRoles()) parsed.assignments[role] ??= role === "roleplay" ? agentFallback : fallback;
     for (const profile of parsed.providers) {
+      profile.proxyUrl = normalizeProxyUrl(profile.proxyUrl);
       for (const model of profile.models) {
         model.pricing = normalizePricing(profile.provider, model.name, undefined, model.pricing);
       }
@@ -224,6 +269,7 @@ function parseCatalog(raw: string): SavedCatalog {
       name: providerLabel(legacy.provider),
       provider: legacy.provider,
       baseUrl: normalizeBaseUrl(legacy.baseUrl),
+      proxyUrl: normalizeProxyUrl(legacy.proxyUrl),
       apiKey: legacy.apiKey,
       models: [{
         id: modelId,
@@ -236,7 +282,62 @@ function parseCatalog(raw: string): SavedCatalog {
   };
 }
 
-function defaultCatalog(): SavedCatalog { const profileId = randomUUID(), modelId = randomUUID(), fallback = { providerId: profileId, modelId }; return { version: 2, activeProviderId: profileId, activeModelId: modelId, assignments: { agent: fallback, roleplay: fallback, drafter: fallback, inline: fallback, writer: fallback, reviewer: fallback, summarizer: fallback }, providers: [{ id: profileId, name: "OpenAI", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "", models: [{ id: modelId, name: "gpt-4.1-mini", pricing: defaultPricing("openai-compatible", "gpt-4.1-mini") }] }] }; }
+/** Seed catalog when no providers.json exists: OpenAI + DeepSeek with official defaults. */
+function defaultCatalog(): SavedCatalog {
+  const openAiId = randomUUID();
+  const openAiModelId = randomUUID();
+  const deepseekId = randomUUID();
+  const deepseekFlashId = randomUUID();
+  const deepseekProId = randomUUID();
+  const fallback = { providerId: openAiId, modelId: openAiModelId };
+  return {
+    version: 2,
+    activeProviderId: openAiId,
+    activeModelId: openAiModelId,
+    assignments: {
+      agent: fallback,
+      roleplay: fallback,
+      drafter: fallback,
+      inline: fallback,
+      writer: fallback,
+      reviewer: fallback,
+      summarizer: fallback,
+    },
+    providers: [
+      {
+        id: openAiId,
+        name: "OpenAI",
+        provider: "openai-compatible",
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "",
+        models: [{
+          id: openAiModelId,
+          name: "gpt-4.1-mini",
+          pricing: defaultPricing("openai-compatible", "gpt-4.1-mini"),
+        }],
+      },
+      {
+        id: deepseekId,
+        name: "DeepSeek",
+        provider: "deepseek",
+        baseUrl: "https://api.deepseek.com",
+        apiKey: "",
+        models: [
+          {
+            id: deepseekFlashId,
+            name: "deepseek-v4-flash",
+            pricing: defaultPricing("deepseek", "deepseek-v4-flash"),
+          },
+          {
+            id: deepseekProId,
+            name: "deepseek-v4-pro",
+            pricing: defaultPricing("deepseek", "deepseek-v4-pro"),
+          },
+        ],
+      },
+    ],
+  };
+}
 function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
 function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();

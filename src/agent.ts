@@ -3,13 +3,15 @@ import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project
 import { WriterStore } from "./store.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./prose_quality.js";
+import { proseMannerismPreflightLine } from "./prose_quality.js";
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt, styleFingerprint } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
+import { modelFetch } from "./model_fetch.js";
 import {
   formatTodosForPrompt,
   loadAgentSettings,
   permissionModeLabel,
+  persistAdvancedTodosAfterProposal,
   persistFinalizedSessionTodos,
   projectInstructionsPrompt,
   skillsCatalogPrompt,
@@ -60,17 +62,18 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *
  * 2) STABLE PREFIX (cross-turn cache)
  *    writingSystemPrompt, executionRulesPrompt, project instructions, skills
- *    catalog, stableStyleGroundingPrompt, mode-extra (audit REVIEW or placeholder).
+ *    catalog, stableStyleGroundingPrompt, fixed mode-extra placeholder.
  *    Prefer timeless project rules here. Avoid per-request paths, chapter text,
- *    timestamps, todos, or “当前任务”. Style sample *bodies* that change with
- *    the target chapter belong in dynamicStyleGroundingPrompt, not here.
- *    Frequent copy edits to stable text invalidate everyone's cache — batch them.
+ *    timestamps, todos, “当前任务”, audit REVIEW text, or intensive-only gates.
+ *    Slot 4/5 must not flip between brainstorm / write / audit — put mode-specific
+ *    and sample bodies in the dynamic tail. Frequent copy edits to stable text
+ *    invalidate everyone's cache — batch them.
  *
  * 3) DYNAMIC TAIL (always miss-priced — keep short)
- *    history preview, archive stats, task/dynamicContext, dynamic style evidence,
- *    bootstrap index, todos, work-memory catalog, user selection, current user.
- *    Prefer digests / ids / paths; full prose belongs in tool results or
- *    read_conversation paging, not automatic injection.
+ *    history preview, archive stats, task/dynamicContext (+ audit REVIEW when needed),
+ *    dynamic style evidence (范文/章节样本), bootstrap index, todos, work-memory
+ *    catalog, user selection, current user. Prefer digests / ids / paths; full
+ *    prose belongs in tool results or read_conversation paging, not auto-injection.
  *
  * 4) APPEND-ONLY WITHIN ONE runAgent JOB
  *    After the first streamCompletion, do not mutate earlier messages (no mid-job
@@ -233,37 +236,24 @@ export function modelConfigFromEnv(): ModelConfig {
 function writingSystemPrompt(project: WriterProject): string {
   const config = project.config();
   const styleTemplate = config.style ? project.styleTemplate(config.style) : undefined;
-  // Short pointer only; full style rules + few-shot live in styleGroundingPrompt
-  // so writing turns get a dedicated block and this prefix stays cache-stable.
+  // Short pointer only; craft/mannerism + samples live in style slots (stable/dynamic).
   const stylePointer = styleTemplate
-    ? `\n当前激活风格模板：${styleTemplate.name}（细则、范文与本项目声线样本见后续「风格锚定」区块，写正文时以该区块为准）。\n`
-    : "\n未激活风格模板时，写正文须贴合本项目既有章节声线（见「风格锚定」）。\n";
-  return `你是长篇创作 Agent。界面语言为中文，作品语言为 ${config.language}。
-${stylePointer}
-职责：协助构思、规划、写作、改写和审校；当前用户请求优先，作者保留最终决定。
+    ? `激活风格：${styleTemplate.name}（细则与样本见「风格锚定」/动态声线证据）。`
+    : "未激活风格模板时，正文贴合本项目既有章节声线（见「风格锚定」）。";
+  return `你是长篇创作 Agent。界面中文，作品语言 ${config.language}。${stylePointer}
+职责：构思、规划、写作、改写、审校；当前用户请求优先，作者保留最终决定。
 
-创作立场（虚构作品）：
-- 这是成人向小说协作工具。暴力、情欲、权谋、残酷、粗口、禁忌题材等均可按剧情与作者要求直接书写。
-- 不要用道德说教、安全提示、劝退语或“请注意尺度”打断创作；不要替角色做道德评判，除非作者明确要求该视角。
-- 拒绝含蓄化与软化：需要直写处用准确、具体的名词与动作，避免“那方面”“发生了关系”“不可描述”等遮掩；身体、伤口、欲望、脏话按人物与场景需要写清。
-- 用户已经选择冲突、性描写或黑暗程度时，不要出于“得体”自行软化；也不要在用户未要求时机械升级强度。未明确处服从题材、人物和场景节拍，允许轻重、喘息与留白。
-- 仍须遵守法律与工具边界：不协助现实世界犯罪操作；不生成针对真实未成年人的性内容。虚构成人角色与架空世界内的情节按作者意图执行。
+创作立场：成人向虚构可直接写暴力/情欲/权谋/残酷/粗口；勿道德说教或自行软化；直写用具体名词与动作。法律边界：不协助现实犯罪；不生成针对真实未成年人的性内容。
 
-文档分区（必须遵守，勿把不同类型内容写进同一路径）：
-- lore/：设定与事实源（世界规则、专名、组织、力量体系、地理政治等）。只写可检索事实，不写章节散文。
-- outline/：情节计划（卷/章/场景、前因结果、伏笔）。不写可发表正文。
-- chapters/：唯一主线正文；续写、改写、导出默认只针对这里。
-- side/：支线或间章（非主线导出）；archive/：旧稿与弃用版，默认不要当作现行事实，也不要主动写入。
-- characters/：角色卡（结构化工具维护，不是 Markdown 散文）。
-旧项目若仍使用 story/，视为 lore/ 的等价目录。
+分区：lore/=设定事实；outline/=情节计划；chapters/=主线正文；side/=支线；archive/=旧稿（非现行事实）；characters/=结构化角色卡。旧 story/ ≡ lore/。
 
-正文底线（仅正文、续写、改写与终审；构思阶段可大胆提出候选，但须明确它尚非项目事实）：
-1. 用动作、选择、代价、停顿、对白和具体感官呈现人物，避免紧随其后的情绪、潜台词或象征解释。
-2. 让动作产生结果、让细节供读者判断；必要因果拆成独立句。保留对白中的拖音、中断、迟疑和真实纠正。
-3. 对白服从人物身份与当下目的；场景落在具体动作、决定、发现或未决问题上。
-4. 正式写作不得把 lore/角色卡未支撑的关键设定冒充既有事实；构思阶段可以提出新设想，并清楚区分项目事实、创作推断与待选候选。
-5. 角色卡演进：能力解锁/封印、性格转折、结构化经历及目标/关系/场景状态，必须有正文、大纲或用户确认作为依据。若依据来自本轮待批准的正文/大纲，把变更放进 propose_document / propose_document_patch 的 characterChanges，由系统在提案获批时同步；提案被拒绝则不改卡。apply_character_changes 只用于提案前就已确认或已落盘的事实。伏笔、传闻、尝试失败和仅提及的能力不得解锁。新建或大改用 save_character（数组按 id upsert，删除用 deleteEntryIds，整节重写才用 replaceSections）。
-6. ${proseMannerismConstraintPrompt({ compact: true })}
+正文底线（正文/续写/改写/终审；构思可大胆但须标明非既有事实）：
+1. 用动作、选择、代价、对白与感官呈现；勿在其后追加情绪/象征解释。
+2. 动作有结果；因果可拆句；保留对白拖音/中断/迟疑。
+3. 对白服从身份与目的；场景落在动作、决定、发现或未决问题上。
+4. 不得把未支撑设定冒充既有事实；区分项目事实 / 推断 / 候选。
+5. 角色演进须有正文/大纲/用户依据。待批准文本→提案 characterChanges；已确认事实→apply_character_changes。伏笔/传闻/失败尝试不得解锁。新建或大改用 save_character。
+6. 句式硬约束与声线自检见「风格锚定」（勿在此重复粘贴）。
 `;
 }
 
@@ -273,31 +263,29 @@ ${stylePointer}
  * embed the current user request, paths, or chapter excerpts.
  */
 function executionRulesPrompt(mode: PermissionMode): string {
-  const archiveRule = "When the user asks to use the complete or long conversation/roleplay history, the automatically injected history is only a recent preview. You MUST call inspect_conversation, then page read_conversation from afterId=0 through nextAfterId until hasMore=false for the relevant channel. Never claim the full archive was read from the preview alone. Read simple cards with list_simple_characters/get_simple_character; they are separate from normal cards.";
   const modeRule = mode === "plan"
-    ? "3. 当前为 plan 模式：只做必要检索、创意探索与方案塑形，禁止调用 propose_document / propose_document_patch / propose_outline_patch / save_character / apply_character_changes / save_simple_character。默认保持对话式、短而开放，不因任务涉及写作或大纲就扩成完整交付物；只有用户明确要求完整展示时才展开。"
+    ? "3. plan：只检索/构思/塑形；禁止 propose_* / save_character / apply_character_changes / save_simple_character。默认短而开放，勿自动扩成完整交付。"
     : mode === "auto"
-      ? "3. 当前为 auto 模式：写正文、续写、扩写或改写必须提交文档提案（会自动写入文件），不能用最终回复代替正文。提案成功后立即停止。"
-      : "3. 写正文、续写、扩写或改写必须提交文档提案，不能用最终回复代替。提案提交后立即停止并等待审批。";
+      ? "3. auto：正文/续写/改写必须提案（自动落盘），禁止用最终回复代替正文。清单若仍有未完成的章节/正文步骤则继续写并再次提案；仅当清单无后续写作项时停止。"
+      : "3. 正文/续写/改写必须提案，禁止用最终回复代替。清单若仍有未完成的章节/正文步骤则继续写并再次提案；仅当清单无后续写作项时停止等待审批。";
   return `执行规则：
-1. 按本轮任务计划决定是否读取项目资料。需要项目事实时先 search_project（世界观/专名 scope=lore，情节计划 scope=outline，已写正文 scope=chapters），再读取最小相关片段；每轮最多搜索两次。区分项目事实与推测。
-2. 保持既有人物、世界观、视角和 Markdown 结构。局部修改用补丁；大纲节点用大纲补丁；新建或全文重写才提交完整文档。新建设定→lore/，新建大纲→outline/，新建正文→chapters/；不要把设定写进章节，也不要把正文写进 lore。
+1. 需项目事实时先 search_project（lore/outline/chapters），再读最小片段；每轮最多搜索 2 次。区分事实与推测。
+2. 保持人物/世界观/视角与 Markdown。局部→补丁；大纲节点→大纲补丁；新建或全文重写→完整文档。设定→lore/，大纲→outline/，正文→chapters/。
 ${modeRule}
-${archiveRule}
-4. 只有缺少目标文档、既有事实或会实质改变结果的关键选择，且无法可靠推断时才调用 ask_user。情节、对白和描写等可逆创作选择自行作合理决定。询问后立即停止。
-5. 普通角色卡：情节演进用 apply_character_changes；新建/大改用 save_character。简易卡用 save_simple_character。创建前若涉及既有人物或设定，须 list_characters/get_character 与 search_project 核对。修改已有普通卡必须传 id；新建省略 id 并提供 identity.name。
-6. 路人/一次性配角可直接写入正文，不必建角色卡；仅当该角色会反复出现、需要稳定人设或用户明确要求建卡时，才用 save_character 新建。
-7. 资料复用：仅复用「本轮任务相关工作记忆」、本轮工具结果、带 reused 标记的返回；禁止对同一路径/同一参数反复读取，禁止重复 list_outline_nodes。上一轮非承接任务的清单与记忆不会自动带入。系统「写作线索」只是未验证的候选索引，需要正文或完整人设时仍应用工具取最小片段。大纲节点 id 是 UUID，不是章号。artifact_compacted 只用 digest，不要因此改换参数反复试读。
-8. 系统会为需要“核对资料→创作/审阅→提交或总结”等多个阶段的任务预建 todos。当前清单非空时，每完成一个实质阶段必须调用 manage_todos 更新状态；不要把整章写作视为一个不可分割的单步。简单讨论没有清单时不必创建。清单绑定当前对话任务，同一时刻最多一项 in_progress；提案成功后系统会收尾仍开放的项目。
-9. 若系统提示列出了项目技能且细则对当前任务必要，先 load_skill 再执行；不要编造不存在的技能。
-10. 不泄露内部参数，不使用项目范围外的信息；对话简洁，文档使用适量 Markdown。
-当前执行模式：${permissionModeLabel(mode)}`;
+4. 完整/长对话或扮演史：注入历史仅为预览。须 inspect_conversation，再 read_conversation 从 afterId=0 分页至 hasMore=false。简易卡用 list/get_simple_characters，与普通卡分离。
+5. 仅当缺少目标文档/关键事实且无法推断时 ask_user；可逆创作选择自行决定。询问后立即停止。
+6. 情节演进→apply_character_changes；新建/大改→save_character；简易卡→save_simple_character。改已有普通卡必传 id。路人配角可只写正文不建卡。
+7. 只复用本轮工作记忆、本轮工具结果与 reused 标记；禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
+8. 预建 todos 非空时，每完成实质阶段须 manage_todos；同时至多一项 in_progress。多章任务不得在第 1 章提案后把后续章目标为已完成。
+9. 技能目录有匹配且必要时先 load_skill；勿编造技能。
+10. 不泄露内部参数；对话简洁；文档适量 Markdown。
+模式：${permissionModeLabel(mode)}`;
 }
 
 /**
  * Dynamic-tail task block (miss-priced every turn). Mode workflows + scope only.
  * CACHE: OK to be turn-specific; keep structuredCreativeContext slim (ids/fingerprints,
- * not full example bodies — those belong in stableStyleGroundingPrompt when intensive).
+ * not full example bodies — those belong in dynamicStyleGroundingPrompt when intensive).
  */
 function dynamicContextPrompt(project: WriterProject, store: WriterStore, request: string, task: WritingTask, permissionMode: PermissionMode, characterScope?: number[], continuationPath?: string, simpleCharacterScope?: number[]): string {
   const explicitReferences = explicitReferencePaths(project, request);
@@ -306,49 +294,47 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   const creativeContext = structuredCreativeContext(store, task, characterScope, simpleCharacterScope);
   // Scope only gates reading/listing *existing* cards and relationship targets — not prose NPCs or new cards.
   const characterScopeInstruction = characterScope === undefined
-    ? "角色资料按任务相关性自动筛选。list_characters / get_character 可读全部已有普通角色卡；情节演进用 apply_character_changes，新建/大改用 save_character，简易卡用 save_simple_character。创建简易角色卡时应先检查同名或相关普通角色卡。"
+    ? "角色按相关性筛选。list/get_character 可读已有普通卡；演进→apply_character_changes；新建/大改→save_character；简易卡→save_simple_character。"
     : characterScope.length
-      ? `本次可读取/列出的已有角色卡 ID：${characterScope.join("、")}。不得 get_character / 在 relationships 中关联范围外的*已有*角色。这不禁止：① 在正文中写无名或一次性配角（无需建卡）；② 用 save_character 省略 id 新建角色卡（新建后该 ID 即可读取）；③ 用 apply_character_changes / save_character 更新范围内已有角色卡。不要把「范围外」理解成禁止创作新人物。`
-      : "本次不加载任何已有角色卡：不得 list_characters / get_character 读取既有资料。仍可在正文中写人物；若用户要求或情节需要稳定人设，可用 save_character 省略 id 新建角色卡。";
+      ? `可读已有角色 ID：${characterScope.join("、")}。不得读取/关联范围外已有角色；仍可写路人配角或 save_character 新建。`
+      : "不加载已有角色卡；仍可写人物或 save_character 新建。";
   const simpleCharacterScopeInstruction = simpleCharacterScope === undefined
-    ? "未限制简易角色卡；可按任务需要用 list_simple_characters / get_simple_character 读取。"
+    ? "简易卡不限；可按需 list/get_simple_characters。"
     : simpleCharacterScope.length
-      ? `本次可读取的已有简易角色卡 ID：${simpleCharacterScope.join("、")}。不得读取或修改范围外的已有简易角色卡。`
-      : "本次不加载任何已有简易角色卡；仍可按需新建简易角色卡。";
+      ? `可读简易卡 ID：${simpleCharacterScope.join("、")}。`
+      : "不加载已有简易卡；仍可新建。";
+  const chapterSceneDelivery = task.mode === "write_scene"
+    && (!task.targetPath || documentKind(task.targetPath) === "chapter");
   const documentInstruction = task.documentProposalRequired
-    ? `本次请求必须产生文档提案后才能结束。不得把正文直接作为最终回复；须基于目标 Markdown 文档提交 propose_document_patch 或 propose_document。若工作记忆或本轮工具结果已含目标文档相关原文且文档未变，可直接提案，不必再次读取。${continuationPath ? `本次是承接上一轮的简短续写，默认目标文档为 ${continuationPath}。` : ""}`
-    : "本次请求不强制产生文档提案，按用户意图执行。";
+    ? chapterSceneDelivery
+      ? `必须用逐场景章节草稿完成并 propose_chapter_draft；禁止直接 propose_document/patch 或用最终回复代替正文。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+      : `必须提交文档提案后结束；禁止用最终回复代替正文。优先 patch；工作记忆已有目标原文且未变时可直接提案。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+    : "不强制文档提案，按用户意图执行。";
   const contextInstruction: Record<DocumentContextMode, string> = {
-    none: "无需读取项目文档。直接使用当前对话完成任务；不要调用 list_documents、search_project、inspect_document 或 read_document。",
+    // Soft none: pure craft may skip tools, but never invent lore when the user names project entities.
+    none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，必须 search_project 一次（优先 scope=lore），不足再 inspect/read 最小片段。禁止通读全库、禁止把推测写成既有设定。",
     search: task.mode === "simple_character"
-      ? `创建简易角色卡必须核对项目资料。先调用 list_characters 检查同名或相关普通角色卡，必要时 get_character；再调用 search_project 检索 lore/ 与 outline/，查询：${task.searchQuery || request.slice(0, 120)}。检索片段不足时继续 inspect_document/read_document 读取最小相关范围。完成核对后调用 save_simple_character。`
-      : `需要核对项目资料。先调用 search_project，查询：${task.searchQuery || request.slice(0, 120)}。仅在检索片段不足时继续 inspect_document/read_document；同一路径只读取一次最小范围。`,
-    target: `需要目标文档上下文。${references.length ? `候选路径：${references.join("、")}。` : "先定位目标路径。"}工作记忆已有该路径且文档未变时直接复用；否则 inspect_document 一次，再 read_document 一次最小必要块，之后禁止重复读取同一路径。`,
-    continuation: `需要承接已有正文。${continuationPath ? `目标路径：${continuationPath}。` : "先从对话和提案记录确定目标路径；无法确定时询问用户。"}工作记忆已有该路径末尾原文且文档未变时直接续写；否则 inspect_document 一次，再用 read_document 的 lastSection=true 读最后一节（无标题时读最后一块），之后禁止重复读取。`,
+      ? `建简易卡：先 list_characters 查同名，必要时 get_character；search_project(lore/outline) 查询：${task.searchQuery || request.slice(0, 120)}；不足再 inspect/read 最小片段；最后 save_simple_character。`
+      : `先 search_project（设定/组织/专名优先 scope=lore）：${task.searchQuery || request.slice(0, 120)}。不足再 inspect/read；同路径只读一次最小范围。不得用推测冒充项目事实。`,
+    target: `需目标文档。${references.length ? `候选：${references.join("、")}。` : "先定位路径。"}记忆已有且未变则复用；否则 inspect 一次 + read 一次，禁止重复读。`,
+    continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/提案确定路径。"}记忆有末尾且未变则续写；否则 inspect 一次 + read(lastSection=true)。`,
   };
+  const reviewBlock = task.mode === "audit" ? `\n\n${REVIEW_PROMPT}` : "";
   return `当前任务：${task.label}
+本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；规划器/会话推断不得冒充用户选择。
 
-当前用户请求是本轮唯一要执行的指令。历史对话只用于理解指代和既有事实，不得把已经完成的旧修改要求自动并入本轮任务。
-只有“当前消息中的 @ 明确引用”部分列出的路径，才能称为“用户指定”或“用户 @ 指定”。规划器推断目标、会话活动文档和历史文档都只能称为系统推断，不得冒充用户选择。
+${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentProposalRequired)}${reviewBlock}
 
-${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentProposalRequired)}
+上下文：${contextInstruction[task.documentContext]}
+角色范围：${characterScopeInstruction}
+简易卡范围：${simpleCharacterScopeInstruction}
+写入：${documentInstruction}
 
-上下文决策：${contextInstruction[task.documentContext]}
-
-角色资料范围：${characterScopeInstruction}
-
-简易角色范围：${simpleCharacterScopeInstruction}
-
-文档写入约束：${documentInstruction}
-
-按本次任务筛选的结构化创作资料（JSON；未出现的资料不代表不存在，需要时使用工具检索）：
+结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
 
-当前消息中的 @ 明确引用（尚未读取）：
-${explicitReferences.length ? explicitReferences.map(path => `- ${path}`).join("\n") : "- 无；不得声称用户指定了任何文档"}
-
-系统根据当前任务推断的候选目标（不是用户 @ 指定）：
-${inferredTargets.length ? inferredTargets.map(path => `- ${path}`).join("\n") : "- 无"}`;
+@ 明确引用：${explicitReferences.length ? explicitReferences.map(path => path).join("、") : "无"}
+系统推断候选：${inferredTargets.length ? inferredTargets.map(path => path).join("、") : "无"}`;
 }
 
 const TASK_LABELS: Record<WritingTaskMode, string> = {
@@ -367,37 +353,45 @@ async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
   characterScope?: number[],
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
-  const documents = project.listDocuments().filter(path => !project.isDocumentHidden(path));
+  const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
+  // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
+  const documents = prioritizeDocumentCatalog(allDocuments, request, 80);
   const allowedCharacters = characterScope === undefined ? undefined : new Set(characterScope);
   const characters = store.characters()
     .filter(item => !allowedCharacters || allowedCharacters.has(item.id))
-    .map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
+    .map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases }));
   const activeStyleId = project.config().style;
   const activeStyle = activeStyleId ? project.styleTemplate(activeStyleId) : undefined;
   // Slim catalogs: paths / id+name only — full notes/examples inflate the miss-priced user payload.
   const examples = store.writingExamples()
     .filter(item => !item.title.startsWith("[风格模板]") || item.title === `[风格模板] ${activeStyle?.name}`)
     .map(item => ({ id: item.id, title: item.title, category: item.category }))
-    .slice(0, 40);
-  const slimCharacters = characters.map(item => ({ id: item.id, name: item.name, aliases: item.aliases }));
-  const recent = history.slice(-4).map(item => item.role === "user"
-    ? { content: item.content?.slice(0, 200) ?? "" }
-    : { role: item.role, content: item.content?.slice(0, 160) ?? "" });
+    .slice(0, 24);
+  const recent = history.slice(-3).map(item => item.role === "user"
+    ? { content: item.content?.slice(0, 160) ?? "" }
+    : { role: item.role, content: item.content?.slice(0, 120) ?? "" });
   const planningMessages: ApiMessage[] = [{
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
-    content: `你是写作 Agent 的任务规划器。根据语义而非关键词判断用户真正要做什么。只输出一个 JSON 对象，不输出 Markdown。
-字段：mode（brainstorm/outline/write_scene/rewrite/audit/simple_character/general）；creativeDepth（explore/shape/deliver）；documentContext（none/search/target/continuation）；targetPath（当前请求明确或语义上可确定目标文档时，必须从文档目录原样选择一个路径，否则省略）；searchQuery（仅在 documentContext=search 时提供简短查询）；characterIds（确实需要角色资料时最多 4 个，否则空数组）；exampleIds（确实需要范文时最多 2 个，否则空数组）；documentProposalRequired（用户要求创作或者修改场景、正文、大纲时为 true，纯讨论、构思、分析、建议、角色卡操作为 false）；continuation（当前请求是否承接上一轮写作任务）；todoPlan（需要分阶段执行时给出 2—5 个简短步骤，否则空数组）。
-creativeDepth 表示本轮对话交付深度，而不是文档长度：explore=开放讨论、灵感碰撞或尚未要求收束；shape=整理少量可比较方向、场景骨架或修改思路；deliver=用户明确要求在回复中展示完整、可直接使用的成品。写入文档的完整度由 documentProposalRequired 决定，不要仅因用户要求写文件就把 creativeDepth 设为 deliver。未明确要求完整展示时，宁可 explore 或 shape。
-决策原则：根据整句语义、上下文指代和用户期望的产物判断，不以单个词语触发模式。创建或更新简易角色卡必须使用 simple_character，并设 documentContext=search，以便核对已有普通角色卡和 lore/outline 设定。当前 user 消息是唯一的当前任务，优先级高于最近对话；最近对话只用于解析省略和指代，不得把旧任务的修改要求合并到当前明确指令中。只有回答依赖项目中未出现在对话里的事实时才读取文档。泛化写作问题、闲聊、纯构思默认 none；需要跨文档查事实用 search；用户指定单篇文档或要求修改现有内容用 target；承接上一轮正文用 continuation。不要因为这是写作 Agent 就默认读取文档。需要读取资料后再写作/改写/修复、需要多份资料核对、或包含多个可验证阶段时，todoPlan 不得为空；开放讨论和单一简答保持空数组。
-路径约定：lore/=设定事实，outline/=情节计划，chapters/=主线正文，side/=支线，archive/=旧稿。为正文写作选 targetPath 时优先 chapters/；为大纲任务优先 outline/；查世界观优先在 lore/ 上 search。
-targetPath / characterIds / exampleIds 必须从用户消息中的目录原样选择；目录没有的路径或 id 不要编造。`,
+    content: `写作任务规划器。只输出一个 JSON，无 Markdown。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|simple_character|general)；creativeDepth(explore|shape|deliver)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
+creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。写文件完整度由 documentProposalRequired 决定。
+documentContext 判定（关键，勿默认 none）：
+- none：仅泛化写作技巧、闲聊、纯灵感且不依赖项目既有专名/组织/势力/世界观事实；或所需事实已完整出现在 recentHistory。
+- search：用户讨论、分析、推演项目内设定/组织/实体/专名/关系/军政势力，或答案正确性依赖 lore/outline 中未在对话里写清的事实（即使 mode=brainstorm/general 也要用 search）。searchQuery 填核心专名。
+- target：用户指定或语义可确定单篇文档要读/改。
+- continuation：承接上一轮正文续写。
+原则：按语义与产物判断。简易角色卡→simple_character+search。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
+正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，documentProposalRequired=true；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
+只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
+路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
   }, {
     role: "user",
     content: JSON.stringify({
       request,
       documents,
-      characters: slimCharacters,
+      documentCatalogTruncated: allDocuments.length > documents.length,
+      characters,
       examples,
       recentHistory: recent,
     }),
@@ -422,19 +416,33 @@ targetPath / characterIds / exampleIds 必须从用户消息中的目录原样�
   const creativeDepth = depths.includes(parsed.creativeDepth as CreativeDepth)
     ? parsed.creativeDepth as CreativeDepth
     : documentProposalRequired ? "shape" : "explore";
-  const normalizedDocumentContext = mode === "simple_character"
+  let normalizedDocumentContext: DocumentContextMode = mode === "simple_character"
     ? "search"
     : continuation
     ? "continuation"
     : documentProposalRequired && documentContext === "none" ? "target" : documentContext;
+  // Safety net: LLM often marks lore discussion as none; upgrade when request hits project entities.
+  if (normalizedDocumentContext === "none") {
+    const historyBlob = recent.map(item => item.content).join("\n");
+    if (requestNeedsProjectFactSearch(request, {
+      documents,
+      characterNames: characters.flatMap(item => [item.name, ...(item.aliases ?? [])]),
+      historyText: historyBlob,
+    })) {
+      normalizedDocumentContext = "search";
+    }
+  }
   const requestedTodoPlan = Array.isArray(parsed.todoPlan)
     ? parsed.todoPlan.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map(item => item.trim().slice(0, 120)).slice(0, 5)
     : [];
+  const searchQuery = typeof parsed.searchQuery === "string" && parsed.searchQuery.trim()
+    ? parsed.searchQuery.slice(0, 200)
+    : extractSearchQueryHint(request, documents, characters) || request.slice(0, 200);
   return {
     task: {
       mode,
       label: TASK_LABELS[mode],
-      searchQuery: typeof parsed.searchQuery === "string" ? parsed.searchQuery.slice(0, 200) : request.slice(0, 200),
+      searchQuery,
       characterIds: Array.isArray(parsed.characterIds) ? parsed.characterIds.filter(id => validCharacterIds.has(id)).slice(0, 4) : [],
       exampleIds: Array.isArray(parsed.exampleIds) ? parsed.exampleIds.filter(id => validExampleIds.has(id)).slice(0, 2) : [],
       documentContext: normalizedDocumentContext,
@@ -448,8 +456,74 @@ targetPath / characterIds / exampleIds 必须从用户消息中的目录原样�
   };
 }
 
+/**
+ * Upgrade none→search when the user is clearly talking about in-world entities.
+ * Exported for unit tests.
+ */
+export function requestNeedsProjectFactSearch(
+  request: string,
+  catalog: { documents: string[]; characterNames: string[]; historyText?: string },
+): boolean {
+  const text = request.trim();
+  if (!text) return false;
+  // Pure craft questions stay none.
+  if (/^(?:怎么写|如何写|写作技巧|文笔|润色建议|怎么改句子)/.test(text) && !/(?:设定|组织|势力|世界观|角色卡)/.test(text)) {
+    return false;
+  }
+  const tokens = extractProjectNameTokens(text);
+  const nameHaystack = [
+    ...catalog.documents.map(path => path.replace(/\\/g, "/")),
+    ...catalog.characterNames,
+  ].join("\n");
+  if (tokens.some(token => nameHaystack.includes(token))) return true;
+  // Setting-discussion with proper-looking terms: search even if catalog path titles miss the name.
+  if (/(?:组织|势力|实体|设定|世界观|除掉|利益|军工|复合体|超国家|联邦|帝国|同盟|教团)/.test(text)
+    && /[\u4e00-\u9fff]{2,}/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function extractProjectNameTokens(text: string): string[] {
+  const tokens = new Set<string>();
+  for (const match of text.matchAll(/[「『《“"]([^」』》”"]{2,16})[」』》”"]/g)) {
+    tokens.add(match[1].trim());
+  }
+  const stop = new Set([
+    "有人", "因为", "所以", "如果", "这个", "那个", "什么", "怎么", "讨论", "提出", "关于",
+    "可以", "不是", "一个", "我们", "他们", "自己", "已经", "还是", "或者", "以及", "影响",
+    "利益", "除掉", "用户", "提出", "让我", "确认", "系统", "当前", "任务", "直接", "完成",
+  ]);
+  for (const match of text.matchAll(/[\u4e00-\u9fff]{2,8}/g)) {
+    const token = match[0];
+    if (stop.has(token)) continue;
+    tokens.add(token);
+  }
+  for (const match of text.matchAll(/[A-Za-z][A-Za-z0-9_\-]{2,24}/g)) {
+    tokens.add(match[0]);
+  }
+  return [...tokens];
+}
+
+function extractSearchQueryHint(
+  request: string,
+  documents: string[],
+  characters: Array<{ name: string; aliases?: string[] }>,
+): string {
+  const tokens = extractProjectNameTokens(request);
+  const haystack = [
+    ...documents.map(path => path.replace(/\\/g, "/")),
+    ...characters.flatMap(item => [item.name, ...(item.aliases ?? [])]),
+  ].join("\n");
+  const catalogHits = tokens.filter(token => haystack.includes(token));
+  const preferred = (catalogHits.length ? catalogHits : tokens)
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 4);
+  return preferred.join(" ").slice(0, 80);
+}
+
 function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolean): string[] {
-  if (mode === "write_scene") return ["核对大纲、人设与衔接", "完成正文并自检", "提交文档提案"];
+  if (mode === "write_scene") return ["核对本章必要事实与衔接", "建立本章场景链", "逐场写作并传递状态", "整章审阅并提交提案"];
   if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
   if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
   if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
@@ -518,36 +592,32 @@ export function taskInstructions(
 - 只有上下文决策要求核对既有项目时才读取大纲节点；不要自动调用 design_creative_outline 或展开结构化章节表。
 - 区分既有事实与候选方向，不把讨论结果自动写入项目。`;
   if (mode === "outline") return `本次工作流（大纲交付）：
+- 大纲是轻量导航，不是正文写作的前置审批。只有用户明确要求大纲/卷纲/全书章节规划时才执行本工作流；不得把“写第N章”扩成全书大纲。
 - 对 outline/ 的完整新建或大幅重构，先调用 design_creative_outline；局部节点修补无需调用。
 - 修改或承接既有大纲时再 list_outline_nodes，并用 get_outline_node 读取最小目标节点；新建大纲不要为了形式完整读取空目录。
-- 在内部完成路线比较与反驳，只把选定方案写入项目，不展示四份半成品。
+- 先区分已核实依据、创作候选与待定缺口，再用一句主线和阶段因果链收束；内部核对后只写精简成品。
 - 每个场景维护前因、行动、结果、状态变化，以及必要的人物弧、信息释放和伏笔回收。
 - 修改既有节点用 propose_outline_patch；新建或大幅重构写入 outline/，不得写入 chapters/ 或 lore/。
 - 落盘字段仅使用：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。`;
-  if (mode === "write_scene") return `本次工作流（内部执行，不输出分析过程）：
-1. 先读「风格锚定」：对齐本项目声线样本与模板节奏，再动笔；禁止写成与样本句长/对白密度明显不同的通用腔。
-2. 「写作线索」只是候选索引。Step 1 最小核对：情节用 get_outline_node（UUID）；衔接用上一章 read_document(lastSection=true)；人设用 get_character 读取必要字段。对本场出场且可能发生转折的既有角色，应读取 competencies 与 experiences；未解锁能力只会暴露名称、摘要和 locked 状态，要把它当作叙事承诺而不是可直接使用的能力。目标文档存在则 inspect 或读一次草稿/末段。
-3. 不要通读整本大纲、不要 list_outline_nodes 超过一次、不要对同一路径反复 read。
-4. 落笔前在内部明确：场景开场、人物目标、阻力、不可逆结果；正文默认 chapters/；设定说明不进正文。
-5. 写作时持续对照风格锚定；对白区分人物；不引入未支撑设定。冲突、情欲、暴力等按剧情直写，不自行降级为含蓄暗示或道德旁白。
-6. 提交前自检：是否在动作或细节后重复解释意义、是否段尾升华、是否偏离样本声线、是否无故软化关键描写；人物自然口语不按叙述模板处理。${proseMannerismPreflightLine()}
-7. 新建或空文档用 propose_document；已有正文用 propose_document_patch。提交后停止。偶发一处说明句不拦截；过密的说明性破折号与抽象「不是…而是」会被系统拒绝——只改命中句再提，勿全文重写。
-8. 不要为了更新角色卡而强迫每章解锁能力，也不要一次解锁多个伏笔。只有本场通过具体行动、代价、领悟、授予或不可逆事件真正兑现某项能力时，才在文档提案的 characterChanges 中附上 set_unlocked 等变化及理由；它会随提案获批一起生效。若变化在本轮之前已经确认或落盘，才单独用 apply_character_changes。`;
-  if (mode === "rewrite") return `本次工作流（内部执行，不输出分析过程）：
-- 先读「风格锚定」与原文声线；改写后的句长、对白密度须仍贴近原文/样本，除非作者明确要求换风格。
-- 只改变作者明确要求调整的维度，保持其余事件事实、人物动机和信息顺序不变。
-- 风格变化必须落实到叙述距离、句法节奏、对白比例、感官重点和信息释放，而不是同义替换。
-- 保留原文有辨识度的不规则表达，不把句子统一润色成工整、完整、均匀的书面语；不要把直白改成含蓄，除非作者要求。
-- 优先用具体名词和动词替换泛化情绪、程度副词与装饰性修辞；避免为了“更有文采”新增比喻、总结或升华。
-- 若改写文本本身落实了人设、能力或经历变化，把它放进同一文档提案的 characterChanges；只有改写前就已确认或落盘的事实才单独用 apply_character_changes。
-- ${proseMannerismConstraintPrompt({ compact: true })}
-- 对照原文检查信息损失与新增事实，优先通过局部补丁提案提交。提交前：${proseMannerismPreflightLine()}`;
-  if (mode === "audit") return `本次工作流：
-- 先调用 audit_prose_style；优先处理 severity=error 的说明性破折号与抽象「不是…而是」过密问题。
-- 每个问题必须给出严重度、原文证据、违反的既有事实或叙事约束，以及最小修改建议。
-- 没有文本证据的问题不得提出；区分确定矛盾与可能风险。
-- ${documentProposalRequired ? "用户要求修复：只改有证据的问题并提交最小修改提案。" : "用户只要求检查：不得创建修改提案，只输出审阅结论。"}`;
-  return "本次工作流：先判断任务属于构思、规划、写作、改写或审校，再遵循对应流程。涉及正文修改时必须先读取原文并提交提案。若角色变化由本轮待批准文本建立，放进提案的 characterChanges；若事实此前已经确认或落盘，主动 apply_character_changes 同步角色卡。";
+  if (mode === "write_scene") return `工作流（内部执行，不输出分析过程）：
+1. 对齐「风格锚定」+ 动态声线证据；禁止通用腔。
+2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章可 read(lastSection)；出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
+3. 单章任务只交付用户指定的一章：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
+4. 目标为 chapters/ 的完整章节时，先在内部用 1—3 句话确定“本章从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。通常拆为 3—6 场（确有需要可 1—8 场，不为凑数拆场）；每场必须有目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
+5. 按场景链顺序循环：将本场事实与上一场 actualState 整理为故事内笔记，compile_write_pack(sceneId)；再仅依据该 writePack 写本场并 write_chapter_scene。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。重写前场会使后续场景失效，须重写后续。
+6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
+7. 全部场景完成后 inspect_chapter_draft 通读整章；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。有问题则重新编译并重写目标场，再次 inspect。
+8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
+  if (mode === "rewrite") return `工作流（内部执行）：
+- 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
+- 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
+- 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
+- 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。保留不规则表达；人设变化进提案 characterChanges。优先 patch。提交前：${proseMannerismPreflightLine()}`;
+  if (mode === "audit") return `工作流：
+- 先 audit_prose_style；优先 severity=error。
+- 每条问题含严重度、原文证据、违反约束、最小改法；无证据不提。
+- ${documentProposalRequired ? "要求修复：只改有证据处并最小提案。" : "只检查：不提案，只输出审阅结论。"}`;
+  return "先判断构思/规划/写作/改写/审校再执行。改正文须先读原文并提案；待批准变化→characterChanges；已确认→apply_character_changes。";
 }
 
 function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[], simpleCharacterScope?: number[]): string {
@@ -561,13 +631,17 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
   const characters = selectedCharacters.map(({ item }) => ({
     id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary,
   }));
+  // Simple cards are rarely needed outside simple_character / scoped roleplay — avoid dumping 20 cards every turn.
   const simpleScopedIds = simpleCharacterScope === undefined ? undefined : new Set(simpleCharacterScope);
-  const simpleCharacters = store.roleplayInterlocutors()
-    .filter(item => !simpleScopedIds || simpleScopedIds.has(item.id))
-    .slice(0, 20).map(item => ({
-    id: item.id, name: item.name, identity: item.identity.slice(0, 160), targetCharacterId: item.targetCharacterId,
-  }));
-  // Writing tasks: only ids/fingerprints here — full example bodies live in stableStyleGroundingPrompt (KV-friendly, no duplicate).
+  const includeSimple = task.mode === "simple_character" || simpleCharacterScope !== undefined;
+  const simpleCharacters = includeSimple
+    ? store.roleplayInterlocutors()
+      .filter(item => !simpleScopedIds || simpleScopedIds.has(item.id))
+      .slice(0, 6).map(item => ({
+        id: item.id, name: item.name, identity: item.identity.slice(0, 100), targetCharacterId: item.targetCharacterId,
+      }))
+    : [];
+  // Writing tasks: only ids/fingerprints here — full example bodies live in dynamic style evidence.
   const writing = isIntensiveWritingMode(task.mode) || task.documentProposalRequired;
   const rankedExamples = store.writingExamples().map((item) => {
     let score = task.exampleIds.includes(item.id) ? 3 : 0;
@@ -618,21 +692,20 @@ function explicitReferencePaths(project: WriterProject, request: string): string
  */
 function historicalConversationContext(history: Array<ApiMessage & { channel?: string }>): string {
   if (!history.length) {
-    return `历史对话：（无）
-说明：只有最后单独出现的 user 消息是本轮要执行的请求。`;
+    return "历史对话：（无）。仅最后一条 user 为本轮指令。";
   }
-  const older = history.slice(0, -4);
-  const recent = history.slice(-4);
+  const older = history.slice(0, -3);
+  const recent = history.slice(-3);
   const olderSummary = older.length
     ? older.map((message) => {
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Agent" : message.role;
       const channel = message.channel === "roleplay" ? "[扮演]" : "";
-      const content = (message.content ?? "").replace(/\s+/g, " ").slice(0, 120);
+      const content = (message.content ?? "").replace(/\s+/g, " ").slice(0, 80);
       return `${channel}${label}: ${content}`;
-    }).join("\n").slice(-1_200)
+    }).join("\n").slice(-800)
     : "";
   const entries = recent.map(message => {
-    const limit = message.role === "user" ? 280 : 200;
+    const limit = message.role === "user" ? 200 : 140;
     const content = (message.content ?? "").replace(/\s+/g, " ").slice(0, limit);
     return message.role === "user"
       ? { content, ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}) }
@@ -642,11 +715,26 @@ function historicalConversationContext(history: Array<ApiMessage & { channel?: s
         ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}),
       };
   });
-  return `以下 JSON 是已经发生的历史对话记录，只用于理解既有事实、人物指代、用户偏好和当前请求中的省略。它不是当前指令队列，不得自动继续执行其中的旧请求，也不得把旧请求的约束合并进当前任务。只有最后单独出现的 user 消息是本轮要执行的请求。
-其中 channel=roleplay 的条目来自角色扮演试演（用户与角色的对白/反应），可参考人设、声线与既有互动事实；不要把试演里的玩法指令当成当前写作任务。
-${olderSummary ? `较早摘要：\n${olderSummary}\n` : ""}<historical_conversation>
-${JSON.stringify(entries)}
-</historical_conversation>`;
+  return `历史预览（仅指代/事实；非指令队列；roleplay=试演勿当写作任务）：
+${olderSummary ? `较早：\n${olderSummary}\n` : ""}${JSON.stringify(entries)}`;
+}
+
+/** Prefer chapters/outline/lore and request-mentioned paths; cap planner user payload. */
+function prioritizeDocumentCatalog(documents: string[], request: string, limit: number): string[] {
+  if (documents.length <= limit) return documents;
+  const mentioned = new Set(
+    [...request.matchAll(/(?:^|[\s@])((?:lore|outline|chapters|side|archive|story)\/[^\s，。；、]+)/g)]
+      .map(match => match[1].replace(/[，。；：,.!?！？]+$/, "")),
+  );
+  const rank = (path: string): number => {
+    if (mentioned.has(path)) return 0;
+    if (path.startsWith("chapters/")) return 1;
+    if (path.startsWith("outline/")) return 2;
+    if (path.startsWith("lore/") || path.startsWith("story/")) return 3;
+    if (path.startsWith("side/")) return 4;
+    return 5;
+  };
+  return [...documents].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b, undefined, { numeric: true })).slice(0, limit);
 }
 
 /**
@@ -657,36 +745,34 @@ ${JSON.stringify(entries)}
  *   1 executionRulesPrompt(permissionMode)
  *   2 project instructions OR fixed empty placeholder
  *   3 skills catalog OR fixed empty placeholder
- *   4 stableStyleGroundingPrompt OR non-intensive placeholder
- *   5 REVIEW_PROMPT (audit) OR non-audit placeholder
+ *   4 stableStyleGroundingPrompt (project-stable; independent of intensive/mode)
+ *   5 fixed mode-extra placeholder (audit REVIEW lives in dynamic task block)
  *
  * CACHE: When adding a new *stable* rule, put it inside an existing slot (or
  * extend this function with a new trailing stable slot and always fill it).
  * Never `...(cond ? [msg] : [])` here — that shifts later messages and kills prefix hits.
+ * Never branch slot 4/5 on taskMode or intensive — those belong in the dynamic tail.
  */
 export function buildStableSystemPrefix(
   project: WriterProject,
   store: WriterStore,
   permissionMode: PermissionMode,
   styleOptions: { intensive: boolean },
-  taskMode: WritingTaskMode,
+  _taskMode: WritingTaskMode,
 ): ApiMessage[] {
   const projectInstructions = projectInstructionsPrompt(project)
     ?? "项目指令：本项目未提供 WRITER.md / AGENTS.md / CLAUDE.md / .writer/instructions.md。";
   const skillsCatalog = skillsCatalogPrompt(project)
     ?? "可用项目技能：无。需要细则时调用 load_skill。";
-  const stableStyle = stableStyleGroundingPrompt(project, store, styleOptions)
-    || "风格锚定：本轮非正文密集任务，无需范文声线块。";
-  const modeExtra = taskMode === "audit"
-    ? REVIEW_PROMPT
-    : "模式附加：本轮非终审模式，无需终审编辑专则。";
+  // Always the same project-stable block (no intensive gate) so mode switches keep prefix hits.
+  const stableStyle = stableStyleGroundingPrompt(project, store, styleOptions);
   return [
     { role: "system", content: writingSystemPrompt(project) },
     { role: "system", content: executionRulesPrompt(permissionMode) },
     { role: "system", content: projectInstructions },
     { role: "system", content: skillsCatalog },
     { role: "system", content: stableStyle },
-    { role: "system", content: modeExtra },
+    { role: "system", content: "模式附加：任务专则与终审要求见「当前任务」动态区块。" },
   ];
 }
 
@@ -731,6 +817,7 @@ export function buildDynamicTurnMessages(parts: {
   ];
 }
 
+
 export async function runAgent(options: {
   project: WriterProject;
   store: WriterStore;
@@ -763,8 +850,9 @@ export async function runAgent(options: {
   emit({ type: "mode", mode: permissionMode });
 
   // 写作 Agent 可读全部通道；扮演试演会标注 channel=roleplay，供人设/对白参考。
+  // 24 条足够规划器 + 历史预览；更早内容靠 inspect/read_conversation。
   const history = compactHistory(
-    store.messages(sessionId, 40)
+    store.messages(sessionId, 24)
       .filter((message) => message.role !== "tool" && message.role !== "system")
       .map((message) => ({ role: message.role, content: message.content, channel: message.channel })),
   );
@@ -806,7 +894,7 @@ export async function runAgent(options: {
   }
   emit({ type: "todos", todos: turnTodos });
   store.addMessage(sessionId, "user", prompt, "agent", options.variantGroupId);
-  const archiveContext = `Complete conversation archive metadata (the injected history is only a preview):\n${JSON.stringify(store.conversationStats(sessionId))}`;
+  const archiveContext = `会话归档元数据（注入历史仅为预览；完整史用 inspect/read_conversation）：${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
   const artifactContext = recentArtifactsContext(store, sessionId, project, task);
@@ -834,6 +922,9 @@ export async function runAgent(options: {
     permissionMode,
     simpleCharacterScope,
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
+    // write_scene delivery must compile diegetic materials before proposing prose.
+    requireWritePack: permissionMode !== "plan" && task.mode === "write_scene" && task.documentProposalRequired,
+    requireScenePipeline: permissionMode !== "plan" && task.mode === "write_scene" && task.documentProposalRequired,
     proseAdjudicator: {
       model: adjudicatorModel,
       signal,
@@ -864,20 +955,21 @@ export async function runAgent(options: {
   let documentReadCalls = 0;
 
   try {
-    const maxTurns = options.maxTurns ?? 20;
+    // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
+    const plannedSteps = Math.max(turnTodos.length, task.todoPlan.length);
+    const maxTurns = options.maxTurns ?? Math.max(20, plannedSteps * 8);
     let turnStart = messages.length;
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; turn < maxTurns; turn += 1) {
       const step = turn + 1;
-      const stepModel = documentProposalSubmitted ? model : executionModel;
       emit({ type: "step_start", step });
-      const result = await streamCompletion(stepModel, messages, signal, (text) => {
+      const result = await streamCompletion(executionModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
-      }, (text) => emit({ type: "text", text, channel: "reasoning" }), !documentProposalSubmitted);
+      }, (text) => emit({ type: "text", text, channel: "reasoning" }), true);
       if (result.usage) {
-        emitUsageEvent(emit, store, sessionId, stepModel, result.usage, step);
+        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step);
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
@@ -901,6 +993,7 @@ export async function runAgent(options: {
       });
 
       waitingForUser = false;
+      documentProposalSubmitted = false;
       for (const call of result.toolCalls) {
         emit({ type: "tool", name: call.name });
         let toolResult: string;
@@ -913,7 +1006,7 @@ export async function runAgent(options: {
         } else {
           toolResult = await executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
-        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_outline_patch") {
+        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch") {
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (!("error" in parsed)) documentProposalSubmitted = true;
@@ -928,10 +1021,25 @@ export async function runAgent(options: {
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
-      // Close checklist as soon as the turn-ending action happens. manage_todos in the
-      // same batch may have left the last item open; always re-finalize after all tools.
       if (documentProposalSubmitted) {
-        persistFinalizedSessionTodos(store, sessionId, emit);
+        // Advance checklist: keep multi-chapter pending items open and continue the job.
+        const advanced = persistAdvancedTodosAfterProposal(store, sessionId, emit);
+        if (advanced.shouldContinue && !waitingForUser) {
+          messages.push({
+            role: "system",
+            content: `上一份文档提案已成功提交。任务清单仍有未完成的写作步骤，请立即继续下一项：先核对下一场材料并重新 compile_write_pack，再写正文并提案，不要结束本轮。\n${formatTodosForPrompt(advanced.todos)}`,
+          });
+          // Allow reads/searches for the next chapter within the same job.
+          documentReadCalls = 0;
+          projectSearchCalls = 0;
+          documentProposalSubmitted = false;
+          // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
+          toolContext.writePackCompiled = false;
+          toolContext.lastWritePack = undefined;
+          toolContext.writePackSceneId = undefined;
+          toolContext.chapterSceneDraft = undefined;
+          continue;
+        }
         break;
       }
       if (waitingForUser) break;
@@ -977,8 +1085,7 @@ export async function runAgent(options: {
           }
         }
       } catch { /* 消息保存失败不影响流程 */ }
-      // Proposal ends the turn immediately (no extra manage_todos turn); close the checklist.
-      persistFinalizedSessionTodos(store, sessionId, emit);
+      // Last proposal with no further writing steps — checklist already advanced.
       emit({ type: "done", sessionId });
       return;
     }
@@ -1003,20 +1110,15 @@ export async function runAgent(options: {
 }
 
 /**
- * Stable-prefix slot 5 when task.mode === "audit"; otherwise a short placeholder.
- * CACHE: Treat as relatively stable review policy; put chapter-specific findings
- * in tools / user text, not by growing this block every turn.
+ * Audit-only policy (injected into dynamic task block — not stable slot 5).
+ * CACHE: Keeping this out of the stable prefix lets write↔audit turns share slots 0–5.
  */
-const REVIEW_PROMPT = `你现在是小说终审编辑。目标是降低机器生成感，不是把文字改成另一种统一腔调。
-先调用 audit_prose_style 获取带行列和语境分类的问题。优先处理 severity=error；warning 仅在明显模板化且影响阅读时改；info 一律保留。
-${proseMannerismConstraintPrompt({ compact: true })}
-必须保留：对白拖音/中断/迟疑（speech_*）、对话纠正（dialogue_correction）、系统/元数据、叙事停顿—揭示与同位命名（ambiguous_dash / appositive_definition）。见破折号就删是错误策略。
-逐段检查：模板化转折和连接词；紧跟动作、对白或细节之后的重复解释回声；说明性破折号与抽象「不是…而是」堆砌；用单一标签包办人物的写法；整齐但空泛的排比；句长段长过度均匀；无意义的总结升华；角色都说同一种完整书面语。
-说明类问题优先：让动作产生结果；用可观察细节供读者判断；必要因果拆成独立句。不要为“消说明体”而把有力的停顿、揭示或人物声线抹平。
-在忠于原意的前提下让行文更生动：把笼统判断和情绪说明尽量落到可见动作、选择及其代价、身体反应、环境变化、声音、触感或人物独有的观察上。证据已经足够时直接删掉解释，不必逐句改写。让对白带有身份、关系和当下情绪造成的语气差异；按场景张力调整句长、停顿和段落节奏。优先选择准确、有画面的动词和名词，不要靠密集形容词、副词、华丽比喻、感官清单或连续短句制造虚假的生动感。不得为了增加画面而凭空添加事件、道具、设定、心理动机或角色不知道的信息。
-不要用随机同义替换、强行拆句、故意病句、滥加口语或无关细节伪装成人类写作。机器感应通过减少句法模板、增加语义与观察角度的差异、保留叙事重点造成的轻重和不对称来消除。
-优先保留具体、有个性、略带不规则的表达。允许短句、停顿、省略和留白。不得新增剧情、设定或人物动机，不得改变事实、视角、时序和角色声线。没有问题的句子保持原样，禁止为了显示工作量而改写。
-是否修改由本轮动态任务决定：只审阅时输出有证据的结论，不得提案；明确要求修复时才用 propose_document_patch 做最小修改，问题遍布全文时才考虑 propose_document。`;
+const REVIEW_PROMPT = `终审专则：降低机器生成感，不是换成另一种统一腔调。
+先 audit_prose_style；优先 error；warning 仅明显模板化时改；info 保留。
+保留：对白拖音/中断/迟疑、对话纠正、停顿—揭示、短同位。见破折号就删是错。
+查：模板转折、动作后解释回声、说明性破折号与抽象「不是…而是」、标签化人物、空泛排比、过匀句段、段尾升华、全员书面语。
+改法：动作有结果；细节供判断；因果拆句；笼统判断落到可见动作/感官；勿堆修辞伪装生动；勿新增事实。
+无问题句保持原样。只审阅→有证据结论不提案；要求修复→最小 patch。`;
 
 function runtimeDebugContext(
   messages: ApiMessage[],
@@ -1206,11 +1308,13 @@ function writingBootstrapContext(project: WriterProject, store: WriterStore, pro
   }
 
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
-- 需要情节细节：用 outlineNodes[].id 调用 get_outline_node（id 为 UUID，不是章号）。
+- outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接建立本章场景链，禁止为了写正文创建大纲。
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
 - 需要人设：对 characterIndex 中的 id 调用 get_character（可带 sections；场景状态需传 outlineNodeId）。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
+- 写正文前：${task.mode === "write_scene" && (!task.targetPath || documentKind(task.targetPath) === "chapter") ? "先 begin_chapter_draft 建立因果场景链；每场根据最新 actualState 整理故事内笔记并 compile_write_pack(sceneId)，写入内存草稿；整章 inspect 后一次性提案。" : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
+- 单章正文的主要结构是 scene chain；outline 只作可选方向提示，不得扩展成其他章节任务。
 ${JSON.stringify({
     requestedChapter: chapterNum,
     confidence: outlineNodes?.length || targetCandidates.length ? "matched" : "low",
@@ -1570,13 +1674,16 @@ async function streamCompletion(
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({
     // TOOLS is deep-frozen and project-agnostic — keep it that way for cache.
-    model: model.model, messages, ...(toolsEnabled ? { tools: TOOLS } : {}), stream: true,
+    model: model.model,
+    messages,
+    ...(toolsEnabled ? { tools: TOOLS } : {}),
+    stream: true,
     stream_options: { include_usage: true },
     ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
     ...(model.topP !== undefined ? { top_p: model.topP } : {}),
   });
   logModelRequest(endpoint, requestBody);
-  const response = await fetch(endpoint, {
+  const response = await modelFetch(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -1584,7 +1691,7 @@ async function streamCompletion(
     },
     body: requestBody,
     signal,
-  });
+  }, model.proxyUrl);
   if (!response.ok) {
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);

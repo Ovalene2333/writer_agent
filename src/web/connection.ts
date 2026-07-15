@@ -52,6 +52,15 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+function isLoopbackBase(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 /** HTTPS 页面不能 fetch HTTP 局域网（浏览器混合内容拦截）。 */
 export function canFetchBase(base: string): boolean {
   try {
@@ -167,23 +176,28 @@ export function initConnection(): string {
   const boot = parseBootstrapHash();
   const stored = readStored();
   const pageOrigin = typeof location !== "undefined" ? normalizeBase(location.origin) : "";
+  const pageIsLocal = isLoopbackBase(pageOrigin);
+  const hasBootstrap = Boolean(boot.token || boot.lan || boot.public);
+  // A plain loopback URL is the dedicated no-token entry. Do not revive stale
+  // LAN/tunnel routing from an earlier QR-code session on this origin.
+  const restoreStoredConnection = !pageIsLocal || hasBootstrap;
 
   token = boot.token
-    || stored?.token
-    || localStorage.getItem(TOKEN_KEY)
-    || sessionStorage.getItem(TOKEN_KEY)
+    || (restoreStoredConnection ? stored?.token : "")
+    || (restoreStoredConnection ? localStorage.getItem(TOKEN_KEY) : "")
+    || (restoreStoredConnection ? sessionStorage.getItem(TOKEN_KEY) : "")
     || "";
 
   const pageIsLan = pageOrigin.startsWith("http://") && !/localhost|127\.0\.0\.1/i.test(pageOrigin);
   const pageIsTunnel = typeof location !== "undefined" && /trycloudflare\.com$/i.test(location.hostname);
 
   lanBase = boot.lan
-    || stored?.lanBase
+    || (restoreStoredConnection ? stored?.lanBase : undefined)
     || (pageIsLan ? pageOrigin : null)
     || null;
 
   publicBase = boot.public
-    || stored?.publicBase
+    || (restoreStoredConnection ? stored?.publicBase : undefined)
     || (pageIsTunnel ? pageOrigin : null)
     || null;
 
@@ -200,7 +214,7 @@ export function initConnection(): string {
   else if (publicBase && activeBase === publicBase) route = "public";
   else route = "local";
 
-  const storedPref = stored?.preference;
+  const storedPref = restoreStoredConnection ? stored?.preference : undefined;
   preference = storedPref === "lan" || storedPref === "public" || storedPref === "auto"
     ? storedPref
     : "auto";
@@ -245,10 +259,10 @@ export function subscribeConnection(listener: Listener): () => void {
 }
 
 async function probe(base: string): Promise<boolean> {
-  if (!token || !canFetchBase(base)) return false;
+  if (!canFetchBase(base) || (!token && !isLoopbackBase(base))) return false;
   try {
     const response = await fetch(`${normalizeBase(base)}/api/health`, {
-      headers: { authorization: `Bearer ${token}` },
+      ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
       signal: timeoutSignal(PROBE_MS),
       cache: "no-store",
     });

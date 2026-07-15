@@ -3,8 +3,83 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { modelSupportsToolChoice } from "./model_compat.js";
+import { defaultPricing } from "./pricing.js";
 import { PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
+
+test("DeepSeek Thinking omits unsupported tool_choice", () => {
+  assert.equal(modelSupportsToolChoice({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), false);
+  assert.equal(modelSupportsToolChoice({ baseUrl: "https://api.deepseek.com" }), false);
+  assert.equal(modelSupportsToolChoice({ provider: "openai-compatible", baseUrl: "https://api.openai.com/v1" }), true);
+});
+
+test("applySamplingDefaults writes temp/topP to all role-assigned models without api key", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-sampling-"));
+  try {
+    const project = WriterProject.init(root, "采样覆盖");
+    const providers = new ProviderManager(project);
+    // Default catalog has empty api keys — sampling must still work.
+    const before = providers.catalog();
+    assert.equal(before.providers[0].apiKeyConfigured, false);
+
+    const agentModel = before.providers[0].models[0];
+    providers.assign("writer", before.providers[0].id, agentModel.id);
+    if (before.providers[1]?.models[0]) {
+      providers.assign("reviewer", before.providers[1].id, before.providers[1].models[0].id);
+    }
+
+    const result = providers.applySamplingDefaults(0.78, 0.9);
+    assert.equal(result.temperature, 0.78);
+    assert.equal(result.topP, 0.9);
+    assert.ok(result.updatedModels >= 1);
+    assert.equal(providers.publicConfig().temperature, 0.78);
+    assert.equal(providers.publicConfig().topP, 0.9);
+    assert.equal(providers.modelConfig("writer").temperature, 0.78);
+    assert.equal(providers.modelConfig("writer").topP, 0.9);
+    if (before.providers[1]?.models[0]) {
+      assert.equal(providers.modelConfig("reviewer").temperature, 0.78);
+      assert.equal(providers.modelConfig("reviewer").topP, 0.9);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("default catalog seeds OpenAI and DeepSeek with latest defaults", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-default-"));
+  try {
+    const project = WriterProject.init(root, "默认供应商");
+    const providers = new ProviderManager(project);
+    const catalog = providers.catalog();
+
+    assert.equal(catalog.providers.length, 2);
+    const openAi = catalog.providers.find((item) => item.name === "OpenAI");
+    const deepseek = catalog.providers.find((item) => item.name === "DeepSeek");
+    assert.ok(openAi);
+    assert.ok(deepseek);
+
+    assert.equal(openAi!.provider, "openai-compatible");
+    assert.equal(openAi!.baseUrl, "https://api.openai.com/v1");
+    assert.deepEqual(openAi!.models.map((m) => m.name), ["gpt-4.1-mini"]);
+    assert.equal(catalog.activeProviderId, openAi!.id);
+    assert.equal(catalog.activeModelId, openAi!.models[0].id);
+
+    assert.equal(deepseek!.provider, "deepseek");
+    assert.equal(deepseek!.baseUrl, "https://api.deepseek.com");
+    assert.deepEqual(
+      deepseek!.models.map((m) => m.name).sort(),
+      ["deepseek-v4-flash", "deepseek-v4-pro"],
+    );
+    const flash = deepseek!.models.find((m) => m.name === "deepseek-v4-flash")!;
+    const pro = deepseek!.models.find((m) => m.name === "deepseek-v4-pro")!;
+    assert.deepEqual(flash.pricing, defaultPricing("deepseek", "deepseek-v4-flash"));
+    assert.deepEqual(pro.pricing, defaultPricing("deepseek", "deepseek-v4-pro"));
+    assert.equal(providers.modelConfig("agent").model, "gpt-4.1-mini");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("save() updates active model only and keeps sibling models", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-provider-save-"));

@@ -4,13 +4,13 @@ import { WriterStore } from "./store.js";
 
 /**
  * Style prompt cache split (see also PROMPT / PREFIX-CACHE CONTRACT in agent.ts):
- * - stableStyleGroundingPrompt → agent stable-prefix slot 4 (project template +
- *   default examples + craft/mannerism rules). Must not depend on targetPath /
- *   selection / this-turn sample windows.
- * - dynamicStyleGroundingPrompt → agent dynamic-tail slot 3 (chapter/selection
- *   voice evidence). OK to change every turn; keep short.
- * When adding style rules: put timeless constraints in stable; put live chapter
- * excerpts only in dynamic. Avoid duplicating the same long checklist in both.
+ * - stableStyleGroundingPrompt → agent stable-prefix slot 4 (project template
+ *   constraints + craft/mannerism). Must be byte-stable across intensive/mode
+ *   flips and must not depend on targetPath / selection / this-turn samples.
+ * - dynamicStyleGroundingPrompt → agent dynamic-tail slot 3 (范文 bodies +
+ *   chapter/selection voice evidence). Miss-priced; keep short.
+ * When adding style rules: timeless constraints → stable; live prose samples →
+ * dynamic. Never paste the same long checklist into both slots.
  */
 
 export type StyleGroundingOptions = {
@@ -22,16 +22,32 @@ export type StyleGroundingOptions = {
   preferredSample?: string;
 };
 
-/** Craft rules for the stable style block (cacheable project-level guidance). */
+/**
+ * Craft rules for the stable style block (cacheable project-level guidance).
+ * Applies under every style template — keep genre flavor in templates, keep
+ * anti-mechanical / anti-stacking hygiene here so all modes share one baseline.
+ */
 export function naturalProseCraftPrompt(): string {
-  return `自然叙事原则（服从项目样本；不要为了显得“自然”故意制造病句或随机变化）：
+  return `自然叙事原则（服从项目样本与激活模板；不要为了显得“自然”故意制造病句或随机变化）：
+
+【活着写，不要“组装”】
 - 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现。叙述距离一旦贴近某人，不因解释方便突然跳进他人内心。
-- 场景推进：刺激必须引出反应、选择或代价，动作应改变人物关系、空间位置、掌握的信息或下一步可能性；不要写完动作又用旁白复述其意义。
-- 细节取舍：每处细节至少承担空间定位、人物习惯、冲突、因果或伏笔之一。把“紧张、复杂、压迫感”等通用标签换成此时此地才成立的对象、动作或感官变化。
-- 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改变关系，不是轮流播报设定。允许答非所问、半句、停顿和被动作打断，但须符合人物身份与当下目的。
-- 节奏与留白：保留朴素功能句、轻重差和不对称；重要处才放慢或加强。不要每句都修辞、每段都转折、每个场景都总结，未说尽之处可由后续行动承接。
-- 具体性检查：若一句话换掉人名和地点仍能无损套进多数故事（如泛泛的目光、气氛、情绪、决心），就把它落实为本场景独有的物件、说法、动作或后果；无有效信息则删除。
-- 变化来自内容：句长、段长、修辞和对白密度随人物压力与事件节拍变化，并以样本分布为上限；不要机械轮换长短句、堆同义词或强凑“三段式”。`;
+- 场景推进：刺激必须引出反应、选择或代价；动作应改变关系、位置、信息或下一步可能。禁止把章节写成功能清单（醒来→说明→测试→评分→收束）或「指令—执行—确认」连环短段。
+- 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改关系，不是轮流播报设定、规则或数据。禁止全员讲课腔；设定优先让人物试错撞出来，旁人只在关键处插一句。
+- 细节取舍：每处细节至少承担空间、习惯、冲突、因果或伏笔之一。把“紧张/复杂/压迫感”等通用标签换成此时此地才成立的对象、动作或感官。
+
+【反机械感（全模板强制）】
+1. 禁止机关枪短段：连续单句独立成段不得超过 3 个；默认 2—5 句中段，长短随压力变化，不要机械轮换长短句或强凑“三段式”。
+2. 禁止无聊堆砌：同一信息、情绪、感官公式、因果或主题只写一次；同类高清感官比喻（“一根根纤维/放大镜式清晰”等）一章内最多 1 次；不要用同义词连打、排比金句或“气氛+眼神+决心”三件套填满段落。
+3. 禁止数字/指标刷屏：精确读数、百分比、等级评分一章合计 ≤3 处（类型必需时也尽量压到后果感写法）；其余用可感后果（器物轻响、对方停顿、地板闷震），禁止正文变 HUD/日志。
+4. 禁止解释掐情绪：难过、发慌、羞耻、兴奋刚起时，先给半拍体感或动作；禁止立刻接设定说明、成分百分比、系统提示或作者总结把情绪冲掉。
+5. 禁止贴金句收尾：流程、测试、赶路、说明为主的段落之后，不要硬接“迈出了第一步/这就够了/新的开始”式升华；收在具体后果、关系余波或未决问题上。
+6. 具体性检查：若一句话换掉人名地点仍能套进多数故事，就落实为本场独有的物件、说法、动作或后果；无有效信息则删。
+7. 禁止角色卡/系统腔污染：勿把能力表字段写进叙述（「未解锁」「还锁着」「档案上…锁着」「专属武装还锁着」）；勿用「不是A，不是B——还锁着」点名否定列举未出场武装；本场不能用的能力直接不写，或只写人物此刻可感的限制（抬不起、唤不出、伤口还在），不要播报卡面状态。
+
+【节奏与留白】
+- 关键信息落地后给半拍落点（动作、停顿、环境），再推进；保留朴素功能句与不对称，未说尽处可由后续行动承接。
+- 不要每句都修辞、每段都转折、每个场景都总结；幽默/张力来自关系错位与现场反应，不靠段子拼贴或全员抖机灵。`;
 }
 
 /**
@@ -52,23 +68,20 @@ export function styleGroundingPrompt(
 
 /**
  * Project-stable style block for agent stable-prefix slot 4.
- * CACHE: Only `intensive` (and project-level template/examples) may affect output.
- * Do not read targetPath / preferredSample here — that belongs in dynamicStyleGroundingPrompt.
- * Empty intensive=false is replaced by a fixed placeholder in buildStableSystemPrefix.
+ * CACHE: Output must be independent of intensive / targetPath / preferredSample /
+ * exampleIds so brainstorm→write→audit turns share the same prefix bytes.
+ * 范文 bodies and chapter windows belong in dynamicStyleGroundingPrompt.
  */
 export function stableStyleGroundingPrompt(
   project: WriterProject,
-  store: WriterStore,
-  options: Pick<StyleGroundingOptions, "intensive">,
+  _store: WriterStore,
+  _options?: Pick<StyleGroundingOptions, "intensive">,
 ): string {
-  if (!options.intensive) return "";
-
   const config = project.config();
   const template = config.style ? project.styleTemplate(config.style) : undefined;
-  const examples = pickStyleExamples(store, template?.name);
 
   const sections: string[] = [
-    "风格锚定（写正文 / 续写 / 改写时强制遵守；优先级：本项目既有正文声线 > 用户范文 > 风格模板范例 > 泛化文学建议）",
+    "风格锚定（写正文 / 续写 / 改写时强制遵守；优先级：本轮动态声线证据 > 本项目既有正文 > 用户范文 > 风格模板 > 泛化建议）",
   ];
 
   if (template) {
@@ -81,42 +94,17 @@ export function stableStyleGroundingPrompt(
     sections.push("未激活风格模板：以本项目既有正文与角色声线为准，避免切换成通用网文或翻译腔。");
   }
 
-  if (examples.length) {
-    const rendered = examples.map((item, index) => {
-      const body = item.content.slice(0, 1_200);
-      return `范文 ${index + 1}「${item.title}」${item.category ? `（${item.category}）` : ""}\n指纹：${styleFingerprint(item.content, item.notes)}\n${item.notes ? `备注：${item.notes.slice(0, 300)}\n` : ""}${body}${item.content.length > body.length ? "\n…" : ""}`;
-    }).join("\n\n");
-    sections.push(`正向范文（模仿节奏与声线，不要复述其情节）：\n${rendered}`);
-  } else if (template?.exampleContent) {
-    const body = template.exampleContent.slice(0, 1_200);
-    sections.push(
-      `模板正向范例（模仿节奏与声线，不要复述其情节）：\n${template.exampleNotes ? `备注：${template.exampleNotes}\n` : ""}${body}${template.exampleContent.length > body.length ? "\n…" : ""}`,
-    );
-  }
-
+  // Compact craft + mannerism once here; do not re-paste into system / task workflows.
   sections.push(naturalProseCraftPrompt());
-
-  // Constraint-first: mannerism rules before the model writes (reduces propose → reject loops).
-  sections.push(proseMannerismConstraintPrompt());
-
-  sections.push(`提交前自检：
-1. 句长、段长、对白占比是否接近上方指纹（本项目样本优先）。
-2. 人物用词是否符合身份与既有对白习惯；勿把所有角色写成同一语气。
-3. 段落是否沿视角人物的注意顺序展开；是否为解释方便跳进了他人内心。
-4. 动作是否产生可见后果；动作之后是否又重复解释意义。必要因果拆成独立句。
-5. 对白是否各有目的与回避方式，而不是角色轮流完整播报信息。
-6. 通用情绪、目光、气氛和总结句能否换成只属于本场景的动作、物件或后果；不能则删。
-7. ${proseMannerismPreflightLine()}
-8. 不引入样本、角色卡、lore 中未支撑的关键设定；空白处用可观察动作推进，勿用作者旁白补课。
-9. 场景落在具体动作、决定、发现或未决问题上，避免段尾总结升华。
-10. 直写检查：关键身体、暴力、情欲、脏话是否被无故换成含蓄说法或道德滤镜；作者未要求收敛时保持直接、具体。`);
+  sections.push(proseMannerismConstraintPrompt({ compact: true }));
+  sections.push(`提交前自检：句长/对白占比贴近动态声线证据与上方指纹；人物语气可区分；动作产生后果后不重复解释；${proseMannerismPreflightLine()}；关键身体/暴力/情欲未无故含蓄化（作者未要求收敛时）。`);
 
   return sections.join("\n\n");
 }
 
 /**
  * Per-turn voice evidence for agent dynamic-tail (after history/task).
- * CACHE: Always miss-priced — prefer one short sample window over multi-chapter dumps.
+ * CACHE: Always miss-priced — 范文 + one short project sample; no multi-chapter dumps.
  */
 export function dynamicStyleGroundingPrompt(
   project: WriterProject,
@@ -124,18 +112,31 @@ export function dynamicStyleGroundingPrompt(
   options: StyleGroundingOptions,
 ): string {
   if (!options.intensive) return "";
+  const config = project.config();
+  const template = config.style ? project.styleTemplate(config.style) : undefined;
   const projectSample = pickProjectVoiceSample(project, options.targetPath, options.preferredSample);
+  const catalogExamples = pickStyleExamples(store, template?.name, options.exampleIds);
   const selectedExamples = pickExplicitStyleExamples(store, options.exampleIds);
-  if (!projectSample && !selectedExamples.length) return "";
+  // Prefer task-specified examples; otherwise default catalog / template seed (bodies only here).
+  const examples = selectedExamples.length
+    ? selectedExamples
+    : catalogExamples.map(item => ({ title: item.title, content: item.content, notes: item.notes }));
+  if (!projectSample && !examples.length && !template?.exampleContent) return "";
+
   const sections = ["本轮动态声线证据（优先于固定模板；只学声线，不复述情节）："];
   if (projectSample) {
     sections.push(`本项目既有正文样本：\n---\n${projectSample.text}\n---\n来源：${projectSample.source} · 指纹：${styleFingerprint(projectSample.text, "")}`);
   }
-  if (selectedExamples.length) {
-    sections.push(selectedExamples.map((item, index) => {
-      const body = item.content.slice(0, 1_200);
-      return `任务指定范文 ${index + 1}《${item.title}》\n指纹：${styleFingerprint(item.content, item.notes)}\n${body}${item.content.length > body.length ? "\n…" : ""}`;
+  if (examples.length) {
+    sections.push(examples.map((item, index) => {
+      const body = item.content.slice(0, 900);
+      return `范文 ${index + 1}《${item.title}》\n指纹：${styleFingerprint(item.content, item.notes)}\n${body}${item.content.length > body.length ? "\n…" : ""}`;
     }).join("\n\n"));
+  } else if (template?.exampleContent) {
+    const body = template.exampleContent.slice(0, 900);
+    sections.push(
+      `模板正向范例：\n${template.exampleNotes ? `备注：${template.exampleNotes}\n` : ""}${body}${template.exampleContent.length > body.length ? "\n…" : ""}`,
+    );
   }
   return sections.join("\n\n");
 }

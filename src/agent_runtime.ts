@@ -224,16 +224,106 @@ export function formatTodosForPrompt(todos: AgentTodoItem[]): string {
 }
 
 /**
- * When a turn ends successfully (final reply or document proposal submitted),
- * mark remaining open todos completed so the UI does not stay stuck at e.g. 1/3
- * after "Agent job completed". Cancelled items are left alone.
- * Proposal success intentionally stops the agent before another manage_todos call.
+ * Soft checklist items that are usually "forgot to tick after proposal" rather than
+ * independent deliverables (e.g. 提交文档提案 / 自检).
+ */
+export function isSoftChecklistTodo(content: string): boolean {
+  const text = content.trim();
+  if (!text) return false;
+  if (isFurtherWritingTodo(text)) return false;
+  // Do not treat primary writing steps as soft just because they mention 自检.
+  if (/(?:完成正文|核对大纲|读取|检索|阅读)/.test(text) && !/(?:提交|提案)/.test(text)) return false;
+  return /提交|提案|收尾|确认完成|结束任务/.test(text)
+    || /^(?:自检|检查|收尾)$/.test(text);
+}
+
+/**
+ * Remaining multi-deliverable writing steps (e.g. 撰写第2章初稿). These must stay open
+ * after an earlier chapter's proposal succeeds.
+ */
+export function isFurtherWritingTodo(content: string): boolean {
+  const text = content.trim();
+  if (!text) return false;
+  // Require multi-deliverable signals (章号/初稿/续写…). Avoid matching the default
+  // single-scene step "完成正文并自检", which would false-continue after one proposal.
+  return /撰写|写第|续写|创作|起草|初稿|改写|重写|第\s*\d+\s*章|第\s*[一二三四五六七八九十两零〇]+\s*章|场景正文|章节正文|第\s*\d+\s*节/.test(text);
+}
+
+/**
+ * After a document proposal succeeds: close the active step and any soft trailing
+ * "submit proposal" checkboxes. If further writing steps remain, promote the next
+ * one and signal the agent loop to continue instead of finalizing the whole plan.
+ */
+export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
+  todos: AgentTodoItem[];
+  changed: boolean;
+  shouldContinue: boolean;
+} {
+  if (!todos.length) return { todos, changed: false, shouldContinue: false };
+  let changed = false;
+  const next = todos.map(item => {
+    if (item.status === "in_progress") {
+      changed = true;
+      return { ...item, status: "completed" as const };
+    }
+    return { ...item };
+  });
+  // Close soft "submit/check" leftovers that models often leave pending after propose_*.
+  for (const item of next) {
+    if (item.status === "pending" && isSoftChecklistTodo(item.content)) {
+      item.status = "completed";
+      changed = true;
+    }
+  }
+  const furtherPending = next.filter(item => item.status === "pending" && isFurtherWritingTodo(item.content));
+  if (furtherPending.length) {
+    // Only one in_progress at a time.
+    for (const item of next) {
+      if (item.status === "in_progress") item.status = "pending";
+    }
+    furtherPending[0].status = "in_progress";
+    changed = true;
+    return { todos: next, changed, shouldContinue: true };
+  }
+  // No further writing deliverables: close any other dangling open items for a clean UI.
+  for (const item of next) {
+    if (item.status !== "completed" && item.status !== "cancelled") {
+      item.status = "completed";
+      changed = true;
+    }
+  }
+  return { todos: next, changed, shouldContinue: false };
+}
+
+/**
+ * When a turn truly ends (final assistant reply with no remaining multi-chapter work),
+ * mark remaining open todos completed so the UI does not stay stuck at e.g. 1/3.
+ * Cancelled items are left alone.
+ *
+ * Prefer `advanceTodosAfterProposal` on propose_* success so multi-chapter plans are not
+ * falsely closed after the first chapter.
  */
 export function finalizeOpenTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
   let changed = false;
   const next = todos.map(item => {
     // Treat anything not already completed/cancelled as open (covers bad model statuses).
     if (item.status !== "completed" && item.status !== "cancelled") {
+      changed = true;
+      return { ...item, status: "completed" as const };
+    }
+    return item;
+  });
+  return { todos: next, changed };
+}
+
+/**
+ * Safety-net close used by the HTTP job wrapper: only complete dangling in_progress
+ * items. Never auto-complete pending multi-chapter writing steps.
+ */
+export function finalizeDanglingInProgressTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
+  let changed = false;
+  const next = todos.map(item => {
+    if (item.status === "in_progress") {
       changed = true;
       return { ...item, status: "completed" as const };
     }
@@ -250,14 +340,38 @@ export function persistFinalizedSessionTodos(
   },
   sessionId: string,
   emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
+  mode: "all_open" | "dangling_in_progress" | "after_proposal" = "all_open",
 ): AgentTodoItem[] {
   const current = store.sessionTodos(sessionId);
   if (!current.length) return current;
-  const { todos, changed } = finalizeOpenTodos(current);
-  if (!changed) return current;
-  store.saveSessionTodos(sessionId, todos);
-  emit?.({ type: "todos", todos });
-  return todos;
+  const result = mode === "dangling_in_progress"
+    ? finalizeDanglingInProgressTodos(current)
+    : mode === "after_proposal"
+      ? advanceTodosAfterProposal(current)
+      : finalizeOpenTodos(current);
+  if (!result.changed) return current;
+  store.saveSessionTodos(sessionId, result.todos);
+  emit?.({ type: "todos", todos: result.todos });
+  return result.todos;
+}
+
+/** Persist proposal advance and report whether the agent should keep writing. */
+export function persistAdvancedTodosAfterProposal(
+  store: {
+    sessionTodos(sessionId: string): AgentTodoItem[];
+    saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void;
+  },
+  sessionId: string,
+  emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
+): { todos: AgentTodoItem[]; shouldContinue: boolean } {
+  const current = store.sessionTodos(sessionId);
+  if (!current.length) return { todos: current, shouldContinue: false };
+  const { todos, changed, shouldContinue } = advanceTodosAfterProposal(current);
+  if (changed) {
+    store.saveSessionTodos(sessionId, todos);
+    emit?.({ type: "todos", todos });
+  }
+  return { todos, shouldContinue };
 }
 
 export function permissionModeLabel(mode: PermissionMode): string {
