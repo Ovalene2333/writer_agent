@@ -30,6 +30,11 @@ export type CompletedChapterScene = {
   actualState: SceneActualState;
 };
 
+export type ChapterDraftStyleEdit = {
+  search: string;
+  replace: string;
+};
+
 export type ChapterSceneDraft = {
   path: string;
   mode: ChapterDraftMode;
@@ -118,6 +123,61 @@ export function writeChapterScene(
     },
     invalidatedSceneIds,
     revised,
+  };
+}
+
+/**
+ * Apply exact, prose-only edits without changing scene state or invalidating the
+ * causal scene chain. Each search must identify exactly one existing passage.
+ */
+export function reviseChapterDraftStyle(
+  draft: ChapterSceneDraft,
+  editsValue: unknown,
+): { draft: ChapterSceneDraft; editedSceneIds: string[]; preservedSceneIds: string[] } {
+  if (!chapterSceneDraftComplete(draft)) throw new Error("场景链尚未完成，不能进行整章风格修订");
+  if (!Array.isArray(editsValue) || editsValue.length < 1 || editsValue.length > 20) {
+    throw new Error("风格修订须包含 1–20 条精确替换");
+  }
+
+  let completed = draft.completed.map(scene => ({ ...scene }));
+  const editedSceneIds = new Set<string>();
+  for (const [editIndex, raw] of editsValue.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`edits[${editIndex}] 格式无效`);
+    }
+    const edit = raw as Record<string, unknown>;
+    const search = typeof edit.search === "string" ? edit.search : "";
+    const replace = typeof edit.replace === "string" ? edit.replace : undefined;
+    if (!search) throw new Error(`edits[${editIndex}].search 不能为空`);
+    if (replace === undefined) throw new Error(`edits[${editIndex}].replace 必须是字符串`);
+    if (search.length > 2_000 || replace.length > 2_000) {
+      throw new Error(`edits[${editIndex}] 过长；风格修订只允许局部替换`);
+    }
+
+    const matches = completed.flatMap((scene, sceneIndex) =>
+      occurrenceOffsets(scene.content, search).map(offset => ({ sceneIndex, offset })),
+    );
+    if (matches.length !== 1) {
+      throw new Error(`edits[${editIndex}].search 在草稿中出现 ${matches.length} 次，必须唯一`);
+    }
+    const { sceneIndex, offset } = matches[0];
+    const scene = completed[sceneIndex];
+    const content = scene.content.slice(0, offset) + replace + scene.content.slice(offset + search.length);
+    if (content.trim().length < 80) throw new Error(`edits[${editIndex}] 会使场景正文过短`);
+    if (/^#\s+/mu.test(content)) throw new Error(`edits[${editIndex}] 不得向场景正文加入章节一级标题`);
+    completed[sceneIndex] = { ...scene, content };
+    editedSceneIds.add(scene.sceneId);
+  }
+
+  return {
+    draft: {
+      ...draft,
+      completed,
+      version: draft.version + 1,
+      inspectedVersion: undefined,
+    },
+    editedSceneIds: [...editedSceneIds],
+    preservedSceneIds: completed.filter(scene => !editedSceneIds.has(scene.sceneId)).map(scene => scene.sceneId),
   };
 }
 
@@ -229,4 +289,16 @@ function requireText(value: unknown, name: string): string {
 
 function cleanString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function occurrenceOffsets(content: string, search: string): number[] {
+  const offsets: number[] = [];
+  let from = 0;
+  while (from <= content.length - search.length) {
+    const index = content.indexOf(search, from);
+    if (index < 0) break;
+    offsets.push(index);
+    from = index + Math.max(1, search.length);
+  }
+  return offsets;
 }

@@ -15,6 +15,7 @@ import {
   assembleChapterSceneDraft,
   beginChapterSceneDraft,
   chapterSceneDraftComplete,
+  reviseChapterDraftStyle,
   writeChapterScene,
 } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
@@ -200,6 +201,37 @@ test("revising an earlier scene invalidates dependent later scenes", () => {
   assert.equal(revised.draft.inspectedVersion, undefined);
 });
 
+test("prose-only chapter draft edits preserve later scenes and state", () => {
+  let draft = beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
+    baseContent: "", baseHash: "empty", scenes: sceneChain,
+  });
+  draft = writeChapterScene(
+    draft,
+    "arrival",
+    `${"门禁灯从绿变红。".repeat(20)}\n\n她不是害怕。是在计算距离。`,
+    actualState("主角违规进入训练区"),
+  ).draft;
+  draft = writeChapterScene(
+    draft,
+    "alarm",
+    "警报在合金墙间响起。".repeat(20),
+    actualState("教官替主角承担违规责任"),
+  ).draft;
+  const statesBefore = draft.completed.map(scene => scene.actualState);
+  const revised = reviseChapterDraftStyle(draft, [{
+    search: "她不是害怕。是在计算距离。",
+    replace: "她盯着门框，默算两步距离。",
+  }]);
+  assert.deepEqual(revised.editedSceneIds, ["arrival"]);
+  assert.deepEqual(revised.preservedSceneIds, ["alarm"]);
+  assert.equal(revised.draft.completed.length, 2);
+  assert.deepEqual(revised.draft.completed.map(scene => scene.actualState), statesBefore);
+  assert.match(revised.draft.completed[0].content, /默算两步距离/u);
+  assert.match(revised.draft.completed[1].content, /警报/u);
+  assert.equal(revised.draft.inspectedVersion, undefined);
+});
+
 test("scene pipeline rejects empty state change and repeated scene functions", () => {
   const draft = beginChapterSceneDraft({
     path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
@@ -266,7 +298,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       sceneId: "arrival", content: "门禁灯变红。".repeat(20), actualState: actualState("违规进入"),
     })) as Record<string, unknown>;
     assert.match(String(missingNotes.error), /notes/);
-    const sceneContent = "门禁灯从绿变红。".repeat(20);
+    const sceneContent = `${"门禁灯从绿变红。".repeat(20)}\n\n她停下脚步。`;
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。\n## 已知事实\n门禁灯会在违规时变红。",
@@ -275,6 +307,23 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     })) as Record<string, unknown>;
     assert.equal(written.complete, true);
     assert.equal(typeof written.writePackCharacters, "number");
+    const auditedDraft = JSON.parse(await call("audit_prose_style", {
+      path: "chapters/第一章.md",
+    })) as Record<string, unknown>;
+    assert.equal(auditedDraft.source, "chapter_draft");
+    const draftHashBeforeRevision = auditedDraft.sourceHash;
+    const styleRevised = JSON.parse(await call("revise_chapter_draft_style", {
+      edits: [{ search: "她停下脚步。", replace: "她在红灯前停步。" }],
+    })) as Record<string, unknown>;
+    assert.equal(styleRevised.status, "style_revised");
+    assert.deepEqual(styleRevised.invalidatedSceneIds, []);
+    assert.equal(styleRevised.completedScenes, 1);
+    const auditedRevisedDraft = JSON.parse(await call("audit_prose_style", {
+      path: "chapters/第一章.md",
+    })) as Record<string, unknown>;
+    assert.equal(auditedRevisedDraft.source, "chapter_draft");
+    assert.notEqual(auditedRevisedDraft.sourceHash, draftHashBeforeRevision);
+    assert.equal("reused" in auditedRevisedDraft, false);
     const beforeInspect = JSON.parse(await call("propose_chapter_draft", {
       summary: "新建第一章", chapterChange: "关系改变", reviewNotes: "已检查",
     })) as Record<string, unknown>;
@@ -291,6 +340,12 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     })) as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
     assert.equal(project.documentExists("chapters/第一章.md"), false);
+
+    const malformed = JSON.parse(await executeTool(
+      { id: "bad-json", name: "inspect_chapter_draft", arguments: "{" },
+      project, activeStore, sessionId, () => {}, undefined, context,
+    )) as Record<string, unknown>;
+    assert.equal(malformed.code, "INVALID_TOOL_ARGUMENTS_JSON");
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

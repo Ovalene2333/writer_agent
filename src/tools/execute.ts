@@ -36,6 +36,7 @@ import {
   handleBeginChapterDraft,
   handleInspectChapterDraft,
   handleProposeChapterDraft,
+  handleReviseChapterDraftStyle,
   handleWriteChapterScene,
 } from "./scene_pipeline.js";
 import {
@@ -61,6 +62,7 @@ const HANDLERS: Record<string, Handler> = {
   compile_write_pack: handleCompileWritePack,
   begin_chapter_draft: handleBeginChapterDraft,
   write_chapter_scene: handleWriteChapterScene,
+  revise_chapter_draft_style: handleReviseChapterDraftStyle,
   inspect_chapter_draft: handleInspectChapterDraft,
   propose_chapter_draft: handleProposeChapterDraft,
   propose_document: handleProposeDocument,
@@ -92,7 +94,7 @@ export async function executeTool(
   try {
     input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
   } catch {
-    return JSON.stringify({ error: "工具参数不是有效 JSON" });
+    return JSON.stringify({ code: "INVALID_TOOL_ARGUMENTS_JSON", error: "工具参数不是有效 JSON；请用同一工具重试一次并提交完整 JSON" });
   }
   const handler = HANDLERS[call.name];
   if (!handler) return JSON.stringify({ error: `未知工具：${call.name}` });

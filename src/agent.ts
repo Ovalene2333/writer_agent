@@ -607,9 +607,9 @@ export function taskInstructions(
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章可 read(lastSection)；出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单章任务只交付用户指定的一章：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节时，先在内部用 1—3 句话确定“本章从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。场景数量遵循动态尾部的当前场景链参数，不为凑数拆场；每场必须有目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场只调用一次 write_chapter_scene：将本场事实与上一场 actualState 整理为故事内 notes，并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。重写前场会使后续场景失效，须重写后续。
+5. 按场景链顺序循环，每场只调用一次 write_chapter_scene：将本场事实与上一场 actualState 整理为故事内 notes，并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后 inspect_chapter_draft 通读整章；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。有问题则用新 notes 直接重写目标场，再次 inspect。
+7. 全部场景完成后 inspect_chapter_draft 通读整章并先通过风格门禁；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题只用 revise_chapter_draft_style 精确替换命中句，不改变 actualState、不废弃后续场景。修改后再次 inspect，通过后再提案。
 8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
@@ -962,15 +962,16 @@ export async function runAgent(options: {
   let projectSearchCalls = 0;
   let documentReadCalls = 0;
   let missingProposalToolRetries = 0;
+  let invalidToolArgumentRetries = 0;
 
   try {
     // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
     const plannedSteps = Math.max(turnTodos.length, task.todoPlan.length);
-    const maxTurns = options.maxTurns ?? Math.max(20, plannedSteps * 8);
+    let turnLimit = options.maxTurns ?? Math.max(20, plannedSteps * 8);
     let turnStart = messages.length;
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
-    for (let turn = 0; turn < maxTurns; turn += 1) {
+    for (let turn = 0; turn < turnLimit; turn += 1) {
       const step = turn + 1;
       emit({ type: "step_start", step });
       const result = await streamCompletion(executionModel, messages, signal, (text) => {
@@ -1034,6 +1035,10 @@ export async function runAgent(options: {
         }
         try {
           const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+          if (parsed.code === "INVALID_TOOL_ARGUMENTS_JSON" && invalidToolArgumentRetries < 2) {
+            invalidToolArgumentRetries += 1;
+            turnLimit += 1;
+          }
           if (!("error" in parsed) && call.name === "begin_chapter_draft" && parsed.status === "started") {
             persistScenePipelineTodos(store, sessionId, "draft_started", emit);
           }
@@ -1127,11 +1132,11 @@ export async function runAgent(options: {
     const debugContext = runtimeDebugContext(messages, {
       task: task.label,
       model: executionModel.model,
-      turns: maxTurns,
+      turns: turnLimit,
       transcript,
     });
     store.addSystemMessage(sessionId, debugContext);
-    throw new Error("Agent 工具调用次数超过限制；中途上下文已保存到当前会话");
+    throw new Error("Agent 模型执行轮次达到上限；中途上下文已保存到当前会话");
   } catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
       if (transcript.trim()) store.addMessage(sessionId, "assistant", `${transcript.trim()}\n\n[生成已中断]`, "agent", options.variantGroupId);
@@ -1179,7 +1184,7 @@ function runtimeDebugContext(
     partialOutput: metadata.transcript,
     messages: entries,
   }, null, 2);
-  return `[Agent 调试上下文：工具调用达到上限]\n${payload}`;
+  return `[Agent 调试上下文：模型执行轮次达到上限]\n${payload}`;
 }
 
 function selectedBlocksContext(project: WriterProject, references?: Array<{ path: string; text?: string }>): string {
@@ -1396,6 +1401,14 @@ async function executeToolCached(
   emit: (event: AgentEvent) => void, counts: Map<string, number>, characterScope?: number[],
   context: ToolExecutionContext = { permissionMode: "ask" },
 ): Promise<string> {
+  if (call.name === "audit_prose_style" && context.chapterSceneDraft) {
+    try {
+      const input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+      if (input.path === context.chapterSceneDraft.path) {
+        return executeTool(call, project, store, sessionId, emit, characterScope, context);
+      }
+    } catch { /* executeTool returns the structured invalid-JSON diagnostic. */ }
+  }
   if (!CACHEABLE_TOOLS.has(call.name)) return executeTool(call, project, store, sessionId, emit, characterScope, context);
   let input: Record<string, unknown>;
   try { input = JSON.parse(call.arguments || "{}") as Record<string, unknown>; }

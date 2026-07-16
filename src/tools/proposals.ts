@@ -94,7 +94,7 @@ export function maybeAutoAcceptProposal(
   }
 }
 
-async function gateProseStyle(
+export async function gateProseStyle(
   beforeContent: string,
   afterContent: string,
   context: ToolHandlerArgs["context"],
@@ -133,6 +133,7 @@ export async function submitFullDocumentProposal(
   summary: string,
   characterChanges: unknown,
   scenePipelineAssembled = false,
+  proseStyleApproved = false,
 ): Promise<string> {
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document");
@@ -140,7 +141,7 @@ export async function submitFullDocumentProposal(
   rejectCompressedPlaceholder(proposedContent, "content");
   const beforeContent = project.documentExists(path) ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
-  await gateProseStyle(beforeContent, meta.content, context);
+  if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
   const proposal = store.createProposal(
     sessionId,
     path,

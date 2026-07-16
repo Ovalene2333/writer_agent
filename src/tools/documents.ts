@@ -1,6 +1,7 @@
 import { documentBlocks, documentSections } from "../document_blocks.js";
 import { adjudicateProseStyleForAudit } from "../prose_adjudicate.js";
 import { analyzeProseStyle } from "../prose_quality.js";
+import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { documentMap, optionalPositiveInteger, requireString } from "./helpers.js";
 
@@ -11,7 +12,10 @@ export function handleListDocuments({ project }: ToolHandlerArgs): string {
 export async function handleAuditProseStyle({ input, project, context }: ToolHandlerArgs): Promise<string> {
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const content = project.read(path);
+  const activeDraft = context.chapterSceneDraft?.path === path && chapterSceneDraftComplete(context.chapterSceneDraft)
+    ? context.chapterSceneDraft
+    : undefined;
+  const content = activeDraft ? assembleChapterSceneDraft(activeDraft) : project.read(path);
   const rules = analyzeProseStyle(content);
   const flash = await adjudicateProseStyleForAudit(
     content,
@@ -22,6 +26,7 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
   const issues = flash.issues;
   return JSON.stringify({
     path,
+    source: activeDraft ? "chapter_draft" : "document",
     sourceHash: project.hash(content),
     summary: {
       errors: issues.filter(issue => issue.severity === "error").length,

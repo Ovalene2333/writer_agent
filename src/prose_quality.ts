@@ -248,7 +248,7 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
 
 /** Actionable block message so one local rewrite can pass re-submit. */
 function formatProseStyleBlockError(errors: ProseStyleIssue[], headline: string): string {
-  const located = errors.slice(0, 5).map(issue => {
+  const located = errors.slice(0, 20).map(issue => {
     const tip = issue.suggestions[0] ?? rewriteTipForSubtype(issue.subtype);
     return `第${issue.line}行「${issue.evidence}」→ ${tip}`;
   });

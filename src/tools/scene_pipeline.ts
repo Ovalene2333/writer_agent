@@ -6,12 +6,13 @@ import {
   chapterSceneDraftComplete,
   chapterSceneLedger,
   nextChapterScene,
+  reviseChapterDraftStyle,
   sceneCardForTool,
   writeChapterScene,
   type ChapterDraftMode,
 } from "../scene_pipeline.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
-import { submitFullDocumentProposal } from "./proposals.js";
+import { gateProseStyle, submitFullDocumentProposal } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
 
 export function handleBeginChapterDraft({ input, project, context }: ToolHandlerArgs): string {
@@ -86,13 +87,45 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
   });
 }
 
-export function handleInspectChapterDraft({ context }: ToolHandlerArgs): string {
+export function handleReviseChapterDraftStyle({ input, context }: ToolHandlerArgs): string {
+  assertWritableMode(context.permissionMode, "revise_chapter_draft_style");
+  const draft = context.chapterSceneDraft;
+  if (!draft) throw new Error("当前没有章节场景草稿");
+  const result = reviseChapterDraftStyle(draft, input.edits);
+  context.chapterSceneDraft = result.draft;
+  return JSON.stringify({
+    status: "style_revised",
+    editedSceneIds: result.editedSceneIds,
+    preservedSceneIds: result.preservedSceneIds,
+    completedScenes: result.draft.completed.length,
+    totalScenes: result.draft.scenes.length,
+    invalidatedSceneIds: [],
+    complete: true,
+    message: "局部风格替换已应用；故事状态与后续场景均保留。请重新 inspect_chapter_draft。",
+  });
+}
+
+export async function handleInspectChapterDraft({ project, context }: ToolHandlerArgs): Promise<string> {
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("当前没有章节场景草稿");
   if (!chapterSceneDraftComplete(draft)) {
     throw new Error(`场景尚未写完（${draft.completed.length}/${draft.scenes.length}）`);
   }
   const content = assembleChapterSceneDraft(draft);
+  const beforeContent = project.documentExists(draft.path) ? project.read(draft.path) : "";
+  try {
+    await gateProseStyle(beforeContent, content, context);
+  } catch (error) {
+    return JSON.stringify({
+      status: "style_revision_required",
+      code: "CHAPTER_DRAFT_STYLE_BLOCKED",
+      error: error instanceof Error ? error.message : String(error),
+      path: draft.path,
+      complete: true,
+      invalidatedSceneIds: [],
+      message: "使用 revise_chapter_draft_style 只替换命中句；不要重写场景。修改后重新 inspect。",
+    });
+  }
   draft.inspectedVersion = draft.version;
   return JSON.stringify({
     status: "inspection_required",
@@ -100,6 +133,7 @@ export function handleInspectChapterDraft({ context }: ToolHandlerArgs): string 
     chapterGoal: draft.chapterGoal,
     contentCharacters: content.length,
     sceneCount: draft.completed.length,
+    proseStyle: "passed",
     ledger: chapterSceneLedger(draft),
     reviewChecklist: [
       "相邻场景是否因果承接，而非只按时间并列",
@@ -134,6 +168,7 @@ export async function handleProposeChapterDraft(args: ToolHandlerArgs): Promise<
     assembleChapterSceneDraft(draft),
     requireString(input.summary, "summary"),
     input.characterChanges,
+    true,
     true,
   );
   try {

@@ -281,8 +281,35 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "revise_chapter_draft_style",
+      description: "对已完成的内存章节草稿做精确局部风格替换；保留离场状态和所有后续场景，风格门禁退回时优先使用",
+      parameters: {
+        type: "object",
+        properties: {
+          edits: {
+            type: "array", minItems: 1, maxItems: 20,
+            description: "只替换风格门禁明确命中的句段；每个 search 在整章草稿中必须唯一",
+            items: {
+              type: "object",
+              properties: {
+                search: { type: "string", description: "草稿中唯一存在的原句或短段" },
+                replace: { type: "string", description: "不改变事实、行动结果和人物状态的替换文本；可为空以删除冗余句" },
+              },
+              required: ["search", "replace"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["edits"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "inspect_chapter_draft",
-      description: "检查内存整章并返回逐场状态账本；不重复回传正文，最终提案前必调",
+      description: "检查内存整章的结构与风格门禁；风格未通过时先用 revise_chapter_draft_style，最终提案前必调",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
