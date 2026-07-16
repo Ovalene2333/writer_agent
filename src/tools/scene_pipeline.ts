@@ -12,6 +12,7 @@ import {
   type ChapterDraftMode,
 } from "../scene_pipeline.js";
 import { previewProseStyleGateError } from "../prose_adjudicate.js";
+import { sceneMannerismGateError } from "../prose_quality.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
 import { gateProseStyle, submitFullDocumentProposal } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -65,6 +66,18 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const content = requireString(input.content, "content");
   rejectCompressedPlaceholder(content, "content");
+  // Generation-side density gate: block before draft so chapter-end style revises stay rare.
+  const sceneStyleError = sceneMannerismGateError(content);
+  if (sceneStyleError) {
+    return JSON.stringify({
+      status: "style_revision_required",
+      code: "SCENE_STYLE_DENSE",
+      error: sceneStyleError,
+      sceneId,
+      complete: false,
+      message: "本场正文尚未写入草稿。请按 error 改掉成串「不是A。是B。」/说明性夹注后，用同一 sceneId 重新调用 write_chapter_scene（可保留 notes，只改正文句式）。不要先写完全章再统一 revise。",
+    });
+  }
   const result = writeChapterScene(draft, sceneId, content, input.actualState);
   context.chapterSceneDraft = result.draft;
   // A write pack belongs to exactly one scene. The next/revised scene must recompile.

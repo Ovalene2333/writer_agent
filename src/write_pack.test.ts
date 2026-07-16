@@ -305,6 +305,20 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       actualState: actualState("违规进入"),
     })) as Record<string, unknown>;
     assert.match(String(oversizedNotes.error), /4000/);
+    const denseStyle = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: "## 场景目标\n主角违规进入训练区。\n## 已知事实\n门禁灯会在违规时变红。",
+      content: [
+        "走廊尽头有动静。不是埋伏。是逃跑。",
+        "空气发涩。不是气体。是悬浮颗粒。",
+        "地面反光。不是水。是油性液体。",
+        "立柱在颤。不是塌方。是预埋装药。",
+      ].join(""),
+      actualState: actualState("主角违规进入训练区"),
+    })) as Record<string, unknown>;
+    assert.equal(denseStyle.code, "SCENE_STYLE_DENSE");
+    assert.equal(denseStyle.status, "style_revision_required");
+    assert.equal(context.chapterSceneDraft?.completed.length, 0);
     const sceneContent = `${"门禁灯从绿变红。".repeat(20)}\n\n她停下脚步。`;
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",

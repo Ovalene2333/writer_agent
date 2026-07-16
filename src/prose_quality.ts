@@ -113,19 +113,26 @@ function hardMannerismFamilyLimit(text: string, family: "dash" | "contrast" | "e
  * Generation-time constraints (constraint-first).
  * Inject into system prompts before the model writes, so fewer proposals fail the final gate.
  * Specific negatives + rewrite recipes outperform vague “avoid dashes”.
+ * Latest chapter telemetry: hard blocks are dominated by split_redefinition
+ * (“不是A。是B。” short-frame stacks) — suppress that pattern at generation time.
  */
 export function proseMannerismConstraintPrompt(options?: { compact?: boolean }): string {
   if (options?.compact) {
     return [
-      "句式硬约束（生成时遵守，减少返工）：",
-      "1. 叙述少用破折号做「画面——解释 / 因果补注」；优先句号拆句，或把说明改成可观察动作/细节。",
-      "2. 叙述少用「不是A（而）是B」「不是A。是B。」「并非…而是…」等否定—肯定重定义；直接写成立事实或落到行动/对白。",
+      "句式硬约束（生成时遵守，减少返工；终审会机器拦截过密说明体）：",
+      "1. 叙述禁止把「不是A。是B。」「不是A——是B」当节奏模板连写；一整场最多偶发 1 次，优先直接写成立事实（坏例：不是埋伏。是逃跑。→ 好例：这是逃跑路线。/ 他们在撤）。",
+      "2. 叙述少用破折号做「画面——解释 / 因果补注 / 成对夹注」；优先句号拆句，或把说明改成可观察动作/细节。",
       "3. 动作、对白或细节已经传达情绪/意图时，不再追加「这说明…」「他显然感到…」「真正重要的是…」等解释回声。",
-      "4. 允许：对白拖音/中断/迟疑；人物口语纠正；并列列举（头——脚——手）；Markdown 表格；偶发停顿—揭示与短同位。",
-      "5. 禁止堆砌：同一段落反复因果补注、否定—肯定、情绪标签或主题总结模板。",
+      "4. 允许：对白拖音/中断/迟疑；人物口语纠正（「不是老周，是他儿子」）；并列列举；Markdown 表格；偶发停顿—揭示与短同位。",
+      "5. 禁止堆砌：同一段落/相邻句反复否定—肯定、因果补注、情绪标签或主题总结。",
     ].join("\n");
   }
   return `句式与符号约束（生成阶段强制遵守；终审会机器抽查过密说明体）
+
+【最高频硬拦：拆句重定义「不是A。是B。」】
+- 叙述禁止用句号/破折号把同一否定—肯定框架拆成两截当顿挫节奏：不是埋伏。是逃跑。 / 不是检查伤势。是放在那里。 / 能听见…——不是呼吸。是散热。
+- 密度：单场正文最多偶发 1 次；一章内不得成串出现。需要纠正误解时，改写为直接事实或交给人物对白。
+- 改写配方：删掉「不是…」前半，只保留真正成立的后半；或并成一句客观陈述（「这是逃跑」「手掌贴在那里」）。
 
 【破折号 —— / --】
 - 默认策略：叙述中优先不用破折号做补充说明。写成「动作。结果。」或「细节供读者判断」，不要「动作——因为/也就是/意味着…」。
@@ -133,9 +140,9 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
 - 允许保留：对白内拖音/中断/迟疑（「你——你说什么」）；标题/列表/数值区间；Markdown 表格分隔；并列列举（头——脚——手）；偶发停顿后揭示或短同位（桌上只剩钥匙——一把黄铜的）。
 - 改写配方：删破折号后半句的解释，只留可观察结果；因果不可省则拆成下一句独立句。
 
-【「不是…是…」类模板】
-- 叙述少用：不是A而是B / 不是A。是B。 / 并非…而是 / 与其说…不如 / 没有…只有 / 不在于…而在于（尤其「这/那不是情绪，而是意义」式抽象重定义）。不要用句号把同一否定—肯定模板伪装成两个短句。
-- 允许：对白里纠正事实（「不是老周，是他儿子」）；客观事实排除写清即可，勿叠抽象标签。
+【其它「不是…是…」类模板】
+- 叙述少用：不是A而是B / 并非…而是 / 与其说…不如 / 没有…只有 / 不在于…而在于（尤其「这/那不是情绪，而是意义」式抽象重定义）。
+- 允许：对白里纠正事实；客观事实排除写清即可，勿叠抽象标签。
 - 改写配方：直接陈述真正成立的事实；若需纠正误解，改由人物行动或对白完成。
 
 【解释回声】
@@ -144,12 +151,25 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
 - 改写配方：删去没有新信息的解释句；若含新事实，只保留事实、行动条件或后果。
 
 【目标】
-一次写对，避免提案被退回后整段重写。提交前快速扫：说明性破折号、抽象「不是…而是」是否成串出现。`;
+一次写对，避免提案被退回后整段重写。提交前快速扫：是否出现成串「不是A。是B。」、说明性破折号、解释回声。`;
 }
 
 /** One-line checklist for pre-submit self-check in task workflows. */
 export function proseMannerismPreflightLine(): string {
-  return "句式自检：有无说明性破折号、抽象「不是…而是」，以及动作/对白后重复翻译情绪、意图、因果或主题的解释回声；有则先改再提交。对白拖音、口语纠正和必要新事实可保留。";
+  return "句式自检：有无成串「不是A。是B。」拆句重定义、说明性破折号/夹注，以及动作/对白后重复翻译情绪意图的解释回声；有则先改再提交。对白拖音、口语纠正和必要新事实可保留。";
+}
+
+/**
+ * Scene-level hard-mannerism gate (rules only, no Flash).
+ * Reject a single scene before it enters the chapter draft so density never
+ * accumulates to a full-chapter style revise loop.
+ */
+export function sceneMannerismGateError(text: string): string | undefined {
+  const errors = analyzeProseStyle(text).filter(issue =>
+    issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
+  );
+  if (!errors.length) return undefined;
+  return formatProseStyleBlockError(errors, "本场说明式写法过密，尚未写入草稿");
 }
 
 /** Rule scan without density escalation (for pre-model packing). */

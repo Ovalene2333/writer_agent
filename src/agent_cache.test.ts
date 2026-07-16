@@ -89,7 +89,9 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /begin_chapter_draft/);
   assert.match(instructions, /write_chapter_scene/);
   assert.match(instructions, /revise_chapter_draft_style/);
-  assert.match(instructions, /每场只调用一次 write_chapter_scene/);
+  assert.match(instructions, /每场默认一次 write_chapter_scene/);
+  assert.match(instructions, /SCENE_STYLE_DENSE/);
+  assert.match(instructions, /禁止通读上一章全文/);
   assert.match(instructions, /工具内部完成 notes 编译/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);

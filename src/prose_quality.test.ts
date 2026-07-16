@@ -8,6 +8,7 @@ import {
   proseMannerismConstraintPrompt,
   proseMannerismPreflightLine,
   proseStyleIssuesError,
+  sceneMannerismGateError,
 } from "./prose_quality.js";
 
 test("generation-time constraint prompt covers dash and contrast rules", () => {
@@ -15,9 +16,28 @@ test("generation-time constraint prompt covers dash and contrast rules", () => {
   assert.match(full, /破折号/);
   assert.match(full, /不是/);
   assert.match(full, /改写配方/);
+  assert.match(full, /拆句重定义/);
   const compact = proseMannerismConstraintPrompt({ compact: true });
   assert.match(compact, /句式硬约束/);
+  assert.match(compact, /不是A。是B/);
   assert.match(proseMannerismPreflightLine(), /句式自检/);
+  assert.match(proseMannerismPreflightLine(), /不是A。是B/);
+});
+
+test("sceneMannerismGateError blocks dense split_redefinition before draft write", () => {
+  const clean = "门禁灯从绿变红。她停下脚步，掌心贴上金属门框。";
+  assert.equal(sceneMannerismGateError(clean), undefined);
+
+  const dense = [
+    "走廊尽头有动静。不是埋伏。是逃跑。",
+    "空气发涩。不是气体。是悬浮颗粒。",
+    "地面反光。不是水。是油性液体。",
+    "立柱在颤。不是塌方。是预埋装药。",
+  ].join("");
+  const blocked = sceneMannerismGateError(dense);
+  assert.ok(blocked);
+  assert.match(blocked!, /本场说明式写法过密/);
+  assert.match(blocked!, /不是/);
 });
 
 test("classifies speech extension, interruption and hesitation without warnings", () => {
