@@ -27,6 +27,7 @@ import {
   expandOutlineFamily,
   previousPath,
   safeReadHeading,
+  type CompletedChapterHandoff,
   type ToolCall,
   type ToolExecutionContext,
 } from "./tools/index.js";
@@ -81,6 +82,11 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *    After the first streamCompletion, do not mutate earlier messages (no mid-job
  *    compactRuntimeMessages / rehydrate / stripStaleReasoning / compactCompletedToolCalls).
  *    Compactors are only for rebuilding a transcript outside an active job.
+ *    Sole exception — multi-chapter boundary: after a successful proposal with
+ *    further writing steps, the loop TRUNCATES back to the initial stable+dynamic
+ *    prefix and appends one compact handoff (chapterContinuationPrompt). Truncation
+ *    never rewrites earlier bytes, so the initial prefix still cache-hits, while the
+ *    next chapter stops paying the previous chapter's scene transcript every step.
  *
  * 5) TOOLS SCHEMA
  *    src/tools/schema.ts TOOLS must stay order-stable and free of project-specific
@@ -607,9 +613,9 @@ export function taskInstructions(
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章可 read(lastSection)；出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单章任务只交付用户指定的一章：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节时，先在内部用 1—3 句话确定“本章从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。场景数量遵循动态尾部的当前场景链参数，不为凑数拆场；每场必须有目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场只调用一次 write_chapter_scene：将本场事实与上一场 actualState 整理为故事内 notes，并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。
+5. 按场景链顺序循环，每场只调用一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 4000 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后 inspect_chapter_draft 通读整章并先通过风格门禁；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题只用 revise_chapter_draft_style 精确替换命中句，不改变 actualState、不废弃后续场景。修改后再次 inspect，通过后再提案。
+7. 全部场景完成后 inspect_chapter_draft 通读整章并先通过风格门禁；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
 8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
@@ -821,6 +827,36 @@ export function buildDynamicTurnMessages(parts: {
 }
 
 
+/**
+ * Cross-chapter continuation block appended after the per-chapter context reset
+ * (contract §4 exception). The previous chapter's tool transcript is gone from the
+ * request, so this single message must carry every continuity fact the next chapter
+ * needs: what was already delivered, how the last chapter ends, and the final scene
+ * state. Keep it compact — it is re-sent on every remaining step of the job.
+ */
+export function chapterContinuationPrompt(parts: {
+  todosText: string;
+  proposal?: { path: string; summary: string; afterContent: string };
+  handoff?: CompletedChapterHandoff;
+}): string {
+  const lines: string[] = [
+    "上一份文档提案已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
+  ];
+  if (parts.proposal) {
+    lines.push(`已交付：${parts.proposal.path} — ${parts.proposal.summary.replace(/\s+/g, " ").slice(0, 200)}`);
+    const tail = parts.proposal.afterContent.trimEnd().slice(-800).trimStart();
+    if (tail) lines.push(`上一章结尾（仅供衔接语气与局面，禁止重复叙述）：\n…${tail}`);
+  }
+  if (parts.handoff?.finalActualState) {
+    lines.push(`上一章末场 actualState（人物与局面现状，续写以此为准）：${JSON.stringify(parts.handoff.finalActualState)}`);
+  }
+  lines.push(
+    "任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立场景链，再逐场 write_chapter_scene（要点式 notes+正文+actualState），整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。",
+    parts.todosText,
+  );
+  return lines.join("\n");
+}
+
 export async function runAgent(options: {
   project: WriterProject;
   store: WriterStore;
@@ -955,6 +991,8 @@ export async function runAgent(options: {
       prompt,
     }),
   ];
+  // Multi-chapter boundary resets truncate back to exactly this prefix (see contract §4).
+  const initialMessageCount = messages.length;
   let transcript = "";
   let documentProposalSubmitted = false;
   let waitingForUser = false;
@@ -1065,19 +1103,37 @@ export async function runAgent(options: {
         // Advance checklist: keep multi-chapter pending items open and continue the job.
         const advanced = persistAdvancedTodosAfterProposal(store, sessionId, emit);
         if (advanced.shouldContinue && !waitingForUser) {
+          // Per-chapter context reset: drop the finished chapter's tool transcript
+          // and restart from the byte-stable initial prefix (still a cache hit), so
+          // the next chapter stops paying the previous chapter's prose on every step.
+          const latestProposal = store.proposals().find(item => item.sessionId === sessionId);
+          const handoff = toolContext.completedChapterHandoff;
+          toolContext.completedChapterHandoff = undefined;
+          messages.length = initialMessageCount;
           messages.push({
             role: "system",
-            content: `上一份文档提案已成功提交。任务清单仍有未完成的写作步骤，请立即继续下一项：整理下一场故事内 notes，并在一次 write_chapter_scene 中提交 notes、正文和 actualState，最后提案。\n${formatTodosForPrompt(advanced.todos)}`,
+            content: chapterContinuationPrompt({
+              todosText: formatTodosForPrompt(advanced.todos),
+              ...(latestProposal
+                ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
+                : {}),
+              ...(handoff ? { handoff } : {}),
+            }),
           });
-          // Allow reads/searches for the next chapter within the same job.
+          turnStart = messages.length;
+          // Allow fresh reads/searches for the next chapter within the same job;
+          // store-cached artifacts still short-circuit identical repeat reads.
           documentReadCalls = 0;
           projectSearchCalls = 0;
+          toolCallCounts.clear();
           documentProposalSubmitted = false;
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
           toolContext.lastWritePack = undefined;
           toolContext.writePackSceneId = undefined;
           toolContext.chapterSceneDraft = undefined;
+          // Style verdicts are per-chapter sentences; stale entries only waste lookups.
+          toolContext.proseVerdictCache = undefined;
           continue;
         }
         break;

@@ -1,8 +1,16 @@
 import type { AgentEvent, ModelConfig, PermissionMode } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
-import type { ChapterSceneDraft } from "../scene_pipeline.js";
+import type { ChapterSceneDraft, SceneActualState } from "../scene_pipeline.js";
 import type { ScenePipelineSettings } from "../agent_runtime.js";
+import type { ProseVerdictCache } from "../prose_adjudicate.js";
+
+/** Compact cross-chapter handoff captured when a chapter draft is proposed. */
+export type CompletedChapterHandoff = {
+  path: string;
+  sceneCount: number;
+  finalActualState?: SceneActualState;
+};
 
 export type ToolCall = {
   id: string;
@@ -40,6 +48,11 @@ export type ToolExecutionContext = {
   /** In-run chapter draft; never writes a partial chapter to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**
+   * Set by propose_chapter_draft on success (before clearing the draft) so the
+   * agent loop can reset per-chapter context while keeping continuity facts.
+   */
+  completedChapterHandoff?: CompletedChapterHandoff;
+  /**
    * Cheap model (flash/summarizer/inline) for rule→snippet prose second pass.
    * When omitted, style checks stay rules-only.
    */
@@ -47,6 +60,12 @@ export type ToolExecutionContext = {
     model: ModelConfig;
     signal?: AbortSignal;
   };
+  /**
+   * Cross-round Flash verdict memory for the style gate (sentence+subtype → verdict).
+   * Keeps repeat inspects stable/cheap and powers the sync re-gate inside
+   * revise_chapter_draft_style. Reset at chapter boundaries.
+   */
+  proseVerdictCache?: ProseVerdictCache;
 };
 
 export type ToolHandlerArgs = {

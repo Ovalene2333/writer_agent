@@ -11,6 +11,7 @@ import {
   writeChapterScene,
   type ChapterDraftMode,
 } from "../scene_pipeline.js";
+import { previewProseStyleGateError } from "../prose_adjudicate.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
 import { gateProseStyle, submitFullDocumentProposal } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -59,7 +60,7 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
   const sceneId = requireString(input.sceneId, "sceneId");
   const notes = requireString(input.notes, "notes");
-  if (notes.length > 24_000) throw new Error("notes 过长（上限 24000 字）；请压缩为本场目标、事实与事件顺序");
+  if (notes.length > 4_000) throw new Error("notes 过长（上限 4000 字）；只写本场目标、关键事实与事件顺序的要点清单，不要写成长文");
   const writePack = formatWritePackForWriter(compileWritePack(notes, { targetPath: draft.path }));
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const content = requireString(input.content, "content");
@@ -87,12 +88,21 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
   });
 }
 
-export function handleReviseChapterDraftStyle({ input, context }: ToolHandlerArgs): string {
+export function handleReviseChapterDraftStyle({ input, project, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "revise_chapter_draft_style");
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("当前没有章节场景草稿");
   const result = reviseChapterDraftStyle(draft, input.edits);
   context.chapterSceneDraft = result.draft;
+  // Sync re-gate (rules + cached Flash verdicts, no model call): tell the model in
+  // THIS step whether the gate would still block, so it never spends an extra
+  // inspect round just to find out.
+  const beforeContent = project.documentExists(result.draft.path) ? project.read(result.draft.path) : "";
+  const recheckError = previewProseStyleGateError(
+    beforeContent,
+    assembleChapterSceneDraft(result.draft),
+    context.proseVerdictCache,
+  );
   return JSON.stringify({
     status: "style_revised",
     editedSceneIds: result.editedSceneIds,
@@ -101,7 +111,11 @@ export function handleReviseChapterDraftStyle({ input, context }: ToolHandlerArg
     totalScenes: result.draft.scenes.length,
     invalidatedSceneIds: [],
     complete: true,
-    message: "局部风格替换已应用；故事状态与后续场景均保留。请重新 inspect_chapter_draft。",
+    styleRecheck: recheckError ? "blocked" : "passed",
+    ...(recheckError ? { styleBlockers: recheckError } : {}),
+    message: recheckError
+      ? "局部替换已应用，但复检仍有硬拦截；不要调用 inspect_chapter_draft，直接再用一次 revise_chapter_draft_style 把 styleBlockers 中列出的全部命中句一次修完。"
+      : "局部风格替换已应用且复检通过；故事状态与后续场景均保留。请 inspect_chapter_draft 完成终审。",
   });
 }
 
@@ -123,7 +137,7 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
       path: draft.path,
       complete: true,
       invalidatedSceneIds: [],
-      message: "使用 revise_chapter_draft_style 只替换命中句；不要重写场景。修改后重新 inspect。",
+      message: "把 error 中列出的全部命中句在一次 revise_chapter_draft_style 调用中修完（最多 20 条替换），只替换命中句、不重写场景；修订结果自带复检（styleRecheck），复检 passed 后再重新 inspect，不要为查看结果单独 inspect。",
     });
   }
   draft.inspectedVersion = draft.version;
@@ -173,7 +187,14 @@ export async function handleProposeChapterDraft(args: ToolHandlerArgs): Promise<
   );
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
-    if (!("error" in parsed)) context.chapterSceneDraft = undefined;
+    if (!("error" in parsed)) {
+      context.completedChapterHandoff = {
+        path: draft.path,
+        sceneCount: draft.completed.length,
+        finalActualState: draft.completed.at(-1)?.actualState,
+      };
+      context.chapterSceneDraft = undefined;
+    }
   } catch { /* submitFullDocumentProposal always returns JSON; preserve draft on unexpected output. */ }
   return result;
 }

@@ -101,11 +101,14 @@ export async function gateProseStyle(
 ): Promise<void> {
   let issues = newProseStyleIssues(beforeContent, afterContent);
   if (context.proseAdjudicator) {
+    // Verdicts persist across gate rounds so repeat inspects stay deterministic
+    // and only genuinely new sentences spend another Flash call.
+    context.proseVerdictCache ??= new Map();
     const flash = await adjudicateProseStyleForProposal(
       afterContent,
       issues,
       context.proseAdjudicator.model,
-      { signal: context.proseAdjudicator.signal },
+      { signal: context.proseAdjudicator.signal, verdictCache: context.proseVerdictCache },
     );
     issues = flash.issues;
   }

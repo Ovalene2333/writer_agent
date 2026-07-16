@@ -13,6 +13,7 @@ import {
   agentToolSchemaHash,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
+  chapterContinuationPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
   initialTodos,
@@ -28,7 +29,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "ccb250bc8362b38b");
+  assert.equal(agentToolSchemaHash(), "3fa5b56cd20705c2");
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -97,6 +98,33 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /大纲不是章节写作的前置条件/);
   assert.match(instructions, /禁止 design_creative_outline/);
   assert.match(instructions, /重心放在因果场景链/);
+});
+
+test("chapter continuation handoff carries delivery, tail, and final scene state", () => {
+  const tail = "走廊尽头的灯灭了。".repeat(200);
+  const prompt = chapterContinuationPrompt({
+    todosText: "- [x] t1: 撰写第1章 (completed)\n- [>] t2: 撰写第2章 (in_progress)",
+    proposal: { path: "chapters/第1章.md", summary: "主角违规进入训练区", afterContent: tail },
+    handoff: {
+      path: "chapters/第1章.md",
+      sceneCount: 3,
+      finalActualState: {
+        situation: ["警报已触发"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
+      },
+    },
+  });
+  assert.match(prompt, /禁止重复提交同一章/);
+  assert.match(prompt, /chapters\/第1章\.md/);
+  assert.match(prompt, /警报已触发/);
+  assert.match(prompt, /begin_chapter_draft/);
+  assert.match(prompt, /撰写第2章/);
+  // Tail excerpt is bounded so the handoff stays cheap on every remaining step.
+  const tailBlock = prompt.split("上一章结尾")[1] ?? "";
+  assert.ok(tailBlock.length < 1_200, `tail block too long: ${tailBlock.length}`);
+
+  const minimal = chapterContinuationPrompt({ todosText: "（空）" });
+  assert.match(minimal, /任务清单仍有未完成的写作步骤/);
+  assert.doesNotMatch(minimal, /已交付：/);
 });
 
 type Msg = {

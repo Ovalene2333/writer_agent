@@ -9,7 +9,7 @@ import { requireString } from "./helpers.js";
  */
 export function handleCompileWritePack({ input, context }: ToolHandlerArgs): string {
   const notes = requireString(input.notes, "notes");
-  if (notes.length > 24_000) throw new Error("notes 过长（上限 24000 字）；请压缩为场景目标、事实与事件顺序");
+  if (notes.length > 4_000) throw new Error("notes 过长（上限 4000 字）；只写场景目标、关键事实与事件顺序的要点清单，不要写成长文");
   const targetPath = typeof input.targetPath === "string" ? input.targetPath.trim() : undefined;
   const instruction = typeof input.instruction === "string" ? input.instruction.trim() : undefined;
   if (context.chapterSceneDraft) {

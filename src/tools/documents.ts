@@ -1,5 +1,5 @@
 import { documentBlocks, documentSections } from "../document_blocks.js";
-import { adjudicateProseStyleForAudit } from "../prose_adjudicate.js";
+import { adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -16,12 +16,15 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
     ? context.chapterSceneDraft
     : undefined;
   const content = activeDraft ? assembleChapterSceneDraft(activeDraft) : project.read(path);
-  const rules = analyzeProseStyle(content);
+  // Draft audits share the gate's verdict cache so audit → inspect never disagree
+  // on the same sentence and repeated audits skip already-adjudicated candidates.
+  const verdictCache = activeDraft ? (context.proseVerdictCache ??= new Map()) : undefined;
+  const rules = applyCachedProseVerdicts(content, analyzeProseStyle(content), verdictCache);
   const flash = await adjudicateProseStyleForAudit(
     content,
     rules,
     context.proseAdjudicator?.model,
-    { signal: context.proseAdjudicator?.signal },
+    { signal: context.proseAdjudicator?.signal, verdictCache },
   );
   const issues = flash.issues;
   return JSON.stringify({

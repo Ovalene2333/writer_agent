@@ -1,13 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyCachedProseVerdicts,
   applyProseVerdicts,
   materializeProseDiscoveries,
   parseProseAdjudication,
   packProseSnippets,
+  previewProseStyleGateError,
+  proseVerdictCacheKey,
   selectAdjudicationCandidates,
   selectDiscoveryPassages,
   shouldAdjudicateForProposal,
+  type ProseVerdictCache,
 } from "./prose_adjudicate.js";
 import { analyzeProseStyle, proseStyleIssuesError } from "./prose_quality.js";
 
@@ -79,6 +83,58 @@ test("split not-A-is-B narration always receives semantic proposal review", () =
   assert.ok(freshSplit);
   const allowed = applyProseVerdicts(text, fresh, [{ id: freshSplit.id, verdict: "allow", reason: "必要事实排除" }]);
   assert.equal(proseStyleIssuesError(allowed), undefined);
+});
+
+test("cached verdicts replay across gate rounds and keep re-gates deterministic", () => {
+  const lines = [
+    "他停住——因为身后无人。",
+    "她转身——因为门开了。",
+    "雨下了——因为云压得很低。",
+    "灯灭了——因为线路老化。",
+    "他沉默——因为无话可说。",
+    "她离开——因为不想再争。",
+  ].join("");
+  const issues = analyzeProseStyle(lines);
+  assert.ok(proseStyleIssuesError(issues));
+
+  // Round 1: Flash allowed every hard candidate — persist those verdicts.
+  const cache: ProseVerdictCache = new Map();
+  for (const issue of issues.filter(item => item.severity === "error")) {
+    cache.set(proseVerdictCacheKey(issue), { verdict: "allow", reason: "误报" });
+  }
+
+  // Round 2: same sentences re-analyzed from scratch must stay allowed without Flash.
+  const replayed = applyCachedProseVerdicts(lines, analyzeProseStyle(lines), cache);
+  assert.equal(proseStyleIssuesError(replayed), undefined);
+  assert.ok(replayed.every(item => item.severity !== "error"));
+
+  // Empty/absent cache is a no-op.
+  const untouched = applyCachedProseVerdicts(lines, analyzeProseStyle(lines), undefined);
+  assert.ok(proseStyleIssuesError(untouched));
+});
+
+test("previewProseStyleGateError re-gates without a model call", () => {
+  const dense = [
+    "他停住——因为身后无人。",
+    "她转身——因为门开了。",
+    "雨下了——因为云压得很低。",
+    "灯灭了——因为线路老化。",
+    "他沉默——因为无话可说。",
+    "她离开——因为不想再争。",
+  ].join("");
+  const blocked = previewProseStyleGateError("", dense);
+  assert.ok(blocked && blocked.includes("硬拦截"));
+
+  // Cached allows lift the block, matching what the async gate would decide.
+  const cache: ProseVerdictCache = new Map();
+  for (const issue of analyzeProseStyle(dense).filter(item => item.severity === "error")) {
+    cache.set(proseVerdictCacheKey(issue), { verdict: "allow" });
+  }
+  assert.equal(previewProseStyleGateError("", dense, cache), undefined);
+
+  // Pre-existing mannerisms in the old document are not re-blocked.
+  assert.equal(previewProseStyleGateError(dense, dense), undefined);
+  assert.equal(previewProseStyleGateError("", "他推开门。屋里没人。"), undefined);
 });
 
 test("selectDiscoveryPassages finds unruled explanatory paragraph windows", () => {

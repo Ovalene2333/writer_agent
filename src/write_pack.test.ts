@@ -298,6 +298,13 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       sceneId: "arrival", content: "门禁灯变红。".repeat(20), actualState: actualState("违规进入"),
     })) as Record<string, unknown>;
     assert.match(String(missingNotes.error), /notes/);
+    const oversizedNotes = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: "## 事件顺序\n主角进入训练区。".repeat(400),
+      content: "门禁灯变红。".repeat(20),
+      actualState: actualState("违规进入"),
+    })) as Record<string, unknown>;
+    assert.match(String(oversizedNotes.error), /4000/);
     const sceneContent = `${"门禁灯从绿变红。".repeat(20)}\n\n她停下脚步。`;
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
@@ -318,6 +325,9 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(styleRevised.status, "style_revised");
     assert.deepEqual(styleRevised.invalidatedSceneIds, []);
     assert.equal(styleRevised.completedScenes, 1);
+    // Inline re-gate: clean prose reports passed so the model skips a probe inspect.
+    assert.equal(styleRevised.styleRecheck, "passed");
+    assert.equal("styleBlockers" in styleRevised, false);
     const auditedRevisedDraft = JSON.parse(await call("audit_prose_style", {
       path: "chapters/第一章.md",
     })) as Record<string, unknown>;
@@ -340,6 +350,10 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     })) as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
     assert.equal(project.documentExists("chapters/第一章.md"), false);
+    assert.equal(context.chapterSceneDraft, undefined);
+    assert.equal(context.completedChapterHandoff?.path, "chapters/第一章.md");
+    assert.equal(context.completedChapterHandoff?.sceneCount, 1);
+    assert.deepEqual(context.completedChapterHandoff?.finalActualState?.situation, ["主角违规进入训练区"]);
 
     const malformed = JSON.parse(await executeTool(
       { id: "bad-json", name: "inspect_chapter_draft", arguments: "{" },

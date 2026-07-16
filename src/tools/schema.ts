@@ -194,7 +194,7 @@ export const TOOLS = deepFreeze([
         properties: {
           notes: {
             type: "string",
-            description: "情节笔记（可用 ## 场景目标/人物当下/事件顺序/已知事实/须自然落地/勿擅自补写/声线提醒）",
+            description: "要点式情节笔记（上限 4000 字；可用 ## 场景目标/人物当下/事件顺序/已知事实/须自然落地/勿擅自补写/声线提醒）",
           },
           targetPath: { type: "string", description: "目标正文路径（仅脱敏，不注入）" },
           instruction: { type: "string", description: "本轮写作要求摘要（可选）" },
@@ -255,7 +255,7 @@ export const TOOLS = deepFreeze([
           sceneId: { type: "string" },
           notes: {
             type: "string",
-            description: "仅含本场目标、人物当下、事件顺序、已知事实、自然落地信息和勿擅自补写项的故事内笔记",
+            description: "要点式故事内短笔记（上限 4000 字）：仅本场目标、人物当下、事件顺序、已知事实、须自然落地与勿擅自补写项，不写成段落长文",
           },
           content: { type: "string", description: "仅本场正文，不含章节一级标题" },
           actualState: {

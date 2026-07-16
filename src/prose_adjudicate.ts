@@ -4,6 +4,8 @@ import {
   escalateHardMannerisms,
   HARD_BLOCK_SUBTYPES,
   hardMannerismLimit,
+  newProseStyleIssues,
+  proseStyleIssuesError,
   type ProseStyleIssue,
 } from "./prose_quality.js";
 import type { ModelConfig } from "./types.js";
@@ -51,6 +53,50 @@ export type ProseAdjudicationResult = {
   verdicts?: ProseAdjudicationVerdict[];
   discoveries?: ProseAdjudicationDiscovery[];
 };
+
+export type ProseVerdictCacheEntry = { verdict: ProseVerdict; reason?: string };
+
+/** Cross-round verdict memory: same sentence + subtype must keep the same verdict across gate rounds. */
+export type ProseVerdictCache = Map<string, ProseVerdictCacheEntry>;
+
+export function proseVerdictCacheKey(issue: Pick<ProseStyleIssue, "sentence" | "subtype">): string {
+  return `${issue.subtype}|${normalizeSentence(issue.sentence)}`;
+}
+
+/**
+ * Replay cached Flash verdicts synchronously (no model call). Callers apply this
+ * BEFORE adjudication so unchanged sentences keep their earlier verdicts and only
+ * genuinely new candidates spend a Flash round trip; it also powers the cheap
+ * in-tool re-gate after revise_chapter_draft_style.
+ */
+export function applyCachedProseVerdicts(
+  text: string,
+  issues: ProseStyleIssue[],
+  cache: ProseVerdictCache | undefined,
+): ProseStyleIssue[] {
+  if (!cache?.size) return issues;
+  const verdicts: ProseAdjudicationVerdict[] = [];
+  for (const issue of issues) {
+    const hit = cache.get(proseVerdictCacheKey(issue));
+    if (hit) verdicts.push({ id: issue.id, verdict: hit.verdict, ...(hit.reason ? { reason: hit.reason } : {}) });
+  }
+  if (!verdicts.length) return issues;
+  return applyProseVerdicts(text, issues, verdicts);
+}
+
+/**
+ * Rules + cached-verdict pre-check without any model call. Used by
+ * revise_chapter_draft_style so the model learns in the same step whether the
+ * gate would still block, instead of spending an extra inspect round to find out.
+ */
+export function previewProseStyleGateError(
+  before: string,
+  after: string,
+  cache?: ProseVerdictCache,
+): string | undefined {
+  const issues = applyCachedProseVerdicts(after, newProseStyleIssues(before, after), cache);
+  return proseStyleIssuesError(issues);
+}
 
 const MAX_ITEMS = 15;
 const MAX_DISCOVERY_PASSAGES = 8;
@@ -174,18 +220,25 @@ export function applyProseVerdicts(
   return escalateHardMannerisms(text, issues);
 }
 
-/** Audit path: always try Flash on grey-zone candidates when model is configured. */
+/**
+ * Audit path: always try Flash on grey-zone candidates when model is configured.
+ * options.verdictCache: candidates whose sentence already has a cached verdict are
+ * NOT re-sent (callers replay the cache via applyCachedProseVerdicts beforehand);
+ * fresh verdicts are stored back so later gate rounds stay stable and cheap.
+ */
 export async function adjudicateProseStyleForAudit(
   text: string,
   issues: ProseStyleIssue[],
   model: ModelConfig | undefined,
-  options?: { signal?: AbortSignal; timeoutMs?: number; discover?: boolean },
+  options?: { signal?: AbortSignal; timeoutMs?: number; discover?: boolean; verdictCache?: ProseVerdictCache },
 ): Promise<ProseAdjudicationResult> {
   if (!model) return { issues, adjudicated: 0, skipped: "no_model" };
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     return { issues, adjudicated: 0, skipped: "no_model" };
   }
-  const candidates = selectAdjudicationCandidates(issues);
+  const cache = options?.verdictCache;
+  const candidates = selectAdjudicationCandidates(issues)
+    .filter(issue => !cache?.has(proseVerdictCacheKey(issue)));
   const passages = options?.discover === false ? [] : selectDiscoveryPassages(text);
   if (!candidates.length && !passages.length) return { issues, adjudicated: 0, skipped: "no_candidates" };
   const packed = packProseSnippets(text, candidates);
@@ -197,6 +250,18 @@ export async function adjudicateProseStyleForAudit(
       options?.signal,
       options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     );
+    if (cache) {
+      const byId = new Map(candidates.map(item => [item.id, item]));
+      for (const verdict of decision.verdicts) {
+        const issue = byId.get(verdict.id);
+        if (issue) {
+          cache.set(proseVerdictCacheKey(issue), {
+            verdict: verdict.verdict,
+            ...(verdict.reason ? { reason: verdict.reason } : {}),
+          });
+        }
+      }
+    }
     if (!decision.verdicts.length && !decision.discoveries.length) {
       return { issues, adjudicated: 0, skipped: "empty_verdicts" };
     }
@@ -214,21 +279,26 @@ export async function adjudicateProseStyleForAudit(
   }
 }
 
-/** Proposal path: Flash only when rules would hard-fail or density is near the limit. */
+/**
+ * Proposal path: Flash only when rules would hard-fail or density is near the limit.
+ * Cached verdicts from earlier rounds are replayed first, so a sentence Flash already
+ * allowed can no longer flip back to blocked on a later inspect.
+ */
 export async function adjudicateProseStyleForProposal(
   text: string,
   issues: ProseStyleIssue[],
   model: ModelConfig | undefined,
-  options?: { signal?: AbortSignal; timeoutMs?: number },
+  options?: { signal?: AbortSignal; timeoutMs?: number; verdictCache?: ProseVerdictCache },
 ): Promise<ProseAdjudicationResult> {
-  if (!model) return { issues, adjudicated: 0, skipped: "no_model" };
-  if (!shouldAdjudicateForProposal(text, issues)) {
-    return { issues, adjudicated: 0, skipped: "below_threshold" };
+  const replayed = applyCachedProseVerdicts(text, issues, options?.verdictCache);
+  if (!model) return { issues: replayed, adjudicated: 0, skipped: "no_model" };
+  if (!shouldAdjudicateForProposal(text, replayed)) {
+    return { issues: replayed, adjudicated: 0, skipped: "below_threshold" };
   }
   // Proposal issues have already been diffed against the old document. Open-ended
   // discovery over the whole `after` text could re-introduce old issues and violate
   // the new-only gate, so active discovery remains an audit-only capability.
-  return adjudicateProseStyleForAudit(text, issues, model, { ...options, discover: false });
+  return adjudicateProseStyleForAudit(text, replayed, model, { ...options, discover: false });
 }
 
 function severityRank(severity: ProseStyleIssue["severity"]): number {
