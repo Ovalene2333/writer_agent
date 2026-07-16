@@ -441,6 +441,24 @@ export class WriterProject {
     }
   }
 
+  readSimpleCharacterCardsJsonl(): string {
+    const target = resolve(this.charactersDir, "simple-characters.jsonl");
+    return existsSync(target) ? readFileSync(target, "utf8") : "";
+  }
+
+  writeSimpleCharacterCardsJsonl(content: string): void {
+    mkdirSync(this.charactersDir, { recursive: true });
+    const target = resolve(this.charactersDir, "simple-characters.jsonl");
+    const temporary = `${target}.writer-tmp-${process.pid}`;
+    writeFileSync(temporary, content, "utf8");
+    try { renameSync(temporary, target); }
+    catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM") throw error;
+      writeFileSync(target, content, "utf8");
+      try { unlinkSync(temporary); } catch { /* 临时文件不影响简易角色卡。 */ }
+    }
+  }
+
   backupV2CharacterCards(content: string): void {
     mkdirSync(this.charactersDir, { recursive: true });
     const target = resolve(this.charactersDir, "characters.v2.backup.jsonl");

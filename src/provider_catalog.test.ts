@@ -76,6 +76,7 @@ test("default catalog seeds OpenAI and DeepSeek with latest defaults", () => {
     assert.deepEqual(flash.pricing, defaultPricing("deepseek", "deepseek-v4-flash"));
     assert.deepEqual(pro.pricing, defaultPricing("deepseek", "deepseek-v4-pro"));
     assert.equal(providers.modelConfig("agent").model, "gpt-4.1-mini");
+    assert.equal(providers.modelConfig("flash").model, "deepseek-v4-flash");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -169,7 +170,7 @@ test("persist writes providers.json.bak before overwrite", () => {
   }
 });
 
-test("legacy v2 catalog without roleplay assignment inherits agent model", () => {
+test("legacy v2 catalog fills roleplay and flash assignments", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-provider-roleplay-migration-"));
   try {
     const project = WriterProject.init(root, "角色扮演模型迁移");
@@ -186,11 +187,14 @@ test("legacy v2 catalog without roleplay assignment inherits agent model", () =>
 
     const raw = JSON.parse(readFileSync(providers.path, "utf8")) as { assignments: Record<string, unknown> };
     delete raw.assignments.roleplay;
+    delete raw.assignments.flash;
     writeFileSync(providers.path, JSON.stringify(raw), "utf8");
 
     const migrated = new ProviderManager(project);
     assert.deepEqual(migrated.catalog().assignments.roleplay, migrated.catalog().assignments.agent);
     assert.equal(migrated.modelConfig("roleplay").model, "agent-model");
+    assert.deepEqual(migrated.catalog().assignments.flash, migrated.catalog().assignments.summarizer);
+    assert.equal(migrated.modelConfig("flash").model, migrated.modelConfig("summarizer").model);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

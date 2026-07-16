@@ -1242,6 +1242,7 @@ button.agent-orb:focus-visible {
   background: color-mix(in srgb, var(--surface) 80%, #000);
   border: 1px solid var(--border-light);
 }
+.agent-head .agent-head-permission-switch { display: none; }
 .permission-mode-btn {
   border: 0;
   background: transparent;
@@ -1367,8 +1368,14 @@ button.agent-orb:focus-visible {
   filter: brightness(1.08);
 }
 
+.conversation-region {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
 .conversation {
-  flex: 1; overflow-y: auto; overflow-x: hidden;
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
   padding: 14px 14px 18px; display: flex; flex-direction: column; gap: 12px;
   scrollbar-gutter: stable;
   background:
@@ -1503,6 +1510,52 @@ button.agent-orb:focus-visible {
     color-mix(in srgb, var(--accent-light) 45%, var(--surface))
   );
 }
+/* Stage directions (actions / expressions) are emitted as *italics* — dim them so dialogue reads first. */
+.conversation .roleplay-msg .markdown em {
+  color: var(--text-faint);
+  font-style: italic;
+}
+.conversation-to-bottom {
+  position: absolute;
+  z-index: 8;
+  right: 12px;
+  bottom: 12px;
+  display: inline-flex;
+  align-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 94%, var(--accent));
+  color: var(--text);
+  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(10px);
+}
+.conversation-to-bottom:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--accent-light);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+.conversation-to-bottom span {
+  display: block;
+  color: var(--accent);
+  font-size: 22px;
+  line-height: 1;
+  transform: rotate(90deg);
+}
+
+.roleplay-inline-actions { display: flex; gap: 8px; margin: -2px 0 10px; }
+.roleplay-memory-modal { width: min(720px, 94vw); max-height: 88vh; overflow: auto; }
+.roleplay-memory-summary { max-height: 180px; overflow: auto; padding: 10px; border-radius: 8px; background: var(--surface2); white-space: pre-wrap; }
+.roleplay-memory-list { display: grid; gap: 7px; max-height: 280px; margin: 12px 0; overflow: auto; }
+.roleplay-memory-item { display: flex; align-items: flex-start; flex-direction: column; gap: 4px; width: 100%; padding: 10px 12px; text-align: left; }
+.roleplay-memory-item small { color: var(--text-faint); }
+.roleplay-memory-item.status-retracted, .roleplay-memory-item.status-superseded { opacity: .58; }
+.roleplay-fact-editor { padding-top: 12px; border-top: 1px solid var(--border-light); }
+.roleplay-fact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 700px) { .roleplay-fact-grid { grid-template-columns: 1fr; } }
 
 /* Agent step timeline */
 .conversation .agent-step {
@@ -1764,6 +1817,66 @@ button.agent-orb:focus-visible {
 .composer-shell:focus-within {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent), 0 8px 28px -16px var(--agent-glow);
+}
+.director-mode-guide {
+  margin: 10px 10px 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-light) 58%, var(--surface));
+  color: var(--text-muted);
+}
+.director-mode-guide-title {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.director-mode-guide-title > div {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.director-mode-guide-title span {
+  color: var(--text); font-size: 12px; font-weight: 750;
+}
+.director-mode-guide-title small {
+  color: var(--text-faint); font-size: 11px;
+}
+.director-mode-guide-title > button {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+.director-mode-guide p {
+  margin: 4px 0 7px; font-size: 12px; line-height: 1.55;
+}
+.director-mode-error {
+  margin: -1px 0 7px;
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.director-mode-examples {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.director-mode-examples button,
+.director-mode-examples span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  color: var(--text-muted);
+  font-size: 11px; line-height: 1.4;
+}
+.director-mode-examples button {
+  text-align: left;
+}
+.director-mode-examples button:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--text);
+}
+.director-mode-examples .director-mode-empty {
+  padding-left: 0;
+  background: transparent;
+  color: var(--text-faint);
 }
 .composer textarea,
 .composer-shell textarea {
@@ -2192,6 +2305,23 @@ button.agent-orb:focus-visible {
   gap: 14px;
   align-items: stretch;
 }
+.character-section-heading {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 2px 2px 0;
+}
+.character-section-heading.simple {
+  margin-top: 14px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-light);
+}
+.character-section-heading > div { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.character-section-heading strong { color: var(--text); font-size: 14px; }
+.character-section-heading span,
+.character-section-heading small { color: var(--text-faint); font-size: 11px; }
 .character-card-wrap {
   position: relative;
   display: flex;
@@ -2201,61 +2331,131 @@ button.agent-orb:focus-visible {
   gap: 0;
 }
 .roleplay-banner {
+  display: grid;
+  gap: 11px;
+  margin: 0 12px 8px;
+  padding: 12px 13px 11px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--accent-light) 78%, var(--surface)),
+    color-mix(in srgb, var(--surface) 94%, var(--accent-light)));
+}
+.roleplay-banner-copy {
+  min-width: 0;
+}
+.roleplay-banner-heading {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 0 12px 8px;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
-  background: color-mix(in srgb, var(--accent-light) 80%, var(--surface));
-}
-.roleplay-banner > div {
-  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 9px;
   min-width: 0;
-  flex-direction: column;
-  gap: 2px;
 }
-.roleplay-banner strong {
-  font-size: 12px;
-  color: var(--accent);
-}
-.roleplay-banner span {
-  color: var(--text-dim);
-  font-size: 12px;
-  line-height: 1.4;
-}
-.roleplay-banner button {
-  flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 650;
-}
-.roleplay-banner > .roleplay-banner-actions {
-  flex: 0 0 auto;
-  flex-direction: row;
-  gap: 6px;
-}
-.roleplay-session-details {
+.roleplay-banner-heading strong {
   min-width: 0;
-  margin-top: 2px;
-  color: var(--text-dim);
-  font-size: 12px;
-}
-.roleplay-session-details summary {
   overflow: hidden;
-  max-width: 100%;
-  cursor: pointer;
-  color: var(--accent);
-  font-size: 12px;
-  line-height: 1.45;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.roleplay-banner-kicker,
+.roleplay-scene-chip {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-height: 20px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+.roleplay-banner-kicker {
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+  letter-spacing: .04em;
+}
+.roleplay-scene-chip {
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
+  background: color-mix(in srgb, var(--accent-light) 55%, var(--surface));
+  color: var(--accent);
+}
+.roleplay-banner button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.roleplay-banner-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border-light));
+}
+.roleplay-input-mode,
+.roleplay-action-group {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.roleplay-input-mode {
+  flex-wrap: nowrap;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface2) 86%, var(--accent-light));
+}
+.roleplay-input-mode button {
+  min-height: 26px;
+  padding: 3px 8px;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+.roleplay-input-mode button.active {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+}
+.roleplay-action-group-secondary {
+  margin-left: auto;
+}
+.roleplay-exit-button {
+  color: var(--danger, #b54444);
+}
+.roleplay-banner .roleplay-session-details {
+  min-width: 0;
+  margin-top: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.roleplay-session-details summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+.roleplay-session-details summary:hover { color: var(--accent); }
 .roleplay-session-body {
   display: grid;
   gap: 5px;
-  padding: 7px 0 2px 14px;
+  margin-top: 7px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface2) 72%, transparent);
 }
 .roleplay-session-details dl {
   display: grid;
@@ -2271,6 +2471,12 @@ button.agent-orb:focus-visible {
 .roleplay-session-details dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+@media (max-width: 560px) {
+  .roleplay-banner { margin-inline: 8px; padding: 11px; }
+  .roleplay-banner-heading strong { flex-basis: 100%; white-space: normal; }
+  .roleplay-banner-actions { align-items: stretch; }
+  .roleplay-action-group-secondary { margin-left: 0; }
 }
 .character-card {
   display: flex;
@@ -3347,15 +3553,78 @@ header { padding-inline: 18px; }
   }
   .editor > textarea { padding: 24px 20px 80px; font-size: 16px; line-height: 1.8; }
 
-  .agent-head { min-height: 52px; }
+  .agent-head {
+    grid-template-columns: minmax(64px, 1fr) auto minmax(64px, 1fr);
+    min-height: 42px;
+    padding: 7px 10px;
+  }
+  .agent-head-brand { gap: 8px; }
+  .agent-head .agent-head-permission-switch {
+    display: inline-flex;
+    justify-self: center;
+  }
+  .agent-head-permission-switch .permission-mode-btn {
+    min-width: 34px;
+    padding: 4px 6px;
+    font-size: 10px;
+  }
+  .agent-head-actions { justify-self: end; gap: 5px; }
+  button.agent-orb { width: 24px; height: 24px; }
+  .agent-head .agent-status {
+    width: 68px;
+    padding: 3px 7px;
+    justify-content: center;
+    font-size: 10px;
+  }
+  .agent-head .agent-status::before { flex: 0 0 6px; }
+  .agent-head .agent-stop-btn { display: none; }
   .agent-head h2 small { display: none; }
-  .conversation { padding: 14px 12px 20px; gap: 14px; }
-  .conversation .user { margin-left: 20px; }
-  .conversation .assistant { padding: 14px 15px; }
-  .composer { padding: 10px 12px calc(12px + env(safe-area-inset-bottom)); }
+  .agent-control-bar { display: none; }
+
+  .roleplay-banner {
+    gap: 5px;
+    margin: 5px 8px 6px;
+    padding: 8px 9px;
+    border-radius: 10px;
+  }
+  .roleplay-banner-heading { flex-wrap: nowrap; gap: 6px; }
+  .roleplay-banner-heading strong {
+    flex: 1 1 auto;
+    flex-basis: auto;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .roleplay-banner-kicker,
+  .roleplay-scene-chip { min-height: 18px; padding: 2px 6px; font-size: 9px; }
+  .roleplay-banner .roleplay-session-details { margin-top: 1px; }
+  .roleplay-session-details summary { font-size: 10px; line-height: 1.25; }
+  .roleplay-banner-actions {
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin-inline: -2px;
+    padding: 6px 2px 1px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+  .roleplay-banner-actions::-webkit-scrollbar { display: none; }
+  .roleplay-input-mode,
+  .roleplay-action-group { flex: 0 0 auto; flex-wrap: nowrap; gap: 3px; }
+  .roleplay-action-group-secondary { margin-left: 0; }
+  .roleplay-banner button { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+  .roleplay-input-mode button { min-height: 24px; }
+
+  .conversation { padding: 10px 10px 14px; gap: 10px; }
+  .conversation .user { margin-left: 14px; padding: 10px 12px; }
+  .conversation .assistant { padding: 11px 12px; }
+  .composer { padding: 6px 8px calc(7px + env(safe-area-inset-bottom)); }
+  .composer-shell { border-radius: 11px; }
   .composer-shell textarea,
-  .composer textarea { height: 82px; font-size: 16px; }
-  .composer-actions .composer-send { min-height: 40px; min-width: 82px; }
+  .composer textarea { height: 58px; padding: 9px 11px 3px; font-size: 16px; }
+  .composer-actions { justify-content: flex-end; padding: 4px 7px 7px; }
+  .composer-actions .composer-hint { display: none; }
+  .composer-actions .composer-send { min-height: 34px; min-width: 72px; padding: 6px 15px; }
 
   .management-backdrop { inset: 54px 0 calc(64px + env(safe-area-inset-bottom)); padding: 0; }
   .management-view { height: 100%; padding: 20px 16px 36px; border: 0; border-radius: 0; }

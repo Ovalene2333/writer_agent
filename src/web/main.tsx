@@ -64,7 +64,20 @@ type RoleplayParticipant = {
 type ActiveRoleplayState = {
   performer: RoleplayParticipant;
   identity: RoleplayParticipant;
+  scene?: RoleplayScene;
 };
+type RoleplayInputMode = "dialogue" | "director";
+type RoleplayScene = {
+  id: number; name: string; setting: string; premise: string; tone: string; timelineAnchor: string;
+  performerGoal: string; identityGoal: string; stakes: string[]; openingVariants: string[];
+  endConditions: string[]; loreBindings: string[]; revision: number; createdAt: string; updatedAt: string;
+};
+type RoleplayMemoryFact = {
+  id: number; sessionId: string; contextKey: string; kind: "event" | "promise" | "relationship" | "secret" | "preference";
+  content: string; sourceMessageId?: number; knownBy: Array<"public" | "performer" | "identity">;
+  importance: number; status: "active" | "superseded" | "retracted"; pinned: boolean; createdAt: string; updatedAt: string;
+};
+type RoleplaySessionMemory = { performerKey: string; summary: string; summarizedThroughId: number; turnCount: number; sameBeatTurns: number };
 type RoleplaySetupPhase = "generating" | "saving" | "entering";
 const ROLEPLAY_SETUP_PHASE_LABELS: Record<RoleplaySetupPhase, string> = {
   generating: "\u6b63\u5728\u751f\u6210\u7b80\u6613\u89d2\u8272\u5361",
@@ -80,6 +93,12 @@ const ROLEPLAY_SETUP_STEP_LABELS: Record<RoleplaySetupPhase, string> = {
 function roleplaySetupPhases(persist: boolean): RoleplaySetupPhase[] {
   return persist ? ["generating", "saving", "entering"] : ["generating", "entering"];
 }
+type RoleplaySceneDraft = Omit<RoleplayScene, "id" | "revision" | "createdAt" | "updatedAt"> & { id?: number };
+const emptyRoleplayScene = (): RoleplaySceneDraft => ({
+  name: "", setting: "", premise: "", tone: "", timelineAnchor: "", performerGoal: "", identityGoal: "",
+  stakes: [], openingVariants: [], endConditions: [], loreBindings: [],
+});
+type RoleplayFactDraft = Omit<RoleplayMemoryFact, "id" | "sessionId" | "contextKey" | "createdAt" | "updatedAt"> & { id?: number };
 type DocumentData = { content: string; hash: string };
 type DocumentVersionMeta = {
   id: number;
@@ -228,7 +247,10 @@ type State = {
   sessions: Array<{ id: string; title: string; updatedAt: string; autoTitleDone?: boolean }>;
   characters: Character[];
   roleplayInterlocutors: SavedRoleplayInterlocutor[];
+  roleplayScenes: RoleplayScene[];
   activeRoleplay: ActiveRoleplayState | null;
+  roleplayMemory: RoleplaySessionMemory | null;
+  roleplayMemoryFacts: RoleplayMemoryFact[];
   usage: Usage;
   provider: Provider;
   providerCatalog: ProviderCatalog;
@@ -1085,6 +1107,7 @@ function App() {
   const [streamStepsAnchorId, setStreamStepsAnchorId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [olderMessagesLoading, setOlderMessagesLoading] = useState(false);
+  const [conversationAtBottom, setConversationAtBottom] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   /** Agent orb easter egg: tap feedback + rare overdrive mode. */
@@ -1145,8 +1168,15 @@ function App() {
   const [versionBusy, setVersionBusy] = useState(false);
   /** Experimental: roleplay voice-test against a character card. */
   const [roleplay, setRoleplay] = useState<ActiveRoleplayState | null>(null);
-  const [roleplaySetup, setRoleplaySetup] = useState<{ performer: RoleplayParticipant | null; identity: RoleplayParticipant | null; request: string; persist: boolean } | null>(null);
+  const [roleplaySetup, setRoleplaySetup] = useState<{ performer: RoleplayParticipant | null; identity: RoleplayParticipant | null; scene: RoleplayScene | null; request: string; persist: boolean } | null>(null);
   const [simpleCardDraft, setSimpleCardDraft] = useState<(RoleplayInterlocutor & { id?: number }) | null>(null);
+  const [roleplaySceneDraft, setRoleplaySceneDraft] = useState<RoleplaySceneDraft | null>(null);
+  const [roleplayMemoryOpen, setRoleplayMemoryOpen] = useState(false);
+  const [roleplayFactDraft, setRoleplayFactDraft] = useState<RoleplayFactDraft | null>(null);
+  const [roleplayInputMode, setRoleplayInputMode] = useState<RoleplayInputMode>("dialogue");
+  const [directorSuggestions, setDirectorSuggestions] = useState<string[]>([]);
+  const [directorSuggestionBusy, setDirectorSuggestionBusy] = useState(false);
+  const [directorSuggestionError, setDirectorSuggestionError] = useState("");
   const [roleplaySetupBusy, setRoleplaySetupBusy] = useState(false);
   const [roleplaySetupPhase, setRoleplaySetupPhase] = useState<RoleplaySetupPhase | null>(null);
   const [roleplaySetupElapsed, setRoleplaySetupElapsed] = useState(0);
@@ -1172,6 +1202,55 @@ function App() {
   const documentReaderRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const conversationAtBottomRef = useRef(true);
+  const composerFocusedAtBottomRef = useRef(false);
+  const updateConversationBottom = useCallback((viewport: HTMLDivElement | null = conversationRef.current) => {
+    if (!viewport) return;
+    const distance = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    const atBottom = distance <= 48;
+    conversationAtBottomRef.current = atBottom;
+    setConversationAtBottom(atBottom);
+  }, []);
+  const scrollConversationToBottom = useCallback(() => {
+    const viewport = conversationRef.current;
+    if (!viewport) return;
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
+  }, []);
+  useEffect(() => {
+    const viewport = conversationRef.current;
+    if (!viewport) return;
+    conversationAtBottomRef.current = true;
+    setConversationAtBottom(true);
+    let frame = 0;
+    const sync = (preserveFocusedBottom = false) => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const shouldStayAtBottom = conversationAtBottomRef.current
+          || (preserveFocusedBottom && composerFocusedAtBottomRef.current);
+        if (shouldStayAtBottom) {
+          viewport.scrollTop = viewport.scrollHeight;
+          conversationAtBottomRef.current = true;
+          setConversationAtBottom(true);
+          return;
+        }
+        updateConversationBottom(viewport);
+      });
+    };
+    const mutationObserver = new MutationObserver(() => sync());
+    mutationObserver.observe(viewport, { childList: true, subtree: true, characterData: true });
+    const resizeObserver = new ResizeObserver(() => sync());
+    resizeObserver.observe(viewport);
+    const visualViewport = window.visualViewport;
+    const handleVisualViewportResize = () => sync(true);
+    visualViewport?.addEventListener("resize", handleVisualViewportResize);
+    sync();
+    return () => {
+      window.cancelAnimationFrame(frame);
+      mutationObserver.disconnect();
+      resizeObserver.disconnect();
+      visualViewport?.removeEventListener("resize", handleVisualViewportResize);
+    };
+  }, [state?.sessionId, updateConversationBottom]);
   useEffect(() => {
     if (!roleplaySetupBusy) {
       setRoleplaySetupElapsed(0);
@@ -1183,6 +1262,10 @@ function App() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [roleplaySetupBusy]);
+  useEffect(() => {
+    setDirectorSuggestions([]);
+    setDirectorSuggestionError("");
+  }, [state?.sessionId, roleplay?.performer.name, roleplay?.identity.name, roleplay?.scene?.id, roleplay?.scene?.revision]);
 
   const headings = useMemo(() => markdownHeadings(document.content, "document"), [document.content]);
 
@@ -1820,7 +1903,7 @@ function App() {
             ...(simpleCharacterScope !== undefined ? { simpleCharacterScope } : {}),
           } : {}),
           ...(activeRoleplay
-            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity }
+            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: roleplayInputMode }
             : {}),
         }),
       });
@@ -2135,12 +2218,21 @@ function App() {
   }
 
   function normalParticipant(character: Character): RoleplayParticipant {
+    // Fill scene/knowledge/goal from the card so the banner isn't blank; relationship is
+    // performer-dependent and is derived server-side at chat time, so leave it empty here.
+    const latestState = character.storyStates[character.storyStates.length - 1];
+    const scene = latestState
+      ? [latestState.location, latestState.physical, latestState.emotion].map((part) => part?.trim()).filter(Boolean).join("；")
+      : "";
+    const known = latestState?.knowledge?.map((entry) => (entry.description || entry.label).trim()).filter(Boolean) ?? [];
     return {
       kind: "normal", id: character.id, name: character.identity.name,
       card: {
         name: character.identity.name,
         identity: character.identity.summary || character.identity.narrativeRole,
-        relationship: "", knowledge: "", scene: "",
+        relationship: "",
+        knowledge: known.join("；"),
+        scene,
         goal: character.motivations.find(item => item.status === "active")?.summary ?? "",
       },
     };
@@ -2161,7 +2253,7 @@ function App() {
     const normal = state?.characters[0];
     const simple = state?.roleplayInterlocutors[0];
     const performer = normal ? normalParticipant(normal) : simple ? simpleParticipant(simple) : null;
-    setRoleplaySetup({ performer, identity: null, request: "", persist: true });
+    setRoleplaySetup({ performer, identity: null, scene: roleplay?.scene ?? null, request: "", persist: true });
     setCharacterDraft(null);
     setManagementView(null);
   }
@@ -2174,6 +2266,7 @@ function App() {
         sessionId: state.sessionId,
         performer: value.performer,
         identity: value.identity,
+        sceneId: value.scene?.id,
       }),
     });
   }
@@ -2205,6 +2298,7 @@ function App() {
       const active = await persistActiveRoleplay({
         performer: roleplaySetup.performer,
         identity,
+        ...(roleplaySetup.scene ? { scene: roleplaySetup.scene } : {}),
       });
       setRoleplay(active);
       setRoleplaySetup(null);
@@ -2261,6 +2355,105 @@ function App() {
       setNotice(`已保存试演身份：${saved.name}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function saveRoleplayScene() {
+    if (!roleplaySceneDraft?.name.trim()) return;
+    try {
+      const saved = await api<RoleplayScene>("/api/roleplay/scenes", { method: "PUT", body: JSON.stringify(roleplaySceneDraft) });
+      setRoleplaySceneDraft(null);
+      if (roleplaySetup) setRoleplaySetup({ ...roleplaySetup, scene: saved });
+      await refresh(state?.sessionId);
+      setNotice(roleplaySceneDraft.id ? "场景卡已更新" : "场景卡已创建");
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function deleteRoleplayScene(id: number) {
+    if (!confirm("删除这张场景卡？")) return;
+    try {
+      await api(`/api/roleplay/scenes/${id}`, { method: "DELETE" });
+      setRoleplaySceneDraft(null);
+      if (roleplaySetup?.scene?.id === id) setRoleplaySetup({ ...roleplaySetup, scene: null });
+      await refresh(state?.sessionId);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  function newFactDraft(source?: Message): RoleplayFactDraft {
+    return {
+      kind: "event", content: source?.content.slice(0, 1_000) ?? "", ...(source ? { sourceMessageId: source.id } : {}),
+      knownBy: ["public"], importance: source ? 80 : 50, status: "active", pinned: Boolean(source),
+    };
+  }
+
+  async function saveRoleplayFact() {
+    if (!state || !roleplayFactDraft?.content.trim()) return;
+    try {
+      await api<RoleplayMemoryFact>("/api/roleplay/memory/facts", {
+        method: "PUT",
+        body: JSON.stringify({ ...roleplayFactDraft, sessionId: state.sessionId, contextKey: state.roleplayMemory?.performerKey }),
+      });
+      setRoleplayFactDraft(null);
+      await refresh(state.sessionId);
+      setRoleplayMemoryOpen(true);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function deleteRoleplayFact(id: number) {
+    if (!state) return;
+    try {
+      await api(`/api/roleplay/memory/facts/${id}?session=${encodeURIComponent(state.sessionId)}`, { method: "DELETE" });
+      setRoleplayFactDraft(null);
+      await refresh(state.sessionId);
+      setRoleplayMemoryOpen(true);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function requestDirectorSuggestions() {
+    if (!state?.sessionId || !roleplay || busy || directorSuggestionBusy) return;
+    setDirectorSuggestionBusy(true);
+    setDirectorSuggestionError("");
+    try {
+      const result = await api<{ suggestions: string[] }>("/api/roleplay/director-suggestions", {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setDirectorSuggestions(result.suggestions);
+    } catch (cause) {
+      setDirectorSuggestionError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDirectorSuggestionBusy(false);
+    }
+  }
+
+  async function requestRoleplayOpening() {
+    if (!state || busy || !roleplay) return;
+    setError("");
+    setNotice("");
+    clearStepTrail(state.sessionId);
+    setStreamSteps([]);
+    // No user bubble for an opening; anchor the live stream to a temp id so it renders via the orphan path.
+    setStreamStepsAnchorId(-Date.now());
+    streamOutputRef.current = "";
+    try {
+      const result = await api<{ jobId: string }>("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: state.sessionId,
+          prompt: "",
+          mode: "roleplay",
+          opening: true,
+          permissionMode: state.agentSettings?.permissionMode ?? "ask",
+          performer: roleplay.performer,
+          identity: roleplay.identity,
+          scene: roleplay.scene,
+        }),
+      });
+      await subscribeAgentJob(result.jobId, state.sessionId, true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(false);
+      clearAgentStream();
     }
   }
 
@@ -2792,6 +2985,23 @@ function App() {
               </small>
             </h2>
           </div>
+          <div className="permission-mode-switch agent-head-permission-switch" role="group" aria-label="Permission mode">
+            {PERMISSION_MODES.map((mode) => {
+              const active = (state.agentSettings?.permissionMode ?? "ask") === mode.id;
+              return (
+                <button
+                  key={mode.id}
+                  type="button"
+                  className={`permission-mode-btn${active ? " active" : ""}`}
+                  title={mode.hint}
+                  disabled={busy || Boolean(roleplay)}
+                  onClick={() => void setPermissionMode(mode.id)}
+                >
+                  {mode.label}
+                </button>
+              );
+            })}
+          </div>
           <div className="agent-head-actions">
             <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "Running" : "Idle"}</span>
             {busy && (
@@ -2828,9 +3038,13 @@ function App() {
         {roleplay && (
           <div className="roleplay-banner" role="status">
             <div className="roleplay-banner-copy">
-              <strong>角色扮演试演</strong>
+              <div className="roleplay-banner-heading">
+                <span className="roleplay-banner-kicker">角色扮演</span>
+                <strong>「{roleplay.performer.name}」×「{roleplay.identity.name}」</strong>
+                {roleplay.scene && <span className="roleplay-scene-chip">{roleplay.scene.name}</span>}
+              </div>
               <details className="roleplay-session-details">
-                <summary>「{roleplay.performer.name}」×「{roleplay.identity.name}」</summary>
+                <summary>查看当前角色与场景设定</summary>
                 <div className="roleplay-session-body">
                   <span>扮演者：{roleplay.performer.name}（{roleplay.performer.kind === "normal" ? "普通卡" : "简易卡"}）</span>
                   <dl>
@@ -2839,16 +3053,31 @@ function App() {
                     <div><dt>已知</dt><dd>{roleplay.identity.card.knowledge}</dd></div>
                     <div><dt>场景</dt><dd>{roleplay.identity.card.scene}</dd></div>
                     <div><dt>目标</dt><dd>{roleplay.identity.card.goal}</dd></div>
+                    {roleplay.scene && <>
+                      <div><dt>独立场景</dt><dd>{roleplay.scene.name}</dd></div>
+                      <div><dt>前提</dt><dd>{roleplay.scene.premise}</dd></div>
+                      <div><dt>时间</dt><dd>{roleplay.scene.timelineAnchor}</dd></div>
+                    </>}
                   </dl>
                 </div>
               </details>
             </div>
             <div className="roleplay-banner-actions">
-              {roleplay.identity.kind === "generated" && (
-                <button type="button" disabled={busy} onClick={() => void saveCurrentRoleplayInterlocutor()}>保存身份</button>
-              )}
-              <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()}>重新设定</button>
-              <button type="button" disabled={busy} onClick={() => void exitRoleplay()}>退出扮演</button>
+              <div className="roleplay-input-mode" role="group" aria-label="角色扮演输入模式">
+                <button type="button" className={roleplayInputMode === "dialogue" ? "active" : ""} onClick={() => setRoleplayInputMode("dialogue")}>角色内</button>
+                <button type="button" className={roleplayInputMode === "director" ? "active" : ""} onClick={() => setRoleplayInputMode("director")}>导演</button>
+              </div>
+              <div className="roleplay-action-group">
+                <button type="button" disabled={busy} title={`让「${roleplay.performer.name}」根据场景先开口`} onClick={() => void requestRoleplayOpening()}>主动开场</button>
+                <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)}>事实记忆</button>
+                {roleplay.identity.kind === "generated" && (
+                  <button type="button" disabled={busy} onClick={() => void saveCurrentRoleplayInterlocutor()}>保存身份</button>
+                )}
+              </div>
+              <div className="roleplay-action-group roleplay-action-group-secondary">
+                <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()}>更换设定</button>
+                <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()}>退出</button>
+              </div>
             </div>
           </div>
         )}
@@ -2878,13 +3107,15 @@ function App() {
             </ul>}
           </div>
         )}
-        <div
-          className="conversation"
-          ref={conversationRef}
-          onScroll={(event) => {
-            if (event.currentTarget.scrollTop <= 80) void loadOlderMessages();
-          }}
-        >
+        <div className="conversation-region">
+          <div
+            className="conversation"
+            ref={conversationRef}
+            onScroll={(event) => {
+              updateConversationBottom(event.currentTarget);
+              if (event.currentTarget.scrollTop <= 80) void loadOlderMessages();
+            }}
+          >
           {state.messagesHasMore && (
             <button className="load-older-messages" type="button" disabled={olderMessagesLoading} onClick={() => void loadOlderMessages()}>
               {olderMessagesLoading ? "\u6b63\u5728\u52a0\u8f7d..." : "\u52a0\u8f7d\u66f4\u65e9\u6d88\u606f"}
@@ -2949,6 +3180,7 @@ function App() {
                 })()}
                 {msg.role === "user" && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
                 <button disabled={busy} onClick={() => requestRerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
+                {msg.channel === "roleplay" && <button disabled={busy} onClick={() => { setRoleplayFactDraft(newFactDraft(msg)); setRoleplayMemoryOpen(true); }} title="把这条消息保存为可纠错的事实记忆">记住</button>}
               </div>}
             </article>
               );
@@ -3006,12 +3238,57 @@ function App() {
           )}
           {notice && <article className="notice">{notice}</article>}
           {error && <article className="error">{error}</article>}
+          </div>
+          {!conversationAtBottom && (
+            <button
+              type="button"
+              className="conversation-to-bottom"
+              aria-label="到达对话最底部"
+              title="到达对话最底部"
+              onClick={scrollConversationToBottom}
+            >
+              <span aria-hidden="true">›</span>
+            </button>
+          )}
         </div>
         <div className="composer">
           <div className="composer-shell">
+            {roleplay && roleplayInputMode === "director" && (
+              <div className="director-mode-guide" role="note">
+                <div className="director-mode-guide-title">
+                  <div>
+                    <span>导演模式</span>
+                    <small>推荐用于推进与校准剧情</small>
+                  </div>
+                  <button type="button" disabled={busy || directorSuggestionBusy} onClick={() => void requestDirectorSuggestions()}>
+                    {directorSuggestionBusy ? "推荐中…" : directorSuggestions.length ? "换一组" : "Flash 推荐"}
+                  </button>
+                </div>
+                <p>说明场景、时间、节奏、角色态度或新增前提；角色对白请切回「角色内」。</p>
+                {directorSuggestionError && <div className="director-mode-error">{directorSuggestionError}</div>}
+                <div className="director-mode-examples" aria-label="导演指令示例">
+                  {directorSuggestions.length
+                    ? directorSuggestions.map((suggestion, index) => (
+                        <button
+                          type="button"
+                          key={index + ":" + suggestion}
+                          onClick={() => {
+                            setPrompt(suggestion);
+                            requestAnimationFrame(() => composerRef.current?.focus());
+                          }}
+                        >
+                          {suggestion}
+                        </button>
+                      ))
+                    : <span className="director-mode-empty">使用通用 Flash 模型，根据当前场景与最近对话生成可直接发送的指令。</span>}
+                </div>
+              </div>
+            )}
             <textarea
               ref={composerRef}
               value={prompt}
+              onFocus={() => { composerFocusedAtBottomRef.current = conversationAtBottomRef.current; }}
+              onBlur={() => { composerFocusedAtBottomRef.current = false; }}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
@@ -3024,12 +3301,16 @@ function App() {
                 }
               }}
               placeholder={roleplay
-                ? `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
+                ? roleplayInputMode === "director"
+                  ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
+                  : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
                 : "Describe your writing task… (Ctrl+Enter to send)"}
               disabled={busy}
             />
             <div className="composer-actions">
-              <span className="composer-hint">{busy ? "Esc to stop" : roleplay ? "RP · Ctrl+Enter" : "Ctrl+Enter"}</span>
+              <span className="composer-hint">
+                {busy ? "Esc to stop" : roleplay ? `${roleplayInputMode === "director" ? "导演指示" : "角色内"} · Ctrl+Enter` : "Ctrl+Enter"}
+              </span>
               <button
                 className={`composer-send ${busy ? "stop" : "primary"}`}
                 onClick={busy ? stop : () => void sendChat()}
@@ -3171,6 +3452,21 @@ function App() {
                 <optgroup label="简易角色卡">{state.roleplayInterlocutors.map(item => <option key={`identity-simple-${item.id}`} value={`simple:${item.id}`}>{item.name}</option>)}</optgroup>
               </select>
             </label>
+            <label>
+              <span>场景卡（可选）</span>
+              <select
+                value={roleplaySetup.scene?.id ?? ""}
+                disabled={roleplaySetupBusy}
+                onChange={(event) => setRoleplaySetup({ ...roleplaySetup, scene: state.roleplayScenes.find(item => item.id === Number(event.target.value)) ?? null })}
+              >
+                <option value="">不使用独立场景卡</option>
+                {state.roleplayScenes.map(scene => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
+              </select>
+            </label>
+            <div className="roleplay-inline-actions">
+              <button type="button" disabled={roleplaySetupBusy} onClick={() => setRoleplaySceneDraft(emptyRoleplayScene())}>新建场景</button>
+              {roleplaySetup.scene && <button type="button" disabled={roleplaySetupBusy} onClick={() => setRoleplaySceneDraft({ ...roleplaySetup.scene! })}>编辑当前场景</button>}
+            </div>
             {!roleplaySetup.identity && <>
             <label>
               <span>生成要求（可留空）</span>
@@ -3221,6 +3517,80 @@ function App() {
                 {roleplaySetupBusy ? "正在设定…" : "开始扮演"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {roleplaySceneDraft && (
+        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => setRoleplaySceneDraft(null)}>
+          <div className="modal roleplay-setup-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+            <span className="eyebrow">Roleplay scene</span>
+            <h2>{roleplaySceneDraft.id ? "编辑场景卡" : "新建场景卡"}</h2>
+            <p>场景独立于角色卡，可复用于不同角色；绑定的 lore 会经过语义重排后按需注入。</p>
+            {([[
+              "name", "名称（必填）"], ["setting", "地点与环境"], ["premise", "场景前提"], ["tone", "基调"],
+              ["timelineAnchor", "时间/剧情阶段"], ["performerGoal", "AI 角色目标"], ["identityGoal", "用户身份目标"],
+            ] as Array<[keyof RoleplaySceneDraft, string]>).map(([field, label]) => <label key={field}>
+              <span>{label}</span>
+              {field === "name" ? <input value={String(roleplaySceneDraft[field])} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value })} />
+                : <textarea rows={2} value={String(roleplaySceneDraft[field])} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value })} />}
+            </label>)}
+            {([[
+              "stakes", "风险/悬念（每行一项）"], ["openingVariants", "开场意图（每行一项）"],
+              ["endConditions", "结束条件（每行一项）"], ["loreBindings", "绑定 lore 路径（每行一项，如 lore/组织.md）"],
+            ] as Array<["stakes" | "openingVariants" | "endConditions" | "loreBindings", string]>).map(([field, label]) => <label key={field}>
+              <span>{label}</span>
+              <textarea rows={3} value={roleplaySceneDraft[field].join("\n")} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) })} />
+            </label>)}
+            <div className="modal-actions">
+              {roleplaySceneDraft.id && <button type="button" className="danger" onClick={() => void deleteRoleplayScene(roleplaySceneDraft.id!)}>删除</button>}
+              <button type="button" onClick={() => setRoleplaySceneDraft(null)}>取消</button>
+              <button type="button" className="primary" disabled={!roleplaySceneDraft.name.trim()} onClick={() => void saveRoleplayScene()}>保存场景</button>
+            </div>
+          </div>
+          </div>
+      )}
+
+      {roleplayMemoryOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => { setRoleplayMemoryOpen(false); setRoleplayFactDraft(null); }}>
+          <div className="modal roleplay-memory-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+            <span className="eyebrow">Roleplay memory</span>
+            <h2>事实记忆</h2>
+            <p>这些事实会进入当前角色、身份与场景组合的上下文。可以纠错、撤回、置顶，并限制谁知道。</p>
+            {state.roleplayMemory?.summary && <details><summary>滚动摘要</summary><pre className="roleplay-memory-summary">{state.roleplayMemory.summary}</pre></details>}
+            <div className="roleplay-memory-list">
+              {state.roleplayMemoryFacts.filter(fact => !state.roleplayMemory || fact.contextKey === state.roleplayMemory.performerKey).map(fact => (
+                <button type="button" className={`roleplay-memory-item status-${fact.status}`} key={fact.id} onClick={() => setRoleplayFactDraft({
+                  id: fact.id, kind: fact.kind, content: fact.content, ...(fact.sourceMessageId ? { sourceMessageId: fact.sourceMessageId } : {}),
+                  knownBy: fact.knownBy, importance: fact.importance, status: fact.status, pinned: fact.pinned,
+                })}>
+                  <span>{fact.pinned ? "📌 " : ""}{fact.content}</span>
+                  <small>{fact.kind} · {fact.knownBy.join("/")} · {fact.importance}{fact.sourceMessageId ? ` · #${fact.sourceMessageId}` : ""}</small>
+                </button>
+              ))}
+              {!state.roleplayMemoryFacts.some(fact => !state.roleplayMemory || fact.contextKey === state.roleplayMemory.performerKey) && <p className="management-empty">还没有事实记忆。</p>}
+            </div>
+            {roleplayFactDraft ? <div className="roleplay-fact-editor">
+              <label><span>事实</span><textarea rows={4} value={roleplayFactDraft.content} onChange={event => setRoleplayFactDraft({ ...roleplayFactDraft, content: event.target.value })} /></label>
+              <div className="roleplay-fact-grid">
+                <label><span>类型</span><select value={roleplayFactDraft.kind} onChange={event => setRoleplayFactDraft({ ...roleplayFactDraft, kind: event.target.value as RoleplayFactDraft["kind"] })}>
+                  <option value="event">事件</option><option value="promise">承诺</option><option value="relationship">关系</option><option value="secret">秘密</option><option value="preference">偏好</option>
+                </select></label>
+                <label><span>谁知道</span><select value={roleplayFactDraft.knownBy[0] ?? "public"} onChange={event => setRoleplayFactDraft({ ...roleplayFactDraft, knownBy: [event.target.value as "public" | "performer" | "identity"] })}>
+                  <option value="public">双方/公开</option><option value="performer">仅 AI 角色</option><option value="identity">仅用户身份</option>
+                </select></label>
+                <label><span>状态</span><select value={roleplayFactDraft.status} onChange={event => setRoleplayFactDraft({ ...roleplayFactDraft, status: event.target.value as RoleplayFactDraft["status"] })}>
+                  <option value="active">有效</option><option value="superseded">已被取代</option><option value="retracted">撤回</option>
+                </select></label>
+                <label><span>重要度 {roleplayFactDraft.importance}</span><input type="range" min="0" max="100" value={roleplayFactDraft.importance} onChange={event => setRoleplayFactDraft({ ...roleplayFactDraft, importance: Number(event.target.value) })} /></label>
+              </div>
+              <label className="roleplay-persist-choice"><input type="checkbox" checked={roleplayFactDraft.pinned} onChange={event => setRoleplayFactDraft({ ...roleplayFactDraft, pinned: event.target.checked })} /><span>置顶，不随普通回滚自动删除</span></label>
+              <div className="modal-actions">
+                {roleplayFactDraft.id && <button type="button" className="danger" onClick={() => void deleteRoleplayFact(roleplayFactDraft.id!)}>删除</button>}
+                <button type="button" onClick={() => setRoleplayFactDraft(null)}>取消编辑</button>
+                <button type="button" className="primary" disabled={!roleplayFactDraft.content.trim()} onClick={() => void saveRoleplayFact()}>保存事实</button>
+              </div>
+            </div> : <div className="modal-actions"><button type="button" onClick={() => setRoleplayFactDraft(newFactDraft())}>新增事实</button><button type="button" onClick={() => setRoleplayMemoryOpen(false)}>关闭</button></div>}
           </div>
         </div>
       )}
@@ -3740,6 +4110,12 @@ function App() {
 
             {managementView === "characters" ? (
               <div className="character-grid">
+                {state.characters.length > 0 && (
+                  <div className="character-section-heading">
+                    <div><strong>普通角色卡</strong><span>完整设定，供写作 Agent 与角色扮演使用</span></div>
+                    <small>{state.characters.length} 张</small>
+                  </div>
+                )}
                 {state.characters.map((character) => (
                   <div className={`character-card-wrap${agentHiddenCharacterCards.has(`normal:${character.id}`) ? " agent-hidden" : ""}`} key={character.id}>
                     <button className="character-card" onClick={() => setCharacterDraft({ ...character, experiences: character.experiences ?? [] })}>
@@ -3769,13 +4145,19 @@ function App() {
                     </button>
                   </div>
                 ))}
+                {state.roleplayInterlocutors.length > 0 && (
+                  <div className="character-section-heading simple">
+                    <div><strong>简易角色卡</strong><span>独立的轻量扮演身份，不会覆盖普通角色卡</span></div>
+                    <small>{state.roleplayInterlocutors.length} 张</small>
+                  </div>
+                )}
                 {state.roleplayInterlocutors.map((card) => (
                   <div className={`character-card-wrap simple${agentHiddenCharacterCards.has(`simple:${card.id}`) ? " agent-hidden" : ""}`} key={`simple-${card.id}`}>
                     <button className="character-card" onClick={() => setSimpleCardDraft({ ...card })}>
                       <span className="character-avatar">{card.name.slice(0, 1)}</span>
                       <span className="character-card-body">
                         <strong title={card.name}>{card.name}</strong>
-                        <small>简易角色卡</small>
+                        <small>{state.characters.some(character => character.identity.name.trim() === card.name.trim()) ? "简易角色卡 · 与普通卡同名" : "简易角色卡"}</small>
                         <span title={card.identity || undefined}>{card.identity || "暂无身份简介"}</span>
                       </span>
                     </button>

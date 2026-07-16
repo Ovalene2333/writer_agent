@@ -48,6 +48,12 @@ export type ToolExecutionContext = {
   /** In-run chapter draft; never writes a partial chapter to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**
+   * Cached reuse-reference prose for the current chapter draft (previous chapter
+   * body, plus base content in append mode). Feeds the verbatim-recycle metric and
+   * scene anti-formula hints without re-reading files on every scene write.
+   */
+  priorProseContext?: { forPath: string; text: string };
+  /**
    * Set by propose_chapter_draft on success (before clearing the draft) so the
    * agent loop can reset per-chapter context while keeping continuity facts.
    */

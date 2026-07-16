@@ -17,6 +17,7 @@ import {
   compactCompletedToolCalls,
   compactRuntimeMessages,
   initialTodos,
+  normalizeCharacterTaskMode,
   rehydrateRecentToolMessages,
   requestNeedsProjectFactSearch,
   stripStaleReasoningContent,
@@ -44,6 +45,17 @@ test("plan workflows stay read-only and use bounded creative pacing", () => {
 
   const audit = taskInstructions("audit", "shape", "plan", false);
   assert.match(audit, /不提交修改提案/);
+});
+
+test("generic character card requests cannot be downgraded to simple cards", () => {
+  assert.equal(normalizeCharacterTaskMode("更新孟秋岚的角色卡", "simple_character"), "character");
+  assert.equal(normalizeCharacterTaskMode("创建一个简易角色卡", "character"), "simple_character");
+  assert.equal(normalizeCharacterTaskMode("创建一个简易角色卡", "simple_character"), "simple_character");
+
+  const normal = taskInstructions("character", "deliver", "ask", false);
+  assert.match(normal, /检查同名卡/);
+  assert.match(normal, /必须 get_character/);
+  assert.match(normal, /不要调用 save_simple_character/);
 });
 
 test("audit workflow separates review-only from repair", () => {

@@ -1,4 +1,4 @@
-import { documentKind } from "../project.js";
+import { documentKind, type WriterProject } from "../project.js";
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
@@ -10,9 +10,18 @@ import {
   sceneCardForTool,
   writeChapterScene,
   type ChapterDraftMode,
+  type ChapterSceneDraft,
 } from "../scene_pipeline.js";
 import { previewProseStyleGateError } from "../prose_adjudicate.js";
+import {
+  analyzeChapterProseMetrics,
+  chapterMetricsBlockError,
+  findAdjacentDuplicateSentences,
+  priorChapterNegativeList,
+  sceneAntiFormulaFeedback,
+} from "../prose_metrics.js";
 import { sceneMannerismGateError } from "../prose_quality.js";
+import type { ToolExecutionContext } from "./types.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
 import { gateProseStyle, submitFullDocumentProposal } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -43,6 +52,9 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
   context.writePackCompiled = false;
   context.writePackSceneId = undefined;
   context.lastWritePack = undefined;
+  context.priorProseContext = undefined;
+  const priorText = priorProseText(project, draft, context);
+  const stylePriorNotes = priorText ? priorChapterNegativeList(priorText) : [];
   return JSON.stringify({
     status: "started",
     path,
@@ -51,11 +63,36 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
     sceneCount: draft.scenes.length,
     scenePolicy: context.scenePipelineSettings,
     nextScene: sceneCardForTool(nextChapterScene(draft)),
-    message: "场景链已锁定并保存在内存草稿中。按顺序为每场调用一次 write_chapter_scene，同时提交故事内 notes、正文和 actualState。",
+    ...(stylePriorNotes.length ? { stylePriorNotes } : {}),
+    message: "场景链已锁定并保存在内存草稿中。按顺序为每场调用一次 write_chapter_scene，同时提交故事内 notes、正文和 actualState。"
+      + (stylePriorNotes.length ? " stylePriorNotes 是从既有正文统计出的高频表达负面清单，写每一场时遵守。" : ""),
   });
 }
 
-export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): string {
+/**
+ * Reuse-reference prose for recycle metrics and anti-formula hints: the nearest
+ * preceding chapter document, plus the draft's own base content in append mode
+ * (replace mode may legitimately preserve sentences from its base, so it is excluded).
+ */
+function priorProseText(project: WriterProject, draft: ChapterSceneDraft, context: ToolExecutionContext): string {
+  if (context.priorProseContext?.forPath === draft.path) return context.priorProseContext.text;
+  const chapters = project.listDocuments()
+    .filter(path => !project.isDocumentHidden(path) && documentKind(path) === "chapter" && path !== draft.path)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const previous = chapters.filter(path => path.localeCompare(draft.path, undefined, { numeric: true }) < 0).at(-1);
+  const parts: string[] = [];
+  if (previous) {
+    try {
+      parts.push(project.read(previous).slice(-60_000));
+    } catch { /* unreadable prior chapter: skip reuse reference */ }
+  }
+  if (draft.mode === "append" && draft.baseContent.trim()) parts.push(draft.baseContent.slice(-60_000));
+  const text = parts.join("\n\n");
+  context.priorProseContext = { forPath: draft.path, text };
+  return text;
+}
+
+export function handleWriteChapterScene({ input, project, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "write_chapter_scene");
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
@@ -78,6 +115,18 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
       message: "本场正文尚未写入草稿。请按 error 改掉成串「不是A。是B。」/说明性夹注后，用同一 sceneId 重新调用 write_chapter_scene（可保留 notes，只改正文句式）。不要先写完全章再统一 revise。",
     });
   }
+  // AA-repeat generation bug ("S。S。") — objective defect, catch before it enters the draft.
+  const duplicateSentences = findAdjacentDuplicateSentences(content);
+  if (duplicateSentences.length) {
+    return JSON.stringify({
+      status: "style_revision_required",
+      code: "SCENE_DUPLICATE_SENTENCE",
+      error: `本场存在相邻逐字复读句：${duplicateSentences.slice(0, 3).map(item => `「${item}」`).join("、")}`,
+      sceneId,
+      complete: false,
+      message: "删去每处复读中的重复句后，用同一 sceneId 重新调用 write_chapter_scene（notes 可保留）。",
+    });
+  }
   const result = writeChapterScene(draft, sceneId, content, input.actualState);
   context.chapterSceneDraft = result.draft;
   // A write pack belongs to exactly one scene. The next/revised scene must recompile.
@@ -85,6 +134,15 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
   context.writePackSceneId = undefined;
   context.lastWritePack = undefined;
   const next = nextChapterScene(result.draft);
+  // Anti-self-imitation hints for the NEXT scene: measured from prose already in the
+  // draft (not model self-report), zero extra model calls — scene-chain counterpart
+  // of the roleplay anti-formula slot.
+  const styleFeedback = next
+    ? sceneAntiFormulaFeedback({
+      chapterSoFar: result.draft.completed.map(scene => scene.content).join("\n\n"),
+      priorChapterText: priorProseText(project, result.draft, context) || undefined,
+    })
+    : [];
   return JSON.stringify({
     status: result.revised ? "revised" : "written",
     sceneId,
@@ -94,9 +152,10 @@ export function handleWriteChapterScene({ input, context }: ToolHandlerArgs): st
     writePackCharacters: writePack.length,
     actualState: result.draft.completed.at(-1)?.actualState,
     nextScene: sceneCardForTool(next),
+    ...(styleFeedback.length ? { styleFeedback } : {}),
     complete: chapterSceneDraftComplete(result.draft),
     message: next
-      ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 write_chapter_scene 中提交新的 notes。`
+      ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 write_chapter_scene 中提交新的 notes。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
       : "全部场景已写完；调用 inspect_chapter_draft 做整章接缝、重复功能与总变化审阅。",
   });
 }
@@ -153,7 +212,30 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
       message: "把 error 中列出的全部命中句在一次 revise_chapter_draft_style 调用中修完（最多 20 条替换），只替换命中句、不重写场景；修订结果自带复检（styleRecheck），复检 passed 后再重新 inspect，不要为查看结果单独 inspect。",
     });
   }
+  // Rhythm / reuse metrics on the newly written scenes only (base content excluded):
+  // AA repeats and heavy verbatim recycling block; the rest ships as a checklist.
+  const scenesText = draft.completed.map(scene => scene.content).join("\n\n");
+  const metrics = analyzeChapterProseMetrics(scenesText, {
+    priorText: priorProseText(project, draft, context) || undefined,
+  });
+  const metricsError = chapterMetricsBlockError(metrics);
+  if (metricsError) {
+    return JSON.stringify({
+      status: "style_revision_required",
+      code: "CHAPTER_METRICS_BLOCKED",
+      error: metricsError,
+      path: draft.path,
+      complete: true,
+      invalidatedSceneIds: [],
+      message: "复读句与逐字回收句用一次 revise_chapter_draft_style 精确替换修完（复读：把「S。S。」替换为单句；回收：只改写命中句，不重写场景），然后重新 inspect 确认计量通过。",
+    });
+  }
   draft.inspectedVersion = draft.version;
+  const styleWarnings = metrics.issues.map(issue => ({
+    code: issue.code,
+    message: issue.message,
+    examples: issue.examples.slice(0, 5),
+  }));
   return JSON.stringify({
     status: "inspection_required",
     path: draft.path,
@@ -161,6 +243,8 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
     contentCharacters: content.length,
     sceneCount: draft.completed.length,
     proseStyle: "passed",
+    proseMetrics: metrics.stats,
+    ...(styleWarnings.length ? { styleWarnings } : {}),
     ledger: chapterSceneLedger(draft),
     reviewChecklist: [
       "相邻场景是否因果承接，而非只按时间并列",
@@ -169,7 +253,8 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
     ],
-    message: "请依据本轮历史中各次 write_chapter_scene 的正文通读整章；正文已保存在内存草稿中，不在此重复返回。发现问题时直接为目标 sceneId 重新调用 write_chapter_scene（同时提供新 notes）；确认无误后再 propose_chapter_draft。",
+    message: "请依据本轮历史中各次 write_chapter_scene 的正文通读整章；正文已保存在内存草稿中，不在此重复返回。发现问题时直接为目标 sceneId 重新调用 write_chapter_scene（同时提供新 notes）；确认无误后再 propose_chapter_draft。"
+      + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",
   });
 }
 

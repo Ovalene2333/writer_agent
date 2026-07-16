@@ -16,7 +16,7 @@ export type Pricing = {
 };
 export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number };
 export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
-export type ModelRole = "agent" | "roleplay" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
+export type ModelRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
 export type ScenePipelineSettings = { preferredMinScenes: number; preferredMaxScenes: number; maxScenes: number };
 
@@ -25,6 +25,7 @@ type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHin
 type Request = (path: string, init?: RequestInit) => Promise<any>;
 
 const ROLES: Array<{ id: Exclude<ModelRole, "drafter">; name: string; detail: string }> = [
+  { id: "flash", name: "通用 Flash", detail: "低延迟、低成本的推荐、提取与轻量辅助任务" },
   { id: "agent", name: "Agent 调度", detail: "理解请求、规划任务与调用工具" },
   { id: "roleplay", name: "角色扮演", detail: "角色试演、对话者设定与沉浸式对白" },
   { id: "inline", name: "行内生成", detail: "短文本补全与局部快速修改" },

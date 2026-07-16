@@ -110,7 +110,7 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
 
 type ToolAccumulator = ToolCall;
 
-type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "simple_character" | "general";
+type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "character" | "simple_character" | "general";
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
 type CreativeDepth = "explore" | "shape" | "deliver";
 
@@ -323,6 +323,8 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
     none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，必须 search_project 一次（优先 scope=lore），不足再 inspect/read 最小片段。禁止通读全库、禁止把推测写成既有设定。",
     search: task.mode === "simple_character"
       ? `建简易卡：先 list_characters 查同名，必要时 get_character；search_project(lore/outline) 查询：${task.searchQuery || request.slice(0, 120)}；不足再 inspect/read 最小片段；最后 save_simple_character。`
+      : task.mode === "character"
+        ? `处理普通角色卡：先 list_characters 查同名；已有同名卡必须 get_character 后携带原 id 更新，禁止另建简易卡或同名普通卡。按需 search_project(lore/outline)：${task.searchQuery || request.slice(0, 120)}；只读最小必要资料。`
       : `先 search_project（设定/组织/专名优先 scope=lore）：${task.searchQuery || request.slice(0, 120)}。不足再 inspect/read；同路径只读一次最小范围。不得用推测冒充项目事实。`,
     target: `需目标文档。${references.length ? `候选：${references.join("、")}。` : "先定位路径。"}记忆已有且未变则复用；否则 inspect 一次 + read 一次，禁止重复读。`,
     continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/提案确定路径。"}记忆有末尾且未变则续写；否则 inspect 一次 + read(lastSection=true)。`,
@@ -349,8 +351,16 @@ ${creativeContext}
 const TASK_LABELS: Record<WritingTaskMode, string> = {
   brainstorm: "创意构思与候选方案", outline: "动态大纲与情节规划",
   write_scene: "场景或章节写作", rewrite: "定向改写",
-  audit: "一致性与质量审校", simple_character: "创建或更新简易角色卡", general: "通用写作协作",
+  audit: "一致性与质量审校", character: "创建或更新普通角色卡",
+  simple_character: "创建或更新简易角色卡", general: "通用写作协作",
 };
+
+export function normalizeCharacterTaskMode(request: string, plannedMode: WritingTaskMode): WritingTaskMode {
+  const explicitlySimple = ["简易角色卡", "简易角色", "简易卡"].some(term => request.includes(term));
+  if (plannedMode === "simple_character" && !explicitlySimple) return "character";
+  if (plannedMode === "character" && explicitlySimple) return "simple_character";
+  return plannedMode;
+}
 
 /**
  * Task planner (separate completion; tools off).
@@ -383,14 +393,14 @@ async function planWritingTask(
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务规划器。只输出一个 JSON，无 Markdown。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|simple_character|general)；creativeDepth(explore|shape|deliver)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general)；creativeDepth(explore|shape|deliver)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。写文件完整度由 documentProposalRequired 决定。
 documentContext 判定（关键，勿默认 none）：
 - none：仅泛化写作技巧、闲聊、纯灵感且不依赖项目既有专名/组织/势力/世界观事实；或所需事实已完整出现在 recentHistory。
 - search：用户讨论、分析、推演项目内设定/组织/实体/专名/关系/军政势力，或答案正确性依赖 lore/outline 中未在对话里写清的事实（即使 mode=brainstorm/general 也要用 search）。searchQuery 填核心专名。
 - target：用户指定或语义可确定单篇文档要读/改。
 - continuation：承接上一轮正文续写。
-原则：按语义与产物判断。简易角色卡→simple_character+search。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
+原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
 正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，documentProposalRequired=true；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
 只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
@@ -410,8 +420,9 @@ documentContext 判定（关键，勿默认 none）：
   const lastBrace = result.content.lastIndexOf("}");
   if (firstBrace < 0 || lastBrace <= firstBrace) throw new Error("任务规划器没有返回有效 JSON");
   const parsed = JSON.parse(result.content.slice(firstBrace, lastBrace + 1)) as Partial<WritingTask>;
-  const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "simple_character", "general"];
-  const mode = modes.includes(parsed.mode as WritingTaskMode) ? parsed.mode as WritingTaskMode : "general";
+  const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "character", "simple_character", "general"];
+  const plannedMode = modes.includes(parsed.mode as WritingTaskMode) ? parsed.mode as WritingTaskMode : "general";
+  const mode = normalizeCharacterTaskMode(request, plannedMode);
   const contextModes: DocumentContextMode[] = ["none", "search", "target", "continuation"];
   const documentContext = contextModes.includes(parsed.documentContext as DocumentContextMode)
     ? parsed.documentContext as DocumentContextMode
@@ -425,7 +436,7 @@ documentContext 判定（关键，勿默认 none）：
   const creativeDepth = depths.includes(parsed.creativeDepth as CreativeDepth)
     ? parsed.creativeDepth as CreativeDepth
     : documentProposalRequired ? "shape" : "explore";
-  let normalizedDocumentContext: DocumentContextMode = mode === "simple_character"
+  let normalizedDocumentContext: DocumentContextMode = mode === "simple_character" || mode === "character"
     ? "search"
     : continuation
     ? "continuation"
@@ -536,6 +547,7 @@ function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolea
   if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
   if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
   if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
+  if (mode === "character") return ["核对已有普通角色卡与设定", "更新或保存普通角色卡"];
   if (mode === "simple_character") return ["核对已有角色与设定", "整理并保存简易角色卡"];
   return [];
 }
@@ -567,6 +579,10 @@ export function taskInstructions(
 ): string {
   const pacing = creativePacing(creativeDepth);
   if (permissionMode === "plan") {
+    if (mode === "character") return `本次工作流（plan 只读）：
+- 这是普通角色卡任务；先核对同名普通卡与最小必要资料，不得调用任何保存工具。
+- 已有同名卡时保留其 id，说明拟更新的分区；不得改建简易卡或创建同名重复卡。
+- ${pacing}`;
     if (mode === "simple_character") return `本次工作流（plan 只读）：
 - 读取最小必要资料，整理一份候选简易角色卡；不得调用任何保存工具。
 - 保留 name、identity、relationship、knowledge、scene、goal 六个字段，不确定处留白或标为“未明确”。
@@ -587,6 +603,10 @@ export function taskInstructions(
     return `本次工作流（plan 只读）：${pacing} 不提交文档或角色资料变更。`;
   }
 
+  if (mode === "character") return `本次工作流：
+- 这是普通角色卡任务。先 list_characters 检查同名卡；若已存在，必须 get_character 读取必要分区，并用其 id 调用 save_character 或 apply_character_changes 更新。
+- 不要调用 save_simple_character；不得因现有卡内容为空、简略或不完整而新建同名角色。
+- 新建或大改用 save_character；有依据的情节演进优先 apply_character_changes。只填写用户提供或项目材料支持的内容，未知处留空。`;
   if (mode === "simple_character") return `本次工作流：
 - 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终调用 save_simple_character 保存。
 - 先调用 list_characters 检查同名或相关普通角色卡；若存在相关角色，用 get_character 读取必要分区。
@@ -613,9 +633,9 @@ export function taskInstructions(
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单章任务只交付用户指定的一章：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节时，先在内部用 1—3 句话确定“本章从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。场景数量遵循动态尾部的当前场景链参数，不为凑数拆场；每场必须有目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 4000 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。若返回 SCENE_STYLE_DENSE，当场改正文后用同一 sceneId 重提（不计入“另写一场”），勿堆到整章再修。
+5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 4000 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。若返回 SCENE_STYLE_DENSE 或 SCENE_DUPLICATE_SENTENCE，当场改正文后用同一 sceneId 重提（不计入“另写一场”），勿堆到整章再修。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后 inspect_chapter_draft 通读整章并先通过风格门禁；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
+7. 全部场景完成后 inspect_chapter_draft 通读整章并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回的 styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
 8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。

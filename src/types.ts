@@ -96,7 +96,7 @@ export interface ProviderCatalogPublic {
 
 // "drafter" is retained for compatibility with existing providers.json files;
 // the writing pipeline no longer assigns or invokes it.
-export type ModelUsageRole = "agent" | "roleplay" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
+export type ModelUsageRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 
 export interface StyleTemplate {
   id: string;
@@ -303,6 +303,55 @@ export type RoleplayParticipant = {
 export interface ActiveRoleplayState {
   performer: RoleplayParticipant;
   identity: RoleplayParticipant;
+  scene?: RoleplayScene;
+}
+
+export type RoleplayInputMode = "dialogue" | "director";
+
+/** Reusable scene setup kept separate from character identity. */
+export interface RoleplayScene {
+  id: number;
+  name: string;
+  setting: string;
+  premise: string;
+  tone: string;
+  timelineAnchor: string;
+  performerGoal: string;
+  identityGoal: string;
+  stakes: string[];
+  openingVariants: string[];
+  endConditions: string[];
+  loreBindings: string[];
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type RoleplayMemoryFactKind = "event" | "promise" | "relationship" | "secret" | "preference";
+export type RoleplayMemoryFactStatus = "active" | "superseded" | "retracted";
+export type RoleplayKnowledgeScope = "public" | "performer" | "identity";
+
+/** Inspectable roleplay fact with provenance and actor knowledge boundaries. */
+export interface RoleplayMemoryFact {
+  id: number;
+  sessionId: string;
+  contextKey: string;
+  kind: RoleplayMemoryFactKind;
+  content: string;
+  sourceMessageId?: number;
+  knownBy: RoleplayKnowledgeScope[];
+  importance: number;
+  status: RoleplayMemoryFactStatus;
+  pinned: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RoleplayLoreEvidence {
+  path: string;
+  excerpt: string;
+  reason: string;
+  sourceHash: string;
 }
 
 /** Structured on-stage facts for long roleplay (not prose / not style templates). */
@@ -324,7 +373,7 @@ export interface RoleplayWorkingState {
  * Summary holds cold facts; working state holds live stage continuity.
  */
 export interface RoleplaySessionMemory {
-  /** "normal:1" | "simple:2" | "generated:Name" — reset when performer changes */
+  /** Full performer+identity+scene context key. Column name remains performer_key for compatibility. */
   performerKey: string;
   summary: string;
   /** Last message id folded into summary (0 = none). */

@@ -20,13 +20,13 @@ import {
   type ScenePipelineSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
-import { generateRoleplayInterlocutor, runRoleplayChat } from "./roleplay.js";
+import { generateRoleplayInterlocutor, recommendRoleplayDirectorActions, runRoleplayChat } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import type { AgentEvent, PermissionMode, RoleplayInterlocutor, RoleplayParticipant, StyleTemplate } from "./types.js";
+import type { AgentEvent, PermissionMode, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
@@ -199,7 +199,10 @@ export async function startWriterServer(options: {
       proposals: options.store.proposals(),
       characters: options.store.characters(),
       roleplayInterlocutors: options.store.roleplayInterlocutors(),
+      roleplayScenes: options.store.roleplayScenes(),
       activeRoleplay: options.store.activeRoleplay(sessionId) ?? null,
+      roleplayMemory: options.store.roleplayMemory(sessionId) ?? null,
+      roleplayMemoryFacts: options.store.roleplayMemoryFacts(sessionId),
       examples: options.store.writingExamples(),
       provider: options.providers.publicConfig(),
       providerCatalog: options.providers.catalog(),
@@ -522,7 +525,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/providers/assign", async (context) => {
-    try { const body = await context.req.json<{ role: "agent" | "roleplay" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer"; providerId: string; modelId: string }>(); return context.json({ catalog: options.providers.assign(body.role, body.providerId, body.modelId), provider: options.providers.publicConfig() }); }
+    try { const body = await context.req.json<{ role: "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer"; providerId: string; modelId: string }>(); return context.json({ catalog: options.providers.assign(body.role, body.providerId, body.modelId), provider: options.providers.publicConfig() }); }
     catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -628,15 +631,59 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.put("/api/roleplay/scenes", async (context) => {
+    try {
+      const body = await context.req.json<Partial<RoleplayScene> & { name: string }>();
+      return context.json(options.store.saveRoleplayScene(body));
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.delete("/api/roleplay/scenes/:id", (context) => {
+    try {
+      const id = Number(context.req.param("id"));
+      if (!Number.isInteger(id)) throw new Error("场景 ID 无效");
+      options.store.deleteRoleplayScene(id);
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.put("/api/roleplay/memory/facts", async (context) => {
+    try {
+      const body = await context.req.json<Partial<RoleplayMemoryFact> & { sessionId?: string; contextKey?: string; content: string }>();
+      if (!body.sessionId || !options.store.sessionExists(body.sessionId)) throw new Error("会话不存在");
+      const contextKey = body.contextKey?.trim() || options.store.roleplayMemory(body.sessionId)?.performerKey;
+      if (!contextKey) throw new Error("当前没有可关联的角色扮演上下文");
+      return context.json(options.store.saveRoleplayMemoryFact(body.sessionId, contextKey, body));
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.delete("/api/roleplay/memory/facts/:id", async (context) => {
+    try {
+      const sessionId = context.req.query("session") ?? "";
+      const id = Number(context.req.param("id"));
+      if (!sessionId || !Number.isInteger(id)) throw new Error("记忆参数无效");
+      options.store.deleteRoleplayMemoryFact(sessionId, id);
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.put("/api/roleplay/state", async (context) => {
     try {
-      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor }>();
+      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; sceneId?: number }>();
       if (!body.sessionId) throw new Error("缺少会话 ID");
       const performer = body.performer ?? body.characterId;
       const identity = body.identity ?? body.interlocutor;
       if (!performer) throw new Error("缺少扮演者角色卡");
       if (!identity) throw new Error("缺少当前身份角色卡");
-      return context.json(options.store.saveActiveRoleplay(body.sessionId, performer, identity));
+      return context.json(options.store.saveActiveRoleplay(body.sessionId, performer, identity, body.sceneId));
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }
@@ -653,9 +700,30 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.post("/api/roleplay/director-suggestions", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string }>();
+      if (!body.sessionId || !options.store.sessionExists(body.sessionId)) throw new Error("会话不存在");
+      const active = options.store.activeRoleplay(body.sessionId);
+      if (!active) throw new Error("请先进入角色扮演");
+      const suggestions = await recommendRoleplayDirectorActions({
+        store: options.store,
+        sessionId: body.sessionId,
+        performer: active.performer,
+        identity: active.identity,
+        scene: active.scene,
+        model: options.providers.modelConfig("flash"),
+      });
+      return context.json({ suggestions });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; documentSelections?: Array<{ path: string; text: string }> }>();
-    if (!body.prompt?.trim()) return context.json({ error: "写作指令不能为空" }, 400);
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; documentSelections?: Array<{ path: string; text: string }> }>();
+    // Roleplay openings are model-initiated and legitimately carry no prompt.
+    if (!body.prompt?.trim() && !(body.mode === "roleplay" && body.opening)) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
       : undefined;
@@ -711,7 +779,10 @@ export async function startWriterServer(options: {
             characterId: body.characterId,
             identity: body.identity,
             interlocutor: body.interlocutor,
+            scene: body.scene?.id ? options.store.roleplayScenes().find(item => item.id === body.scene!.id) : undefined,
             prompt: body.prompt,
+            inputMode: body.inputMode === "director" ? "director" : "dialogue",
+            opening: body.opening === true,
             variantGroupId,
             model: options.providers.modelConfig("roleplay"),
             summarizer: options.providers.summaryModelConfig(),

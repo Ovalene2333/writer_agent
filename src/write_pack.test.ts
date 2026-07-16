@@ -319,7 +319,17 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(denseStyle.code, "SCENE_STYLE_DENSE");
     assert.equal(denseStyle.status, "style_revision_required");
     assert.equal(context.chapterSceneDraft?.completed.length, 0);
-    const sceneContent = `${"门禁灯从绿变红。".repeat(20)}\n\n她停下脚步。`;
+    const duplicated = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: "## 场景目标\n主角违规进入训练区。",
+      content: `${"她沿着走廊走到尽头的门前。".repeat(2)}${"警报没有响起来。".repeat(12)}`,
+      actualState: actualState("主角违规进入训练区"),
+    })) as Record<string, unknown>;
+    assert.equal(duplicated.code, "SCENE_DUPLICATE_SENTENCE");
+    assert.equal(context.chapterSceneDraft?.completed.length, 0);
+    // Varied filler: verbatim-repeated sentences now trip the adjacent-duplicate gate.
+    const sceneContent = `${Array.from({ length: 20 }, (_, index) =>
+      `门禁灯第${String.fromCharCode(65 + index)}区从绿变红。`).join("")}\n\n她停下脚步。`;
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。\n## 已知事实\n门禁灯会在违规时变红。",

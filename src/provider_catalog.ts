@@ -235,7 +235,8 @@ function parseCatalog(raw: string): SavedCatalog {
     const fallback = { providerId: parsed.activeProviderId, modelId: parsed.activeModelId };
     parsed.assignments = parsed.assignments ?? {} as SavedCatalog["assignments"];
     const agentFallback = parsed.assignments.agent ?? fallback;
-    for (const role of modelRoles()) parsed.assignments[role] ??= role === "roleplay" ? agentFallback : fallback;
+    const flashFallback = parsed.assignments.summarizer ?? parsed.assignments.inline ?? fallback;
+    for (const role of modelRoles()) parsed.assignments[role] ??= role === "roleplay" ? agentFallback : role === "flash" ? flashFallback : fallback;
     for (const profile of parsed.providers) {
       profile.proxyUrl = normalizeProxyUrl(profile.proxyUrl);
       for (const model of profile.models) {
@@ -258,6 +259,7 @@ function parseCatalog(raw: string): SavedCatalog {
     assignments: {
       agent: fallback,
       roleplay: fallback,
+      flash: fallback,
       drafter: fallback,
       inline: fallback,
       writer: fallback,
@@ -290,6 +292,7 @@ function defaultCatalog(): SavedCatalog {
   const deepseekFlashId = randomUUID();
   const deepseekProId = randomUUID();
   const fallback = { providerId: openAiId, modelId: openAiModelId };
+  const flash = { providerId: deepseekId, modelId: deepseekFlashId };
   return {
     version: 2,
     activeProviderId: openAiId,
@@ -297,6 +300,7 @@ function defaultCatalog(): SavedCatalog {
     assignments: {
       agent: fallback,
       roleplay: fallback,
+      flash,
       drafter: fallback,
       inline: fallback,
       writer: fallback,
@@ -338,7 +342,7 @@ function defaultCatalog(): SavedCatalog {
     ],
   };
 }
-function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
+function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "flash", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
 function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();
   if (!name) throw new Error("模型名称不能为空");

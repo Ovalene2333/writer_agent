@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -9,16 +9,21 @@ import {
   buildRoleplayChatMessages,
   buildRoleplayStablePrefix,
   buildRoleplaySystemPrompt,
+  deriveInterlocutorFromCharacter,
   emptyRoleplaySessionMemory,
   extractAntiFormulaHints,
   formatRoleplayAntiFormulaSlot,
   formatRoleplayMemorySlot,
+  formatRoleplayOocDirective,
   formatRoleplaySummarySlot,
   isRoleplayExitCommand,
+  isRoleplayOocInput,
   ROLEPLAY_RECENT_MESSAGES,
+  roleplayContextKey,
   roleplayPerformerKey,
   roleplaySampling,
   slimRoleplayCharacterViews,
+  stripRoleplayOocMarker,
 } from "./roleplay.js";
 import { WriterStore } from "./store.js";
 import { handleGetSimpleCharacter, handleListSimpleCharacters, handleSaveSimpleCharacter } from "./tools/characters.js";
@@ -74,7 +79,8 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /未透露姓名的来访者/);
     assert.match(prompt, /实时对手戏，不是问答/);
     assert.match(prompt, /写出潜台词/);
-    assert.match(prompt, /不要每轮用问题收尾/);
+    assert.match(prompt, /问句收尾是稀缺手段/);
+    assert.match(prompt, /把场景当成对手戏的一部分/);
     assert.match(prompt, /禁止把「动作→对白/);
     assert.match(prompt, /滚动事实摘要/);
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
@@ -158,6 +164,30 @@ describe("roleplay prompts", () => {
     assert.equal(messages[6].content, "看着我。");
   });
 
+  test("context key isolates identity and scene revisions", () => {
+    const performer = { kind: "normal" as const, id: 1, name: "林千夏", card: { name: "林千夏", identity: "", relationship: "", knowledge: "", scene: "", goal: "" } };
+    const first = { kind: "simple" as const, id: 2, name: "苏远", card: { name: "苏远", identity: "", relationship: "", knowledge: "", scene: "", goal: "" } };
+    const second = { ...first, id: 3, name: "李岚" };
+    const scene = { id: 4, name: "医务室", setting: "基地", premise: "训练后", tone: "克制", timelineAnchor: "第一幕", performerGoal: "", identityGoal: "", stakes: [], openingVariants: [], endConditions: [], loreBindings: [], revision: 1, createdAt: "", updatedAt: "" };
+    assert.notEqual(roleplayContextKey(performer, first, scene), roleplayContextKey(performer, second, scene));
+    assert.notEqual(roleplayContextKey(performer, first, scene), roleplayContextKey(performer, first, { ...scene, revision: 2 }));
+  });
+
+  test("memory slot carries scene, facts, and lore without adding a fifth system slot", () => {
+    const scene = { id: 1, name: "雨夜重逢", setting: "旧港", premise: "三年后重逢", tone: "紧张", timelineAnchor: "第二卷后", performerGoal: "追问", identityGoal: "隐瞒", stakes: ["身份暴露"], openingVariants: [], endConditions: ["一方离场"], loreBindings: ["lore/旧港.md"], revision: 1, createdAt: "", updatedAt: "" };
+    const messages = buildRoleplayChatMessages({
+      stablePrefix: "stable", summary: "", state: { scene: "旧港", proximity: "", mood: "", openThreads: [], promises: [], revealed: [], relationshipDelta: "", beat: "", timeInScene: "" },
+      scene,
+      facts: [{ id: 1, sessionId: "s", contextKey: "k", kind: "promise", content: "答应天亮前离开", sourceMessageId: 9, knownBy: ["public"], importance: 90, status: "active", pinned: true, createdAt: "", updatedAt: "" }],
+      lore: [{ path: "lore/旧港.md", excerpt: "旧港午夜封锁。", reason: "地点相关", sourceHash: "h" }],
+      recentAssistantReplies: [], history: [], userText: "继续",
+    });
+    assert.equal(messages.filter(message => message.role === "system").length, 4);
+    assert.match(messages[2].content, /雨夜重逢/);
+    assert.match(messages[2].content, /答应天亮前离开/);
+    assert.match(messages[2].content, /旧港午夜封锁/);
+  });
+
   test("empty summary and memory use stable placeholders", () => {
     assert.equal(formatRoleplaySummarySlot(""), "滚动事实摘要：无。");
     assert.match(formatRoleplayMemorySlot({
@@ -183,13 +213,132 @@ describe("roleplay prompts", () => {
     assert.match(slot, /不要再用问题收束|问句/);
   });
 
+  test("anti-formula escalates on question-end streak and hard-bans question marks", () => {
+    const hints = extractAntiFormulaHints([
+      "「你饿了？」",
+      "「那你想去哪？」",
+      "「真的吗？」",
+    ]);
+    assert.equal(hints.questionEndStreak, 3);
+    const slot = formatRoleplayAntiFormulaSlot([
+      "「那你想去哪？」",
+      "「真的吗？」",
+    ]);
+    assert.match(slot, /禁止出现问号/);
+    // Single question-end stays at the soft warning.
+    const soft = extractAntiFormulaHints(["「好。」", "「真的吗？」"]);
+    assert.equal(soft.questionEndStreak, 1);
+    assert.doesNotMatch(formatRoleplayAntiFormulaSlot(["「好。」", "「真的吗？」"]), /禁止出现问号/);
+  });
+
+  test("anti-formula nudges scene participation when recent replies lack environment", () => {
+    const sceneless = extractAntiFormulaHints([
+      "「随你。」",
+      "（别过脸）「我没这么说。」",
+    ]);
+    assert.equal(sceneless.lacksScene, true);
+    assert.match(formatRoleplayAntiFormulaSlot(["「随你。」", "（别过脸）「我没这么说。」"]), /场景存在感|环境参与/);
+    // Environment words in any recent reply suppress the nudge.
+    const grounded = extractAntiFormulaHints([
+      "（把杯子推过去）「喝完再说。」",
+      "「随你。」",
+    ]);
+    assert.equal(grounded.lacksScene, false);
+    // A single reply is too early to demand scene grounding.
+    assert.equal(extractAntiFormulaHints(["「随你。」"]).lacksScene, false);
+  });
+
   test("recent window constant stays short for cache and anti-echo", () => {
     assert.ok(ROLEPLAY_RECENT_MESSAGES <= 20);
     assert.ok(ROLEPLAY_RECENT_MESSAGES >= 8);
   });
+
+  test("normal identity card keeps relationship / scene / knowledge instead of blanking them", () => {
+    const performer = { ...sampleCharacter(), id: 1 };
+    const identity: Character = {
+      ...sampleCharacter(),
+      id: 2,
+      identity: { ...sampleCharacter().identity, name: "苏远", summary: "泛亚基地教官" },
+      relationships: [{
+        id: "rel-1", characterId: 1, type: "搭档", attitude: "信任但担忧",
+        status: "active", description: "带过林千夏的实战训练", sourceRefs: [],
+      }],
+      storyStates: [{
+        id: "st-1", location: "训练结束后的医务室", physical: "疲惫", emotion: "克制的关切",
+        knowledge: [{ id: "k1", label: "训练安排", description: "知道今天的训练强度超标", sourceRefs: [] }],
+        beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [],
+      }],
+      motivations: [{
+        id: "m1", category: "current", status: "active", priority: 1,
+        summary: "确认林千夏的身体状态", stakes: "", obstacles: [], sourceRefs: [],
+      }],
+    };
+    const derived = deriveInterlocutorFromCharacter(identity, performer);
+    assert.equal(derived.name, "苏远");
+    assert.match(derived.relationship, /搭档/);
+    assert.match(derived.relationship, /带过林千夏/);
+    assert.match(derived.scene, /医务室/);
+    assert.match(derived.knowledge, /训练强度超标/);
+    assert.match(derived.goal, /身体状态/);
+    // And it flows into the stable prefix.
+    const prompt = buildRoleplayStablePrefix(performer, undefined, identity);
+    assert.match(prompt, /医务室/);
+    assert.match(prompt, /带过林千夏/);
+  });
+
+  test("OOC input detection and marker stripping", () => {
+    assert.equal(isRoleplayOocInput("（时间跳到当晚）"), true);
+    assert.equal(isRoleplayOocInput("(她的态度冷淡一点)"), true);
+    assert.equal(isRoleplayOocInput("/ooc 换到雨夜的巷口"), true);
+    assert.equal(isRoleplayOocInput("你还好吗？"), false);
+    assert.equal(isRoleplayOocInput("（叹气）我没事。"), false);
+    assert.equal(stripRoleplayOocMarker("（时间跳到当晚）"), "时间跳到当晚");
+    assert.equal(stripRoleplayOocMarker("/ooc：换到雨夜的巷口"), "换到雨夜的巷口");
+    assert.match(formatRoleplayOocDirective("时间跳到当晚"), /OOC 导演指示/);
+    assert.match(formatRoleplayOocDirective("时间跳到当晚"), /时间跳到当晚/);
+  });
 });
 
 describe("roleplay memory store", () => {
+  test("stores scenes, correctable facts, and restores message-point snapshots", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-p0-"));
+    try {
+      const project = WriterProject.init(root, "P0");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("scene-memory");
+      const scene = store.saveRoleplayScene({
+        name: "雨夜旧港", setting: "旧港", premise: "失联后重逢", tone: "紧张", timelineAnchor: "第二卷后",
+        performerGoal: "追问", identityGoal: "隐瞒", stakes: ["身份暴露"], openingVariants: ["从警报声开始"],
+        endConditions: ["一方离场"], loreBindings: [],
+      });
+      assert.equal(scene.revision, 1);
+      const editedScene = store.saveRoleplayScene({ ...scene, tone: "克制" });
+      assert.equal(editedScene.revision, 2);
+
+      const contextKey = "normal:1|simple:2|scene:1@2";
+      const fact = store.saveRoleplayMemoryFact(sessionId, contextKey, {
+        content: "苏远答应天亮前离开", kind: "promise", knownBy: ["public"], importance: 90,
+        status: "active", pinned: false, sourceMessageId: 12,
+      });
+      const corrected = store.saveRoleplayMemoryFact(sessionId, contextKey, { ...fact, content: "苏远答应日出前离开", pinned: true });
+      assert.equal(corrected.content, "苏远答应日出前离开");
+      assert.equal(store.roleplayMemoryFacts(sessionId, contextKey).length, 1);
+
+      const snapshot = emptyRoleplaySessionMemory(contextKey);
+      snapshot.summary = "旧摘要";
+      snapshot.turnCount = 2;
+      store.saveRoleplayMemory(sessionId, snapshot);
+      store.saveRoleplayMemorySnapshot(sessionId, 10, snapshot);
+      store.saveRoleplayMemory(sessionId, { ...snapshot, summary: "错误分支", turnCount: 5 });
+      store.restoreRoleplayMemoryBefore(sessionId, 11);
+      assert.equal(store.roleplayMemory(sessionId)?.summary, "旧摘要");
+      assert.equal(store.roleplayMemory(sessionId)?.turnCount, 2);
+      // Manually pinned facts survive rewind even when their source message is newer.
+      assert.equal(store.roleplayMemoryFacts(sessionId, contextKey)[0].pinned, true);
+      store.close();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("persists memory and clears with active roleplay exit", () => {
     const root = mkdtempSync(join(tmpdir(), "writer-roleplay-memory-"));
     try {
@@ -354,6 +503,10 @@ describe("saved roleplay interlocutors", () => {
       assert.ok(saved.id > 0);
       assert.equal(store.characters().length, characterCount);
       assert.equal(store.roleplayInterlocutors()[0].name, "苏远");
+      const simpleCardsPath = join(root, "characters", "simple-characters.jsonl");
+      assert.equal(existsSync(simpleCardsPath), true);
+      assert.equal(JSON.parse(readFileSync(simpleCardsPath, "utf8").trim()).name, "苏远");
+      assert.equal(Number(store.database.prepare("SELECT COUNT(*) count FROM roleplay_interlocutors").get()!.count), 0);
 
       const updated = store.saveRoleplayInterlocutor({ ...saved, identity: "泛亚基地教官" });
       assert.equal(updated.id, saved.id);
@@ -361,6 +514,30 @@ describe("saved roleplay interlocutors", () => {
 
       store.deleteRoleplayInterlocutor(saved.id);
       assert.deepEqual(store.roleplayInterlocutors(), []);
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("migrates legacy SQLite simple cards into characters JSONL", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-simple-card-migration-"));
+    try {
+      const project = WriterProject.init(root, "简易角色迁移");
+      let store = new WriterStore(project);
+      store.database.prepare(`INSERT INTO roleplay_interlocutors(
+        target_character_id,name,identity,relationship,knowledge,scene,goal,created_at,updated_at
+      ) VALUES(NULL,?,?,?,?,?,?,?,?)`).run(
+        "旧卡", "旧身份", "旧关系", "旧知识", "旧场景", "旧目标",
+        "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z",
+      );
+      store.close();
+
+      store = new WriterStore(project);
+      assert.equal(store.roleplayInterlocutors()[0].name, "旧卡");
+      assert.equal(Number(store.database.prepare("SELECT COUNT(*) count FROM roleplay_interlocutors").get()!.count), 0);
+      const persisted = readFileSync(join(root, "characters", "simple-characters.jsonl"), "utf8");
+      assert.match(persisted, /"name":"旧卡"/);
       store.close();
     } finally {
       rmSync(root, { recursive: true, force: true });
