@@ -1072,7 +1072,7 @@ export async function startWriterServer(options: {
     self.addEventListener('fetch',e=>{if(e.request.method==='GET'&&!e.request.url.includes('/api/'))e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))) });
   `, 200, { "content-type": "application/javascript" }));
 
-  const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "web");
+  const webRoot = resolveWebRoot(import.meta.url);
   app.use("/*", serveStatic({ root: webRoot }));
   app.get("/*", serveStatic({ path: resolve(webRoot, "index.html") }));
 
@@ -1123,6 +1123,12 @@ export async function startWriterServer(options: {
       await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);
     },
   };
+}
+
+export function resolveWebRoot(moduleUrl: string): string {
+  // Both `tsx src/cli.ts` and `node dist/cli.js` must publish Vite's compiled
+  // assets. Serving src/web exposes main.tsx directly and fails on fresh origins.
+  return resolve(dirname(fileURLToPath(moduleUrl)), "..", "dist", "web");
 }
 
 function tokensEqual(left: string, right: string): boolean {

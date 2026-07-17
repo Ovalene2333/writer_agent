@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
-import { BackgroundAgentJobs, startWriterServer } from "./server.js";
+import { BackgroundAgentJobs, resolveWebRoot, startWriterServer } from "./server.js";
 import { WriterStore } from "./store.js";
+
+test("web assets always resolve to Vite's build output", () => {
+  const repositoryRoot = resolve("C:/workspace/writer-agent");
+  const expected = join(repositoryRoot, "dist", "web");
+  assert.equal(resolveWebRoot(pathToFileURL(join(repositoryRoot, "src", "server.ts")).href), expected);
+  assert.equal(resolveWebRoot(pathToFileURL(join(repositoryRoot, "dist", "server.js")).href), expected);
+});
 
 test("agent event snapshot keeps events emitted during replay", async () => {
   let releaseAgent!: () => void;

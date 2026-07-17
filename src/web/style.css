@@ -29,14 +29,20 @@
   --warn: #c0392b;
   --warn-light: #faece5;
   --warn-text: #fff;
-  --shadow: 0 1px 3px rgba(44,51,43,.05), 0 1px 2px rgba(44,51,43,.06);
-  --shadow-sm: 0 1px 2px rgba(44,51,43,.04);
-  --shadow-md: 0 10px 30px rgba(44,51,43,.09), 0 2px 6px rgba(44,51,43,.04);
-  --shadow-lg: 0 12px 40px rgba(44,51,43,.12);
-  --radius: 10px;
-  --radius-sm: 7px;
-  --radius-xs: 4px;
-  --transition: .18s ease;
+  --shadow-sm: 0 1px 2px rgba(44,51,43,.05);
+  --shadow: 0 1px 2px rgba(44,51,43,.04), 0 3px 8px -3px rgba(44,51,43,.06);
+  --shadow-md: 0 4px 10px -5px rgba(44,51,43,.08), 0 14px 32px -10px rgba(44,51,43,.12);
+  --shadow-lg: 0 10px 20px -10px rgba(44,51,43,.12), 0 28px 60px -18px rgba(44,51,43,.18);
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-sm: 8px;
+  --radius-xs: 5px;
+  --transition: .18s cubic-bezier(.4, 0, .2, 1);
+  --ease-out: cubic-bezier(.22, 1, .36, 1);
+  --ease-spring: cubic-bezier(.34, 1.4, .5, 1);
+  --text-muted: var(--text-dim);
+  --danger: var(--warn);
+  --shadow-hover: 0 10px 24px -12px var(--agent-glow), var(--shadow-md);
   --font-serif: Georgia, "Songti SC", "STSong", "Noto Serif SC", serif;
   --font-mono: "JetBrains Mono", "Fira Code", Consolas, "Courier New", monospace;
   --folder-bg: #eadfbd;
@@ -75,10 +81,10 @@
   --warn: #d48563;
   --warn-light: #2a1f18;
   --warn-text: #fff;
-  --shadow: 0 1px 3px rgba(0,0,0,.18);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.12);
-  --shadow-md: 0 4px 12px rgba(0,0,0,.2);
-  --shadow-lg: 0 12px 40px rgba(0,0,0,.35);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.25);
+  --shadow: 0 1px 2px rgba(0,0,0,.2), 0 4px 10px -3px rgba(0,0,0,.3);
+  --shadow-md: 0 6px 16px -6px rgba(0,0,0,.4), 0 18px 38px -12px rgba(0,0,0,.5);
+  --shadow-lg: 0 12px 24px -10px rgba(0,0,0,.5), 0 34px 66px -20px rgba(0,0,0,.62);
   --folder-bg: #3a3320;
   --folder-fg: #c5ab5e;
   --reader-card-shadow: 0 12px 40px rgba(0,0,0,.28);
@@ -115,10 +121,10 @@
   --warn: #8b2e22;
   --warn-light: #f5e6e3;
   --warn-text: #fff;
-  --shadow: 0 1px 2px rgba(26,26,26,.06);
   --shadow-sm: 0 1px 2px rgba(26,26,26,.05);
-  --shadow-md: 0 8px 28px rgba(26,26,26,.08);
-  --shadow-lg: 0 16px 48px rgba(26,26,26,.12);
+  --shadow: 0 1px 2px rgba(26,26,26,.05), 0 3px 8px -3px rgba(26,26,26,.07);
+  --shadow-md: 0 4px 10px -5px rgba(26,26,26,.08), 0 14px 34px -12px rgba(26,26,26,.12);
+  --shadow-lg: 0 10px 20px -10px rgba(26,26,26,.12), 0 30px 60px -18px rgba(26,26,26,.16);
   --font-serif: "Songti SC", "STSong", "Noto Serif SC", "Source Han Serif SC", Georgia, serif;
   --folder-bg: #ebe6dc;
   --folder-fg: #6b5b4a;
@@ -156,10 +162,10 @@
   --warn: #d94848;
   --warn-light: #fdecec;
   --warn-text: #fff;
-  --shadow: 0 1px 3px rgba(28,36,51,.06);
-  --shadow-sm: 0 1px 2px rgba(28,36,51,.05);
-  --shadow-md: 0 12px 32px rgba(79,110,247,.12);
-  --shadow-lg: 0 18px 50px rgba(28,36,51,.14);
+  --shadow-sm: 0 1px 2px rgba(28,36,51,.06);
+  --shadow: 0 1px 2px rgba(28,36,51,.05), 0 3px 8px -3px rgba(28,36,51,.08);
+  --shadow-md: 0 4px 10px -5px rgba(79,110,247,.10), 0 16px 36px -12px rgba(79,110,247,.16);
+  --shadow-lg: 0 10px 22px -10px rgba(28,36,51,.14), 0 30px 62px -18px rgba(28,36,51,.2);
   --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", Georgia, serif;
   --folder-bg: #e0e7ff;
   --folder-fg: #3d4db8;
@@ -197,10 +203,10 @@
   --warn: #b54040;
   --warn-light: #fce9e9;
   --warn-text: #fff;
-  --shadow: 0 1px 3px rgba(58,42,46,.05);
-  --shadow-sm: 0 1px 2px rgba(58,42,46,.04);
-  --shadow-md: 0 12px 32px rgba(196,92,122,.1);
-  --shadow-lg: 0 16px 48px rgba(58,42,46,.1);
+  --shadow-sm: 0 1px 2px rgba(58,42,46,.05);
+  --shadow: 0 1px 2px rgba(58,42,46,.04), 0 3px 8px -3px rgba(58,42,46,.06);
+  --shadow-md: 0 4px 10px -5px rgba(196,92,122,.10), 0 14px 34px -12px rgba(196,92,122,.16);
+  --shadow-lg: 0 10px 20px -10px rgba(58,42,46,.12), 0 30px 60px -18px rgba(58,42,46,.15);
   --font-serif: "Iowan Old Style", "Songti SC", "STSong", Georgia, serif;
   --folder-bg: #f6e0e7;
   --folder-fg: #9a4d66;
@@ -238,10 +244,10 @@
   --warn: #ff7b72;
   --warn-light: #2a1514;
   --warn-text: #fff;
-  --shadow: 0 1px 3px rgba(0,0,0,.35);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.28);
-  --shadow-md: 0 8px 24px rgba(0,0,0,.4);
-  --shadow-lg: 0 16px 48px rgba(0,0,0,.5);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.32);
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 10px -3px rgba(0,0,0,.42);
+  --shadow-md: 0 6px 16px -6px rgba(0,0,0,.5), 0 18px 40px -12px rgba(0,0,0,.6);
+  --shadow-lg: 0 12px 24px -10px rgba(0,0,0,.6), 0 34px 66px -20px rgba(0,0,0,.72);
   --font-serif: "Iowan Old Style", "Palatino Linotype", Georgia, "Songti SC", serif;
   --folder-bg: #243040;
   --folder-fg: #7ec8e8;
@@ -300,9 +306,16 @@ button:disabled:hover { background: var(--surface); border-color: var(--border);
 button.primary {
   background: var(--accent); color: var(--accent-text); border-color: var(--accent);
   font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 5px 14px -7px var(--agent-glow);
 }
-button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-button.primary:disabled:hover { background: var(--accent); border-color: var(--accent); }
+button.primary:hover {
+  background: var(--accent-hover); border-color: var(--accent-hover);
+  box-shadow: 0 2px 4px rgba(0,0,0,.1), 0 9px 22px -8px var(--agent-glow);
+  transform: translateY(-1px);
+}
+button.primary:active { transform: scale(.97); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+button.primary:disabled { box-shadow: none; }
+button.primary:disabled:hover { background: var(--accent); border-color: var(--accent); transform: none; box-shadow: none; }
 
 button.danger { color: var(--warn); border-color: var(--warn); }
 button.danger:hover { background: var(--warn-light); }
@@ -336,6 +349,26 @@ textarea {
   background: var(--surface); color: var(--text); resize: vertical;
   transition: border-color var(--transition), box-shadow var(--transition);
 }
+
+/* ── Focus system: unified keyboard focus ring ─────────────
+   Mouse clicks stay ring-free (outline:none above); keyboard
+   navigation gets a consistent accent ring across interactives. */
+button:focus-visible,
+[role="button"]:focus-visible,
+.sidebar-item:focus-visible,
+.tree-row:focus-visible,
+.version-item:focus-visible,
+.document-outline-item:focus-visible,
+.mobile-tabs button:focus-visible,
+.connection-pref-card:focus-visible,
+.tab:focus-visible,
+summary:focus-visible,
+a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent);
+  outline-offset: 2px;
+}
+/* Inputs already show an accent box-shadow ring on focus — don't double up. */
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; }
 
 .app {
   height: 100vh; height: 100dvh;
@@ -479,12 +512,14 @@ header {
   text-align: left; padding: 12px 10px; border-radius: 12px;
   border: 1px solid var(--border-light); background: var(--surface2);
   cursor: pointer; font-family: inherit;
-  transition: border-color var(--transition), box-shadow var(--transition), background var(--transition);
+  transition: border-color var(--transition), box-shadow var(--transition), background var(--transition), transform var(--transition);
 }
 .connection-pref-card strong { font-size: 13px; color: var(--text); }
 .connection-pref-card small { font-size: 11px; color: var(--text-faint); line-height: 1.35; }
 .connection-pref-card:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: var(--shadow-hover);
+  transform: translateY(-1px);
 }
 .connection-pref-card.active {
   border-color: var(--accent);
@@ -1941,7 +1976,7 @@ button.agent-orb:focus-visible {
 }
 .proposals .proposal-card:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  box-shadow: 0 8px 24px -12px var(--agent-glow);
+  box-shadow: var(--shadow-hover);
   transform: translateY(-1px);
 }
 .proposals .proposal-card h3 {
@@ -2081,16 +2116,18 @@ button.agent-orb:focus-visible {
 .modal-backdrop {
   position: fixed; z-index: 50; inset: 0;
   display: grid; place-items: center; padding: 16px;
-  background: rgba(24,28,24,.45); backdrop-filter: blur(6px);
-  animation: fadeIn .18s ease;
+  background: rgba(24,28,24,.5); backdrop-filter: blur(8px) saturate(1.05);
+  -webkit-backdrop-filter: blur(8px) saturate(1.05);
+  animation: fadeIn .2s ease;
 }
 @keyframes fadeIn { from { opacity: 0; } }
 
 .modal {
   width: min(520px, 100%); max-height: 90vh; overflow-y: auto;
-  background: var(--surface); border-radius: var(--radius);
+  background: var(--surface); border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg); padding: 28px;
-  animation: scaleIn .18s ease;
+  border: 1px solid color-mix(in srgb, var(--border-light) 70%, transparent);
+  animation: scaleIn .24s var(--ease-spring);
 }
 @keyframes scaleIn { from { opacity: 0; transform: scale(.95) translateY(8px); } }
 
@@ -3311,12 +3348,21 @@ button.agent-orb:focus-visible {
   padding: 0 12px; gap: 12px; align-items: center;
 }
 .mobile-tabs button {
+  position: relative;
   border: 0; background: transparent; padding: 10px 6px;
   font-size: 13px; font-weight: 500; border-radius: var(--radius-sm);
-  color: var(--text-dim); cursor: pointer; transition: background .15s, color .15s;
+  color: var(--text-dim); cursor: pointer;
+  transition: background var(--transition), color var(--transition);
 }
 .mobile-tabs button:hover { background: var(--surface2); color: var(--text); }
-.mobile-tabs button.active { background: var(--accent); color: var(--accent-text); }
+.mobile-tabs button.active {
+  background: color-mix(in srgb, var(--accent-light) 85%, var(--surface));
+  color: var(--accent); font-weight: 650;
+}
+.mobile-tabs button.active::before {
+  content: ""; position: absolute; top: 3px; left: 50%; transform: translateX(-50%);
+  width: 24px; height: 3px; border-radius: 999px; background: var(--accent);
+}
 
 /* ── Mobile responsive (base rules; refined block below continues) ─── */
 @media (max-width: 900px) {
@@ -3367,10 +3413,21 @@ button.agent-orb:focus-visible {
 }
 
 /* ── Scrollbar ─────────────────────────── */
-::-webkit-scrollbar { width: 5px; height: 5px; }
+html { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--text-faint) 45%, transparent) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-faint) 50%, transparent);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  transition: background var(--transition);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-faint) 85%, transparent);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner { background: transparent; }
 
 /* Refined responsive workspace */
 body { overflow: hidden; }
@@ -3788,8 +3845,8 @@ header .nav-action.style-active {
 }
 .theme-card:hover {
   border-color: var(--accent);
-  box-shadow: var(--shadow-md);
-  transform: translateY(-1px);
+  box-shadow: var(--shadow-hover);
+  transform: translateY(-2px);
 }
 .theme-card.active {
   border-color: var(--accent);

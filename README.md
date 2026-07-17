@@ -94,7 +94,7 @@ writer web -p ./my-novel          # 指定项目目录
 writer web --port 4096            # 端口，默认 4096
 writer web --lan                  # 监听 0.0.0.0，允许局域网访问
 writer web --host 0.0.0.0         # 自定义监听地址
-writer web --share                # 局域网 + cloudflared；二维码默认打开公网入口
+writer web --share                # 局域网 + cloudflared；扫一次码，进出家自动切换通道
 writer web --no-open              # 不自动打开浏览器
 writer web --no-token             # 关闭 API 鉴权；可与 --lan / --share 同用
 writer web --share --no-token     # 建立无令牌公网入口（终端会打印安全警告）
@@ -302,8 +302,8 @@ npm test                    # 编译并跑测试
 - `.writer/providers.json`（或 `WRITER_PROVIDERS_FILE` 指向的文件）含 API Key，**不要提交到公开仓库**
 - `writer web --share` 会把带令牌的公网地址暴露到外网；只发给可信设备，结束进程后隧道关闭
 - `writer web --no-token` 会关闭全部 API 访问鉴权；可与 `--share` 同用，但拿到公网地址的任何人都能读写项目，终端会明确警告
-- `--share` 会同时监听局域网，但终端二维码默认使用**公网 HTTPS 入口**，在任意网络都能直接打开；二维码 URL 仍携带局域网地址，连接面板中会显示局域网备用入口
-- 公网 HTTPS 页受浏览器混合内容限制，不能在页内直接请求局域网 HTTP；需要走局域网时，请在同一 Wi-Fi 下打开终端列出的“局域网备用”链接。下次重启 Writer 需重新扫码（临时隧道地址会变）
+- `--share` 会同时监听局域网：终端二维码为**局域网入口**（hash 里带公网地址）。手机在家扫一次后，Web 端会探测 `/api/health`，在家走局域网、出门自动改打 Cloudflare；下次重启 Writer 需重新扫码（临时隧道地址会变）
+- 请在**家中 Wi‑Fi** 下扫推荐二维码。若先打开纯公网 HTTPS 页，浏览器会拦截对局域网 HTTP 的探测（混合内容），无法自动切回局域网
 - `--lan` 会允许同一局域网内的设备访问工作台，请注意网络安全环境
 
 ## 许可证

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildShareAccessUrls, buildShareEntryUrl, diagnoseTunnelFailure, formatTunnelFailureReport, tunnelLogTail } from "./share_tunnel.js";
+import { buildShareEntryUrl, diagnoseTunnelFailure, formatTunnelFailureReport, tunnelLogTail } from "./share_tunnel.js";
 
 test("share entry URLs explicitly distinguish token and no-token modes", () => {
   assert.equal(
@@ -10,23 +10,6 @@ test("share entry URLs explicitly distinguish token and no-token modes", () => {
   assert.equal(
     buildShareEntryUrl("https://demo.trycloudflare.com", "", "lan", "http://192.168.1.2:4096"),
     "https://demo.trycloudflare.com/#auth=none&lan=http%3A%2F%2F192.168.1.2%3A4096",
-  );
-});
-
-test("share QR defaults to the public entry and keeps a LAN fallback", () => {
-  const entries = buildShareAccessUrls(
-    "https://demo.trycloudflare.com",
-    "http://192.168.1.2:4096",
-    "secret",
-  );
-  assert.equal(entries.qr, entries.public);
-  assert.equal(
-    entries.qr,
-    "https://demo.trycloudflare.com/#token=secret&lan=http%3A%2F%2F192.168.1.2%3A4096",
-  );
-  assert.equal(
-    entries.lan,
-    "http://192.168.1.2:4096/#token=secret&public=https%3A%2F%2Fdemo.trycloudflare.com",
   );
 });
 
