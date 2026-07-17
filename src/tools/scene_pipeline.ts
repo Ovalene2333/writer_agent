@@ -1,4 +1,4 @@
-import { documentKind, type WriterProject } from "../project.js";
+import { documentKind, orderedChapterPaths, type WriterProject } from "../project.js";
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
@@ -8,17 +8,24 @@ import {
   nextChapterScene,
   reviseChapterDraftStyle,
   sceneCardForTool,
+  MAX_SCENE_CHARACTERS,
   writeChapterScene,
   type ChapterDraftMode,
+  type ChapterSceneCard,
   type ChapterSceneDraft,
 } from "../scene_pipeline.js";
+import { pickBestSceneCandidate, rewriteSceneCandidate, sceneRewriteLengthOk, SCENE_CANDIDATE_SKIP_SCORE } from "../scene_candidates.js";
+import { dynamicStyleGroundingPrompt } from "../style_grounding.js";
+import type { WriterStore } from "../store.js";
 import { previewProseStyleGateError } from "../prose_adjudicate.js";
 import {
   analyzeChapterProseMetrics,
   chapterMetricsBlockError,
   findAdjacentDuplicateSentences,
   priorChapterNegativeList,
+  removeAdjacentDuplicateSentences,
   sceneAntiFormulaFeedback,
+  sceneProseScore,
 } from "../prose_metrics.js";
 import { sceneMannerismGateError } from "../prose_quality.js";
 import type { ToolExecutionContext } from "./types.js";
@@ -53,8 +60,13 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
   context.writePackSceneId = undefined;
   context.lastWritePack = undefined;
   context.priorProseContext = undefined;
+  context.sceneStyleBounces = undefined;
+  context.sceneStyleEvidence = undefined;
   const priorText = priorProseText(project, draft, context);
   const stylePriorNotes = priorText ? priorChapterNegativeList(priorText) : [];
+  // Stashed for scene-boundary handoffs: the begin exchange leaves the request
+  // after the first scene reset, but these notes must keep applying to every scene.
+  context.chapterStylePriorNotes = stylePriorNotes;
   return JSON.stringify({
     status: "started",
     path,
@@ -76,10 +88,13 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
  */
 function priorProseText(project: WriterProject, draft: ChapterSceneDraft, context: ToolExecutionContext): string {
   if (context.priorProseContext?.forPath === draft.path) return context.priorProseContext.text;
-  const chapters = project.listDocuments()
-    .filter(path => !project.isDocumentHidden(path) && documentKind(path) === "chapter" && path !== draft.path)
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  const previous = chapters.filter(path => path.localeCompare(draft.path, undefined, { numeric: true }) < 0).at(-1);
+  const ordered = orderedChapterPaths(project);
+  // Narrative order: the draft's predecessor if registered, else the current last
+  // chapter (a new chapter will be appended right after it).
+  const registeredIndex = ordered.indexOf(draft.path);
+  const previous = registeredIndex > 0
+    ? ordered[registeredIndex - 1]
+    : ordered.filter(path => path !== draft.path).at(-1);
   const parts: string[] = [];
   if (previous) {
     try {
@@ -92,43 +107,68 @@ function priorProseText(project: WriterProject, draft: ChapterSceneDraft, contex
   return text;
 }
 
-export function handleWriteChapterScene({ input, project, context }: ToolHandlerArgs): string {
+export async function handleWriteChapterScene({ input, project, store, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "write_chapter_scene");
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
   const sceneId = requireString(input.sceneId, "sceneId");
   const notes = requireString(input.notes, "notes");
-  if (notes.length > 4_000) throw new Error("notes 过长（上限 4000 字）；只写本场目标、关键事实与事件顺序的要点清单，不要写成长文");
+  if (notes.length > 1_500) throw new Error("notes 过长（上限 1500 字）；只写本场目标、关键事实与事件顺序的要点清单，不要写成长文");
   const writePack = formatWritePackForWriter(compileWritePack(notes, { targetPath: draft.path }));
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
-  const content = requireString(input.content, "content");
-  rejectCompressedPlaceholder(content, "content");
-  // Generation-side density gate: block before draft so chapter-end style revises stay rare.
-  const sceneStyleError = sceneMannerismGateError(content);
-  if (sceneStyleError) {
-    return JSON.stringify({
-      status: "style_revision_required",
-      code: "SCENE_STYLE_DENSE",
-      error: sceneStyleError,
-      sceneId,
-      complete: false,
-      message: "本场正文尚未写入草稿。请按 error 改掉成串「不是A。是B。」/说明性夹注后，用同一 sceneId 重新调用 write_chapter_scene（可保留 notes，只改正文句式）。不要先写完全章再统一 revise。",
-    });
-  }
-  // AA-repeat generation bug ("S。S。") — objective defect, catch before it enters the draft.
-  const duplicateSentences = findAdjacentDuplicateSentences(content);
-  if (duplicateSentences.length) {
+  const submitted = requireString(input.content, "content");
+  rejectCompressedPlaceholder(submitted, "content");
+  // AA-repeat generation bug ("S。S。") — objective defect with a mechanical fix:
+  // dedupe in-tool instead of spending a full round-trip on regeneration.
+  const dedup = removeAdjacentDuplicateSentences(submitted);
+  const content = dedup.text;
+  const residualDuplicates = findAdjacentDuplicateSentences(content);
+  if (residualDuplicates.length) {
+    // Duplicates spanning a line boundary that the remover can't safely fix — rare fallback bounce.
     return JSON.stringify({
       status: "style_revision_required",
       code: "SCENE_DUPLICATE_SENTENCE",
-      error: `本场存在相邻逐字复读句：${duplicateSentences.slice(0, 3).map(item => `「${item}」`).join("、")}`,
+      error: `本场存在相邻逐字复读句：${residualDuplicates.slice(0, 3).map(item => `「${item}」`).join("、")}`,
       sceneId,
       complete: false,
       message: "删去每处复读中的重复句后，用同一 sceneId 重新调用 write_chapter_scene（notes 可保留）。",
     });
   }
-  const result = writeChapterScene(draft, sceneId, content, input.actualState);
+  // Generation-side density gate: block before draft so chapter-end style revises
+  // stay rare — but at most ONE bounce per scene. A second dense submission enters
+  // the draft with styleDeferred: remaining hits are cheaper as chapter-end precise
+  // replacements than another full-scene regeneration left dead in context.
+  const sceneStyleError = sceneMannerismGateError(content);
+  let deferredStyleError: string | undefined;
+  if (sceneStyleError) {
+    const bounces = context.sceneStyleBounces ?? (context.sceneStyleBounces = new Map());
+    const priorBounces = bounces.get(sceneId) ?? 0;
+    if (priorBounces < 1) {
+      bounces.set(sceneId, priorBounces + 1);
+      return JSON.stringify({
+        status: "style_revision_required",
+        code: "SCENE_STYLE_DENSE",
+        error: sceneStyleError,
+        sceneId,
+        complete: false,
+        message: "本场正文尚未写入草稿。请按 error 中列出的命中句逐条改写后，用同一 sceneId 重新调用 write_chapter_scene（可保留 notes，只改正文句式）。同一场只回弹一次：再次提交将直接入稿，剩余命中句留到整章 inspect 后用 revise_chapter_draft_style 一并修。",
+      });
+    }
+    deferredStyleError = sceneStyleError;
+  }
+  // Experimental best-of-N prose sampling: the submitted scene is candidate 0;
+  // fact-preserving rewrites compete on the deterministic prose score. Any
+  // rewrite failure silently keeps the original — this never blocks a scene.
+  const { content: selectedContent, candidateReport } = await sampleSceneCandidates(
+    { project, store, context },
+    draft,
+    sceneId,
+    content,
+  );
+  const result = writeChapterScene(draft, sceneId, selectedContent, input.actualState);
   context.chapterSceneDraft = result.draft;
+  // A later structural rewrite of this scene gets a fresh dense-bounce allowance.
+  context.sceneStyleBounces?.delete(sceneId);
   // A write pack belongs to exactly one scene. The next/revised scene must recompile.
   context.writePackCompiled = false;
   context.writePackSceneId = undefined;
@@ -153,11 +193,130 @@ export function handleWriteChapterScene({ input, project, context }: ToolHandler
     actualState: result.draft.completed.at(-1)?.actualState,
     nextScene: sceneCardForTool(next),
     ...(styleFeedback.length ? { styleFeedback } : {}),
+    ...(candidateReport ? { candidateSampling: candidateReport } : {}),
+    ...(dedup.removed.length ? { autoFixes: { duplicateSentencesRemoved: dedup.removed.slice(0, 5) } } : {}),
+    ...(deferredStyleError ? { styleDeferred: { code: "SCENE_STYLE_DENSE", error: deferredStyleError } } : {}),
+    // When a rewrite wins, the model's own submission is NOT what entered the
+    // draft — return the stored text so later inspect/revise work on real bytes.
+    ...(candidateReport?.chosen === "rewrite" ? { content: selectedContent } : {}),
     complete: chapterSceneDraftComplete(result.draft),
-    message: next
-      ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 write_chapter_scene 中提交新的 notes。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
-      : "全部场景已写完；调用 inspect_chapter_draft 做整章接缝、重复功能与总变化审阅。",
+    message: [
+      next
+        ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 write_chapter_scene 中提交新的 notes。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
+        : "全部场景已写完；调用 inspect_chapter_draft 做整章接缝、重复功能与总变化审阅。",
+      dedup.removed.length
+        ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
+        : "",
+      deferredStyleError
+        ? "本场带 styleDeferred 入稿：不要重写本场，整章 inspect 被拦时把命中句用一次 revise_chapter_draft_style 精确替换修完。"
+        : "",
+      candidateReport?.chosen === "rewrite"
+        ? "候选采样选中了重写稿并已写入草稿（见 content 字段）；本场后续审阅与精确替换一律以该文本为准，不要引用你提交的原稿字句。"
+        : "",
+    ].filter(Boolean).join(" "),
   });
+}
+
+type SceneCandidateReport = {
+  requested: number;
+  generated: number;
+  eligible: number;
+  scores: number[];
+  chosen: "original" | "rewrite";
+  skipped?: string;
+};
+
+/**
+ * Best-of-N prose sampling for one scene (candidateCount > 1). The submitted
+ * prose is candidate 0 and wins ties; rewrites must pass the same generation
+ * gates before competing on the deterministic prose score. All failures fall
+ * back to the original — this stage may improve a scene, never reject one.
+ */
+async function sampleSceneCandidates(
+  args: { project: WriterProject; store: WriterStore; context: ToolExecutionContext },
+  draft: ChapterSceneDraft,
+  sceneId: string,
+  original: string,
+): Promise<{ content: string; candidateReport?: SceneCandidateReport }> {
+  const requested = args.context.scenePipelineSettings?.candidateCount ?? 1;
+  const sampler = args.context.sceneCandidates;
+  if (requested <= 1) return { content: original };
+  if (!sampler) return { content: original, candidateReport: { requested, generated: 0, eligible: 0, scores: [], chosen: "original", skipped: "no_model" } };
+  // Conditional trigger: a rewrite must strictly beat the original, so sampling a
+  // clean scene is (candidateCount−1) full-scene generations spent on noise.
+  const originalScore = sceneProseScore(original);
+  if (originalScore >= SCENE_CANDIDATE_SKIP_SCORE) {
+    return {
+      content: original,
+      candidateReport: { requested, generated: 0, eligible: 0, scores: [originalScore], chosen: "original", skipped: "original_clean" },
+    };
+  }
+
+  const sceneIndex = draft.scenes.findIndex(scene => scene.id === sceneId);
+  const sceneCard = draft.scenes[sceneIndex];
+  const previousTail = draft.completed
+    .slice(0, Math.max(0, sceneIndex))
+    .map(scene => scene.content)
+    .join("\n\n")
+    .slice(-1_200);
+  const styleEvidence = [
+    chapterStyleEvidence(args, draft),
+    previousTail ? `［本章前一场结尾——重写稿要与之衔接并保持同一支笔的手感］\n${previousTail}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  const settled = await Promise.allSettled(Array.from({ length: requested - 1 }, () =>
+    rewriteSceneCandidate({
+      model: sampler.model,
+      signal: sampler.signal,
+      styleEvidence,
+      sceneBrief: sceneCardBrief(sceneCard),
+      original,
+    })));
+  const generated = settled.filter(item => item.status === "fulfilled").length;
+  const eligibleRewrites = settled
+    .flatMap(item => (item.status === "fulfilled" ? [item.value] : []))
+    .filter(rewrite =>
+      rewrite.trim().length >= 80
+      && rewrite.length <= MAX_SCENE_CHARACTERS
+      && !/^#\s+/mu.test(rewrite)
+      && sceneRewriteLengthOk(original, rewrite)
+      && !sceneMannerismGateError(rewrite)
+      && !findAdjacentDuplicateSentences(rewrite).length,
+    );
+  const candidates = [original, ...eligibleRewrites];
+  const { index, scores } = pickBestSceneCandidate(candidates);
+  return {
+    content: candidates[index],
+    candidateReport: {
+      requested,
+      generated,
+      eligible: eligibleRewrites.length,
+      scores,
+      chosen: index === 0 ? "original" : "rewrite",
+      ...(generated < requested - 1 ? { skipped: "rewrite_error" } : {}),
+    },
+  };
+}
+
+/**
+ * One exemplar window per chapter draft, shared by every scene's rewrite calls:
+ * repeat scenes stop paying a fresh style-grounding build, and all candidates of
+ * one chapter compete against the same voice evidence. Reset per chapter.
+ */
+function chapterStyleEvidence(
+  args: { project: WriterProject; store: WriterStore; context: ToolExecutionContext },
+  draft: ChapterSceneDraft,
+): string {
+  const cached = args.context.sceneStyleEvidence;
+  if (cached?.forPath === draft.path) return cached.text;
+  const text = dynamicStyleGroundingPrompt(args.project, args.store, { intensive: true, targetPath: draft.path });
+  args.context.sceneStyleEvidence = { forPath: draft.path, text };
+  return text;
+}
+
+function sceneCardBrief(scene: ChapterSceneCard | undefined): string {
+  if (!scene) return "（场景卡缺失，按原稿事实重写）";
+  return `目标：${scene.goal}；阻力：${scene.obstacle}；转折：${scene.turn}；结果：${scene.outcome}`;
 }
 
 export function handleReviseChapterDraftStyle({ input, project, context }: ToolHandlerArgs): string {
@@ -246,6 +405,9 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
     proseMetrics: metrics.stats,
     ...(styleWarnings.length ? { styleWarnings } : {}),
     ledger: chapterSceneLedger(draft),
+    // Scene-boundary context resets removed each scene's prose from the dialogue,
+    // so final review reads the assembled chapter from here (paid once, not per step).
+    content,
     reviewChecklist: [
       "相邻场景是否因果承接，而非只按时间并列",
       "各场转折与结果是否承担不同功能",
@@ -253,7 +415,7 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
     ],
-    message: "请依据本轮历史中各次 write_chapter_scene 的正文通读整章；正文已保存在内存草稿中，不在此重复返回。发现问题时直接为目标 sceneId 重新调用 write_chapter_scene（同时提供新 notes）；确认无误后再 propose_chapter_draft。"
+    message: "content 为组装后的整章正文（此前各场正文已不在对话中，通读与精确替换一律以 content 为准）。发现结构问题时直接为目标 sceneId 重新调用 write_chapter_scene（同时提供新 notes）；确认无误后再 propose_chapter_draft。"
       + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",
   });
 }

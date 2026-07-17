@@ -11,6 +11,7 @@ import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
 import {
   ABSOLUTE_MAX_SCENES,
+  MAX_SCENE_CANDIDATES,
   isPermissionMode,
   listProjectSkills,
   loadAgentSettings,
@@ -56,7 +57,7 @@ type AgentJob = {
   listeners: Set<(event: StoredAgentEvent) => void>;
 };
 
-class BackgroundAgentJobs {
+export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
 
   start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
@@ -103,11 +104,24 @@ class BackgroundAgentJobs {
     return true;
   }
 
-  subscribe(id: string, listener: (event: StoredAgentEvent) => void): (() => void) | undefined {
+  snapshotAndSubscribe(id: string, listener: (event: StoredAgentEvent) => void): {
+    events: StoredAgentEvent[];
+    status: AgentJobStatus;
+    unsubscribe: () => void;
+  } | undefined {
     const job = this.jobs.get(id);
     if (!job) return undefined;
+    const events = job.events.slice();
+    const status = job.status;
+    if (status !== "running") {
+      return { events, status, unsubscribe: () => undefined };
+    }
     job.listeners.add(listener);
-    return () => job.listeners.delete(listener);
+    return {
+      events,
+      status,
+      unsubscribe: () => job.listeners.delete(listener),
+    };
   }
 
   private emit(id: string, event: AgentEvent): void {
@@ -135,12 +149,15 @@ export async function startWriterServer(options: {
   providers: ProviderManager;
   host?: string;
   port?: number;
+  /** Disable API bearer-token checks only when explicitly requested by the CLI. */
+  requireToken?: boolean;
   /** 是否在终端打印访问地址 / 二维码，默认 true。`--share` 时由 CLI 统一打印双端点二维码。 */
   announce?: boolean;
 }): Promise<{ url: string; origin: string; localOrigin: string; token: string; close: () => Promise<void> }> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4096;
-  const token = randomBytes(24).toString("base64url");
+  const requireToken = options.requireToken !== false;
+  const token = requireToken ? randomBytes(24).toString("base64url") : "";
   const localBypassToken = randomBytes(24).toString("base64url");
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs();
@@ -160,6 +177,10 @@ export async function startWriterServer(options: {
   });
 
   app.use("/api/*", async (context, next) => {
+    if (!requireToken) {
+      await next();
+      return;
+    }
     const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
     const localBypass = context.req.header("x-writer-local-access") ?? "";
     if (!tokensEqual(provided, token) && !tokensEqual(localBypass, localBypassToken)) {
@@ -197,6 +218,7 @@ export async function startWriterServer(options: {
         return firstId !== undefined && firstArchiveId !== undefined && firstId > firstArchiveId;
       })(),
       proposals: options.store.proposals(),
+      changeSets: options.store.changeSets(),
       characters: options.store.characters(),
       roleplayInterlocutors: options.store.roleplayInterlocutors(),
       roleplayScenes: options.store.roleplayScenes(),
@@ -582,6 +604,10 @@ export async function startWriterServer(options: {
         if (values.some(value => !Number.isInteger(value) || Number(value) < 1 || Number(value) > ABSOLUTE_MAX_SCENES)) {
           return context.json({ error: `场景链参数须为 1—${ABSOLUTE_MAX_SCENES} 的整数` }, 400);
         }
+        const candidateCount = body.scenePipeline.candidateCount;
+        if (candidateCount !== undefined && (!Number.isInteger(candidateCount) || Number(candidateCount) < 1 || Number(candidateCount) > MAX_SCENE_CANDIDATES)) {
+          return context.json({ error: `candidateCount 须为 1—${MAX_SCENE_CANDIDATES} 的整数（1 = 关闭候选采样）` }, 400);
+        }
       }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
@@ -850,32 +876,46 @@ export async function startWriterServer(options: {
         if (closed) return;
         await stream.writeSSE({ data: JSON.stringify(event), event: event.type });
       };
-      for (const event of job.events) await write(event);
-      if (job.status !== "running") return;
-      await new Promise<void>((resolve) => {
-        let writeChain = Promise.resolve();
-        let finished = false;
-        const finishAfterQueuedWrites = () => {
-          if (finished) return;
-          finished = true;
-          void writeChain.then(resolve, resolve);
-        };
-        const unsubscribe = agentJobs.subscribe(job.id, (event) => {
-          // Background jobs emit synchronously, while SSE writes are async. Queue every
-          // live write so usage/tool/proposal events cannot be overtaken by terminal done.
-          writeChain = writeChain.then(() => write(event)).catch(() => {
-            closed = true;
-          });
-          if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
-            unsubscribe?.();
-            finishAfterQueuedWrites();
-          }
-        });
-        context.req.raw.signal.addEventListener("abort", () => {
+      let writeChain = Promise.resolve();
+      let finished = false;
+      let resolveFinished: () => void = () => undefined;
+      let unsubscribe: () => void = () => undefined;
+      const finishAfterQueuedWrites = () => {
+        if (finished) return;
+        finished = true;
+        void writeChain.then(resolveFinished, resolveFinished);
+      };
+      const enqueue = (event: StoredAgentEvent) => {
+        // Writes are serialized so replayed and live events stay in index order.
+        writeChain = writeChain.then(() => write(event)).catch(() => {
           closed = true;
-          unsubscribe?.();
+        });
+        if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
+          unsubscribe();
           finishAfterQueuedWrites();
-        }, { once: true });
+        }
+      };
+
+      // Snapshot and listener registration happen synchronously. An event emitted while
+      // the snapshot is being written is queued behind it instead of falling through a gap.
+      const subscription = agentJobs.snapshotAndSubscribe(job.id, enqueue);
+      if (!subscription) return;
+      unsubscribe = subscription.unsubscribe;
+      for (const event of subscription.events) enqueue(event);
+      if (subscription.status !== "running") {
+        await writeChain;
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        resolveFinished = resolve;
+        const abort = () => {
+          closed = true;
+          unsubscribe();
+          finishAfterQueuedWrites();
+        };
+        if (context.req.raw.signal.aborted) abort();
+        else context.req.raw.signal.addEventListener("abort", abort, { once: true });
       });
     });
   });
@@ -923,6 +963,21 @@ export async function startWriterServer(options: {
       if (!Number.isInteger(id) || !["accept", "reject"].includes(action)) throw new Error("审批参数无效");
       const proposal = action === "accept" ? options.store.acceptProposal(id) : options.store.rejectProposal(id);
       return context.json({ proposal });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 409);
+    }
+  });
+
+  app.post("/api/change-sets/:id/:action", (context) => {
+    try {
+      const id = Number(context.req.param("id"));
+      const action = context.req.param("action");
+      if (!Number.isInteger(id) || !["accept", "reject", "undo", "redo"].includes(action)) throw new Error("change set 审批参数无效");
+      const changeSet = action === "accept" ? options.store.acceptChangeSet(id)
+        : action === "reject" ? options.store.rejectChangeSet(id)
+          : action === "undo" ? options.store.undoChangeSet(id)
+            : options.store.redoChangeSet(id);
+      return context.json({ changeSet });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -1044,11 +1099,13 @@ export async function startWriterServer(options: {
   const address = host === "0.0.0.0" ? findLanAddress() : host;
   const boundPort = (server.address() as AddressInfo).port;
   const origin = `http://${address}:${boundPort}`;
-  const protectedUrl = `${origin}/#token=${token}`;
+  const protectedUrl = requireToken ? `${origin}/#token=${token}` : origin;
   const localPort = localServer ? (localServer.address() as AddressInfo).port : boundPort;
   const localOrigin = `http://127.0.0.1:${localPort}`;
   const url = localOrigin;
-  process.stdout.write(`Writer Web（本机免令牌）：${localOrigin}\n`);
+  process.stdout.write(requireToken
+    ? `Writer Web（本机免令牌）：${localOrigin}\n`
+    : `Writer Web（未启用令牌）：${localOrigin}\n`);
   if (options.announce !== false) {
     if (host === "0.0.0.0") {
       process.stdout.write(`\n手机访问：${protectedUrl}\n`);

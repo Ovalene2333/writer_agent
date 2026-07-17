@@ -69,6 +69,9 @@ program.command("run")
             else if (event.type === "proposal") {
               const status = event.proposal.status === "accepted" ? "已写入" : "待审批";
               process.stdout.write(`\n[${status}提案 #${event.proposal.id}：${event.proposal.path}]\n`);
+            } else if (event.type === "change_set") {
+              const status = event.changeSet.status === "accepted" ? "已应用" : "待审批";
+              process.stdout.write(`\n[${status} change set #${event.changeSet.id}：${event.changeSet.summary}（${event.changeSet.files.length} 个文件）]\n`);
             } else if (event.type === "todos") {
               process.stdout.write(`\n[任务 ${event.todos.filter(t => t.status === "completed").length}/${event.todos.length}]\n`);
             } else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
@@ -90,14 +93,18 @@ program.command("web")
   .option("--port <port>", "监听端口", "4096")
   .option("--share", "创建临时公网访问地址（需要已安装 cloudflared；默认同时开局域网，扫一次码可自动切换）")
   .option("--no-open", "不自动打开 PC 浏览器")
+  .option("--no-token", "关闭 API 访问令牌（包括 --share 公网入口）")
   .option("--debug", "调试：终端打印 step 内容 + 模型请求/响应体")
   .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端，不含模型原文")
-  .action(async (options: { project: string; lan?: boolean; host?: string; port: string; share?: boolean; open: boolean; debug?: boolean; debugSteps?: boolean }) => {
+  .action(async (options: { project: string; lan?: boolean; host?: string; port: string; share?: boolean; open: boolean; token: boolean; debug?: boolean; debugSteps?: boolean }) => {
     if (options.debug) process.env.WRITER_DEBUG = "1";
     if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
     if (stepDebugEnabled()) {
       process.stderr.write("[WRITER STEP] step debug enabled — Agent 每步 reasoning/tools/output 会打印到本终端\n");
     }
+    if (!options.token) process.stderr.write(options.share
+      ? "警告：--share --no-token 会把无鉴权的完整项目读写接口暴露到公网。\n"
+      : "警告：--no-token 已关闭全部 API 鉴权，任何能连接该端口的设备都可读写项目。\n");
     const { project, store, providers } = openProject(options.project);
     // --share 默认绑定 0.0.0.0，便于手机扫码后在局域网/公网间自动切换
     const host = options.host || (options.lan || options.share ? "0.0.0.0" : "127.0.0.1");
@@ -105,6 +112,7 @@ program.command("web")
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口必须是 1 至 65535 的整数");
     const server = await startWriterServer({
       project, store, providers, host, port,
+      requireToken: options.token,
       announce: !options.share,
     });
     const tunnel = options.share ? startShareTunnel(port, server.token, server.origin) : undefined;

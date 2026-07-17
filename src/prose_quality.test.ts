@@ -11,17 +11,21 @@ import {
   sceneMannerismGateError,
 } from "./prose_quality.js";
 
-test("generation-time constraint prompt covers dash and contrast rules", () => {
+test("generation-time constraint prompt is positive-first and never demos banned patterns", () => {
   const full = proseMannerismConstraintPrompt();
+  assert.match(full, /直接陈述成立的事实/);
   assert.match(full, /破折号/);
-  assert.match(full, /不是/);
-  assert.match(full, /改写配方/);
-  assert.match(full, /拆句重定义/);
+  assert.match(full, /解释只在引入新事实时出现/);
   const compact = proseMannerismConstraintPrompt({ compact: true });
-  assert.match(compact, /句式硬约束/);
-  assert.match(compact, /不是A。是B/);
-  assert.match(proseMannerismPreflightLine(), /句式自检/);
-  assert.match(proseMannerismPreflightLine(), /不是A。是B/);
+  assert.match(compact, /句式基准/);
+  assert.ok(full.length < 600, "constraint prompt must stay short");
+  // Pink-elephant guard: quoting a banned frame in the prompt raises its salience.
+  for (const prompt of [full, compact, proseMannerismPreflightLine()]) {
+    assert.ok(!prompt.includes("不是A"), "must not demo the negation frame");
+    assert.ok(!prompt.includes("坏例"), "must not carry bad-example demos");
+    assert.ok(!prompt.includes("禁止"), "must stay positively framed");
+  }
+  assert.match(proseMannerismPreflightLine(), /自检/);
 });
 
 test("sceneMannerismGateError blocks dense split_redefinition before draft write", () => {

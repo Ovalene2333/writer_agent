@@ -546,6 +546,60 @@ function ensureEntryId(raw: Record<string, unknown>, prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}`;
 }
 
+export const CHARACTER_CHANGE_OPS = [
+  "set_unlocked",
+  "upsert_competency",
+  "set_psychology_summary",
+  "upsert_psychology_entry",
+  "delete_psychology_entry",
+  "add_experience",
+  "upsert_experience",
+  "delete_experience",
+  "upsert_motivation",
+  "upsert_relationship",
+  "upsert_story_state",
+  "delete_entry",
+] as const;
+
+const CHANGE_OP_UPSERT_TARGETS: Record<string, string> = {
+  competency: "upsert_competency",
+  psychology_entry: "upsert_psychology_entry",
+  experience: "add_experience",
+  experiences: "add_experience",
+  motivation: "upsert_motivation",
+  goal: "upsert_motivation",
+  relationship: "upsert_relationship",
+  relation: "upsert_relationship",
+  story_state: "upsert_story_state",
+  state: "upsert_story_state",
+};
+
+/** Models routinely guess op names (add_/append_/update_*); accept the synonyms instead of skipping the change. */
+export function normalizeCharacterChangeOp(op: string): string {
+  const trimmed = op.trim();
+  if ((CHARACTER_CHANGE_OPS as readonly string[]).includes(trimmed)) return trimmed;
+  const upsertLike = /^(?:add|append|update|create|insert|upsert)_(.+)$/.exec(trimmed);
+  if (upsertLike && CHANGE_OP_UPSERT_TARGETS[upsertLike[1]]) return CHANGE_OP_UPSERT_TARGETS[upsertLike[1]];
+  const deleteLike = /^(?:remove|delete)_(.+)$/.exec(trimmed);
+  if (deleteLike) {
+    if (deleteLike[1] === "experience" || deleteLike[1] === "experiences") return "delete_experience";
+    if (deleteLike[1] === "psychology_entry") return "delete_psychology_entry";
+    if (deleteLike[1] === "entry") return "delete_entry";
+  }
+  return trimmed;
+}
+
+export function isCharacterChangeOp(op: string): boolean {
+  return (CHARACTER_CHANGE_OPS as readonly string[]).includes(normalizeCharacterChangeOp(op));
+}
+
+export function characterChangeOpsHint(): string {
+  return "可用 op：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / "
+    + "upsert_psychology_entry{group,entry} / delete_psychology_entry{group,entryId} / add_experience{entry} / "
+    + "delete_experience{entryId} / upsert_motivation{entry} / upsert_relationship{entry.characterId} / "
+    + "upsert_story_state{entry} / delete_entry{section,entryId}";
+}
+
 /**
  * Apply semantic evolution ops onto a character. Unknown ops are skipped (not fatal).
  * Does not persist; caller should pass result through saveCharacter validation.
@@ -569,11 +623,12 @@ export function applyCharacterChanges(
   };
 
   for (const raw of changes) {
-    const op = txt(raw.op);
-    if (!op) {
-      skip("unknown", "缺少 op");
+    const rawOp = txt(raw.op);
+    if (!rawOp) {
+      skip("unknown", `缺少 op；${characterChangeOpsHint()}`);
       continue;
     }
+    const op = normalizeCharacterChangeOp(rawOp);
 
     try {
       switch (op) {
@@ -745,7 +800,7 @@ export function applyCharacterChanges(
           break;
         }
         default:
-          skip(op, `未知 op：${op}`);
+          skip(rawOp, `未知 op：${rawOp}；${characterChangeOpsHint()}`);
       }
     } catch (error) {
       skip(op, error instanceof Error ? error.message : String(error));

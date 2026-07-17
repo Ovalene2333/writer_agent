@@ -18,6 +18,7 @@ export type ConnectionInfo = {
 
 type StoredConnection = {
   token: string;
+  tokenless?: boolean;
   lanBase?: string;
   publicBase?: string;
   preference?: ConnectionPreference;
@@ -31,6 +32,7 @@ const MONITOR_MS = 4000;
 type Listener = (info: ConnectionInfo) => void;
 
 let token = "";
+let tokenless = false;
 let lanBase: string | null = null;
 let publicBase: string | null = null;
 let activeBase = "";
@@ -91,7 +93,7 @@ function readStored(): StoredConnection | null {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as StoredConnection;
-    if (!parsed || typeof parsed.token !== "string" || !parsed.token) return null;
+    if (!parsed || typeof parsed.token !== "string" || (!parsed.token && parsed.tokenless !== true)) return null;
     return parsed;
   } catch {
     return null;
@@ -101,7 +103,8 @@ function readStored(): StoredConnection | null {
 function writeStored(data: StoredConnection): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    localStorage.setItem(TOKEN_KEY, data.token);
+    if (data.token) localStorage.setItem(TOKEN_KEY, data.token);
+    else localStorage.removeItem(TOKEN_KEY);
   } catch {
     /* private mode / quota */
   }
@@ -131,9 +134,10 @@ function currentInfo(): ConnectionInfo {
 }
 
 function persist(): void {
-  if (!token) return;
+  if (!token && !tokenless) return;
   writeStored({
     token,
+    ...(tokenless ? { tokenless: true } : {}),
     ...(lanBase ? { lanBase } : {}),
     ...(publicBase ? { publicBase } : {}),
     preference,
@@ -153,7 +157,7 @@ function setRoute(next: ConnectionRoute, base: string): void {
   emit();
 }
 
-function parseBootstrapHash(): { token?: string; lan?: string; public?: string } {
+function parseBootstrapHash(): { token?: string; tokenless?: boolean; lan?: string; public?: string } {
   const hash = typeof location !== "undefined" ? location.hash.slice(1) : "";
   if (!hash) return {};
   const params = new URLSearchParams(hash);
@@ -162,6 +166,7 @@ function parseBootstrapHash(): { token?: string; lan?: string; public?: string }
   const pub = params.get("public")?.trim() || undefined;
   return {
     token: tokenValue,
+    tokenless: params.get("auth") === "none",
     lan: lan && isHttpUrl(lan) ? normalizeBase(lan) : undefined,
     public: pub && isHttpUrl(pub) ? normalizeBase(pub) : undefined,
   };
@@ -177,12 +182,14 @@ export function initConnection(): string {
   const stored = readStored();
   const pageOrigin = typeof location !== "undefined" ? normalizeBase(location.origin) : "";
   const pageIsLocal = isLoopbackBase(pageOrigin);
-  const hasBootstrap = Boolean(boot.token || boot.lan || boot.public);
+  const hasBootstrap = Boolean(boot.token || boot.tokenless || boot.lan || boot.public);
   // A plain loopback URL is the dedicated no-token entry. Do not revive stale
   // LAN/tunnel routing from an earlier QR-code session on this origin.
   const restoreStoredConnection = !pageIsLocal || hasBootstrap;
 
-  token = boot.token
+  tokenless = boot.tokenless === true
+    || (!boot.token && restoreStoredConnection && stored?.tokenless === true);
+  token = tokenless ? "" : boot.token
     || (restoreStoredConnection ? stored?.token : "")
     || (restoreStoredConnection ? localStorage.getItem(TOKEN_KEY) : "")
     || (restoreStoredConnection ? sessionStorage.getItem(TOKEN_KEY) : "")
@@ -219,9 +226,9 @@ export function initConnection(): string {
     ? storedPref
     : "auto";
 
-  if (token) persist();
+  if (token || tokenless) persist();
 
-  if (boot.token || boot.lan || boot.public) {
+  if (boot.token || boot.tokenless || boot.lan || boot.public) {
     try {
       history.replaceState(null, "", location.pathname + location.search);
     } catch {
@@ -259,7 +266,7 @@ export function subscribeConnection(listener: Listener): () => void {
 }
 
 async function probe(base: string): Promise<boolean> {
-  if (!canFetchBase(base) || (!token && !isLoopbackBase(base))) return false;
+  if (!canFetchBase(base) || (!token && !tokenless && !isLoopbackBase(base))) return false;
   try {
     const response = await fetch(`${normalizeBase(base)}/api/health`, {
       ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
@@ -274,17 +281,19 @@ async function probe(base: string): Promise<boolean> {
 
 /** 带 token 的入口链接（可复制 / 在新标签打开 / 整页跳转）。 */
 export function buildEntryUrl(kind: "lan" | "public"): string | null {
-  if (!token) return null;
+  if (!token && !tokenless) return null;
   if (kind === "lan") {
     if (!lanBase) return null;
     const params = new URLSearchParams();
-    params.set("token", token);
+    if (token) params.set("token", token);
+    else params.set("auth", "none");
     if (publicBase) params.set("public", publicBase);
     return `${lanBase}/#${params.toString()}`;
   }
   if (!publicBase) return null;
   const params = new URLSearchParams();
-  params.set("token", token);
+  if (token) params.set("token", token);
+  else params.set("auth", "none");
   if (lanBase) params.set("lan", lanBase);
   return `${publicBase}/#${params.toString()}`;
 }

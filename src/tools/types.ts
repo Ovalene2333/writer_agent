@@ -67,6 +67,33 @@ export type ToolExecutionContext = {
     signal?: AbortSignal;
   };
   /**
+   * Experimental best-of-N scene prose sampling (scenePipeline.candidateCount > 1):
+   * model used for fact-preserving plain-text rewrites of each submitted scene.
+   * Absent = feature off; rewrite failures always fall back to the original prose.
+   */
+  sceneCandidates?: {
+    model: ModelConfig;
+    signal?: AbortSignal;
+  };
+  /**
+   * SCENE_STYLE_DENSE bounce counter per sceneId for the current chapter draft.
+   * A scene is rejected at most once; the second dense submission enters the
+   * draft with a deferred-warning so remaining hits are fixed by chapter-end
+   * revise instead of another full-scene regeneration. Reset per chapter.
+   */
+  sceneStyleBounces?: Map<string, number>;
+  /**
+   * Chapter-cached voice evidence for candidate rewrites: one exemplar window is
+   * sampled per draft and shared by every scene's rewrite calls. Reset per chapter.
+   */
+  sceneStyleEvidence?: { forPath: string; text: string };
+  /**
+   * stylePriorNotes returned by begin_chapter_draft, stashed so the agent loop can
+   * re-inject them into each scene-boundary handoff after the begin exchange has
+   * been truncated out of the request. Reset per chapter.
+   */
+  chapterStylePriorNotes?: string[];
+  /**
    * Cross-round Flash verdict memory for the style gate (sentence+subtype → verdict).
    * Keeps repeat inspects stable/cheap and powers the sync re-gate inside
    * revise_chapter_draft_style. Reset at chapter boundaries.

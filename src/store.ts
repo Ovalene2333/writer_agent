@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentTodoItem, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
+  ActiveRoleplayState, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
   RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
@@ -125,6 +125,29 @@ export class WriterStore {
         character_revisions_json TEXT NOT NULL DEFAULT '[]',
         undone INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS change_sets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        summary TEXT NOT NULL,
+        character_changes_json TEXT NOT NULL DEFAULT '[]',
+        character_revisions_json TEXT NOT NULL DEFAULT '[]',
+        before_config TEXT NOT NULL DEFAULT '',
+        after_config TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        undone INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS change_set_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        change_set_id INTEGER NOT NULL REFERENCES change_sets(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL,
+        path TEXT NOT NULL,
+        target_path TEXT,
+        before_content TEXT NOT NULL,
+        after_content TEXT NOT NULL,
+        base_hash TEXT NOT NULL,
+        target_base_hash TEXT
       );
       CREATE TABLE IF NOT EXISTS writing_examples (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,6 +286,13 @@ export class WriterStore {
     }
     if (!revisionColumns.some(column => column.name === "character_revisions_json")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN character_revisions_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    const changeSetColumns = this.database.prepare("PRAGMA table_info(change_sets)").all() as Row[];
+    if (!changeSetColumns.some(column => column.name === "before_config")) {
+      this.database.exec("ALTER TABLE change_sets ADD COLUMN before_config TEXT NOT NULL DEFAULT ''");
+    }
+    if (!changeSetColumns.some(column => column.name === "after_config")) {
+      this.database.exec("ALTER TABLE change_sets ADD COLUMN after_config TEXT NOT NULL DEFAULT ''");
     }
     const proposalColumns = this.database.prepare("PRAGMA table_info(proposals)").all() as Row[];
     if (!proposalColumns.some(column => column.name === "character_changes_json")) {
@@ -1179,6 +1209,329 @@ export class WriterStore {
       : message);
   }
 
+  createChangeSet(
+    sessionId: string,
+    summary: string,
+    fileInputs: Array<{
+      operation: ChangeSetFileOperation;
+      path: string;
+      targetPath?: string;
+      content?: string;
+      edits?: Array<{ search: string; replace: string }>;
+    }>,
+    characterChanges: ProposalCharacterChange[] = [],
+  ): ChangeSet {
+    if (!fileInputs.length && !characterChanges.length) throw new Error("change set 至少需要一个文件或角色变化");
+    if (fileInputs.length > 20) throw new Error("单个 change set 最多包含 20 个文件操作");
+    const touched = new Set<string>();
+    const files = fileInputs.map((input, index) => {
+      const operation = input.operation;
+      if (!["write", "patch", "move", "delete"].includes(operation)) {
+        throw new Error(`第 ${index + 1} 个文件操作无效`);
+      }
+      const path = canonicalTextPath(input.path);
+      this.project.resolveTextFileSafe(path);
+      if (this.project.isDocumentHidden(path)) throw new Error(`文件已对 Agent 屏蔽：${path}`);
+      const exists = this.project.textFileExists(path);
+      const beforeContent = exists ? this.project.readTextFile(path) : "";
+      const baseHash = exists ? this.project.hash(beforeContent) : "__missing__";
+      const targetPath = operation === "move" ? canonicalTextPath(input.targetPath ?? "") : undefined;
+      if (targetPath) {
+        this.project.resolveTextFileSafe(targetPath);
+        if (this.project.isDocumentHidden(targetPath)) throw new Error(`目标文件已对 Agent 屏蔽：${targetPath}`);
+      }
+      for (const candidate of [path, targetPath].filter((item): item is string => Boolean(item))) {
+        if (touched.has(candidate)) throw new Error(`同一 change set 不能重复触碰路径：${candidate}`);
+        touched.add(candidate);
+      }
+
+      if ((operation === "patch" || operation === "move" || operation === "delete") && !exists) {
+        throw new Error(`${operation} 的源文件不存在：${path}`);
+      }
+      if (operation === "move" && targetPath && this.project.textFileExists(targetPath)) {
+        throw new Error(`移动目标已存在：${targetPath}`);
+      }
+      let afterContent = beforeContent;
+      if (operation === "write") {
+        if (typeof input.content !== "string") throw new Error(`write 缺少 content：${path}`);
+        afterContent = input.content;
+      } else if (operation === "patch") {
+        const edits = input.edits ?? [];
+        if (!edits.length || edits.length > 20) throw new Error(`patch 需要 1 至 20 条 edits：${path}`);
+        for (const [editIndex, edit] of edits.entries()) {
+          if (!edit.search || typeof edit.replace !== "string") throw new Error(`patch edit ${editIndex + 1} 无效：${path}`);
+          const occurrences = textOccurrences(afterContent, edit.search);
+          if (occurrences !== 1) throw new Error(`patch edit ${editIndex + 1} 的 search 出现 ${occurrences} 次，必须唯一：${path}`);
+          afterContent = afterContent.replace(edit.search, edit.replace);
+        }
+      }
+      if (afterContent.includes("\0")) throw new Error(`纯文本内容不能包含 NUL 字节：${path}`);
+      return {
+        operation, path, targetPath, beforeContent, afterContent, baseHash,
+        ...(targetPath ? { targetBaseHash: "__missing__" } : {}),
+      };
+    });
+    const sourceRef = files[0]?.targetPath ?? files[0]?.path ?? "characters/characters.jsonl";
+    this.evolveCharactersForProposal(sourceRef, summary, characterChanges);
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const now = new Date().toISOString();
+      const result = this.database.prepare(`
+        INSERT INTO change_sets(session_id,summary,character_changes_json,before_config,status,created_at)
+        VALUES(?,?,?,?,'pending',?)
+      `).run(sessionId, summary, JSON.stringify(characterChanges), this.project.readRaw("writer.yaml"), now);
+      const changeSetId = Number(result.lastInsertRowid);
+      const insert = this.database.prepare(`
+        INSERT INTO change_set_files(change_set_id,operation,path,target_path,before_content,after_content,base_hash,target_base_hash)
+        VALUES(?,?,?,?,?,?,?,?)
+      `);
+      for (const file of files) insert.run(
+        changeSetId, file.operation, file.path, file.targetPath ?? null, file.beforeContent,
+        file.afterContent, file.baseHash, file.targetBaseHash ?? null,
+      );
+      this.database.exec("COMMIT");
+      return this.changeSet(changeSetId);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  changeSet(id: number): ChangeSet {
+    const row = this.database.prepare("SELECT * FROM change_sets WHERE id=?").get(id) as Row | undefined;
+    if (!row) throw new Error(`change set 不存在：${id}`);
+    return this.changeSetFromRow(row);
+  }
+
+  changeSets(limit = 100): ChangeSet[] {
+    return this.database.prepare("SELECT * FROM change_sets ORDER BY id DESC LIMIT ?").all(Math.max(1, Math.min(200, limit)))
+      .map(row => this.changeSetFromRow(row as Row));
+  }
+
+  private changeSetFromRow(row: Row): ChangeSet {
+    const files = this.database.prepare("SELECT * FROM change_set_files WHERE change_set_id=? ORDER BY id").all(Number(row.id))
+      .map(raw => {
+        const file = raw as Row;
+        return {
+          id: Number(file.id),
+          operation: String(file.operation) as ChangeSetFileOperation,
+          path: String(file.path),
+          ...(typeof file.target_path === "string" ? { targetPath: file.target_path } : {}),
+          beforeContent: String(file.before_content),
+          afterContent: String(file.after_content),
+          baseHash: String(file.base_hash),
+          ...(typeof file.target_base_hash === "string" ? { targetBaseHash: file.target_base_hash } : {}),
+        } satisfies ChangeSetFileChange;
+      });
+    return {
+      id: Number(row.id), sessionId: String(row.session_id), summary: String(row.summary),
+      status: String(row.status) as ChangeSet["status"], undone: Number(row.undone) === 1,
+      createdAt: String(row.created_at), files,
+      characterChanges: parseProposalCharacterChanges(row.character_changes_json),
+    };
+  }
+
+  acceptChangeSet(id: number): ChangeSet {
+    const changeSet = this.changeSet(id);
+    if (changeSet.status !== "pending") throw new Error("该 change set 已处理");
+    try { this.assertChangeSetForwardState(changeSet); }
+    catch (error) {
+      this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
+      throw error;
+    }
+    const sourceRef = changeSet.files[0]?.targetPath ?? changeSet.files[0]?.path ?? "characters/characters.jsonl";
+    const evolved = this.evolveCharactersForProposal(sourceRef, changeSet.summary, changeSet.characterChanges);
+    const snapshots = this.captureManagedFiles(changeSet.files);
+    const originalCharacters = this.characters();
+    const originalConfig = this.project.readRaw("writer.yaml");
+    const outlineSnapshot = this.captureOutlineSnapshot();
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.applyChangeSetFiles(changeSet.files);
+      validateCharacters(evolved.characters, this.outlineNodeIds());
+      if (evolved.revisions.length) this.writeCharacters(evolved.characters);
+      this.database.prepare("UPDATE change_sets SET status='accepted',undone=0,character_revisions_json=?,after_config=? WHERE id=?")
+        .run(JSON.stringify(evolved.revisions), this.project.readRaw("writer.yaml"), id);
+      this.reindex();
+      this.database.exec("COMMIT");
+      return this.changeSet(id);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      this.restoreManagedFiles(snapshots);
+      this.project.writeRaw("writer.yaml", originalConfig);
+      this.restoreOutlineSnapshot(outlineSnapshot);
+      if (evolved.revisions.length) this.writeCharacters(originalCharacters);
+      throw error;
+    }
+  }
+
+  undoChangeSet(id: number): ChangeSet {
+    const changeSet = this.changeSet(id);
+    if (changeSet.status !== "accepted" || changeSet.undone) throw new Error("该 change set 当前不可回滚");
+    this.assertChangeSetAppliedState(changeSet);
+    const row = this.database.prepare("SELECT character_revisions_json,before_config FROM change_sets WHERE id=?").get(id) as Row;
+    const characterRevisions = parseProposalCharacterRevisions(row.character_revisions_json);
+    const restoredCharacters = this.reverseCharacterRevisions(characterRevisions, "after");
+    const snapshots = this.captureManagedFiles(changeSet.files);
+    const originalCharacters = this.characters();
+    const originalConfig = this.project.readRaw("writer.yaml");
+    const outlineSnapshot = this.captureOutlineSnapshot();
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.restoreChangeSetFiles(changeSet.files);
+      this.project.writeRaw("writer.yaml", String(row.before_config));
+      validateCharacters(restoredCharacters, this.outlineNodeIds());
+      if (characterRevisions.length) this.writeCharacters(restoredCharacters);
+      this.database.prepare("UPDATE change_sets SET undone=1 WHERE id=?").run(id);
+      this.reindex();
+      this.database.exec("COMMIT");
+      return this.changeSet(id);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      this.restoreManagedFiles(snapshots);
+      this.project.writeRaw("writer.yaml", originalConfig);
+      this.restoreOutlineSnapshot(outlineSnapshot);
+      if (characterRevisions.length) this.writeCharacters(originalCharacters);
+      throw error;
+    }
+  }
+
+  redoChangeSet(id: number): ChangeSet {
+    const changeSet = this.changeSet(id);
+    if (changeSet.status !== "accepted" || !changeSet.undone) throw new Error("该 change set 当前不可重做");
+    this.assertChangeSetForwardState(changeSet);
+    const row = this.database.prepare("SELECT character_revisions_json,after_config FROM change_sets WHERE id=?").get(id) as Row;
+    const characterRevisions = parseProposalCharacterRevisions(row.character_revisions_json);
+    const restoredCharacters = this.reverseCharacterRevisions(characterRevisions, "before");
+    const snapshots = this.captureManagedFiles(changeSet.files);
+    const originalCharacters = this.characters();
+    const originalConfig = this.project.readRaw("writer.yaml");
+    const outlineSnapshot = this.captureOutlineSnapshot();
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.applyChangeSetFiles(changeSet.files);
+      this.project.writeRaw("writer.yaml", String(row.after_config));
+      validateCharacters(restoredCharacters, this.outlineNodeIds());
+      if (characterRevisions.length) this.writeCharacters(restoredCharacters);
+      this.database.prepare("UPDATE change_sets SET undone=0 WHERE id=?").run(id);
+      this.reindex();
+      this.database.exec("COMMIT");
+      return this.changeSet(id);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      this.restoreManagedFiles(snapshots);
+      this.project.writeRaw("writer.yaml", originalConfig);
+      this.restoreOutlineSnapshot(outlineSnapshot);
+      if (characterRevisions.length) this.writeCharacters(originalCharacters);
+      throw error;
+    }
+  }
+
+  rejectChangeSet(id: number): ChangeSet {
+    const changeSet = this.changeSet(id);
+    if (changeSet.status !== "pending") throw new Error("该 change set 已处理");
+    this.database.prepare("UPDATE change_sets SET status='rejected' WHERE id=?").run(id);
+    return this.changeSet(id);
+  }
+
+  private assertChangeSetForwardState(changeSet: ChangeSet): void {
+    for (const file of changeSet.files) {
+      const exists = this.project.textFileExists(file.path);
+      const hash = exists ? this.project.hash(this.project.readTextFile(file.path)) : "__missing__";
+      if (hash !== file.baseHash) throw new Error(`文件已变化，change set 已过期：${file.path}`);
+      if (file.targetPath && this.project.textFileExists(file.targetPath)) throw new Error(`移动目标已出现，change set 已过期：${file.targetPath}`);
+    }
+  }
+
+  private assertChangeSetAppliedState(changeSet: ChangeSet): void {
+    for (const file of changeSet.files) {
+      if (file.operation === "delete") {
+        if (this.project.textFileExists(file.path)) throw new Error(`已删除文件重新出现，无法安全回滚：${file.path}`);
+      } else if (file.operation === "move") {
+        if (this.project.textFileExists(file.path) || !file.targetPath || !this.project.textFileExists(file.targetPath)
+          || this.project.hash(this.project.readTextFile(file.targetPath)) !== this.project.hash(file.afterContent)) {
+          throw new Error(`移动结果已变化，无法安全回滚：${file.path}`);
+        }
+      } else if (!this.project.textFileExists(file.path)
+        || this.project.hash(this.project.readTextFile(file.path)) !== this.project.hash(file.afterContent)) {
+        throw new Error(`文件已在审批后变化，无法安全回滚：${file.path}`);
+      }
+    }
+  }
+
+  private reverseCharacterRevisions(revisions: ProposalCharacterRevision[], expectedSide: "before" | "after"): Character[] {
+    let characters = this.characters();
+    for (const revision of revisions) {
+      const expected = this.normalizeCharacter(revision[expectedSide]);
+      const current = characters.find(item => item.id === revision.characterId);
+      if (!current || JSON.stringify(current) !== JSON.stringify(expected)) {
+        throw new Error(`角色卡 ${revision.characterId} 已变化，无法安全${expectedSide === "after" ? "回滚" : "重做"}`);
+      }
+      const replacement = this.normalizeCharacter(revision[expectedSide === "after" ? "before" : "after"]);
+      characters = [...characters.filter(item => item.id !== revision.characterId), replacement];
+    }
+    return characters;
+  }
+
+  private captureManagedFiles(files: ChangeSetFileChange[]): Map<string, string | undefined> {
+    const snapshots = new Map<string, string | undefined>();
+    for (const path of files.flatMap(file => [file.path, file.targetPath].filter((item): item is string => Boolean(item)))) {
+      if (!snapshots.has(path)) snapshots.set(path, this.project.textFileExists(path) ? this.project.readTextFile(path) : undefined);
+    }
+    return snapshots;
+  }
+
+  private restoreManagedFiles(snapshots: Map<string, string | undefined>): void {
+    for (const path of snapshots.keys()) if (this.project.textFileExists(path)) this.removeManagedTextFile(path);
+    for (const [path, content] of snapshots) if (content !== undefined) this.writeManagedTextFile(path, content);
+  }
+
+  private captureOutlineSnapshot(): string | undefined {
+    const path = resolve(this.project.privateDir, "outline.json");
+    return existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  }
+
+  private restoreOutlineSnapshot(content: string | undefined): void {
+    const path = resolve(this.project.privateDir, "outline.json");
+    if (content === undefined) {
+      if (existsSync(path)) unlinkSync(path);
+    } else writeFileSync(path, content, "utf8");
+  }
+
+  private applyChangeSetFiles(files: ChangeSetFileChange[]): void {
+    for (const file of files) {
+      if (file.operation === "delete") this.removeManagedTextFile(file.path);
+      else if (file.operation === "move" && file.targetPath) {
+        this.removeManagedTextFile(file.path);
+        this.writeManagedTextFile(file.targetPath, file.afterContent);
+      } else this.writeManagedTextFile(file.path, file.afterContent);
+    }
+  }
+
+  private restoreChangeSetFiles(files: ChangeSetFileChange[]): void {
+    for (const file of [...files].reverse()) {
+      if (file.operation === "move" && file.targetPath && this.project.textFileExists(file.targetPath)) {
+        this.removeManagedTextFile(file.targetPath);
+      }
+      if (file.baseHash === "__missing__") {
+        if (this.project.textFileExists(file.path)) this.removeManagedTextFile(file.path);
+      } else this.writeManagedTextFile(file.path, file.beforeContent);
+    }
+  }
+
+  private writeManagedTextFile(path: string, content: string): void {
+    if (path.toLowerCase().endsWith(".md")) {
+      this.project.writeRaw(path, content);
+      this.project.registerChapter(path);
+    } else this.project.writeTextFile(path, content);
+  }
+
+  private removeManagedTextFile(path: string): void {
+    if (path.toLowerCase().endsWith(".md")) this.project.removeDocument(path);
+    else this.project.removeTextFile(path);
+  }
+
   createProposal(sessionId: string, path: string, content: string, summary: string, characterChanges: ProposalCharacterChange[] = []): Proposal {
     const exists = this.project.documentExists(path);
     const before = exists ? this.project.read(path) : "";
@@ -1694,6 +2047,22 @@ function headingAtLine(lines: string[], line: number): string | undefined {
     if (match) return match[1].replace(/\s+#+\s*$/, "").trim();
   }
   return undefined;
+}
+
+function canonicalTextPath(path: string): string {
+  return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "").replace(/^resource(?:\/|$)/, "");
+}
+
+function textOccurrences(content: string, search: string): number {
+  let count = 0;
+  let offset = 0;
+  while (search && offset <= content.length - search.length) {
+    const index = content.indexOf(search, offset);
+    if (index < 0) break;
+    count += 1;
+    offset = index + search.length;
+  }
+  return count;
 }
 
 function searchFragments(terms: string[]): string[] {

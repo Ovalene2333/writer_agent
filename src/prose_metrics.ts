@@ -14,6 +14,8 @@
  *   hints injected into scene-pipeline tool results (mirrors roleplay anti-formula slot).
  */
 
+import { analyzeProseStyle } from "./prose_quality.js";
+
 export type ChapterMetricSeverity = "error" | "warning";
 
 export type ChapterMetricCode =
@@ -234,6 +236,45 @@ export function findAdjacentDuplicateSentences(text: string): string[] {
   return dedupe(found);
 }
 
+/**
+ * Mechanical auto-fix for the "S。S。" generation bug: drop adjacent verbatim
+ * sentence repeats within a line, plus consecutive identical lines inside one
+ * paragraph (blank-line-separated repeats — e.g. intentional dialogue echo — are
+ * preserved). All other bytes pass through unchanged, so precise replacements
+ * targeting untouched sentences still match.
+ */
+export function removeAdjacentDuplicateSentences(text: string): { text: string; removed: string[] } {
+  const removed: string[] = [];
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const output: string[] = [];
+  for (const line of lines) {
+    const parts = line.split(/(?<=[。！？!?…])/u);
+    const kept: string[] = [];
+    for (const part of parts) {
+      const normalized = normalizeSentence(part);
+      const previous = kept.length ? normalizeSentence(kept[kept.length - 1]) : undefined;
+      if (previous !== undefined && normalized.length >= 6 && normalized === previous) {
+        removed.push(part.trim());
+        continue;
+      }
+      kept.push(part);
+    }
+    const rebuilt = kept.join("");
+    const previousLine = output.length ? output[output.length - 1] : undefined;
+    if (
+      previousLine !== undefined
+      && previousLine.trim().length > 0
+      && normalizeSentence(rebuilt).length >= 6
+      && normalizeSentence(rebuilt) === normalizeSentence(previousLine)
+    ) {
+      removed.push(rebuilt.trim());
+      continue;
+    }
+    output.push(rebuilt);
+  }
+  return { text: output.join("\n"), removed: dedupe(removed) };
+}
+
 /** Adjacent paragraphs that are the same quoted line (echo-dialogue device). */
 export function findEchoDialogueParagraphs(text: string): string[] {
   const items = paragraphs(text);
@@ -310,6 +351,33 @@ export function sceneAntiFormulaFeedback(options: {
   }
 
   return lines;
+}
+
+/**
+ * Deterministic prose score for best-of-N scene candidate reranking (higher is
+ * better, ~100 for clean prose). Purely rule-based so ranking is reproducible
+ * and free; penalizes exactly the failure modes the chapter metrics measure,
+ * with a small reward for long-sentence presence (rhythm shifting).
+ */
+export function sceneProseScore(text: string): number {
+  const body = stripStructuralLines(text);
+  const characters = Math.max(1, body.replace(/\s/g, "").length);
+  const per10k = (count: number) => (count / characters) * 10_000;
+  let score = 100;
+  score -= Math.max(0, per10k(countMatches(body, DASH_UNIT)) - DASH_PER_10K_LIMIT) * 0.2;
+  score -= Math.max(0, per10k(collectContrastFrames(body).length) - CONTRAST_PER_10K_LIMIT) * 2;
+  score -= Math.max(0, per10k((body.match(SAMENESS_FRAME) ?? []).length) - SAMENESS_PER_10K_LIMIT) * 1.5;
+  score -= Math.max(0, per10k(countMatches(body, NUMERIC_READOUT)) - NUMERIC_PER_10K_LIMIT) * 0.3;
+  const rhythm = narrativeRhythm(body);
+  score -= per10k(rhythm.fragmentRuns) * 1.2;
+  if (rhythm.sentenceCount >= 20) {
+    score -= Math.max(0, rhythm.shortSentenceRatio - 0.45) * 100;
+    score += Math.min(0.08, rhythm.longSentenceRatio) * 150;
+  }
+  score -= findAdjacentDuplicateSentences(body).length * 40;
+  score -= repeatedShortSentences(body, 3).length * 5;
+  score -= analyzeProseStyle(body).filter(issue => issue.severity === "error").length * 25;
+  return Math.round(score * 10) / 10;
 }
 
 /** Negative list from the previous chapter, injected once at begin_chapter_draft. */

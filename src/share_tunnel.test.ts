@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { diagnoseTunnelFailure, formatTunnelFailureReport, tunnelLogTail } from "./share_tunnel.js";
+import { buildShareEntryUrl, diagnoseTunnelFailure, formatTunnelFailureReport, tunnelLogTail } from "./share_tunnel.js";
+
+test("share entry URLs explicitly distinguish token and no-token modes", () => {
+  assert.equal(
+    buildShareEntryUrl("http://192.168.1.2:4096", "secret", "public", "https://demo.trycloudflare.com"),
+    "http://192.168.1.2:4096/#token=secret&public=https%3A%2F%2Fdemo.trycloudflare.com",
+  );
+  assert.equal(
+    buildShareEntryUrl("https://demo.trycloudflare.com", "", "lan", "http://192.168.1.2:4096"),
+    "https://demo.trycloudflare.com/#auth=none&lan=http%3A%2F%2F192.168.1.2%3A4096",
+  );
+});
 
 const edgeTimeoutLog = [
   '2026-07-14T16:24:45Z ERR Unable to establish connection with Cloudflare edge error="TLS handshake with edge error: read tcp 192.168.152.127:14270->198.41.192.107:7844: i/o timeout"',

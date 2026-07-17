@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { dynamicStyleGroundingPrompt, extractProseSample, naturalProseCraftPrompt, stableStyleGroundingPrompt, styleFingerprint, styleGroundingPrompt } from "./style_grounding.js";
+import { dynamicStyleGroundingPrompt, extractProseSample, naturalProseCraftPrompt, sampleProseWindow, stableStyleGroundingPrompt, styleFingerprint, styleGroundingPrompt } from "./style_grounding.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { defaultPricing } from "./pricing.js";
@@ -28,12 +28,14 @@ describe("naturalProseCraftPrompt", () => {
     assert.match(prompt, /场景推进/);
     assert.match(prompt, /对白意图/);
     assert.match(prompt, /具体性检查/);
-    assert.match(prompt, /不要机械轮换长短句|机械轮换/);
-    assert.match(prompt, /反机械感/);
-    assert.match(prompt, /无聊堆砌|禁止无聊堆砌/);
-    assert.match(prompt, /机关枪短段|单句独立成段/);
-    assert.match(prompt, /数字\/指标|指标刷屏/);
-    assert.match(prompt, /贴金句收尾/);
+    assert.match(prompt, /节奏与质感/);
+    assert.match(prompt, /单句成段是重音/);
+    assert.match(prompt, /绵延的长句/);
+    assert.match(prompt, /半拍/);
+    // Pink-elephant guard: the craft baseline stays positively framed, no bad-example demos.
+    assert.ok(!prompt.includes("禁止"));
+    assert.ok(!prompt.includes("坏例"));
+    assert.ok(!prompt.includes("不是A"));
   });
 });
 
@@ -125,6 +127,28 @@ describe("extractProseSample", () => {
     const sample = extractProseSample(text, 120);
     assert.ok(!sample.includes("# 第一章"));
     assert.ok(sample.includes("你还要走吗") || sample.includes("她没有回答"));
+  });
+});
+
+describe("sampleProseWindow", () => {
+  const long = Array.from({ length: 40 }, (_, index) =>
+    `第${index}段：夜里的雨敲着铁皮屋顶，敲了很久才停下来，屋檐还在滴水。`).join("\n\n");
+
+  it("returns short exemplars whole and honors the budget on long ones", () => {
+    assert.equal(sampleProseWindow("只有一段。", 200), "只有一段。");
+    const window = sampleProseWindow(long, 300, () => 0.5);
+    assert.ok(window.length <= 300);
+    assert.ok(window.includes("铁皮屋顶"));
+  });
+
+  it("samples different paragraph-aligned windows for different rolls", () => {
+    const head = sampleProseWindow(long, 300, () => 0);
+    const tail = sampleProseWindow(long, 300, () => 0.99);
+    assert.notEqual(head, tail);
+    assert.match(head, /^第0段/);
+    assert.doesNotMatch(tail, /^第0段/);
+    // Window starts at a paragraph boundary, not mid-sentence.
+    assert.match(tail, /^第\d+段：/);
   });
 });
 

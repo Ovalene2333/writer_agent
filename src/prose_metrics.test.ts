@@ -8,6 +8,7 @@ import {
   findRecycledSentences,
   priorChapterNegativeList,
   RECYCLE_ERROR_LIMIT,
+  removeAdjacentDuplicateSentences,
   sceneAntiFormulaFeedback,
 } from "./prose_metrics.js";
 
@@ -20,6 +21,33 @@ test("findAdjacentDuplicateSentences catches the AA generation bug and ignores r
   // Intentional rhythm device: short beats stay allowed.
   assert.equal(findAdjacentDuplicateSentences("水滴的声音。一下。一下。一下。").length, 0);
   assert.equal(findAdjacentDuplicateSentences("她推开门，走进院子。院子里没有人。").length, 0);
+});
+
+test("removeAdjacentDuplicateSentences drops repeats and leaves everything else byte-identical", () => {
+  const fixed = removeAdjacentDuplicateSentences("她沿着走廊走到尽头。她沿着走廊走到尽头。警报没有响。");
+  assert.equal(fixed.text, "她沿着走廊走到尽头。警报没有响。");
+  assert.deepEqual(fixed.removed, ["她沿着走廊走到尽头。"]);
+
+  // Triple repeats collapse to one.
+  assert.equal(
+    removeAdjacentDuplicateSentences("能穿透护盾的陶瓷层间隙。能穿透护盾的陶瓷层间隙。能穿透护盾的陶瓷层间隙。").text,
+    "能穿透护盾的陶瓷层间隙。",
+  );
+
+  // Rhythm device and normal prose stay untouched.
+  const rhythm = "水滴的声音。一下。一下。一下。";
+  assert.equal(removeAdjacentDuplicateSentences(rhythm).text, rhythm);
+  const clean = "她推开门，走进院子。院子里没有人。";
+  assert.equal(removeAdjacentDuplicateSentences(clean).text, clean);
+});
+
+test("removeAdjacentDuplicateSentences dedupes identical lines in one paragraph but keeps paragraph echoes", () => {
+  const lineDup = "警报声贴着墙来回撞。\n警报声贴着墙来回撞。\n她数到第三声。";
+  assert.equal(removeAdjacentDuplicateSentences(lineDup).text, "警报声贴着墙来回撞。\n她数到第三声。");
+
+  // Blank-line-separated repeats (intentional echo dialogue) are preserved.
+  const echo = "「他们不会回来了。」\n\n「他们不会回来了。」";
+  assert.equal(removeAdjacentDuplicateSentences(echo).text, echo);
 });
 
 test("findRecycledSentences flags verbatim reuse of full sentences only", () => {

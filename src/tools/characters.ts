@@ -1,6 +1,7 @@
 import {
   characterPromptCard,
   competencyPromptView,
+  normalizeCharacterChangeOp,
   resolveCharacterAt,
   type ApplyCharacterChangesInput,
   type CharacterInput,
@@ -144,7 +145,7 @@ export function handleApplyCharacterChanges({ input, store, characterScope, cont
   for (const raw of changes) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const op = raw as Record<string, unknown>;
-    if (typeof op.op === "string" && op.op.trim() === "upsert_relationship") {
+    if (typeof op.op === "string" && normalizeCharacterChangeOp(op.op) === "upsert_relationship") {
       const entry = op.entry && typeof op.entry === "object" && !Array.isArray(op.entry)
         ? op.entry as Record<string, unknown>
         : op;

@@ -18,11 +18,14 @@ import {
   compactRuntimeMessages,
   initialTodos,
   normalizeCharacterTaskMode,
+  normalizeDocumentProposalRequired,
   rehydrateRecentToolMessages,
   requestNeedsProjectFactSearch,
+  sceneContinuationPrompt,
   stripStaleReasoningContent,
   taskInstructions,
 } from "./agent.js";
+import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 
@@ -30,7 +33,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "3fa5b56cd20705c2");
+  assert.equal(agentToolSchemaHash(), "647e41a5e54ba429");
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -51,6 +54,9 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.equal(normalizeCharacterTaskMode("更新孟秋岚的角色卡", "simple_character"), "character");
   assert.equal(normalizeCharacterTaskMode("创建一个简易角色卡", "character"), "simple_character");
   assert.equal(normalizeCharacterTaskMode("创建一个简易角色卡", "simple_character"), "simple_character");
+  assert.equal(normalizeDocumentProposalRequired("character", true), false);
+  assert.equal(normalizeDocumentProposalRequired("simple_character", true), false);
+  assert.equal(normalizeDocumentProposalRequired("write_scene", true), true);
 
   const normal = taskInstructions("character", "deliver", "ask", false);
   assert.match(normal, /检查同名卡/);
@@ -139,6 +145,44 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   const minimal = chapterContinuationPrompt({ todosText: "（空）" });
   assert.match(minimal, /任务清单仍有未完成的写作步骤/);
   assert.doesNotMatch(minimal, /已交付：/);
+});
+
+test("scene continuation handoff carries seam tail, states and next card without full prose", () => {
+  let draft = beginChapterSceneDraft({
+    path: "chapters/第1章.md", mode: "create", heading: "第1章", chapterGoal: "关系反转",
+    baseContent: "", baseHash: "empty",
+    scenes: [
+      { id: "s1", title: "抵达", goal: "进入基地", obstacle: "门禁", turn: "冻结令", outcome: "违规进入", handoff: "触发警报" },
+      { id: "s2", title: "警报", goal: "处置违规", obstacle: "实弹防卫", turn: "教官担责", outcome: "秘密共担", handoff: "" },
+    ],
+  });
+  const sceneBody = `独属于开场的第一句钥匙句。${"她沿着通道往里走，门禁灯逐个变红。".repeat(80)}警报在头顶炸开。`;
+  draft = writeChapterScene(draft, "s1", sceneBody, {
+    situation: ["警报已触发"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
+  }).draft;
+  const prompt = sceneContinuationPrompt(draft, {
+    styleFeedback: ["下一场禁用段首起笔：「她沿」×30"],
+    stylePriorNotes: ["上一章高频微动作词：目光×8"],
+  });
+  assert.match(prompt, /已完成 1\/2 场/);
+  assert.match(prompt, /警报在头顶炸开/);
+  assert.match(prompt, /警报已触发/);
+  assert.match(prompt, /"id":"s2"/);
+  assert.match(prompt, /sceneId=s2/);
+  assert.match(prompt, /禁用段首起笔/);
+  assert.match(prompt, /目光×8/);
+  assert.match(prompt, /禁止先用单独一步输出计划/);
+  // Only the bounded tail of the finished scene survives — never its full prose.
+  assert.doesNotMatch(prompt, /钥匙句/);
+  const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
+  assert.ok(tailBlock.length > 0 && tailBlock.length < 1_000, `tail block out of bounds: ${tailBlock.length}`);
+
+  draft = writeChapterScene(draft, "s2", "教官在警报声里签下自己的名字。".repeat(10), {
+    situation: ["违规被共同隐瞒"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
+  }).draft;
+  const complete = sceneContinuationPrompt(draft, {});
+  assert.match(complete, /全部场景已写完/);
+  assert.match(complete, /inspect_chapter_draft/);
 });
 
 type Msg = {

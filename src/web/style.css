@@ -1954,6 +1954,19 @@ button.agent-orb:focus-visible {
 .proposals .proposal-actions {
   display: flex; gap: 6px; justify-content: flex-end;
 }
+.change-set-status {
+  display: inline-block; margin-bottom: 8px; color: var(--text-faint); font: 11px var(--font-mono);
+}
+.change-set-file {
+  border-top: 1px solid var(--border); padding: 7px 0;
+}
+.change-set-file summary {
+  cursor: pointer; color: var(--text-dim); font: 11px var(--font-mono); overflow-wrap: anywhere;
+}
+.change-set-file .document-diff {
+  max-height: 240px; overflow: auto; margin-top: 8px; padding: 8px; background: var(--surface2);
+}
+.change-set-card .proposal-actions { margin-top: 8px; }
 .proposals .block-empty {
   text-align: center; color: var(--text-faint); font-size: 12px; padding: 16px;
   border: 1px dashed var(--border); border-radius: 10px;

@@ -16,6 +16,7 @@
 - **项目指令**：自动加载 `WRITER.md` / `AGENTS.md` / `CLAUDE.md` / `.writer/instructions.md`
 - **项目技能**：`.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md`，按需 `load_skill`
 - **修改提案与撤销**：Agent 默认不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo
+- **纯文本工作区与 change set**：Agent 可在 `resource/` 内读取和管理 UTF-8 纯文本；多文件写入、补丁、移动、删除及角色演进可整组预览、审批、回滚和重做
 - **角色卡**：结构化角色资料，可供检索与写作引用
 - **角色扮演试演**：扮演者和当前身份均支持简易/普通角色卡；可绑定独立场景卡，显式切换“角色内/导演”输入，查看、纠错和置顶带来源的事实记忆，并按当前对白语义选择相关 lore；试演按会话保存且不直接修改文档
 - **结构化大纲**：幕 / 章 / 场景节点，可与正文对照校验
@@ -95,6 +96,8 @@ writer web --lan                  # 监听 0.0.0.0，允许局域网访问
 writer web --host 0.0.0.0         # 自定义监听地址
 writer web --share                # 局域网 + cloudflared；扫一次码，进出家自动切换通道
 writer web --no-open              # 不自动打开浏览器
+writer web --no-token             # 关闭 API 鉴权；可与 --lan / --share 同用
+writer web --share --no-token     # 建立无令牌公网入口（终端会打印安全警告）
 writer web --debug                # 打印 step 内容 + 模型请求/响应体
 writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / output（推荐排查 UI step）
 ```
@@ -250,7 +253,7 @@ style: ""   # 可设为风格模板 id，如 light-novel
 3. **生成提案**：新建或局部补丁修改 Markdown；**须作者审批**后才落盘  
 4. **可中断 / 可追问**：支持取消作业，也可在关键决策点向用户提问  
 
-Agent 可用的主要能力包括：列出与检视文档、按块 / 节 / 行读取、全文检索、大纲节点读写与校验、文档提案、角色卡读写、向用户提问等。
+Agent 可用的主要能力包括：列出与检视 Markdown 文档、按块 / 节 / 行读取、全文检索、大纲节点读写与校验、通用纯文本文件读取，以及通过 change set 整组提议文件创建 / 补丁 / 移动 / 删除与角色演进。
 
 ## 内置风格模板
 
@@ -292,10 +295,13 @@ npm test                    # 编译并跑测试
 | `src/templates.ts` | 风格模板 |
 | `src/web/` | Web 前端（Vite + React） |
 
+排障与数据分析：[docs/db-query.md](docs/db-query.md)（如何只读查询项目的 `.writer/writer.db`：表结构、成本/缓存命中分析等常用配方）。
+
 ## 安全提示
 
 - `.writer/providers.json`（或 `WRITER_PROVIDERS_FILE` 指向的文件）含 API Key，**不要提交到公开仓库**
 - `writer web --share` 会把带令牌的公网地址暴露到外网；只发给可信设备，结束进程后隧道关闭
+- `writer web --no-token` 会关闭全部 API 访问鉴权；可与 `--share` 同用，但拿到公网地址的任何人都能读写项目，终端会明确警告
 - `--share` 会同时监听局域网：终端二维码为**局域网入口**（hash 里带公网地址）。手机在家扫一次后，Web 端会探测 `/api/health`，在家走局域网、出门自动改打 Cloudflare；下次重启 Writer 需重新扫码（临时隧道地址会变）
 - 请在**家中 Wi‑Fi** 下扫推荐二维码。若先打开纯公网 HTTPS 页，浏览器会拦截对局域网 HTTP 的探测（混合内容），无法自动切回局域网
 - `--lan` 会允许同一局域网内的设备访问工作台，请注意网络安全环境

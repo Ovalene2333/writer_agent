@@ -205,6 +205,27 @@ test("applyCharacterInput pure merge preserves experience history", () => {
   assert.equal(cleared.experiences[0].id, "e2");
 });
 
+test("applyCharacterChanges normalizes op synonyms and hints valid ops on unknown", () => {
+  const base = normalizeV3Character({ ...emptyCharacter("戊"), id: 2, updatedAt: "" });
+  const result = applyCharacterChanges(base, {
+    reason: "第4章确认",
+    changes: [
+      { op: "append_experience", label: "初次实战", description: "在桥上完成首次协同作战" },
+      { op: "add_relationship", entry: { characterId: 3, type: "战友", attitude: "信任" } },
+      { op: "update_motivation", entry: { summary: "查明失踪案" } },
+      { op: "add", foo: 1 },
+    ],
+  });
+  assert.equal(result.applied.length, 3);
+  assert.equal(result.character.experiences.length, 1);
+  assert.equal(result.character.relationships[0]?.characterId, 3);
+  assert.equal(result.character.motivations.length, 1);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].op, "add");
+  assert.match(result.skipped[0].reason, /可用 op/);
+  assert.match(result.skipped[0].reason, /upsert_relationship/);
+});
+
 test("applyCharacterChanges requires reason and at least one change", () => {
   const base = normalizeV3Character({ ...emptyCharacter("丁"), id: 1, updatedAt: "" });
   assert.throws(() => applyCharacterChanges(base, { reason: "", changes: [{ op: "set_psychology_summary", summary: "x" }] }), /reason/);

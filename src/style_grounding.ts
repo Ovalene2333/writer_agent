@@ -1,4 +1,4 @@
-import { documentKind, WriterProject } from "./project.js";
+import { orderedChapterPaths, WriterProject } from "./project.js";
 import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./prose_quality.js";
 import { WriterStore } from "./store.js";
 
@@ -20,34 +20,68 @@ export type StyleGroundingOptions = {
   exampleIds?: number[];
   /** Extra prose already in hand (selection, draft context) to prefer as voice anchor. */
   preferredSample?: string;
+  /** RNG for exemplar window sampling (tests inject a seeded fn). Defaults to Math.random. */
+  random?: () => number;
 };
+
+/**
+ * Random paragraph-aligned window from a long exemplar. Long 范文 are stored
+ * whole; each prompt build samples a different slice so successive scenes see
+ * different facets of the voice instead of overfitting one fixed excerpt. Only
+ * used in the dynamic tail (always cache-miss), never in the stable prefix.
+ */
+export function sampleProseWindow(text: string, maxChars: number, random: () => number = Math.random): string {
+  const cleaned = extractProseSample(text, Number.MAX_SAFE_INTEGER);
+  if (cleaned.length <= maxChars) return cleaned;
+  const paragraphs = cleaned.split(/\n\s*\n/).map(item => item.trim()).filter(Boolean);
+  // Last valid start keeps a full window available; +1 so every start is reachable.
+  let tailLength = 0;
+  let lastStart = paragraphs.length - 1;
+  for (let index = paragraphs.length - 1; index >= 0; index -= 1) {
+    tailLength += paragraphs[index].length + 2;
+    if (tailLength >= maxChars) { lastStart = index; break; }
+    lastStart = index;
+  }
+  const start = Math.min(lastStart, Math.floor(random() * (lastStart + 1)));
+  const window: string[] = [];
+  let used = 0;
+  for (let index = start; index < paragraphs.length; index += 1) {
+    const cost = paragraphs[index].length + (window.length ? 2 : 0);
+    if (used + cost > maxChars && window.length) break;
+    window.push(paragraphs[index]);
+    used += cost;
+  }
+  return window.join("\n\n");
+}
 
 /**
  * Craft rules for the stable style block (cacheable project-level guidance).
  * Applies under every style template — keep genre flavor in templates, keep
- * anti-mechanical / anti-stacking hygiene here so all modes share one baseline.
+ * the shared craft baseline here.
+ *
+ * Positive-first on purpose: prohibition walls with bad-example demos raise the
+ * salience of the very patterns they ban (Pink Elephant / ironic rebound), so
+ * this block describes what good scenes do; density enforcement lives in the
+ * exit-side machine gates.
  */
 export function naturalProseCraftPrompt(): string {
-  return `自然叙事原则（服从项目样本与激活模板；不要为了显得“自然”故意制造病句或随机变化）：
+  return `自然叙事原则（服从项目样本与激活模板；出口有机器门禁复核密度，正文无需自我说明）：
 
-【活着写，不要“组装”】
-- 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现。叙述距离一旦贴近某人，不因解释方便突然跳进他人内心。
-- 场景推进：刺激必须引出反应、选择或代价；动作应改变关系、位置、信息或下一步可能。禁止把章节写成功能清单（醒来→说明→测试→评分→收束）或「指令—执行—确认」连环短段。
-- 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改关系，不是轮流播报设定、规则或数据。禁止全员讲课腔；设定优先让人物试错撞出来，旁人只在关键处插一句。
-- 细节取舍：每处细节至少承担空间、习惯、冲突、因果或伏笔之一。把“紧张/复杂/压迫感”等通用标签换成此时此地才成立的对象、动作或感官。
+【写活一场戏】
+- 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现；叙述距离贴近谁，就停在谁的感知里。
+- 场景推进：刺激引出反应、选择或代价；每个动作改变关系、位置、信息或下一步的可能。
+- 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改变关系；设定让人物在行动里试错撞出来，旁人只在关键处补一句。
+- 细节取舍：每处细节至少承担空间、习惯、冲突、因果或伏笔之一；用此时此地才成立的物件、动作或感官，代替随处可用的气氛标签。
+- 具体性检查：一句话若换掉人名地点仍能套进多数故事，就换成本场独有的说法或后果；没有有效信息就删。
 
-【反机械感（全模板强制）】
-1. 禁止机关枪短段：连续单句独立成段不得超过 3 个；默认 2—5 句中段，长短随压力变化，不要机械轮换长短句或强凑“三段式”。
-2. 禁止无聊堆砌：同一信息、情绪、感官公式、因果或主题只写一次；同类高清感官比喻（“一根根纤维/放大镜式清晰”等）一章内最多 1 次；不要用同义词连打、排比金句或“气氛+眼神+决心”三件套填满段落。
-3. 禁止数字/指标刷屏：精确读数、百分比、等级评分一章合计 ≤3 处（类型必需时也尽量压到后果感写法）；其余用可感后果（器物轻响、对方停顿、地板闷震），禁止正文变 HUD/日志。
-4. 禁止解释掐情绪：难过、发慌、羞耻、兴奋刚起时，先给半拍体感或动作；禁止立刻接设定说明、成分百分比、系统提示或作者总结把情绪冲掉。
-5. 禁止贴金句收尾：流程、测试、赶路、说明为主的段落之后，不要硬接“迈出了第一步/这就够了/新的开始”式升华；收在具体后果、关系余波或未决问题上。
-6. 具体性检查：若一句话换掉人名地点仍能套进多数故事，就落实为本场独有的物件、说法、动作或后果；无有效信息则删。
-7. 禁止角色卡/系统腔污染：勿把能力表字段写进叙述（「未解锁」「还锁着」「档案上…锁着」「专属武装还锁着」）；勿用「不是A，不是B——还锁着」点名否定列举未出场武装；本场不能用的能力直接不写，或只写人物此刻可感的限制（抬不起、唤不出、伤口还在），不要播报卡面状态。
-
-【节奏与留白】
-- 关键信息落地后给半拍落点（动作、停顿、环境），再推进；保留朴素功能句与不对称，未说尽处可由后续行动承接。
-- 不要每句都修辞、每段都转折、每个场景都总结；幽默/张力来自关系错位与现场反应，不靠段子拼贴或全员抖机灵。`;
+【节奏与质感】
+- 段落默认 2—5 句，长短随情绪压力起伏；单句成段是重音，省着用才有力。
+- 静场与情感段落里安排绵延的长句，让读者呼吸；紧张段落才收短。
+- 关键信息落地后给半拍落点（动作、停顿、环境），再推进。
+- 读数、参数、系统状态优先转译为人物可感的后果（器物轻响、对方停顿、地板闷震）或一个准确的比喻；精确数字一章少而准。
+- 情绪刚起时先给半拍体感或动作，再进任何说明。
+- 同一信息、情绪、感官公式或因果只写一次；比喻与金句的效果来自克制。
+- 段落与章节收在具体后果、关系余波或未决问题上。`;
 }
 
 /**
@@ -81,23 +115,22 @@ export function stableStyleGroundingPrompt(
   const template = config.style ? project.styleTemplate(config.style) : undefined;
 
   const sections: string[] = [
-    "风格锚定（写正文 / 续写 / 改写时强制遵守；优先级：本轮动态声线证据 > 本项目既有正文 > 用户范文 > 风格模板 > 泛化建议）",
+    "风格锚定（写正文 / 续写 / 改写时强制遵守；优先级：本轮动态声线证据中的原文片段 > 风格模板 > 泛化建议。声线学习以读原文为准，不以任何统计描述为准）",
   ];
 
   if (template) {
     sections.push(
       `激活模板：${template.name}`,
       `模板约束：\n${template.systemPromptAddition.trim()}`,
-      `模板声线指纹：${styleFingerprint(template.exampleContent, template.exampleNotes)}`,
     );
   } else {
-    sections.push("未激活风格模板：以本项目既有正文与角色声线为准，避免切换成通用网文或翻译腔。");
+    sections.push("未激活风格模板：以本轮动态声线证据中的原文片段为准，避免切换成通用网文或翻译腔。");
   }
 
   // Compact craft + mannerism once here; do not re-paste into system / task workflows.
   sections.push(naturalProseCraftPrompt());
   sections.push(proseMannerismConstraintPrompt({ compact: true }));
-  sections.push(`提交前自检：句长/对白占比贴近动态声线证据与上方指纹；人物语气可区分；动作产生后果后不重复解释；${proseMannerismPreflightLine()}；关键身体/暴力/情欲未无故含蓄化（作者未要求收敛时）。`);
+  sections.push(`${proseMannerismPreflightLine()}关键身体/暴力/情欲不无故含蓄化（作者未要求收敛时）。`);
 
   return sections.join("\n\n");
 }
@@ -105,6 +138,12 @@ export function stableStyleGroundingPrompt(
 /**
  * Per-turn voice evidence for agent dynamic-tail (after history/task).
  * CACHE: Always miss-priced — 范文 + one short project sample; no multi-chapter dumps.
+ *
+ * Continuation-anchor form: raw exemplar prose first, then the immediately
+ * preceding project prose LAST, framed as the text being continued. Style
+ * imitation research shows raw text + completion framing anchors voice far
+ * better than instructions, and statistical style summaries do not anchor at
+ * all — so no fingerprints here, just prose.
  */
 export function dynamicStyleGroundingPrompt(
   project: WriterProject,
@@ -114,8 +153,9 @@ export function dynamicStyleGroundingPrompt(
   if (!options.intensive) return "";
   const config = project.config();
   const template = config.style ? project.styleTemplate(config.style) : undefined;
+  const random = options.random ?? Math.random;
   const projectSample = pickProjectVoiceSample(project, options.targetPath, options.preferredSample);
-  const catalogExamples = pickStyleExamples(store, template?.name, options.exampleIds);
+  const catalogExamples = pickStyleExamples(store, template?.name, options.exampleIds, random);
   const selectedExamples = pickExplicitStyleExamples(store, options.exampleIds);
   // Prefer task-specified examples; otherwise default catalog / template seed (bodies only here).
   const examples = selectedExamples.length
@@ -123,25 +163,31 @@ export function dynamicStyleGroundingPrompt(
     : catalogExamples.map(item => ({ title: item.title, content: item.content, notes: item.notes }));
   if (!projectSample && !examples.length && !template?.exampleContent) return "";
 
-  const sections = ["本轮动态声线证据（优先于固定模板；只学声线，不复述情节）："];
-  if (projectSample) {
-    sections.push(`本项目既有正文样本：\n---\n${projectSample.text}\n---\n来源：${projectSample.source} · 指纹：${styleFingerprint(projectSample.text, "")}`);
-  }
+  const sections = ["本轮动态声线证据（只学句法、节奏与叙述姿态，不复述其中内容）："];
   if (examples.length) {
+    // Long exemplars: each build samples a different paragraph-aligned window.
     sections.push(examples.map((item, index) => {
-      const body = item.content.slice(0, 900);
-      return `范文 ${index + 1}《${item.title}》\n指纹：${styleFingerprint(item.content, item.notes)}\n${body}${item.content.length > body.length ? "\n…" : ""}`;
+      const body = sampleProseWindow(item.content, 1_500, random);
+      const notes = item.notes.trim() ? `（${item.notes.trim().slice(0, 120)}）` : "";
+      return `［范文 ${index + 1}·《${item.title}》${notes}］\n${body}`;
     }).join("\n\n"));
   } else if (template?.exampleContent) {
-    const body = template.exampleContent.slice(0, 900);
+    const body = sampleProseWindow(template.exampleContent, 1_500, random);
     sections.push(
-      `模板正向范例：\n${template.exampleNotes ? `备注：${template.exampleNotes}\n` : ""}${body}${template.exampleContent.length > body.length ? "\n…" : ""}`,
+      `［模板范例${template.exampleNotes ? `（${template.exampleNotes.trim().slice(0, 120)}）` : ""}］\n${body}`,
     );
+  }
+  if (projectSample) {
+    sections.push(`［紧接本次写作之前的正文（来源：${projectSample.source}）——新正文从这里的声线自然续下去，句法与节奏保持同一支笔的手感］\n${projectSample.text}`);
   }
   return sections.join("\n\n");
 }
 
-/** Lightweight fingerprint used in prompts (shared shape with agent creative context). */
+/**
+ * Lightweight rhythm fingerprint. No longer injected into writing prompts
+ * (statistical style summaries do not anchor imitation — raw prose does);
+ * kept for diagnostics, tests and potential UI display.
+ */
 export function styleFingerprint(content: string, notes: string): string {
   const paragraphs = content.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
   const sentences = content.split(/[。！？!?]+/).map((item) => item.trim()).filter(Boolean);
@@ -184,12 +230,22 @@ function percentile(values: number[], ratio: number): number {
   return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio))];
 }
 
+/**
+ * Placeholder exemplars（占位条目，等作者粘贴正文）must never reach a prompt:
+ * skip entries that still carry the placeholder marker or have no real prose.
+ */
+export function isPlaceholderStyleExample(example: { content: string }): boolean {
+  if (example.content.includes("【范文占位】")) return true;
+  return example.content.replace(/\s/g, "").length < 120;
+}
+
 function pickStyleExamples(
   store: WriterStore,
   templateName: string | undefined,
   exampleIds?: number[],
+  random: () => number = Math.random,
 ): Array<{ title: string; category: string; content: string; notes: string }> {
-  const all = store.writingExamples();
+  const all = store.writingExamples().filter(item => !isPlaceholderStyleExample(item));
   const wanted = new Set(exampleIds ?? []);
   const selected: typeof all = [];
 
@@ -198,13 +254,14 @@ function pickStyleExamples(
     if (hit && !hit.title.startsWith("[风格模板]")) selected.push(hit);
   }
 
-  // Prefer non-template user examples for voice diversity.
+  // Fill from non-template user examples, sampled randomly so a 3+ item 范文库
+  // rotates across turns instead of always showing the same two entries.
   if (selected.length < 2) {
-    for (const item of all) {
-      if (item.title.startsWith("[风格模板]")) continue;
-      if (selected.some((entry) => entry.id === item.id)) continue;
-      selected.push(item);
-      if (selected.length >= 2) break;
+    const pool = all.filter(item =>
+      !item.title.startsWith("[风格模板]") && !selected.some(entry => entry.id === item.id));
+    while (selected.length < 2 && pool.length) {
+      const index = Math.min(pool.length - 1, Math.floor(random() * pool.length));
+      selected.push(pool.splice(index, 1)[0]);
     }
   }
 
@@ -239,16 +296,14 @@ function pickProjectVoiceSample(
   targetPath?: string,
   preferredSample?: string,
 ): { text: string; source: string } | undefined {
-  const preferred = extractProseSample(preferredSample ?? "", 900);
+  const preferred = extractProseSample(preferredSample ?? "", 1_200);
   if (preferred) return { text: preferred, source: "本轮上下文/选区" };
 
   const candidates: string[] = [];
   if (targetPath && project.documentExists(targetPath) && !project.isDocumentHidden(targetPath)) {
     candidates.push(targetPath);
   }
-  const chapters = project.listDocuments()
-    .filter((path) => !project.isDocumentHidden(path) && documentKind(path) === "chapter")
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const chapters = orderedChapterPaths(project);
   if (targetPath) {
     const index = chapters.indexOf(targetPath);
     if (index > 0) candidates.push(chapters[index - 1]);
@@ -261,11 +316,11 @@ function pickProjectVoiceSample(
     try {
       const raw = project.read(path);
       // Prefer ending (voice continuity for续写); fall back to a mid window if ending is tiny.
-      const tail = extractProseSample(raw.slice(-2_400), 900);
+      const tail = extractProseSample(raw.slice(-3_000), 1_200);
       if (tail && tail.replace(/\s/g, "").length >= 80) {
         return { text: tail, source: path };
       }
-      const body = extractProseSample(raw, 900);
+      const body = extractProseSample(raw, 1_200);
       if (body && body.replace(/\s/g, "").length >= 80) {
         return { text: body, source: path };
       }

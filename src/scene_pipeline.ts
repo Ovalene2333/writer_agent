@@ -60,7 +60,7 @@ export type BeginChapterSceneDraftInput = {
 };
 
 const DEFAULT_MAX_SCENES = 5;
-const MAX_SCENE_CHARACTERS = 12_000;
+export const MAX_SCENE_CHARACTERS = 12_000;
 
 export function beginChapterSceneDraft(input: BeginChapterSceneDraftInput): ChapterSceneDraft {
   const heading = cleanString(input.heading);
@@ -104,7 +104,7 @@ export function writeChapterScene(
   const trimmed = content.trim();
   if (trimmed.length < 80) throw new Error("场景正文过短；如果本场确实不产生局面变化，应合并而不是保留空壳场景");
   if (trimmed.length > MAX_SCENE_CHARACTERS) throw new Error(`单场正文超过 ${MAX_SCENE_CHARACTERS} 字，请收紧场景边界`);
-  if (/^#\s+/mu.test(trimmed)) throw new Error("场景正文不要包含章节一级标题；标题由章节草稿统一组装");
+  if (/^#{1,6}\s/mu.test(trimmed)) throw new Error("场景正文不要包含任何 markdown 标题；章节标题与每场的 ## 场景小标题（取场景卡 title）都由组装自动生成");
   const actualState = normalizeActualState(actualStateValue);
   if (!hasMaterialStateChange(actualState)) {
     throw new Error("actualState 至少记录一项实际局面变化（situation/physical/knowledge/relationships/goals）");
@@ -164,7 +164,7 @@ export function reviseChapterDraftStyle(
     const scene = completed[sceneIndex];
     const content = scene.content.slice(0, offset) + replace + scene.content.slice(offset + search.length);
     if (content.trim().length < 80) throw new Error(`edits[${editIndex}] 会使场景正文过短`);
-    if (/^#\s+/mu.test(content)) throw new Error(`edits[${editIndex}] 不得向场景正文加入章节一级标题`);
+    if (/^#{1,6}\s/mu.test(content)) throw new Error(`edits[${editIndex}] 不得向场景正文加入 markdown 标题（小标题由组装自动生成）`);
     completed[sceneIndex] = { ...scene, content };
     editedSceneIds.add(scene.sceneId);
   }
@@ -193,7 +193,10 @@ export function assembleChapterSceneDraft(draft: ChapterSceneDraft): string {
   const sceneBodies = draft.completed.map((completed, index) => {
     const hasEarlierBody = index > 0 || (draft.mode === "append" && Boolean(draft.baseContent.trim()));
     const separator = hasEarlierBody && draft.scenes[index].dividerBefore ? "---\n\n" : "";
-    return `${separator}${completed.content}`;
+    // Scene-card title as a deterministic "## " anchor: structures the chapter for
+    // block-level reads/patches without asking the model to author headings.
+    const heading = `## ${draft.scenes[index].title}\n\n`;
+    return `${separator}${heading}${completed.content}`;
   }).join("\n\n");
   if (draft.mode === "append") {
     return [draft.baseContent.trimEnd(), sceneBodies].filter(Boolean).join("\n\n");

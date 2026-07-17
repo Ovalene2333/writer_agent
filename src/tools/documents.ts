@@ -61,10 +61,75 @@ export function handleInspectDocument({ input, project }: ToolHandlerArgs): stri
   });
 }
 
+/** Longest quote sub-segment worth retrying when the exact quote misses (ellipsis/typo tolerance). */
+function longestQuoteFragment(quote: string): string | undefined {
+  const fragments = quote.split(/[\r\n]+|…{1,2}|\.{3,}/).map(part => part.trim()).filter(part => part.length >= 8);
+  if (!fragments.length) return undefined;
+  return fragments.reduce((longest, part) => part.length > longest.length ? part : longest, "");
+}
+
+function locateQuoteMatches(content: string, needle: string): Array<{ startLine: number; endLine: number }> {
+  const matches: Array<{ startLine: number; endLine: number }> = [];
+  let offset = 0;
+  while (matches.length < 4) {
+    const index = content.indexOf(needle, offset);
+    if (index < 0) break;
+    const startLine = content.slice(0, index).split(/\r?\n/).length;
+    const endLine = content.slice(0, index + needle.length).split(/\r?\n/).length;
+    matches.push({ startLine, endLine });
+    offset = index + needle.length;
+  }
+  return matches;
+}
+
+/** One-call locator for user-quoted prose: exact substring → line range + nearby context. */
+function readDocumentByQuote(path: string, content: string, quote: string): string {
+  const lines = content.split(/\r?\n/);
+  const trimmed = quote.trim();
+  let needle = trimmed;
+  let matches = locateQuoteMatches(content, needle);
+  let approximate = false;
+  if (!matches.length) {
+    const fragment = longestQuoteFragment(trimmed);
+    if (fragment && fragment !== trimmed) {
+      needle = fragment;
+      matches = locateQuoteMatches(content, fragment);
+      approximate = matches.length > 0;
+    }
+  }
+  if (!matches.length) {
+    return JSON.stringify({
+      path, quote: trimmed.slice(0, 80), occurrences: 0, matches: [],
+      hint: "未找到该原文；请缩短引用片段（避免省略号拼接与转写差异）后重试，或改用 search_project",
+    });
+  }
+  const contextRadius = 2;
+  return JSON.stringify({
+    path,
+    quote: trimmed.slice(0, 80),
+    ...(approximate ? { matchedFragment: needle.slice(0, 80) } : {}),
+    lineCount: lines.length,
+    occurrences: matches.length > 3 ? "3+" : matches.length,
+    matches: matches.slice(0, 3).map(match => {
+      const contextStart = Math.max(1, match.startLine - contextRadius);
+      const contextEnd = Math.min(lines.length, match.endLine + contextRadius);
+      return {
+        startLine: match.startLine,
+        endLine: match.endLine,
+        contextStartLine: contextStart,
+        context: lines.slice(contextStart - 1, contextEnd).join("\n").slice(0, 1_500),
+      };
+    }),
+  });
+}
+
 export function handleReadDocument({ input, project }: ToolHandlerArgs): string {
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const content = project.read(path);
+  if (typeof input.quote === "string" && input.quote.trim()) {
+    return readDocumentByQuote(path, content, input.quote);
+  }
   const requestedStart = optionalPositiveInteger(input.startLine, "startLine");
   const requestedEnd = optionalPositiveInteger(input.endLine, "endLine");
   if ((requestedStart === undefined) !== (requestedEnd === undefined)) throw new Error("startLine 和 endLine 必须同时提供");

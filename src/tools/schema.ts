@@ -49,11 +49,12 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "read_document",
-      description: "按节/块/行范围截取；有行号时读最小范围；长文先 inspect",
+      description: "按节/块/行范围截取；有行号时读最小范围；长文先 inspect。改既有句段时传 quote 一步定位",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "相对路径" },
+          quote: { type: "string", description: "原文引用片段；返回行号与上下文，勿再通读或反复 search" },
           block: { type: "number", description: "块号，从 1 起" },
           section: { type: "string", description: "Markdown 标题文本（不含 #）" },
           lastSection: { type: "boolean", description: "读最后一节；续写优先" },
@@ -86,6 +87,68 @@ export const TOOLS = deepFreeze([
         },
         required: ["query"],
         additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_files",
+      description: "分页列出 resource/ 内可访问的 UTF-8 纯文本文件；不限于 Markdown",
+      parameters: {
+        type: "object",
+        properties: {
+          pathPrefix: { type: "string", description: "可选目录前缀" },
+          cursor: { type: "string", description: "上一页 nextCursor" },
+          limit: { type: "number", description: "每页 1-200，默认 100" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "inspect_file",
+      description: "查看 resource/ 内纯文本文件的行数、块结构、首尾预览与 sourceHash",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string", description: "resource/ 内相对路径" } },
+        required: ["path"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "按引用、块或行范围读取 resource/ 内 UTF-8 纯文本文件",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "resource/ 内相对路径" },
+          quote: { type: "string", description: "精确原文定位" },
+          block: { type: "number", description: "块号，从 1 起" },
+          startLine: { type: "number", description: "起始行，与 endLine 同用" },
+          endLine: { type: "number", description: "结束行，最多 200 行/12000 字符" },
+        },
+        required: ["path"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_files",
+      description: "在 resource/ 的纯文本文件中做精确文本检索；语义问题仍用 search_project",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "要查找的原文" },
+          pathPrefix: { type: "string", description: "可选目录前缀" },
+          limit: { type: "number", description: "结果数 1-20，默认 8" },
+        },
+        required: ["query"], additionalProperties: false,
       },
     },
   },
@@ -255,9 +318,9 @@ export const TOOLS = deepFreeze([
           sceneId: { type: "string" },
           notes: {
             type: "string",
-            description: "要点式故事内短笔记（上限 4000 字）：仅本场目标、人物当下、事件顺序、已知事实、须自然落地与勿擅自补写项，不写成段落长文",
+            description: "要点式故事内短笔记（上限 1500 字）：仅本场目标、人物当下、事件顺序、已知事实、须自然落地与勿擅自补写项，不写成段落长文",
           },
-          content: { type: "string", description: "仅本场正文，不含章节一级标题" },
+          content: { type: "string", description: "仅本场正文，不含任何 markdown 标题（章节标题与 ## 场景小标题由组装自动生成）" },
           actualState: {
             type: "object",
             description: "从实际正文归纳的离场状态；不可照抄计划",
@@ -330,7 +393,7 @@ export const TOOLS = deepFreeze([
               type: "object",
               properties: {
                 characterId: { type: "number" }, reason: { type: "string" },
-                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+                changes: { type: "array", description: "op 同 apply_character_changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
             },
@@ -360,7 +423,7 @@ export const TOOLS = deepFreeze([
               properties: {
                 characterId: { type: "number", description: "角色 ID" },
                 reason: { type: "string", description: "正文依据" },
-                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+                changes: { type: "array", description: "op 同 apply_character_changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
             },
@@ -402,7 +465,7 @@ export const TOOLS = deepFreeze([
               type: "object",
               properties: {
                 characterId: { type: "number" }, reason: { type: "string" },
-                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+                changes: { type: "array", description: "op 同 apply_character_changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
             },
@@ -410,6 +473,53 @@ export const TOOLS = deepFreeze([
         },
         required: ["path", "edits", "summary"],
         additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_change_set",
+      description: "统一提议多个纯文本文件的写入/精确补丁/移动/删除及角色演进；整体审批、校验、应用和回滚",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "整组变更摘要" },
+          files: {
+            type: "array", maxItems: 20,
+            items: {
+              type: "object",
+              properties: {
+                operation: { type: "string", enum: ["write", "patch", "move", "delete"] },
+                path: { type: "string", description: "resource/ 内源路径；write 可新建" },
+                targetPath: { type: "string", description: "move 的目标路径" },
+                content: { type: "string", description: "write 的完整 UTF-8 文本，可为空" },
+                edits: {
+                  type: "array", minItems: 1, maxItems: 20,
+                  items: {
+                    type: "object",
+                    properties: { search: { type: "string" }, replace: { type: "string" } },
+                    required: ["search", "replace"], additionalProperties: false,
+                  },
+                },
+              },
+              required: ["operation", "path"], additionalProperties: false,
+            },
+          },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            description: "整组审批成功后一起生效的角色演进；格式同 propose_document",
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["summary"], additionalProperties: false,
       },
     },
   },
@@ -483,7 +593,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "apply_character_changes",
-      description: "已确认事实的角色演进（解锁/经历/心理/目标/关系/场景态）。ops 见系统约定；新建用 save_character",
+      description: "已确认事实的角色演进（解锁/经历/心理/目标/关系/场景态）；新建用 save_character",
       parameters: {
         type: "object",
         properties: {
@@ -496,7 +606,7 @@ export const TOOLS = deepFreeze([
           },
           changes: {
             type: "array",
-            description: "含 op 的变更列表",
+            description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,...}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
             items: { type: "object", additionalProperties: true },
           },
         },

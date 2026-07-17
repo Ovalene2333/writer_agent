@@ -1,4 +1,5 @@
 import type { AgentEvent, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
+import { characterChangeOpsHint, isCharacterChangeOp, normalizeCharacterChangeOp } from "../characters.js";
 import { documentKind } from "../project.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
@@ -15,11 +16,26 @@ function assertWritePackReady(context: ToolHandlerArgs["context"], toolName: str
   );
 }
 
+/**
+ * Sentence-level fixes must stay cheap: patches whose total replacement text fits
+ * this budget skip the scene pipeline and write-pack gates. Anything larger is
+ * chapter (re)writing and keeps the full delivery contract.
+ */
+export const LIGHT_PATCH_MAX_REPLACE_CHARS = 1_500;
+
+function patchReplaceCharacters(edits: unknown[]): number {
+  return edits.reduce<number>((sum, edit) => {
+    const replace = edit && typeof edit === "object" ? (edit as Record<string, unknown>).replace : undefined;
+    return sum + (typeof replace === "string" ? replace.length : 0);
+  }, 0);
+}
+
 function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], path: string, toolName: string): void {
   if (!context.requireScenePipeline || documentKind(path) !== "chapter") return;
   throw new Error(
     `${toolName} 不能跳过逐场景章节流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
-    "再 inspect_chapter_draft 与 propose_chapter_draft。",
+    `再 inspect_chapter_draft 与 propose_chapter_draft。已有章节的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
+    "可直接用 propose_document_patch，不受此限。",
   );
 }
 
@@ -35,7 +51,7 @@ function gateProseMetaLeaks(content: string, path: string): { content: string; s
   return { content: cleaned.text, stripped: cleaned.stripped };
 }
 
-function deferredCharacterChanges(value: unknown, characterScope?: number[]): ProposalCharacterChange[] {
+export function deferredCharacterChanges(value: unknown, characterScope?: number[]): ProposalCharacterChange[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error("characterChanges 必须是数组");
   const seen = new Set<number>();
@@ -53,11 +69,16 @@ function deferredCharacterChanges(value: unknown, characterScope?: number[]): Pr
       if (!change || typeof change !== "object" || Array.isArray(change)) {
         throw new Error(`characterChanges[${index}].changes[${changeIndex}] 格式无效`);
       }
-      const op = typeof (change as Record<string, unknown>).op === "string"
+      const rawOp = typeof (change as Record<string, unknown>).op === "string"
         ? String((change as Record<string, unknown>).op).trim()
         : "";
-      if (!op) throw new Error(`characterChanges[${index}].changes[${changeIndex}].op 不能为空`);
-      return { ...(change as Record<string, unknown>), op };
+      if (!rawOp) throw new Error(`characterChanges[${index}].changes[${changeIndex}].op 不能为空`);
+      // Reject unknown ops at propose time — deferring them means they silently
+      // fail (skip) when the user later accepts the proposal.
+      if (!isCharacterChangeOp(rawOp)) {
+        throw new Error(`characterChanges[${index}].changes[${changeIndex}].op 无效：${rawOp}。${characterChangeOpsHint()}`);
+      }
+      return { ...(change as Record<string, unknown>), op: normalizeCharacterChangeOp(rawOp) };
     });
     return { characterId, reason, changes };
   });
@@ -162,12 +183,16 @@ export async function submitFullDocumentProposal(
 export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document_patch");
   const path = requireString(input.path, "path");
-  assertDirectChapterWriteAllowed(context, path, "propose_document_patch");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  assertCreativeOutlineDesigned(context, path, "propose_document_patch");
-  assertWritePackReady(context, "propose_document_patch");
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
+  // Light patches (sentence-level fixes) skip the chapter pipeline / write-pack
+  // gates: forcing begin_chapter_draft + compile_write_pack to fix one OOC line
+  // costs a full chapter regeneration for a few-hundred-character change.
+  const lightPatch = patchReplaceCharacters(edits) <= LIGHT_PATCH_MAX_REPLACE_CHARS;
+  if (!lightPatch) assertDirectChapterWriteAllowed(context, path, "propose_document_patch");
+  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  assertCreativeOutlineDesigned(context, path, "propose_document_patch");
+  if (!lightPatch) assertWritePackReady(context, "propose_document_patch");
   const beforeContent = project.read(path);
   let content = beforeContent;
   const strippedMeta: string[] = [];

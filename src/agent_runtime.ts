@@ -11,6 +11,13 @@ export interface ScenePipelineSettings {
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
+  /**
+   * Experimental best-of-N scene prose sampling: 1 = off (default);
+   * 2–3 = per scene, request candidateCount-1 fact-preserving rewrites and keep
+   * the highest-scoring candidate. Adds one plain-text model call per extra
+   * candidate per scene.
+   */
+  candidateCount: number;
 }
 
 export interface AgentRuntimeSettings {
@@ -54,8 +61,11 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
     maxScenes: 5,
+    candidateCount: 1,
   },
 };
+
+export const MAX_SCENE_CANDIDATES = 3;
 
 const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
 
@@ -74,7 +84,10 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
   const maxScenes = integer(value?.maxScenes, DEFAULT_SETTINGS.scenePipeline.maxScenes);
   const preferredMaxScenes = Math.min(maxScenes, integer(value?.preferredMaxScenes, DEFAULT_SETTINGS.scenePipeline.preferredMaxScenes));
   const preferredMinScenes = Math.min(preferredMaxScenes, integer(value?.preferredMinScenes, DEFAULT_SETTINGS.scenePipeline.preferredMinScenes));
-  return { preferredMinScenes, preferredMaxScenes, maxScenes };
+  const candidateCount = Number.isInteger(value?.candidateCount)
+    ? Math.min(MAX_SCENE_CANDIDATES, Math.max(1, Number(value?.candidateCount)))
+    : DEFAULT_SETTINGS.scenePipeline.candidateCount;
+  return { preferredMinScenes, preferredMaxScenes, maxScenes, candidateCount };
 }
 
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {
@@ -91,7 +104,10 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
   }
 }
 
-export function saveAgentSettings(project: WriterProject, patch: Partial<AgentRuntimeSettings>): AgentRuntimeSettings {
+export function saveAgentSettings(
+  project: WriterProject,
+  patch: { permissionMode?: PermissionMode; scenePipeline?: Partial<ScenePipelineSettings> },
+): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
   const next: AgentRuntimeSettings = {
     permissionMode: patch.permissionMode && isPermissionMode(patch.permissionMode)

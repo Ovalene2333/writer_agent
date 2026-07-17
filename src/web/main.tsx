@@ -66,6 +66,21 @@ type ActiveRoleplayState = {
   identity: RoleplayParticipant;
   scene?: RoleplayScene;
 };
+type ChangeSet = {
+  id: number;
+  summary: string;
+  status: "pending" | "accepted" | "rejected" | "stale";
+  undone: boolean;
+  files: Array<{
+    id: number;
+    operation: "write" | "patch" | "move" | "delete";
+    path: string;
+    targetPath?: string;
+    beforeContent: string;
+    afterContent: string;
+  }>;
+  characterChanges: Array<{ characterId: number; reason: string; changes: Array<{ op: string }> }>;
+};
 type RoleplayInputMode = "dialogue" | "director";
 type RoleplayScene = {
   id: number; name: string; setting: string; premise: string; tone: string; timelineAnchor: string;
@@ -179,6 +194,7 @@ type AgentStreamEvent = {
   question?: string;
   options?: string[];
   proposal?: { id: number; path: string; summary: string; beforeContent: string; afterContent: string; status: "pending" | "accepted" | "rejected" | "stale" };
+  changeSet?: ChangeSet;
   usage?: Usage;
   call?: StepUsage;
   todos?: AgentTodoItem[];
@@ -244,6 +260,7 @@ type State = {
   messages: Message[];
   messagesHasMore: boolean;
   proposals: Proposal[];
+  changeSets: ChangeSet[];
   sessions: Array<{ id: string; title: string; updatedAt: string; autoTitleDone?: boolean }>;
   characters: Character[];
   roleplayInterlocutors: SavedRoleplayInterlocutor[];
@@ -759,6 +776,44 @@ function DocumentDiffView({ before, after }: { before: string; after: string }) 
       className="markdown document-diff"
       dangerouslySetInnerHTML={{ __html: html }}
     />
+  );
+}
+
+function ChangeSetCard({ value, onAction }: {
+  value: ChangeSet;
+  onAction: (changeSet: ChangeSet, action: "accept" | "reject" | "undo" | "redo") => void;
+}) {
+  const stateLabel = value.status === "accepted" && value.undone ? "rolled back" : value.status;
+  return (
+    <div className="proposal-card change-set-card">
+      <h3>Change set #{value.id}</h3>
+      <p>{value.summary}</p>
+      <span className="change-set-status">{stateLabel}</span>
+      {value.files.map((file) => (
+        <details className="change-set-file" key={file.id}>
+          <summary>
+            <strong>{file.operation}</strong> {file.path}{file.targetPath ? ` -> ${file.targetPath}` : ""}
+          </summary>
+          {file.operation !== "move" && <DocumentDiffView before={file.beforeContent} after={file.afterContent} />}
+        </details>
+      ))}
+      {value.characterChanges.length > 0 && (
+        <details className="change-set-file">
+          <summary><strong>characters</strong> {value.characterChanges.length}</summary>
+          {value.characterChanges.map((change) => (
+            <p key={change.characterId}>#{change.characterId}: {change.reason} ({change.changes.map(item => item.op).join(", ")})</p>
+          ))}
+        </details>
+      )}
+      <div className="proposal-actions">
+        {value.status === "pending" && <>
+          <button onClick={() => onAction(value, "reject")}>Reject</button>
+          <button className="primary" onClick={() => onAction(value, "accept")}>Accept all</button>
+        </>}
+        {value.status === "accepted" && !value.undone && <button onClick={() => onAction(value, "undo")}>Roll back all</button>}
+        {value.status === "accepted" && value.undone && <button onClick={() => onAction(value, "redo")}>Reapply all</button>}
+      </div>
+    </div>
   );
 }
 
@@ -1689,6 +1744,16 @@ function App() {
         setNotice(`提案 #${event.proposal.id} 待审批：${event.proposal.path}`);
       }
     }
+    if (event.type === "change_set" && event.changeSet) {
+      setState((prev) => {
+        if (!prev) return prev;
+        const rest = prev.changeSets.filter((item) => item.id !== event.changeSet!.id);
+        return { ...prev, changeSets: [event.changeSet!, ...rest] };
+      });
+      setNotice(event.changeSet.status === "accepted"
+        ? `Auto: change set #${event.changeSet.id} applied`
+        : `Change set #${event.changeSet.id} awaiting approval`);
+    }
     if (event.type === "todos" && event.todos) {
       setState((prev) => (prev ? { ...prev, todos: event.todos } : prev));
     }
@@ -2358,6 +2423,15 @@ function App() {
     }
   }
 
+  async function decideChangeSet(changeSet: ChangeSet, action: "accept" | "reject" | "undo" | "redo") {
+    try {
+      await api(`/api/change-sets/${changeSet.id}/${action}`, { method: "POST" });
+      await refresh(state?.sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function saveRoleplayScene() {
     if (!roleplaySceneDraft?.name.trim()) return;
     try {
@@ -2531,6 +2605,8 @@ function App() {
   }
 
   const pendingProposals = state.proposals.filter((p) => p.status === "pending");
+  const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
+  const visibleChangeSets = state.changeSets.filter((item) => item.status !== "rejected").slice(0, 10);
   const visibleMessages = state.messages.filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.content.trim());
   const usagePct = state.provider.pricing.contextWindow
     ? Math.round((state.usage.lastPromptTokens / state.provider.pricing.contextWindow) * 100)
@@ -3321,6 +3397,14 @@ function App() {
             </div>
           </div>
         </div>
+        {pendingChangeSets.length > 0 && (
+          <div className="mobile-proposals">
+            <h2>Change sets <span style={{ fontWeight: 400, marginLeft: 8 }}>({pendingChangeSets.length})</span></h2>
+            {pendingChangeSets.map((changeSet) => (
+              <ChangeSetCard key={changeSet.id} value={changeSet} onAction={(value, action) => void decideChangeSet(value, action)} />
+            ))}
+          </div>
+        )}
         {pendingProposals.length > 0 && (
           <div className="mobile-proposals">
             <h2>
@@ -3341,6 +3425,15 @@ function App() {
             ))}
           </div>
         )}
+      </section>
+
+      <section className="proposals">
+        <h2>Change sets {pendingChangeSets.length > 0 && <span className="proposal-count">{pendingChangeSets.length}</span>}</h2>
+        {visibleChangeSets.length === 0 ? (
+          <div className="block-empty">No change sets</div>
+        ) : visibleChangeSets.map((changeSet) => (
+          <ChangeSetCard key={changeSet.id} value={changeSet} onAction={(value, action) => void decideChangeSet(value, action)} />
+        ))}
       </section>
 
       <section className="proposals">

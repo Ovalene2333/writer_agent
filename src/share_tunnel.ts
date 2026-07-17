@@ -133,8 +133,8 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
       printed = true;
       if (readinessTimer) clearTimeout(readinessTimer);
       // 二维码走局域网入口：页在 HTTP 上，才能在局域网/Cloudflare 间自动切 API（HTTPS 页无法探测 HTTP 局域网）。
-      const dualEntry = `${lanOrigin}/#token=${encodeURIComponent(token)}&public=${encodeURIComponent(publicOrigin)}`;
-      const publicOnly = `${publicOrigin}/#token=${encodeURIComponent(token)}&lan=${encodeURIComponent(lanOrigin)}`;
+      const dualEntry = buildShareEntryUrl(lanOrigin, token, "public", publicOrigin);
+      const publicOnly = buildShareEntryUrl(publicOrigin, token, "lan", lanOrigin);
       process.stdout.write("\n手机扫码（推荐，一次即可；在家走局域网，出门自动切 Cloudflare）：\n");
       process.stdout.write(`${dualEntry}\n`);
       void QRCode.toString(dualEntry, { type: "terminal", small: true })
@@ -219,4 +219,12 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
       active?.kill();
     },
   };
+}
+
+export function buildShareEntryUrl(origin: string, token: string, alternate: "lan" | "public", alternateOrigin: string): string {
+  const params = new URLSearchParams();
+  if (token) params.set("token", token);
+  else params.set("auth", "none");
+  params.set(alternate, alternateOrigin);
+  return `${origin}/#${params.toString()}`;
 }

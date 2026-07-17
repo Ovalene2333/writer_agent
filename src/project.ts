@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -10,7 +11,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import YAML from "yaml";
 import type { StyleTemplate, WriterConfig } from "./types.js";
 import { getStyleTemplate, listStyleTemplates, normalizeStyleTemplate } from "./templates.js";
@@ -25,6 +26,11 @@ const DEFAULT_CONFIG: WriterConfig = {
 /** Document role inferred from path conventions under resource/. */
 export type DocumentKind = "lore" | "outline" | "chapter" | "archive" | "side" | "other";
 
+export function isSupportedTextFilePath(path: string): boolean {
+  const name = basename(path.trim());
+  return Boolean(name && name !== "." && name !== ".." && !name.includes("\0"));
+}
+
 export function documentKind(path: string): DocumentKind {
   const normalized = normalizeDocumentPath(path);
   if (normalized.startsWith("lore/") || normalized.startsWith("story/")) {
@@ -35,6 +41,25 @@ export function documentKind(path: string): DocumentKind {
   if (normalized.startsWith("archive/") || normalized.startsWith("屏蔽/")) return "archive";
   if (normalized.startsWith("side/") || normalized.startsWith("涩涩/")) return "side";
   return "other";
+}
+
+/**
+ * Chapter documents in NARRATIVE order: writer.yaml's `chapters` list first
+ * (it is appended to on every chapters/ write, so its order is authoring order),
+ * then any unregistered chapter docs. Path sorting alone misorders hanzi-numbered
+ * chapters（第一章/第二章/第十章）, so callers that need "the latest / previous
+ * chapter" must use this instead of localeCompare.
+ */
+export function orderedChapterPaths(project: WriterProject): string[] {
+  const visible = new Set(
+    project.listDocuments().filter(path => !project.isDocumentHidden(path)),
+  );
+  const registered = project.config().chapters.filter(path => visible.has(path));
+  const registeredSet = new Set(registered);
+  const rest = [...visible]
+    .filter(path => documentKind(path) === "chapter" && !registeredSet.has(path))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  return [...registered, ...rest];
 }
 
 /** Resolve the primary outline markdown path for structured outline tools. */
@@ -210,6 +235,83 @@ export class WriterProject {
       throw new Error("禁止访问项目范围外或内部数据库中的文件夹");
     }
     return absolute;
+  }
+
+  resolveTextFileSafe(path: string): string {
+    if (!path || isAbsolute(path)) throw new Error("文本文件路径必须是 resource/ 内的相对路径");
+    const normalized = normalizeFolderPath(path).replace(/^resource(?:\/|$)/, "");
+    if (!normalized || !isSupportedTextFilePath(normalized)) {
+      throw new Error("只允许访问 resource/ 内的 UTF-8 纯文本文件");
+    }
+    const absolute = resolve(this.resourceDir, normalized);
+    const rel = relative(this.resourceDir, absolute);
+    if (rel.startsWith(`..${sep}`) || rel === ".." || rel.startsWith(".writer")) {
+      throw new Error("禁止访问 resource/ 范围外或内部数据库中的文件");
+    }
+    let cursor = this.resourceDir;
+    for (const part of rel.split(sep).filter(Boolean)) {
+      cursor = resolve(cursor, part);
+      if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+        throw new Error("禁止通过符号链接访问文本文件");
+      }
+    }
+    return absolute;
+  }
+
+  textFileExists(path: string): boolean {
+    try { return lstatSync(this.resolveTextFileSafe(path)).isFile(); }
+    catch { return false; }
+  }
+
+  listTextFiles(): string[] {
+    const results: string[] = [];
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.name === ".writer" || entry.isSymbolicLink()) continue;
+        const absolute = resolve(directory, entry.name);
+        if (entry.isDirectory()) visit(absolute);
+        else if (entry.isFile()) {
+          const path = relative(this.resourceDir, absolute).split(sep).join("/");
+          if (isSupportedTextFilePath(path) && isUtf8TextBuffer(readFileSync(absolute))) results.push(path);
+        }
+      }
+    };
+    if (existsSync(this.resourceDir)) visit(this.resourceDir);
+    return results.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }
+
+  readTextFile(path: string): string {
+    const buffer = readFileSync(this.resolveTextFileSafe(path));
+    if (!isUtf8TextBuffer(buffer)) throw new Error("文件不是有效的 UTF-8 纯文本");
+    const content = buffer.toString("utf8");
+    return content;
+  }
+
+  writeTextFile(path: string, content: string): void {
+    if (content.includes("\0")) throw new Error("纯文本内容不能包含 NUL 字节");
+    const target = this.resolveTextFileSafe(path);
+    mkdirSync(dirname(target), { recursive: true });
+    const temp = `${target}.writer-tmp-${process.pid}`;
+    writeFileSync(temp, content, "utf8");
+    try { renameSync(temp, target); }
+    catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM") throw error;
+      writeFileSync(target, content, "utf8");
+      try { unlinkSync(temp); } catch { /* best-effort temporary cleanup */ }
+    }
+  }
+
+  removeTextFile(path: string): void {
+    unlinkSync(this.resolveTextFileSafe(path));
+  }
+
+  renameTextFile(fromPath: string, toPath: string): void {
+    const from = this.resolveTextFileSafe(fromPath);
+    const to = this.resolveTextFileSafe(toPath);
+    if (!existsSync(from)) throw new Error("源文本文件不存在");
+    if (existsSync(to)) throw new Error("目标文本文件已存在");
+    mkdirSync(dirname(to), { recursive: true });
+    renameSync(from, to);
   }
 
   readRaw(path: string): string {
@@ -533,6 +635,11 @@ export class WriterProject {
     this.writeRaw("writer.yaml", YAML.stringify(config));
     return config.style;
   }
+}
+
+function isUtf8TextBuffer(buffer: Buffer): boolean {
+  if (buffer.includes(0)) return false;
+  return Buffer.from(buffer.toString("utf8"), "utf8").equals(buffer);
 }
 
 function normalizeFolderPath(path: string): string {

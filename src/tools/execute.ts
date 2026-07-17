@@ -31,6 +31,13 @@ import {
   handleProposeDocument,
   handleProposeDocumentPatch,
 } from "./proposals.js";
+import {
+  handleInspectFile,
+  handleListFiles,
+  handleProposeChangeSet,
+  handleReadFile,
+  handleSearchFiles,
+} from "./files.js";
 import { handleCompileWritePack } from "./write_pack.js";
 import {
   handleBeginChapterDraft,
@@ -53,6 +60,10 @@ const HANDLERS: Record<string, Handler> = {
   inspect_document: handleInspectDocument,
   read_document: handleReadDocument,
   search_project: handleSearchProject,
+  list_files: handleListFiles,
+  inspect_file: handleInspectFile,
+  read_file: handleReadFile,
+  search_files: handleSearchFiles,
   list_outline_nodes: handleListOutlineNodes,
   get_outline_node: handleGetOutlineNode,
   design_creative_outline: handleDesignCreativeOutline,
@@ -67,6 +78,7 @@ const HANDLERS: Record<string, Handler> = {
   propose_chapter_draft: handleProposeChapterDraft,
   propose_document: handleProposeDocument,
   propose_document_patch: handleProposeDocumentPatch,
+  propose_change_set: handleProposeChangeSet,
   list_characters: handleListCharacters,
   get_character: handleGetCharacter,
   list_simple_characters: handleListSimpleCharacters,

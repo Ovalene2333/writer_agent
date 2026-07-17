@@ -228,6 +228,30 @@ export interface ProposalCharacterChange {
   changes: Array<{ op: string; [key: string]: unknown }>;
 }
 
+export type ChangeSetFileOperation = "write" | "patch" | "move" | "delete";
+
+export interface ChangeSetFileChange {
+  id: number;
+  operation: ChangeSetFileOperation;
+  path: string;
+  targetPath?: string;
+  beforeContent: string;
+  afterContent: string;
+  baseHash: string;
+  targetBaseHash?: string;
+}
+
+export interface ChangeSet {
+  id: number;
+  sessionId: string;
+  summary: string;
+  status: "pending" | "accepted" | "rejected" | "stale";
+  undone: boolean;
+  createdAt: string;
+  files: ChangeSetFileChange[];
+  characterChanges: ProposalCharacterChange[];
+}
+
 /** Metadata for a document snapshot in browse-only version history. */
 export interface DocumentVersionMeta {
   id: number;
@@ -394,6 +418,7 @@ export type AgentEvent =
   | { type: "tool"; name: string }
   | { type: "step_done"; step: number }
   | { type: "proposal"; proposal: Proposal }
+  | { type: "change_set"; changeSet: ChangeSet }
   | { type: "todos"; todos: AgentTodoItem[] }
   | { type: "mode"; mode: PermissionMode }
   | { type: "character"; character: Character }

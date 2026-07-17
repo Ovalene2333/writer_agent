@@ -1,10 +1,11 @@
 import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, StepUsage, UsageSummary } from "./types.js";
+import type { ChapterSceneDraft } from "./scene_pipeline.js";
 import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { proseMannerismPreflightLine } from "./prose_quality.js";
-import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt, styleFingerprint } from "./style_grounding.js";
+import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 import { modelFetch } from "./model_fetch.js";
 import {
@@ -82,11 +83,24 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *    After the first streamCompletion, do not mutate earlier messages (no mid-job
  *    compactRuntimeMessages / rehydrate / stripStaleReasoning / compactCompletedToolCalls).
  *    Compactors are only for rebuilding a transcript outside an active job.
- *    Sole exception — multi-chapter boundary: after a successful proposal with
- *    further writing steps, the loop TRUNCATES back to the initial stable+dynamic
- *    prefix and appends one compact handoff (chapterContinuationPrompt). Truncation
- *    never rewrites earlier bytes, so the initial prefix still cache-hits, while the
- *    next chapter stops paying the previous chapter's scene transcript every step.
+ *    Sole exceptions — boundary truncations (never rewrites, so the surviving
+ *    prefix still cache-hits):
+ *    a) Chapter boundary: after a successful proposal with further writing steps,
+ *       truncate back to the initial stable+dynamic prefix and append one compact
+ *       handoff (chapterContinuationPrompt), so the next chapter stops paying the
+ *       previous chapter's scene transcript every step.
+ *    b) Scene boundary: after each successful write_chapter_scene, truncate back
+ *       to the post-begin context base (prep reads + scene chain lock survive) and
+ *       append one compact handoff (sceneContinuationPrompt), so later scenes stop
+ *       paying earlier scenes' full prose; inspect_chapter_draft returns the
+ *       assembled chapter once for final review instead.
+ *    Mid-job injections (both handoffs and the no-tool retry) MUST use role
+ *    "user", never "system": DeepSeek re-renders any request whose history has
+ *    a system message after assistant/tool turns under a different template —
+ *    measured 2026-07-17 (v4-pro): trailing-system request hit 0 cached tokens
+ *    against an identical warmed prefix; the same bytes as trailing-user hit
+ *    the full prefix. A system handoff therefore pays a full-context cache
+ *    miss at every scene boundary.
  *
  * 5) TOOLS SCHEMA
  *    src/tools/schema.ts TOOLS must stay order-stable and free of project-specific
@@ -272,7 +286,7 @@ function writingSystemPrompt(project: WriterProject): string {
  */
 function executionRulesPrompt(mode: PermissionMode): string {
   const modeRule = mode === "plan"
-    ? "3. plan：只检索/构思/塑形；禁止 propose_* / save_character / apply_character_changes / save_simple_character。默认短而开放，勿自动扩成完整交付。"
+    ? "3. plan：只检索/构思/塑形；禁止 propose_*（含 propose_change_set）/ save_character / apply_character_changes / save_simple_character。默认短而开放，勿自动扩成完整交付。"
     : mode === "auto"
       ? "3. auto：正文/续写/改写必须提案（自动落盘），禁止用最终回复代替正文。清单若仍有未完成的章节/正文步骤则继续写并再次提案；仅当清单无后续写作项时停止。"
       : "3. 正文/续写/改写必须提案，禁止用最终回复代替。清单若仍有未完成的章节/正文步骤则继续写并再次提案；仅当清单无后续写作项时停止等待审批。";
@@ -286,7 +300,8 @@ ${modeRule}
 7. 只复用本轮工作记忆、本轮工具结果与 reused 标记；禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
 8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
 9. 技能目录有匹配且必要时先 load_skill；勿编造技能。
-10. 不泄露内部参数；对话简洁；文档适量 Markdown。
+10. resource/ 内纯文本工作区：Markdown 继续用 document 工具；其他 UTF-8 文本用 list/inspect/read/search_files。创建、修改、移动、删除多个文件及其角色演进统一用 propose_change_set，禁止绕过审批直接改文件；路径只能在 resource/ 内。
+11. 不泄露内部参数；对话简洁；文档适量 Markdown。
 模式：${permissionModeLabel(mode)}`;
 }
 
@@ -316,8 +331,8 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   const documentInstruction = task.documentProposalRequired
     ? chapterSceneDelivery
       ? `必须用逐场景章节草稿完成并 propose_chapter_draft；禁止直接 propose_document/patch 或用最终回复代替正文。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
-      : `必须提交文档提案后结束；禁止用最终回复代替正文。优先 patch；工作记忆已有目标原文且未变时可直接提案。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
-    : "不强制文档提案，按用户意图执行。";
+      : `必须提交文档提案或 change set 后结束；禁止用最终回复代替文件交付。单文档优先 patch；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接提案。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+    : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
   const contextInstruction: Record<DocumentContextMode, string> = {
     // Soft none: pure craft may skip tools, but never invent lore when the user names project entities.
     none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，必须 search_project 一次（优先 scope=lore），不足再 inspect/read 最小片段。禁止通读全库、禁止把推测写成既有设定。",
@@ -362,6 +377,10 @@ export function normalizeCharacterTaskMode(request: string, plannedMode: Writing
   return plannedMode;
 }
 
+export function normalizeDocumentProposalRequired(mode: WritingTaskMode, requested: boolean): boolean {
+  return mode === "character" || mode === "simple_character" ? false : requested;
+}
+
 /**
  * Task planner (separate completion; tools off).
  * CACHE: Keep the system string free of project catalogs and request text so the
@@ -400,8 +419,10 @@ documentContext 判定（关键，勿默认 none）：
 - search：用户讨论、分析、推演项目内设定/组织/实体/专名/关系/军政势力，或答案正确性依赖 lore/outline 中未在对话里写清的事实（即使 mode=brainstorm/general 也要用 search）。searchQuery 填核心专名。
 - target：用户指定或语义可确定单篇文档要读/改。
 - continuation：承接上一轮正文续写。
+纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件或多文件原子变更时，mode=general、documentProposalRequired=true；非 Markdown 文件不必出现在 documents 目录，执行阶段先用 list_files 定位，再用 propose_change_set。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
 正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，documentProposalRequired=true；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
+用户引用具体正文句段并指出问题或要求修改（不合理/OOC/改掉这句/换个说法等）时，一律 mode=rewrite，documentProposalRequired=true，documentContext=target；不得判为 audit（audit 只用于“审阅/检查/评价”而不动笔），也不得因目标是章节而改判 write_scene。
 只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
   }, {
@@ -431,7 +452,9 @@ documentContext 判定（关键，勿默认 none）：
   const validExampleIds = new Set(examples.map(item => item.id));
   const validDocumentPaths = new Set(documents);
   const continuation = parsed.continuation === true;
-  const documentProposalRequired = parsed.documentProposalRequired === true;
+  // Character cards are persisted by save_character/save_simple_character, not document proposals.
+  // Treat contradictory planner JSON as invalid instead of forcing a second, unrelated artifact.
+  const documentProposalRequired = normalizeDocumentProposalRequired(mode, parsed.documentProposalRequired === true);
   const depths: CreativeDepth[] = ["explore", "shape", "deliver"];
   const creativeDepth = depths.includes(parsed.creativeDepth as CreativeDepth)
     ? parsed.creativeDepth as CreativeDepth
@@ -547,6 +570,7 @@ function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolea
   if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
   if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
   if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
+  if (mode === "general" && documentProposalRequired) return ["定位相关纯文本文件", "准备并校验 change set", "提交统一审批"];
   if (mode === "character") return ["核对已有普通角色卡与设定", "更新或保存普通角色卡"];
   if (mode === "simple_character") return ["核对已有角色与设定", "整理并保存简易角色卡"];
   return [];
@@ -633,11 +657,12 @@ export function taskInstructions(
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单章任务只交付用户指定的一章：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节时，先在内部用 1—3 句话确定“本章从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。场景数量遵循动态尾部的当前场景链参数，不为凑数拆场；每场必须有目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 4000 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。若返回 SCENE_STYLE_DENSE 或 SCENE_DUPLICATE_SENTENCE，当场改正文后用同一 sceneId 重提（不计入“另写一场”），勿堆到整章再修。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
+5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 SCENE_STYLE_DENSE，当场改正文后用同一 sceneId 重提一次（不计入“另写一场”）；同场第二次仍超标会带 styleDeferred 直接入稿，命中句留到整章 inspect 后用 revise_chapter_draft_style 一并修，禁止反复重写整场。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后 inspect_chapter_draft 通读整章并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回的 styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
-8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
+7. 全部场景完成后 inspect_chapter_draft 通读整章（其返回的 content 为组装后全文，通读以此为准）并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回的 styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
+8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链（例外：仅修正已有章节的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch，不必走流水线）；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
+- 定位用户引用的原句：read_document 传 path+quote 一步取回行号与上下文；禁止为找一句话通读全章或反复 search_project。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
@@ -645,8 +670,10 @@ export function taskInstructions(
   if (mode === "audit") return `工作流：
 - 先 audit_prose_style；优先 severity=error。
 - 每条问题含严重度、原文证据、违反约束、最小改法；无证据不提。
-- ${documentProposalRequired ? "要求修复：只改有证据处并最小提案。" : "只检查：不提案，只输出审阅结论。"}`;
-  return "先判断构思/规划/写作/改写/审校再执行。改正文须先读原文并提案；待批准变化→characterChanges；已确认→apply_character_changes。";
+- ${documentProposalRequired ? "要求修复：用 read_document 的 quote 参数定位证据句，只改有证据处，用 propose_document_patch 最小提案。" : "只检查：不提案，只输出审阅结论。"}`;
+  return documentProposalRequired
+    ? "文件交付任务：先用 document 或 file 工具读取最小必要原文；多文件、移动、删除或角色联动必须用 propose_change_set 统一提交，禁止直接改盘。"
+    : "先判断构思/规划/写作/改写/审校再执行。改正文须先读原文并提案；待批准变化→characterChanges；已确认→apply_character_changes。";
 }
 
 function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[], simpleCharacterScope?: number[]): string {
@@ -686,7 +713,6 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
       id: item.id,
       title: item.title,
       category: item.category,
-      styleFingerprint: styleFingerprint(item.content, item.notes),
       usage: "imitate_voice_not_plot",
     };
     if (writing) {
@@ -877,6 +903,52 @@ export function chapterContinuationPrompt(parts: {
   return lines.join("\n");
 }
 
+/**
+ * Scene-boundary handoff (contract §4b). After each successful write_chapter_scene
+ * the loop truncates back to the post-begin context base and appends this single
+ * message, so later scenes stop paying earlier scenes' full prose on every step.
+ * It must therefore carry everything the next scene needs: the seam tail, each
+ * scene's actual exit state, the next scene card and the anti-formula feedback.
+ */
+export function sceneContinuationPrompt(
+  draft: ChapterSceneDraft,
+  extras: { styleFeedback?: string[]; stylePriorNotes?: string[] },
+): string {
+  const completedCount = draft.completed.length;
+  const next = draft.scenes[completedCount];
+  const last = draft.completed.at(-1);
+  const tail = last ? last.content.trimEnd().slice(-800).trimStart() : "";
+  const states = draft.completed.map((scene, index) => ({
+    sceneId: scene.sceneId,
+    title: draft.scenes[index]?.title,
+    actualState: scene.actualState,
+  }));
+  const remaining = draft.scenes.slice(completedCount + 1)
+    .map(scene => ({ id: scene.id, title: scene.title, goal: scene.goal }));
+  const lines: string[] = [
+    `章节场景写作进行中（已完成 ${completedCount}/${draft.scenes.length} 场）。为控制上下文，此前各场完整正文已从本轮对话移除，只保存在内存草稿中；整章 inspect_chapter_draft 会返回组装后的全文，勿因此重写已完成场景。`,
+    `章节：${draft.path}（${draft.mode}）· 章节目标：${draft.chapterGoal}`,
+  ];
+  if (tail) lines.push(`上一场结尾（仅供衔接语气与局面，禁止重复叙述）：\n…${tail}`);
+  if (states.length) lines.push(`各场实际离场状态（事实与衔接以此为准）：${JSON.stringify(states)}`);
+  if (extras.stylePriorNotes?.length) {
+    lines.push(`stylePriorNotes（既有正文高频表达负面清单，每场都要遵守）：${extras.stylePriorNotes.join("；")}`);
+  }
+  if (extras.styleFeedback?.length) {
+    lines.push(`styleFeedback（对已写正文的机器统计，写下一场必须遵守）：${extras.styleFeedback.join("；")}`);
+  }
+  if (next) {
+    lines.push(
+      `下一场场景卡：${JSON.stringify(next)}`,
+      ...(remaining.length ? [`其后场景（暂不展开）：${JSON.stringify(remaining)}`] : []),
+      `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），在同一调用中提交要点式 notes、正文与 actualState；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
+    );
+  } else {
+    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft 做整章审阅（其返回的 content 为组装后全文），不要先输出总结或更新任务清单。");
+  }
+  return lines.join("\n");
+}
+
 export async function runAgent(options: {
   project: WriterProject;
   store: WriterStore;
@@ -993,6 +1065,11 @@ export async function runAgent(options: {
       model: adjudicatorModel,
       signal,
     },
+    // Best-of-N scene sampling (experimental, off by default): rewrites use the
+    // main writing model in a dedicated plain-text call, not the cheap adjudicator.
+    ...(scenePipelineSettings && scenePipelineSettings.candidateCount > 1
+      ? { sceneCandidates: { model, signal } }
+      : {}),
   };
   // Assemble per PROMPT / PREFIX-CACHE CONTRACT (top of this file):
   // stable 6 + dynamic 9, then append-only tool loop. See buildStableSystemPrefix /
@@ -1013,6 +1090,9 @@ export async function runAgent(options: {
   ];
   // Multi-chapter boundary resets truncate back to exactly this prefix (see contract §4).
   const initialMessageCount = messages.length;
+  // Scene-boundary resets truncate back here (§4b): advanced past prep reads when
+  // begin_chapter_draft succeeds, so chapter facts survive while scene prose does not.
+  let contextBase = initialMessageCount;
   let transcript = "";
   let documentProposalSubmitted = false;
   let waitingForUser = false;
@@ -1050,7 +1130,9 @@ export async function runAgent(options: {
           });
           if (missingProposalToolRetries <= 2) {
             messages.push({
-              role: "system",
+              // CACHE: user role — a mid-job system message flips DeepSeek's
+              // whole-request rendering and forfeits the cached prefix (§4).
+              role: "user",
               content: "当前任务要求实际提交文档提案，但尚未成功调用 propose_*。不要结束：若场景链已建立，立即按下一场 sceneId 调用 write_chapter_scene，并在同一调用中提供故事内 notes、正文和 actualState；全部场景完成后 inspect_chapter_draft 并 propose_chapter_draft。",
             });
             continue;
@@ -1079,6 +1161,9 @@ export async function runAgent(options: {
 
       waitingForUser = false;
       documentProposalSubmitted = false;
+      let beginChapterSucceeded = false;
+      let sceneWrittenFeedback: string[] | undefined;
+      let chapterReviewInStep = false;
       for (const call of result.toolCalls) {
         emit({ type: "tool", name: call.name });
         let toolResult: string;
@@ -1099,12 +1184,24 @@ export async function runAgent(options: {
           }
           if (!("error" in parsed) && call.name === "begin_chapter_draft" && parsed.status === "started") {
             persistScenePipelineTodos(store, sessionId, "draft_started", emit);
+            beginChapterSucceeded = true;
           }
           if (!("error" in parsed) && call.name === "write_chapter_scene" && parsed.complete === true) {
             persistScenePipelineTodos(store, sessionId, "draft_complete", emit);
           }
+          if (!("error" in parsed) && call.name === "write_chapter_scene"
+            && (parsed.status === "written" || parsed.status === "revised")) {
+            sceneWrittenFeedback = Array.isArray(parsed.styleFeedback)
+              ? (parsed.styleFeedback as unknown[]).filter((item): item is string => typeof item === "string")
+              : [];
+          }
         } catch { /* 非 JSON 工具结果不参与结构化里程碑推进。 */ }
-        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch") {
+        if (call.name === "inspect_chapter_draft" || call.name === "revise_chapter_draft_style" || call.name === "propose_chapter_draft") {
+          // Same-step write→inspect/revise/propose: the review payload must survive,
+          // so the scene-boundary reset below is skipped for this step.
+          chapterReviewInStep = true;
+        }
+        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch" || call.name === "propose_change_set") {
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (!("error" in parsed)) documentProposalSubmitted = true;
@@ -1119,6 +1216,30 @@ export async function runAgent(options: {
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
+      // §4b anchor: keep prep reads + the scene chain lock inside the cached base.
+      if (beginChapterSucceeded) contextBase = messages.length;
+      if (sceneWrittenFeedback && toolContext.chapterSceneDraft && !chapterReviewInStep
+        && !documentProposalSubmitted && !waitingForUser) {
+        // Scene-boundary context reset: drop the finished scene's full prose (the
+        // model's own tool arguments) from the request. The compact handoff below
+        // carries seam tail + exit states; the prefix up to contextBase still
+        // cache-hits. Skipped when begin+write landed in one step (contextBase
+        // then already contains this scene — nothing older to drop).
+        if (!beginChapterSucceeded) {
+          messages.length = contextBase;
+          messages.push({
+            // CACHE: user role — a mid-job system message flips DeepSeek's
+            // whole-request rendering and forfeits the cached prefix (§4).
+            role: "user",
+            content: sceneContinuationPrompt(toolContext.chapterSceneDraft, {
+              styleFeedback: sceneWrittenFeedback,
+              stylePriorNotes: toolContext.chapterStylePriorNotes,
+            }),
+          });
+          turnStart = messages.length;
+        }
+        continue;
+      }
       if (documentProposalSubmitted) {
         // Advance checklist: keep multi-chapter pending items open and continue the job.
         const advanced = persistAdvancedTodosAfterProposal(store, sessionId, emit);
@@ -1131,7 +1252,9 @@ export async function runAgent(options: {
           toolContext.completedChapterHandoff = undefined;
           messages.length = initialMessageCount;
           messages.push({
-            role: "system",
+            // CACHE: user role — a mid-job system message flips DeepSeek's
+            // whole-request rendering and forfeits the cached prefix (§4).
+            role: "user",
             content: chapterContinuationPrompt({
               todosText: formatTodosForPrompt(advanced.todos),
               ...(latestProposal
@@ -1141,6 +1264,8 @@ export async function runAgent(options: {
             }),
           });
           turnStart = messages.length;
+          // Next chapter's scene resets truncate to here until its begin succeeds.
+          contextBase = messages.length;
           // Allow fresh reads/searches for the next chapter within the same job;
           // store-cached artifacts still short-circuit identical repeat reads.
           documentReadCalls = 0;
@@ -1152,6 +1277,10 @@ export async function runAgent(options: {
           toolContext.lastWritePack = undefined;
           toolContext.writePackSceneId = undefined;
           toolContext.chapterSceneDraft = undefined;
+          // Per-chapter scene-gate state: bounce counts, voice evidence, prior notes.
+          toolContext.sceneStyleBounces = undefined;
+          toolContext.sceneStyleEvidence = undefined;
+          toolContext.chapterStylePriorNotes = undefined;
           // Style verdicts are per-chapter sentences; stale entries only waste lookups.
           toolContext.proseVerdictCache = undefined;
           continue;
@@ -1296,15 +1425,16 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
   }
   if (!artifacts.length && !state.activeDocument && !state.currentIntent) return "";
   const activePath = task.continuation ? state.activeDocument : (task.targetPath ?? state.activeDocument);
-  const activeHash = activePath && project.documentExists(activePath)
-    ? project.hash(project.read(activePath))
+  const activeHash = activePath && project.textFileExists(activePath)
+    ? project.hash(project.readTextFile(activePath))
     : undefined;
   // Prefer catalog + digests in the miss-priced dynamic tail. Only restore one body on
   // continuation (tail of the active doc) so the model can keep writing without a re-read.
   const restored: Array<Record<string, unknown>> = [];
   if (task.continuation) {
     for (const artifact of artifacts) {
-      if (artifact.kind !== "read_document" && artifact.kind !== "inspect_document") continue;
+      if (artifact.kind !== "read_document" && artifact.kind !== "inspect_document"
+        && artifact.kind !== "read_file" && artifact.kind !== "inspect_file") continue;
       if (artifact.path && activePath && artifact.path !== activePath) continue;
       if (activeHash && artifact.sourceHash !== activeHash) continue;
       const full = store.contextArtifactById(sessionId, artifact.id);
@@ -1341,6 +1471,7 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
   }
   const catalog = artifacts
     .filter(item => item.kind === "read_document" || item.kind === "inspect_document"
+      || item.kind === "read_file" || item.kind === "inspect_file"
       || item.kind === "get_outline_node" || item.kind === "list_outline_nodes")
     .map(({ id, kind, path, sourceHash, digest }) => ({
       id, kind, path, sourceHash,
@@ -1445,8 +1576,8 @@ ${JSON.stringify({
   })}`;
 }
 
-const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
-const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "read_document"]);
+const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
+const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "read_document", "inspect_file", "read_file"]);
 const MAX_READS_PER_PATH_PER_RUN = 3;
 const MAX_DOCUMENT_READS_PER_RUN = 5;
 /** Structural / catalog tools must stay intact so the model does not re-list after compaction. */
@@ -1494,9 +1625,11 @@ async function executeToolCached(
   const path = typeof normalized.path === "string" ? normalized.path : undefined;
   const outlinePath = call.name.includes("outline") ? resolveOutlineSourcePath(project) : undefined;
   const sourcePath = path ?? (outlinePath && project.documentExists(outlinePath) ? outlinePath : undefined);
-  const sourceHash = sourcePath && project.documentExists(sourcePath)
-    ? project.hash(project.read(sourcePath))
-    : project.hash(JSON.stringify(project.listDocuments()));
+  const sourceHash = sourcePath && project.textFileExists(sourcePath)
+    ? project.hash(project.readTextFile(sourcePath))
+    : call.name.endsWith("_files")
+      ? project.hash(JSON.stringify(project.listTextFiles().map(file => [file, project.hash(project.readTextFile(file))])))
+      : project.hash(JSON.stringify(project.listDocuments()));
 
   // Throttle thrashing the same document with slightly different ranges.
   if (DOCUMENT_READ_TOOLS.has(call.name) && sourcePath) {
@@ -1517,7 +1650,7 @@ async function executeToolCached(
   }
 
   // list_outline_nodes / list_documents: hard-stop after first success this run
-  if (call.name === "list_outline_nodes" || call.name === "list_documents") {
+  if (call.name === "list_outline_nodes" || call.name === "list_documents" || call.name === "list_files") {
     const listKey = `list-once:${call.name}:${sourceHash}`;
     const listCount = (counts.get(listKey) ?? 0) + 1;
     counts.set(listKey, listCount);
