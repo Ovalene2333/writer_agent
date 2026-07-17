@@ -2707,8 +2707,9 @@ function App() {
             ◐
           </button>
           <button
-            className="ghost"
+            className="icon header-command"
             title="New session"
+            aria-label="New session"
             onClick={async () => {
               // New session: stop rendering previous trail (storage for old session kept for later switch-back).
               clearAgentStream({ abort: true });
@@ -2716,10 +2717,15 @@ function App() {
               await refresh(r.sessionId);
             }}
           >
-            + New
+            <span aria-hidden="true">＋</span>
           </button>
-          <button className="ghost" onClick={() => void refresh(state.sessionId)} title="Refresh">
-            Refresh
+          <button
+            className="icon header-command"
+            onClick={() => void refresh(state.sessionId)}
+            title="Refresh"
+            aria-label="Refresh"
+          >
+            <span aria-hidden="true">↻</span>
           </button>
         </div>
       </header>
@@ -3428,37 +3434,41 @@ function App() {
       </section>
 
       <section className="proposals">
-        <h2>Change sets {pendingChangeSets.length > 0 && <span className="proposal-count">{pendingChangeSets.length}</span>}</h2>
-        {visibleChangeSets.length === 0 ? (
-          <div className="block-empty">No change sets</div>
-        ) : visibleChangeSets.map((changeSet) => (
-          <ChangeSetCard key={changeSet.id} value={changeSet} onAction={(value, action) => void decideChangeSet(value, action)} />
-        ))}
-      </section>
-
-      <section className="proposals">
-        <h2>
-          Proposals
-          {pendingProposals.length > 0 && (
-            <span className="proposal-count">{pendingProposals.length}</span>
-          )}
-        </h2>
-        {pendingProposals.length === 0 ? (
-          <div className="block-empty">No pending proposals</div>
-        ) : (
-          pendingProposals.map((p) => (
-            <div className="proposal-card" key={p.id}>
-              <h3>{p.path}</h3>
-              <p>{p.summary}</p>
-              <div className="proposal-actions">
-                <button onClick={() => void decide(p, "reject")}>Reject</button>
-                <button className="primary" onClick={() => void decide(p, "accept")}>
-                  Accept
-                </button>
-              </div>
-            </div>
-          ))
+        {visibleChangeSets.length > 0 && (
+          <div className="approval-group">
+            <h2>
+              Change sets
+              {pendingChangeSets.length > 0 && <span className="proposal-count">{pendingChangeSets.length}</span>}
+            </h2>
+            {visibleChangeSets.map((changeSet) => (
+              <ChangeSetCard key={changeSet.id} value={changeSet} onAction={(value, action) => void decideChangeSet(value, action)} />
+            ))}
+          </div>
         )}
+        <div className="approval-group">
+          <h2>
+            Proposals
+            {pendingProposals.length > 0 && (
+              <span className="proposal-count">{pendingProposals.length}</span>
+            )}
+          </h2>
+          {pendingProposals.length === 0 ? (
+            <div className="block-empty">No pending proposals</div>
+          ) : (
+            pendingProposals.map((p) => (
+              <div className="proposal-card" key={p.id}>
+                <h3>{p.path}</h3>
+                <p>{p.summary}</p>
+                <div className="proposal-actions">
+                  <button onClick={() => void decide(p, "reject")}>Reject</button>
+                  <button className="primary" onClick={() => void decide(p, "accept")}>
+                    Accept
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
       </section>
 
       {branchConfirm && (
