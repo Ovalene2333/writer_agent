@@ -1025,6 +1025,7 @@ header {
   align-items: start; gap: clamp(16px, 3vw, 36px);
 }
 .document-reader-layout.outline-collapsed { grid-template-columns: 38px minmax(0, 1fr); gap: 10px; }
+.document-reader-layout.without-outline { grid-template-columns: minmax(0, 1fr); gap: 0; }
 .document-outline {
   position: sticky; top: 0; display: flex; flex-direction: column; gap: 2px;
   max-height: calc(100vh - 120px); overflow-y: auto; padding: 12px 0;

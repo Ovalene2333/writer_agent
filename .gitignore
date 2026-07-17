@@ -38,3 +38,8 @@ writer-agent-data/
 .cache/
 tmp/
 temp/
+
+# Agents
+.claude
+.codex
+.opencode

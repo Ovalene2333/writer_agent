@@ -2995,7 +2995,7 @@ function App() {
                   />
                 </div>
               ) : document.content ? (
-                <div className={`document-reader-layout ${outlineCollapsed ? "outline-collapsed" : ""}`}>
+                <div className={`document-reader-layout${headings.length === 0 ? " without-outline" : ""}${outlineCollapsed ? " outline-collapsed" : ""}`}>
                   {headings.length > 0 && (
                     <nav className={`document-outline ${outlineCollapsed ? "collapsed" : ""}`} aria-label="Document sections">
                       <div className="document-outline-head">
