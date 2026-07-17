@@ -132,16 +132,14 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
       if (printed || !publicOrigin) return;
       printed = true;
       if (readinessTimer) clearTimeout(readinessTimer);
-      // 二维码走局域网入口：页在 HTTP 上，才能在局域网/Cloudflare 间自动切 API（HTTPS 页无法探测 HTTP 局域网）。
-      const dualEntry = buildShareEntryUrl(lanOrigin, token, "public", publicOrigin);
-      const publicOnly = buildShareEntryUrl(publicOrigin, token, "lan", lanOrigin);
-      process.stdout.write("\n手机扫码（推荐，一次即可；在家走局域网，出门自动切 Cloudflare）：\n");
-      process.stdout.write(`${dualEntry}\n`);
-      void QRCode.toString(dualEntry, { type: "terminal", small: true })
+      const entries = buildShareAccessUrls(publicOrigin, lanOrigin, token);
+      process.stdout.write("\n手机扫码（公网入口，可在任意网络访问）：\n");
+      process.stdout.write(`${entries.qr}\n`);
+      void QRCode.toString(entries.qr, { type: "terminal", small: true })
         .then(qr => {
           if (stopped || !valid) return;
           process.stdout.write(qr);
-          process.stdout.write(`仅公网备用（不在家 Wi‑Fi 时打开）：\n${publicOnly}\n`);
+          process.stdout.write(`局域网备用（同一 Wi-Fi 下可直接打开）：\n${entries.lan}\n`);
           process.stdout.write("注意：公网地址会暴露写作工作台。只给可信设备；结束进程后隧道关闭。隧道重连后请使用最新地址。\n");
         })
         .catch(() => {
@@ -227,4 +225,14 @@ export function buildShareEntryUrl(origin: string, token: string, alternate: "la
   else params.set("auth", "none");
   params.set(alternate, alternateOrigin);
   return `${origin}/#${params.toString()}`;
+}
+
+export function buildShareAccessUrls(publicOrigin: string, lanOrigin: string, token: string): {
+  qr: string;
+  public: string;
+  lan: string;
+} {
+  const publicEntry = buildShareEntryUrl(publicOrigin, token, "lan", lanOrigin);
+  const lanEntry = buildShareEntryUrl(lanOrigin, token, "public", publicOrigin);
+  return { qr: publicEntry, public: publicEntry, lan: lanEntry };
 }
