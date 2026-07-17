@@ -817,6 +817,66 @@ function ChangeSetCard({ value, onAction }: {
   );
 }
 
+/** Collapsible review dock (pending change-sets + proposals) docked in the agent panel. */
+function ReviewDock({
+  changeSets,
+  proposals,
+  pendingCount,
+  open,
+  onToggle,
+  onChangeSetAction,
+  onProposalDecide,
+}: {
+  changeSets: ChangeSet[];
+  proposals: Proposal[];
+  pendingCount: number;
+  open: boolean;
+  onToggle: () => void;
+  onChangeSetAction: (changeSet: ChangeSet, action: "accept" | "reject" | "undo" | "redo") => void;
+  onProposalDecide: (proposal: Proposal, action: "accept" | "reject") => void;
+}) {
+  const total = changeSets.length + proposals.length;
+  return (
+    <section className={`review-drawer${open ? " open" : ""}`} aria-label="待审阅的改动">
+      <button type="button" className="review-drawer-toggle" onClick={onToggle} aria-expanded={open}>
+        <span className="review-drawer-chevron" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="11" height="11"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"/></svg>
+        </span>
+        <span className="review-drawer-title">审阅</span>
+        {pendingCount > 0 && <span className="proposal-count">{pendingCount}</span>}
+        <span className="review-drawer-hint">{open ? "收起" : `${total} 项`}</span>
+      </button>
+      {open && (
+        <div className="review-drawer-body">
+          {changeSets.length > 0 && (
+            <div className="review-group">
+              <h4 className="review-group-head">Change sets</h4>
+              {changeSets.map((changeSet) => (
+                <ChangeSetCard key={changeSet.id} value={changeSet} onAction={onChangeSetAction} />
+              ))}
+            </div>
+          )}
+          {proposals.length > 0 && (
+            <div className="review-group">
+              <h4 className="review-group-head">Proposals</h4>
+              {proposals.map((p) => (
+                <div className="proposal-card" key={p.id}>
+                  <h3>{p.path}</h3>
+                  <p>{p.summary}</p>
+                  <div className="proposal-actions">
+                    <button onClick={() => onProposalDecide(p, "reject")}>Reject</button>
+                    <button className="primary" onClick={() => onProposalDecide(p, "accept")}>Accept</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function formatVersionTime(iso: string): string {
   try {
     const date = new Date(iso);
@@ -1173,6 +1233,8 @@ function App() {
   const orbTapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const orbEggTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [mobileTab, setMobileTab] = useState<"docs" | "editor" | "agent">("editor");
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const prevPendingReviewRef = useRef(0);
   const [theme, setTheme] = useState<UiThemeId>(() => loadUiTheme());
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [showStylePicker, setShowStylePicker] = useState(false);
@@ -1241,6 +1303,7 @@ function App() {
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const [connection, setConnection] = useState<ConnectionInfo>(() => getConnectionInfo());
   const [showConnectionPanel, setShowConnectionPanel] = useState(false);
+  const [showUsagePopover, setShowUsagePopover] = useState(false);
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [connectionPanelMsg, setConnectionPanelMsg] = useState("");
   const abortRef = useRef<AbortController | undefined>(undefined);
@@ -1271,6 +1334,14 @@ function App() {
     if (!viewport) return;
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
   }, []);
+  // Auto-open the review dock when new pending marks (change-sets / proposals) arrive.
+  useEffect(() => {
+    if (!state) return;
+    const pending = state.proposals.filter((p) => p.status === "pending").length
+      + state.changeSets.filter((c) => c.status === "pending").length;
+    if (pending > prevPendingReviewRef.current) setReviewOpen(true);
+    prevPendingReviewRef.current = pending;
+  }, [state?.proposals, state?.changeSets]);
   useEffect(() => {
     const viewport = conversationRef.current;
     if (!viewport) return;
@@ -2653,74 +2724,71 @@ function App() {
           )}
         </div>
         <div className="header-right">
-          <button className="usage-strip" onClick={openProviderSettings} title="打开设置">
+          <button className="usage-strip" onClick={() => setShowUsagePopover(true)} title="用量与计费明细">
             <span className="model-name">{state.provider.model}</span>
             <span className="context-meter" title={`${usagePct}% context`} aria-hidden="true">
               <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
             </span>
             <span title="Context window used">{usagePct}%</span>
-            <span>{state.usage.totalTokens.toLocaleString()} tokens</span>
-            <span title="仅统计供应商真实返回的缓存 hit/miss；不含估算调用">
-              cache {(realCacheHitRate(state.usage) * 100).toFixed(1)}%
-            </span>
-            <span className="usage-number">
-              {state.usage.currency === "CNY" ? "¥" : "$"}{state.usage.cost.toFixed(4)}
-            </span>
-            <span className="settings-glyph" aria-hidden="true">⚙</span>
+            <span className="usage-chevron" aria-hidden="true">▾</span>
           </button>
-          <button
-            className="ghost nav-action"
-            title="角色卡"
-            onClick={() => {
-              setSessionBatchMode(false);
-              setSelectedSessionIds(new Set());
-              setManagementView("characters");
-            }}
-          >角色</button>
-          <button
-            className="ghost nav-action"
-            title="选择扮演者与当前身份"
-            disabled={busy}
-            onClick={() => beginRoleplaySetup()}
-          >扮演</button>
-          <button
-            className="ghost nav-action"
-            title="会话"
-            onClick={() => {
-              setSessionBatchMode(false);
-              setSelectedSessionIds(new Set());
-              setManagementView("sessions");
-            }}
-          >会话</button>
-          <button
-            className={`ghost nav-action${activeStyle ? " style-active" : ""}`}
-            title={activeStyle ? `写作风格：${activeStyle.name}` : "写作风格模板"}
-            aria-label="选择写作风格模板"
-            onClick={() => setShowStylePicker(true)}
-          >风格</button>
-          <button
-            className="icon"
-            title="界面风格"
-            aria-label="选择界面风格"
-            onClick={() => setShowThemePicker(true)}
-          >
-            ◐
-          </button>
-          <button
-            className="ghost"
-            title="New session"
-            onClick={async () => {
-              // New session: stop rendering previous trail (storage for old session kept for later switch-back).
-              clearAgentStream({ abort: true });
-              const r = await api<{ sessionId: string }>("/api/session", { method: "POST" });
-              await refresh(r.sessionId);
-            }}
-          >
-            + New
-          </button>
-          <button className="ghost" onClick={() => void refresh(state.sessionId)} title="Refresh">
-            Refresh
-          </button>
+          <div className="nav-cluster" role="group" aria-label="内容导航">
+            <button
+              className="ghost nav-action"
+              title="角色卡"
+              onClick={() => {
+                setSessionBatchMode(false);
+                setSelectedSessionIds(new Set());
+                setManagementView("characters");
+              }}
+            >角色</button>
+            <button
+              className="ghost nav-action"
+              title="选择扮演者与当前身份"
+              disabled={busy}
+              onClick={() => beginRoleplaySetup()}
+            >扮演</button>
+            <button
+              className="ghost nav-action"
+              title="会话"
+              onClick={() => {
+                setSessionBatchMode(false);
+                setSelectedSessionIds(new Set());
+                setManagementView("sessions");
+              }}
+            >会话</button>
+            <button
+              className={`ghost nav-action${activeStyle ? " style-active" : ""}`}
+              title={activeStyle ? `写作风格：${activeStyle.name}` : "写作风格模板"}
+              aria-label="选择写作风格模板"
+              onClick={() => setShowStylePicker(true)}
+            >风格</button>
+          </div>
+          <div className="header-utility" role="group" aria-label="会话操作">
+            <button
+              className="icon"
+              title="界面风格"
+              aria-label="选择界面风格"
+              onClick={() => setShowThemePicker(true)}
+            >
+              ◐
+            </button>
+            <button
+              className="ghost"
+              title="New session"
+              onClick={async () => {
+                // New session: stop rendering previous trail (storage for old session kept for later switch-back).
+                clearAgentStream({ abort: true });
+                const r = await api<{ sessionId: string }>("/api/session", { method: "POST" });
+                await refresh(r.sessionId);
+              }}
+            >
+              + New
+            </button>
+            <button className="ghost" onClick={() => void refresh(state.sessionId)} title="Refresh">
+              Refresh
+            </button>
+          </div>
         </div>
       </header>
 
@@ -3061,23 +3129,6 @@ function App() {
               </small>
             </h2>
           </div>
-          <div className="permission-mode-switch agent-head-permission-switch" role="group" aria-label="Permission mode">
-            {PERMISSION_MODES.map((mode) => {
-              const active = (state.agentSettings?.permissionMode ?? "ask") === mode.id;
-              return (
-                <button
-                  key={mode.id}
-                  type="button"
-                  className={`permission-mode-btn${active ? " active" : ""}`}
-                  title={mode.hint}
-                  disabled={busy || Boolean(roleplay)}
-                  onClick={() => void setPermissionMode(mode.id)}
-                >
-                  {mode.label}
-                </button>
-              );
-            })}
-          </div>
           <div className="agent-head-actions">
             <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "Running" : "Idle"}</span>
             {busy && (
@@ -3327,6 +3378,17 @@ function App() {
             </button>
           )}
         </div>
+        {(visibleChangeSets.length > 0 || pendingProposals.length > 0) && (
+          <ReviewDock
+            changeSets={visibleChangeSets}
+            proposals={pendingProposals}
+            pendingCount={pendingChangeSets.length + pendingProposals.length}
+            open={reviewOpen}
+            onToggle={() => setReviewOpen((v) => !v)}
+            onChangeSetAction={(value, action) => void decideChangeSet(value, action)}
+            onProposalDecide={(p, action) => void decide(p, action)}
+          />
+        )}
         <div className="composer">
           <div className="composer-shell">
             {roleplay && roleplayInputMode === "director" && (
@@ -3397,68 +3459,6 @@ function App() {
             </div>
           </div>
         </div>
-        {pendingChangeSets.length > 0 && (
-          <div className="mobile-proposals">
-            <h2>Change sets <span style={{ fontWeight: 400, marginLeft: 8 }}>({pendingChangeSets.length})</span></h2>
-            {pendingChangeSets.map((changeSet) => (
-              <ChangeSetCard key={changeSet.id} value={changeSet} onAction={(value, action) => void decideChangeSet(value, action)} />
-            ))}
-          </div>
-        )}
-        {pendingProposals.length > 0 && (
-          <div className="mobile-proposals">
-            <h2>
-              Proposals
-              <span style={{ fontWeight: 400, marginLeft: 8 }}>({pendingProposals.length})</span>
-            </h2>
-            {pendingProposals.map((p) => (
-              <div className="proposal-card" key={p.id}>
-                <h3>{p.path}</h3>
-                <p>{p.summary}</p>
-                <div className="proposal-actions">
-                  <button onClick={() => void decide(p, "reject")}>Reject</button>
-                  <button className="primary" onClick={() => void decide(p, "accept")}>
-                    Accept
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="proposals">
-        <h2>Change sets {pendingChangeSets.length > 0 && <span className="proposal-count">{pendingChangeSets.length}</span>}</h2>
-        {visibleChangeSets.length === 0 ? (
-          <div className="block-empty">No change sets</div>
-        ) : visibleChangeSets.map((changeSet) => (
-          <ChangeSetCard key={changeSet.id} value={changeSet} onAction={(value, action) => void decideChangeSet(value, action)} />
-        ))}
-      </section>
-
-      <section className="proposals">
-        <h2>
-          Proposals
-          {pendingProposals.length > 0 && (
-            <span className="proposal-count">{pendingProposals.length}</span>
-          )}
-        </h2>
-        {pendingProposals.length === 0 ? (
-          <div className="block-empty">No pending proposals</div>
-        ) : (
-          pendingProposals.map((p) => (
-            <div className="proposal-card" key={p.id}>
-              <h3>{p.path}</h3>
-              <p>{p.summary}</p>
-              <div className="proposal-actions">
-                <button onClick={() => void decide(p, "reject")}>Reject</button>
-                <button className="primary" onClick={() => void decide(p, "accept")}>
-                  Accept
-                </button>
-              </div>
-            </div>
-          ))
-        )}
       </section>
 
       {branchConfirm && (
@@ -4076,6 +4076,62 @@ function App() {
             {connectionPanelMsg && (
               <p className="connection-panel-msg" role="status">{connectionPanelMsg}</p>
             )}
+          </div>
+        </div>
+      )}
+
+      {showUsagePopover && (
+        <div
+          className="theme-picker-backdrop"
+          onMouseDown={() => setShowUsagePopover(false)}
+          role="presentation"
+        >
+          <div
+            className="theme-picker usage-popover"
+            role="dialog"
+            aria-modal="true"
+            aria-label="用量与计费"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="theme-picker-head">
+              <div>
+                <span className="eyebrow">Usage</span>
+                <h2>用量与计费</h2>
+                <p>本会话累计的上下文占用、token 与费用。</p>
+              </div>
+              <button className="icon" aria-label="关闭" onClick={() => setShowUsagePopover(false)}>×</button>
+            </div>
+            <div className="usage-detail">
+              <div className="usage-detail-row">
+                <span className="usage-detail-label">模型</span>
+                <span className="usage-detail-value">{state.provider.model}</span>
+              </div>
+              <div className="usage-detail-row">
+                <span className="usage-detail-label">上下文占用</span>
+                <span className="usage-detail-value">
+                  {usagePct}% · {state.usage.lastPromptTokens.toLocaleString()} / {state.provider.pricing.contextWindow.toLocaleString()}
+                </span>
+              </div>
+              <div className="usage-detail-row">
+                <span className="usage-detail-label">累计 tokens</span>
+                <span className="usage-detail-value">{state.usage.totalTokens.toLocaleString()}</span>
+              </div>
+              <div className="usage-detail-row" title="仅统计供应商真实返回的缓存 hit/miss；不含估算调用">
+                <span className="usage-detail-label">缓存命中率</span>
+                <span className="usage-detail-value">{(realCacheHitRate(state.usage) * 100).toFixed(1)}%</span>
+              </div>
+              <div className="usage-detail-row">
+                <span className="usage-detail-label">累计费用</span>
+                <span className="usage-detail-value usage-number">
+                  {state.usage.currency === "CNY" ? "¥" : "$"}{state.usage.cost.toFixed(4)}
+                </span>
+              </div>
+            </div>
+            <div className="usage-popover-actions">
+              <button className="primary" onClick={() => { setShowUsagePopover(false); openProviderSettings(); }}>
+                打开模型设置
+              </button>
+            </div>
           </div>
         </div>
       )}

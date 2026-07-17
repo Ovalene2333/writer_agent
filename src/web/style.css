@@ -40,6 +40,22 @@
   --transition: .18s cubic-bezier(.4, 0, .2, 1);
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-spring: cubic-bezier(.34, 1.4, .5, 1);
+  /* Spacing scale (structural — inherited by all themes) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  /* Type scale */
+  --fs-kicker: 10px;
+  --fs-label: 11px;
+  --fs-meta: 12px;
+  --fs-body: 13px;
+  --fs-title: 15px;
+  --fs-h1: 16px;
+  /* Focus ring (shared) */
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
   --text-muted: var(--text-dim);
   --danger: var(--warn);
   --shadow-hover: 0 10px 24px -12px var(--agent-glow), var(--shadow-md);
@@ -374,12 +390,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: non
   height: 100vh; height: 100dvh;
   display: grid;
   grid-template-columns: 260px minmax(420px, 1fr) minmax(350px, .72fr);
-  grid-template-rows: 58px minmax(0, 1fr) auto 44px;
+  grid-template-rows: 58px minmax(0, 1fr) 44px;
   grid-template-areas:
     "head  head  head"
     "side  edit  agent"
-    "side  props agent"
-    "tabs  tabs tabs";
+    "tabs  tabs  tabs";
   gap: 0;
   background: var(--border);
   overflow: hidden;
@@ -558,16 +573,23 @@ header {
 }
 
 .header-right {
-  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  display: flex; align-items: center; gap: var(--space-2); flex-shrink: 0;
+}
+/* Grouped header clusters: usage chip | content nav | session utility */
+.header-right .nav-cluster,
+.header-right .header-utility {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding-left: var(--space-2); border-left: 1px solid var(--border-light);
 }
 .header-right .usage-strip {
-  display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-dim);
+  display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-label); color: var(--text-dim);
   padding: 5px 12px; border-radius: 999px; background: var(--surface2);
   border: 1px solid var(--border-light);
   position: relative; overflow: hidden;
 }
 .header-right .usage-strip span { white-space: nowrap; }
 .header-right .usage-strip .usage-number { font-weight: 600; color: var(--accent); }
+.usage-strip .usage-chevron { color: var(--text-faint); font-size: 9px; margin-left: -2px; }
 .usage-strip .context-meter {
   width: 42px; height: 4px; border-radius: 2px; flex-shrink: 0;
   background: var(--border); overflow: hidden;
@@ -578,6 +600,19 @@ header {
   box-shadow: 0 0 8px var(--agent-glow);
   max-width: 100%;
 }
+
+/* Usage & billing popover (reuses .theme-picker shell) */
+.usage-popover { max-width: 380px; width: min(380px, 92vw); }
+.usage-detail { display: flex; flex-direction: column; margin-top: var(--space-2); }
+.usage-detail-row {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-4);
+  padding: var(--space-3) 0; border-top: 1px solid var(--border-light);
+}
+.usage-detail-row:first-child { border-top: 0; }
+.usage-detail-label { color: var(--text-dim); font-size: var(--fs-meta); }
+.usage-detail-value { color: var(--text); font-size: var(--fs-body); font-weight: 600; text-align: right; }
+.usage-detail-value.usage-number { color: var(--accent); }
+.usage-popover-actions { margin-top: var(--space-4); display: flex; justify-content: flex-end; }
 
 .style-selector {
   width: 130px; padding: 5px 8px; font-size: 12px;
@@ -1278,7 +1313,6 @@ button.agent-orb:focus-visible {
   background: color-mix(in srgb, var(--surface) 80%, #000);
   border: 1px solid var(--border-light);
 }
-.agent-head .agent-head-permission-switch { display: none; }
 .permission-mode-btn {
   border: 0;
   background: transparent;
@@ -1948,48 +1982,63 @@ button.agent-orb:focus-visible {
   box-shadow: 0 4px 14px -4px color-mix(in srgb, var(--warn) 40%, transparent);
 }
 
-/* ── Proposals ─────────────────────────── */
-.proposals {
-  grid-area: props;
-  background: color-mix(in srgb, var(--surface) 96%, var(--accent-light));
-  padding: 12px 16px; overflow: auto;
+/* ── Review dock (change-sets + proposals, docked at bottom of agent panel) ── */
+.review-drawer {
+  flex-shrink: 0; min-height: 0;
+  display: flex; flex-direction: column;
   border-top: 1px solid var(--border);
-  max-height: 200px;
+  background: color-mix(in srgb, var(--surface) 96%, var(--accent-light));
+  max-height: 42vh;
 }
-.proposals h2 {
-  font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
-  margin: 0 0 10px; color: var(--text-faint); font-weight: 750;
-  display: flex; align-items: center; gap: 8px;
+.review-drawer-toggle {
+  flex-shrink: 0;
+  display: flex; align-items: center; gap: var(--space-2);
+  width: 100%; padding: var(--space-2) var(--space-4);
+  border: 0; border-radius: 0; background: transparent;
+  color: var(--text-dim); cursor: pointer;
+  font-size: var(--fs-label); font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
 }
-.proposals h2 .proposal-count {
+.review-drawer-toggle:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); border: 0; }
+.review-drawer-chevron { display: inline-flex; color: var(--text-faint); transition: transform .16s var(--ease-out); }
+.review-drawer.open .review-drawer-chevron { transform: rotate(90deg); }
+.review-drawer-hint {
+  margin-left: auto; text-transform: none; letter-spacing: 0;
+  font-size: var(--fs-label); font-weight: 500; color: var(--text-faint);
+}
+.review-drawer .proposal-count {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 18px; height: 18px; padding: 0 6px;
   border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0;
-  background: var(--accent); color: var(--accent-text);
-  box-shadow: 0 0 12px var(--agent-glow);
+  background: var(--accent); color: var(--accent-text); box-shadow: 0 0 12px var(--agent-glow);
 }
-.proposals .proposal-card {
-  border: 1px solid var(--border); border-radius: 12px;
-  padding: 12px 14px; margin-bottom: 8px;
+.review-drawer-body {
+  overflow: auto; min-height: 0;
+  padding: 0 var(--space-4) var(--space-3);
+  display: flex; flex-direction: column; gap: var(--space-2);
+}
+.review-group { display: flex; flex-direction: column; gap: var(--space-2); }
+.review-group-head {
+  margin: var(--space-1) 0 0; font-size: var(--fs-kicker);
+  text-transform: uppercase; letter-spacing: .12em; color: var(--text-faint); font-weight: 750;
+}
+.review-drawer .proposal-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: var(--space-3); margin: 0;
   background: var(--surface);
   transition: border-color var(--transition), box-shadow var(--transition), transform .12s ease;
   border-left: 3px solid var(--accent);
 }
-.proposals .proposal-card:hover {
+.review-drawer .proposal-card:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  box-shadow: var(--shadow-hover);
-  transform: translateY(-1px);
+  box-shadow: var(--shadow-hover); transform: translateY(-1px);
 }
-.proposals .proposal-card h3 {
-  margin: 0 0 4px; font-size: 13px; font-weight: 650; color: var(--accent);
-  font-family: var(--font-mono);
+.review-drawer .proposal-card h3 {
+  margin: 0 0 4px; font-size: var(--fs-body); font-weight: 650; color: var(--accent); font-family: var(--font-mono);
 }
-.proposals .proposal-card p {
-  margin: 0 0 10px; font-size: 12px; color: var(--text-dim); line-height: 1.5;
+.review-drawer .proposal-card p {
+  margin: 0 0 10px; font-size: var(--fs-meta); color: var(--text-dim); line-height: 1.5;
 }
-.proposals .proposal-actions {
-  display: flex; gap: 6px; justify-content: flex-end;
-}
+.review-drawer .proposal-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .change-set-status {
   display: inline-block; margin-bottom: 8px; color: var(--text-faint); font: 11px var(--font-mono);
 }
@@ -2003,14 +2052,11 @@ button.agent-orb:focus-visible {
   max-height: 240px; overflow: auto; margin-top: 8px; padding: 8px; background: var(--surface2);
 }
 .change-set-card .proposal-actions { margin-top: 8px; }
-.proposals .block-empty {
+.block-empty {
   text-align: center; color: var(--text-faint); font-size: 12px; padding: 16px;
   border: 1px dashed var(--border); border-radius: 10px;
   background: color-mix(in srgb, var(--surface2) 80%, transparent);
 }
-
-/* ── Mobile proposals (inside agent panel) ─── */
-.mobile-proposals { display: none; }
 
 /* ── Markdown ──────────────────────────── */
 .markdown {
@@ -3370,39 +3416,11 @@ button.agent-orb:focus-visible {
   .documents { display: none; }
   .editor { display: none; }
   .agent-panel { display: none; }
-  .proposals { display: none; }
   .document-reader-shell.with-versions {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(120px, 32%) minmax(0, 1fr);
   }
   .version-panel { border-right: 0; border-bottom: 1px solid var(--border); }
-
-  .mobile-proposals {
-    display: block;
-    background: var(--surface);
-    border-top: 1px solid var(--border);
-    padding: 12px 14px;
-    max-height: 36vh;
-    overflow: auto;
-    flex-shrink: 0;
-  }
-  .mobile-proposals h2 {
-    font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
-    margin: 0 0 8px; color: var(--text-faint); font-weight: 700;
-  }
-  .mobile-proposals .proposal-card {
-    border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 10px 12px; margin-bottom: 6px; background: var(--surface2);
-  }
-  .mobile-proposals .proposal-card h3 {
-    margin: 0 0 2px; font-size: 12px; font-weight: 600; color: var(--accent);
-  }
-  .mobile-proposals .proposal-card p {
-    margin: 0 0 8px; font-size: 11px; color: var(--text-dim); line-height: 1.4;
-  }
-  .mobile-proposals .proposal-actions {
-    display: flex; gap: 6px; justify-content: flex-end;
-  }
 }
 
 @media (max-width: 600px) {
@@ -3436,11 +3454,10 @@ body { overflow: hidden; }
 .app {
   position: relative;
   grid-template-columns: var(--sidebar-w, 248px) minmax(440px, 1fr) var(--agent-w, 400px);
-  grid-template-rows: 58px minmax(0, 1fr) auto;
+  grid-template-rows: 58px minmax(0, 1fr);
   grid-template-areas:
     "head head head"
-    "side edit agent"
-    "side props agent";
+    "side edit agent";
   background: transparent;
   gap: 0;
 }
@@ -3562,16 +3579,19 @@ header { padding-inline: 18px; }
   .connection-pref-grid { grid-template-columns: 1fr; }
   .connection-link-row { flex-direction: column; align-items: stretch; gap: 8px; }
   .connection-link-actions { justify-content: flex-end; }
-  header .header-right { gap: 2px; }
-  header .header-right > .ghost:not(.nav-action) { display: none; }
+  header .header-right { gap: 4px; }
+  header .header-right .nav-cluster,
+  header .header-right .header-utility { padding-left: 4px; border-left: 0; gap: 2px; }
+  header .header-utility .ghost { display: none; }               /* hide New / Refresh on mobile */
   header .header-right .nav-action { padding: 6px 8px; font-size: 12px; min-height: 38px; }
-  header .header-right > .icon { display: inline-flex; width: 40px; height: 40px; font-size: 17px; }
+  header .header-utility .icon { display: inline-flex; width: 40px; height: 40px; font-size: 17px; }
   header .header-right button.usage-strip {
-    display: inline-flex; width: 40px; height: 40px; padding: 0;
+    display: inline-flex; height: 40px; padding: 0 8px;
     border: 0; background: transparent; border-radius: var(--radius-sm);
   }
-  header .header-right .usage-strip > span:not(.settings-glyph) { display: none; }
-  .usage-strip .settings-glyph { font-size: 18px; }
+  header .header-right .usage-strip .model-name,
+  header .header-right .usage-strip .context-meter,
+  header .header-right .usage-strip .usage-chevron { display: none; }
 
   .mobile-tabs {
     grid-area: tabs; display: grid; position: relative; z-index: 30;
@@ -3625,21 +3645,16 @@ header { padding-inline: 18px; }
   .editor > textarea { padding: 24px 20px 80px; font-size: 16px; line-height: 1.8; }
 
   .agent-head {
-    grid-template-columns: minmax(64px, 1fr) auto minmax(64px, 1fr);
     min-height: 42px;
     padding: 7px 10px;
   }
   .agent-head-brand { gap: 8px; }
-  .agent-head .agent-head-permission-switch {
-    display: inline-flex;
-    justify-self: center;
-  }
-  .agent-head-permission-switch .permission-mode-btn {
-    min-width: 34px;
-    padding: 4px 6px;
+  .agent-control-bar .permission-mode-btn {
+    min-width: 40px;
+    padding: 4px 8px;
     font-size: 10px;
   }
-  .agent-head-actions { justify-self: end; gap: 5px; }
+  .agent-head-actions { gap: 5px; }
   button.agent-orb { width: 24px; height: 24px; }
   .agent-head .agent-status {
     width: 68px;
@@ -3650,7 +3665,7 @@ header { padding-inline: 18px; }
   .agent-head .agent-status::before { flex: 0 0 6px; }
   .agent-head .agent-stop-btn { display: none; }
   .agent-head h2 small { display: none; }
-  .agent-control-bar { display: none; }
+  .agent-control-bar { padding: 6px 10px; }
 
   .roleplay-banner {
     gap: 5px;
