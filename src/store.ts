@@ -235,7 +235,10 @@ export class WriterStore {
         cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
         cost REAL NOT NULL DEFAULT 0,
         currency TEXT NOT NULL DEFAULT 'CNY',
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        job_id TEXT,
+        call_kind TEXT NOT NULL DEFAULT 'unspecified',
+        step INTEGER
       );
       CREATE TABLE IF NOT EXISTS writing_drafts (
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -316,6 +319,16 @@ export class WriterStore {
     const variantColumns = this.database.prepare("PRAGMA table_info(message_variants)").all() as Row[];
     if (!variantColumns.some(column => column.name === "prompt")) {
       this.database.exec("ALTER TABLE message_variants ADD COLUMN prompt TEXT NOT NULL DEFAULT ''");
+    }
+    const usageColumns = this.database.prepare("PRAGMA table_info(model_usage)").all() as Row[];
+    if (!usageColumns.some(column => column.name === "job_id")) {
+      this.database.exec("ALTER TABLE model_usage ADD COLUMN job_id TEXT");
+    }
+    if (!usageColumns.some(column => column.name === "call_kind")) {
+      this.database.exec("ALTER TABLE model_usage ADD COLUMN call_kind TEXT NOT NULL DEFAULT 'unspecified'");
+    }
+    if (!usageColumns.some(column => column.name === "step")) {
+      this.database.exec("ALTER TABLE model_usage ADD COLUMN step INTEGER");
     }
   }
 
@@ -1145,11 +1158,11 @@ export class WriterStore {
 
   recordUsage(sessionId: string, model: string, usage: {
     promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number;
-  }, pricing: TokenPricing, at: Date = new Date()): UsageSummary {
+  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number } = {}): UsageSummary {
     const miss = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
     const cost = calculateUsageCost({ ...usage, cacheMissTokens: miss }, pricing, at);
-    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at) VALUES(?,?,?,?,?,?,?,?,?)`)
-      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString());
+    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null);
     return this.usage(sessionId);
   }
 
@@ -1158,7 +1171,9 @@ export class WriterStore {
       COALESCE(SUM(prompt_tokens),0) prompt_tokens, COALESCE(SUM(completion_tokens),0) completion_tokens,
       COALESCE(SUM(cache_hit_tokens),0) cache_hit_tokens, COALESCE(SUM(cache_miss_tokens),0) cache_miss_tokens,
       COALESCE(SUM(cost),0) cost, COALESCE(MAX(currency),'CNY') currency,
-      COALESCE((SELECT prompt_tokens FROM model_usage WHERE session_id=? ORDER BY id DESC LIMIT 1),0) last_prompt_tokens
+      COALESCE((SELECT prompt_tokens FROM model_usage WHERE session_id=?
+        AND call_kind IN ('unspecified','agent_step','roleplay_reply','writing_generation','draft_generation','character_generation','character_tool_loop')
+        ORDER BY id DESC LIMIT 1),0) last_prompt_tokens
       FROM model_usage WHERE session_id=?`).get(sessionId, sessionId) as Row;
     const promptTokens = Number(row.prompt_tokens);
     const completionTokens = Number(row.completion_tokens);

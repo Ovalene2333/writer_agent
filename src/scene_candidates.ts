@@ -2,6 +2,7 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
 import { sceneProseScore } from "./prose_metrics.js";
 import type { ModelConfig } from "./types.js";
+import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 
 /**
  * Experimental best-of-N scene prose sampling (Re3-style rerank, prompt-level).
@@ -32,6 +33,7 @@ export type SceneRewriteRequest = {
   sceneBrief: string;
   original: string;
   timeoutMs?: number;
+  usageReporter?: ModelUsageReporter;
 };
 
 /** Deterministic rerank: original first; a rewrite must strictly beat it to win. */
@@ -105,7 +107,9 @@ export async function rewriteSceneCandidate(request: SceneRewriteRequest): Promi
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) throw new Error(`场景重写请求失败（${response.status}）：${responseBody.slice(0, 240)}`);
-  const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null } }> };
+  const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null } }>; usage?: unknown };
+  const usage = parseModelTokenUsage(payload.usage);
+  if (usage) request.usageReporter?.(model, usage, { callKind: "scene_candidate_rewrite" });
   const content = (payload.choices?.[0]?.message?.content ?? "").trim()
     .replace(/^```(?:markdown)?\s*/i, "")
     .replace(/\s*```$/, "")

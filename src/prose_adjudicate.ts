@@ -8,7 +8,8 @@ import {
   proseStyleIssuesError,
   type ProseStyleIssue,
 } from "./prose_quality.js";
-import type { ModelConfig } from "./types.js";
+import type { ModelConfig, ModelTokenUsage } from "./types.js";
+import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 
 export type ProseVerdict = "allow" | "warn" | "block";
 
@@ -230,7 +231,7 @@ export async function adjudicateProseStyleForAudit(
   text: string,
   issues: ProseStyleIssue[],
   model: ModelConfig | undefined,
-  options?: { signal?: AbortSignal; timeoutMs?: number; discover?: boolean; verdictCache?: ProseVerdictCache },
+  options?: { signal?: AbortSignal; timeoutMs?: number; discover?: boolean; verdictCache?: ProseVerdictCache; usageReporter?: ModelUsageReporter; callKind?: string },
 ): Promise<ProseAdjudicationResult> {
   if (!model) return { issues, adjudicated: 0, skipped: "no_model" };
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
@@ -250,6 +251,9 @@ export async function adjudicateProseStyleForAudit(
       options?.signal,
       options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     );
+    if (decision.usage) {
+      options?.usageReporter?.(model, decision.usage, { callKind: options.callKind ?? "prose_adjudication" });
+    }
     if (cache) {
       const byId = new Map(candidates.map(item => [item.id, item]));
       for (const verdict of decision.verdicts) {
@@ -288,7 +292,7 @@ export async function adjudicateProseStyleForProposal(
   text: string,
   issues: ProseStyleIssue[],
   model: ModelConfig | undefined,
-  options?: { signal?: AbortSignal; timeoutMs?: number; verdictCache?: ProseVerdictCache },
+  options?: { signal?: AbortSignal; timeoutMs?: number; verdictCache?: ProseVerdictCache; usageReporter?: ModelUsageReporter; callKind?: string },
 ): Promise<ProseAdjudicationResult> {
   const replayed = applyCachedProseVerdicts(text, issues, options?.verdictCache);
   if (!model) return { issues: replayed, adjudicated: 0, skipped: "no_model" };
@@ -377,7 +381,7 @@ async function requestProseAdjudication(
   passages: ProseDiscoveryPassage[],
   outerSignal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-): Promise<{ verdicts: ProseAdjudicationVerdict[]; discoveries: ProseAdjudicationDiscovery[] }> {
+): Promise<{ verdicts: ProseAdjudicationVerdict[]; discoveries: ProseAdjudicationDiscovery[]; usage?: ModelTokenUsage }> {
   const system = `你是中文小说解释腔二审器。既要复核规则候选，也要在高风险段落中主动发现规则漏掉的解释回声，不要改写全文。特别检查用句号拆开的“不是A。是B。”：若只是刻意制造顿挫或重新命名同一事实，应 block；若是人物对白纠错、必要的客观排除或确有语境作用，则 allow/warn。
 对 candidates 中每条给出 verdict：
 - allow：应放行（对白拖音/中断、停顿—揭示、短同位、列举、表格/元数据、口语纠正、客观事实排除等）
@@ -387,16 +391,17 @@ async function requestProseAdjudication(
 只输出 JSON 对象：{"verdicts":[{"id":"...","verdict":"allow|warn|block","reason":"不超过40字"}],"discoveries":[{"passageId":"...","sentence":"逐字原句","subtype":"semantic_echo|emotion_label|intent_translation|thematic_summary|causal_gloss|narrator_redefinition","verdict":"warn|block","reason":"不超过40字"}]}。不要 Markdown 围栏。`;
 
   const user = JSON.stringify({ candidates: items, passages }, null, 0);
-  const content = await completeJsonChat(model, [
+  const completed = await completeJsonChat(model, [
     { role: "system", content: system },
     { role: "user", content: user },
   ], outerSignal, timeoutMs);
 
-  return parseProseAdjudication(
-    content,
+  const parsed = parseProseAdjudication(
+    completed.content,
     new Set(items.map(item => item.id)),
     new Map(passages.map(item => [item.id, item])),
   );
+  return { ...parsed, ...(completed.usage ? { usage: completed.usage } : {}) };
 }
 
 export function parseProseAdjudication(
@@ -472,7 +477,7 @@ async function completeJsonChat(
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
   outerSignal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-): Promise<string> {
+): Promise<{ content: string; usage?: ModelTokenUsage }> {
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置 API Key");
   }
@@ -502,8 +507,10 @@ async function completeJsonChat(
   if (!response.ok) throw new Error(`句式二审请求失败（${response.status}）：${responseBody.slice(0, 240)}`);
   const payload = JSON.parse(responseBody) as {
     choices?: Array<{ message?: { content?: string | null } }>;
+    usage?: unknown;
   };
   const content = payload.choices?.[0]?.message?.content ?? "";
   if (!content.trim()) throw new Error("句式二审无内容");
-  return content;
+  const usage = parseModelTokenUsage(payload.usage);
+  return { content, ...(usage ? { usage } : {}) };
 }

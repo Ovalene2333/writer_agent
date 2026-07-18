@@ -57,7 +57,12 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
     content,
     rules,
     context.proseAdjudicator?.model,
-    { signal: context.proseAdjudicator?.signal, verdictCache },
+    {
+      signal: context.proseAdjudicator?.signal,
+      verdictCache,
+      usageReporter: context.modelUsageReporter,
+      callKind: "prose_audit",
+    },
   );
   const issues = flash.issues;
   return JSON.stringify({

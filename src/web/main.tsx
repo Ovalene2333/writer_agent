@@ -1430,6 +1430,26 @@ function WorkspaceTopbar({
   );
 }
 
+function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage): StepUsage {
+  if (!current) return next;
+  const cacheHitTokens = current.cacheHitTokens + next.cacheHitTokens;
+  const cacheMissTokens = current.cacheMissTokens + next.cacheMissTokens;
+  const estimated = Boolean(current.estimated || next.estimated);
+  return {
+    promptTokens: current.promptTokens + next.promptTokens,
+    completionTokens: current.completionTokens + next.completionTokens,
+    cacheHitTokens,
+    cacheMissTokens,
+    totalTokens: current.totalTokens + next.totalTokens,
+    cost: current.cost + next.cost,
+    currency: current.cost > 0 ? current.currency : next.currency,
+    ...(estimated ? { estimated: true } : {}),
+    ...(!estimated && cacheHitTokens + cacheMissTokens > 0
+      ? { cacheHitRate: cacheHitTokens / (cacheHitTokens + cacheMissTokens) }
+      : {}),
+  };
+}
+
 function App() {
   const [state, setState] = useState<State>();
   const [activePath, setActivePath] = useState("");
@@ -2038,7 +2058,7 @@ function App() {
             ? current.findIndex((s) => s.id === targetId)
             : activeStepIndex(current);
           if (idx < 0) return current;
-          return current.map((s, i) => (i === idx ? { ...s, usage: event.call } : s));
+          return current.map((s, i) => (i === idx ? { ...s, usage: mergeStepCallUsage(s.usage, event.call!) } : s));
         });
       }
     }
@@ -2566,7 +2586,7 @@ function App() {
   async function summarizeCompetency(competency: Competency): Promise<string> {
     const result = await api<{ summary: string }>("/api/characters/competencies/summarize", {
       method: "POST",
-      body: JSON.stringify({ competency }),
+      body: JSON.stringify({ sessionId: state?.sessionId, competency }),
     });
     return result.summary;
   }
@@ -2636,7 +2656,7 @@ function App() {
       if (!identity) {
         const generated = await api<RoleplayInterlocutor>("/api/roleplay/interlocutor", {
           method: "POST",
-          body: JSON.stringify({ performer: roleplaySetup.performer, request: roleplaySetup.request }),
+          body: JSON.stringify({ sessionId: state?.sessionId, performer: roleplaySetup.performer, request: roleplaySetup.request }),
         });
         if (roleplaySetup.persist) {
           setRoleplaySetupPhase("saving");

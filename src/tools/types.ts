@@ -4,6 +4,8 @@ import type { WriterStore } from "../store.js";
 import type { ChapterSceneDraft, SceneActualState } from "../scene_pipeline.js";
 import type { ScenePipelineSettings } from "../agent_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
+import type { ModelUsageReporter } from "../model_usage.js";
+import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -20,6 +22,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Records provider usage from model calls made inside tool handlers. */
+  modelUsageReporter?: ModelUsageReporter;
   /**
    * Per-job read transaction: the first inspect/read locks a path to one source
    * hash, and successful body reads register non-overlapping line atoms.
@@ -77,6 +81,23 @@ export type ToolExecutionContext = {
     signal?: AbortSignal;
   };
   /**
+   * Full-chapter structural review runs in an isolated, tool-free call so the
+   * assembled prose is not appended to every later Agent step. Production uses
+   * the writing model; `run` allows deterministic handler tests.
+   */
+  chapterReviewer?: {
+    model: ModelConfig;
+    /** Retried only when the primary isolated review fails. */
+    fallbackModel?: ModelConfig;
+    signal?: AbortSignal;
+    context?: string;
+    run?: (
+      model: ModelConfig,
+      input: ChapterReviewInput,
+      signal?: AbortSignal,
+    ) => Promise<{ review: ChapterReviewResult; usage?: import("../types.js").ModelTokenUsage }>;
+  };
+  /**
    * Experimental best-of-N scene prose sampling (scenePipeline.candidateCount > 1):
    * model used for fact-preserving plain-text rewrites of each submitted scene.
    * Absent = feature off; rewrite failures always fall back to the original prose.
@@ -85,13 +106,6 @@ export type ToolExecutionContext = {
     model: ModelConfig;
     signal?: AbortSignal;
   };
-  /**
-   * SCENE_STYLE_DENSE bounce counter per sceneId for the current chapter draft.
-   * A scene is rejected at most once; the second dense submission enters the
-   * draft with a deferred-warning so remaining hits are fixed by chapter-end
-   * revise instead of another full-scene regeneration. Reset per chapter.
-   */
-  sceneStyleBounces?: Map<string, number>;
   /**
    * Chapter-cached voice evidence for candidate rewrites: one exemplar window is
    * sampled per draft and shared by every scene's rewrite calls. Reset per chapter.

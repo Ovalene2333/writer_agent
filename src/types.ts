@@ -51,6 +51,14 @@ export interface UsageSummary {
   cacheHitRate: number;
 }
 
+/** Provider-reported token counts before pricing/UI normalization. */
+export interface ModelTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+}
+
 export type ProviderId = "deepseek" | "openai-compatible";
 
 export interface ProviderPublicConfig {
@@ -425,5 +433,5 @@ export type AgentEvent =
   | { type: "done"; sessionId: string }
   | { type: "cancelled"; sessionId: string }
   | { type: "waiting_for_input"; sessionId: string; question: string; options?: string[] }
-  | { type: "usage"; usage: UsageSummary; step?: number; call?: StepUsage }
+  | { type: "usage"; usage: UsageSummary; step?: number; call?: StepUsage; callKind?: string; jobId?: string }
   | { type: "error"; message: string };

@@ -11,6 +11,7 @@ import test from "node:test";
 import {
   agentToolNames,
   agentToolSchemaHash,
+  agentToolsForTask,
   admitReadAtom,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
@@ -31,12 +32,64 @@ import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
+import { parseModelTokenUsage } from "./model_usage.js";
+import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
 
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
   assert.equal(agentToolSchemaHash(), "0a334dac5f1197aa");
+});
+
+test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
+  const content = "# 第一章\n\n## 进入\n\n门禁灯由绿变红。\n\n## 结果\n\n她越过了门。";
+  const scenes = [{
+    sceneId: "arrival", title: "进入", plannedTurn: "门禁变红", plannedOutcome: "主角违规进入",
+    actualState: { situation: ["主角违规进入"] },
+  }];
+  const messages = buildChapterReviewMessages({ chapterGoal: "关系改变", content, scenes });
+  assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
+  assert.match(messages[1].content, /门禁灯由绿变红/u);
+
+  const review = parseChapterReview(JSON.stringify({
+    verdict: "revise",
+    chapterChange: "主角从服从转为违规",
+    reviewNotes: "结果与计划一致，但接缝需要补强。",
+    issues: [{
+      severity: "blocker", kind: "seam", sceneId: "arrival",
+      evidence: ["门禁灯由绿变红。"], problem: "动作缺少直接后果", action: "在本场补出越界动作",
+    }],
+  }), new Set(["arrival"]), content);
+  assert.equal(review.verdict, "revise");
+  assert.deepEqual(review.issues[0].evidence, ["门禁灯由绿变红。"]);
+  assert.throws(() => parseChapterReview(JSON.stringify({
+    verdict: "revise",
+    chapterChange: "主角改变",
+    reviewNotes: "存在问题",
+    issues: [{
+      severity: "blocker", kind: "seam", sceneId: "arrival",
+      evidence: ["正文中不存在的句子。"], problem: "问题", action: "修复",
+    }],
+  }), new Set(["arrival"]), content), /可定位的 blocker/u);
+});
+
+test("task tool profiles are frozen order-preserving allow-lists", () => {
+  const catalog = agentToolNames();
+  const write = agentToolsForTask("write_scene", "ask");
+  const writeNames = write.map(tool => tool.function.name);
+  assert.ok(Object.isFrozen(write));
+  assert.ok(writeNames.length < catalog.length);
+  assert.deepEqual(writeNames, catalog.filter(name => writeNames.includes(name)));
+  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "inspect_chapter_draft", "propose_chapter_draft"]) {
+    assert.ok(writeNames.includes(required), `write profile missing ${required}`);
+  }
+  assert.equal(writeNames.includes("save_character"), false);
+
+  const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
+  assert.equal(planNames.includes("write_chapter_scene"), false);
+  assert.equal(planNames.includes("propose_chapter_draft"), false);
+  assert.ok(planNames.includes("read_document"));
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -78,6 +131,51 @@ test("planner JSON parser accepts one object and rejects surrounding prose", () 
   assert.equal(parsePlannerJson('分析如下：{"mode":"general"}'), undefined);
   assert.equal(parsePlannerJson('{"mode":'), undefined);
   assert.equal(parsePlannerJson('[]'), undefined);
+});
+
+test("provider usage parsing and tagged persistence include hidden model calls", () => {
+  assert.deepEqual(parseModelTokenUsage({
+    prompt_tokens: 120,
+    completion_tokens: 30,
+    prompt_tokens_details: { cached_tokens: 80 },
+  }), {
+    promptTokens: 120,
+    completionTokens: 30,
+    cacheHitTokens: 80,
+    cacheMissTokens: 40,
+  });
+
+  const root = mkdtempSync(join(tmpdir(), "writer-usage-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "用量");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("用量");
+    store.recordUsage(sessionId, "flash", {
+      promptTokens: 120, completionTokens: 30, cacheHitTokens: 80, cacheMissTokens: 40,
+    }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:00Z"), {
+      jobId: "job-1", callKind: "prose_gate", step: 3,
+    });
+    const row = store.database.prepare("SELECT job_id,call_kind,step FROM model_usage WHERE session_id=? AND call_kind='prose_gate'").get(sessionId) as Record<string, unknown>;
+    assert.equal(row.job_id, "job-1");
+    assert.equal(row.call_kind, "prose_gate");
+    assert.equal(row.step, 3);
+    assert.equal(store.usage(sessionId).lastPromptTokens, 0, "internal calls must not replace the main context meter");
+    store.recordUsage(sessionId, "pro", {
+      promptTokens: 500, completionTokens: 20, cacheHitTokens: 400, cacheMissTokens: 100,
+    }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:01Z"), {
+      jobId: "job-1", callKind: "agent_step", step: 3,
+    });
+    store.recordUsage(sessionId, "flash", {
+      promptTokens: 40, completionTokens: 10, cacheHitTokens: 0, cacheMissTokens: 40,
+    }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:02Z"), {
+      jobId: "job-1", callKind: "auto_title",
+    });
+    assert.equal(store.usage(sessionId).lastPromptTokens, 500);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("audit workflow separates review-only from repair", () => {
@@ -124,7 +222,8 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /write_chapter_scene/);
   assert.match(instructions, /revise_chapter_draft_style/);
   assert.match(instructions, /每场默认一次 write_chapter_scene/);
-  assert.match(instructions, /SCENE_STYLE_DENSE/);
+  assert.match(instructions, /styleDeferred/);
+  assert.match(instructions, /禁止为句式问题重写整场/);
   assert.match(instructions, /禁止通读上一章全文/);
   assert.match(instructions, /工具内部完成 notes 编译/);
   assert.match(instructions, /inspect_chapter_draft/);

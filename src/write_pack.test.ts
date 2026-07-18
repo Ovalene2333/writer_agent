@@ -25,6 +25,7 @@ import { executeTool } from "./tools/execute.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { sceneProseScore } from "./prose_metrics.js";
 import { SCENE_CANDIDATE_SKIP_SCORE } from "./scene_candidates.js";
+import { ChapterReviewRequestError } from "./chapter_review.js";
 
 test("sanitizeDiegeticText rewrites 序章 meta into story-world phrasing", () => {
   const { text, stripped } = sanitizeDiegeticText("比序章里预估的还高了零点七。");
@@ -352,8 +353,35 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     store = new WriterStore(project);
     const activeStore = store;
     const sessionId = activeStore.createSession("逐场写作");
+    const chapterReviewUsage: Array<{ model: string; callKind: string }> = [];
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      modelUsageReporter: (model, _usage, meta) => {
+        chapterReviewUsage.push({ model: model.model, callKind: meta.callKind });
+      },
+      chapterReviewer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "reviewer-test" },
+        fallbackModel: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" },
+        run: async (model, input) => {
+          assert.match(input.content, /^# 第一章/u);
+          assert.match(input.content, /门禁灯/u);
+          if (model.model === "reviewer-test") {
+            throw new ChapterReviewRequestError(
+              "终审 JSON 无法解析",
+              { promptTokens: 700, completionTokens: 80, cacheHitTokens: 0, cacheMissTokens: 700 },
+            );
+          }
+          return {
+            review: {
+              verdict: "pass" as const,
+              chapterChange: "主角从服从转为违规",
+              reviewNotes: "单场章无需接缝；目标与结果一致",
+              issues: [],
+            },
+            usage: { promptTokens: 800, completionTokens: 120, cacheHitTokens: 0, cacheMissTokens: 800 },
+          };
+        },
+      },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
       { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, () => {}, undefined, context,
@@ -388,12 +416,13 @@ test("chapter scene tool compiles notes inline and submits only after inspection
         "空气发涩。不是气体。是悬浮颗粒。",
         "地面反光。不是水。是油性液体。",
         "立柱在颤。不是塌方。是预埋装药。",
+        "应急门沿着轨道落下，主角侧身挤进最后一道缝隙，鞋底在油膜上拖出半圈亮痕。",
       ].join(""),
       actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
-    assert.equal(denseStyle.code, "SCENE_STYLE_DENSE");
-    assert.equal(denseStyle.status, "style_revision_required");
-    assert.equal(context.chapterSceneDraft?.completed.length, 0);
+    assert.equal(denseStyle.status, "written");
+    assert.equal((denseStyle.styleDeferred as Record<string, unknown>).code, "SCENE_STYLE_DENSE");
+    assert.equal(context.chapterSceneDraft?.completed.length, 1);
     // AA repeats are auto-fixed in-tool: the deduped scene enters the draft directly.
     const duplicated = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
@@ -402,7 +431,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
         `第${String.fromCharCode(65 + index)}区的警报灯保持沉默。`).join("")}`,
       actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
-    assert.equal(duplicated.status, "written");
+    assert.equal(duplicated.status, "revised");
     const autoFixes = duplicated.autoFixes as { duplicateSentencesRemoved: string[] };
     assert.deepEqual(autoFixes.duplicateSentencesRemoved, ["她沿着走廊走到尽头的门前。"]);
     assert.equal(context.chapterSceneDraft?.completed.length, 1);
@@ -445,12 +474,14 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     const inspectedRaw = await call("inspect_chapter_draft", {});
     const inspected = JSON.parse(inspectedRaw) as Record<string, unknown>;
     assert.equal(inspected.status, "inspection_required");
+    assert.equal(inspected.reviewCompleted, true);
     assert.equal(typeof inspected.contentCharacters, "number");
-    // Scene texts no longer live in the agent context; inspect must hand over the
-    // assembled chapter exactly once for final review.
-    assert.match(String(inspected.content), /^# 第一章/u);
-    assert.match(String(inspected.content), /门禁灯/u);
-    assert.equal(String(inspected.content).length, inspected.contentCharacters);
+    assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
+    assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
+    assert.deepEqual(chapterReviewUsage, [
+      { model: "reviewer-test", callKind: "chapter_review_failed" },
+      { model: "writer-test", callKind: "chapter_review" },
+    ]);
     const proposed = JSON.parse(await call("propose_chapter_draft", {
       summary: "新建第一章", chapterChange: "主角从服从转为违规", reviewNotes: "单场章无需接缝；目标与结果一致",
     })) as Record<string, unknown>;
@@ -472,7 +503,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
   }
 });
 
-test("scene dense gate bounces once then accepts with a deferred style warning", async () => {
+test("scene dense gate accepts once with a deferred sentence-level warning", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-scene-dense-"));
   let store: WriterStore | undefined;
   try {
@@ -503,19 +534,12 @@ test("scene dense gate bounces once then accepts with a deferred style warning",
       content: dense,
       actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
-    assert.equal(first.code, "SCENE_STYLE_DENSE");
-    assert.equal(context.chapterSceneDraft?.completed.length, 0);
-    // Second dense submission of the same scene enters the draft with styleDeferred
-    // instead of burning another full-scene regeneration.
-    const second = JSON.parse(await call("write_chapter_scene", {
-      sceneId: "arrival",
-      notes: "## 场景目标\n主角违规进入训练区。",
-      content: dense,
-      actualState: actualState("主角违规进入训练区"),
-    })) as Record<string, unknown>;
-    assert.equal(second.status, "written");
-    assert.equal((second.styleDeferred as Record<string, unknown>).code, "SCENE_STYLE_DENSE");
+    assert.equal(first.status, "written");
+    assert.equal((first.styleDeferred as Record<string, unknown>).code, "SCENE_STYLE_DENSE");
     assert.equal(context.chapterSceneDraft?.completed.length, 1);
+    const inspected = JSON.parse(await call("inspect_chapter_draft", {})) as Record<string, unknown>;
+    assert.equal(inspected.status, "style_revision_required");
+    assert.equal(inspected.code, "CHAPTER_DRAFT_STYLE_BLOCKED");
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

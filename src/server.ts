@@ -23,6 +23,7 @@ import {
 import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
 import { generateRoleplayInterlocutor, recommendRoleplayDirectorActions, runRoleplayChat } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
+import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
@@ -435,7 +436,7 @@ export async function startWriterServer(options: {
 
   app.post("/api/characters/competencies/summarize", async (context) => {
     try {
-      const body = await context.req.json<{ competency?: {
+      const body = await context.req.json<{ sessionId?: string; competency?: {
         name?: string; level?: string; description?: string;
         resources?: string[]; limitations?: string[]; costs?: string[];
       } }>();
@@ -444,6 +445,7 @@ export async function startWriterServer(options: {
         model: options.providers.summaryModelConfig(),
         competency: body.competency,
         signal: context.req.raw.signal,
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
       });
       return context.json({ summary });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
@@ -621,7 +623,7 @@ export async function startWriterServer(options: {
 
   app.post("/api/roleplay/interlocutor", async (context) => {
     try {
-      const body = await context.req.json<{ performer?: RoleplayParticipant; characterId?: number; request?: string }>();
+      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; characterId?: number; request?: string }>();
       if (!body.performer && !Number.isInteger(body.characterId)) return context.json({ error: "角色扮演需要指定扮演者" }, 400);
       const interlocutor = await generateRoleplayInterlocutor({
         project: options.project,
@@ -630,6 +632,7 @@ export async function startWriterServer(options: {
         characterId: body.characterId,
         request: body.request ?? "",
         model: options.providers.modelConfig("roleplay"),
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
       });
       return context.json(interlocutor);
     } catch (error) {
@@ -792,6 +795,7 @@ export async function startWriterServer(options: {
             model: options.providers.modelConfig("agent"), summaryModel: options.providers.summaryModelConfig(), store: options.store,
             sessionId: body.sessionId, instruction: body.prompt,
             characterId: Number.isInteger(body.characterId) ? body.characterId : undefined,
+            jobId: job.id,
             allowedDocumentPaths: characterContextDocumentPaths(options.project, body.contextDocumentPaths),
             signal, onEvent,
           });
@@ -807,6 +811,7 @@ export async function startWriterServer(options: {
             interlocutor: body.interlocutor,
             scene: body.scene?.id ? options.store.roleplayScenes().find(item => item.id === body.scene!.id) : undefined,
             prompt: body.prompt,
+            jobId: job.id,
             inputMode: body.inputMode === "director" ? "director" : "dialogue",
             opening: body.opening === true,
             variantGroupId,
@@ -820,6 +825,7 @@ export async function startWriterServer(options: {
             project: options.project,
             store: options.store,
             sessionId: body.sessionId,
+            jobId: job.id,
             prompt: body.prompt,
             variantGroupId,
             selectedDocumentBlocks: body.documentSelections,
@@ -844,6 +850,12 @@ export async function startWriterServer(options: {
               model: options.providers.summaryModelConfig(),
               sessionId: body.sessionId,
               signal,
+              usageReporter: (callModel, callUsage, meta) => {
+                emit(buildRecordedUsageEvent(options.store, body.sessionId, callModel, callUsage, {
+                  ...meta,
+                  jobId: job.id,
+                }));
+              },
             });
           } catch { /* title is best-effort */ }
         }
@@ -940,6 +952,7 @@ export async function startWriterServer(options: {
         hasSelection: Boolean(body.hasSelection),
         characters: options.store.characters().map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases })),
         signal: context.req.raw.signal,
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
       });
       return context.json({ suggestions });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
@@ -947,10 +960,11 @@ export async function startWriterServer(options: {
 
   app.post("/api/characters/generate", async (context) => {
     try {
-      const body = await context.req.json<{ description: string; existing?: Record<string, unknown> }>();
+      const body = await context.req.json<{ sessionId?: string; description: string; existing?: Record<string, unknown> }>();
       const character = await generateCharacter({
         model: options.providers.modelConfig("agent"), description: body.description ?? "",
         existing: body.existing, signal: context.req.raw.signal,
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
       });
       return context.json({ character });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
@@ -1199,4 +1213,11 @@ function errorMessage(error: unknown): string {
     : "";
   const detail = code && !causeMessage.includes(code) ? `${code}: ${causeMessage}` : causeMessage;
   return detail && !error.message.includes(detail) ? `${error.message}（${detail}）` : error.message;
+}
+
+function usageReporterForSession(store: WriterStore, sessionId?: string): ModelUsageReporter | undefined {
+  if (!sessionId || !store.sessionExists(sessionId)) return undefined;
+  return (model, usage, meta) => {
+    buildRecordedUsageEvent(store, sessionId, model, usage, meta);
+  };
 }

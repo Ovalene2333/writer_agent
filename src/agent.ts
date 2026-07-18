@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, StepUsage, UsageSummary } from "./types.js";
+import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, StepUsage } from "./types.js";
 import type { ChapterSceneDraft } from "./scene_pipeline.js";
 import { documentKind, isScenePipelineDocument, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -7,6 +7,7 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { proseMannerismPreflightLine } from "./prose_quality.js";
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
+import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import {
   formatTodosForPrompt,
@@ -20,8 +21,8 @@ import {
   type ScenePipelineSettings,
 } from "./agent_runtime.js";
 import {
-  TOOLS,
   TOOL_NAMES,
+  agentToolsForTask,
   executeTool,
   parseChapterNumber,
   chapterTitleMatches,
@@ -31,6 +32,7 @@ import {
   type CompletedChapterHandoff,
   type ToolCall,
   type ToolExecutionContext,
+  type ToolDefinition,
 } from "./tools/index.js";
 
 type ApiMessage = {
@@ -47,7 +49,7 @@ type ApiToolCall = {
   function: { name: string; arguments: string };
 };
 
-export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
+export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/index.js";
 
 /**
  * =============================================================================
@@ -92,8 +94,8 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *    b) Scene boundary: after each successful write_chapter_scene, truncate back
  *       to the post-begin context base (prep reads + scene chain lock survive) and
  *       append one compact handoff (sceneContinuationPrompt), so later scenes stop
- *       paying earlier scenes' full prose; inspect_chapter_draft returns the
- *       assembled chapter once for final review instead.
+ *       paying earlier scenes' full prose; inspect_chapter_draft reviews the
+ *       assembled chapter in an isolated call and returns a compact report.
  *    Mid-job injections (both handoffs and the no-tool retry) MUST use role
  *    "user", never "system": DeepSeek re-renders any request whose history has
  *    a system message after assistant/tool turns under a different template —
@@ -103,14 +105,14 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *    miss at every scene boundary.
  *
  * 5) TOOLS SCHEMA
- *    src/tools/schema.ts TOOLS must stay order-stable and free of project-specific
- *    path/id lists. Do not swap tool sets per task mode mid-session unless the
- *    whole session uses one fixed set (changing tools breaks the tools-side prefix).
+ *    src/tools/schema.ts TOOLS is the stable catalog. After the tool-free planner,
+ *    select one project-agnostic task profile and freeze it for the entire job.
+ *    Profiles preserve catalog order and never contain live paths/ids/state.
  *
  * 6) PLANNER
- *    planWritingTask starts with the exact same 6 stable system slots and frozen
- *    TOOLS schema as execution, then appends immutable planner rules and one
- *    dynamic user payload. This warms the execution prefix before step 1.
+ *    planWritingTask is a small, tool-free Flash call. It does not pretend to
+ *    warm execution: provider measurements show planner/execution diverge before
+ *    the tools payload, so attaching 36 tools only adds miss-priced input/output.
  *
  * 7) DEDUPE
  *    Prefer one compact rule + cross-reference over pasting the same mannerism /
@@ -143,13 +145,6 @@ interface WritingTask {
   targetPath?: string;
 }
 
-type CompletionUsage = {
-  promptTokens: number;
-  completionTokens: number;
-  cacheHitTokens: number;
-  cacheMissTokens: number;
-};
-
 /** Parse the planner's single JSON object without accepting surrounding prose. */
 export function parsePlannerJson(content: string): Partial<WritingTask> | undefined {
   const trimmed = content.trim();
@@ -164,17 +159,6 @@ export function parsePlannerJson(content: string): Partial<WritingTask> | undefi
   } catch {
     return undefined;
   }
-}
-
-function addCompletionUsage(first?: CompletionUsage, second?: CompletionUsage): CompletionUsage | undefined {
-  if (!first) return second;
-  if (!second) return first;
-  return {
-    promptTokens: first.promptTokens + second.promptTokens,
-    completionTokens: first.completionTokens + second.completionTokens,
-    cacheHitTokens: first.cacheHitTokens + second.cacheHitTokens,
-    cacheMissTokens: first.cacheMissTokens + second.cacheMissTokens,
-  };
 }
 
 function dsmlMarkerIndex(text: string): number {
@@ -417,14 +401,13 @@ export function normalizeDocumentProposalRequired(mode: WritingTaskMode, request
 }
 
 /**
- * Task planner (separate completion; tool calls forbidden by prompt, but the
- * frozen tools schema stays present so planner and execution share one prefix).
- * CACHE: stablePrefix must be the exact array later reused by execution. Keep
- * project catalogs and request text in the final user message only.
+ * Task planner: a compact tool-free call, normally assigned to Flash.
+ * CACHE: Keep stable rules in the first message and project/request data in the
+ * final user message. Execution has a different prefix and is not warmed here.
  */
 async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
-  characterScope?: number[], stablePrefix: ApiMessage[] = [],
+  characterScope?: number[],
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
@@ -443,7 +426,7 @@ async function planWritingTask(
   const recent = history.slice(-3).map(item => item.role === "user"
     ? { content: item.content?.slice(0, 160) ?? "" }
     : { role: item.role, content: item.content?.slice(0, 120) ?? "" });
-  const planningMessages: ApiMessage[] = [...stablePrefix, {
+  const planningMessages: ApiMessage[] = [{
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务规划器。不得调用工具；只输出一个 JSON，无 Markdown。
@@ -471,19 +454,10 @@ documentContext 判定（关键，勿默认 none）：
       recentHistory: recent,
     }),
   }];
-  // Keep the frozen TOOLS payload identical to execution. DeepSeek renders the
-  // tool schema before/with messages, so omitting it here prevents step 1 from
-  // reusing the prefix that the immediately preceding planner call just warmed.
-  let result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, true);
-  let parsed = parsePlannerJson(result.content);
-  if (!parsed) {
-    // Keeping TOOLS on the first call warms the execution prefix, but some models
-    // still choose a tool despite the planner rule and consequently return no
-    // content. Retry tool-free so a cache optimization cannot block the task.
-    const fallback = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, false);
-    parsed = parsePlannerJson(fallback.content);
-    result = { ...fallback, usage: addCompletionUsage(result.usage, fallback.usage) };
-  }
+  const result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, {
+    maxCompletionTokens: 900,
+  });
+  const parsed = parsePlannerJson(result.content);
   if (!parsed) throw new Error("任务规划器没有返回有效 JSON");
   const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "character", "simple_character", "general"];
   const plannedMode = modes.includes(parsed.mode as WritingTaskMode) ? parsed.mode as WritingTaskMode : "general";
@@ -701,9 +675,9 @@ export function taskInstructions(
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单个正文任务只交付用户指定的章节或支线片段：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 SCENE_STYLE_DENSE，当场改正文后用同一 sceneId 重提一次（不计入“另写一场”）；同场第二次仍超标会带 styleDeferred 直接入稿，命中句留到整章 inspect 后用 revise_chapter_draft_style 一并修，禁止反复重写整场。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
+5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后 inspect_chapter_draft 通读整章（其返回的 content 为组装后全文，通读以此为准）并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回的 styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
+7. 全部场景完成后 inspect_chapter_draft 对组装后的整章执行一次隔离终审，并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；终审覆盖接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回结构化 chapterReview；通过后下一回复直接把 chapterChange/reviewNotes 写入 propose_chapter_draft 参数，禁止先复述审阅。若有 blocker，只重写返回的 targetScenes；styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch，不必走流水线）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：read_document 传 path+quote 一步取回行号与上下文；禁止为找一句话通读全章或反复 search_project。
@@ -970,7 +944,7 @@ export function sceneContinuationPrompt(
   const remaining = draft.scenes.slice(completedCount + 1)
     .map(scene => ({ id: scene.id, title: scene.title, goal: scene.goal }));
   const lines: string[] = [
-    `章节场景写作进行中（已完成 ${completedCount}/${draft.scenes.length} 场）。为控制上下文，此前各场完整正文已从本轮对话移除，只保存在内存草稿中；整章 inspect_chapter_draft 会返回组装后的全文，勿因此重写已完成场景。`,
+    `章节场景写作进行中（已完成 ${completedCount}/${draft.scenes.length} 场）。为控制上下文，此前各场完整正文已从本轮对话移除，只保存在内存草稿中；整章 inspect_chapter_draft 会在隔离调用中阅读全文并返回结构化终审报告，勿因此重写已完成场景。`,
     `章节：${draft.path}（${draft.mode}）· 章节目标：${draft.chapterGoal}`,
   ];
   if (tail) lines.push(`上一场结尾（仅供衔接语气与局面，禁止重复叙述）：\n…${tail}`);
@@ -988,7 +962,7 @@ export function sceneContinuationPrompt(
       `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），在同一调用中提交要点式 notes、正文与 actualState；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
     );
   } else {
-    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft 做整章审阅（其返回的 content 为组装后全文），不要先输出总结或更新任务清单。");
+    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft 做整章隔离终审，不要先输出总结或更新任务清单。");
   }
   return lines.join("\n");
 }
@@ -999,6 +973,8 @@ export async function runAgent(options: {
   sessionId: string;
   prompt: string;
   variantGroupId?: string;
+  /** Server-side job id used to correlate every provider call in model_usage. */
+  jobId?: string;
   characterScope?: number[];
   simpleCharacterScope?: number[];
   selectedDocumentBlocks?: Array<{ path: string; text?: string }>;
@@ -1036,13 +1012,11 @@ export async function runAgent(options: {
       .map((message) => ({ role: message.role, content: message.content, channel: message.channel })),
   );
   const previousTaskState = store.sessionContext(sessionId);
-  // Build once and reuse byte-for-byte. Slot 4 deliberately ignores intensive
-  // and task mode; dynamic style evidence is assembled only after planning.
-  const stableSystemPrefix = buildStableSystemPrefix(
-    project, store, permissionMode, { intensive: false }, "general",
-  );
+  // Planning is classification/routing, not prose generation. Prefer the cheap
+  // summarizer/Flash assignment and keep the request tool-free.
+  const plannerModel = options.models?.summarizer ?? options.models?.inline ?? model;
   const planned = await planWritingTask(
-    model, project, store, prompt, history, signal, characterScope, stableSystemPrefix,
+    plannerModel, project, store, prompt, history, signal, characterScope,
   );
   const task = planned.task;
   // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
@@ -1055,8 +1029,15 @@ export async function runAgent(options: {
       ? options.models?.writer ?? model
       : model;
   if ("usage" in planned && planned.usage) {
-    emitUsageEvent(emit, store, sessionId, model, planned.usage);
+    emitUsageEvent(emit, store, sessionId, plannerModel, planned.usage, undefined, "planner", options.jobId);
   }
+  // Build execution prefix and tool profile once, then reuse both byte-for-byte
+  // for every step in this job. Profiles are stable and project-agnostic.
+  const stableSystemPrefix = buildStableSystemPrefix(
+    project, store, permissionMode, { intensive: false }, "general",
+  );
+  const executionTools = agentToolsForTask(task.mode, permissionMode);
+  const executionToolNames = new Set(executionTools.map(tool => tool.function.name));
   // Task state binds to the current dialogue, not the session shell.
   // - continuation: reuse prior active doc / todos / tool memory
   // - same mode without continuation: keep todos (multi-turn ask_user etc.), but never sticky-inherit a doc via COALESCE
@@ -1104,8 +1085,20 @@ export async function runAgent(options: {
     ?? options.models?.summarizer
     ?? options.models?.reviewer
     ?? model;
+  const chapterReviewContext = [
+    projectInstructionsPrompt(project),
+    structuredCreativeContext(store, task, characterScope, simpleCharacterScope),
+  ].filter((value): value is string => Boolean(value?.trim())).join("\n\n");
+  let currentUsageStep: number | undefined;
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    modelUsageReporter: (callModel, callUsage, meta) => {
+      emit(buildRecordedUsageEvent(store, sessionId, callModel, callUsage, {
+        ...meta,
+        ...(meta.step === undefined && currentUsageStep !== undefined ? { step: currentUsageStep } : {}),
+        ...(meta.jobId || !options.jobId ? {} : { jobId: options.jobId }),
+      }));
+    },
     readSnapshots: new Map(),
     readCharactersUsed: 0,
     simpleCharacterScope,
@@ -1117,6 +1110,16 @@ export async function runAgent(options: {
     proseAdjudicator: {
       model: adjudicatorModel,
       signal,
+    },
+    // Prefer the configured cheap reviewer for the isolated full-chapter read;
+    // retain the writing model as a quality/compatibility fallback.
+    chapterReviewer: {
+      model: options.models?.reviewer ?? executionModel,
+      ...(options.models?.reviewer && options.models.reviewer !== executionModel
+        ? { fallbackModel: executionModel }
+        : {}),
+      signal,
+      context: chapterReviewContext,
     },
     // Best-of-N scene sampling (experimental, off by default): rewrites use the
     // main writing model in a dedicated plain-text call, not the cheap adjudicator.
@@ -1164,13 +1167,14 @@ export async function runAgent(options: {
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; turn < turnLimit; turn += 1) {
       const step = turn + 1;
+      currentUsageStep = step;
       emit({ type: "step_start", step });
       const result = await streamCompletion(executionModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
-      }, (text) => emit({ type: "text", text, channel: "reasoning" }), true);
+      }, (text) => emit({ type: "text", text, channel: "reasoning" }), { tools: executionTools });
       if (result.usage) {
-        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step);
+        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step, "agent_step", options.jobId);
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
@@ -1220,7 +1224,9 @@ export async function runAgent(options: {
       for (const call of result.toolCalls) {
         emit({ type: "tool", name: call.name });
         let toolResult: string;
-        if (call.name === "search_project" && ++projectSearchCalls > 2) {
+        if (!executionToolNames.has(call.name)) {
+          toolResult = JSON.stringify({ error: `工具 ${call.name} 不在当前 ${task.mode} 任务的固定允许集中；请使用已提供的工具继续` });
+        } else if (call.name === "search_project" && ++projectSearchCalls > 2) {
           toolResult = JSON.stringify({ error: "本轮项目搜索已达到两次上限；请使用已有结果和最小文档截取继续。" });
         } else if (DOCUMENT_READ_TOOLS.has(call.name) && ++documentReadCalls > MAX_DOCUMENT_READS_PER_RUN) {
           toolResult = JSON.stringify({
@@ -1332,8 +1338,7 @@ export async function runAgent(options: {
           toolContext.lastWritePack = undefined;
           toolContext.writePackSceneId = undefined;
           toolContext.chapterSceneDraft = undefined;
-          // Per-chapter scene-gate state: bounce counts, voice evidence, prior notes.
-          toolContext.sceneStyleBounces = undefined;
+          // Per-chapter scene-gate state: voice evidence and prior notes.
           toolContext.sceneStyleEvidence = undefined;
           toolContext.chapterStylePriorNotes = undefined;
           // Style verdicts are per-chapter sentences; stale entries only waste lookups.
@@ -2097,26 +2102,33 @@ function emitUsageEvent(
     estimated?: boolean;
   },
   step?: number,
+  callKind = "agent_step",
+  jobId?: string,
 ): void {
   const estimated = usage.estimated === true;
   const call = toStepUsage(usage, model.pricing);
-  let sessionUsage: UsageSummary = store.usage(sessionId);
-  // Only bill/store provider-reported usage; estimates stay UI-only.
-  if (model.pricing && !estimated) {
-    sessionUsage = store.recordUsage(sessionId, model.model, usage, model.pricing);
+  if (!estimated) {
+    emit(buildRecordedUsageEvent(store, sessionId, model, usage, {
+      callKind,
+      ...(step === undefined ? {} : { step }),
+      ...(jobId ? { jobId } : {}),
+    }));
+    return;
   }
   emit({
     type: "usage",
-    usage: sessionUsage,
+    usage: store.usage(sessionId),
     call,
     ...(step !== undefined ? { step } : {}),
+    callKind,
+    ...(jobId ? { jobId } : {}),
   });
 }
 
 /**
- * Low-level chat completion. CACHE: when toolsEnabled, always pass the frozen
- * global TOOLS set from schema.ts — do not build per-request tool lists with
- * project paths/ids (that destroys the tools-side of the prefix cache).
+ * Low-level chat completion. CACHE: execution receives one frozen, order-stable
+ * task profile for the whole job. Never derive tools from project paths/ids or
+ * replace the profile between steps.
  */
 async function streamCompletion(
   model: ModelConfig,
@@ -2124,16 +2136,17 @@ async function streamCompletion(
   signal: AbortSignal | undefined,
   onText: (text: string) => void,
   onReasoning: (text: string) => void,
-  toolsEnabled = true,
+  options: { tools?: readonly ToolDefinition[]; maxCompletionTokens?: number } = {},
 ): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({
-    // TOOLS is deep-frozen and project-agnostic — keep it that way for cache.
+    // The selected profile is frozen and project-agnostic for this job.
     model: model.model,
     messages,
-    ...(toolsEnabled ? { tools: TOOLS } : {}),
+    ...(options.tools?.length ? { tools: options.tools } : {}),
     stream: true,
     stream_options: { include_usage: true },
+    ...(options.maxCompletionTokens ? { max_tokens: options.maxCompletionTokens } : {}),
     ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
     ...(model.topP !== undefined ? { top_p: model.topP } : {}),
   });

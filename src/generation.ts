@@ -1,4 +1,4 @@
-import type { AgentEvent, Character, ModelConfig, StepUsage, UsageSummary } from "./types.js";
+import type { AgentEvent, Character, ModelConfig } from "./types.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
@@ -11,9 +11,9 @@ import {
 } from "./prose_quality.js";
 import { adjudicateProseStyleForAudit } from "./prose_adjudicate.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
-import { calculateUsageCost } from "./pricing.js";
 import { modelSupportsToolChoice } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
+import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { compileWritePack, formatWritePackForWriter, writePackDraftContractPrompt } from "./write_pack.js";
@@ -37,6 +37,7 @@ export async function suggestActions(input: {
   hasSelection: boolean;
   characters: Array<{ id: number; name: string; aliases: string[] }>;
   signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
 }): Promise<ActionSuggestion[]> {
   if (!input.request.trim()) throw new Error("请求不能为空");
   if (input.activePath && requestsWholeDocumentRewrite(input.request)) {
@@ -50,6 +51,7 @@ export async function suggestActions(input: {
     { role: "system", content: `你是写作应用的意图路由器，只负责提出可执行动作，不创作正文，也不修改数据。只输出 JSON 数组，包含 1 到 3 个对象。对象字段：mode（只能是 write/continue/rewrite/rewrite_document/polish/character）、label（简短中文按钮文案）、reason（不超过40字）、characterId（仅修改已有角色时使用，必须来自给定角色列表）、documentPaths（可选字符串数组）。规则：新建正文用 write；接续当前文档用 continue；修改选区内容用 rewrite；修改当前完整文档用 rewrite_document；仅改善选区语言用 polish；创建或修改角色资料用 character。rewrite_document 只有存在 activePath 时才能提出，且不要求文本选区。处理角色卡时，根据用户要求可从给定 documents 中选择最多 5 个可能相关的 lore/设定 或 outline/大纲 文档放入 documentPaths（优先 lore/ 与 outline/，不要选 archive 旧稿）；不需要资料时返回空数组。conversation 是当前请求之前的最近对话。必须结合它判断省略的操作对象和指代：若用户正在创建或修改角色卡，后续补充、调整、确认等请求仍应路由到 character；对话中提到的世界观或参考文档不代表要切换为正文或文档编辑。仅在用户明确改变任务时切换模式。不要发明文档、角色 ID 或其他工具。` },
     { role: "user", content: JSON.stringify({ request: input.request, conversation: input.conversation?.slice(-12) ?? [], activePath: input.activePath || null, hasSelection: input.hasSelection, documents: input.documents.slice(0, 100), characters: input.characters.slice(0, 100) }) },
   ], input.signal);
+  if (result.usage) input.usageReporter?.(input.model, result.usage, { callKind: "action_suggestions" });
   const value = parseJsonArray(result.content);
   const validModes = new Set<ActionMode>(["write", "continue", "rewrite", "rewrite_document", "polish", "character"]);
   const characterIds = new Set(input.characters.map(item => item.id));
@@ -98,10 +100,18 @@ export interface GenerateWritingOptions {
   characterIds?: number[];
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
+  jobId?: string;
 }
 
 export async function generateWriting(options: GenerateWritingOptions): Promise<void> {
   const emit = async (event: AgentEvent) => { await options.onEvent?.(event); };
+  const usageReporter: ModelUsageReporter = (callModel, callUsage, meta) => {
+    void emit(buildRecordedUsageEvent(options.store, options.sessionId, callModel, callUsage, {
+      ...meta,
+      step: meta.step ?? 1,
+      ...(meta.jobId || !options.jobId ? {} : { jobId: options.jobId }),
+    }));
+  };
   const pending = options.store.writingDraft(options.sessionId);
   const effective = pending
     ? { ...options, mode: pending.mode as WritingMode, instruction: pending.instruction, path: pending.path, selection: pending.selection }
@@ -127,7 +137,7 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
         selection: draftBase.selection, draft: draftResult.draft,
       });
       if (draftResult.usage) {
-        await emit(buildUsageEvent(draftBase.store, draftBase.sessionId, draftBase.draftModel, draftResult.usage, 1));
+        await emit(buildUsageEvent(draftBase.store, draftBase.sessionId, draftBase.draftModel, draftResult.usage, 1, "draft_generation", options.jobId));
       }
       const report = `${pending ? "草案已修改" : "写作草案已生成"}：\n\n${draftResult.draft}\n\n回复修改要求可继续调整草案；回复“确认开写”后才会调用正文模型。`;
       draftBase.store.addMessage(draftBase.sessionId, "assistant", report);
@@ -144,7 +154,7 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     let generated = cleanModelText(result.content);
     if (!generated) throw new Error("模型没有返回正文");
     const usages = result.usage ? [result.usage] : [];
-    const repaired = await repairGeneratedProse(effective.model, generated, effective.signal);
+    const repaired = await repairGeneratedProse(effective.model, generated, effective.signal, usageReporter);
     if (repaired.changed) {
       generated = repaired.text;
       usages.push(...repaired.usages);
@@ -160,12 +170,12 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     const summary = await safeChangeSummary(effective.summaryModel ?? effective.model, {
       kind: "document", action: modeLabel(effective.mode), target: path, instruction: effective.instruction,
       before: summaryBefore(effective.mode, before, effective.selection), after: summaryAfter(effective.mode, generated),
-    }, fallbackSummary, effective.signal);
+    }, fallbackSummary, effective.signal, usageReporter);
     effective.store.addMessage(effective.sessionId, "assistant", summary);
     await emit({ type: "text", text: `\n\n${summary}`, channel: "output" });
     const totalUsage = sumModelUsage(usages);
     if (totalUsage) {
-      await emit(buildUsageEvent(effective.store, effective.sessionId, effective.model, totalUsage, 1));
+      await emit(buildUsageEvent(effective.store, effective.sessionId, effective.model, totalUsage, 1, "writing_generation", options.jobId));
     }
     await emit({ type: "proposal", proposal });
     await emit({ type: "step_done", step: 1 });
@@ -188,15 +198,20 @@ export async function generateCharacter(input: {
   allowedDocumentPaths?: string[];
   onTool?: (name: string, path: string) => void | Promise<void>;
   signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/experiences/notes；结构化条目必须有稳定 ASCII id，演进记录包含 status/sourceRefs/validFrom/validUntil。competencies 每项必须填写 name、summary 和 unlocked；summary 是无论是否解锁都会展示的简短能力概述，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 sourceRefs/validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
-  const result = input.project && input.allowedDocumentPaths?.length
-    ? await runReadOnlyToolLoop(input.model, messages, input.project, input.allowedDocumentPaths, input.signal, input.onTool)
+  const usesToolLoop = Boolean(input.project && input.allowedDocumentPaths?.length);
+  const result = usesToolLoop
+    ? await runReadOnlyToolLoop(input.model, messages, input.project!, input.allowedDocumentPaths!, input.signal, input.onTool, input.usageReporter)
     : await completeText(input.model, messages, input.signal);
+  // The tool loop records every provider round itself, including its final
+  // no-tool response. Only the direct path needs an outer usage record.
+  if (result.usage && !usesToolLoop) input.usageReporter?.(input.model, result.usage, { callKind: "character_generation" });
   const parsed = parseJsonObject(result.content);
   return normalizeCharacterDraft(parsed);
 }
@@ -212,6 +227,7 @@ export async function summarizeCharacterCompetency(input: {
     costs?: string[];
   };
   signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
 }): Promise<string> {
   const competency = {
     name: String(input.competency.name ?? "").trim().slice(0, 160),
@@ -231,6 +247,7 @@ export async function summarizeCharacterCompetency(input: {
     },
     { role: "user", content: JSON.stringify(competency) },
   ], input.signal);
+  if (result.usage) input.usageReporter?.(input.model, result.usage, { callKind: "character_competency_summary" });
   const summary = result.content
     .replace(/\s+/g, " ")
     .trim()
@@ -252,8 +269,16 @@ export async function updateCharacterFromConversation(input: {
   allowedDocumentPaths?: string[];
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
+  jobId?: string;
 }): Promise<void> {
   const emit = async (event: AgentEvent) => { await input.onEvent?.(event); };
+  const usageReporter: ModelUsageReporter = (callModel, callUsage, meta) => {
+    void emit(buildRecordedUsageEvent(input.store, input.sessionId, callModel, callUsage, {
+      ...meta,
+      step: meta.step ?? 1,
+      ...(meta.jobId || !input.jobId ? {} : { jobId: input.jobId }),
+    }));
+  };
   if (!input.store.sessionExists(input.sessionId)) throw new Error("写作会话不存在");
   const existing = input.characterId === undefined
     ? undefined
@@ -266,6 +291,7 @@ export async function updateCharacterFromConversation(input: {
       model: input.model, description: input.instruction, existing,
       project: input.store.project, allowedDocumentPaths: input.allowedDocumentPaths,
       onTool: async () => { await emit({ type: "tool", name: "read_document" }); }, signal: input.signal,
+      usageReporter,
     });
     const character = input.store.saveCharacterWithRevision(input.sessionId, userMessageId, {
       ...draft, id: existing?.id,
@@ -277,7 +303,7 @@ export async function updateCharacterFromConversation(input: {
       instruction: input.instruction,
       before: existing ? JSON.stringify(characterContext(existing), null, 2) : "（新建）",
       after: JSON.stringify(characterContext(character), null, 2),
-    }, fallback, input.signal);
+    }, fallback, input.signal, usageReporter);
     input.store.addMessage(input.sessionId, "assistant", message);
     await emit({ type: "text", text: message, channel: "output" });
     await emit({ type: "character", character });
@@ -515,28 +541,14 @@ function buildUsageEvent(
   model: ModelConfig,
   usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number },
   step?: number,
+  callKind = "generation",
+  jobId?: string,
 ): AgentEvent {
-  const cacheMissTokens = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
-  const normalized = { ...usage, cacheMissTokens };
-  const call: StepUsage = {
-    promptTokens: usage.promptTokens,
-    completionTokens: usage.completionTokens,
-    cacheHitTokens: usage.cacheHitTokens,
-    cacheMissTokens,
-    totalTokens: usage.promptTokens + usage.completionTokens,
-    cost: model.pricing ? calculateUsageCost(normalized, model.pricing) : 0,
-    currency: model.pricing?.currency ?? "CNY",
-  };
-  let sessionUsage: UsageSummary = store.usage(sessionId);
-  if (model.pricing) {
-    sessionUsage = store.recordUsage(sessionId, model.model, usage, model.pricing);
-  }
-  return {
-    type: "usage",
-    usage: sessionUsage,
-    call,
-    ...(step !== undefined ? { step } : {}),
-  };
+  return buildRecordedUsageEvent(store, sessionId, model, usage, {
+    callKind,
+    ...(step === undefined ? {} : { step }),
+    ...(jobId ? { jobId } : {}),
+  });
 }
 function modeLabel(mode: WritingMode): string { return ({ write: "新写", continue: "续写", rewrite: "改写选区", rewrite_document: "修改全文档", polish: "润色" })[mode]; }
 function cleanModelText(value: string): string { return value.trim().replace(/^```(?:markdown|md)?\s*/i, "").replace(/\s*```$/, "").trim(); }
@@ -547,6 +559,7 @@ async function repairGeneratedProse(
   model: ModelConfig,
   original: string,
   signal?: AbortSignal,
+  usageReporter?: ModelUsageReporter,
 ): Promise<{ text: string; changed: boolean; repairedIssues: number; usages: ModelUsage[] }> {
   let text = original;
   let repairedIssues = 0;
@@ -555,7 +568,11 @@ async function repairGeneratedProse(
     const scanned = analyzeProseStyle(text);
     let issues: ProseStyleIssue[];
     if (round === 0 && scanned.some(issue => issue.severity !== "info")) {
-      const reviewed = await adjudicateProseStyleForAudit(text, scanned, model, { signal });
+      const reviewed = await adjudicateProseStyleForAudit(text, scanned, model, {
+        signal,
+        usageReporter,
+        callKind: "writing_prose_adjudication",
+      });
       issues = reviewed.issues.filter(issue =>
         issue.severity === "error"
         || (issue.severity === "warning" && issue.confidence >= 0.95),
@@ -650,12 +667,13 @@ function defaultActionLabel(mode: ActionMode): string {
 async function safeChangeSummary(model: ModelConfig, change: {
   kind: "document" | "character"; action: string; target: string;
   instruction: string; before: string; after: string;
-}, fallback: string, signal?: AbortSignal): Promise<string> {
+}, fallback: string, signal?: AbortSignal, usageReporter?: ModelUsageReporter): Promise<string> {
   try {
     const result = await completeText(model, [
       { role: "system", content: `你是写作应用的改动总结器。只根据操作前后内容说明实际变化，不继续创作，不评价质量，不提出下一步建议。使用简洁中文：先用一句话说明结果，再列出 1 至 5 条最重要的具体改动。正文指出情节、段落、措辞或新增内容发生在哪里；角色卡指出哪些结构化字段改变。没有证据的变化不要声称。不要输出 Markdown 标题。` },
       { role: "user", content: JSON.stringify({ ...change, before: change.before.slice(-6_000), after: change.after.slice(0, 6_000) }) },
     ], signal);
+    if (result.usage) usageReporter?.(model, result.usage, { callKind: "change_summary" });
     return result.content.trim() || fallback;
   } catch { return fallback; }
 }
@@ -684,6 +702,7 @@ export async function maybeAutoTitleSession(options: {
   model: ModelConfig;
   sessionId: string;
   signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
 }): Promise<{ title?: string; skipped?: string }> {
   const session = options.store.getSession(options.sessionId);
   if (!session) return { skipped: "missing" };
@@ -716,6 +735,7 @@ export async function maybeAutoTitleSession(options: {
       },
       { role: "user", content: `请为以下写作会话生成标题：\n\n${transcript}` },
     ], options.signal);
+    if (result.usage) options.usageReporter?.(options.model, result.usage, { callKind: "auto_title" });
 
     let title = result.content.trim().split(/\r?\n/)[0]?.trim() ?? "";
     title = title
@@ -758,7 +778,8 @@ async function runReadOnlyToolLoop(
   allowedPaths: string[],
   signal?: AbortSignal,
   onTool?: (name: string, path: string) => void | Promise<void>,
-): Promise<{ content: string }> {
+  usageReporter?: ModelUsageReporter,
+): Promise<{ content: string; usage?: import("./types.js").ModelTokenUsage }> {
   if (!model.apiKey) throw new Error("请先配置模型 API Key");
   const allowed = new Set(allowedPaths.filter(path => project.documentExists(path) && !project.isDocumentHidden(path)).slice(0, 5));
   const read = new Map<string, string>();
@@ -782,7 +803,9 @@ async function runReadOnlyToolLoop(
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`角色卡上下文读取失败（${response.status}）：${responseBody.slice(0, 500)}`);
-    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string; tool_calls?: ToolCall[] } }> };
+    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string; tool_calls?: ToolCall[] } }>; usage?: unknown };
+    const usage = parseModelTokenUsage(payload.usage);
+    if (usage) usageReporter?.(model, usage, { callKind: "character_tool_loop" });
     const message = payload.choices?.[0]?.message;
     if (!message) throw new Error("角色模型没有返回有效响应");
     const calls = message.tool_calls ?? [];

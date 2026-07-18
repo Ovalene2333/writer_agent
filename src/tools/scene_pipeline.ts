@@ -28,6 +28,7 @@ import {
   sceneProseScore,
 } from "../prose_metrics.js";
 import { sceneMannerismGateError } from "../prose_quality.js";
+import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
 import type { ToolExecutionContext } from "./types.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
 import { gateProseStyle, submitFullDocumentProposal } from "./proposals.js";
@@ -77,7 +78,6 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
   context.writePackSceneId = undefined;
   context.lastWritePack = undefined;
   context.priorProseContext = undefined;
-  context.sceneStyleBounces = undefined;
   context.sceneStyleEvidence = undefined;
   const priorText = priorProseText(project, draft, context);
   const stylePriorNotes = priorText ? priorChapterNegativeList(priorText) : [];
@@ -151,28 +151,10 @@ export async function handleWriteChapterScene({ input, project, store, context }
       message: "删去每处复读中的重复句后，用同一 sceneId 重新调用 write_chapter_scene（notes 可保留）。",
     });
   }
-  // Generation-side density gate: block before draft so chapter-end style revises
-  // stay rare — but at most ONE bounce per scene. A second dense submission enters
-  // the draft with styleDeferred: remaining hits are cheaper as chapter-end precise
-  // replacements than another full-scene regeneration left dead in context.
-  const sceneStyleError = sceneMannerismGateError(content);
-  let deferredStyleError: string | undefined;
-  if (sceneStyleError) {
-    const bounces = context.sceneStyleBounces ?? (context.sceneStyleBounces = new Map());
-    const priorBounces = bounces.get(sceneId) ?? 0;
-    if (priorBounces < 1) {
-      bounces.set(sceneId, priorBounces + 1);
-      return JSON.stringify({
-        status: "style_revision_required",
-        code: "SCENE_STYLE_DENSE",
-        error: sceneStyleError,
-        sceneId,
-        complete: false,
-        message: "本场正文尚未写入草稿。请按 error 中列出的命中句逐条改写后，用同一 sceneId 重新调用 write_chapter_scene（可保留 notes，只改正文句式）。同一场只回弹一次：再次提交将直接入稿，剩余命中句留到整章 inspect 后用 revise_chapter_draft_style 一并修。",
-      });
-    }
-    deferredStyleError = sceneStyleError;
-  }
+  // Never spend another full-scene generation on sentence-level density. Keep
+  // the accepted scene and defer exact offending sentences to the mandatory
+  // chapter inspection/revise gate. Structural and length failures still reject.
+  const deferredStyleError = sceneMannerismGateError(content);
   // Experimental best-of-N prose sampling: the submitted scene is candidate 0;
   // fact-preserving rewrites compete on the deterministic prose score. Any
   // rewrite failure silently keeps the original — this never blocks a scene.
@@ -184,8 +166,6 @@ export async function handleWriteChapterScene({ input, project, store, context }
   );
   const result = writeChapterScene(draft, sceneId, selectedContent, input.actualState);
   context.chapterSceneDraft = result.draft;
-  // A later structural rewrite of this scene gets a fresh dense-bounce allowance.
-  context.sceneStyleBounces?.delete(sceneId);
   // A write pack belongs to exactly one scene. The next/revised scene must recompile.
   context.writePackCompiled = false;
   context.writePackSceneId = undefined;
@@ -225,7 +205,7 @@ export async function handleWriteChapterScene({ input, project, store, context }
         ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
         : "",
       deferredStyleError
-        ? "本场带 styleDeferred 入稿：不要重写本场，整章 inspect 被拦时把命中句用一次 revise_chapter_draft_style 精确替换修完。"
+        ? "本场带 styleDeferred 入稿：不要重写本场；整章 inspect 会硬拦截，届时把命中句用 revise_chapter_draft_style 精确替换修完并复检。"
         : "",
       candidateReport?.chosen === "rewrite"
         ? "候选采样选中了重写稿并已写入草稿（见 content 字段）；本场后续审阅与精确替换一律以该文本为准，不要引用你提交的原稿字句。"
@@ -288,6 +268,7 @@ async function sampleSceneCandidates(
       styleEvidence,
       sceneBrief: sceneCardBrief(sceneCard),
       original,
+      usageReporter: args.context.modelUsageReporter,
     })));
   const generated = settled.filter(item => item.status === "fulfilled").length;
   const eligibleRewrites = settled
@@ -406,14 +387,93 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
       message: "复读句与逐字回收句用一次 revise_chapter_draft_style 精确替换修完（复读：把「S。S。」替换为单句；回收：只改写命中句，不重写场景），然后重新 inspect 确认计量通过。",
     });
   }
-  draft.inspectedVersion = draft.version;
   const styleWarnings = metrics.issues.map(issue => ({
     code: issue.code,
     message: issue.message,
     examples: issue.examples.slice(0, 5),
   }));
+  const ledger = chapterSceneLedger(draft);
+  let reviewFailure: { attempts: number; errors: string[] } | undefined;
+  if (context.chapterReviewer) {
+    const reviewer = context.chapterReviewer;
+    const runReview = reviewer.run ?? reviewChapterDraft;
+    const reviewModels = [reviewer.model, reviewer.fallbackModel]
+      .filter((model): model is NonNullable<typeof model> => Boolean(model))
+      .filter((model, index, models) => models.findIndex(candidate =>
+        candidate.baseUrl === model.baseUrl && candidate.model === model.model
+      ) === index);
+    const reviewErrors: string[] = [];
+    for (const reviewModel of reviewModels) {
+      try {
+        const reviewed = await runReview(reviewModel, {
+          chapterGoal: draft.chapterGoal,
+          content,
+          scenes: ledger,
+          context: reviewer.context,
+        }, reviewer.signal);
+        if (reviewed.usage) {
+          context.modelUsageReporter?.(reviewModel, reviewed.usage, { callKind: "chapter_review" });
+        }
+        if (reviewed.review.verdict === "revise") {
+          const targetIds = new Set(reviewed.review.issues
+            .filter(issue => issue.severity === "blocker" && issue.sceneId)
+            .map(issue => issue.sceneId!));
+          const targetScenes = draft.completed.flatMap((completed, index) => {
+            if (!targetIds.has(completed.sceneId)) return [];
+            return [{
+              sceneId: completed.sceneId,
+              card: draft.scenes[index],
+              content: completed.content,
+              actualState: completed.actualState,
+              ...(index > 0 ? { previousTail: draft.completed[index - 1].content.slice(-600) } : {}),
+              ...(index + 1 < draft.completed.length ? { nextHead: draft.completed[index + 1].content.slice(0, 600) } : {}),
+            }];
+          });
+          return JSON.stringify({
+            status: "structural_revision_required",
+            code: "CHAPTER_REVIEW_BLOCKED",
+            path: draft.path,
+            contentCharacters: content.length,
+            sceneCount: draft.completed.length,
+            proseStyle: "passed",
+            proseMetrics: metrics.stats,
+            ...(styleWarnings.length ? { styleWarnings } : {}),
+            ledger,
+            chapterReview: reviewed.review,
+            targetScenes,
+            message: "终审发现有证据的结构/连续性问题。只重写 targetScenes 中 blocker 对应场景；保留无关事实与声线，并以新 actualState 为准续写被失效的后续场景。禁止复述审阅报告或全文重写。",
+          });
+        }
+        draft.inspectedVersion = draft.version;
+        return JSON.stringify({
+          status: "inspection_required",
+          reviewCompleted: true,
+          path: draft.path,
+          chapterGoal: draft.chapterGoal,
+          contentCharacters: content.length,
+          sceneCount: draft.completed.length,
+          proseStyle: "passed",
+          proseMetrics: metrics.stats,
+          ...(styleWarnings.length ? { styleWarnings } : {}),
+          ledger,
+          chapterReview: reviewed.review,
+          message: "整章终审已完成且通过。下一回复禁止输出或复述审阅正文；第一个动作直接调用 propose_chapter_draft，把 chapterReview.chapterChange 和 reviewNotes 原样写入对应参数。",
+        });
+      } catch (error) {
+        if (error instanceof ChapterReviewRequestError && error.usage) {
+          context.modelUsageReporter?.(reviewModel, error.usage, { callKind: "chapter_review_failed" });
+        }
+        reviewErrors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+      }
+    }
+    reviewFailure = { attempts: reviewModels.length, errors: reviewErrors };
+  }
+  draft.inspectedVersion = draft.version;
   return JSON.stringify({
     status: "inspection_required",
+    reviewCompleted: false,
+    reviewMode: "agent_fallback",
+    ...(reviewFailure ? { reviewFailure } : {}),
     path: draft.path,
     chapterGoal: draft.chapterGoal,
     contentCharacters: content.length,
@@ -421,9 +481,8 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
     proseStyle: "passed",
     proseMetrics: metrics.stats,
     ...(styleWarnings.length ? { styleWarnings } : {}),
-    ledger: chapterSceneLedger(draft),
-    // Scene-boundary context resets removed each scene's prose from the dialogue,
-    // so final review reads the assembled chapter from here (paid once, not per step).
+    ledger,
+    // Only the compatibility fallback appends the full chapter to the Agent loop.
     content,
     reviewChecklist: [
       "相邻场景是否因果承接，而非只按时间并列",
@@ -432,7 +491,7 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
     ],
-    message: "content 为组装后的整章正文（此前各场正文已不在对话中，通读与精确替换一律以 content 为准）。发现结构问题时直接为目标 sceneId 重新调用 write_chapter_scene（同时提供新 notes）；确认无误后再 propose_chapter_draft。"
+    message: "隔离终审不可用，已回退到主 Agent 通读：content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
       + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",
   });
 }

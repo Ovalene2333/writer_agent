@@ -129,7 +129,12 @@ export async function gateProseStyle(
       afterContent,
       issues,
       context.proseAdjudicator.model,
-      { signal: context.proseAdjudicator.signal, verdictCache: context.proseVerdictCache },
+      {
+        signal: context.proseAdjudicator.signal,
+        verdictCache: context.proseVerdictCache,
+        usageReporter: context.modelUsageReporter,
+        callKind: "prose_gate",
+      },
     );
     issues = flash.issues;
   }
