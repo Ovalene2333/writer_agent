@@ -1,4 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
+import { thinkingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -19,6 +20,7 @@ export class ChapterStyleRepairRequestError extends Error {
     message: string,
     readonly usage?: ModelTokenUsage,
     readonly requestCharacters = 0,
+    readonly failureKind: "http" | "truncated" | "invalid_output" = "invalid_output",
     options?: ErrorOptions,
   ) {
     super(message, options);
@@ -29,6 +31,8 @@ export class ChapterStyleRepairRequestError extends Error {
 const STYLE_REPAIR_SYSTEM = `你是中文小说局部句式修订器。只修复输入列出的硬拦截句，不改事件、事实、人物状态、场景顺序或未列出的正文。
 只输出 JSON：{"edits":[{"search":"原句","replace":"替换句"}]}。
 search 必须逐字取自 issue.sentence；每个 issue 至多一条 edit；replace 必须是可直接替换的完整正文，不得包含 Markdown 标题、解释、占位符或元信息。`;
+
+export const CHAPTER_STYLE_REPAIR_BATCH_SIZE = 8;
 
 export function buildChapterStyleRepairMessages(input: {
   issues: ChapterStyleRepairIssue[];
@@ -41,8 +45,8 @@ export function buildChapterStyleRepairMessages(input: {
       role: "user",
       content: JSON.stringify({
         chapterGoal: input.chapterGoal,
-        issues: input.issues.slice(0, 20),
-        ...(input.styleEvidence?.trim() ? { styleEvidence: input.styleEvidence.slice(0, 2_000) } : {}),
+        issues: input.issues.slice(0, CHAPTER_STYLE_REPAIR_BATCH_SIZE),
+        ...(input.styleEvidence?.trim() ? { styleEvidence: input.styleEvidence.slice(0, 1_000) } : {}),
       }),
     },
   ];
@@ -78,15 +82,16 @@ export async function requestChapterStyleRepair(
   input: { issues: ChapterStyleRepairIssue[]; chapterGoal: string; styleEvidence?: string },
   signal?: AbortSignal,
 ): Promise<{ edits: ChapterStyleEdit[]; usage?: ModelTokenUsage; requestCharacters: number }> {
-  const messages = buildChapterStyleRepairMessages(input);
+  const batch = input.issues.slice(0, CHAPTER_STYLE_REPAIR_BATCH_SIZE);
+  const messages = buildChapterStyleRepairMessages({ ...input, issues: batch });
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const body = JSON.stringify({
     model: model.model,
     messages,
     stream: false,
     temperature: 0.2,
-    max_tokens: 2_400,
     response_format: { type: "json_object" },
+    ...thinkingRequestOptions(model),
   });
   logModelRequest(endpoint, body);
   const response = await modelFetch(endpoint, {
@@ -101,24 +106,28 @@ export async function requestChapterStyleRepair(
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   const requestCharacters = messages.reduce((sum, message) => sum + message.content.length, 0);
-  let payload: { choices?: Array<{ message?: { content?: string | null } }>; usage?: unknown };
+  let payload: { choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>; usage?: unknown };
   try {
     payload = JSON.parse(responseBody) as typeof payload;
   } catch (error) {
-    throw new ChapterStyleRepairRequestError("局部风格修订响应不是 JSON", undefined, requestCharacters, { cause: error });
+    throw new ChapterStyleRepairRequestError("局部风格修订响应不是 JSON", undefined, requestCharacters, "invalid_output", { cause: error });
   }
   const usage = parseModelTokenUsage(payload.usage);
   if (!response.ok) {
-    throw new ChapterStyleRepairRequestError(`局部风格修订请求失败（${response.status}）`, usage, requestCharacters);
+    throw new ChapterStyleRepairRequestError(`局部风格修订请求失败（${response.status}）`, usage, requestCharacters, "http");
+  }
+  if (payload.choices?.[0]?.finish_reason === "length") {
+    throw new ChapterStyleRepairRequestError("局部风格修订输出达到长度上限", usage, requestCharacters, "truncated");
   }
   try {
-    const edits = parseChapterStyleRepair(payload.choices?.[0]?.message?.content ?? "", input.issues);
+    const edits = parseChapterStyleRepair(payload.choices?.[0]?.message?.content ?? "", batch);
     return { edits, ...(usage ? { usage } : {}), requestCharacters };
   } catch (error) {
     throw new ChapterStyleRepairRequestError(
       error instanceof Error ? error.message : String(error),
       usage,
       requestCharacters,
+      "invalid_output",
       { cause: error },
     );
   }

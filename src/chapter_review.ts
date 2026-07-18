@@ -1,4 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
+import { thinkingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -54,11 +55,16 @@ export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ r
   return [
     { role: "system", content: REVIEW_SYSTEM },
     {
+      role: "system",
+      // Keep reusable project context ahead of chapter-specific fields so repeated
+      // inspections and later chapters can reuse a longer provider cache prefix.
+      content: input.context?.trim() || "无额外项目终审上下文。",
+    },
+    {
       role: "user",
       content: JSON.stringify({
         chapterGoal: input.chapterGoal,
         scenes: input.scenes,
-        ...(input.context?.trim() ? { projectContext: input.context.trim() } : {}),
         fullChapter: input.content,
       }),
     },
@@ -134,8 +140,8 @@ export async function reviewChapterDraft(
     messages: buildChapterReviewMessages(input),
     stream: false,
     temperature: 0,
-    max_tokens: 2_400,
     response_format: { type: "json_object" },
+    ...thinkingRequestOptions(model),
   });
   logModelRequest(endpoint, body);
   const response = await modelFetch(endpoint, {

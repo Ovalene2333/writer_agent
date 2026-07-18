@@ -615,7 +615,10 @@ export async function startWriterServer(options: {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
       });
-      return context.json({ permissionMode: settings.permissionMode, scenePipeline: settings.scenePipeline });
+      return context.json({
+        permissionMode: settings.permissionMode,
+        scenePipeline: settings.scenePipeline,
+      });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }

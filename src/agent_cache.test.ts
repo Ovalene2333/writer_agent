@@ -13,11 +13,11 @@ import {
   agentToolSchemaHash,
   agentToolsForTask,
   admitReadAtom,
-  agentProgressFingerprint,
   boundToolResultForModel,
   buildRequestComponentUsage,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
+  buildToolArgumentRepairMessages,
   chapterContinuationPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
@@ -25,8 +25,12 @@ import {
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
   parsePlannerJson,
+  parseToolArgumentRepair,
+  plannerCompletionOptions,
   rehydrateRecentToolMessages,
   requestNeedsProjectFactSearch,
+  repairTruncatedToolArguments,
+  resolveRecentCharacterIds,
   restoreChapterDraftCheckpoint,
   sceneContinuationPrompt,
   stripStaleReasoningContent,
@@ -38,7 +42,7 @@ import { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
-import { parseChapterStyleRepair } from "./chapter_style_repair.js";
+import { buildChapterStyleRepairMessages, CHAPTER_STYLE_REPAIR_BATCH_SIZE, parseChapterStyleRepair } from "./chapter_style_repair.js";
 import { documentSpans } from "./document_spans.js";
 import { parseDocumentLocatorResult } from "./document_locator.js";
 import { parseDocumentRevision } from "./document_revision.js";
@@ -56,9 +60,10 @@ test("isolated chapter review carries the full draft once and returns bounded st
     sceneId: "arrival", title: "进入", plannedTurn: "门禁变红", plannedOutcome: "主角违规进入",
     actualState: { situation: ["主角违规进入"] },
   }];
-  const messages = buildChapterReviewMessages({ chapterGoal: "关系改变", content, scenes });
-  assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
-  assert.match(messages[1].content, /门禁灯由绿变红/u);
+  const messages = buildChapterReviewMessages({ chapterGoal: "关系改变", content, scenes, context: "稳定项目约束" });
+  assert.deepEqual(messages.map(message => message.role), ["system", "system", "user"]);
+  assert.equal(messages[1].content, "稳定项目约束");
+  assert.match(messages[2].content, /门禁灯由绿变红/u);
 
   const review = parseChapterReview(JSON.stringify({
     verdict: "revise",
@@ -94,6 +99,21 @@ test("isolated style repair only admits exact issue sentences", () => {
     search: issues[0].sentence,
     replace: "风从门缝钻进来，贴着她的手背往袖口里走。",
   }]);
+});
+
+test("isolated style repair bounds each request batch and style evidence", () => {
+  const issues = Array.from({ length: CHAPTER_STYLE_REPAIR_BATCH_SIZE + 3 }, (_, index) => ({
+    id: `i${index}`, code: "contrast", sentence: `命中句${index}。`,
+    before: "前文", after: "后文", instruction: "局部改写",
+  }));
+  const messages = buildChapterStyleRepairMessages({
+    chapterGoal: "关系改变",
+    issues,
+    styleEvidence: "例".repeat(2_000),
+  });
+  const payload = JSON.parse(messages[1].content) as { issues: unknown[]; styleEvidence: string };
+  assert.equal(payload.issues.length, CHAPTER_STYLE_REPAIR_BATCH_SIZE);
+  assert.equal(payload.styleEvidence.length, 1_000);
 });
 
 test("document spans are snapshot-scoped and locator outputs stay within candidates", () => {
@@ -144,7 +164,7 @@ test("request waterfall and oversized tool paging stay bounded", () => {
   }
 });
 
-test("validated checkpoints restore drafts and contribute to structural progress", () => {
+test("validated checkpoints restore drafts and clear with task state", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-checkpoint-"));
   try {
     const project = WriterProject.init(root, "断点");
@@ -160,10 +180,7 @@ test("validated checkpoints restore drafts and contribute to structural progress
       draftVersion: 0, completedScenes: 0, totalScenes: 1, draft, updatedAt: new Date().toISOString(),
     });
     assert.equal(restoreChapterDraftCheckpoint(store, sessionId, project, draft.path)?.path, draft.path);
-    const context: ToolExecutionContext = { permissionMode: "ask", chapterSceneDraft: draft };
-    const before = agentProgressFingerprint(context, store, sessionId);
     store.saveSessionTodos(sessionId, [{ id: "t1", content: "完成章节", status: "in_progress" }]);
-    assert.notEqual(agentProgressFingerprint(context, store, sessionId), before);
     store.clearSessionTaskState(sessionId);
     assert.equal(store.agentCheckpoint(sessionId), undefined);
     store.close();
@@ -216,6 +233,43 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.match(normal, /检查同名卡/);
   assert.match(normal, /必须 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
+  assert.match(normal, /结构化错误/);
+});
+
+test("character tool JSON recovery is conservative and keeps repair requests isolated", () => {
+  assert.deepEqual(JSON.parse(repairTruncatedToolArguments(
+    '{"id":4,"identity":{"name":"日和"}',
+  ) ?? "null"), { id: 4, identity: { name: "日和" } });
+  assert.deepEqual(JSON.parse(repairTruncatedToolArguments(
+    '{"id":4,"identity":{"name":"日和"},',
+  ) ?? "null"), { id: 4, identity: { name: "日和" } });
+  assert.equal(repairTruncatedToolArguments('{"id":4,"identity":{"name":"日'), undefined);
+  assert.equal(repairTruncatedToolArguments('[1,2]'), undefined);
+  assert.deepEqual(JSON.parse(parseToolArgumentRepair(
+    '```json\n{"id":4,"identity":{"name":"日和"}}\n```',
+  ) ?? "null"), { id: 4, identity: { name: "日和" } });
+
+  const messages = buildToolArgumentRepairMessages({
+    toolName: "save_character",
+    rawArguments: '{"id":4,"identity":{"name":"日',
+    parameterSchema: { type: "object" },
+  });
+  assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
+  const payload = JSON.parse(messages[1].content ?? "{}") as Record<string, unknown>;
+  assert.equal(payload.rawArguments, '{"id":4,"identity":{"name":"日');
+});
+
+test("short character follow-ups resolve the latest exact catalog mention", () => {
+  const catalog = [
+    { id: 3, name: "ARC-03「烁刃」", aliases: ["烁刃"] },
+    { id: 4, name: "ARC-04「锻星」", aliases: ["锻星", "千钧"] },
+  ];
+  assert.deepEqual(resolveRecentCharacterIds(catalog, [
+    "日系一点",
+    "已有 ARC-04「锻星」（id=4），现在读取必要分区。",
+    "烁刃也在场。",
+  ]), [4]);
+  assert.deepEqual(resolveRecentCharacterIds(catalog, ["名字再短一点", "没有出现角色名"]), []);
 });
 
 test("planner JSON parser accepts one object and rejects surrounding prose", () => {
@@ -229,6 +283,19 @@ test("planner JSON parser accepts one object and rejects surrounding prose", () 
   assert.equal(parsePlannerJson('分析如下：{"mode":"general"}'), undefined);
   assert.equal(parsePlannerJson('{"mode":'), undefined);
   assert.equal(parsePlannerJson('[]'), undefined);
+});
+
+test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () => {
+  assert.deepEqual(plannerCompletionOptions({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), {
+    temperature: 0,
+    topP: 1,
+    responseFormat: { type: "json_object" },
+    thinking: { type: "enabled" },
+  });
+  assert.deepEqual(plannerCompletionOptions({ provider: "openai-compatible", baseUrl: "https://api.openai.com/v1" }), {
+    temperature: 0,
+    topP: 1,
+  });
 });
 
 test("provider usage parsing and tagged persistence include hidden model calls", () => {
@@ -466,7 +533,7 @@ test("dynamic turn messages always expose the same slot count", () => {
   assert.match(empty[6].content ?? "", /工作记忆/);
 });
 
-test("read atoms lock one source snapshot and suppress overlapping bodies", () => {
+test("read atoms lock one source snapshot, reuse exact coverage and allow wider context", () => {
   const context: ToolExecutionContext = {
     permissionMode: "ask",
     readSnapshots: new Map(),
@@ -482,10 +549,10 @@ test("read atoms lock one source snapshot and suppress overlapping bodies", () =
   assert.equal(duplicate.status, "read_atom_reused");
   assert.equal("content" in duplicate, false);
 
-  const overlap = JSON.parse(admitReadAtom("read_document", "lore/world.md", "h1", JSON.stringify({
+  const overlapPayload = JSON.stringify({
     path: "lore/world.md", sourceHash: "h1", startLine: 18, endLine: 25, content: "重叠",
-  }), context)) as Record<string, unknown>;
-  assert.match(String(overlap.error), /重叠/);
+  });
+  assert.equal(admitReadAtom("read_document", "lore/world.md", "h1", overlapPayload, context), overlapPayload);
 
   const changed = JSON.parse(admitReadAtom("read_document", "lore/world.md", "h2", JSON.stringify({
     path: "lore/world.md", sourceHash: "h2", startLine: 30, endLine: 32, content: "新版本",

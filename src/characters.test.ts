@@ -39,7 +39,7 @@ test("competency unlock state is normalized and defaults to locked", () => {
   });
   assert.equal(locked.competencies[0].unlocked, false);
   assert.equal(unlocked.competencies[0].unlocked, true);
-  assert.deepEqual(competencyPromptView(locked.competencies[0]), { name: "Locked", summary: "Public hint", unlocked: false });
+  assert.deepEqual(competencyPromptView(locked.competencies[0]), { id: "skill-locked", name: "Locked", summary: "Public hint", unlocked: false });
   assert.deepEqual(competencyPromptView(unlocked.competencies[0]), unlocked.competencies[0]);
 });
 
@@ -140,6 +140,19 @@ test("saveCharacter upserts arrays and supports replaceSections", () => {
     });
     assert.equal(replaced.competencies.length, 1);
     assert.equal(replaced.competencies[0].id, "c3");
+
+    const generated = store.saveCharacter({
+      id: card.id,
+      psychology: {
+        traits: [{ id: "", label: "临场补充", description: "工具可省略新增条目的 id", sourceRefs: [] }],
+      },
+      motivations: [{
+        id: "非-ascii-id", category: "current", status: "active", priority: 50,
+        summary: "完成眼前任务", stakes: "", obstacles: [], sourceRefs: [],
+      }],
+    });
+    assert.match(generated.psychology.traits.find(item => item.label === "临场补充")?.id ?? "", /^trait-[a-z0-9-]+$/u);
+    assert.match(generated.motivations.find(item => item.summary === "完成眼前任务")?.id ?? "", /^goal-[a-z0-9-]+$/u);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

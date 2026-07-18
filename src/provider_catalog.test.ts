@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { modelSupportsToolChoice } from "./model_compat.js";
+import { modelSupportsToolChoice, thinkingRequestOptions } from "./model_compat.js";
 import { defaultPricing } from "./pricing.js";
 import { PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
@@ -12,6 +12,12 @@ test("DeepSeek Thinking omits unsupported tool_choice", () => {
   assert.equal(modelSupportsToolChoice({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), false);
   assert.equal(modelSupportsToolChoice({ baseUrl: "https://api.deepseek.com" }), false);
   assert.equal(modelSupportsToolChoice({ provider: "openai-compatible", baseUrl: "https://api.openai.com/v1" }), true);
+});
+
+test("DeepSeek requests explicit Thinking", () => {
+  assert.deepEqual(thinkingRequestOptions({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), {
+    thinking: { type: "enabled" },
+  });
 });
 
 test("applySamplingDefaults writes temp/topP to all role-assigned models without api key", () => {

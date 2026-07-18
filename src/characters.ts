@@ -154,14 +154,14 @@ function competency(v: unknown): CharacterCompetency {
 
 export type CharacterCompetencyPromptView =
   | CharacterCompetency
-  | { name: string; summary: string; unlocked: false };
+  | { id: string; name: string; summary: string; unlocked: false };
 
 /**
- * Planning/tool view: locked skills keep a public name/summary only (no mechanism dump).
+ * Planning/tool view: locked skills keep only their stable id and public name/summary (no mechanism dump).
  * Still exposes unlocked=false so apply_character_changes / scene planning can see status.
  */
 export function competencyPromptView(item: CharacterCompetency): CharacterCompetencyPromptView {
-  return item.unlocked ? item : { name: item.name, summary: item.summary, unlocked: false };
+  return item.unlocked ? item : { id: item.id, name: item.name, summary: item.summary, unlocked: false };
 }
 
 /** One-line rule attached to any character payload that may reach a prose model. */
@@ -432,10 +432,14 @@ function mergeArraySection<T extends { id: string }>(
   deletedIds: string[] | undefined,
   replace: boolean,
   normalizeItem: (v: unknown) => T,
+  idPrefix: string,
 ): T[] {
   const afterDelete = removeByIds(base, deletedIds);
   if (patch === undefined) return afterDelete;
-  const normalized = patch.map(normalizeItem);
+  const normalized = patch.map(value => {
+    const item = normalizeItem(value);
+    return VALID_ID.test(item.id) ? item : { ...item, id: generatedEntryId(idPrefix) };
+  });
   return replace ? normalized : upsertById(afterDelete, normalized);
 }
 
@@ -456,6 +460,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.traits,
       replace.has("traits"),
       entry,
+      "trait",
     ),
     values: mergeArraySection(
       base.psychology.values,
@@ -463,6 +468,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.values,
       replace.has("values"),
       entry,
+      "value",
     ),
     fears: mergeArraySection(
       base.psychology.fears,
@@ -470,6 +476,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.fears,
       replace.has("fears"),
       entry,
+      "fear",
     ),
     conflicts: mergeArraySection(
       base.psychology.conflicts,
@@ -477,6 +484,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.conflicts,
       replace.has("conflicts"),
       entry,
+      "conflict",
     ),
   };
 
@@ -496,6 +504,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.motivations,
       replace.has("motivations"),
       goal,
+      "goal",
     ),
     competencies: mergeArraySection(
       base.competencies,
@@ -503,6 +512,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.competencies,
       replace.has("competencies"),
       competency,
+      "competency",
     ),
     relationships: mergeArraySection(
       base.relationships,
@@ -510,6 +520,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.relationships,
       replace.has("relationships"),
       relationship,
+      "relationship",
     ),
     storyStates: mergeArraySection(
       base.storyStates,
@@ -517,6 +528,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.storyStates,
       replace.has("storyStates"),
       state,
+      "state",
     ),
     experiences: mergeArraySection(
       base.experiences,
@@ -524,6 +536,7 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       deleted.experiences,
       replace.has("experiences"),
       entry,
+      "experience",
     ),
     notes: input.notes !== undefined ? txt(input.notes) : base.notes,
     extensions: input.extensions !== undefined ? input.extensions : base.extensions,
@@ -540,10 +553,17 @@ function withOptionalSourceRef<T extends CharacterTemporal>(
   return { ...item, sourceRefs: [...item.sourceRefs, ref] };
 }
 
+let generatedEntrySequence = 0;
+
+function generatedEntryId(prefix: string): string {
+  generatedEntrySequence = (generatedEntrySequence + 1) % 0x100000;
+  return `${prefix}-${Date.now().toString(36)}-${generatedEntrySequence.toString(36)}`;
+}
+
 function ensureEntryId(raw: Record<string, unknown>, prefix: string): string {
   const id = txt(raw.id);
-  if (id) return id;
-  return `${prefix}-${Date.now().toString(36)}`;
+  if (VALID_ID.test(id)) return id;
+  return generatedEntryId(prefix);
 }
 
 export const CHARACTER_CHANGE_OPS = [

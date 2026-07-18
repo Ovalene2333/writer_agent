@@ -28,8 +28,9 @@ import {
   sceneProseScore,
 } from "../prose_metrics.js";
 import { proseStyleIssuesError, sceneMannerismGateError, type ProseStyleIssue } from "../prose_quality.js";
-import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
+import { ChapterReviewRequestError, reviewChapterDraft, type ChapterReviewResult } from "../chapter_review.js";
 import {
+  CHAPTER_STYLE_REPAIR_BATCH_SIZE,
   ChapterStyleRepairRequestError,
   requestChapterStyleRepair,
   type ChapterStyleRepairIssue,
@@ -382,8 +383,8 @@ function styleRepairIssues(content: string, blockers: ProseStyleIssue[]): Chapte
     id: issue.id,
     code: issue.subtype,
     sentence: issue.sentence,
-    before: content.slice(Math.max(0, issue.start - 180), issue.start).trim(),
-    after: content.slice(issue.end, Math.min(content.length, issue.end + 180)).trim(),
+    before: content.slice(Math.max(0, issue.start - 100), issue.start).trim(),
+    after: content.slice(issue.end, Math.min(content.length, issue.end + 100)).trim(),
     instruction: [issue.reason, ...issue.suggestions.slice(0, 2)].filter(Boolean).join("；"),
   }));
 }
@@ -405,6 +406,7 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
   errors: string[];
 }> {
   const { project, store, context } = args;
+  const maxRequests = 4;
   let attempts = 0;
   const errors: string[] = [];
   for (;;) {
@@ -414,44 +416,119 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
     const issues = await proseStyleGateIssues(beforeContent, content, context);
     const blockers = issues.filter(issue => issue.severity === "error");
     if (!blockers.length) return { passed: true, attempts, blockers: [], errors };
-    if (!context.chapterStyleRepairer || attempts >= 2) return { passed: false, attempts, blockers, errors };
-    attempts += 1;
+    if (!context.chapterStyleRepairer || attempts >= maxRequests) return { passed: false, attempts, blockers, errors };
     const repairer = context.chapterStyleRepairer;
     const runRepair = repairer.run ?? requestChapterStyleRepair;
     const models = [repairer.model, repairer.fallbackModel]
       .filter((model): model is NonNullable<typeof model> => Boolean(model))
       .filter((model, index, all) => all.findIndex(candidate => candidate.baseUrl === model.baseUrl && candidate.model === model.model) === index);
     let applied = false;
-    for (const repairModel of models) {
-      try {
-        const repaired = await runRepair(repairModel, {
-          issues: styleRepairIssues(content, blockers),
-          chapterGoal: draft.chapterGoal,
-          styleEvidence: chapterStyleEvidence({ project, store, context }, draft),
-        }, repairer.signal);
-        if (repaired.usage) {
-          context.modelUsageReporter?.(repairModel, repaired.usage, {
-            callKind: "chapter_style_repair",
-            requestComponents: isolatedRequestComponent("隔离风格修订请求", repaired.requestCharacters, "chapter_style_repair"),
-          });
+    const styleEvidence = chapterStyleEvidence({ project, store, context }, draft);
+    modelLoop: for (const repairModel of models) {
+      let batchSize = CHAPTER_STYLE_REPAIR_BATCH_SIZE;
+      for (let modelAttempt = 0; modelAttempt < 2 && attempts < maxRequests; modelAttempt += 1) {
+        attempts += 1;
+        try {
+          const repaired = await runRepair(repairModel, {
+            issues: styleRepairIssues(content, blockers.slice(0, batchSize)),
+            chapterGoal: draft.chapterGoal,
+            styleEvidence,
+          }, repairer.signal);
+          if (repaired.usage) {
+            context.modelUsageReporter?.(repairModel, repaired.usage, {
+              callKind: "chapter_style_repair",
+              requestComponents: isolatedRequestComponent("隔离风格修订请求", repaired.requestCharacters, "chapter_style_repair"),
+            });
+          }
+          const revised = reviseChapterDraftStyle(draft, repaired.edits);
+          context.chapterSceneDraft = revised.draft;
+          saveDraftCheckpoint(args, "style_repaired", revised.draft);
+          applied = true;
+          break modelLoop;
+        } catch (error) {
+          if (error instanceof ChapterStyleRepairRequestError && error.usage) {
+            context.modelUsageReporter?.(repairModel, error.usage, {
+              callKind: "chapter_style_repair_failed",
+              requestComponents: isolatedRequestComponent("失败的隔离风格修订请求", error.requestCharacters, "chapter_style_repair_failed"),
+            });
+          }
+          errors.push(error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240));
+          const deterministicOutputFailure = error instanceof ChapterStyleRepairRequestError
+            && (error.failureKind === "truncated" || error.failureKind === "invalid_output");
+          if (deterministicOutputFailure && modelAttempt === 0 && batchSize > 4) {
+            // A shorter Flash retry is cheaper and more likely to return complete
+            // JSON than replaying the same oversized request on the Pro fallback.
+            batchSize = 4;
+            continue;
+          }
+          if (deterministicOutputFailure) break;
+          break;
         }
-        const revised = reviseChapterDraftStyle(draft, repaired.edits);
-        context.chapterSceneDraft = revised.draft;
-        saveDraftCheckpoint(args, "style_repaired", revised.draft);
-        applied = true;
-        break;
-      } catch (error) {
-        if (error instanceof ChapterStyleRepairRequestError && error.usage) {
-          context.modelUsageReporter?.(repairModel, error.usage, {
-            callKind: "chapter_style_repair_failed",
-            requestComponents: isolatedRequestComponent("失败的隔离风格修订请求", error.requestCharacters, "chapter_style_repair_failed"),
-          });
-        }
-        errors.push(error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240));
       }
     }
     if (!applied) return { passed: false, attempts, blockers, errors };
   }
+}
+
+async function submitPassedChapterReview(
+  args: ToolHandlerArgs,
+  values: {
+    draft: ChapterSceneDraft;
+    proposalSummary: string;
+    contentCharacters: number;
+    metrics: ReturnType<typeof analyzeChapterProseMetrics>;
+    styleWarnings: Array<{ code: string; message: string; examples: string[] }>;
+    ledger: ReturnType<typeof chapterSceneLedger>;
+    chapterReview: ChapterReviewResult;
+  },
+): Promise<string> {
+  const { input } = args;
+  const { draft, proposalSummary, contentCharacters, metrics, styleWarnings, ledger, chapterReview } = values;
+  draft.inspectedVersion = draft.version;
+  saveDraftCheckpoint(args, "review_passed", draft);
+  let proposalResult: string;
+  try {
+    proposalResult = await submitChapterDraftProposal(args, {
+      summary: proposalSummary,
+      chapterChange: chapterReview.chapterChange,
+      reviewNotes: chapterReview.reviewNotes,
+      characterChanges: input.characterChanges,
+    });
+  } catch (error) {
+    return JSON.stringify({
+      status: "proposal_failed",
+      reviewCompleted: true,
+      chapterReview,
+      error: error instanceof Error ? error.message : String(error),
+      message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
+    });
+  }
+  const proposal = JSON.parse(proposalResult) as Record<string, unknown>;
+  if ("error" in proposal) {
+    return JSON.stringify({
+      status: "proposal_failed",
+      reviewCompleted: true,
+      chapterReview,
+      error: proposal.error,
+      message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
+    });
+  }
+  return JSON.stringify({
+    status: "proposal_submitted",
+    reviewCompleted: true,
+    proposalSubmitted: true,
+    proposal,
+    path: draft.path,
+    chapterGoal: draft.chapterGoal,
+    contentCharacters,
+    sceneCount: draft.completed.length,
+    proseStyle: "passed",
+    proseMetrics: metrics.stats,
+    ...(styleWarnings.length ? { styleWarnings } : {}),
+    ledger,
+    chapterReview,
+    message: "整章终审已完成且提案已创建；不要再调用 propose_chapter_draft。",
+  });
 }
 
 export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<string> {
@@ -511,6 +588,23 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     examples: issue.examples.slice(0, 5),
   }));
   const ledger = chapterSceneLedger(draft);
+  if (draft.completed.length === 1) {
+    const scene = draft.scenes[0];
+    return submitPassedChapterReview(args, {
+      draft,
+      proposalSummary,
+      contentCharacters: content.length,
+      metrics,
+      styleWarnings,
+      ledger,
+      chapterReview: {
+        verdict: "pass",
+        chapterChange: `本章完成“${draft.chapterGoal}”：${scene.outcome}`,
+        reviewNotes: "单场景章节无跨场景接缝或功能重复；句式门禁、复用计量与场景结果检查均已通过。",
+        issues: [],
+      },
+    });
+  }
   let reviewFailure: { attempts: number; errors: string[] } | undefined;
   if (context.chapterReviewer) {
     const reviewer = context.chapterReviewer;
@@ -570,50 +664,14 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             message: "终审发现有证据的结构/连续性问题。只重写 targetScenes 中 blocker 对应场景；保留无关事实与声线，并以新 actualState 为准续写被失效的后续场景。禁止复述审阅报告或全文重写。",
           });
         }
-        draft.inspectedVersion = draft.version;
-        saveDraftCheckpoint(args, "review_passed", draft);
-        let proposalResult: string;
-        try {
-          proposalResult = await submitChapterDraftProposal(args, {
-            summary: proposalSummary,
-            chapterChange: reviewed.review.chapterChange,
-            reviewNotes: reviewed.review.reviewNotes,
-            characterChanges: input.characterChanges,
-          });
-        } catch (error) {
-          return JSON.stringify({
-            status: "proposal_failed",
-            reviewCompleted: true,
-            chapterReview: reviewed.review,
-            error: error instanceof Error ? error.message : String(error),
-            message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
-          });
-        }
-        const proposal = JSON.parse(proposalResult) as Record<string, unknown>;
-        if ("error" in proposal) {
-          return JSON.stringify({
-            status: "proposal_failed",
-            reviewCompleted: true,
-            chapterReview: reviewed.review,
-            error: proposal.error,
-            message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
-          });
-        }
-        return JSON.stringify({
-          status: "proposal_submitted",
-          reviewCompleted: true,
-          proposalSubmitted: true,
-          proposal,
-          path: draft.path,
-          chapterGoal: draft.chapterGoal,
+        return submitPassedChapterReview(args, {
+          draft,
+          proposalSummary,
           contentCharacters: content.length,
-          sceneCount: draft.completed.length,
-          proseStyle: "passed",
-          proseMetrics: metrics.stats,
-          ...(styleWarnings.length ? { styleWarnings } : {}),
+          metrics,
+          styleWarnings,
           ledger,
           chapterReview: reviewed.review,
-          message: "整章终审已完成且提案已创建；不要再调用 propose_chapter_draft。",
         });
       } catch (error) {
         if (error instanceof ChapterReviewRequestError && error.usage) {

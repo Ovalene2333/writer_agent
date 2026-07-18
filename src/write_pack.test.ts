@@ -480,10 +480,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(typeof inspected.contentCharacters, "number");
     assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
     assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
-    assert.deepEqual(chapterReviewUsage, [
-      { model: "reviewer-test", callKind: "chapter_review_failed" },
-      { model: "writer-test", callKind: "chapter_review" },
-    ]);
+    assert.deepEqual(chapterReviewUsage, [], "single-scene chapters skip the cross-scene model review");
     const proposed = inspected.proposal as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
     assert.equal(project.documentExists("chapters/第一章.md"), false);

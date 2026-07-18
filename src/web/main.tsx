@@ -7,6 +7,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Columns3,
+  Copy,
   Drama,
   Eye,
   EyeOff,
@@ -29,6 +30,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Save,
   Settings,
   Sun,
@@ -191,6 +193,16 @@ type StepUsage = {
   currency: string;
   estimated?: boolean;
   cacheHitRate?: number;
+  callBreakdown?: Array<{
+    callKind: string;
+    promptTokens: number;
+    completionTokens: number;
+    cacheHitTokens: number;
+    cacheMissTokens: number;
+    cost: number;
+    currency: string;
+    estimated?: boolean;
+  }>;
   requestComponents?: Array<{
     kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
     label: string;
@@ -241,6 +253,7 @@ type AgentStreamEvent = {
   changeSet?: ChangeSet;
   usage?: Usage;
   call?: StepUsage;
+  callKind?: string;
   todos?: AgentTodoItem[];
   mode?: PermissionMode;
 };
@@ -716,6 +729,7 @@ function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
     estimated: withUsage.some((step) => step.usage?.estimated),
     ...(measuredHits + measuredMisses > 0 ? { cacheHitRate: measuredHits / (measuredHits + measuredMisses) } : {}),
     requestComponents: withUsage.flatMap(step => step.usage?.requestComponents ?? []),
+    callBreakdown: withUsage.flatMap(step => step.usage?.callBreakdown ?? []),
   };
 }
 
@@ -1069,6 +1083,28 @@ function buildTree(docs: string[], folders: string[], hiddenDocs: string[], hidd
   return roots;
 }
 
+function filterTree(nodes: TreeNode[], query: string): TreeNode[] {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return nodes;
+  return nodes.flatMap((node) => {
+    const children = filterTree(node.children, normalized);
+    const matches = node.name.toLocaleLowerCase().includes(normalized)
+      || node.path.toLocaleLowerCase().includes(normalized);
+    if (matches) return [node];
+    return children.length ? [{ ...node, children }] : [];
+  });
+}
+
+function collectFolderPaths(nodes: TreeNode[]): string[] {
+  return nodes.flatMap((node) => node.kind === "folder"
+    ? [node.path, ...collectFolderPaths(node.children)]
+    : []);
+}
+
+function countFiles(node: TreeNode): number {
+  return node.kind === "file" ? 1 : node.children.reduce((total, child) => total + countFiles(child), 0);
+}
+
 function FileTreeItem({
   node,
   depth,
@@ -1078,7 +1114,8 @@ function FileTreeItem({
   onRename,
   onDelete,
   onToggleHidden,
-  onDropFile,
+  onMoveNode,
+  onDuplicate,
   onNewChild,
   expandedFolders,
   setExpandedFolders,
@@ -1091,7 +1128,8 @@ function FileTreeItem({
   onRename: (oldPath: string, kind: "file" | "folder") => void;
   onDelete: (path: string, kind: "file" | "folder") => void;
   onToggleHidden: (path: string, kind: "file" | "folder", current: boolean) => void;
-  onDropFile: (filePath: string, targetFolder: string) => void;
+  onMoveNode: (path: string, kind: "file" | "folder", targetFolder: string) => void;
+  onDuplicate: (path: string) => void;
   onNewChild: (parentFolder: string, kind: "file" | "folder") => void;
   expandedFolders: Set<string>;
   setExpandedFolders: React.Dispatch<React.SetStateAction<Set<string>>>;
@@ -1101,6 +1139,7 @@ function FileTreeItem({
   const [dragOver, setDragOver] = useState(false);
 
   const handleDragStart = (e: React.DragEvent) => {
+    e.dataTransfer.setData("application/x-writer-node", JSON.stringify({ path: node.path, kind: node.kind }));
     e.dataTransfer.setData("text/plain", node.path);
     e.dataTransfer.effectAllowed = "move";
   };
@@ -1117,9 +1156,10 @@ function FileTreeItem({
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const filePath = e.dataTransfer.getData("text/plain");
-    if (filePath && node.kind === "folder" && filePath !== node.path) {
-      onDropFile(filePath, node.path);
+    const raw = e.dataTransfer.getData("application/x-writer-node");
+    const payload = raw ? JSON.parse(raw) as { path: string; kind: "file" | "folder" } : null;
+    if (payload && node.kind === "folder" && payload.path !== node.path) {
+      onMoveNode(payload.path, payload.kind, node.path);
     }
   };
 
@@ -1150,8 +1190,8 @@ function FileTreeItem({
       <div
         className={`tree-row ${activePath === node.path ? "active" : ""} ${dragOver ? "drop-target" : ""}`}
         style={{ paddingLeft: depth * 16 + 4 }}
-        draggable={node.kind === "file"}
-        onDragStart={node.kind === "file" ? handleDragStart : undefined}
+        draggable
+        onDragStart={handleDragStart}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
@@ -1178,6 +1218,7 @@ function FileTreeItem({
         </span>
         <span className="tree-label" title={node.path}>
           <span className="tree-name">{node.name}</span>
+          {node.kind === "folder" && <span className="tree-count">{countFiles(node)}</span>}
         </span>
         <div className="tree-actions">
           <button
@@ -1195,15 +1236,39 @@ function FileTreeItem({
             )}
           </button>
           {node.kind === "folder" && (
+            <>
+              <button
+                className="tree-action-btn"
+                title="在此新建文档"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onNewChild(node.path, "file");
+                }}
+              >
+                <Plus size={13} aria-hidden="true" />
+              </button>
+              <button
+                className="tree-action-btn"
+                title="在此新建文件夹"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onNewChild(node.path, "folder");
+                }}
+              >
+                <FolderPlus size={13} aria-hidden="true" />
+              </button>
+            </>
+          )}
+          {node.kind === "file" && (
             <button
               className="tree-action-btn"
-              title="在此新建文档"
+              title="创建副本"
               onClick={(e) => {
                 e.stopPropagation();
-                onNewChild(node.path, "file");
+                onDuplicate(node.path);
               }}
             >
-              <Plus size={13} aria-hidden="true" />
+              <Copy size={13} aria-hidden="true" />
             </button>
           )}
           <button
@@ -1241,7 +1306,8 @@ function FileTreeItem({
             onRename={onRename}
             onDelete={onDelete}
             onToggleHidden={onToggleHidden}
-            onDropFile={onDropFile}
+            onMoveNode={onMoveNode}
+            onDuplicate={onDuplicate}
             onNewChild={onNewChild}
             expandedFolders={expandedFolders}
             setExpandedFolders={setExpandedFolders}
@@ -1311,6 +1377,26 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               )
               : "本步暂无 token 数据（供应商未返回 usage 且未能估算）"}
           </div>
+          {(step.usage?.callBreakdown?.length ?? 0) > 1 ? (
+            <details className="agent-step-context-breakdown" open>
+              <summary>模型调用明细</summary>
+              <div className="agent-step-context-list">
+                {step.usage!.callBreakdown!.map((call, index) => {
+                  const measured = call.cacheHitTokens + call.cacheMissTokens;
+                  const rate = measured > 0 ? call.cacheHitTokens / measured : 0;
+                  return (
+                    <div className="agent-step-context-row" key={`${call.callKind}-${index}`}>
+                      <span>{call.callKind}</span>
+                      <span>
+                        输入 {call.promptTokens.toLocaleString()} · 缓存 {(rate * 100).toFixed(1)}% · 输出 {call.completionTokens.toLocaleString()}
+                        {call.cost > 0 ? ` · ${call.currency === "CNY" ? "¥" : "$"}${call.cost.toFixed(6)}` : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </details>
+          ) : null}
           {step.usage?.requestComponents?.length ? (
             <details className="agent-step-context-breakdown">
               <summary>请求上下文组成（发送前估算）</summary>
@@ -1453,8 +1539,18 @@ function WorkspaceTopbar({
   );
 }
 
-function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage): StepUsage {
-  if (!current) return next;
+function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, callKind = "unspecified"): StepUsage {
+  const nextCall = {
+    callKind,
+    promptTokens: next.promptTokens,
+    completionTokens: next.completionTokens,
+    cacheHitTokens: next.cacheHitTokens,
+    cacheMissTokens: next.cacheMissTokens,
+    cost: next.cost,
+    currency: next.currency,
+    ...(next.estimated ? { estimated: true } : {}),
+  };
+  if (!current) return { ...next, callBreakdown: [nextCall] };
   const cacheHitTokens = current.cacheHitTokens + next.cacheHitTokens;
   const cacheMissTokens = current.cacheMissTokens + next.cacheMissTokens;
   const estimated = Boolean(current.estimated || next.estimated);
@@ -1471,6 +1567,7 @@ function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage): St
       ? { cacheHitRate: cacheHitTokens / (cacheHitTokens + cacheMissTokens) }
       : {}),
     requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
+    callBreakdown: [...(current.callBreakdown ?? []), nextCall],
   };
 }
 
@@ -1518,7 +1615,14 @@ function App() {
   } | null>(null);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("writer-expanded-folders") || "[]") as string[]);
+    } catch {
+      return new Set();
+    }
+  });
+  const [fileQuery, setFileQuery] = useState("");
   const [renaming, setRenaming] = useState<{ path: string; kind: "file" | "folder" } | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [creating, setCreating] = useState<{ parent: string; kind: "file" | "folder" } | null>(null);
@@ -1578,6 +1682,7 @@ function App() {
   editingDocumentRef.current = editingDocument;
   const renameInputRef = useRef<HTMLInputElement>(null);
   const createInputRef = useRef<HTMLInputElement>(null);
+  const fileSearchRef = useRef<HTMLInputElement>(null);
   const documentReaderRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -2047,6 +2152,37 @@ function App() {
     if (creating && createInputRef.current) createInputRef.current.focus();
   }, [creating]);
 
+  useEffect(() => {
+    localStorage.setItem("writer-expanded-folders", JSON.stringify([...expandedFolders]));
+  }, [expandedFolders]);
+
+  useEffect(() => {
+    if (!activePath.includes("/")) return;
+    const parts = activePath.split("/").slice(0, -1);
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      parts.forEach((_, index) => next.add(parts.slice(0, index + 1).join("/")));
+      return next;
+    });
+  }, [activePath]);
+
+  useEffect(() => {
+    const handleFileSearchShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping = target?.matches("input, textarea, [contenteditable='true']");
+      if (event.key === "/" && !isTyping && workspaceMode !== "agent-focus") {
+        event.preventDefault();
+        fileSearchRef.current?.focus();
+      }
+      if (event.key === "Escape" && window.document.activeElement === fileSearchRef.current) {
+        setFileQuery("");
+        fileSearchRef.current?.blur();
+      }
+    };
+    window.addEventListener("keydown", handleFileSearchShortcut);
+    return () => window.removeEventListener("keydown", handleFileSearchShortcut);
+  }, [workspaceMode]);
+
   function handleAgentEvent(event: AgentStreamEvent) {
     if (event.type === "step_start") {
       setStreamSteps((current) => {
@@ -2082,7 +2218,7 @@ function App() {
             ? current.findIndex((s) => s.id === targetId)
             : activeStepIndex(current);
           if (idx < 0) return current;
-          return current.map((s, i) => (i === idx ? { ...s, usage: mergeStepCallUsage(s.usage, event.call!) } : s));
+          return current.map((s, i) => (i === idx ? { ...s, usage: mergeStepCallUsage(s.usage, event.call!, event.callKind) } : s));
         });
       }
     }
@@ -2511,7 +2647,9 @@ function App() {
         method: "PUT",
         body: JSON.stringify({ fromPath: oldPath, toPath: newPath }),
       });
-      if (activePath === oldPath) setActivePath(newPath);
+      if (activePath === oldPath || activePath.startsWith(`${oldPath}/`)) {
+        setActivePath(`${newPath}${activePath.slice(oldPath.length)}`);
+      }
       await refresh(state?.sessionId);
     } catch (e) {
       setError(String(e));
@@ -2525,7 +2663,7 @@ function App() {
     try {
       const endpoint = kind === "file" ? "/api/document" : "/api/folder";
       await api(`${endpoint}?path=${encodeURIComponent(path)}`, { method: "DELETE" });
-      if (activePath === path) setActivePath("");
+      if (activePath === path || activePath.startsWith(`${path}/`)) setActivePath("");
       await refresh(state?.sessionId);
     } catch (e) {
       setError(String(e));
@@ -2545,18 +2683,50 @@ function App() {
     }
   }
 
-  async function handleDropFile(filePath: string, targetFolder: string) {
-    const parts = filePath.split("/");
+  async function handleMoveNode(path: string, kind: "file" | "folder", targetFolder: string) {
+    if (kind === "folder" && (targetFolder === path || targetFolder.startsWith(`${path}/`))) {
+      setNotice("不能把文件夹移动到自身内部");
+      return;
+    }
+    const parts = path.split("/");
     const name = parts.pop()!;
-    const newPath = `${targetFolder}/${name}`;
-    if (newPath === filePath) return;
+    const newPath = targetFolder ? `${targetFolder}/${name}` : name;
+    if (newPath === path) return;
     try {
-      await api("/api/document/rename", {
+      await api(kind === "file" ? "/api/document/rename" : "/api/folder/rename", {
         method: "PUT",
-        body: JSON.stringify({ fromPath: filePath, toPath: newPath }),
+        body: JSON.stringify({ fromPath: path, toPath: newPath }),
       });
-      if (activePath === filePath) setActivePath(newPath);
+      if (activePath === path || activePath.startsWith(`${path}/`)) {
+        setActivePath(`${newPath}${activePath.slice(path.length)}`);
+      }
+      if (targetFolder) setExpandedFolders((prev) => new Set(prev).add(targetFolder));
       await refresh(state?.sessionId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleDuplicate(path: string) {
+    try {
+      const source = await api<DocumentData>(`/api/document?path=${encodeURIComponent(path)}`);
+      const slash = path.lastIndexOf("/");
+      const parent = slash >= 0 ? path.slice(0, slash + 1) : "";
+      const filename = slash >= 0 ? path.slice(slash + 1) : path;
+      const stem = filename.replace(/\.md$/i, "");
+      let index = 1;
+      let copyPath = `${parent}${stem} - 副本.md`;
+      while (state?.documents.includes(copyPath)) {
+        index += 1;
+        copyPath = `${parent}${stem} - 副本 ${index}.md`;
+      }
+      await api("/api/document", {
+        method: "POST",
+        body: JSON.stringify({ path: copyPath, content: source.content }),
+      });
+      await refresh(state?.sessionId);
+      setActivePath(copyPath);
+      setNotice(`已创建 ${copyPath}`);
     } catch (e) {
       setError(String(e));
     }
@@ -2929,6 +3099,10 @@ function App() {
     if (!state) return [];
     return buildTree(state.documents, state.documentFolders, state.hiddenDocuments, state.hiddenFolders);
   }, [state?.documents, state?.documentFolders, state?.hiddenDocuments, state?.hiddenFolders]);
+  const visibleTree = useMemo(() => filterTree(tree, fileQuery), [tree, fileQuery]);
+  const visibleExpandedFolders = useMemo(() => fileQuery.trim()
+    ? new Set([...expandedFolders, ...collectFolderPaths(visibleTree)])
+    : expandedFolders, [expandedFolders, fileQuery, visibleTree]);
 
   if (!state) {
     return (
@@ -3041,7 +3215,35 @@ function App() {
             <span className="file-manager-kicker">Workspace</span>
             <h2>项目文件</h2>
           </div>
-          <span className="file-manager-count">{state.documents.length} 篇</span>
+          <span className="file-manager-count">
+            {fileQuery.trim() ? `${state.documents.length - visibleTree.reduce((sum, node) => sum + countFiles(node), 0)} 条已筛除` : `${state.documents.length} 篇`}
+          </span>
+        </div>
+
+        <div className="file-manager-tools">
+          <label className="file-search">
+            <Search size={14} aria-hidden="true" />
+            <input
+              ref={fileSearchRef}
+              value={fileQuery}
+              onChange={(event) => setFileQuery(event.target.value)}
+              placeholder="搜索文件或路径…"
+              aria-label="搜索项目文件"
+              aria-keyshortcuts="/"
+            />
+            {fileQuery && <button type="button" title="清除搜索" onClick={() => setFileQuery("")}><X size={13} /></button>}
+          </label>
+          <div className="file-view-actions">
+            <button type="button" title="展开全部" onClick={() => setExpandedFolders(new Set(collectFolderPaths(tree)))}>
+              <ChevronDown size={14} />
+            </button>
+            <button type="button" title="收起全部" onClick={() => setExpandedFolders(new Set())}>
+              <Minus size={14} />
+            </button>
+            <button type="button" title="刷新文件列表" onClick={() => void refresh(state.sessionId)}>
+              <RefreshCw size={14} />
+            </button>
+          </div>
         </div>
         <div className="file-manager-actions">
           <button
@@ -3109,9 +3311,30 @@ function App() {
               <strong>还没有文档</strong>
               <span>点击上方按钮创建文档或文件夹</span>
             </div>
+          ) : visibleTree.length === 0 ? (
+            <div className="sidebar-empty compact">
+              <Search size={24} aria-hidden="true" />
+              <strong>没有匹配的文件</strong>
+              <span>换个名称或路径关键词试试</span>
+              <button type="button" onClick={() => setFileQuery("")}>清除搜索</button>
+            </div>
           ) : (
-            <div className="document-tree">
-              {tree.map((node) => (
+            <div
+              className="document-tree"
+              title="可将文件或文件夹拖到此处，移回项目根目录"
+              onDragOver={(event) => {
+                if (event.currentTarget === event.target) event.preventDefault();
+              }}
+              onDrop={(event) => {
+                if (event.currentTarget !== event.target) return;
+                event.preventDefault();
+                const raw = event.dataTransfer.getData("application/x-writer-node");
+                if (!raw) return;
+                const payload = JSON.parse(raw) as { path: string; kind: "file" | "folder" };
+                void handleMoveNode(payload.path, payload.kind, "");
+              }}
+            >
+              {visibleTree.map((node) => (
                 <FileTreeItem
                   key={node.path}
                   node={node}
@@ -3124,9 +3347,10 @@ function App() {
                   onRename={handleRename}
                   onDelete={handleDelete}
                   onToggleHidden={handleToggleHidden}
-                  onDropFile={handleDropFile}
+                  onMoveNode={handleMoveNode}
+                  onDuplicate={handleDuplicate}
                   onNewChild={handleNewChild}
-                  expandedFolders={expandedFolders}
+                  expandedFolders={visibleExpandedFolders}
                   setExpandedFolders={setExpandedFolders}
                 />
               ))}

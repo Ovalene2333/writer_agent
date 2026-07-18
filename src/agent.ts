@@ -10,6 +10,7 @@ import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundi
 import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
+import { isDeepSeekModel, thinkingRequestOptions } from "./model_compat.js";
 import {
   formatTodosForPrompt,
   loadAgentSettings,
@@ -356,13 +357,13 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
       : `必须提交文档提案或 change set 后结束；禁止用最终回复代替文件交付。单文档优先 patch；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接提案。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
     : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
   const editScopeInstruction: Record<EditScope, string> = {
-    point: "局部修改：有原句/选区就直接 locate/read 锚点，最多读取目标及邻段；目标锁定后禁止 inspect 或按块通读；用 sourceHash+anchorId+spanHash 提交 patch。",
+    point: "局部修改：有原句/选区就优先 locate/read 锚点；根据修改所需事实按需补读上下文，并用 sourceHash+anchorId+spanHash 提交 patch。",
     section: "分节修改：按标题或语义 locate，读取目标锚点范围与必要接缝；只 patch 命中范围，不读取无关章节。",
     document: "通篇修改：inspect 一次取得 sourceHash 后调用 revise_document_isolated；主 Agent 不逐块读取全文，也不自行拼接完整 content。",
   };
   const contextInstruction: Record<DocumentContextMode, string> = {
     // Soft none: pure craft may skip tools, but never invent lore when the user names project entities.
-    none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，必须 search_project 一次（优先 scope=lore），不足再 inspect/read 最小片段。禁止通读全库、禁止把推测写成既有设定。",
+    none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，先 search_project（优先 scope=lore），再按结果读取必要资料。禁止把推测写成既有设定。",
     search: task.mode === "simple_character"
       ? `建简易卡：先 list_characters 查同名，必要时 get_character；search_project(lore/outline) 查询：${task.searchQuery || request.slice(0, 120)}；不足再 inspect/read 最小片段；最后 save_simple_character。`
       : task.mode === "character"
@@ -398,6 +399,133 @@ const TASK_LABELS: Record<WritingTaskMode, string> = {
   simple_character: "创建或更新简易角色卡", general: "通用写作协作",
 };
 
+/**
+ * Conservatively close a JSON object only when the stream ended between values.
+ * Never invents or closes an unterminated string, so truncated prose cannot be
+ * silently persisted as if it were complete.
+ */
+export function repairTruncatedToolArguments(argumentsText: string): string | undefined {
+  let candidate = argumentsText.trim();
+  if (!candidate.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? candidate : undefined;
+  } catch { /* try structural tail closure below */ }
+
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const character of candidate) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === "{" || character === "[") stack.push(character);
+    else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.pop() !== expected) return undefined;
+    }
+  }
+  if (inString || escaped || !stack.length) return undefined;
+  candidate = candidate.replace(/,\s*$/u, "");
+  candidate += [...stack].reverse().map(open => open === "{" ? "}" : "]").join("");
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function buildToolArgumentRepairMessages(input: {
+  toolName: string;
+  rawArguments: string;
+  parameterSchema: Record<string, unknown>;
+}): ApiMessage[] {
+  return [{
+    role: "system",
+    content: `你是工具参数 JSON 修复器。只输出一个可解析 JSON 对象，不得输出 Markdown 或解释。
+保留原参数中已经完整表达的事实，不新增设定，不改写文案。删除未完成的末尾字段，修复引号、逗号、括号与转义。
+严格遵守 parameterSchema，删除 schema 外字段。save_character 更新已有角色时必须保留 id。`,
+  }, {
+    role: "user",
+    content: JSON.stringify({
+      toolName: input.toolName,
+      parameterSchema: input.parameterSchema,
+      rawArguments: input.rawArguments.slice(0, 24_000),
+    }),
+  }];
+}
+
+export function parseToolArgumentRepair(content: string): string | undefined {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/iu)?.[1]?.trim();
+  return repairTruncatedToolArguments(fenced ?? trimmed);
+}
+
+async function repairToolArgumentsWithModel(
+  model: ModelConfig,
+  call: ToolCall,
+  definition: ToolDefinition,
+  signal?: AbortSignal,
+): Promise<{
+  arguments?: string;
+  usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean };
+}> {
+  const messages = buildToolArgumentRepairMessages({
+    toolName: call.name,
+    rawArguments: call.arguments,
+    parameterSchema: definition.function.parameters,
+  });
+  const result = await streamCompletion(model, messages, signal, () => undefined, () => undefined, {
+    temperature: 0,
+    topP: 1,
+    ...(isDeepSeekModel(model) ? { responseFormat: { type: "json_object" as const } } : {}),
+    ...thinkingRequestOptions(model),
+  });
+  const repaired = parseToolArgumentRepair(result.content);
+  return {
+    ...(repaired ? { arguments: repaired } : {}),
+    ...(result.usage ? { usage: result.usage } : {}),
+  };
+}
+
+function isCharacterMutationTool(name: string): boolean {
+  return name === "save_character" || name === "save_simple_character" || name === "apply_character_changes";
+}
+
+function characterMutationDiagnostic(result: Record<string, unknown>): string {
+  const diagnostic = {
+    ...(typeof result.code === "string" ? { code: result.code } : {}),
+    ...(typeof result.error === "string" ? { error: result.error } : {}),
+    ...(typeof result.message === "string" ? { message: result.message } : {}),
+    ...(Array.isArray(result.skipped) ? { skipped: result.skipped.slice(0, 4) } : {}),
+  };
+  const text = JSON.stringify(diagnostic);
+  return (text === "{}" ? JSON.stringify(result) : text).slice(0, 1_200);
+}
+
+/** Planner uses deterministic sampling while retaining the configured Thinking mode. */
+export function plannerCompletionOptions(model: Pick<ModelConfig, "provider" | "baseUrl">): {
+  temperature: number;
+  topP: number;
+  thinking?: { type: "enabled" };
+  responseFormat?: { type: "json_object" };
+} {
+  return {
+    temperature: 0,
+    topP: 1,
+    ...(isDeepSeekModel(model) ? { responseFormat: { type: "json_object" as const } } : {}),
+    ...thinkingRequestOptions(model),
+  };
+}
+
 export function normalizeCharacterTaskMode(request: string, plannedMode: WritingTaskMode): WritingTaskMode {
   const explicitlySimple = ["简易角色卡", "简易角色", "简易卡"].some(term => request.includes(term));
   if (plannedMode === "simple_character" && !explicitlySimple) return "character";
@@ -409,6 +537,23 @@ export function normalizeDocumentProposalRequired(mode: WritingTaskMode, request
   return mode === "character" || mode === "simple_character" ? false : requested;
 }
 
+/** Exact catalog resolution for short follow-ups; no semantic keyword guessing. */
+export function resolveRecentCharacterIds(
+  catalog: Array<{ id: number; name: string; aliases?: string[] }>,
+  textsNewestFirst: string[],
+): number[] {
+  for (const text of textsNewestFirst) {
+    const hits = catalog.filter(character =>
+      [character.name, ...(character.aliases ?? [])]
+        .map(value => value.trim())
+        .filter(value => value.length >= 2)
+        .some(value => text.includes(value)),
+    );
+    if (hits.length) return [...new Set(hits.map(character => character.id))].slice(0, 4);
+  }
+  return [];
+}
+
 /**
  * Task planner: a compact tool-free call, normally assigned to Flash.
  * CACHE: Keep stable rules in the first message and project/request data in the
@@ -418,7 +563,8 @@ async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
   characterScope?: number[],
   selectionCharacters = 0,
-): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
+  onUsage?: (usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean }, retry: boolean) => void,
+): Promise<{ task: WritingTask }> {
   const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
   const documents = prioritizeDocumentCatalog(allDocuments, request, 80);
@@ -440,6 +586,7 @@ async function planWritingTask(
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务规划器。不得调用工具；只输出一个 JSON，无 Markdown。
+JSON 总长度不超过 1200 字符；字符串保持简短，todoPlan 每项不超过 40 字。
 字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。写文件完整度由 documentProposalRequired 决定。
 documentContext 判定（关键，勿默认 none）：
@@ -449,6 +596,7 @@ documentContext 判定（关键，勿默认 none）：
 - continuation：承接上一轮正文续写。
 纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件或多文件原子变更时，mode=general、documentProposalRequired=true；非 Markdown 文件不必出现在 documents 目录，执行阶段先用 list_files 定位，再用 propose_change_set。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
+用户要求创作/设计一个具体人物，并主要描述其身份、外貌、性格、能力或关系时，即使没有说“角色卡”，也使用 character；只有明确要求“一段/片段/场景/章节/正文”来表现该人物时才使用 write_scene。
 正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，documentProposalRequired=true；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
 用户引用具体正文句段并指出问题或要求修改（不合理/OOC/改掉这句/换个说法等）时，一律 mode=rewrite，documentProposalRequired=true，documentContext=target；不得判为 audit（audit 只用于“审阅/检查/评价”而不动笔），也不得因目标是章节而改判 write_scene。
 editScope 仅描述既有文档修改范围：明确原句/网页选区/一小处→point；一个小节或若干相邻段→section；明确通篇/全文/整体统一调整且每部分都需处理→document。不要把“深度修改某一处”误判为document。
@@ -466,11 +614,31 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
       recentHistory: recent,
     }),
   }];
-  const result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, {
-    maxCompletionTokens: 900,
-  });
-  const parsed = parsePlannerJson(result.content);
-  if (!parsed) throw new Error("任务规划器没有返回有效 JSON");
+  const plannerRequestOptions = plannerCompletionOptions(model);
+  let result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, plannerRequestOptions);
+  if (result.usage) onUsage?.(result.usage, false);
+  let parsed = parsePlannerJson(result.content);
+  if (!parsed) {
+    const repairMessages: ApiMessage[] = [
+      ...planningMessages,
+      {
+        role: "assistant",
+        content: result.content.trim().slice(0, 1_200) || "{}",
+        ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
+      },
+      {
+        role: "user",
+        content: "上一个输出不是可解析的单一 JSON 对象。只修复格式并重新输出完整 JSON；不得解释、不得使用 Markdown。",
+      },
+    ];
+    const retry = await streamCompletion(model, repairMessages, signal, () => undefined, () => undefined, plannerRequestOptions);
+    if (retry.usage) onUsage?.(retry.usage, true);
+    parsed = parsePlannerJson(retry.content);
+    if (!parsed) {
+      throw new Error(`任务规划器连续两次没有返回有效 JSON（首次 finish=${result.finishReason ?? "unknown"}、${result.content.length} 字符；重试 finish=${retry.finishReason ?? "unknown"}、${retry.content.length} 字符）`);
+    }
+    result = retry;
+  }
   const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "character", "simple_character", "general"];
   const plannedMode = modes.includes(parsed.mode as WritingTaskMode) ? parsed.mode as WritingTaskMode : "general";
   const mode = normalizeCharacterTaskMode(request, plannedMode);
@@ -524,12 +692,21 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
   const searchQuery = typeof parsed.searchQuery === "string" && parsed.searchQuery.trim()
     ? parsed.searchQuery.slice(0, 200)
     : extractSearchQueryHint(request, documents, characters) || request.slice(0, 200);
+  const plannedCharacterIds = Array.isArray(parsed.characterIds)
+    ? parsed.characterIds.filter(id => validCharacterIds.has(id)).slice(0, 4)
+    : [];
+  const selectedCharacterIds = plannedCharacterIds.length || mode !== "character"
+    ? plannedCharacterIds
+    : resolveRecentCharacterIds(
+      characters,
+      [request, ...(continuation ? [...recent].reverse().map(item => item.content) : [])],
+    );
   return {
     task: {
       mode,
       label: TASK_LABELS[mode],
       searchQuery,
-      characterIds: Array.isArray(parsed.characterIds) ? parsed.characterIds.filter(id => validCharacterIds.has(id)).slice(0, 4) : [],
+      characterIds: selectedCharacterIds,
       exampleIds: Array.isArray(parsed.exampleIds) ? parsed.exampleIds.filter(id => validExampleIds.has(id)).slice(0, 2) : [],
       documentContext: normalizedDocumentContext,
       creativeDepth,
@@ -539,7 +716,6 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
       todoPlan: requestedTodoPlan.length ? requestedTodoPlan : defaultTodoPlan(mode, documentProposalRequired),
       ...(typeof parsed.targetPath === "string" && validDocumentPaths.has(parsed.targetPath) ? { targetPath: parsed.targetPath } : {}),
     },
-    usage: result.usage,
   };
 }
 
@@ -674,12 +850,14 @@ export function taskInstructions(
   if (mode === "character") return `本次工作流：
 - 这是普通角色卡任务。先 list_characters 检查同名卡；若已存在，必须 get_character 读取必要分区，并用其 id 调用 save_character 或 apply_character_changes 更新。
 - 不要调用 save_simple_character；不得因现有卡内容为空、简略或不完整而新建同名角色。
-- 新建或大改用 save_character；有依据的情节演进优先 apply_character_changes。只填写用户提供或项目材料支持的内容，未知处留空。`;
+- 新建或大改用 save_character；有依据的情节演进优先 apply_character_changes。只填写用户提供或项目材料支持的内容，未知处留空。
+- 更新已有卡时保留原 id，优先只提交实际修改的分区；需要核对关联信息时可以继续读取相关分区或项目资料。数组条目沿用已有 ASCII id，新增条目提供唯一 ASCII id。
+- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试，保存成功后再结束。`;
   if (mode === "simple_character") return `本次工作流：
 - 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终调用 save_simple_character 保存。
 - 先调用 list_characters 检查同名或相关普通角色卡；若存在相关角色，用 get_character 读取必要分区。
 - 按上下文决策检索相关 lore/ 与 outline/，只读取最小必要片段。
-- 将项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定处留空或标为“未明确”。`;
+- 将项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定处留空或标为“未明确”。可按需继续检查同名角色和项目资料，工具报错时修正后继续保存。`;
   if (mode === "brainstorm") return `本次工作流：
 - ${pacing}
 - 候选应具体到画面、人物选择或关系变化，不必把每个火花都补成完整因果链。
@@ -706,7 +884,7 @@ export function taskInstructions(
 7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
-- 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再用 read_document_span 只读锚点邻域。禁止为找一句话通读全章或反复 search_project。
+- 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再按需读取锚点及关联上下文。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
@@ -1044,6 +1222,10 @@ export async function runAgent(options: {
   const planned = await planWritingTask(
     plannerModel, project, store, prompt, history, signal, characterScope,
     options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
+    (usage, retry) => emitUsageEvent(
+      emit, store, sessionId, plannerModel, usage, undefined,
+      retry ? "planner_retry" : "planner", options.jobId,
+    ),
   );
   const task = planned.task;
   // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
@@ -1055,9 +1237,6 @@ export async function runAgent(options: {
     : task.documentProposalRequired
       ? options.models?.writer ?? model
       : model;
-  if ("usage" in planned && planned.usage) {
-    emitUsageEvent(emit, store, sessionId, plannerModel, planned.usage, undefined, "planner", options.jobId);
-  }
   // Build execution prefix and tool profile once, then reuse both byte-for-byte
   // for every step in this job. Profiles are stable and project-agnostic.
   const stableSystemPrefix = buildStableSystemPrefix(
@@ -1209,19 +1388,20 @@ export async function runAgent(options: {
   let contextBase = initialMessageCount;
   let transcript = "";
   let documentProposalSubmitted = false;
+  let characterMutationSubmitted = false;
+  let characterMutationName = "";
+  let lastCharacterMutationDiagnostic = "";
   let waitingForUser = false;
   const toolCallCounts = new Map<string, number>();
-  let projectSearchCalls = 0;
-  let documentReadCalls = 0;
-  let missingProposalToolRetries = 0;
-  let invalidToolArgumentRetries = 0;
-  let stagnantToolSteps = 0;
-  let lastProgressFingerprint = agentProgressFingerprint(toolContext, store, sessionId);
+  const isCharacterTask = task.mode === "character" || task.mode === "simple_character";
+  const requiresCharacterMutation = isCharacterTask && permissionMode !== "plan";
+  // DeepSeek Thinking is fixed for the whole append-only tool job.
+  const jobThinkingOptions = thinkingRequestOptions(executionModel);
 
   try {
     // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
     const plannedSteps = Math.max(turnTodos.length, task.todoPlan.length);
-    let turnLimit = options.maxTurns ?? Math.max(20, plannedSteps * 8);
+    const turnLimit = options.maxTurns ?? Math.max(20, plannedSteps * 8);
     let turnStart = messages.length;
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
@@ -1233,29 +1413,51 @@ export async function runAgent(options: {
       const result = await streamCompletion(executionModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
-      }, (text) => emit({ type: "text", text, channel: "reasoning" }), { tools: executionTools });
+      }, (text) => emit({ type: "text", text, channel: "reasoning" }), {
+        tools: executionTools,
+        ...jobThinkingOptions,
+      });
+      const ensureThinkingTranscriptCanContinue = () => {
+        if (isDeepSeekModel(executionModel) && "thinking" in jobThinkingOptions
+          && jobThinkingOptions.thinking.type === "enabled"
+          && !result.reasoningContent.trim()) {
+          throw new Error(`DeepSeek Thinking 未返回 reasoning_content；当前结果已保留，但不能继续拼接下一次请求，请重试本任务${lastCharacterMutationDiagnostic ? `。本步工具诊断：${lastCharacterMutationDiagnostic}` : ""}`);
+        }
+      };
       if (result.usage) {
         emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step, "agent_step", options.jobId, requestComponents);
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
+        if (requiresCharacterMutation) {
+          messages.push({
+            role: "assistant",
+            content: stripDsmlText(result.content || "", "[本步未调用保存工具]"),
+            ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
+          });
+          messages.push({
+            role: "user",
+            content: task.mode === "simple_character"
+              ? "本任务尚未保存简易角色卡。请根据已有资料调用 save_simple_character；如果还缺资料，可以继续读取后再保存。"
+              : "本任务尚未保存普通角色卡。请继续完成必要读取，并调用 save_character 或 apply_character_changes；若工具返回错误，按结构化错误修正。",
+          });
+          ensureThinkingTranscriptCanContinue();
+          continue;
+        }
         if (task.documentProposalRequired) {
-          missingProposalToolRetries += 1;
           messages.push({
             role: "assistant",
             content: stripDsmlText(result.content || "", "[本步未调用工具]"),
             ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
           });
-          if (missingProposalToolRetries <= 2) {
-            messages.push({
-              // CACHE: user role — a mid-job system message flips DeepSeek's
-              // whole-request rendering and forfeits the cached prefix (§4).
-              role: "user",
-              content: "当前任务要求实际提交文档提案，但尚未成功创建提案。不要结束：若场景链已建立，立即按下一场 sceneId 调用 write_chapter_scene，并在同一调用中提供故事内 notes、正文和 actualState；全部场景完成后调用 inspect_chapter_draft 并提供 summary，终审通过会直接创建提案。",
-            });
-            continue;
-          }
-          throw new Error("Agent 连续三步未调用工具，且必需的文档提案尚未提交；任务已停止并保留未完成清单，请重试或检查模型工具调用兼容性");
+          messages.push({
+            // CACHE: user role — a mid-job system message flips DeepSeek's
+            // whole-request rendering and forfeits the cached prefix (§4).
+            role: "user",
+            content: "当前任务要求实际提交文档提案，但尚未成功创建提案。请依据已有工具结果继续；若工具返回结构化错误，修正参数或补充必要读取后重试。",
+          });
+          ensureThinkingTranscriptCanContinue();
+          continue;
         }
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
         store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
@@ -1264,7 +1466,6 @@ export async function runAgent(options: {
         return;
       }
 
-      missingProposalToolRetries = 0;
       turnStart = messages.length;
       messages.push({
         role: "assistant",
@@ -1282,26 +1483,65 @@ export async function runAgent(options: {
       let beginChapterSucceeded = false;
       let sceneWrittenFeedback: string[] | undefined;
       let chapterReviewInStep = false;
+      let characterMutationFailedThisStep = false;
       for (const call of result.toolCalls) {
+        let effectiveCall = call;
         emit({ type: "tool", name: call.name });
+        if (executionToolNames.has(call.name) && isCharacterMutationTool(call.name)) {
+          // A provider length stop may omit whole trailing fields even when braces
+          // happen to be closable; let the isolated repairer decide what is safe.
+          const locallyRepaired = result.finishReason === "length"
+            ? undefined
+            : repairTruncatedToolArguments(effectiveCall.arguments);
+          if (locallyRepaired) {
+            effectiveCall = { ...effectiveCall, arguments: locallyRepaired };
+          } else {
+            const definition = executionTools.find(tool => tool.function.name === call.name);
+            if (definition) {
+              try {
+                const repaired = await repairToolArgumentsWithModel(
+                  plannerModel, effectiveCall, definition, signal,
+                );
+                if (repaired.usage) {
+                  emitUsageEvent(
+                    emit, store, sessionId, plannerModel, repaired.usage, step,
+                    "tool_argument_repair", options.jobId,
+                    [{
+                      kind: "other",
+                      label: `${call.name} 参数修复`,
+                      characters: effectiveCall.arguments.length,
+                      estimatedTokens: approximateRequestTokens(effectiveCall.arguments),
+                    }],
+                  );
+                }
+                if (repaired.arguments) {
+                  effectiveCall = { ...effectiveCall, arguments: repaired.arguments };
+                } else {
+                }
+              } catch {
+              }
+            }
+          }
+        }
         let toolResult: string;
         if (!executionToolNames.has(call.name)) {
           toolResult = JSON.stringify({ error: `工具 ${call.name} 不在当前 ${task.mode} 任务的固定允许集中；请使用已提供的工具继续` });
-        } else if (call.name === "search_project" && ++projectSearchCalls > 2) {
-          toolResult = JSON.stringify({ error: "本轮项目搜索已达到两次上限；请使用已有结果和最小文档截取继续。" });
-        } else if (DOCUMENT_READ_TOOLS.has(call.name) && ++documentReadCalls > MAX_DOCUMENT_READS_PER_RUN) {
-          toolResult = JSON.stringify({
-            error: `本轮文档读取已达 ${MAX_DOCUMENT_READS_PER_RUN} 次上限；请使用写作引导、工作记忆和已有工具结果继续写作或提交提案，不要再次读取。`,
-          });
         } else {
-          toolResult = await executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
+          toolResult = await executeToolCached(effectiveCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
-        toolResult = boundToolResultForModel(call, toolResult, project, store, sessionId);
+        toolResult = boundToolResultForModel(effectiveCall, toolResult, project, store, sessionId);
         try {
           const parsed = JSON.parse(toolResult) as Record<string, unknown>;
-          if (parsed.code === "INVALID_TOOL_ARGUMENTS_JSON" && invalidToolArgumentRetries < 2) {
-            invalidToolArgumentRetries += 1;
-            turnLimit += 1;
+          if (call.name === "save_character" || call.name === "save_simple_character" || call.name === "apply_character_changes") {
+            const appliedCharacterChange = call.name !== "apply_character_changes"
+              || (Array.isArray(parsed.applied) && parsed.applied.length > 0);
+            if (!("error" in parsed) && appliedCharacterChange) {
+              characterMutationSubmitted = true;
+              characterMutationName = typeof parsed.name === "string" ? parsed.name : "";
+            } else {
+              characterMutationFailedThisStep = true;
+              lastCharacterMutationDiagnostic = characterMutationDiagnostic(parsed);
+            }
           }
           if (!("error" in parsed) && call.name === "begin_chapter_draft" && parsed.status === "started") {
             persistScenePipelineTodos(store, sessionId, "draft_started", emit);
@@ -1340,21 +1580,19 @@ export async function runAgent(options: {
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
-      if (task.documentProposalRequired && !documentProposalSubmitted && !waitingForUser) {
-        const progressFingerprint = agentProgressFingerprint(toolContext, store, sessionId);
-        if (progressFingerprint === lastProgressFingerprint) stagnantToolSteps += 1;
-        else stagnantToolSteps = 0;
-        lastProgressFingerprint = progressFingerprint;
-        if (stagnantToolSteps >= 3) {
-          throw new Error("Agent 连续三步工具调用未改变草稿、读取、清单、工件或提案状态；已停止以避免继续消耗 token，请根据最后一个结构化错误重试");
-        }
-        if (stagnantToolSteps === 2) {
-          messages.push({
-            role: "user",
-            content: "连续两步工具调用未推动任何结构化状态。不要重复同一调用：依据最后一个工具结果中的 code/error，改用能改变草稿版本、读取范围、任务清单或提案状态的有效工具；若参数无效，先修正参数。",
-          });
-          continue;
-        }
+      if (characterMutationSubmitted) {
+        const answer = stripDsmlText(transcript, "").trim()
+          || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
+        store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+        persistFinalizedSessionTodos(store, sessionId, emit);
+        emit({ type: "done", sessionId });
+        return;
+      }
+      if (requiresCharacterMutation && characterMutationFailedThisStep) {
+        messages.push({
+          role: "user",
+          content: `上一次角色卡保存失败。请根据结构化错误修正参数后继续；必要时可以重新读取相关角色或项目资料。错误：${lastCharacterMutationDiagnostic}`,
+        });
       }
       // §4b anchor: keep prep reads + the scene chain lock inside the cached base.
       if (beginChapterSucceeded) contextBase = messages.length;
@@ -1378,6 +1616,7 @@ export async function runAgent(options: {
           });
           turnStart = messages.length;
         }
+        ensureThinkingTranscriptCanContinue();
         continue;
       }
       if (documentProposalSubmitted) {
@@ -1408,8 +1647,6 @@ export async function runAgent(options: {
           contextBase = messages.length;
           // Allow fresh reads/searches for the next chapter within the same job;
           // store-cached artifacts still short-circuit identical repeat reads.
-          documentReadCalls = 0;
-          projectSearchCalls = 0;
           toolCallCounts.clear();
           toolContext.readSnapshots?.clear();
           toolContext.readCharactersUsed = 0;
@@ -1424,11 +1661,13 @@ export async function runAgent(options: {
           toolContext.chapterStylePriorNotes = undefined;
           // Style verdicts are per-chapter sentences; stale entries only waste lookups.
           toolContext.proseVerdictCache = undefined;
+          ensureThinkingTranscriptCanContinue();
           continue;
         }
         break;
       }
       if (waitingForUser) break;
+      ensureThinkingTranscriptCanContinue();
       // Append-only: do not mutate prior tool_calls / tool bodies mid-job (preserves prefix cache).
     }
     if (waitingForUser) {
@@ -1794,9 +2033,6 @@ ${JSON.stringify({
 const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
 const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "locate_document_span", "read_document", "read_document_span", "inspect_file", "read_file"]);
 const DOCUMENT_BODY_READ_TOOLS = new Set(["read_document", "read_document_span", "read_file"]);
-const MAX_READS_PER_PATH_PER_RUN = 2;
-const MAX_DOCUMENT_READS_PER_RUN = 5;
-const MAX_DOCUMENT_READ_CHARACTERS_PER_JOB = 9_000;
 const READ_ATOM_CACHE_VERSION = "v2";
 /** Structural / catalog tools must stay intact so the model does not re-list after compaction. */
 const NEVER_COMPACT_KEYS = new Set(["nodes", "matches", "issues"]);
@@ -1882,29 +2118,8 @@ export function admitReadAtom(
       message: "该行范围已存在于本轮上下文，正文不再重复返回；请直接使用已有读取结果。",
     });
   }
-  const overlaps = ranges.some(range => snapshot.ranges.some(previous =>
-    range.startLine <= previous.endLine && range.endLine >= previous.startLine));
-  if (overlaps) {
-    return JSON.stringify({
-      error: `${path} 请求范围与本轮已读原子重叠；请只读取尚未覆盖的最小行范围。`,
-      path,
-      sourceHash: resultHash,
-      requestedRanges: ranges,
-      readRanges: snapshot.ranges,
-    });
-  }
-
   const characters = readResultBodyCharacters(parsed);
   const used = context.readCharactersUsed ?? 0;
-  if (used + characters > MAX_DOCUMENT_READ_CHARACTERS_PER_JOB) {
-    return JSON.stringify({
-      error: `本轮读取正文将超过 ${MAX_DOCUMENT_READ_CHARACTERS_PER_JOB} 字符预算；请使用已有原子、search_project 摘要或直接继续任务。`,
-      path,
-      sourceHash: resultHash,
-      usedCharacters: used,
-      rejectedCharacters: characters,
-    });
-  }
   context.readCharactersUsed = used + characters;
   snapshot.ranges.push(...ranges);
   return result;
@@ -1947,17 +2162,6 @@ async function executeToolCached(
   let input: Record<string, unknown>;
   try { input = JSON.parse(call.arguments || "{}") as Record<string, unknown>; }
   catch { return executeTool(call, project, store, sessionId, emit, characterScope, context); }
-  if (context.editScope === "point" && context.editTargetLocked
-    && input.path === context.editTargetLocked.path
-    && (call.name === "inspect_document"
-      || (call.name === "read_document" && !(typeof input.quote === "string" && input.quote.trim())))) {
-    return JSON.stringify({
-      error: "局部修改目标已锁定；禁止继续 inspect 或按块/节/行读取，请使用已读锚点提交 patch",
-      path: context.editTargetLocked.path,
-      sourceHash: context.editTargetLocked.sourceHash,
-      anchorIds: context.editTargetLocked.anchorIds,
-    });
-  }
   const normalized = Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) =>
     [key, typeof value === "string" ? value.trim() : value]));
   const path = typeof normalized.path === "string" ? normalized.path : undefined;
@@ -1981,55 +2185,12 @@ async function executeToolCached(
     }
   }
 
-  // Throttle thrashing the same document with slightly different ranges.
-  if (DOCUMENT_READ_TOOLS.has(call.name) && sourcePath) {
-    const pathKey = `path-read:${sourcePath}:${sourceHash}`;
-    const pathCount = (counts.get(pathKey) ?? 0) + 1;
-    counts.set(pathKey, pathCount);
-    if (pathCount > MAX_READS_PER_PATH_PER_RUN) {
-      const recent = store.recentContextArtifacts(sessionId, 8)
-        .filter(item => item.path === sourcePath && item.sourceHash === sourceHash)
-        .map(item => ({ id: item.id, kind: item.kind, digest: item.digest }));
-      return JSON.stringify({
-        error: `本轮已对 ${sourcePath} 读取 ${MAX_READS_PER_PATH_PER_RUN} 次且文档未变；请使用已有工具结果或工作记忆继续，不要再次读取。`,
-        path: sourcePath,
-        sourceHash,
-        availableArtifacts: recent,
-      });
-    }
-  }
-
-  // list_outline_nodes / list_documents: hard-stop after first success this run
-  if (call.name === "list_outline_nodes" || call.name === "list_documents" || call.name === "list_files") {
-    const listKey = `list-once:${call.name}:${sourceHash}`;
-    const listCount = (counts.get(listKey) ?? 0) + 1;
-    counts.set(listKey, listCount);
-    if (listCount > 1) {
-      const cachedList = store.recentContextArtifacts(sessionId, 12).find(item => item.kind === call.name && item.sourceHash === sourceHash);
-      if (cachedList) {
-        const full = store.contextArtifactById(sessionId, cachedList.id);
-        if (full) {
-          return withReuseMarker(full.content, `${call.name} 本轮已调用过；以下从工作记忆恢复，禁止再次列出。`, cachedList.id);
-        }
-      }
-      return JSON.stringify({ error: `${call.name} 本轮已调用过；请使用已有结果中的 id/path，不要再次列出。` });
-    }
-  }
-
-  // Old read artifacts may contain pre-boundary 6k/12k bodies. Version read
-  // atoms so those persisted rows can never bypass the current hard limits.
+  // Version read artifacts so older cached payload shapes are not mixed in.
   const cacheVersion = DOCUMENT_READ_TOOLS.has(call.name) ? `:${READ_ATOM_CACHE_VERSION}` : "";
   const cacheKey = `${call.name}${cacheVersion}:${JSON.stringify(normalized)}:${sourceHash}`;
   const count = (counts.get(cacheKey) ?? 0) + 1;
   counts.set(cacheKey, count);
   const cached = store.contextArtifact(sessionId, cacheKey);
-  if (count > 3) {
-    return JSON.stringify({
-      error: "相同工具调用已重复三次，结果没有变化；请使用现有工作记忆继续，不要再次调用。",
-      path: cached?.path ?? sourcePath,
-      digest: cached?.digest,
-    });
-  }
   if (cached) {
     if (DOCUMENT_READ_TOOLS.has(call.name) && count > 1) {
       return JSON.stringify({
@@ -2165,7 +2326,7 @@ export function rehydrateRecentToolMessages(
       if (artifactId === undefined) continue;
       const full = store.contextArtifactById(sessionId, artifactId);
       if (!full?.content) continue;
-      message.content = withReuseMarker(full.content, "已从工作记忆恢复最近工具结果；禁止再次读取同一内容。", artifactId);
+      message.content = withReuseMarker(full.content, "已从工作记忆恢复最近工具结果；如信息仍不足，可继续读取必要范围。", artifactId);
     } catch { /* ignore non-JSON tool payloads */ }
   }
 }
@@ -2353,38 +2514,7 @@ export function boundToolResultForModel(
     estimatedOriginalTokens: estimatedTokens,
     metadata,
     preview: tail ? `${head}\n…[中间内容已省略，可按 artifactId 分页读取]…\n${tail}` : head,
-    message: "完整工具结果已保存到工作记忆。仅当 preview 与 metadata 不足以继续时，使用 read_context_artifact 按需分页；禁止重复执行原工具。",
-  });
-}
-
-/** Structural progress only; no semantic keyword matching. */
-export function agentProgressFingerprint(
-  context: ToolExecutionContext,
-  store: WriterStore,
-  sessionId: string,
-): string {
-  const draft = context.chapterSceneDraft;
-  const checkpoint = store.agentCheckpoint(sessionId);
-  const reads = context.readSnapshots ? [...context.readSnapshots.entries()] : [];
-  return JSON.stringify({
-    draft: draft ? {
-      path: draft.path,
-      version: draft.version,
-      inspectedVersion: draft.inspectedVersion,
-      completed: draft.completed.length,
-    } : null,
-    reads: reads.map(([path, snapshot]) => ({
-      path,
-      sourceHash: snapshot.sourceHash,
-      ranges: snapshot.ranges.map(range => [range.startLine, range.endLine, range.artifactId]),
-    })).sort((a, b) => a.path.localeCompare(b.path)),
-    readCharactersUsed: context.readCharactersUsed ?? 0,
-    writePack: [context.writePackCompiled === true, context.writePackSceneId ?? null],
-    outlineDesigned: context.creativeOutlineDesigned === true,
-    todos: store.sessionTodos(sessionId).map(todo => [todo.id, todo.status]),
-    artifacts: store.recentContextArtifacts(sessionId, 8).map(item => item.id).sort((a, b) => a - b),
-    checkpoint: checkpoint ? [checkpoint.stage, checkpoint.draftVersion, checkpoint.completedScenes, checkpoint.proposalId,
-      checkpoint.unresolved ?? []] : null,
+    message: "完整工具结果已保存到工作记忆。preview 与 metadata 不足时，可用 read_context_artifact 分页读取，或继续执行必要工具。",
   });
 }
 
@@ -2435,8 +2565,15 @@ async function streamCompletion(
   signal: AbortSignal | undefined,
   onText: (text: string) => void,
   onReasoning: (text: string) => void,
-  options: { tools?: readonly ToolDefinition[]; maxCompletionTokens?: number } = {},
-): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
+  options: {
+    tools?: readonly ToolDefinition[];
+    maxCompletionTokens?: number;
+    thinking?: { type: "enabled" | "disabled" };
+    temperature?: number;
+    topP?: number;
+    responseFormat?: { type: "json_object" };
+  } = {},
+): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean } }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({
     // The selected profile is frozen and project-agnostic for this job.
@@ -2446,8 +2583,14 @@ async function streamCompletion(
     stream: true,
     stream_options: { include_usage: true },
     ...(options.maxCompletionTokens ? { max_tokens: options.maxCompletionTokens } : {}),
-    ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
-    ...(model.topP !== undefined ? { top_p: model.topP } : {}),
+    ...(options.thinking ? { thinking: options.thinking } : {}),
+    ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
+    ...(options.temperature !== undefined
+      ? { temperature: options.temperature }
+      : model.temperature !== undefined ? { temperature: model.temperature } : {}),
+    ...(options.topP !== undefined
+      ? { top_p: options.topP }
+      : model.topP !== undefined ? { top_p: model.topP } : {}),
   });
   logModelRequest(endpoint, requestBody);
   const response = await modelFetch(endpoint, {
@@ -2473,6 +2616,7 @@ async function streamCompletion(
   let buffer = "";
   let content = "";
   let reasoningContent = "";
+  let finishReason: string | undefined;
   let usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } | undefined;
 
   const consume = (block: string) => {
@@ -2505,7 +2649,9 @@ async function streamCompletion(
           )),
         ),
       };
-      const delta = chunk.choices?.[0]?.delta;
+      const choice = chunk.choices?.[0];
+      if (typeof choice?.finish_reason === "string") finishReason = choice.finish_reason;
+      const delta = choice?.delta;
       if (!delta) continue;
       if (typeof delta.content === "string") {
         content += delta.content;
@@ -2547,6 +2693,7 @@ async function streamCompletion(
     content: textual.content,
     reasoningContent,
     toolCalls: resolvedToolCalls,
+    ...(finishReason ? { finishReason } : {}),
     usage: resolvedUsage,
   };
   logModelResponse(endpoint, JSON.stringify(completed, null, 2));
