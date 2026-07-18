@@ -34,7 +34,7 @@ function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], pa
   if (!context.requireScenePipeline || !isScenePipelineDocument(path)) return;
   throw new Error(
     `${toolName} 不能跳过逐场景正文流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
-    `再 inspect_chapter_draft 与 propose_chapter_draft。已有正文的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
+    `再用 inspect_chapter_draft 终审并直接创建提案。已有正文的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
     "可直接用 propose_document_patch，不受此限。",
   );
 }
@@ -120,6 +120,16 @@ export async function gateProseStyle(
   afterContent: string,
   context: ToolHandlerArgs["context"],
 ): Promise<void> {
+  const issues = await proseStyleGateIssues(beforeContent, afterContent, context);
+  const styleError = proseStyleIssuesError(issues);
+  if (styleError) throw new Error(styleError);
+}
+
+export async function proseStyleGateIssues(
+  beforeContent: string,
+  afterContent: string,
+  context: ToolHandlerArgs["context"],
+) {
   let issues = newProseStyleIssues(beforeContent, afterContent);
   if (context.proseAdjudicator) {
     // Verdicts persist across gate rounds so repeat inspects stay deterministic
@@ -138,8 +148,7 @@ export async function gateProseStyle(
     );
     issues = flash.issues;
   }
-  const styleError = proseStyleIssuesError(issues);
-  if (styleError) throw new Error(styleError);
+  return issues;
 }
 
 export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {

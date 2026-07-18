@@ -13,6 +13,9 @@ import {
   agentToolSchemaHash,
   agentToolsForTask,
   admitReadAtom,
+  agentProgressFingerprint,
+  boundToolResultForModel,
+  buildRequestComponentUsage,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
   chapterContinuationPrompt,
@@ -24,6 +27,7 @@ import {
   parsePlannerJson,
   rehydrateRecentToolMessages,
   requestNeedsProjectFactSearch,
+  restoreChapterDraftCheckpoint,
   sceneContinuationPrompt,
   stripStaleReasoningContent,
   taskInstructions,
@@ -34,12 +38,13 @@ import { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
+import { parseChapterStyleRepair } from "./chapter_style_repair.js";
 
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "0a334dac5f1197aa");
+  assert.equal(agentToolSchemaHash(), "d70428a4899205cc");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -72,6 +77,79 @@ test("isolated chapter review carries the full draft once and returns bounded st
       evidence: ["正文中不存在的句子。"], problem: "问题", action: "修复",
     }],
   }), new Set(["arrival"]), content), /可定位的 blocker/u);
+});
+
+test("isolated style repair only admits exact issue sentences", () => {
+  const issues = [{
+    id: "i1", code: "contrast", sentence: "不是寒冷，是风在门缝里找路。",
+    before: "她关上窗。", after: "灯影晃了一下。", instruction: "去掉模板化转折",
+  }];
+  assert.deepEqual(parseChapterStyleRepair(JSON.stringify({ edits: [
+    { search: issues[0].sentence, replace: "风从门缝钻进来，贴着她的手背往袖口里走。" },
+    { search: "未列出的句子。", replace: "不得应用。" },
+  ] }), issues), [{
+    search: issues[0].sentence,
+    replace: "风从门缝钻进来，贴着她的手背往袖口里走。",
+  }]);
+});
+
+test("request waterfall and oversized tool paging stay bounded", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-context-budget-"));
+  try {
+    const project = WriterProject.init(root, "上下文预算");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("上下文预算");
+    const tools = agentToolsForTask("write_scene", "ask");
+    const components = buildRequestComponentUsage([
+      { role: "system", content: "stable" },
+      { role: "user", content: "dynamic" },
+      { role: "tool", tool_call_id: "t1", content: "result" },
+    ], tools, 1, 2);
+    assert.ok(components.some(component => component.kind === "tool_schema"));
+    assert.ok(components.some(component => component.kind === "stable_system"));
+    assert.ok(components.some(component => component.kind === "tool_result"));
+
+    const full = JSON.stringify({ status: "written", complete: true, content: "正文".repeat(20_000) });
+    const bounded = JSON.parse(boundToolResultForModel(
+      { id: "t1", name: "read_document", arguments: "{}" }, full, project, store, sessionId,
+    )) as Record<string, unknown>;
+    assert.equal(bounded.status, "tool_result_truncated");
+    assert.equal(bounded.complete, true, "control milestones must survive truncation");
+    const artifact = store.contextArtifactById(sessionId, Number(bounded.artifactId));
+    assert.equal(artifact?.content, full);
+    assert.ok(String(bounded.preview).length < full.length);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("validated checkpoints restore drafts and contribute to structural progress", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-checkpoint-"));
+  try {
+    const project = WriterProject.init(root, "断点");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("断点");
+    const draft = beginChapterSceneDraft({
+      path: "chapters/第1章.md", mode: "create", heading: "第1章", chapterGoal: "越界",
+      baseContent: "", baseHash: project.hash(""),
+      scenes: [{ id: "s1", title: "门禁", goal: "进入", obstacle: "锁门", turn: "警报", outcome: "越界", handoff: "" }],
+    });
+    store.saveAgentCheckpoint(sessionId, {
+      version: 1, stage: "draft_started", path: draft.path, sourceHash: draft.baseHash,
+      draftVersion: 0, completedScenes: 0, totalScenes: 1, draft, updatedAt: new Date().toISOString(),
+    });
+    assert.equal(restoreChapterDraftCheckpoint(store, sessionId, project, draft.path)?.path, draft.path);
+    const context: ToolExecutionContext = { permissionMode: "ask", chapterSceneDraft: draft };
+    const before = agentProgressFingerprint(context, store, sessionId);
+    store.saveSessionTodos(sessionId, [{ id: "t1", content: "完成章节", status: "in_progress" }]);
+    assert.notEqual(agentProgressFingerprint(context, store, sessionId), before);
+    store.clearSessionTaskState(sessionId);
+    assert.equal(store.agentCheckpoint(sessionId), undefined);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("task tool profiles are frozen order-preserving allow-lists", () => {
@@ -155,11 +233,13 @@ test("provider usage parsing and tagged persistence include hidden model calls",
       promptTokens: 120, completionTokens: 30, cacheHitTokens: 80, cacheMissTokens: 40,
     }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:00Z"), {
       jobId: "job-1", callKind: "prose_gate", step: 3,
+      requestComponents: [{ kind: "other", label: "局部审查", characters: 400, estimatedTokens: 100 }],
     });
-    const row = store.database.prepare("SELECT job_id,call_kind,step FROM model_usage WHERE session_id=? AND call_kind='prose_gate'").get(sessionId) as Record<string, unknown>;
+    const row = store.database.prepare("SELECT job_id,call_kind,step,request_components_json FROM model_usage WHERE session_id=? AND call_kind='prose_gate'").get(sessionId) as Record<string, unknown>;
     assert.equal(row.job_id, "job-1");
     assert.equal(row.call_kind, "prose_gate");
     assert.equal(row.step, 3);
+    assert.equal((JSON.parse(String(row.request_components_json)) as unknown[]).length, 1);
     assert.equal(store.usage(sessionId).lastPromptTokens, 0, "internal calls must not replace the main context meter");
     store.recordUsage(sessionId, "pro", {
       promptTokens: 500, completionTokens: 20, cacheHitTokens: 400, cacheMissTokens: 100,
@@ -228,8 +308,9 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /工具内部完成 notes 编译/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);
+  assert.match(instructions, /直接创建提案/);
   assert.match(instructions, /actualState/);
-  assert.match(instructions, /禁止直接 propose_document/);
+  assert.match(instructions, /禁止 propose_document\/patch/);
   assert.match(instructions, /大纲不是章节写作的前置条件/);
   assert.match(instructions, /禁止 design_creative_outline/);
   assert.match(instructions, /重心放在因果场景链/);

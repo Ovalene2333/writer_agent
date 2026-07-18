@@ -27,14 +27,40 @@ import {
   sceneAntiFormulaFeedback,
   sceneProseScore,
 } from "../prose_metrics.js";
-import { sceneMannerismGateError } from "../prose_quality.js";
+import { proseStyleIssuesError, sceneMannerismGateError, type ProseStyleIssue } from "../prose_quality.js";
 import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
+import {
+  ChapterStyleRepairRequestError,
+  requestChapterStyleRepair,
+  type ChapterStyleRepairIssue,
+} from "../chapter_style_repair.js";
 import type { ToolExecutionContext } from "./types.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
-import { gateProseStyle, submitFullDocumentProposal } from "./proposals.js";
+import { proseStyleGateIssues, submitFullDocumentProposal } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
 
-export function handleBeginChapterDraft({ input, project, context }: ToolHandlerArgs): string {
+function saveDraftCheckpoint(
+  args: Pick<ToolHandlerArgs, "store" | "sessionId">,
+  stage: import("../types.js").AgentCheckpoint["stage"],
+  draft: ChapterSceneDraft,
+  extra: { unresolved?: string[]; proposalId?: number } = {},
+): void {
+  args.store.saveAgentCheckpoint(args.sessionId, {
+    version: 1,
+    stage,
+    path: draft.path,
+    sourceHash: draft.baseHash,
+    draftVersion: draft.version,
+    completedScenes: draft.completed.length,
+    totalScenes: draft.scenes.length,
+    artifactIds: args.store.recentContextArtifacts(args.sessionId, 8).map(item => item.id),
+    draft,
+    ...extra,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+export function handleBeginChapterDraft({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "begin_chapter_draft");
   if (context.chapterSceneDraft) throw new Error("已有章节场景草稿正在进行；请完成提案后再开始下一章");
   const path = requireString(input.path, "path");
@@ -84,6 +110,7 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
   // Stashed for scene-boundary handoffs: the begin exchange leaves the request
   // after the first scene reset, but these notes must keep applying to every scene.
   context.chapterStylePriorNotes = stylePriorNotes;
+  saveDraftCheckpoint({ store, sessionId }, "draft_started", draft);
   return JSON.stringify({
     status: "started",
     path,
@@ -124,7 +151,7 @@ function priorProseText(project: WriterProject, draft: ChapterSceneDraft, contex
   return text;
 }
 
-export async function handleWriteChapterScene({ input, project, store, context }: ToolHandlerArgs): Promise<string> {
+export async function handleWriteChapterScene({ input, project, store, sessionId, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "write_chapter_scene");
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
@@ -166,6 +193,7 @@ export async function handleWriteChapterScene({ input, project, store, context }
   );
   const result = writeChapterScene(draft, sceneId, selectedContent, input.actualState);
   context.chapterSceneDraft = result.draft;
+  saveDraftCheckpoint({ store, sessionId }, "scene_written", result.draft);
   // A write pack belongs to exactly one scene. The next/revised scene must recompile.
   context.writePackCompiled = false;
   context.writePackSceneId = undefined;
@@ -317,12 +345,13 @@ function sceneCardBrief(scene: ChapterSceneCard | undefined): string {
   return `目标：${scene.goal}；阻力：${scene.obstacle}；转折：${scene.turn}；结果：${scene.outcome}`;
 }
 
-export function handleReviseChapterDraftStyle({ input, project, context }: ToolHandlerArgs): string {
+export function handleReviseChapterDraftStyle({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "revise_chapter_draft_style");
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("当前没有章节场景草稿");
   const result = reviseChapterDraftStyle(draft, input.edits);
   context.chapterSceneDraft = result.draft;
+  saveDraftCheckpoint({ store, sessionId }, "style_repaired", result.draft);
   // Sync re-gate (rules + cached Flash verdicts, no model call): tell the model in
   // THIS step whether the gate would still block, so it never spends an extra
   // inspect round just to find out.
@@ -348,21 +377,107 @@ export function handleReviseChapterDraftStyle({ input, project, context }: ToolH
   });
 }
 
-export async function handleInspectChapterDraft({ project, context }: ToolHandlerArgs): Promise<string> {
-  const draft = context.chapterSceneDraft;
+function styleRepairIssues(content: string, blockers: ProseStyleIssue[]): ChapterStyleRepairIssue[] {
+  return blockers.slice(0, 20).map(issue => ({
+    id: issue.id,
+    code: issue.subtype,
+    sentence: issue.sentence,
+    before: content.slice(Math.max(0, issue.start - 180), issue.start).trim(),
+    after: content.slice(issue.end, Math.min(content.length, issue.end + 180)).trim(),
+    instruction: [issue.reason, ...issue.suggestions.slice(0, 2)].filter(Boolean).join("；"),
+  }));
+}
+
+function isolatedRequestComponent(label: string, characters: number, callKind: string) {
+  return [{
+    kind: "other" as const,
+    label,
+    characters,
+    estimatedTokens: Math.ceil(characters * 0.75),
+    callKind,
+  }];
+}
+
+async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: string): Promise<{
+  passed: boolean;
+  attempts: number;
+  blockers: ProseStyleIssue[];
+  errors: string[];
+}> {
+  const { project, store, context } = args;
+  let attempts = 0;
+  const errors: string[] = [];
+  for (;;) {
+    const draft = context.chapterSceneDraft;
+    if (!draft) return { passed: false, attempts, blockers: [], errors: ["章节草稿已丢失"] };
+    const content = assembleChapterSceneDraft(draft);
+    const issues = await proseStyleGateIssues(beforeContent, content, context);
+    const blockers = issues.filter(issue => issue.severity === "error");
+    if (!blockers.length) return { passed: true, attempts, blockers: [], errors };
+    if (!context.chapterStyleRepairer || attempts >= 2) return { passed: false, attempts, blockers, errors };
+    attempts += 1;
+    const repairer = context.chapterStyleRepairer;
+    const runRepair = repairer.run ?? requestChapterStyleRepair;
+    const models = [repairer.model, repairer.fallbackModel]
+      .filter((model): model is NonNullable<typeof model> => Boolean(model))
+      .filter((model, index, all) => all.findIndex(candidate => candidate.baseUrl === model.baseUrl && candidate.model === model.model) === index);
+    let applied = false;
+    for (const repairModel of models) {
+      try {
+        const repaired = await runRepair(repairModel, {
+          issues: styleRepairIssues(content, blockers),
+          chapterGoal: draft.chapterGoal,
+          styleEvidence: chapterStyleEvidence({ project, store, context }, draft),
+        }, repairer.signal);
+        if (repaired.usage) {
+          context.modelUsageReporter?.(repairModel, repaired.usage, {
+            callKind: "chapter_style_repair",
+            requestComponents: isolatedRequestComponent("隔离风格修订请求", repaired.requestCharacters, "chapter_style_repair"),
+          });
+        }
+        const revised = reviseChapterDraftStyle(draft, repaired.edits);
+        context.chapterSceneDraft = revised.draft;
+        saveDraftCheckpoint(args, "style_repaired", revised.draft);
+        applied = true;
+        break;
+      } catch (error) {
+        if (error instanceof ChapterStyleRepairRequestError && error.usage) {
+          context.modelUsageReporter?.(repairModel, error.usage, {
+            callKind: "chapter_style_repair_failed",
+            requestComponents: isolatedRequestComponent("失败的隔离风格修订请求", error.requestCharacters, "chapter_style_repair_failed"),
+          });
+        }
+        errors.push(error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240));
+      }
+    }
+    if (!applied) return { passed: false, attempts, blockers, errors };
+  }
+}
+
+export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<string> {
+  const { input, project, context } = args;
+  assertWritableMode(context.permissionMode, "inspect_chapter_draft");
+  const proposalSummary = requireString(input.summary, "summary");
+  let draft = context.chapterSceneDraft;
   if (!draft) throw new Error("当前没有章节场景草稿");
   if (!chapterSceneDraftComplete(draft)) {
     throw new Error(`场景尚未写完（${draft.completed.length}/${draft.scenes.length}）`);
   }
-  const content = assembleChapterSceneDraft(draft);
+  let content = assembleChapterSceneDraft(draft);
   const beforeContent = project.documentExists(draft.path) ? project.read(draft.path) : "";
-  try {
-    await gateProseStyle(beforeContent, content, context);
-  } catch (error) {
+  const styleRepair = await autoRepairChapterStyle(args, beforeContent);
+  draft = context.chapterSceneDraft ?? draft;
+  content = assembleChapterSceneDraft(draft);
+  if (!styleRepair.passed) {
+    saveDraftCheckpoint(args, "review_blocked", draft, {
+      unresolved: styleRepair.blockers.map(issue => `${issue.subtype}:${issue.sentence}`).slice(0, 20),
+    });
     return JSON.stringify({
       status: "style_revision_required",
       code: "CHAPTER_DRAFT_STYLE_BLOCKED",
-      error: error instanceof Error ? error.message : String(error),
+      error: proseStyleIssuesError(styleRepair.blockers) ?? "局部风格修订未通过",
+      autoRepairAttempts: styleRepair.attempts,
+      ...(styleRepair.errors.length ? { autoRepairErrors: styleRepair.errors } : {}),
       path: draft.path,
       complete: true,
       invalidatedSceneIds: [],
@@ -377,6 +492,9 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
   });
   const metricsError = chapterMetricsBlockError(metrics);
   if (metricsError) {
+    saveDraftCheckpoint(args, "review_blocked", draft, {
+      unresolved: metrics.issues.filter(issue => issue.severity === "error").flatMap(issue => issue.examples).slice(0, 20),
+    });
     return JSON.stringify({
       status: "style_revision_required",
       code: "CHAPTER_METRICS_BLOCKED",
@@ -403,6 +521,8 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
         candidate.baseUrl === model.baseUrl && candidate.model === model.model
       ) === index);
     const reviewErrors: string[] = [];
+    const reviewRequestCharacters = content.length + JSON.stringify(ledger).length
+      + draft.chapterGoal.length + (reviewer.context?.length ?? 0) + 1_200;
     for (const reviewModel of reviewModels) {
       try {
         const reviewed = await runReview(reviewModel, {
@@ -412,9 +532,15 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
           context: reviewer.context,
         }, reviewer.signal);
         if (reviewed.usage) {
-          context.modelUsageReporter?.(reviewModel, reviewed.usage, { callKind: "chapter_review" });
+          context.modelUsageReporter?.(reviewModel, reviewed.usage, {
+            callKind: "chapter_review",
+            requestComponents: isolatedRequestComponent("隔离整章终审请求", reviewRequestCharacters, "chapter_review"),
+          });
         }
         if (reviewed.review.verdict === "revise") {
+          saveDraftCheckpoint(args, "review_blocked", draft, {
+            unresolved: reviewed.review.issues.filter(issue => issue.severity === "blocker").map(issue => issue.problem),
+          });
           const targetIds = new Set(reviewed.review.issues
             .filter(issue => issue.severity === "blocker" && issue.sceneId)
             .map(issue => issue.sceneId!));
@@ -445,9 +571,39 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
           });
         }
         draft.inspectedVersion = draft.version;
+        saveDraftCheckpoint(args, "review_passed", draft);
+        let proposalResult: string;
+        try {
+          proposalResult = await submitChapterDraftProposal(args, {
+            summary: proposalSummary,
+            chapterChange: reviewed.review.chapterChange,
+            reviewNotes: reviewed.review.reviewNotes,
+            characterChanges: input.characterChanges,
+          });
+        } catch (error) {
+          return JSON.stringify({
+            status: "proposal_failed",
+            reviewCompleted: true,
+            chapterReview: reviewed.review,
+            error: error instanceof Error ? error.message : String(error),
+            message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
+          });
+        }
+        const proposal = JSON.parse(proposalResult) as Record<string, unknown>;
+        if ("error" in proposal) {
+          return JSON.stringify({
+            status: "proposal_failed",
+            reviewCompleted: true,
+            chapterReview: reviewed.review,
+            error: proposal.error,
+            message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
+          });
+        }
         return JSON.stringify({
-          status: "inspection_required",
+          status: "proposal_submitted",
           reviewCompleted: true,
+          proposalSubmitted: true,
+          proposal,
           path: draft.path,
           chapterGoal: draft.chapterGoal,
           contentCharacters: content.length,
@@ -457,11 +613,14 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
           ...(styleWarnings.length ? { styleWarnings } : {}),
           ledger,
           chapterReview: reviewed.review,
-          message: "整章终审已完成且通过。下一回复禁止输出或复述审阅正文；第一个动作直接调用 propose_chapter_draft，把 chapterReview.chapterChange 和 reviewNotes 原样写入对应参数。",
+          message: "整章终审已完成且提案已创建；不要再调用 propose_chapter_draft。",
         });
       } catch (error) {
         if (error instanceof ChapterReviewRequestError && error.usage) {
-          context.modelUsageReporter?.(reviewModel, error.usage, { callKind: "chapter_review_failed" });
+          context.modelUsageReporter?.(reviewModel, error.usage, {
+            callKind: "chapter_review_failed",
+            requestComponents: isolatedRequestComponent("失败的隔离整章终审请求", reviewRequestCharacters, "chapter_review_failed"),
+          });
         }
         reviewErrors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
       }
@@ -497,14 +656,26 @@ export async function handleInspectChapterDraft({ project, context }: ToolHandle
 }
 
 export async function handleProposeChapterDraft(args: ToolHandlerArgs): Promise<string> {
-  const { input, project, context } = args;
+  const { input } = args;
+  return submitChapterDraftProposal(args, {
+    summary: requireString(input.summary, "summary"),
+    chapterChange: requireString(input.chapterChange, "chapterChange"),
+    reviewNotes: requireString(input.reviewNotes, "reviewNotes"),
+    characterChanges: input.characterChanges,
+  });
+}
+
+async function submitChapterDraftProposal(
+  args: ToolHandlerArgs,
+  values: { summary: string; chapterChange: string; reviewNotes: string; characterChanges?: unknown },
+): Promise<string> {
+  const { project, context } = args;
+  if (!values.chapterChange.trim() || !values.reviewNotes.trim()) throw new Error("终审结论不能为空");
   assertWritableMode(context.permissionMode, "propose_chapter_draft");
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("当前没有章节场景草稿");
   if (!chapterSceneDraftComplete(draft)) throw new Error("场景链尚未完成，不能提交整章");
   if (draft.inspectedVersion !== draft.version) throw new Error("整章草稿在最后修改后尚未 inspect_chapter_draft");
-  requireString(input.chapterChange, "chapterChange");
-  requireString(input.reviewNotes, "reviewNotes");
   const exists = project.documentExists(draft.path);
   if (draft.mode === "create" && exists) throw new Error("目标文档在场景写作期间已被创建，请重新开始并选择 replace/append");
   if (draft.mode !== "create") {
@@ -516,14 +687,16 @@ export async function handleProposeChapterDraft(args: ToolHandlerArgs): Promise<
     args,
     draft.path,
     assembleChapterSceneDraft(draft),
-    requireString(input.summary, "summary"),
-    input.characterChanges,
+    values.summary,
+    values.characterChanges,
     true,
     true,
   );
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
     if (!("error" in parsed)) {
+      const proposalId = typeof parsed.proposalId === "number" ? parsed.proposalId : undefined;
+      saveDraftCheckpoint(args, "proposal_submitted", draft, { proposalId });
       context.completedChapterHandoff = {
         path: draft.path,
         sceneCount: draft.completed.length,

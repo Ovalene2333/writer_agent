@@ -238,7 +238,8 @@ export class WriterStore {
         created_at TEXT NOT NULL,
         job_id TEXT,
         call_kind TEXT NOT NULL DEFAULT 'unspecified',
-        step INTEGER
+        step INTEGER,
+        request_components_json TEXT NOT NULL DEFAULT '[]'
       );
       CREATE TABLE IF NOT EXISTS writing_drafts (
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -267,6 +268,7 @@ export class WriterStore {
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
         active_document TEXT,
         current_intent TEXT NOT NULL DEFAULT '',
+        agent_checkpoint_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS character_revisions (
@@ -309,6 +311,9 @@ export class WriterStore {
     if (!contextColumns.some(column => column.name === "todos_json")) {
       this.database.exec("ALTER TABLE session_context ADD COLUMN todos_json TEXT NOT NULL DEFAULT '[]'");
     }
+    if (!contextColumns.some(column => column.name === "agent_checkpoint_json")) {
+      this.database.exec("ALTER TABLE session_context ADD COLUMN agent_checkpoint_json TEXT NOT NULL DEFAULT '{}'");
+    }
     const messageColumns = this.database.prepare("PRAGMA table_info(messages)").all() as Row[];
     if (!messageColumns.some(column => column.name === "channel")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'agent'");
@@ -329,6 +334,9 @@ export class WriterStore {
     }
     if (!usageColumns.some(column => column.name === "step")) {
       this.database.exec("ALTER TABLE model_usage ADD COLUMN step INTEGER");
+    }
+    if (!usageColumns.some(column => column.name === "request_components_json")) {
+      this.database.exec("ALTER TABLE model_usage ADD COLUMN request_components_json TEXT NOT NULL DEFAULT '[]'");
     }
   }
 
@@ -390,9 +398,9 @@ export class WriterStore {
   /** Drop sticky task residue (todos / intent / active doc / tool memory) when dialogue is rewound or a new non-continuation turn starts. */
   clearSessionTaskState(sessionId: string): void {
     const now = new Date().toISOString();
-    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET active_document=NULL, current_intent='', todos_json='[]', updated_at=excluded.updated_at`)
-      .run(sessionId, null, "", "[]", now);
+    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,agent_checkpoint_json,updated_at) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET active_document=NULL, current_intent='', todos_json='[]', agent_checkpoint_json='{}', updated_at=excluded.updated_at`)
+      .run(sessionId, null, "", "[]", "{}", now);
     this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
   }
 
@@ -534,6 +542,27 @@ export class WriterStore {
       ids.add(card.id);
     }
     return cards.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id - a.id);
+  }
+
+  agentCheckpoint(sessionId: string): import("./types.js").AgentCheckpoint | undefined {
+    const row = this.database.prepare("SELECT agent_checkpoint_json FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
+    if (typeof row?.agent_checkpoint_json !== "string" || !row.agent_checkpoint_json.trim() || row.agent_checkpoint_json === "{}") return undefined;
+    try {
+      const value = JSON.parse(row.agent_checkpoint_json) as import("./types.js").AgentCheckpoint;
+      return value?.version === 1 ? value : undefined;
+    } catch { return undefined; }
+  }
+
+  saveAgentCheckpoint(sessionId: string, checkpoint: import("./types.js").AgentCheckpoint): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,agent_checkpoint_json,updated_at)
+      VALUES(?,NULL,'','[]',?,?) ON CONFLICT(session_id) DO UPDATE SET agent_checkpoint_json=excluded.agent_checkpoint_json,updated_at=excluded.updated_at`)
+      .run(sessionId, JSON.stringify(checkpoint), now);
+  }
+
+  clearAgentCheckpoint(sessionId: string): void {
+    this.database.prepare("UPDATE session_context SET agent_checkpoint_json='{}',updated_at=? WHERE session_id=?")
+      .run(new Date().toISOString(), sessionId);
   }
 
   saveRoleplayInterlocutor(input: RoleplayInterlocutor & { id?: number; targetCharacterId?: number }): SavedRoleplayInterlocutor {
@@ -1158,11 +1187,11 @@ export class WriterStore {
 
   recordUsage(sessionId: string, model: string, usage: {
     promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number;
-  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number } = {}): UsageSummary {
+  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number; requestComponents?: import("./types.js").RequestComponentUsage[] } = {}): UsageSummary {
     const miss = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
     const cost = calculateUsageCost({ ...usage, cacheMissTokens: miss }, pricing, at);
-    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null);
+    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step,request_components_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null, JSON.stringify(meta.requestComponents ?? []));
     return this.usage(sessionId);
   }
 

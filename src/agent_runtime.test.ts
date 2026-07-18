@@ -242,6 +242,9 @@ test("session task state does not sticky-inherit activeDocument across turns", (
       cacheKey: "k1", kind: "list_outline_nodes", path: "outline/outline.md",
       sourceHash: "h1", content: "{}", digest: "d1",
     });
+    store.saveAgentCheckpoint(sessionId, {
+      version: 1, stage: "task_started", updatedAt: new Date().toISOString(),
+    });
 
     // New turn without a target must clear the previous document binding (no COALESCE stickiness).
     store.saveSessionContext(sessionId, { currentIntent: "general: 闲聊" });
@@ -255,6 +258,7 @@ test("session task state does not sticky-inherit activeDocument across turns", (
     assert.equal(store.sessionContext(sessionId).currentIntent, "");
     assert.equal(store.sessionTodos(sessionId).length, 0);
     assert.equal(store.recentContextArtifacts(sessionId, 8).length, 0);
+    assert.equal(store.agentCheckpoint(sessionId), undefined);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

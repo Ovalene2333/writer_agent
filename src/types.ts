@@ -281,6 +281,14 @@ export interface DocumentVersionDetail extends DocumentVersionMeta {
 }
 
 /** Per-model-call token stats (one agent step / draft call). */
+export interface RequestComponentUsage {
+  kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
+  label: string;
+  characters: number;
+  estimatedTokens: number;
+  callKind?: string;
+}
+
 export interface StepUsage {
   promptTokens: number;
   completionTokens: number;
@@ -293,9 +301,26 @@ export interface StepUsage {
   estimated?: boolean;
   /** Undefined for estimated calls; otherwise cacheHit/(cacheHit+cacheMiss). */
   cacheHitRate?: number;
+  /** Pre-request estimate by message/schema component; provider usage remains authoritative. */
+  requestComponents?: RequestComponentUsage[];
 }
 
 export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+
+export interface AgentCheckpoint {
+  version: 1;
+  stage: "task_started" | "draft_started" | "scene_written" | "style_repaired" | "review_blocked" | "review_passed" | "proposal_submitted";
+  path?: string;
+  sourceHash?: string;
+  draftVersion?: number;
+  completedScenes?: number;
+  totalScenes?: number;
+  unresolved?: string[];
+  artifactIds?: number[];
+  proposalId?: number;
+  draft?: unknown;
+  updatedAt: string;
+}
 
 export interface AgentTodoItem {
   id: string;

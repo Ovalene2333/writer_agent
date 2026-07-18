@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, StepUsage } from "./types.js";
+import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, RequestComponentUsage, StepUsage } from "./types.js";
 import type { ChapterSceneDraft } from "./scene_pipeline.js";
 import { documentKind, isScenePipelineDocument, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -677,8 +677,8 @@ export function taskInstructions(
 4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
 5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后 inspect_chapter_draft 对组装后的整章执行一次隔离终审，并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；终审覆盖接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回结构化 chapterReview；通过后下一回复直接把 chapterChange/reviewNotes 写入 propose_chapter_draft 参数，禁止先复述审阅。若有 blocker，只重写返回的 targetScenes；styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
-8. 完整章节与 side/ 支线片段最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch，不必走流水线）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
+7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
+8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：read_document 传 path+quote 一步取回行号与上下文；禁止为找一句话通读全章或反复 search_project。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
@@ -962,7 +962,7 @@ export function sceneContinuationPrompt(
       `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），在同一调用中提交要点式 notes、正文与 actualState；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
     );
   } else {
-    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft 做整章隔离终审，不要先输出总结或更新任务清单。");
+    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft，并同时提供提案 summary 与已确认的 characterChanges；终审通过后工具会直接创建提案，不要再调用 propose_chapter_draft。");
   }
   return lines.join("\n");
 }
@@ -1049,6 +1049,9 @@ export async function runAgent(options: {
   if (!task.continuation && previousMode !== task.mode) {
     store.clearSessionTaskState(sessionId);
   }
+  // A fresh request in the same mode may keep its todo list, but must never
+  // inherit an unfinished server-side draft unless the planner marked it as a continuation.
+  if (!task.continuation) store.clearAgentCheckpoint(sessionId);
   const activeDocument = task.targetPath ?? continuationPath;
   store.saveSessionContext(sessionId, {
     activeDocument,
@@ -1089,6 +1092,9 @@ export async function runAgent(options: {
     projectInstructionsPrompt(project),
     structuredCreativeContext(store, task, characterScope, simpleCharacterScope),
   ].filter((value): value is string => Boolean(value?.trim())).join("\n\n");
+  const restoredChapterDraft = task.mode === "write_scene" && task.continuation
+    ? restoreChapterDraftCheckpoint(store, sessionId, project, task.targetPath ?? continuationPath)
+    : undefined;
   let currentUsageStep: number | undefined;
   const toolContext: ToolExecutionContext = {
     permissionMode,
@@ -1106,9 +1112,17 @@ export async function runAgent(options: {
     // write_scene delivery must compile diegetic materials before proposing prose.
     requireWritePack: permissionMode !== "plan" && task.mode === "write_scene" && task.documentProposalRequired,
     requireScenePipeline: permissionMode !== "plan" && task.mode === "write_scene" && task.documentProposalRequired,
+    ...(restoredChapterDraft ? { chapterSceneDraft: restoredChapterDraft } : {}),
     scenePipelineSettings,
     proseAdjudicator: {
       model: adjudicatorModel,
+      signal,
+    },
+    chapterStyleRepairer: {
+      model: options.models?.inline ?? executionModel,
+      ...((options.models?.inline ?? executionModel) !== executionModel
+        ? { fallbackModel: executionModel }
+        : {}),
       signal,
     },
     // Prefer the configured cheap reviewer for the isolated full-chapter read;
@@ -1157,6 +1171,8 @@ export async function runAgent(options: {
   let documentReadCalls = 0;
   let missingProposalToolRetries = 0;
   let invalidToolArgumentRetries = 0;
+  let stagnantToolSteps = 0;
+  let lastProgressFingerprint = agentProgressFingerprint(toolContext, store, sessionId);
 
   try {
     // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
@@ -1169,12 +1185,13 @@ export async function runAgent(options: {
       const step = turn + 1;
       currentUsageStep = step;
       emit({ type: "step_start", step });
+      const requestComponents = buildRequestComponentUsage(messages, executionTools, 6, initialMessageCount);
       const result = await streamCompletion(executionModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
       }, (text) => emit({ type: "text", text, channel: "reasoning" }), { tools: executionTools });
       if (result.usage) {
-        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step, "agent_step", options.jobId);
+        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step, "agent_step", options.jobId, requestComponents);
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
@@ -1190,7 +1207,7 @@ export async function runAgent(options: {
               // CACHE: user role — a mid-job system message flips DeepSeek's
               // whole-request rendering and forfeits the cached prefix (§4).
               role: "user",
-              content: "当前任务要求实际提交文档提案，但尚未成功调用 propose_*。不要结束：若场景链已建立，立即按下一场 sceneId 调用 write_chapter_scene，并在同一调用中提供故事内 notes、正文和 actualState；全部场景完成后 inspect_chapter_draft 并 propose_chapter_draft。",
+              content: "当前任务要求实际提交文档提案，但尚未成功创建提案。不要结束：若场景链已建立，立即按下一场 sceneId 调用 write_chapter_scene，并在同一调用中提供故事内 notes、正文和 actualState；全部场景完成后调用 inspect_chapter_draft 并提供 summary，终审通过会直接创建提案。",
             });
             continue;
           }
@@ -1235,6 +1252,7 @@ export async function runAgent(options: {
         } else {
           toolResult = await executeToolCached(call, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
+        toolResult = boundToolResultForModel(call, toolResult, project, store, sessionId);
         try {
           const parsed = JSON.parse(toolResult) as Record<string, unknown>;
           if (parsed.code === "INVALID_TOOL_ARGUMENTS_JSON" && invalidToolArgumentRetries < 2) {
@@ -1253,6 +1271,9 @@ export async function runAgent(options: {
             sceneWrittenFeedback = Array.isArray(parsed.styleFeedback)
               ? (parsed.styleFeedback as unknown[]).filter((item): item is string => typeof item === "string")
               : [];
+          }
+          if (!("error" in parsed) && call.name === "inspect_chapter_draft" && parsed.proposalSubmitted === true) {
+            documentProposalSubmitted = true;
           }
         } catch { /* 非 JSON 工具结果不参与结构化里程碑推进。 */ }
         if (call.name === "inspect_chapter_draft" || call.name === "revise_chapter_draft_style" || call.name === "propose_chapter_draft") {
@@ -1275,6 +1296,22 @@ export async function runAgent(options: {
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
+      if (task.documentProposalRequired && !documentProposalSubmitted && !waitingForUser) {
+        const progressFingerprint = agentProgressFingerprint(toolContext, store, sessionId);
+        if (progressFingerprint === lastProgressFingerprint) stagnantToolSteps += 1;
+        else stagnantToolSteps = 0;
+        lastProgressFingerprint = progressFingerprint;
+        if (stagnantToolSteps >= 3) {
+          throw new Error("Agent 连续三步工具调用未改变草稿、读取、清单、工件或提案状态；已停止以避免继续消耗 token，请根据最后一个结构化错误重试");
+        }
+        if (stagnantToolSteps === 2) {
+          messages.push({
+            role: "user",
+            content: "连续两步工具调用未推动任何结构化状态。不要重复同一调用：依据最后一个工具结果中的 code/error，改用能改变草稿版本、读取范围、任务清单或提案状态的有效工具；若参数无效，先修正参数。",
+          });
+          continue;
+        }
+      }
       // §4b anchor: keep prep reads + the scene chain lock inside the cached base.
       if (beginChapterSucceeded) contextBase = messages.length;
       if (sceneWrittenFeedback && toolContext.chapterSceneDraft && !chapterReviewInStep
@@ -1475,15 +1512,32 @@ function selectedBlocksContext(project: WriterProject, references?: Array<{ path
  */
 function recentArtifactsContext(store: WriterStore, sessionId: string, project: WriterProject, task: WritingTask): string {
   const state = store.sessionContext(sessionId);
+  const restorableDraft = task.continuation
+    ? restoreChapterDraftCheckpoint(store, sessionId, project, task.targetPath ?? state.activeDocument)
+    : undefined;
+  const savedCheckpoint = restorableDraft ? store.agentCheckpoint(sessionId) : undefined;
+  const checkpoint = savedCheckpoint && savedCheckpoint.stage !== "proposal_submitted"
+    ? {
+        version: savedCheckpoint.version,
+        stage: savedCheckpoint.stage,
+        path: savedCheckpoint.path,
+        sourceHash: savedCheckpoint.sourceHash,
+        draftVersion: savedCheckpoint.draftVersion,
+        completedScenes: savedCheckpoint.completedScenes,
+        totalScenes: savedCheckpoint.totalScenes,
+        unresolved: savedCheckpoint.unresolved?.slice(0, 12),
+        artifactIds: savedCheckpoint.artifactIds?.slice(0, 8),
+      }
+    : undefined;
   let artifacts = store.recentContextArtifacts(sessionId, 8);
   // New dialogue turn (not continuation): never inject whole-session residue — only the current target path, if any.
   if (!task.continuation) {
     const focusPath = task.targetPath ?? state.activeDocument;
-    if (!focusPath) return "";
+    if (!focusPath && !checkpoint) return "";
     artifacts = artifacts.filter(item => item.path === focusPath);
-    if (!artifacts.length) return "";
+    if (!artifacts.length && !checkpoint) return "";
   }
-  if (!artifacts.length && !state.activeDocument && !state.currentIntent) return "";
+  if (!artifacts.length && !state.activeDocument && !state.currentIntent && !checkpoint) return "";
   const activePath = task.continuation ? state.activeDocument : (task.targetPath ?? state.activeDocument);
   const activeHash = activePath && project.textFileExists(activePath)
     ? project.hash(project.readTextFile(activePath))
@@ -1537,15 +1591,40 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
       id, kind, path, sourceHash,
       digest: digest.replace(/\s+/g, " ").slice(0, 240),
     }));
-  if (!catalog.length && !restored.length) return "";
+  if (!catalog.length && !restored.length && !checkpoint) return "";
   const scopeNote = task.continuation
     ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
     : "仅当前目标文档相关索引（非会话级残留）；正文未注入时请按需 read 最小片段，或对相同 path+sourceHash 使用已有工具结果";
   return `本轮任务工作记忆（${scopeNote}）：\n${JSON.stringify({
     state: { activeDocument: state.activeDocument, currentIntent: state.currentIntent.slice(0, 160) },
+    ...(checkpoint ? { checkpoint } : {}),
     artifacts: catalog,
     restoredReads: restored,
   })}`;
+}
+
+/** Restore only a validated, unfinished write-scene checkpoint. */
+export function restoreChapterDraftCheckpoint(
+  store: WriterStore,
+  sessionId: string,
+  project: WriterProject,
+  targetPath?: string,
+): ChapterSceneDraft | undefined {
+  const checkpoint = store.agentCheckpoint(sessionId);
+  if (!checkpoint || checkpoint.stage === "proposal_submitted" || !checkpoint.draft
+    || typeof checkpoint.draft !== "object" || Array.isArray(checkpoint.draft)) return undefined;
+  const draft = checkpoint.draft as Partial<ChapterSceneDraft>;
+  if (typeof draft.path !== "string" || (targetPath && draft.path !== targetPath)
+    || typeof draft.baseHash !== "string" || checkpoint.sourceHash !== draft.baseHash
+    || !Array.isArray(draft.scenes) || !Array.isArray(draft.completed)
+    || typeof draft.version !== "number" || typeof draft.chapterGoal !== "string"
+    || typeof draft.baseContent !== "string" || typeof draft.heading !== "string"
+    || (draft.mode !== "create" && draft.mode !== "replace" && draft.mode !== "append")) return undefined;
+  const exists = project.documentExists(draft.path);
+  if ((draft.mode === "create" && exists) || (draft.mode !== "create" && !exists)) return undefined;
+  const current = exists ? project.read(draft.path) : "";
+  if (project.hash(current) !== draft.baseHash) return undefined;
+  return draft as ChapterSceneDraft;
 }
 
 /**
@@ -2104,6 +2183,7 @@ function emitUsageEvent(
   step?: number,
   callKind = "agent_step",
   jobId?: string,
+  requestComponents?: RequestComponentUsage[],
 ): void {
   const estimated = usage.estimated === true;
   const call = toStepUsage(usage, model.pricing);
@@ -2112,17 +2192,149 @@ function emitUsageEvent(
       callKind,
       ...(step === undefined ? {} : { step }),
       ...(jobId ? { jobId } : {}),
+      ...(requestComponents?.length ? { requestComponents } : {}),
     }));
     return;
   }
   emit({
     type: "usage",
     usage: store.usage(sessionId),
-    call,
+    call: requestComponents?.length ? { ...call, requestComponents } : call,
     ...(step !== undefined ? { step } : {}),
     callKind,
     ...(jobId ? { jobId } : {}),
   });
+}
+
+const MODEL_TOOL_RESULT_TOKEN_BUDGET = 6_000;
+
+/**
+ * Bound a tool result before it is appended to the live transcript. The full
+ * payload remains in session-scoped work memory and can be paged explicitly.
+ * This never rewrites an earlier message, so the append-only cache contract holds.
+ */
+export function boundToolResultForModel(
+  call: ToolAccumulator,
+  result: string,
+  project: WriterProject,
+  store: WriterStore,
+  sessionId: string,
+): string {
+  const estimatedTokens = approximateRequestTokens(result);
+  if (estimatedTokens <= MODEL_TOOL_RESULT_TOKEN_BUDGET) return result;
+  let parsed: Record<string, unknown> | undefined;
+  try {
+    const value = JSON.parse(result) as unknown;
+    if (value && typeof value === "object" && !Array.isArray(value)) parsed = value as Record<string, unknown>;
+  } catch { /* plain text is still archived and previewed */ }
+
+  const existingArtifactId = typeof parsed?.artifactId === "number" ? parsed.artifactId : undefined;
+  const sourceHash = typeof parsed?.sourceHash === "string" ? parsed.sourceHash : project.hash(result);
+  const artifactId = existingArtifactId ?? store.saveContextArtifact(sessionId, {
+    cacheKey: `oversize-tool:${call.name}:${project.hash(result)}`,
+    kind: call.name,
+    ...(typeof parsed?.path === "string" ? { path: parsed.path } : {}),
+    sourceHash,
+    content: result,
+    digest: `${call.name} 大型结果：${result.replace(/\s+/g, " ").slice(0, 240)}`,
+  });
+  const metadata: Record<string, unknown> = {};
+  if (parsed) {
+    for (const [key, value] of Object.entries(parsed)) {
+      if (key === "content" || key === "markdown" || key === "beforeContent" || key === "afterContent") continue;
+      if (typeof value === "string" && value.length <= 800) metadata[key] = value;
+      else if (typeof value === "number" || typeof value === "boolean" || value === null) metadata[key] = value;
+      else if (Array.isArray(value) && JSON.stringify(value).length <= 1_600) metadata[key] = value;
+    }
+  }
+  const head = result.slice(0, 5_000);
+  const tail = result.length > 6_500 ? result.slice(-1_500) : "";
+  const controlFields = parsed ? {
+    ...(typeof parsed.complete === "boolean" ? { complete: parsed.complete } : {}),
+    ...(typeof parsed.proposalSubmitted === "boolean" ? { proposalSubmitted: parsed.proposalSubmitted } : {}),
+    ...(typeof parsed.reviewCompleted === "boolean" ? { reviewCompleted: parsed.reviewCompleted } : {}),
+    ...(typeof parsed.code === "string" ? { code: parsed.code } : {}),
+    ...(typeof parsed.error === "string" ? { error: parsed.error.slice(0, 800) } : {}),
+    ...(typeof parsed.status === "string" ? { originalStatus: parsed.status } : {}),
+  } : {};
+  return JSON.stringify({
+    status: "tool_result_truncated",
+    ...controlFields,
+    tool: call.name,
+    artifactId,
+    originalCharacters: result.length,
+    estimatedOriginalTokens: estimatedTokens,
+    metadata,
+    preview: tail ? `${head}\n…[中间内容已省略，可按 artifactId 分页读取]…\n${tail}` : head,
+    message: "完整工具结果已保存到工作记忆。仅当 preview 与 metadata 不足以继续时，使用 read_context_artifact 按需分页；禁止重复执行原工具。",
+  });
+}
+
+/** Structural progress only; no semantic keyword matching. */
+export function agentProgressFingerprint(
+  context: ToolExecutionContext,
+  store: WriterStore,
+  sessionId: string,
+): string {
+  const draft = context.chapterSceneDraft;
+  const checkpoint = store.agentCheckpoint(sessionId);
+  const reads = context.readSnapshots ? [...context.readSnapshots.entries()] : [];
+  return JSON.stringify({
+    draft: draft ? {
+      path: draft.path,
+      version: draft.version,
+      inspectedVersion: draft.inspectedVersion,
+      completed: draft.completed.length,
+    } : null,
+    reads: reads.map(([path, snapshot]) => ({
+      path,
+      sourceHash: snapshot.sourceHash,
+      ranges: snapshot.ranges.map(range => [range.startLine, range.endLine, range.artifactId]),
+    })).sort((a, b) => a.path.localeCompare(b.path)),
+    readCharactersUsed: context.readCharactersUsed ?? 0,
+    writePack: [context.writePackCompiled === true, context.writePackSceneId ?? null],
+    outlineDesigned: context.creativeOutlineDesigned === true,
+    todos: store.sessionTodos(sessionId).map(todo => [todo.id, todo.status]),
+    artifacts: store.recentContextArtifacts(sessionId, 8).map(item => item.id).sort((a, b) => a - b),
+    checkpoint: checkpoint ? [checkpoint.stage, checkpoint.draftVersion, checkpoint.completedScenes, checkpoint.proposalId,
+      checkpoint.unresolved ?? []] : null,
+  });
+}
+
+function approximateRequestTokens(text: string): number {
+  return Math.ceil(Buffer.byteLength(text, "utf8") / 4);
+}
+
+/** Preflight-only context waterfall; provider usage remains the billing source of truth. */
+export function buildRequestComponentUsage(
+  messages: ApiMessage[],
+  tools: readonly ToolDefinition[],
+  stableMessageCount: number,
+  initialMessageCount: number,
+): RequestComponentUsage[] {
+  const components: RequestComponentUsage[] = [];
+  const append = (kind: RequestComponentUsage["kind"], label: string, text: string) => {
+    if (!text) return;
+    components.push({ kind, label, characters: text.length, estimatedTokens: approximateRequestTokens(text) });
+  };
+  if (tools.length) append("tool_schema", `工具 schema（${tools.length}）`, JSON.stringify(tools));
+  messages.forEach((message, index) => {
+    const serialized = JSON.stringify({
+      role: message.role,
+      content: message.content,
+      ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}),
+      ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
+      ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+    });
+    if (index < stableMessageCount) append("stable_system", `稳定 system ${index + 1}`, serialized);
+    else if (index < initialMessageCount && message.role === "user") append("user", "当前用户请求", serialized);
+    else if (index < initialMessageCount) append("dynamic_system", `动态尾部 ${index - stableMessageCount + 1}`, serialized);
+    else if (message.role === "tool") append("tool_result", `工具结果 ${message.tool_call_id ?? index}`, serialized);
+    else if (message.role === "assistant") append("assistant", `Agent 历史 ${index - initialMessageCount + 1}`, serialized);
+    else if (message.role === "user") append("user", `用户/阶段交接 ${index - initialMessageCount + 1}`, serialized);
+    else append("other", `其他消息 ${index + 1}`, serialized);
+  });
+  return components;
 }
 
 /**

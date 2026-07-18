@@ -191,6 +191,13 @@ type StepUsage = {
   currency: string;
   estimated?: boolean;
   cacheHitRate?: number;
+  requestComponents?: Array<{
+    kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
+    label: string;
+    characters: number;
+    estimatedTokens: number;
+    callKind?: string;
+  }>;
 };
 type StreamStep = {
   id: number;
@@ -708,6 +715,7 @@ function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
     currency,
     estimated: withUsage.some((step) => step.usage?.estimated),
     ...(measuredHits + measuredMisses > 0 ? { cacheHitRate: measuredHits / (measuredHits + measuredMisses) } : {}),
+    requestComponents: withUsage.flatMap(step => step.usage?.requestComponents ?? []),
   };
 }
 
@@ -1303,6 +1311,21 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               )
               : "本步暂无 token 数据（供应商未返回 usage 且未能估算）"}
           </div>
+          {step.usage?.requestComponents?.length ? (
+            <details className="agent-step-context-breakdown">
+              <summary>请求上下文组成（发送前估算）</summary>
+              <div className="agent-step-context-list">
+                {[...step.usage.requestComponents]
+                  .sort((a, b) => b.estimatedTokens - a.estimatedTokens)
+                  .map((component, index) => (
+                    <div className="agent-step-context-row" key={`${component.callKind ?? "call"}-${component.kind}-${index}`}>
+                      <span>{component.callKind ? `${component.callKind} · ` : ""}{component.label}</span>
+                      <span>{component.estimatedTokens.toLocaleString()} tok · {component.characters.toLocaleString()} chars</span>
+                    </div>
+                  ))}
+              </div>
+            </details>
+          ) : null}
           {step.reasoning && (
             <div className="agent-step-reasoning">
               <Markdown content={step.reasoning} />
@@ -1447,6 +1470,7 @@ function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage): St
     ...(!estimated && cacheHitTokens + cacheMissTokens > 0
       ? { cacheHitRate: cacheHitTokens / (cacheHitTokens + cacheMissTokens) }
       : {}),
+    requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
   };
 }
 

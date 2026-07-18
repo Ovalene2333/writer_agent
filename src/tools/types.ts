@@ -6,6 +6,7 @@ import type { ScenePipelineSettings } from "../agent_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
+import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -96,6 +97,17 @@ export type ToolExecutionContext = {
       input: ChapterReviewInput,
       signal?: AbortSignal,
     ) => Promise<{ review: ChapterReviewResult; usage?: import("../types.js").ModelTokenUsage }>;
+  };
+  /** Isolated sentence-level repair; full chapter prose never enters the parent loop. */
+  chapterStyleRepairer?: {
+    model: ModelConfig;
+    fallbackModel?: ModelConfig;
+    signal?: AbortSignal;
+    run?: (
+      model: ModelConfig,
+      input: { issues: ChapterStyleRepairIssue[]; chapterGoal: string; styleEvidence?: string },
+      signal?: AbortSignal,
+    ) => Promise<{ edits: ChapterStyleEdit[]; usage?: import("../types.js").ModelTokenUsage; requestCharacters: number }>;
   };
   /**
    * Experimental best-of-N scene prose sampling (scenePipeline.candidateCount > 1):

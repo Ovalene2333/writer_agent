@@ -1,4 +1,4 @@
-import type { AgentEvent, ModelConfig, ModelTokenUsage, StepUsage } from "./types.js";
+import type { AgentEvent, ModelConfig, ModelTokenUsage, RequestComponentUsage, StepUsage } from "./types.js";
 import type { WriterStore } from "./store.js";
 import { calculateUsageCost } from "./pricing.js";
 
@@ -6,6 +6,7 @@ export type ModelUsageMeta = {
   callKind: string;
   step?: number;
   jobId?: string;
+  requestComponents?: RequestComponentUsage[];
 };
 
 export type ModelUsageReporter = (
@@ -54,6 +55,9 @@ export function buildRecordedUsageEvent(
     cacheHitRate: usage.cacheHitTokens + cacheMissTokens > 0
       ? usage.cacheHitTokens / (usage.cacheHitTokens + cacheMissTokens)
       : 0,
+    ...(meta.requestComponents?.length
+      ? { requestComponents: meta.requestComponents.map(component => ({ ...component, callKind: meta.callKind })) }
+      : {}),
   };
   const summary = model.pricing
     ? store.recordUsage(sessionId, model.model, normalized, model.pricing, new Date(), meta)

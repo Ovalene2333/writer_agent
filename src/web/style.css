@@ -1817,6 +1817,20 @@ button.agent-orb:focus-visible {
   border-radius: 5px; background: var(--surface2);
   border: 1px solid var(--border-light); flex-shrink: 0;
 }
+.agent-step-context-breakdown {
+  margin: -3px 0 10px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--border-light); color: var(--text-dim);
+  background: color-mix(in srgb, var(--surface2) 55%, transparent);
+  font-size: 11.5px;
+}
+.agent-step-context-breakdown summary { cursor: pointer; user-select: none; }
+.agent-step-context-list { display: grid; gap: 3px; margin-top: 7px; }
+.agent-step-context-row {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+}
+.agent-step-context-row span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-step-context-row span:last-child { flex: 0 0 auto; color: var(--text-faint); }
 @container (max-width: 320px) {
   .agent-step-summary { gap: 6px; padding-inline: 10px; }
   .agent-step-tools,

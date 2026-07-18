@@ -50,6 +50,7 @@ import {
   handleAskUser,
   handleLoadSkill,
   handleManageTodos,
+  handleReadContextArtifact,
 } from "./meta.js";
 
 type Handler = (args: ToolHandlerArgs) => string | Promise<string>;
@@ -91,6 +92,7 @@ const HANDLERS: Record<string, Handler> = {
   ask_user: handleAskUser,
   manage_todos: handleManageTodos,
   load_skill: handleLoadSkill,
+  read_context_artifact: handleReadContextArtifact,
 };
 
 export async function executeTool(

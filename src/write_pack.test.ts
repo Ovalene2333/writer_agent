@@ -471,10 +471,11 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       summary: "新建第一章", chapterChange: "关系改变", reviewNotes: "已检查",
     })) as Record<string, unknown>;
     assert.match(String(beforeInspect.error), /inspect_chapter_draft/);
-    const inspectedRaw = await call("inspect_chapter_draft", {});
+    const inspectedRaw = await call("inspect_chapter_draft", { summary: "新建第一章" });
     const inspected = JSON.parse(inspectedRaw) as Record<string, unknown>;
-    assert.equal(inspected.status, "inspection_required");
+    assert.equal(inspected.status, "proposal_submitted");
     assert.equal(inspected.reviewCompleted, true);
+    assert.equal(inspected.proposalSubmitted, true);
     assert.equal(typeof inspected.contentCharacters, "number");
     assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
     assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
@@ -482,9 +483,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       { model: "reviewer-test", callKind: "chapter_review_failed" },
       { model: "writer-test", callKind: "chapter_review" },
     ]);
-    const proposed = JSON.parse(await call("propose_chapter_draft", {
-      summary: "新建第一章", chapterChange: "主角从服从转为违规", reviewNotes: "单场章无需接缝；目标与结果一致",
-    })) as Record<string, unknown>;
+    const proposed = inspected.proposal as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
     assert.equal(project.documentExists("chapters/第一章.md"), false);
     assert.equal(context.chapterSceneDraft, undefined);
@@ -537,7 +536,7 @@ test("scene dense gate accepts once with a deferred sentence-level warning", asy
     assert.equal(first.status, "written");
     assert.equal((first.styleDeferred as Record<string, unknown>).code, "SCENE_STYLE_DENSE");
     assert.equal(context.chapterSceneDraft?.completed.length, 1);
-    const inspected = JSON.parse(await call("inspect_chapter_draft", {})) as Record<string, unknown>;
+    const inspected = JSON.parse(await call("inspect_chapter_draft", { summary: "新建第一章" })) as Record<string, unknown>;
     assert.equal(inspected.status, "style_revision_required");
     assert.equal(inspected.code, "CHAPTER_DRAFT_STYLE_BLOCKED");
   } finally {

@@ -374,15 +374,33 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_chapter_draft",
-      description: "检查内存全文的结构与风格门禁；风格未通过时先用 revise_chapter_draft_style，最终提案前必调",
-      parameters: { type: "object", properties: {}, additionalProperties: false },
+      description: "检查内存全文并在终审通过时直接创建提案；结构/风格未通过则返回精确修订目标",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "终审通过后用于提案的修改摘要" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["summary"],
+        additionalProperties: false,
+      },
     },
   },
   {
     type: "function",
     function: {
       name: "propose_chapter_draft",
-      description: "提交已逐场完成并全文审阅的章节或支线片段；只在最后一次写场后 inspect 过才可用",
+      description: "兼容性重试：仅当 inspect_chapter_draft 已通过终审但自动建提案失败时提交；正常流程无需调用",
       parameters: {
         type: "object",
         properties: {
@@ -686,6 +704,23 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "read_context_artifact",
+      description: "分页读取被 token 预算裁剪的完整工具结果；仅凭 artifactId 读取必要页",
+      parameters: {
+        type: "object",
+        properties: {
+          artifactId: { type: "number", description: "工具结果返回的 artifactId" },
+          offset: { type: "number", description: "字符偏移，首页为 0" },
+          limit: { type: "number", description: "每页 500–6000 字符，默认 4000" },
+        },
+        required: ["artifactId"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description: "缺关键事实/目标且无法推断时提问并暂停；可逆创作选择勿滥用。勿与其他工具同轮",
       parameters: {
@@ -746,7 +781,7 @@ export const TOOLS = deepFreeze([
 
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
-const META_TOOLS = ["inspect_conversation", "read_conversation", "ask_user", "manage_todos", "load_skill"] as const;
+const META_TOOLS = ["inspect_conversation", "read_conversation", "read_context_artifact", "ask_user", "manage_todos", "load_skill"] as const;
 const DOCUMENT_READ_TOOLS = ["list_documents", "inspect_document", "read_document", "search_project"] as const;
 const FILE_READ_TOOLS = ["list_files", "inspect_file", "read_file", "search_files"] as const;
 const CHARACTER_READ_TOOLS = ["list_characters", "get_character", "list_simple_characters", "get_simple_character"] as const;
@@ -800,7 +835,7 @@ const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
 
 const WRITE_TOOLS = new Set([
   "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
-  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style", "propose_chapter_draft",
+  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
 ]);
 

@@ -50,3 +50,26 @@ export function handleLoadSkill({ input, project }: ToolHandlerArgs): string {
     content: skill.body,
   });
 }
+
+export function handleReadContextArtifact({ input, store, sessionId }: ToolHandlerArgs): string {
+  const artifactId = Number(input.artifactId);
+  if (!Number.isInteger(artifactId) || artifactId <= 0) throw new Error("artifactId 必须是正整数");
+  const artifact = store.contextArtifactById(sessionId, artifactId);
+  if (!artifact) throw new Error("工作记忆不存在或不属于当前会话");
+  const offset = Math.max(0, Math.floor(Number(input.offset ?? 0)) || 0);
+  const limit = Math.max(500, Math.min(6_000, Math.floor(Number(input.limit ?? 4_000)) || 4_000));
+  const content = artifact.content.slice(offset, offset + limit);
+  return JSON.stringify({
+    status: "artifact_page",
+    artifactId,
+    kind: artifact.kind,
+    path: artifact.path,
+    sourceHash: artifact.sourceHash,
+    offset,
+    nextOffset: offset + content.length,
+    totalCharacters: artifact.content.length,
+    hasMore: offset + content.length < artifact.content.length,
+    content,
+    message: "仅在当前页不足以完成任务时读取下一页；禁止从头重复读取。",
+  });
+}
