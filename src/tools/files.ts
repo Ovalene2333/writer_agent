@@ -1,9 +1,22 @@
 import { documentBlocks } from "../document_blocks.js";
-import { documentKind } from "../project.js";
+import { documentKind, isScenePipelineDocument } from "../project.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
 import { deferredCharacterChanges, gateProseStyle } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
+
+const READ_BLOCK_TARGET_CHARACTERS = 3_000;
+const MAX_READ_CHARACTERS = 4_000;
+
+function assertExpectedSourceHash(input: Record<string, unknown>, sourceHash: string): void {
+  if (input.sourceHash === undefined) return;
+  if (typeof input.sourceHash !== "string" || !input.sourceHash.trim()) {
+    throw new Error("sourceHash 必须是 inspect_file 返回的非空字符串");
+  }
+  if (input.sourceHash.trim() !== sourceHash) {
+    throw new Error(`文件快照已变化；期望 ${input.sourceHash.trim()}，当前 ${sourceHash}。请重新 inspect 后按新快照读取`);
+  }
+}
 
 export function handleListFiles({ input, project }: ToolHandlerArgs): string {
   const prefix = typeof input.pathPrefix === "string"
@@ -23,11 +36,13 @@ export function handleInspectFile({ input, project }: ToolHandlerArgs): string {
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文件已对 Agent 屏蔽");
   const content = project.readTextFile(path);
+  const sourceHash = project.hash(content);
+  assertExpectedSourceHash(input, sourceHash);
   const lines = content.split(/\r?\n/);
-  const blocks = documentBlocks(content);
+  const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   return JSON.stringify({
     path,
-    sourceHash: project.hash(content),
+    sourceHash,
     lineCount: lines.length,
     characterCount: content.length,
     blockCount: blocks.length,
@@ -41,6 +56,8 @@ export function handleReadFile({ input, project }: ToolHandlerArgs): string {
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文件已对 Agent 屏蔽");
   const content = project.readTextFile(path);
+  const sourceHash = project.hash(content);
+  assertExpectedSourceHash(input, sourceHash);
   const lines = content.split(/\r?\n/);
   const quote = typeof input.quote === "string" ? input.quote.trim() : "";
   if (quote) {
@@ -50,8 +67,9 @@ export function handleReadFile({ input, project }: ToolHandlerArgs): string {
     const endLine = content.slice(0, offset + quote.length).split(/\r?\n/).length;
     const contextStart = Math.max(1, startLine - 2);
     const contextEnd = Math.min(lines.length, endLine + 2);
-    return JSON.stringify({ path, sourceHash: project.hash(content), quote: quote.slice(0, 120), startLine, endLine,
-      contextStartLine: contextStart, content: lines.slice(contextStart - 1, contextEnd).join("\n").slice(0, 3_000) });
+    return JSON.stringify({ path, sourceHash, quote: quote.slice(0, 120), startLine, endLine,
+      contextStartLine: contextStart, contextEndLine: contextEnd,
+      content: lines.slice(contextStart - 1, contextEnd).join("\n").slice(0, 3_000) });
   }
   const startLine = optionalPositiveInteger(input.startLine, "startLine");
   const endLine = optionalPositiveInteger(input.endLine, "endLine");
@@ -59,18 +77,22 @@ export function handleReadFile({ input, project }: ToolHandlerArgs): string {
   if (startLine !== undefined && endLine !== undefined) {
     if (startLine > endLine) throw new Error("startLine 不能大于 endLine");
     if (startLine > lines.length) throw new Error(`startLine 超出范围；文件共 ${lines.length} 行`);
-    if (endLine - startLine + 1 > 200) throw new Error("单次最多读取 200 行");
+    if (endLine - startLine + 1 > 120) throw new Error("单次最多读取 120 行");
     const actualEnd = Math.min(endLine, lines.length);
     const selected = lines.slice(startLine - 1, actualEnd).join("\n");
-    if (selected.length > 12_000) throw new Error("读取范围超过 12000 字符，请缩小范围");
-    return JSON.stringify({ path, sourceHash: project.hash(content), startLine, endLine: actualEnd, lineCount: lines.length, content: selected });
+    if (selected.length > MAX_READ_CHARACTERS) throw new Error(`读取范围超过 ${MAX_READ_CHARACTERS} 字符，请缩小范围`);
+    return JSON.stringify({ path, sourceHash, startLine, endLine: actualEnd, lineCount: lines.length, content: selected });
   }
-  const blocks = documentBlocks(content);
+  const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   const block = optionalPositiveInteger(input.block, "block") ?? 1;
   if (block > blocks.length) throw new Error(`block 超出范围；文件共 ${blocks.length} 块`);
   const selected = blocks[block - 1];
-  return JSON.stringify({ path, sourceHash: project.hash(content), block, blockCount: blocks.length,
-    startLine: selected.startLine, endLine: selected.endLine, hasPrevious: block > 1, hasNext: block < blocks.length, content: selected.content });
+  const bounded = selected.content.slice(0, MAX_READ_CHARACTERS);
+  return JSON.stringify({ path, sourceHash, block, blockCount: blocks.length,
+    startLine: selected.startLine,
+    endLine: Math.min(selected.endLine, selected.startLine + (bounded.match(/\n/g)?.length ?? 0)),
+    truncated: bounded.length < selected.content.length,
+    hasPrevious: block > 1, hasNext: block < blocks.length, content: bounded });
 }
 
 export function handleSearchFiles({ input, project }: ToolHandlerArgs): string {
@@ -117,8 +139,8 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
   });
   if (!files.length && !Array.isArray(input.characterChanges)) throw new Error("change set 至少需要 files 或 characterChanges");
   for (const file of files) {
-    if (context.requireScenePipeline && (file.operation === "write" || file.operation === "patch") && documentKind(file.path) === "chapter") {
-      throw new Error("完整章节写作不能用 propose_change_set 绕过场景流水线；请先完成章节草稿提案，再在后续 change set 管理其他文件");
+    if (context.requireScenePipeline && (file.operation === "write" || file.operation === "patch") && isScenePipelineDocument(file.path)) {
+      throw new Error("完整章节或支线片段写作不能用 propose_change_set 绕过场景流水线；请先完成正文草稿提案，再在后续 change set 管理其他文件");
     }
     if (context.requireWritePack && !context.writePackCompiled && (file.operation === "write" || file.operation === "patch")) {
       throw new Error("写作任务创建 change set 前必须先调用 compile_write_pack");

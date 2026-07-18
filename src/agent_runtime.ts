@@ -42,6 +42,13 @@ export interface ProjectSkill {
 export type ScenePipelineMilestone = "draft_started" | "draft_complete";
 
 const DEFAULT_SCENE_PIPELINE_TODOS = [
+  "核对本篇必要事实与衔接",
+  "建立本篇场景链",
+  "逐场写作并传递状态",
+  "全文审阅并提交提案",
+] as const;
+
+const PREVIOUS_SCENE_PIPELINE_TODOS = [
   "核对本章必要事实与衔接",
   "建立本章场景链",
   "逐场写作并传递状态",
@@ -272,7 +279,7 @@ export function normalizeTodos(input: unknown): AgentTodoItem[] {
 }
 
 /**
- * Advance the built-in four-stage chapter workflow from structured tool results.
+ * Advance the built-in four-stage narrative workflow from structured tool results.
  * This is deliberately exact-match based: custom/model-authored plans remain under
  * manage_todos control and are never guessed from keywords.
  */
@@ -280,7 +287,7 @@ export function advanceScenePipelineTodos(
   todos: AgentTodoItem[],
   milestone: ScenePipelineMilestone,
 ): { todos: AgentTodoItem[]; changed: boolean } {
-  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
+  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, PREVIOUS_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
     .map(contents => contents.map(content => todos.findIndex(item => item.content === content)))
     .find(indexes => indexes.every(index => index >= 0));
   if (!signature) return { todos, changed: false };

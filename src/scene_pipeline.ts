@@ -103,6 +103,10 @@ export function writeChapterScene(
   }
   const trimmed = content.trim();
   if (trimmed.length < 80) throw new Error("场景正文过短；如果本场确实不产生局面变化，应合并而不是保留空壳场景");
+  const targetCharacters = draft.scenes[index].targetCharacters;
+  if (targetCharacters !== undefined && trimmed.length < Math.ceil(targetCharacters * 0.7)) {
+    throw new Error(`场景正文仅 ${trimmed.length} 字，明显低于目标 ${targetCharacters} 字；请补足行动、阻力、转折与结果后重提`);
+  }
   if (trimmed.length > MAX_SCENE_CHARACTERS) throw new Error(`单场正文超过 ${MAX_SCENE_CHARACTERS} 字，请收紧场景边界`);
   if (/^#{1,6}\s/mu.test(trimmed)) throw new Error("场景正文不要包含任何 markdown 标题；章节标题与每场的 ## 场景小标题（取场景卡 title）都由组装自动生成");
   const actualState = normalizeActualState(actualStateValue);

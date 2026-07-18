@@ -1,5 +1,5 @@
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
-import { documentKind } from "../project.js";
+import { isScenePipelineDocument } from "../project.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { requireString } from "./helpers.js";
 
@@ -14,8 +14,8 @@ export function handleCompileWritePack({ input, context }: ToolHandlerArgs): str
   const instruction = typeof input.instruction === "string" ? input.instruction.trim() : undefined;
   if (context.chapterSceneDraft) {
     throw new Error("章节场景无需单独 compile_write_pack；请在 write_chapter_scene 的 notes 中提供故事内笔记，工具会在同一步完成编译");
-  } else if (context.requireScenePipeline && (!targetPath || documentKind(targetPath) === "chapter")) {
-    throw new Error("完整章节写作须先调用 begin_chapter_draft 建立场景链");
+  } else if (context.requireScenePipeline && (!targetPath || isScenePipelineDocument(targetPath))) {
+    throw new Error("完整章节或支线片段写作须先调用 begin_chapter_draft 建立场景链");
   }
   const pack = compileWritePack(notes, { targetPath, instruction });
   const writePack = formatWritePackForWriter(pack);

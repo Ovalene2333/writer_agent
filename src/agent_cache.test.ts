@@ -11,6 +11,7 @@ import test from "node:test";
 import {
   agentToolNames,
   agentToolSchemaHash,
+  admitReadAtom,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
   chapterContinuationPrompt,
@@ -19,6 +20,7 @@ import {
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
+  parsePlannerJson,
   rehydrateRecentToolMessages,
   requestNeedsProjectFactSearch,
   sceneContinuationPrompt,
@@ -28,12 +30,13 @@ import {
 import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
+import type { ToolExecutionContext } from "./tools/types.js";
 
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "647e41a5e54ba429");
+  assert.equal(agentToolSchemaHash(), "0a334dac5f1197aa");
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -62,6 +65,19 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.match(normal, /检查同名卡/);
   assert.match(normal, /必须 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
+});
+
+test("planner JSON parser accepts one object and rejects surrounding prose", () => {
+  assert.deepEqual(parsePlannerJson('{"mode":"general","todoPlan":[]}'), {
+    mode: "general",
+    todoPlan: [],
+  });
+  assert.deepEqual(parsePlannerJson('```json\n{"mode":"write_scene"}\n```'), {
+    mode: "write_scene",
+  });
+  assert.equal(parsePlannerJson('分析如下：{"mode":"general"}'), undefined);
+  assert.equal(parsePlannerJson('{"mode":'), undefined);
+  assert.equal(parsePlannerJson('[]'), undefined);
 });
 
 test("audit workflow separates review-only from repair", () => {
@@ -118,6 +134,7 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /大纲不是章节写作的前置条件/);
   assert.match(instructions, /禁止 design_creative_outline/);
   assert.match(instructions, /重心放在因果场景链/);
+  assert.match(instructions, /side\/ 的支线片段/u);
 });
 
 test("chapter continuation handoff carries delivery, tail, and final scene state", () => {
@@ -247,6 +264,33 @@ test("dynamic turn messages always expose the same slot count", () => {
   assert.equal(empty.at(-1)?.content, "闲聊");
   assert.match(empty[3].content ?? "", /动态声线/);
   assert.match(empty[6].content ?? "", /工作记忆/);
+});
+
+test("read atoms lock one source snapshot and suppress overlapping bodies", () => {
+  const context: ToolExecutionContext = {
+    permissionMode: "ask",
+    readSnapshots: new Map(),
+    readCharactersUsed: 0,
+  };
+  const first = JSON.stringify({
+    path: "lore/world.md", sourceHash: "h1", startLine: 10, endLine: 20, content: "设定".repeat(200),
+  });
+  assert.equal(admitReadAtom("read_document", "lore/world.md", "h1", first, context), first);
+  assert.equal(context.readCharactersUsed, 400);
+
+  const duplicate = JSON.parse(admitReadAtom("read_document", "lore/world.md", "h1", first, context)) as Record<string, unknown>;
+  assert.equal(duplicate.status, "read_atom_reused");
+  assert.equal("content" in duplicate, false);
+
+  const overlap = JSON.parse(admitReadAtom("read_document", "lore/world.md", "h1", JSON.stringify({
+    path: "lore/world.md", sourceHash: "h1", startLine: 18, endLine: 25, content: "重叠",
+  }), context)) as Record<string, unknown>;
+  assert.match(String(overlap.error), /重叠/);
+
+  const changed = JSON.parse(admitReadAtom("read_document", "lore/world.md", "h2", JSON.stringify({
+    path: "lore/world.md", sourceHash: "h2", startLine: 30, endLine: 32, content: "新版本",
+  }), context)) as Record<string, unknown>;
+  assert.match(String(changed.error), /锁定快照|禁止混读/);
 });
 
 test("compactRuntimeMessages digests older heavy tool bodies and keeps recent full", () => {

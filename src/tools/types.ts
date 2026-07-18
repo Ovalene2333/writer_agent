@@ -20,6 +20,16 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /**
+   * Per-job read transaction: the first inspect/read locks a path to one source
+   * hash, and successful body reads register non-overlapping line atoms.
+   */
+  readSnapshots?: Map<string, {
+    sourceHash: string;
+    ranges: Array<{ startLine: number; endLine: number; artifactId?: number }>;
+  }>;
+  /** Total body characters admitted from document/file read tools this job. */
+  readCharactersUsed?: number;
   /** Optional UI-selected scope for compact/simple character cards. */
   simpleCharacterScope?: number[];
   /**
@@ -41,11 +51,11 @@ export type ToolExecutionContext = {
   lastWritePack?: string;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
-  /** Full-chapter delivery uses the scene pipeline instead of a one-shot proposal. */
+  /** Long-form chapter/side delivery uses the scene pipeline instead of a one-shot proposal. */
   requireScenePipeline?: boolean;
-  /** Current project scene-chain guidance and enforced per-chapter limit. */
+  /** Current project scene-chain guidance and enforced per-document limit. */
   scenePipelineSettings?: ScenePipelineSettings;
-  /** In-run chapter draft; never writes a partial chapter to the project. */
+  /** In-run narrative draft; never writes a partial document to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**
    * Cached reuse-reference prose for the current chapter draft (previous chapter

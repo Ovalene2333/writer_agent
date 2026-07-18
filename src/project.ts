@@ -43,6 +43,12 @@ export function documentKind(path: string): DocumentKind {
   return "other";
 }
 
+/** Long-form narrative documents assembled through the causal scene pipeline. */
+export function isScenePipelineDocument(path: string): boolean {
+  const kind = documentKind(path);
+  return kind === "chapter" || kind === "side";
+}
+
 /**
  * Chapter documents in NARRATIVE order: writer.yaml's `chapters` list first
  * (it is appended to on every chapters/ write, so its order is authoring order),

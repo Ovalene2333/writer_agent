@@ -1,5 +1,42 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import {
+  Bot,
+  BookOpenText,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Columns3,
+  Drama,
+  Eye,
+  EyeOff,
+  FilePlus2,
+  FileText,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  History,
+  IdCard,
+  Library,
+  Menu,
+  MessageSquare,
+  Minus,
+  Moon,
+  MoreHorizontal,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRight,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Save,
+  Settings,
+  Sun,
+  Trash2,
+  WandSparkles,
+  Wifi,
+  X,
+} from "lucide-react";
 import { Marked, type Token, type Tokens } from "marked";
 import { documentDiff, renderDiffHtml } from "../diff";
 import { CharacterEditor } from "./character_editor";
@@ -307,18 +344,10 @@ const EMPTY_CHARACTER: CharacterDraft = {
   voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
   competencies: [], relationships: [], storyStates: [], experiences: [], notes: "",
 };
-/** Agent orb easter-egg lines (shown after multi-tap overdrive). */
-const ORB_EGG_LINES = [
-  "写作核心已过载 · 灵感滤镜开启",
-  "能量球低语：删掉形容词，留下心跳",
-  "今日配额：无限草稿，有限自我怀疑",
-  "检测到人类作者 · 建议继续摸鱼写作",
-  "过载模式：把「突然」全部换成具体动作",
-  "球说：大纲是地图，正文是迷路的勇气",
-];
-
 /** Visual UI themes (workspace chrome). Not writing style templates. */
-type UiThemeId = "parchment" | "midnight" | "ink" | "aurora" | "sakura" | "carbon";
+type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
+type WorkspaceMode = "split" | "editor-focus" | "agent-focus";
+type ManagementView = "characters" | "sessions" | "models";
 
 type UiTheme = {
   id: UiThemeId;
@@ -333,57 +362,57 @@ type UiTheme = {
 
 const UI_THEMES: UiTheme[] = [
   {
-    id: "parchment",
-    name: "羊皮纸",
-    tag: "默认浅色",
-    description: "暖纸张底 + 墨绿强调，现有工作台的经典配色。",
-    example: "长篇正文阅读、白天连载写作",
-    preview: { bg: "#f3f0e9", surface: "#fffdfa", surface2: "#f8f5ef", border: "#e0d9cc", accent: "#3d5a45", text: "#2c332b" },
+    id: "light",
+    name: "云白",
+    tag: "中性浅色",
+    description: "中性灰白工作台，适合白天写作与长篇阅读。",
+    example: "正文写作、资料整理与审阅",
+    preview: { bg: "#f4f6f7", surface: "#ffffff", surface2: "#f7f9fa", border: "#d8dee2", accent: "#0f766e", text: "#182126" },
     dark: false,
   },
   {
-    id: "midnight",
-    name: "午夜林",
-    tag: "默认深色",
-    description: "深绿夜色 + 薄荷强调，现有暗色模式的演进版。",
-    example: "夜间写作、降亮度长时间改稿",
-    preview: { bg: "#151c17", surface: "#1b231d", surface2: "#1d2820", border: "#2e3a30", accent: "#8bb89a", text: "#d5dfd8" },
+    id: "dark",
+    name: "夜幕",
+    tag: "中性深色",
+    description: "中性深灰工作台，减少夜间长时间工作的眩光。",
+    example: "夜间写作、密集 Agent 会话",
+    preview: { bg: "#111719", surface: "#182023", surface2: "#1d272a", border: "#344044", accent: "#2dd4bf", text: "#e5ecee" },
     dark: true,
   },
   {
     id: "ink",
-    name: "墨砚",
-    tag: "纸墨",
-    description: "近黑正文与朱砂点缀，偏传统出版与中文排版气质。",
-    example: "严肃文学、设定文档校对",
-    preview: { bg: "#f2efe8", surface: "#fbfaf6", surface2: "#f4f1ea", border: "#d4cfc3", accent: "#b33a2b", text: "#1a1a1a" },
+    name: "纸墨",
+    tag: "朱红",
+    description: "清晰纸面与克制朱红强调。",
+    example: "校对与出版排版",
+    preview: { bg: "#eef0ef", surface: "#fbfbf8", surface2: "#f3f4f1", border: "#d5d9d5", accent: "#b44232", text: "#191d1c" },
     dark: false,
   },
   {
-    id: "aurora",
-    name: "极光",
-    tag: "现代",
-    description: "冷调蓝紫工具感，侧栏与对话更像产品工作台。",
-    example: "规划大纲、工具调用密集的 Agent 会话",
-    preview: { bg: "#eef2f8", surface: "#fbfcfe", surface2: "#f3f6fb", border: "#d3dbe8", accent: "#4f6ef7", text: "#1c2433" },
+    id: "rose",
+    name: "冷樱",
+    tag: "莓红",
+    description: "冷灰底色与莓红强调。",
+    example: "人物与情感线写作",
+    preview: { bg: "#f3f2f5", surface: "#fefcfe", surface2: "#f7f4f7", border: "#ded8df", accent: "#a73d68", text: "#262027" },
     dark: false,
   },
   {
-    id: "sakura",
-    name: "樱色",
-    tag: "柔和",
-    description: "浅粉纸感与玫红强调，阅读区更轻、更“轻小说”。",
-    example: "日常/恋爱线正文精读",
-    preview: { bg: "#faf4f5", surface: "#fffafb", surface2: "#fbf5f6", border: "#ead5da", accent: "#c45c7a", text: "#3a2a2e" },
+    id: "ocean",
+    name: "海盐",
+    tag: "海蓝",
+    description: "冷白工作面与深海蓝强调。",
+    example: "规划与资料整理",
+    preview: { bg: "#edf2f4", surface: "#fbfdfe", surface2: "#f2f6f7", border: "#d2dde1", accent: "#176b87", text: "#17252b" },
     dark: false,
   },
   {
-    id: "carbon",
-    name: "碳黑",
-    tag: "编辑器",
-    description: "高对比深灰 + 电青强调，接近代码编辑器的夜间界面。",
-    example: "深夜改设定、对照检索与补丁提案",
-    preview: { bg: "#0e0f12", surface: "#16181d", surface2: "#12141a", border: "#2a2e38", accent: "#64d2ff", text: "#e8eaef" },
+    id: "graphite",
+    name: "石墨",
+    tag: "琥珀深色",
+    description: "石墨灰工作面与琥珀强调。",
+    example: "夜间审阅与长会话",
+    preview: { bg: "#121415", surface: "#1c1f20", surface2: "#222627", border: "#3a4042", accent: "#e0ae45", text: "#ecebea" },
     dark: true,
   },
 ];
@@ -402,11 +431,90 @@ function loadAgentHiddenCharacterCards(): Set<string> {
 
 function loadUiTheme(): UiThemeId {
   const stored = localStorage.getItem("writer-ui-theme") || localStorage.getItem("writer-theme");
-  if (stored === "light") return "parchment";
-  if (stored === "dark") return "midnight";
   if (stored && UI_THEME_IDS.has(stored)) return stored as UiThemeId;
-  if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) return "midnight";
-  return "parchment";
+  if (stored === "aurora") return "ocean";
+  if (stored === "sakura") return "rose";
+  if (stored === "carbon") return "graphite";
+  if (stored === "parchment") return "light";
+  if (stored === "midnight") return "dark";
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function loadWorkspaceMode(): WorkspaceMode {
+  const stored = localStorage.getItem("writer-workspace-mode");
+  return stored === "editor-focus" || stored === "agent-focus" ? stored : "split";
+}
+
+function IconButton({ label, children, className = "", onClick, disabled = false }: {
+  label: string;
+  children: React.ReactNode;
+  className?: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button type="button" className={`icon ${className}`.trim()} title={label} aria-label={label} onClick={onClick} disabled={disabled}>
+      {children}
+    </button>
+  );
+}
+
+function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggleDocuments }: {
+  mode: WorkspaceMode;
+  documentsCollapsed: boolean;
+  onModeChange: (mode: WorkspaceMode) => void;
+  onToggleDocuments: () => void;
+}) {
+  return (
+    <div className="layout-controls" role="group" aria-label="工作区布局">
+      <IconButton label={documentsCollapsed ? "展开文档栏" : "折叠文档栏"} onClick={onToggleDocuments}>
+        {documentsCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+      </IconButton>
+      <IconButton label="三栏布局" className={mode === "split" ? "active" : ""} onClick={() => onModeChange("split")}>
+        <Columns3 size={16} />
+      </IconButton>
+      <IconButton label="聚焦正文" className={mode === "editor-focus" ? "active" : ""} onClick={() => onModeChange("editor-focus")}>
+        <BookOpenText size={16} />
+      </IconButton>
+      <IconButton label="聚焦 Agent" className={mode === "agent-focus" ? "active" : ""} onClick={() => onModeChange("agent-focus")}>
+        <PanelRight size={16} />
+      </IconButton>
+    </div>
+  );
+}
+
+function SettingsMenu({ open, theme, connectionAvailable, onClose, onTheme, onModels, onStyle, onConnection, onRefresh }: {
+  open: boolean;
+  theme: UiThemeId;
+  connectionAvailable: boolean;
+  onClose: () => void;
+  onTheme: () => void;
+  onModels: () => void;
+  onStyle: () => void;
+  onConnection: () => void;
+  onRefresh: () => void;
+}) {
+  if (!open) return null;
+  return (
+    <div className="settings-menu-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="settings-menu" role="menu" aria-label="设置" onMouseDown={(event) => event.stopPropagation()}>
+        <button role="menuitem" onClick={onTheme}>{UI_THEMES.find((item) => item.id === theme)?.dark ? <Moon size={16} /> : <Sun size={16} />}界面主题</button>
+        <button role="menuitem" onClick={onModels}><Settings size={16} />模型与场景链</button>
+        <button role="menuitem" onClick={onStyle}><WandSparkles size={16} />写作风格</button>
+        <button role="menuitem" disabled={!connectionAvailable} onClick={onConnection}><Wifi size={16} />连接设置</button>
+        <span className="settings-menu-separator" />
+        <button role="menuitem" onClick={onRefresh}><RefreshCw size={16} />刷新工作区</button>
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceShell({ mode, documentsCollapsed, children }: {
+  mode: WorkspaceMode;
+  documentsCollapsed: boolean;
+  children: React.ReactNode;
+}) {
+  return <div className={`app workspace-${mode}${documentsCollapsed ? " documents-collapsed" : ""}`}>{children}</div>;
 }
 
 const token = initConnection();
@@ -840,7 +948,7 @@ function ReviewDock({
     <section className={`review-drawer${open ? " open" : ""}`} aria-label="待审阅的改动">
       <button type="button" className="review-drawer-toggle" onClick={onToggle} aria-expanded={open}>
         <span className="review-drawer-chevron" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="11" height="11"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          <ChevronRight size={12} />
         </span>
         <span className="review-drawer-title">审阅</span>
         {pendingCount > 0 && <span className="proposal-count">{pendingCount}</span>}
@@ -1044,7 +1152,7 @@ function FileTreeItem({
       >
         {node.kind === "folder" ? (
           <span className={`tree-arrow ${isExpanded ? "expanded" : ""}`} onClick={toggleFolder} aria-hidden="true">
-            <svg viewBox="0 0 16 16" width="12" height="12"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            <ChevronRight size={13} />
           </span>
         ) : (
           <span className="tree-arrow-spacer" />
@@ -1052,12 +1160,12 @@ function FileTreeItem({
         <span className={`tree-icon ${node.kind === "folder" ? (isExpanded ? "folder-open" : "folder") : "file"}`} aria-hidden="true">
           {node.kind === "folder" ? (
             isExpanded ? (
-              <svg viewBox="0 0 20 20" width="15" height="15"><path d="M2.5 6.5h5l1.2 1.3H17.5v7.2a1.5 1.5 0 0 1-1.5 1.5H4a1.5 1.5 0 0 1-1.5-1.5V6.5z" fill="currentColor" opacity=".92"/><path d="M2.5 8.2h15l-1.1 6.4A1.4 1.4 0 0 1 15 16H5a1.4 1.4 0 0 1-1.4-1.2L2.5 8.2z" fill="currentColor" opacity=".55"/></svg>
+              <FolderOpen size={15} />
             ) : (
-              <svg viewBox="0 0 20 20" width="15" height="15"><path d="M2.5 5.2A1.7 1.7 0 0 1 4.2 3.5h3.1l1.4 1.5h7.1A1.7 1.7 0 0 1 17.5 6.7v7.6a1.7 1.7 0 0 1-1.7 1.7H4.2a1.7 1.7 0 0 1-1.7-1.7V5.2z" fill="currentColor"/></svg>
+              <Folder size={15} />
             )
           ) : (
-            <svg viewBox="0 0 20 20" width="14" height="14"><path d="M5.2 2.8h6.1L14.8 6.3v10.4a1.2 1.2 0 0 1-1.2 1.2H5.2a1.2 1.2 0 0 1-1.2-1.2V4a1.2 1.2 0 0 1 1.2-1.2z" fill="none" stroke="currentColor" strokeWidth="1.5"/><path d="M11.2 2.9v3.2h3.4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/><path d="M6.6 10.2h6.2M6.6 12.8h4.6" fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" opacity=".7"/></svg>
+            <FileText size={14} />
           )}
         </span>
         <span className="tree-label" title={node.path}>
@@ -1073,9 +1181,9 @@ function FileTreeItem({
             }}
           >
             {isEffectivelyHidden ? (
-              <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2 8s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" fill="none" stroke="currentColor" strokeWidth="1.4"/><circle cx="8" cy="8" r="1.6" fill="currentColor"/><path d="M3 13L13 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+              <EyeOff size={13} aria-hidden="true" />
             ) : (
-              <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2 8s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" fill="none" stroke="currentColor" strokeWidth="1.4"/><circle cx="8" cy="8" r="1.6" fill="currentColor"/></svg>
+              <Eye size={13} aria-hidden="true" />
             )}
           </button>
           {node.kind === "folder" && (
@@ -1087,7 +1195,7 @@ function FileTreeItem({
                 onNewChild(node.path, "file");
               }}
             >
-              <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.2v9.6M3.2 8h9.6" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+              <Plus size={13} aria-hidden="true" />
             </button>
           )}
           <button
@@ -1098,7 +1206,7 @@ function FileTreeItem({
               onRename(node.path, node.kind);
             }}
           >
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M9.2 3.4l3.4 3.4M3 13l1.1-3.9L11.4 1.8a1.1 1.1 0 0 1 1.6 0l1.2 1.2a1.1 1.1 0 0 1 0 1.6L6.9 11.9 3 13z" fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round"/></svg>
+            <Pencil size={13} aria-hidden="true" />
           </button>
           <button
             className="tree-action-btn danger"
@@ -1108,7 +1216,7 @@ function FileTreeItem({
               onDelete(node.path, node.kind);
             }}
           >
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M3.5 4.5h9M6 4.5V3.4h4v1.1M5.2 4.5l.5 8.1h4.6l.5-8.1" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            <Trash2 size={13} aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -1210,6 +1318,118 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
   );
 }
 
+function WorkspaceTopbar({
+  title,
+  connection,
+  model,
+  usagePct,
+  usageCost,
+  usageCurrency,
+  busy,
+  theme,
+  settingsOpen,
+  workspaceMode,
+  documentsCollapsed,
+  onCharacters,
+  onRoleplay,
+  onSessions,
+  onUsage,
+  onConnection,
+  onToggleSettings,
+  onCloseSettings,
+  onTheme,
+  onModels,
+  onStyle,
+  onRefresh,
+  onModeChange,
+  onToggleDocuments,
+}: {
+  title: string;
+  connection: ConnectionInfo;
+  model: string;
+  usagePct: number;
+  usageCost: number;
+  usageCurrency: string;
+  busy: boolean;
+  theme: UiThemeId;
+  settingsOpen: boolean;
+  workspaceMode: WorkspaceMode;
+  documentsCollapsed: boolean;
+  onCharacters: () => void;
+  onRoleplay: () => void;
+  onSessions: () => void;
+  onUsage: () => void;
+  onConnection: () => void;
+  onToggleSettings: () => void;
+  onCloseSettings: () => void;
+  onTheme: () => void;
+  onModels: () => void;
+  onStyle: () => void;
+  onRefresh: () => void;
+  onModeChange: (mode: WorkspaceMode) => void;
+  onToggleDocuments: () => void;
+}) {
+  return (
+    <header className="workspace-topbar">
+      <div className="header-left">
+        <span className="logo" aria-hidden="true"><span className="logo-mark">W</span></span>
+        <div className="title-stack">
+          <span className="product-line">Writer</span>
+          <h1 title={title}>{title}</h1>
+        </div>
+        {connection.dualMode && (
+          <button
+            type="button"
+            className={`connection-pill route-${connection.route}${connection.lanBlockedByMixedContent ? " mixed-block" : ""}`}
+            title="连接通道：点击查看说明与切换"
+            aria-label={`当前${connection.label}，打开连接设置`}
+            onClick={onConnection}
+          >
+            <i aria-hidden="true" />
+            <span className="connection-pill-label">{connection.label}</span>
+          </button>
+        )}
+      </div>
+      <div className="header-right">
+        <LayoutControls
+          mode={workspaceMode}
+          documentsCollapsed={documentsCollapsed}
+          onModeChange={onModeChange}
+          onToggleDocuments={onToggleDocuments}
+        />
+        <nav className="nav-cluster" aria-label="工作区入口">
+          <button type="button" className="ghost nav-action" aria-label="角色" title="角色" onClick={onCharacters}><IdCard size={17} aria-hidden="true" /><span>角色</span></button>
+          <button type="button" className="ghost nav-action" aria-label="扮演" title="扮演" disabled={busy} onClick={onRoleplay}><Drama size={17} aria-hidden="true" /><span>扮演</span></button>
+          <button type="button" className="ghost nav-action" aria-label="会话" title="会话" onClick={onSessions}><MessageSquare size={16} aria-hidden="true" /><span>会话</span></button>
+        </nav>
+        <button className="usage-strip" onClick={onUsage} title="当前会话用量与计费明细">
+          <span className="model-name">{model}</span>
+          <span className="context-meter" title={`${usagePct}% context`} aria-hidden="true">
+            <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
+          </span>
+          <span>{usagePct}%</span>
+          <span className="usage-cost">{usageCurrency === "CNY" ? "¥" : "$"}{usageCost.toFixed(4)}</span>
+          <ChevronDown size={13} aria-hidden="true" />
+        </button>
+        <div className="settings-anchor">
+          <IconButton label="设置" className={settingsOpen ? "active" : ""} onClick={onToggleSettings}><Settings size={17} /></IconButton>
+          <SettingsMenu
+            open={settingsOpen}
+            theme={theme}
+            connectionAvailable={connection.dualMode}
+            onClose={onCloseSettings}
+            onTheme={onTheme}
+            onModels={onModels}
+            onStyle={onStyle}
+            onConnection={onConnection}
+            onRefresh={onRefresh}
+          />
+        </div>
+      </div>
+    </header>
+  );
+}
+
 function App() {
   const [state, setState] = useState<State>();
   const [activePath, setActivePath] = useState("");
@@ -1225,13 +1445,6 @@ function App() {
   const [conversationAtBottom, setConversationAtBottom] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  /** Agent orb easter egg: tap feedback + rare overdrive mode. */
-  const [orbTap, setOrbTap] = useState(false);
-  const [orbEgg, setOrbEgg] = useState(false);
-  const [orbEggLine, setOrbEggLine] = useState(0);
-  const orbClickRef = useRef({ count: 0, lastAt: 0 });
-  const orbTapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const orbEggTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [mobileTab, setMobileTab] = useState<"docs" | "editor" | "agent">("editor");
   const [reviewOpen, setReviewOpen] = useState(false);
   const prevPendingReviewRef = useRef(0);
@@ -1240,7 +1453,12 @@ function App() {
   const [showStylePicker, setShowStylePicker] = useState(false);
   const [styleBusy, setStyleBusy] = useState(false);
   const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
-  const [managementView, setManagementView] = useState<"characters" | "sessions" | null>(null);
+  const [managementView, setManagementView] = useState<ManagementView | null>(null);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(loadWorkspaceMode);
+  const [documentsCollapsed, setDocumentsCollapsed] = useState(() =>
+    localStorage.getItem("writer-documents-collapsed") === "true",
+  );
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [sessionBatchMode, setSessionBatchMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [messageVersionViews, setMessageVersionViews] = useState<Record<number, MessageVersionBundle>>({});
@@ -1256,7 +1474,6 @@ function App() {
   } | null>(null);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<{ path: string; kind: "file" | "folder" } | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -1632,24 +1849,61 @@ function App() {
     const root = window.document.documentElement;
     root.dataset.theme = theme;
     localStorage.setItem("writer-ui-theme", theme);
-    localStorage.setItem("writer-theme", theme === "midnight" || theme === "carbon" ? "dark" : "light");
-    const meta = window.document.querySelector('meta[name="theme-color"]');
     const active = UI_THEMES.find((item) => item.id === theme);
+    localStorage.setItem("writer-theme", active?.dark ? "dark" : "light");
+    const meta = window.document.querySelector('meta[name="theme-color"]');
     if (meta && active) meta.setAttribute("content", active.preview.accent);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem("writer-workspace-mode", workspaceMode);
+    localStorage.setItem("writer-documents-collapsed", String(documentsCollapsed));
+  }, [workspaceMode, documentsCollapsed]);
 
   useEffect(() => {
     localStorage.setItem("writer-outline-collapsed", String(outlineCollapsed));
   }, [outlineCollapsed]);
 
   useEffect(() => {
-    if (!showThemePicker) return;
+    const overlayOpen = showThemePicker || showStylePicker || showConnectionPanel
+      || showUsagePopover || settingsMenuOpen || managementView !== null
+      || styleDraft !== null || characterDraft !== null || simpleCardDraft !== null
+      || roleplaySetup !== null || roleplaySceneDraft !== null || roleplayFactDraft !== null
+      || branchConfirm !== null;
+    if (!overlayOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowThemePicker(false);
+      if (e.key !== "Escape") return;
+      if (styleDraft) {
+        setStyleDraft(null);
+        setShowStylePicker(true);
+        return;
+      }
+      if (characterDraft) { setCharacterDraft(null); return; }
+      if (simpleCardDraft) { setSimpleCardDraft(null); return; }
+      if (roleplayFactDraft) { setRoleplayFactDraft(null); return; }
+      if (roleplaySceneDraft) { setRoleplaySceneDraft(null); return; }
+      if (roleplaySetup && !roleplaySetupBusy) { setRoleplaySetup(null); return; }
+      if (branchConfirm) { setBranchConfirm(null); return; }
+      if (settingsMenuOpen) { setSettingsMenuOpen(false); return; }
+      if (showUsagePopover) { setShowUsagePopover(false); return; }
+      if (showThemePicker) { setShowThemePicker(false); return; }
+      if (showStylePicker) { setShowStylePicker(false); return; }
+      if (showConnectionPanel) { setShowConnectionPanel(false); return; }
+      if (managementView) { setManagementView(null); return; }
+      setShowThemePicker(false);
+      setShowStylePicker(false);
+      setShowConnectionPanel(false);
+      setShowUsagePopover(false);
+      setSettingsMenuOpen(false);
+      setManagementView(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showThemePicker]);
+  }, [
+    showThemePicker, showStylePicker, showConnectionPanel, showUsagePopover, settingsMenuOpen,
+    managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
+    roleplaySceneDraft, roleplayFactDraft, branchConfirm,
+  ]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -2067,42 +2321,6 @@ function App() {
     if (jobId) void api(`/api/chat/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
     abortRef.current?.abort();
   }
-
-  function pokeAgentOrb() {
-    const now = Date.now();
-    // Reset combo if the user pauses too long between taps.
-    if (now - orbClickRef.current.lastAt > 1600) orbClickRef.current.count = 0;
-    orbClickRef.current.lastAt = now;
-    orbClickRef.current.count += 1;
-
-    setOrbTap(true);
-    if (orbTapTimerRef.current) clearTimeout(orbTapTimerRef.current);
-    orbTapTimerRef.current = setTimeout(() => setOrbTap(false), 420);
-
-    if (orbEgg) {
-      // Already awake: cycle witty lines on each poke.
-      setOrbEggLine((n) => (n + 1) % ORB_EGG_LINES.length);
-      return;
-    }
-
-    if (orbClickRef.current.count >= 7) {
-      orbClickRef.current.count = 0;
-      setOrbEgg(true);
-      setOrbEggLine(Math.floor(Math.random() * ORB_EGG_LINES.length));
-      setNotice("✦ 能量球过载：写作核心已解锁隐藏滤镜");
-      if (orbEggTimerRef.current) clearTimeout(orbEggTimerRef.current);
-      // Fade back to normal after a while so it stays an easter egg.
-      orbEggTimerRef.current = setTimeout(() => {
-        setOrbEgg(false);
-        setNotice("");
-      }, 28_000);
-    }
-  }
-
-  useEffect(() => () => {
-    if (orbTapTimerRef.current) clearTimeout(orbTapTimerRef.current);
-    if (orbEggTimerRef.current) clearTimeout(orbEggTimerRef.current);
-  }, []);
 
   function requestRewindMessage(message: Message) {
     if (!state || busy || message.role !== "user") return;
@@ -2614,7 +2832,8 @@ function App() {
   }
 
   function openProviderSettings() {
-    setShowSettings(true);
+    setSettingsMenuOpen(false);
+    setManagementView("models");
   }
 
   async function deleteCharacter(character: Character) {
@@ -2689,108 +2908,55 @@ function App() {
     : undefined;
 
   return (
-    <div className="app">
-      <div
+    <WorkspaceShell mode={workspaceMode} documentsCollapsed={documentsCollapsed}>
+      {!documentsCollapsed && workspaceMode !== "agent-focus" && <div
         className={`resize-handle${resizing === "sidebar" ? " active" : ""}`}
         style={{ left: `calc(var(--sidebar-w, 248px) - 2.5px)` }}
         onMouseDown={() => setResizing("sidebar")}
-      />
-      <div
+      />}
+      {workspaceMode === "split" && <div
         className={`resize-handle${resizing === "agent" ? " active" : ""}`}
         style={{ right: `calc(var(--agent-w, 380px) - 2.5px)` }}
         onMouseDown={() => setResizing("agent")}
+      />}
+      <WorkspaceTopbar
+        title={state.config.title || "Writer Agent"}
+        connection={connection}
+        model={state.provider.model}
+        usagePct={usagePct}
+        usageCost={state.usage.cost}
+        usageCurrency={state.usage.currency}
+        busy={busy}
+        theme={theme}
+        settingsOpen={settingsMenuOpen}
+        workspaceMode={workspaceMode}
+        documentsCollapsed={documentsCollapsed}
+        onCharacters={() => {
+          setSessionBatchMode(false);
+          setSelectedSessionIds(new Set());
+          setManagementView("characters");
+        }}
+        onRoleplay={() => beginRoleplaySetup()}
+        onSessions={() => {
+          setSessionBatchMode(false);
+          setSelectedSessionIds(new Set());
+          setManagementView("sessions");
+        }}
+        onUsage={() => setShowUsagePopover(true)}
+        onConnection={() => {
+          setSettingsMenuOpen(false);
+          setConnectionPanelMsg("");
+          setShowConnectionPanel(true);
+        }}
+        onToggleSettings={() => setSettingsMenuOpen((value) => !value)}
+        onCloseSettings={() => setSettingsMenuOpen(false)}
+        onTheme={() => { setSettingsMenuOpen(false); setShowThemePicker(true); }}
+        onModels={openProviderSettings}
+        onStyle={() => { setSettingsMenuOpen(false); setShowStylePicker(true); }}
+        onRefresh={() => { setSettingsMenuOpen(false); void refresh(state.sessionId); }}
+        onModeChange={setWorkspaceMode}
+        onToggleDocuments={() => setDocumentsCollapsed((value) => !value)}
       />
-      <header>
-        <div className="header-left">
-          <span className="logo"><span className="logo-mark">W</span><span>Writer</span></span>
-          <div className="title-stack">
-            <span className="product-line">AI Writing Agent</span>
-            <h1>{state.config.title || "Writer Agent"}</h1>
-          </div>
-          {connection.dualMode && (
-            <button
-              type="button"
-              className={`connection-pill route-${connection.route}${connection.lanBlockedByMixedContent ? " mixed-block" : ""}`}
-              title="连接通道：点击查看说明与切换"
-              aria-label={`当前${connection.label}，打开连接设置`}
-              onClick={() => {
-                setConnectionPanelMsg("");
-                setShowConnectionPanel(true);
-              }}
-            >
-              <i aria-hidden="true" />
-              <span className="connection-pill-label">{connection.label}</span>
-            </button>
-          )}
-        </div>
-        <div className="header-right">
-          <button className="usage-strip" onClick={() => setShowUsagePopover(true)} title="用量与计费明细">
-            <span className="model-name">{state.provider.model}</span>
-            <span className="context-meter" title={`${usagePct}% context`} aria-hidden="true">
-              <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
-            </span>
-            <span title="Context window used">{usagePct}%</span>
-            <span className="usage-chevron" aria-hidden="true">▾</span>
-          </button>
-          <div className="nav-cluster" role="group" aria-label="内容导航">
-            <button
-              className="ghost nav-action"
-              title="角色卡"
-              onClick={() => {
-                setSessionBatchMode(false);
-                setSelectedSessionIds(new Set());
-                setManagementView("characters");
-              }}
-            >角色</button>
-            <button
-              className="ghost nav-action"
-              title="选择扮演者与当前身份"
-              disabled={busy}
-              onClick={() => beginRoleplaySetup()}
-            >扮演</button>
-            <button
-              className="ghost nav-action"
-              title="会话"
-              onClick={() => {
-                setSessionBatchMode(false);
-                setSelectedSessionIds(new Set());
-                setManagementView("sessions");
-              }}
-            >会话</button>
-            <button
-              className={`ghost nav-action${activeStyle ? " style-active" : ""}`}
-              title={activeStyle ? `写作风格：${activeStyle.name}` : "写作风格模板"}
-              aria-label="选择写作风格模板"
-              onClick={() => setShowStylePicker(true)}
-            >风格</button>
-          </div>
-          <div className="header-utility" role="group" aria-label="会话操作">
-            <button
-              className="icon"
-              title="界面风格"
-              aria-label="选择界面风格"
-              onClick={() => setShowThemePicker(true)}
-            >
-              ◐
-            </button>
-            <button
-              className="ghost"
-              title="New session"
-              onClick={async () => {
-                // New session: stop rendering previous trail (storage for old session kept for later switch-back).
-                clearAgentStream({ abort: true });
-                const r = await api<{ sessionId: string }>("/api/session", { method: "POST" });
-                await refresh(r.sessionId);
-              }}
-            >
-              + New
-            </button>
-            <button className="ghost" onClick={() => void refresh(state.sessionId)} title="Refresh">
-              Refresh
-            </button>
-          </div>
-        </div>
-      </header>
 
       <nav className="mobile-tabs" aria-label="主区域">
         <button
@@ -2801,7 +2967,7 @@ function App() {
             setMobileTab("docs");
           }}
         >
-          <span className="tab-icon" aria-hidden="true">☷</span><span>文档</span>
+          <Library className="tab-icon" size={19} aria-hidden="true" /><span>文档</span>
         </button>
         <button
           type="button"
@@ -2811,7 +2977,7 @@ function App() {
             setMobileTab("editor");
           }}
         >
-          <span className="tab-icon" aria-hidden="true">✎</span><span>正文</span>
+          <BookOpenText className="tab-icon" size={19} aria-hidden="true" /><span>正文</span>
         </button>
         <button
           type="button"
@@ -2821,7 +2987,7 @@ function App() {
             setMobileTab("agent");
           }}
         >
-          <span className="tab-icon" aria-hidden="true">✦</span><span>Agent</span>
+          <Bot className="tab-icon" size={19} aria-hidden="true" /><span>Agent</span>
         </button>
       </nav>
 
@@ -2842,7 +3008,7 @@ function App() {
               setCreateValue("新文档");
             }}
           >
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4.2 2.5h5.2L12.5 5.6v7.4a1 1 0 0 1-1 1H4.2a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" strokeWidth="1.35"/><path d="M9.3 2.6v3h3" fill="none" stroke="currentColor" strokeWidth="1.35"/><path d="M5.5 9.2h5M8 6.7v5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+            <FilePlus2 size={15} aria-hidden="true" />
             新建文档
           </button>
           <button
@@ -2853,7 +3019,7 @@ function App() {
               setCreateValue("新文件夹");
             }}
           >
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.2 4.2A1.2 1.2 0 0 1 3.4 3h2.4l1.1 1.2h5.7A1.2 1.2 0 0 1 13.8 5.4v6a1.2 1.2 0 0 1-1.2 1.2H3.4A1.2 1.2 0 0 1 2.2 11.4V4.2z" fill="none" stroke="currentColor" strokeWidth="1.35"/><path d="M8 7v4.2M5.9 9.1H10.1" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+            <FolderPlus size={15} aria-hidden="true" />
             新建文件夹
           </button>
         </div>
@@ -2894,7 +3060,7 @@ function App() {
           {tree.length === 0 ? (
             <div className="sidebar-empty">
               <div className="sidebar-empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 40 40" width="36" height="36"><path d="M8 11h9l3 3h12v15a3 3 0 0 1-3 3H11a3 3 0 0 1-3-3V11z" fill="none" stroke="currentColor" strokeWidth="1.6"/><path d="M16 22h8M20 18v8" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity=".7"/></svg>
+                <FolderPlus size={32} />
               </div>
               <strong>还没有文档</strong>
               <span>点击上方按钮创建文档或文件夹</span>
@@ -2949,15 +3115,15 @@ function App() {
               <div className="reader-controls">
                 <div className="ctrl-group">
                   <span className="ctrl-label">A</span>
-                  <button onClick={() => setReaderFontSize((v) => Math.max(12, v - 1))} title="Decrease font size">-</button>
+                  <button onClick={() => setReaderFontSize((v) => Math.max(12, v - 1))} title="减小字号" aria-label="减小字号"><Minus size={12} /></button>
                   <span className="ctrl-val">{readerFontSize}</span>
-                  <button onClick={() => setReaderFontSize((v) => Math.min(24, v + 1))} title="Increase font size">+</button>
+                  <button onClick={() => setReaderFontSize((v) => Math.min(24, v + 1))} title="增大字号" aria-label="增大字号"><Plus size={12} /></button>
                 </div>
                 <div className="ctrl-group">
                   <span className="ctrl-label">W</span>
-                  <button onClick={() => setReaderWidth((v) => Math.max(420, v - 60))} title="Narrower margins">-</button>
+                  <button onClick={() => setReaderWidth((v) => Math.max(420, v - 60))} title="缩窄正文" aria-label="缩窄正文"><Minus size={12} /></button>
                   <span className="ctrl-val">{readerWidth}</span>
-                  <button onClick={() => setReaderWidth((v) => Math.min(1200, v + 60))} title="Wider margins">+</button>
+                  <button onClick={() => setReaderWidth((v) => Math.min(1200, v + 60))} title="加宽正文" aria-label="加宽正文"><Plus size={12} /></button>
                 </div>
               </div>
             )}
@@ -2968,9 +3134,9 @@ function App() {
                 </button>
               ) : editingDocument ? (
                 <>
-                  <button onClick={cancelEdit}>Cancel</button>
+                  <button onClick={cancelEdit}><X size={14} />取消</button>
                   <button className="primary" onClick={() => void saveDocument()}>
-                    Save
+                    <Save size={14} />保存
                   </button>
                 </>
               ) : (
@@ -2982,10 +3148,10 @@ function App() {
                     onClick={() => void toggleVersionPanel()}
                     title="浏览文档历史版本（只读，Agent 仅见当前版）"
                   >
-                    版本
+                    <History size={14} />版本
                   </button>
                   <button disabled={!activePath} onClick={() => setEditingDocument(true)}>
-                    Edit
+                    <Pencil size={14} />编辑
                   </button>
                 </>
               )}
@@ -3075,7 +3241,7 @@ function App() {
                           aria-label={outlineCollapsed ? "Expand sections" : "Collapse sections"}
                           aria-expanded={!outlineCollapsed}
                         >
-                          {outlineCollapsed ? "☰" : "‹"}
+                          {outlineCollapsed ? <Menu size={15} /> : <ChevronLeft size={15} />}
                         </button>
                       </div>
                       {!outlineCollapsed && headings.map((heading) => (
@@ -3103,33 +3269,28 @@ function App() {
         )}
       </main>
 
-      <section className={`agent-panel ${mobileTab === "agent" ? "mobile-active" : ""} ${busy ? "agent-busy" : ""} ${orbEgg ? "orb-egg" : ""}`}>
+      <section className={`agent-panel ${mobileTab === "agent" ? "mobile-active" : ""} ${busy ? "agent-busy" : ""}`}>
         <div className="agent-head">
           <div className="agent-head-brand">
-            <button
-              type="button"
-              className={`agent-orb${orbTap ? " orb-tap" : ""}${orbEgg ? " orb-egg-active" : ""}`}
-              aria-label={orbEgg ? "写作能量球（过载中）" : "写作能量球"}
-              title={orbEgg ? "再点一下听它多说两句" : "连点试试？"}
-              onClick={pokeAgentOrb}
-            >
-              <span className="agent-orb-core" aria-hidden="true" />
-              <span className="agent-orb-spark agent-orb-spark-a" aria-hidden="true" />
-              <span className="agent-orb-spark agent-orb-spark-b" aria-hidden="true" />
-              <span className="agent-orb-spark agent-orb-spark-c" aria-hidden="true" />
-            </button>
+            <span className="agent-mark" aria-hidden="true"><Bot size={17} /></span>
             <h2>
               Agent
               <small>
-                {orbEgg
-                  ? ORB_EGG_LINES[orbEggLine]
-                  : busy
-                    ? "Thinking & writing…"
-                    : "Ready for your task"}
+                {busy ? "Thinking & writing…" : "Ready for your task"}
               </small>
             </h2>
           </div>
           <div className="agent-head-actions">
+            {!busy && (
+              <IconButton
+                label="新建会话"
+                onClick={() => void (async () => {
+                  clearAgentStream({ abort: true });
+                  const result = await api<{ sessionId: string }>("/api/session", { method: "POST" });
+                  await refresh(result.sessionId);
+                })()}
+              ><Plus size={16} /></IconButton>
+            )}
             <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "Running" : "Idle"}</span>
             {busy && (
               <button className="agent-stop-btn" onClick={stop}>
@@ -3740,12 +3901,7 @@ function App() {
                   激活后会注入对应系统提示与范文示例，并应用建议的 temperature / topP。可随时关闭。
                 </p>
               </div>
-              <button
-                className="icon"
-                aria-label="关闭"
-                disabled={styleBusy}
-                onClick={() => setShowStylePicker(false)}
-              >×</button>
+              <IconButton label="关闭" disabled={styleBusy} onClick={() => setShowStylePicker(false)}><X size={17} /></IconButton>
             </div>
             <div className="style-picker-actions">
               <button type="button" className="primary" disabled={styleBusy} onClick={() => openStyleTemplate()}>
@@ -3934,7 +4090,7 @@ function App() {
                   。在家优先局域网，出门自动切公网；也可手动锁定或打开对应链接。
                 </p>
               </div>
-              <button className="icon" aria-label="关闭" onClick={() => setShowConnectionPanel(false)}>×</button>
+              <IconButton label="关闭" onClick={() => setShowConnectionPanel(false)}><X size={17} /></IconButton>
             </div>
 
             <div className="connection-status-row">
@@ -4099,7 +4255,7 @@ function App() {
                 <h2>用量与计费</h2>
                 <p>本会话累计的上下文占用、token 与费用。</p>
               </div>
-              <button className="icon" aria-label="关闭" onClick={() => setShowUsagePopover(false)}>×</button>
+              <IconButton label="关闭" onClick={() => setShowUsagePopover(false)}><X size={17} /></IconButton>
             </div>
             <div className="usage-detail">
               <div className="usage-detail-row">
@@ -4152,12 +4308,9 @@ function App() {
             <div className="theme-picker-head">
               <div>
                 <span className="eyebrow">Appearance</span>
-                <h2>界面风格</h2>
-                <p>
-                  选择工作台配色。下方「案例」对应典型用法。写作文风请点顶栏「风格」配置。
-                </p>
+                <h2>界面主题</h2>
               </div>
-              <button className="icon" aria-label="关闭" onClick={() => setShowThemePicker(false)}>×</button>
+              <IconButton label="关闭" onClick={() => setShowThemePicker(false)}><X size={17} /></IconButton>
             </div>
             <div className="theme-grid">
               {UI_THEMES.map((item) => (
@@ -4198,8 +4351,6 @@ function App() {
                       {item.name}
                       <span className="theme-tag">{item.tag}</span>
                     </strong>
-                    <small>{item.description}</small>
-                    <span className="theme-example">{item.example}</span>
                   </div>
                 </button>
               ))}
@@ -4208,7 +4359,7 @@ function App() {
         </div>
       )}
 
-      {managementView && (
+      {managementView && managementView !== "models" && (
         <div className="management-backdrop" onMouseDown={() => setManagementView(null)}>
           <section className="management-view" onMouseDown={(e) => e.stopPropagation()}>
             <div className="management-head">
@@ -4219,8 +4370,8 @@ function App() {
               <div className="management-actions">
                 {managementView === "characters" ? (
                   <>
-                    <button className="ghost" onClick={() => setSimpleCardDraft({ name: "", identity: "", relationship: "", knowledge: "", scene: "", goal: "" })}>+ 简易角色</button>
-                    <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}>+ 普通角色</button>
+                    <button className="ghost" onClick={() => setSimpleCardDraft({ name: "", identity: "", relationship: "", knowledge: "", scene: "", goal: "" })}><Plus size={15} />简易角色</button>
+                    <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}><Plus size={15} />普通角色</button>
                   </>
                 ) : (
                   <>
@@ -4241,7 +4392,7 @@ function App() {
                         setManagementView(null);
                         setSessionBatchMode(false);
                         setSelectedSessionIds(new Set());
-                      }} title="新建会话并清除当前 step 渲染">+ Session</button>
+                      }} title="新建会话并清除当前 step 渲染"><Plus size={15} />新建会话</button>
                     )}
                   </>
                 )}
@@ -4253,7 +4404,7 @@ function App() {
                     setSessionBatchMode(false);
                     setSelectedSessionIds(new Set());
                   }}
-                >×</button>
+                ><X size={17} /></button>
               </div>
             </div>
 
@@ -4387,8 +4538,8 @@ function App() {
                       {session.id === state.sessionId && <span className="current-badge">Current</span>}
                       {!sessionBatchMode && (
                         <>
-                          <button className="icon" title="Rename" onClick={() => void renameSession(session.id, session.title)}>✎</button>
-                          <button className="icon danger" title="Delete" onClick={() => void deleteSession(session.id)}>×</button>
+                          <button className="icon" aria-label="重命名会话" title="重命名" onClick={() => void renameSession(session.id, session.title)}><Pencil size={15} /></button>
+                          <button className="icon danger" aria-label="删除会话" title="删除" onClick={() => void deleteSession(session.id)}><Trash2 size={15} /></button>
                         </>
                       )}
                     </div>
@@ -4414,11 +4565,11 @@ function App() {
         />
       )}
 
-      {showSettings && <ModelConfig
+      {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
         scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 }}
         request={api}
-        onClose={() => setShowSettings(false)}
+        onClose={() => setManagementView(null)}
         onChanged={() => { void refresh(state.sessionId); }}
         onScenePipelineChanged={scenePipeline => setState(previous => previous ? {
           ...previous,
@@ -4428,7 +4579,7 @@ function App() {
           },
         } : previous)}
       />}
-    </div>
+    </WorkspaceShell>
   );
 }
 

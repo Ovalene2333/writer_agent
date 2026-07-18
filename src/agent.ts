@@ -1,6 +1,6 @@
 import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, StepUsage, UsageSummary } from "./types.js";
 import type { ChapterSceneDraft } from "./scene_pipeline.js";
-import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
+import { documentKind, isScenePipelineDocument, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
@@ -108,8 +108,9 @@ export { agentToolNames, agentToolSchemaHash } from "./tools/index.js";
  *    whole session uses one fixed set (changing tools breaks the tools-side prefix).
  *
  * 6) PLANNER
- *    planWritingTask: immutable rules in system; request + catalogs + short history
- *    in the user message only.
+ *    planWritingTask starts with the exact same 6 stable system slots and frozen
+ *    TOOLS schema as execution, then appends immutable planner rules and one
+ *    dynamic user payload. This warms the execution prefix before step 1.
  *
  * 7) DEDUPE
  *    Prefer one compact rule + cross-reference over pasting the same mannerism /
@@ -140,6 +141,40 @@ interface WritingTask {
   continuation: boolean;
   todoPlan: string[];
   targetPath?: string;
+}
+
+type CompletionUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+};
+
+/** Parse the planner's single JSON object without accepting surrounding prose. */
+export function parsePlannerJson(content: string): Partial<WritingTask> | undefined {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
+  const candidate = fenced ?? trimmed;
+  if (!candidate.startsWith("{") || !candidate.endsWith("}")) return undefined;
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Partial<WritingTask>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function addCompletionUsage(first?: CompletionUsage, second?: CompletionUsage): CompletionUsage | undefined {
+  if (!first) return second;
+  if (!second) return first;
+  return {
+    promptTokens: first.promptTokens + second.promptTokens,
+    completionTokens: first.completionTokens + second.completionTokens,
+    cacheHitTokens: first.cacheHitTokens + second.cacheHitTokens,
+    cacheMissTokens: first.cacheMissTokens + second.cacheMissTokens,
+  };
 }
 
 function dsmlMarkerIndex(text: string): number {
@@ -327,10 +362,10 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
       ? `可读简易卡 ID：${simpleCharacterScope.join("、")}。`
       : "不加载已有简易卡；仍可新建。";
   const chapterSceneDelivery = task.mode === "write_scene"
-    && (!task.targetPath || documentKind(task.targetPath) === "chapter");
+    && (!task.targetPath || isScenePipelineDocument(task.targetPath));
   const documentInstruction = task.documentProposalRequired
     ? chapterSceneDelivery
-      ? `必须用逐场景章节草稿完成并 propose_chapter_draft；禁止直接 propose_document/patch 或用最终回复代替正文。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+      ? `必须用逐场景正文草稿完成并 propose_chapter_draft；章节与 side/ 支线片段都禁止直接 propose_document/patch 或用最终回复代替正文。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
       : `必须提交文档提案或 change set 后结束；禁止用最终回复代替文件交付。单文档优先 patch；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接提案。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
     : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
   const contextInstruction: Record<DocumentContextMode, string> = {
@@ -382,14 +417,14 @@ export function normalizeDocumentProposalRequired(mode: WritingTaskMode, request
 }
 
 /**
- * Task planner (separate completion; tools off).
- * CACHE: Keep the system string free of project catalogs and request text so the
- * rules prefix can hit across turns. Put request + slim catalogs + short history
- * only in the user message. Do not re-merge catalogs into system when editing.
+ * Task planner (separate completion; tool calls forbidden by prompt, but the
+ * frozen tools schema stays present so planner and execution share one prefix).
+ * CACHE: stablePrefix must be the exact array later reused by execution. Keep
+ * project catalogs and request text in the final user message only.
  */
 async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
-  characterScope?: number[],
+  characterScope?: number[], stablePrefix: ApiMessage[] = [],
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
@@ -408,10 +443,10 @@ async function planWritingTask(
   const recent = history.slice(-3).map(item => item.role === "user"
     ? { content: item.content?.slice(0, 160) ?? "" }
     : { role: item.role, content: item.content?.slice(0, 120) ?? "" });
-  const planningMessages: ApiMessage[] = [{
+  const planningMessages: ApiMessage[] = [...stablePrefix, {
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
-    content: `写作任务规划器。只输出一个 JSON，无 Markdown。
+    content: `写作任务规划器。不得调用工具；只输出一个 JSON，无 Markdown。
 字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general)；creativeDepth(explore|shape|deliver)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。写文件完整度由 documentProposalRequired 决定。
 documentContext 判定（关键，勿默认 none）：
@@ -436,11 +471,20 @@ documentContext 判定（关键，勿默认 none）：
       recentHistory: recent,
     }),
   }];
-  const result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, false);
-  const firstBrace = result.content.indexOf("{");
-  const lastBrace = result.content.lastIndexOf("}");
-  if (firstBrace < 0 || lastBrace <= firstBrace) throw new Error("任务规划器没有返回有效 JSON");
-  const parsed = JSON.parse(result.content.slice(firstBrace, lastBrace + 1)) as Partial<WritingTask>;
+  // Keep the frozen TOOLS payload identical to execution. DeepSeek renders the
+  // tool schema before/with messages, so omitting it here prevents step 1 from
+  // reusing the prefix that the immediately preceding planner call just warmed.
+  let result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, true);
+  let parsed = parsePlannerJson(result.content);
+  if (!parsed) {
+    // Keeping TOOLS on the first call warms the execution prefix, but some models
+    // still choose a tool despite the planner rule and consequently return no
+    // content. Retry tool-free so a cache optimization cannot block the task.
+    const fallback = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, false);
+    parsed = parsePlannerJson(fallback.content);
+    result = { ...fallback, usage: addCompletionUsage(result.usage, fallback.usage) };
+  }
+  if (!parsed) throw new Error("任务规划器没有返回有效 JSON");
   const modes: WritingTaskMode[] = ["brainstorm", "outline", "write_scene", "rewrite", "audit", "character", "simple_character", "general"];
   const plannedMode = modes.includes(parsed.mode as WritingTaskMode) ? parsed.mode as WritingTaskMode : "general";
   const mode = normalizeCharacterTaskMode(request, plannedMode);
@@ -566,7 +610,7 @@ function extractSearchQueryHint(
 }
 
 function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolean): string[] {
-  if (mode === "write_scene") return ["核对本章必要事实与衔接", "建立本章场景链", "逐场写作并传递状态", "整章审阅并提交提案"];
+  if (mode === "write_scene") return ["核对本篇必要事实与衔接", "建立本篇场景链", "逐场写作并传递状态", "全文审阅并提交提案"];
   if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
   if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
   if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
@@ -655,12 +699,12 @@ export function taskInstructions(
   if (mode === "write_scene") return `工作流（内部执行，不输出分析过程）：
 1. 对齐「风格锚定」+ 动态声线证据；禁止通用腔。
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
-3. 单章任务只交付用户指定的一章：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
-4. 目标为 chapters/ 的完整章节时，先在内部用 1—3 句话确定“本章从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。场景数量遵循动态尾部的当前场景链参数，不为凑数拆场；每场必须有目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
+3. 单个正文任务只交付用户指定的章节或支线片段：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
+4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
 5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 SCENE_STYLE_DENSE，当场改正文后用同一 sceneId 重提一次（不计入“另写一场”）；同场第二次仍超标会带 styleDeferred 直接入稿，命中句留到整章 inspect 后用 revise_chapter_draft_style 一并修，禁止反复重写整场。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
 7. 全部场景完成后 inspect_chapter_draft 通读整章（其返回的 content 为组装后全文，通读以此为准）并先通过风格门禁与复用计量（CHAPTER_METRICS_BLOCKED 时按提示用 revise_chapter_draft_style 修复复读/回收句）；检查接缝、场景功能重复、转折类型、意象/参数/沉默/总结式章尾复用，以及章首到章尾的总变化。inspect 返回的 styleWarnings 挑影响最大的 1—3 条局部压降即可，不要为凑指标全文重写。故事结构或状态有问题才用新 notes 重写目标场；风格门禁问题把列出的全部命中句在一次 revise_chapter_draft_style 中精确替换（不改变 actualState、不废弃后续场景），其结果自带复检：styleRecheck=blocked 就继续 revise 修完 styleBlockers，passed 才重新 inspect 一次，然后提案；禁止为查看门禁结果反复 inspect。
-8. 完整章节最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链（例外：仅修正已有章节的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch，不必走流水线）；非 chapters/ 短场景才按常规提案。清单仍有后续章节时继续下一章并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
+8. 完整章节与 side/ 支线片段最终只用 propose_chapter_draft 一次性提交，禁止直接 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch，不必走流水线）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：read_document 传 path+quote 一步取回行号与上下文；禁止为找一句话通读全章或反复 search_project。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
@@ -992,7 +1036,14 @@ export async function runAgent(options: {
       .map((message) => ({ role: message.role, content: message.content, channel: message.channel })),
   );
   const previousTaskState = store.sessionContext(sessionId);
-  const planned = await planWritingTask(model, project, store, prompt, history, signal, characterScope);
+  // Build once and reuse byte-for-byte. Slot 4 deliberately ignores intensive
+  // and task mode; dynamic style evidence is assembled only after planning.
+  const stableSystemPrefix = buildStableSystemPrefix(
+    project, store, permissionMode, { intensive: false }, "general",
+  );
+  const planned = await planWritingTask(
+    model, project, store, prompt, history, signal, characterScope, stableSystemPrefix,
+  );
   const task = planned.task;
   // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
   if (permissionMode === "plan") task.documentProposalRequired = false;
@@ -1055,6 +1106,8 @@ export async function runAgent(options: {
     ?? model;
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    readSnapshots: new Map(),
+    readCharactersUsed: 0,
     simpleCharacterScope,
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
     // write_scene delivery must compile diegetic materials before proposing prose.
@@ -1075,7 +1128,7 @@ export async function runAgent(options: {
   // stable 6 + dynamic 9, then append-only tool loop. See buildStableSystemPrefix /
   // buildDynamicTurnMessages for slot maps when adding new prompt material.
   const messages: ApiMessage[] = [
-    ...buildStableSystemPrefix(project, store, permissionMode, styleOptions, task.mode),
+    ...stableSystemPrefix,
     ...buildDynamicTurnMessages({
       historyText,
       archiveContext,
@@ -1271,6 +1324,8 @@ export async function runAgent(options: {
           documentReadCalls = 0;
           projectSearchCalls = 0;
           toolCallCounts.clear();
+          toolContext.readSnapshots?.clear();
+          toolContext.readCharactersUsed = 0;
           documentProposalSubmitted = false;
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
@@ -1562,7 +1617,7 @@ function writingBootstrapContext(project: WriterProject, store: WriterStore, pro
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
 - 需要人设：对 characterIndex 中的 id 调用 get_character（可带 sections；场景状态需传 outlineNodeId）。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
-- 写正文前：${task.mode === "write_scene" && (!task.targetPath || documentKind(task.targetPath) === "chapter") ? "先 begin_chapter_draft 按当前场景链参数建立因果场景链；每场根据最新 actualState 整理故事内 notes，并在一次 write_chapter_scene 中提交 notes、正文与 actualState；整章 inspect 后一次性提案。" : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
+- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? "先 begin_chapter_draft 按当前场景链参数建立因果场景链；章节与 side/ 支线片段都要逐场充分展开，每场根据最新 actualState 整理故事内 notes，并在一次 write_chapter_scene 中提交 notes、正文与 actualState；全文 inspect 后一次性提案。" : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
 - 单章正文的主要结构是 scene chain；outline 只作可选方向提示，不得扩展成其他章节任务。
 ${JSON.stringify({
@@ -1578,10 +1633,122 @@ ${JSON.stringify({
 
 const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
 const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "read_document", "inspect_file", "read_file"]);
-const MAX_READS_PER_PATH_PER_RUN = 3;
+const DOCUMENT_BODY_READ_TOOLS = new Set(["read_document", "read_file"]);
+const MAX_READS_PER_PATH_PER_RUN = 2;
 const MAX_DOCUMENT_READS_PER_RUN = 5;
+const MAX_DOCUMENT_READ_CHARACTERS_PER_JOB = 9_000;
+const READ_ATOM_CACHE_VERSION = "v2";
 /** Structural / catalog tools must stay intact so the model does not re-list after compaction. */
 const NEVER_COMPACT_KEYS = new Set(["nodes", "matches", "issues"]);
+
+function readResultRanges(parsed: Record<string, unknown>): Array<{ startLine: number; endLine: number }> {
+  const ranges: Array<{ startLine: number; endLine: number }> = [];
+  const add = (start: unknown, end: unknown) => {
+    if (typeof start !== "number" || typeof end !== "number" || !Number.isInteger(start) || !Number.isInteger(end)) return;
+    if (start < 1 || end < start) return;
+    ranges.push({ startLine: start, endLine: end });
+  };
+  add(parsed.contextStartLine ?? parsed.startLine, parsed.contextEndLine ?? parsed.endLine);
+  if (Array.isArray(parsed.matches)) {
+    for (const match of parsed.matches) {
+      if (!match || typeof match !== "object" || Array.isArray(match)) continue;
+      const value = match as Record<string, unknown>;
+      add(value.contextStartLine ?? value.startLine, value.contextEndLine ?? value.endLine);
+    }
+  }
+  return ranges;
+}
+
+function readResultBodyCharacters(parsed: Record<string, unknown>): number {
+  let total = typeof parsed.content === "string" ? parsed.content.length : 0;
+  if (Array.isArray(parsed.matches)) {
+    for (const match of parsed.matches) {
+      if (!match || typeof match !== "object" || Array.isArray(match)) continue;
+      const context = (match as Record<string, unknown>).context;
+      if (typeof context === "string") total += context.length;
+    }
+  }
+  return total;
+}
+
+/**
+ * Admit one immutable read atom into the active job. A path cannot silently
+ * switch source hashes, and body ranges cannot overlap text already in context.
+ */
+export function admitReadAtom(
+  toolName: string,
+  path: string,
+  expectedSourceHash: string,
+  result: string,
+  context: ToolExecutionContext,
+): string {
+  if (!DOCUMENT_READ_TOOLS.has(toolName)) return result;
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(result) as Record<string, unknown>; }
+  catch { return result; }
+  if (typeof parsed.error === "string") return result;
+  const resultHash = typeof parsed.sourceHash === "string" ? parsed.sourceHash : expectedSourceHash;
+  if (resultHash !== expectedSourceHash) {
+    return JSON.stringify({
+      error: `${path} 在读取过程中发生变化；本次结果已丢弃，避免混合两个版本。请重新开始该文档的读取。`,
+      path,
+      expectedSourceHash,
+      actualSourceHash: resultHash,
+    });
+  }
+  context.readSnapshots ??= new Map();
+  const existing = context.readSnapshots.get(path);
+  if (existing && existing.sourceHash !== resultHash) {
+    return JSON.stringify({
+      error: `${path} 已锁定快照 ${existing.sourceHash}，当前版本为 ${resultHash}；本轮禁止混读，请在下一任务重新读取。`,
+      path,
+      sourceHash: resultHash,
+      lockedSourceHash: existing.sourceHash,
+    });
+  }
+  const snapshot = existing ?? { sourceHash: resultHash, ranges: [] };
+  context.readSnapshots.set(path, snapshot);
+  if (!DOCUMENT_BODY_READ_TOOLS.has(toolName)) return result;
+
+  const ranges = readResultRanges(parsed);
+  const covered = ranges.length > 0 && ranges.every(range => snapshot.ranges.some(previous =>
+    range.startLine >= previous.startLine && range.endLine <= previous.endLine));
+  if (covered) {
+    return JSON.stringify({
+      status: "read_atom_reused",
+      path,
+      sourceHash: resultHash,
+      ranges,
+      message: "该行范围已存在于本轮上下文，正文不再重复返回；请直接使用已有读取结果。",
+    });
+  }
+  const overlaps = ranges.some(range => snapshot.ranges.some(previous =>
+    range.startLine <= previous.endLine && range.endLine >= previous.startLine));
+  if (overlaps) {
+    return JSON.stringify({
+      error: `${path} 请求范围与本轮已读原子重叠；请只读取尚未覆盖的最小行范围。`,
+      path,
+      sourceHash: resultHash,
+      requestedRanges: ranges,
+      readRanges: snapshot.ranges,
+    });
+  }
+
+  const characters = readResultBodyCharacters(parsed);
+  const used = context.readCharactersUsed ?? 0;
+  if (used + characters > MAX_DOCUMENT_READ_CHARACTERS_PER_JOB) {
+    return JSON.stringify({
+      error: `本轮读取正文将超过 ${MAX_DOCUMENT_READ_CHARACTERS_PER_JOB} 字符预算；请使用已有原子、search_project 摘要或直接继续任务。`,
+      path,
+      sourceHash: resultHash,
+      usedCharacters: used,
+      rejectedCharacters: characters,
+    });
+  }
+  context.readCharactersUsed = used + characters;
+  snapshot.ranges.push(...ranges);
+  return result;
+}
 
 function withReuseMarker(content: string, message: string, artifactId?: number): string {
   try {
@@ -1631,6 +1798,18 @@ async function executeToolCached(
       ? project.hash(JSON.stringify(project.listTextFiles().map(file => [file, project.hash(project.readTextFile(file))])))
       : project.hash(JSON.stringify(project.listDocuments()));
 
+  if (DOCUMENT_READ_TOOLS.has(call.name) && sourcePath) {
+    const locked = context.readSnapshots?.get(sourcePath);
+    if (locked && locked.sourceHash !== sourceHash) {
+      return JSON.stringify({
+        error: `${sourcePath} 已锁定快照 ${locked.sourceHash}，当前版本为 ${sourceHash}；本轮禁止混读，请在下一任务重新读取。`,
+        path: sourcePath,
+        sourceHash,
+        lockedSourceHash: locked.sourceHash,
+      });
+    }
+  }
+
   // Throttle thrashing the same document with slightly different ranges.
   if (DOCUMENT_READ_TOOLS.has(call.name) && sourcePath) {
     const pathKey = `path-read:${sourcePath}:${sourceHash}`;
@@ -1666,7 +1845,10 @@ async function executeToolCached(
     }
   }
 
-  const cacheKey = `${call.name}:${JSON.stringify(normalized)}:${sourceHash}`;
+  // Old read artifacts may contain pre-boundary 6k/12k bodies. Version read
+  // atoms so those persisted rows can never bypass the current hard limits.
+  const cacheVersion = DOCUMENT_READ_TOOLS.has(call.name) ? `:${READ_ATOM_CACHE_VERSION}` : "";
+  const cacheKey = `${call.name}${cacheVersion}:${JSON.stringify(normalized)}:${sourceHash}`;
   const count = (counts.get(cacheKey) ?? 0) + 1;
   counts.set(cacheKey, count);
   const cached = store.contextArtifact(sessionId, cacheKey);
@@ -1678,13 +1860,26 @@ async function executeToolCached(
     });
   }
   if (cached) {
-    return withReuseMarker(cached.content,
+    if (DOCUMENT_READ_TOOLS.has(call.name) && count > 1) {
+      return JSON.stringify({
+        status: "read_atom_reused",
+        artifactId: cached.id,
+        path: cached.path ?? sourcePath,
+        sourceHash: cached.sourceHash,
+        digest: cached.digest,
+        message: "相同读取已存在于本轮上下文，正文不再重复返回。",
+      });
+    }
+    const restored = withReuseMarker(cached.content,
       count === 1
         ? "工作记忆中已有相同且未变化的工具结果；以下为完整内容，请直接使用，勿再次读取。"
         : "相同读取已执行过且文档未变；以下从工作记忆恢复完整结果，请直接使用，禁止再次调用。",
       cached.id);
+    return sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, restored, context) : restored;
   }
   const result = await executeTool(call, project, store, sessionId, emit, characterScope, context);
+  const admitted = sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, result, context) : result;
+  if (admitted !== result) return admitted;
   let digest = `${call.name} 已完成`;
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;

@@ -197,6 +197,67 @@ test("chapter scene pipeline assembles causal scenes without writing partial doc
   );
 });
 
+test("side prose uses a multi-scene pipeline with meaningful length targets", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-side-scene-pipeline-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "支线场景链");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("展开支线片段");
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      requireWritePack: true,
+      requireScenePipeline: true,
+      scenePipelineSettings: {
+        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, candidateCount: 1,
+      },
+    };
+    const call = (name: string, input: Record<string, unknown>) => executeTool(
+      { id: name, name, arguments: JSON.stringify(input) }, project, store!, sessionId, () => {}, undefined, context,
+    );
+    const makeScene = (index: number) => ({
+      id: `side-${index}`,
+      title: `支线场景 ${index}`,
+      goal: `推动支线变化 ${index}`,
+      obstacle: `形成直接阻力 ${index}`,
+      turn: `产生局面转折 ${index}`,
+      outcome: `留下实际结果 ${index}`,
+      handoff: index === 3 ? "" : `结果迫使人物进入场景 ${index + 1}`,
+      targetCharacters: 2_000,
+    });
+
+    const tooFew = JSON.parse(await call("begin_chapter_draft", {
+      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
+      scenes: [makeScene(1), makeScene(2)],
+    })) as Record<string, unknown>;
+    assert.match(String(tooFew.error), /至少需要 3 个/u);
+
+    const missingTarget = JSON.parse(await call("begin_chapter_draft", {
+      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
+      scenes: [makeScene(1), { ...makeScene(2), targetCharacters: undefined }, makeScene(3)],
+    })) as Record<string, unknown>;
+    assert.match(String(missingTarget.error), /targetCharacters/u);
+
+    const begun = JSON.parse(await call("begin_chapter_draft", {
+      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
+      scenes: [makeScene(1), makeScene(2), makeScene(3)],
+    })) as Record<string, unknown>;
+    assert.equal(begun.status, "started");
+    assert.equal(begun.sceneCount, 3);
+    assert.throws(() => writeChapterScene(
+      context.chapterSceneDraft!, "side-1", "她向城门走去。".repeat(30), actualState("她抵达城门"),
+    ), /明显低于目标 2000 字/u);
+
+    const bypass = JSON.parse(await call("propose_document", {
+      path: "side/arc-08.md", content: "试图绕过场景链。".repeat(30), summary: "支线片段",
+    })) as Record<string, unknown>;
+    assert.match(String(bypass.error), /不能跳过逐场景/u);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("revising an earlier scene invalidates dependent later scenes", () => {
   let draft = beginChapterSceneDraft({
     path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
@@ -521,7 +582,8 @@ test("read_document quote locates quoted prose in one call", async () => {
     );
     const located = JSON.parse(await call("read_document", {
       path, quote: "老人的体重数字出现在她脑子里。",
-    })) as { occurrences: number; matches: Array<{ startLine: number; endLine: number; context: string }> };
+    })) as { sourceHash: string; occurrences: number; matches: Array<{ startLine: number; endLine: number; context: string }> };
+    assert.equal(located.sourceHash.length, 64);
     assert.equal(located.occurrences, 1);
     assert.equal(located.matches[0].startLine, 5);
     assert.equal(located.matches[0].endLine, 5);
@@ -539,6 +601,35 @@ test("read_document quote locates quoted prose in one call", async () => {
     })) as { occurrences: number; hint?: string };
     assert.equal(missing.occurrences, 0);
     assert.match(String(missing.hint), /缩短|search_project/);
+
+    project.writeRaw(path, `${project.read(path)}\n新版本。\n`);
+    const stale = JSON.parse(await call("read_document", {
+      path, sourceHash: located.sourceHash, block: 1,
+    })) as { error?: string };
+    assert.match(String(stale.error), /快照已变化/);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("read_document bounds large sections to one snapshot atom", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-bounded-read-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "有界读取");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("有界读取");
+    const path = "lore/world.md";
+    project.writeRaw(path, `# 世界观\n\n${Array.from({ length: 120 }, (_, index) => `设定条目${index}：${"细节".repeat(30)}。`).join("\n")}`);
+    const result = JSON.parse(await executeTool(
+      { id: "bounded", name: "read_document", arguments: JSON.stringify({ path, section: "世界观" }) },
+      project, store, sessionId, () => {},
+    )) as { sourceHash: string; content: string; truncated: boolean; nextStartLine?: number };
+    assert.equal(result.sourceHash.length, 64);
+    assert.ok(result.content.length <= 4_000);
+    assert.equal(result.truncated, true);
+    assert.ok(result.nextStartLine);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

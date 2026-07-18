@@ -36,7 +36,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_document",
-      description: "查看行数、标题结构与首尾预览；长文档先调用",
+      description: "查看行数、3k 字符块、标题、首尾预览与 sourceHash；长文档先调用",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "相对路径" } },
@@ -49,17 +49,18 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "read_document",
-      description: "按节/块/行范围截取；有行号时读最小范围；长文先 inspect。改既有句段时传 quote 一步定位",
+      description: "按节/3k 字符块/行范围读取一个有界快照；单次正文最多 4k 字符。长文先 inspect，后续传 sourceHash 防止混读版本",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "相对路径" },
+          sourceHash: { type: "string", description: "可选；inspect 返回的快照哈希，文档变化时拒绝读取" },
           quote: { type: "string", description: "原文引用片段；返回行号与上下文，勿再通读或反复 search" },
           block: { type: "number", description: "块号，从 1 起" },
           section: { type: "string", description: "Markdown 标题文本（不含 #）" },
           lastSection: { type: "boolean", description: "读最后一节；续写优先" },
           startLine: { type: "number", description: "起始行，与 endLine 同用" },
-          endLine: { type: "number", description: "结束行；最多 200 行/12000 字" },
+          endLine: { type: "number", description: "结束行；最多 120 行/4000 字符" },
         },
         required: ["path"],
         additionalProperties: false,
@@ -110,7 +111,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_file",
-      description: "查看 resource/ 内纯文本文件的行数、块结构、首尾预览与 sourceHash",
+      description: "查看 resource/ 内纯文本文件的行数、3k 字符块、首尾预览与 sourceHash",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "resource/ 内相对路径" } },
@@ -122,15 +123,16 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "read_file",
-      description: "按引用、块或行范围读取 resource/ 内 UTF-8 纯文本文件",
+      description: "按引用、3k 字符块或行范围读取一个 UTF-8 文件快照；单次正文最多 4k 字符",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "resource/ 内相对路径" },
+          sourceHash: { type: "string", description: "可选；inspect 返回的快照哈希，文件变化时拒绝读取" },
           quote: { type: "string", description: "精确原文定位" },
           block: { type: "number", description: "块号，从 1 起" },
           startLine: { type: "number", description: "起始行，与 endLine 同用" },
-          endLine: { type: "number", description: "结束行，最多 200 行/12000 字符" },
+          endLine: { type: "number", description: "结束行，最多 120 行/4000 字符" },
         },
         required: ["path"], additionalProperties: false,
       },
@@ -271,21 +273,21 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "begin_chapter_draft",
-      description: "建立整章场景链与内存草稿；不写项目文件",
+      description: "为章节或支线片段建立场景链与内存草稿；不写项目文件",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "chapters/ 下目标路径" },
+          path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
           mode: { type: "string", enum: ["create", "replace", "append"] },
-          heading: { type: "string", description: "create/replace 时的章节标题（不含 #）" },
-          chapterGoal: { type: "string", description: "整章结束后真正改变什么" },
+          heading: { type: "string", description: "create/replace 时的正文标题（不含 #）" },
+          chapterGoal: { type: "string", description: "全文结束后真正改变什么" },
           scenes: {
             type: "array", minItems: 1, maxItems: 8,
             description: "有因果承接的场景链；数量遵循当前场景链设置，不为凑数拆场",
             items: {
               type: "object",
               properties: {
-                id: { type: "string", description: "本章内唯一短 id" },
+                id: { type: "string", description: "本文内唯一短 id" },
                 title: { type: "string", description: "内部场景名，不写入正文" },
                 goal: { type: "string", description: "本场要完成的变化" },
                 entryState: { type: "array", items: { type: "string" }, description: "入场局面" },
@@ -295,7 +297,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "本场直接结果" },
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "预计字数 200—8000" },
+                targetCharacters: { type: "number", description: "预计字数 200—8000；side/ 支线必填且至少 2000，正文低于目标 70% 会退回" },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -320,7 +322,7 @@ export const TOOLS = deepFreeze([
             type: "string",
             description: "要点式故事内短笔记（上限 1500 字）：仅本场目标、人物当下、事件顺序、已知事实、须自然落地与勿擅自补写项，不写成段落长文",
           },
-          content: { type: "string", description: "仅本场正文，不含任何 markdown 标题（章节标题与 ## 场景小标题由组装自动生成）" },
+          content: { type: "string", description: "仅本场正文，不含任何 markdown 标题（正文标题与 ## 场景小标题由组装自动生成）" },
           actualState: {
             type: "object",
             description: "从实际正文归纳的离场状态；不可照抄计划",
@@ -345,13 +347,13 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "revise_chapter_draft_style",
-      description: "对已完成的内存章节草稿做精确局部风格替换；保留离场状态和所有后续场景，风格门禁退回时优先使用",
+      description: "对已完成的内存正文草稿做精确局部风格替换；保留离场状态和所有后续场景，风格门禁退回时优先使用",
       parameters: {
         type: "object",
         properties: {
           edits: {
             type: "array", minItems: 1, maxItems: 20,
-            description: "只替换风格门禁明确命中的句段；每个 search 在整章草稿中必须唯一",
+            description: "只替换风格门禁明确命中的句段；每个 search 在全文草稿中必须唯一",
             items: {
               type: "object",
               properties: {
@@ -372,7 +374,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "inspect_chapter_draft",
-      description: "检查内存整章的结构与风格门禁；风格未通过时先用 revise_chapter_draft_style，最终提案前必调",
+      description: "检查内存全文的结构与风格门禁；风格未通过时先用 revise_chapter_draft_style，最终提案前必调",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -380,12 +382,12 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "propose_chapter_draft",
-      description: "提交已逐场完成并整章审阅的章节；只在最后一次写场后 inspect 过才可用",
+      description: "提交已逐场完成并全文审阅的章节或支线片段；只在最后一次写场后 inspect 过才可用",
       parameters: {
         type: "object",
         properties: {
           summary: { type: "string", description: "修改摘要" },
-          chapterChange: { type: "string", description: "一句话说明章首到章尾的总变化" },
+          chapterChange: { type: "string", description: "一句话说明全文开头到结尾的总变化" },
           reviewNotes: { type: "string", description: "接缝、重复功能与转折多样性审阅结论" },
           characterChanges: {
             type: "array", maxItems: 8,

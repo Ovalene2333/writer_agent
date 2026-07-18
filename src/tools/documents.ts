@@ -5,6 +5,39 @@ import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_p
 import type { ToolHandlerArgs } from "./types.js";
 import { documentMap, optionalPositiveInteger, requireString } from "./helpers.js";
 
+const READ_BLOCK_TARGET_CHARACTERS = 3_000;
+const MAX_READ_CHARACTERS = 4_000;
+
+function assertExpectedSourceHash(input: Record<string, unknown>, sourceHash: string): void {
+  if (input.sourceHash === undefined) return;
+  if (typeof input.sourceHash !== "string" || !input.sourceHash.trim()) {
+    throw new Error("sourceHash 必须是 inspect_document 返回的非空字符串");
+  }
+  if (input.sourceHash.trim() !== sourceHash) {
+    throw new Error(`文档快照已变化；期望 ${input.sourceHash.trim()}，当前 ${sourceHash}。请重新 inspect 后按新快照读取`);
+  }
+}
+
+function newlineCount(value: string): number {
+  return value.match(/\n/g)?.length ?? 0;
+}
+
+function boundedText(value: string, fromEnd = false): { content: string; truncated: boolean } {
+  if (value.length <= MAX_READ_CHARACTERS) return { content: value, truncated: false };
+  if (fromEnd) {
+    const rawStart = value.length - MAX_READ_CHARACTERS;
+    const lineStart = value.indexOf("\n", rawStart);
+    const start = lineStart >= 0 && lineStart - rawStart < MAX_READ_CHARACTERS / 2 ? lineStart + 1 : rawStart;
+    return { content: value.slice(start), truncated: true };
+  }
+  const lineEnd = value.lastIndexOf("\n", MAX_READ_CHARACTERS);
+  const end = lineEnd >= MAX_READ_CHARACTERS / 2 ? lineEnd : MAX_READ_CHARACTERS;
+  return {
+    content: value.slice(0, end),
+    truncated: true,
+  };
+}
+
 export function handleListDocuments({ project }: ToolHandlerArgs): string {
   return JSON.stringify(documentMap(project));
 }
@@ -46,11 +79,14 @@ export function handleInspectDocument({ input, project }: ToolHandlerArgs): stri
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const content = project.read(path);
+  const sourceHash = project.hash(content);
+  assertExpectedSourceHash(input, sourceHash);
   const lines = content.split(/\r?\n/);
-  const blocks = documentBlocks(content);
+  const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   const headings = lines.flatMap((line, index) => /^#{1,6}\s+/.test(line) ? [{ line: index + 1, text: line }] : []).slice(0, 120);
   return JSON.stringify({
     path,
+    sourceHash,
     lineCount: lines.length,
     characterCount: content.length,
     blockCount: blocks.length,
@@ -117,6 +153,7 @@ function readDocumentByQuote(path: string, content: string, quote: string): stri
         startLine: match.startLine,
         endLine: match.endLine,
         contextStartLine: contextStart,
+        contextEndLine: contextEnd,
         context: lines.slice(contextStart - 1, contextEnd).join("\n").slice(0, 1_500),
       };
     }),
@@ -127,8 +164,11 @@ export function handleReadDocument({ input, project }: ToolHandlerArgs): string 
   const path = requireString(input.path, "path");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const content = project.read(path);
+  const sourceHash = project.hash(content);
+  assertExpectedSourceHash(input, sourceHash);
   if (typeof input.quote === "string" && input.quote.trim()) {
-    return readDocumentByQuote(path, content, input.quote);
+    const located = JSON.parse(readDocumentByQuote(path, content, input.quote)) as Record<string, unknown>;
+    return JSON.stringify({ ...located, sourceHash });
   }
   const requestedStart = optionalPositiveInteger(input.startLine, "startLine");
   const requestedEnd = optionalPositiveInteger(input.endLine, "endLine");
@@ -137,11 +177,11 @@ export function handleReadDocument({ input, project }: ToolHandlerArgs): string 
     const lines = content.split(/\r?\n/);
     if (requestedStart > requestedEnd) throw new Error("startLine 不能大于 endLine");
     if (requestedStart > lines.length) throw new Error(`startLine 超出范围；文档共 ${lines.length} 行`);
-    if (requestedEnd - requestedStart + 1 > 200) throw new Error("单次最多读取 200 行");
+    if (requestedEnd - requestedStart + 1 > 120) throw new Error("单次最多读取 120 行");
     const actualEnd = Math.min(requestedEnd, lines.length);
     const selected = lines.slice(requestedStart - 1, actualEnd).join("\n");
-    if (selected.length > 12_000) throw new Error("行范围超过 12000 字符，请缩小读取范围");
-    return JSON.stringify({ path, startLine: requestedStart, endLine: actualEnd, lineCount: lines.length,
+    if (selected.length > MAX_READ_CHARACTERS) throw new Error(`行范围超过 ${MAX_READ_CHARACTERS} 字符，请缩小读取范围`);
+    return JSON.stringify({ path, sourceHash, startLine: requestedStart, endLine: actualEnd, lineCount: lines.length,
       characters: selected.length, content: selected });
   }
   const sections = documentSections(content);
@@ -154,34 +194,51 @@ export function handleReadDocument({ input, project }: ToolHandlerArgs): string 
     if (!matches.length) throw new Error(`未找到标题“${requestedSection}”；请先用 inspect_document 查看标题结构`);
     if (matches.length > 1) throw new Error(`标题“${requestedSection}”出现多次，请改用唯一标题或 block 读取`);
     const selected = matches[0];
+    const fromEnd = input.lastSection === true;
+    const bounded = boundedText(selected.content, fromEnd);
+    const returnedStartLine = fromEnd && bounded.truncated
+      ? Math.max(selected.startLine, selected.endLine - newlineCount(bounded.content))
+      : selected.startLine;
+    const returnedEndLine = fromEnd
+      ? selected.endLine
+      : Math.min(selected.endLine, selected.startLine + newlineCount(bounded.content));
     return JSON.stringify({
       path,
+      sourceHash,
       section: selected.section,
       sectionCount: sections.length,
       heading: selected.heading,
       level: selected.level,
-      startLine: selected.startLine,
-      endLine: selected.endLine,
-      characters: selected.characters,
+      sectionStartLine: selected.startLine,
+      sectionEndLine: selected.endLine,
+      startLine: returnedStartLine,
+      endLine: returnedEndLine,
+      characters: bounded.content.length,
+      truncated: bounded.truncated,
+      ...(bounded.truncated && fromEnd ? { previousEndLine: Math.max(selected.startLine, returnedStartLine - 1) } : {}),
+      ...(bounded.truncated && !fromEnd ? { nextStartLine: Math.min(selected.endLine, returnedEndLine + 1) } : {}),
       hasPrevious: selected.section > 1,
       hasNext: selected.section < sections.length,
-      content: selected.content,
+      content: bounded.content,
     });
   }
-  const blocks = documentBlocks(content);
+  const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   const requestedBlock = optionalPositiveInteger(input.block, "block") ?? 1;
   if (requestedBlock > blocks.length) throw new Error(`block 超出范围；文档共 ${blocks.length} 块`);
   const selected = blocks[requestedBlock - 1];
+  const bounded = boundedText(selected.content);
   return JSON.stringify({
     path,
+    sourceHash,
     block: selected.block,
     blockCount: blocks.length,
     startLine: selected.startLine,
-    endLine: selected.endLine,
-    characters: selected.characters,
+    endLine: Math.min(selected.endLine, selected.startLine + newlineCount(bounded.content)),
+    characters: bounded.content.length,
+    truncated: bounded.truncated,
     hasPrevious: selected.block > 1,
     hasNext: selected.block < blocks.length,
-    content: selected.content,
+    content: bounded.content,
   });
 }
 
@@ -196,7 +253,18 @@ export function handleSearchProject({ input, project, store }: ToolHandlerArgs):
   const contextLines = typeof input.contextLines === "number" && Number.isFinite(input.contextLines)
     ? Math.max(0, Math.min(12, Math.round(input.contextLines))) : 2;
   const pathPrefix = typeof input.pathPrefix === "string" ? input.pathPrefix : undefined;
-  return JSON.stringify({ query: requireString(input.query, "query"), scope, mode,
-    matches: store.search(requireString(input.query, "query"), limit, { scope, mode, contextLines, pathPrefix })
-      .filter(item => !project.isDocumentHidden(item.path)) });
+  const query = requireString(input.query, "query");
+  const found = store.search(query, limit, { scope, mode, contextLines, pathPrefix })
+    .filter(item => !project.isDocumentHidden(item.path));
+  // Search is a locator, not a bulk reader. Keep the complete result atom under
+  // a fixed excerpt budget even when the caller asks for many wide contexts.
+  let excerptBudget = 6_000;
+  const matches: typeof found = [];
+  for (const item of found) {
+    if (excerptBudget <= 0) break;
+    const excerpt = item.excerpt.slice(0, Math.min(1_500, excerptBudget));
+    matches.push({ ...item, excerpt });
+    excerptBudget -= excerpt.length;
+  }
+  return JSON.stringify({ query, scope, mode, matches, truncated: matches.length < found.length || matches.some((item, index) => item.excerpt.length < found[index].excerpt.length) });
 }

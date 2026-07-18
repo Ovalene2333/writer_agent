@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { CheckCircle2, LoaderCircle, Plus, Radar, X, XCircle } from "lucide-react";
 
 export type Pricing = {
   cacheHit: number;
@@ -42,33 +43,15 @@ type TestStatus = "idle" | "testing" | "ok" | "fail";
 
 function TestStatusIcon({ status }: { status: TestStatus }) {
   if (status === "testing") {
-    return <svg className="test-icon test-icon-spin" viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2" opacity=".2"/>
-      <path d="M21 12a9 9 0 0 0-9-9" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round"/>
-    </svg>;
+    return <LoaderCircle className="test-icon test-icon-spin" aria-hidden="true" />;
   }
   if (status === "ok") {
-    return <svg className="test-icon test-icon-ok" viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="12" cy="12" r="9.25" fill="currentColor" opacity=".14"/>
-      <circle cx="12" cy="12" r="9.25" fill="none" stroke="currentColor" strokeWidth="1.9"/>
-      <path d="M7.2 12.4l3.1 3.1 6.5-6.8" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>;
+    return <CheckCircle2 className="test-icon test-icon-ok" aria-hidden="true" />;
   }
   if (status === "fail") {
-    return <svg className="test-icon test-icon-fail" viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="12" cy="12" r="9.25" fill="currentColor" opacity=".12"/>
-      <circle cx="12" cy="12" r="9.25" fill="none" stroke="currentColor" strokeWidth="1.9"/>
-      <path d="M8.5 8.5l7 7M15.5 8.5l-7 7" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"/>
-    </svg>;
+    return <XCircle className="test-icon test-icon-fail" aria-hidden="true" />;
   }
-  // idle: radar scan — fills the button, reads as “probe”
-  return <svg className="test-icon test-icon-idle" viewBox="0 0 24 24" aria-hidden="true">
-    <circle cx="12" cy="12" r="9.25" fill="none" stroke="currentColor" strokeWidth="1.7" opacity=".28"/>
-    <circle cx="12" cy="12" r="5.6" fill="none" stroke="currentColor" strokeWidth="1.7" opacity=".5"/>
-    <path d="M12 12 L18.2 7.4" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round"/>
-    <path d="M12 12 A6.8 6.8 0 0 1 17.7 9.1" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" opacity=".85"/>
-    <circle cx="12" cy="12" r="2.15" fill="currentColor"/>
-  </svg>;
+  return <Radar className="test-icon test-icon-idle" aria-hidden="true" />;
 }
 
 type ModelConfigProps = {
@@ -194,9 +177,9 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
     }
   }
 
-  return <div className="model-config-backdrop">
+  return <div className="model-config-backdrop management-page">
     <section className="model-config-view">
-      <div className="management-head"><div><span className="eyebrow">Settings</span><h2>设置</h2><p>统一管理模型分工与章节场景链策略。</p></div><div className="management-actions">{tab === "models" && <button onClick={() => setEditing(emptyProfile())}>+ 添加供应商</button>}<button className="primary" onClick={onClose}>完成</button></div></div>
+      <div className="management-head"><div><span className="eyebrow">Settings</span><h2>模型配置</h2></div><div className="management-actions">{tab === "models" && <button onClick={() => setEditing(emptyProfile())}><Plus size={15} />添加供应商</button>}<button className="icon" title="返回工作区" aria-label="返回工作区" onClick={onClose}><X size={17} /></button></div></div>
       <nav className="settings-tabs" aria-label="设置分类">
         <button className={tab === "models" ? "active" : ""} onClick={() => { setTab("models"); setError(""); setMessage(""); }}>模型</button>
         <button className={tab === "scene-pipeline" ? "active" : ""} onClick={() => { setTab("scene-pipeline"); setError(""); setMessage(""); }}>场景链</button>
@@ -259,12 +242,12 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
       </div>}
       {tab === "scene-pipeline" && <div className="scene-settings">
         <div className="scene-settings-copy">
-          <span className="eyebrow">Chapter pipeline</span>
-          <h3>章节场景链</h3>
-          <p>推荐范围会写入每轮动态任务提示；允许最多场数由工具强制校验。场景越多，模型调用和累计 input 通常越高。</p>
+          <span className="eyebrow">Narrative pipeline</span>
+          <h3>章节与支线场景链</h3>
+          <p>完整章节和 side/ 支线片段都会逐场写作。支线至少使用推荐最少场数，且每场会校验目标篇幅；场景越多，模型调用和累计 input 通常越高。</p>
         </div>
         <div className="scene-settings-grid">
-          <label><span>推荐最少场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><small>短章或单一冲突可以低于此值。</small></label>
+          <label><span>推荐最少场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><small>支线片段会把它作为最低场数；完整章节仍按情节弹性取值。</small></label>
           <label><span>推荐最多场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/><small>模型默认在推荐区间内规划。</small></label>
           <label><span>允许最多场数</span><input type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>硬上限为 8；超过时 begin_chapter_draft 会拒绝。</small></label>
         </div>
@@ -273,9 +256,9 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
       </div>}
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>
-      <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" onClick={() => setEditing(null)}>×</button></div>
+      <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" title="关闭" aria-label="关闭" onClick={() => setEditing(null)}><X size={17} /></button></div>
       <div className="character-form-grid"><label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label><span>协议类型</span><select value={editing.provider} onChange={e => setEditing({ ...editing, provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容</option><option value="deepseek">DeepSeek</option></select></label><label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => setEditing({ ...editing, baseUrl: e.target.value })}/></label><label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => setEditing({ ...editing, apiKey: e.target.value })}/></label></div>
-      <div className="model-list-head"><h3>模型</h3><button onClick={() => setEditing({ ...editing, models: [...editing.models, newModel()] })}>+ 添加模型</button></div>
+      <div className="model-list-head"><h3>模型</h3><button onClick={() => setEditing({ ...editing, models: [...editing.models, newModel()] })}><Plus size={15} />添加模型</button></div>
       <div className="model-edit-list">{editing.models.map((model, index) => {
         const peak = model.pricing.peakBilling;
         const ratePrefix = peak ? "平时 · " : "";

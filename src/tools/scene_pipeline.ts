@@ -1,4 +1,4 @@
-import { documentKind, orderedChapterPaths, type WriterProject } from "../project.js";
+import { documentKind, isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
@@ -37,7 +37,7 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
   assertWritableMode(context.permissionMode, "begin_chapter_draft");
   if (context.chapterSceneDraft) throw new Error("已有章节场景草稿正在进行；请完成提案后再开始下一章");
   const path = requireString(input.path, "path");
-  if (documentKind(path) !== "chapter") throw new Error("逐场景章节草稿只能写入 chapters/");
+  if (!isScenePipelineDocument(path)) throw new Error("逐场景正文草稿只能写入 chapters/ 或 side/");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const mode = requireString(input.mode, "mode") as ChapterDraftMode;
   if (!(["create", "replace", "append"] as string[]).includes(mode)) throw new Error("mode 只能是 create/replace/append");
@@ -45,6 +45,23 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
   if (mode === "create" && exists) throw new Error("create 模式目标已存在；全文重写用 replace，续写用 append");
   if (mode !== "create" && !exists) throw new Error(`${mode} 模式目标文档不存在`);
   const baseContent = exists ? project.read(path) : "";
+  const scenes = Array.isArray(input.scenes) ? input.scenes : [];
+  if (documentKind(path) === "side") {
+    const settings = context.scenePipelineSettings;
+    const maxScenes = settings?.maxScenes ?? 5;
+    const minimumScenes = Math.min(maxScenes, Math.max(2, settings?.preferredMinScenes ?? 3));
+    if (scenes.length < minimumScenes) {
+      throw new Error(`side/ 支线片段至少需要 ${minimumScenes} 个因果承接场景；请按场景链设置充分展开，而不是压缩成单场`);
+    }
+    for (const [index, scene] of scenes.entries()) {
+      const target = scene && typeof scene === "object" && !Array.isArray(scene)
+        ? Number((scene as Record<string, unknown>).targetCharacters)
+        : NaN;
+      if (!Number.isInteger(target) || target < 2_000) {
+        throw new Error(`side/ 支线片段 scenes[${index}].targetCharacters 必须至少为 2000，以避免场景过短`);
+      }
+    }
+  }
   const draft = beginChapterSceneDraft({
     path,
     mode,
@@ -52,7 +69,7 @@ export function handleBeginChapterDraft({ input, project, context }: ToolHandler
     chapterGoal: requireString(input.chapterGoal, "chapterGoal"),
     baseContent,
     baseHash: project.hash(baseContent),
-    scenes: Array.isArray(input.scenes) ? input.scenes : [],
+    scenes,
     maxScenes: context.scenePipelineSettings?.maxScenes,
   });
   context.chapterSceneDraft = draft;

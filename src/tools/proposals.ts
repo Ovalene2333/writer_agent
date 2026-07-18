@@ -1,6 +1,6 @@
 import type { AgentEvent, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
 import { characterChangeOpsHint, isCharacterChangeOp, normalizeCharacterChangeOp } from "../characters.js";
-import { documentKind } from "../project.js";
+import { isScenePipelineDocument } from "../project.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
 import { findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
@@ -31,10 +31,10 @@ function patchReplaceCharacters(edits: unknown[]): number {
 }
 
 function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], path: string, toolName: string): void {
-  if (!context.requireScenePipeline || documentKind(path) !== "chapter") return;
+  if (!context.requireScenePipeline || !isScenePipelineDocument(path)) return;
   throw new Error(
-    `${toolName} 不能跳过逐场景章节流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
-    `再 inspect_chapter_draft 与 propose_chapter_draft。已有章节的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
+    `${toolName} 不能跳过逐场景正文流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
+    `再 inspect_chapter_draft 与 propose_chapter_draft。已有正文的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
     "可直接用 propose_document_patch，不受此限。",
   );
 }
