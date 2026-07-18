@@ -7,6 +7,8 @@ import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
+import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
+import type { DocumentRevisionInput } from "../document_revision.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -23,6 +25,10 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Planner-classified rewrite scope; point edits enforce a narrow read lock. */
+  editScope?: "point" | "section" | "document";
+  /** Set after an exact quote/anchor read so point edits cannot drift into bulk reads. */
+  editTargetLocked?: { path: string; sourceHash: string; anchorIds: string[] };
   /** Records provider usage from model calls made inside tool handlers. */
   modelUsageReporter?: ModelUsageReporter;
   /**
@@ -108,6 +114,27 @@ export type ToolExecutionContext = {
       input: { issues: ChapterStyleRepairIssue[]; chapterGoal: string; styleEvidence?: string },
       signal?: AbortSignal,
     ) => Promise<{ edits: ChapterStyleEdit[]; usage?: import("../types.js").ModelTokenUsage; requestCharacters: number }>;
+  };
+  /** Cheap isolated semantic reranker for prose anchors. */
+  documentLocator?: {
+    model: ModelConfig;
+    signal?: AbortSignal;
+    run?: (
+      model: ModelConfig,
+      input: { intent: string; candidates: DocumentLocatorCandidate[] },
+      signal?: AbortSignal,
+    ) => Promise<{ matches: DocumentLocatorMatch[]; usage?: import("../types.js").ModelTokenUsage; requestCharacters: number }>;
+  };
+  /** Isolated block rewriter used when a request truly targets the whole document. */
+  documentRevisioner?: {
+    model: ModelConfig;
+    fallbackModel?: ModelConfig;
+    signal?: AbortSignal;
+    run?: (
+      model: ModelConfig,
+      input: DocumentRevisionInput,
+      signal?: AbortSignal,
+    ) => Promise<{ content: string; usage?: import("../types.js").ModelTokenUsage; requestCharacters: number }>;
   };
   /**
    * Experimental best-of-N scene prose sampling (scenePipeline.candidateCount > 1):

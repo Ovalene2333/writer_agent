@@ -39,12 +39,15 @@ import type { ToolExecutionContext } from "./tools/types.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
 import { parseChapterStyleRepair } from "./chapter_style_repair.js";
+import { documentSpans } from "./document_spans.js";
+import { parseDocumentLocatorResult } from "./document_locator.js";
+import { parseDocumentRevision } from "./document_revision.js";
 
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "d70428a4899205cc");
+  assert.equal(agentToolSchemaHash(), "a77addf7ec2e2cf5");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -91,6 +94,23 @@ test("isolated style repair only admits exact issue sentences", () => {
     search: issues[0].sentence,
     replace: "风从门缝钻进来，贴着她的手背往袖口里走。",
   }]);
+});
+
+test("document spans are snapshot-scoped and locator outputs stay within candidates", () => {
+  const content = "# 第一章\n\n门禁灯由绿变红。\n\n她没有停下。";
+  const first = documentSpans(content, "hash-a");
+  const second = documentSpans(content, "hash-b");
+  assert.equal(first.length, 3);
+  assert.notEqual(first[1].anchorId, second[1].anchorId);
+  assert.deepEqual(first[1].headingPath, ["第一章"]);
+  const candidates = first.map(span => ({
+    anchorId: span.anchorId, headingPath: span.headingPath, startLine: span.startLine, endLine: span.endLine, preview: span.content,
+  }));
+  assert.deepEqual(parseDocumentLocatorResult(JSON.stringify({ matches: [
+    { anchorId: first[2].anchorId, confidence: 0.9, reason: "首次越界" },
+    { anchorId: "invented", confidence: 1, reason: "不存在" },
+  ] }), candidates), [{ anchorId: first[2].anchorId, confidence: 0.9, reason: "首次越界" }]);
+  assert.equal(parseDocumentRevision(JSON.stringify({ content: content.replace("没有", "仍未") }), content).includes("仍未"), true);
 });
 
 test("request waterfall and oversized tool paging stay bounded", () => {

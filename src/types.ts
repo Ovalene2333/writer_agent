@@ -309,7 +309,8 @@ export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancell
 
 export interface AgentCheckpoint {
   version: 1;
-  stage: "task_started" | "draft_started" | "scene_written" | "style_repaired" | "review_blocked" | "review_passed" | "proposal_submitted";
+  stage: "task_started" | "draft_started" | "scene_written" | "style_repaired" | "review_blocked" | "review_passed" |
+    "document_revision_started" | "proposal_submitted";
   path?: string;
   sourceHash?: string;
   draftVersion?: number;

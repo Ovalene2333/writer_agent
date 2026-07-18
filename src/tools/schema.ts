@@ -48,6 +48,24 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "locate_document_span",
+      description: "用精确引用、标题或隔离语义定位器返回段落锚点；模糊修改先定位再按锚点读",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "目标文档路径" },
+          sourceHash: { type: "string", description: "可选快照哈希" },
+          quote: { type: "string", description: "精确原文；优先" },
+          heading: { type: "string", description: "Markdown 标题文本" },
+          query: { type: "string", description: "无法给出原文时的语义定位意图" },
+        },
+        required: ["path"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_document",
       description: "按节/3k 字符块/行范围读取一个有界快照；单次正文最多 4k 字符。长文先 inspect，后续传 sourceHash 防止混读版本",
       parameters: {
@@ -64,6 +82,27 @@ export const TOOLS = deepFreeze([
         },
         required: ["path"],
         additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_document_span",
+      description: "按快照锚点读取目标段及最多三个邻段；默认上限1800字符，写入使用anchorId+spanHash",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "目标文档路径" },
+          sourceHash: { type: "string", description: "locate/inspect 返回的快照哈希" },
+          anchorId: { type: "string", description: "单一目标锚点" },
+          startAnchorId: { type: "string", description: "范围起点；与 anchorId 二选一" },
+          endAnchorId: { type: "string", description: "范围终点" },
+          beforeParagraphs: { type: "number", description: "前置邻段 0–3" },
+          afterParagraphs: { type: "number", description: "后置邻段 0–3" },
+          maxCharacters: { type: "number", description: "返回上限 500–4000，默认1800" },
+        },
+        required: ["path", "sourceHash"], additionalProperties: false,
       },
     },
   },
@@ -458,11 +497,12 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "propose_document_patch",
-      description: "精确 search/replace 局部提案；每段 search 须唯一。续写用末段作 search",
+      description: "局部提案；优先使用sourceHash+anchorId+spanHash，兼容唯一search/replace",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "文档路径" },
+          sourceHash: { type: "string", description: "锚点 patch 必填；文档变化时拒绝" },
           edits: {
             type: "array",
             minItems: 1,
@@ -470,10 +510,13 @@ export const TOOLS = deepFreeze([
             items: {
               type: "object",
               properties: {
-                search: { type: "string", description: "唯一原文" },
-                replace: { type: "string", description: "替换文本；空=删除" },
+                search: { type: "string", description: "兼容模式：唯一原文" },
+                replace: { type: "string", description: "兼容模式替换文本；空=删除" },
+                anchorId: { type: "string", description: "推荐：read_document_span 返回的目标锚点" },
+                spanHash: { type: "string", description: "推荐：目标段内容哈希" },
+                operation: { type: "string", enum: ["replace", "delete", "insert_before", "insert_after"], description: "锚点操作，默认replace" },
+                content: { type: "string", description: "锚点模式的新文本；delete可省略" },
               },
-              required: ["search", "replace"],
               additionalProperties: false,
             },
           },
@@ -493,6 +536,34 @@ export const TOOLS = deepFreeze([
         },
         required: ["path", "edits", "summary"],
         additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "revise_document_isolated",
+      description: "仅通篇修改：服务端逐块隔离改写并组装完整提案，原文不进入主Agent循环",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "目标文档路径" },
+          sourceHash: { type: "string", description: "inspect_document 返回的快照哈希" },
+          instruction: { type: "string", description: "适用于全文的明确修改要求" },
+          summary: { type: "string", description: "提案摘要" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["path", "sourceHash", "instruction", "summary"], additionalProperties: false,
       },
     },
   },
@@ -782,7 +853,7 @@ export const TOOLS = deepFreeze([
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
 const META_TOOLS = ["inspect_conversation", "read_conversation", "read_context_artifact", "ask_user", "manage_todos", "load_skill"] as const;
-const DOCUMENT_READ_TOOLS = ["list_documents", "inspect_document", "read_document", "search_project"] as const;
+const DOCUMENT_READ_TOOLS = ["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project"] as const;
 const FILE_READ_TOOLS = ["list_files", "inspect_file", "read_file", "search_files"] as const;
 const CHARACTER_READ_TOOLS = ["list_characters", "get_character", "list_simple_characters", "get_simple_character"] as const;
 
@@ -806,7 +877,7 @@ const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
   rewrite: [
     ...DOCUMENT_READ_TOOLS, "audit_prose_style",
     ...CHARACTER_READ_TOOLS, "apply_character_changes",
-    "propose_document", "propose_document_patch", "propose_change_set",
+    "propose_document", "propose_document_patch", "revise_document_isolated", "propose_change_set",
     ...META_TOOLS,
   ],
   audit: [
@@ -835,6 +906,7 @@ const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
 
 const WRITE_TOOLS = new Set([
   "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
+  "revise_document_isolated",
   "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
 ]);

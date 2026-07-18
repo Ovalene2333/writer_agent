@@ -26,6 +26,7 @@ import type { ToolExecutionContext } from "./tools/types.js";
 import { sceneProseScore } from "./prose_metrics.js";
 import { SCENE_CANDIDATE_SKIP_SCORE } from "./scene_candidates.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
+import { documentSpans } from "./document_spans.js";
 
 test("sanitizeDiegeticText rewrites 序章 meta into story-world phrasing", () => {
   const { text, stripped } = sanitizeDiegeticText("比序章里预估的还高了零点七。");
@@ -728,6 +729,104 @@ test("proposal characterChanges validate ops at propose time and accept synonyms
       characterChanges: [{ characterId: card.id, reason: "确认经历", changes: [{ op: "append_experience", label: "初次外勤", description: "桥上协同" }] }],
     })) as Record<string, unknown>;
     assert.equal(ok.status, "pending");
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("document anchors locate, read and patch one paragraph without a full-document payload", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-anchor-patch-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "锚点补丁");
+    project.writeRaw("lore/world.md", "# 城市\n\n门禁灯由绿变红。\n\n她仍然跨过了门。\n\n远处响起警报。\n");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("锚点补丁");
+    const context: ToolExecutionContext = { permissionMode: "ask", editScope: "point" };
+    const call = (name: string, input: Record<string, unknown>) => executeTool(
+      { id: name, name, arguments: JSON.stringify(input) }, project, store!, sessionId, () => {}, undefined, context,
+    );
+    const located = JSON.parse(await call("locate_document_span", {
+      path: "lore/world.md", quote: "她仍然跨过了门。",
+    })) as Record<string, unknown>;
+    const target = (located.matches as Array<Record<string, unknown>>)[0];
+    assert.equal(typeof target.anchorId, "string");
+    const read = JSON.parse(await call("read_document_span", {
+      path: "lore/world.md", sourceHash: located.sourceHash, anchorId: target.anchorId,
+      beforeParagraphs: 1, afterParagraphs: 1,
+    })) as Record<string, unknown>;
+    assert.match(String(read.content), /门禁灯由绿变红/u);
+    assert.ok(String(read.content).length < project.read("lore/world.md").length);
+    const otherAnchor = documentSpans(project.read("lore/world.md"), String(located.sourceHash)).at(-1)!;
+    const drifted = JSON.parse(await call("read_document_span", {
+      path: "lore/world.md", sourceHash: located.sourceHash, anchorId: otherAnchor.anchorId,
+    })) as Record<string, unknown>;
+    assert.match(String(drifted.error), /目标已锁定/u);
+    const targetAnchor = (read.anchors as Array<Record<string, unknown>>).find(anchor => anchor.anchorId === target.anchorId)!;
+    const patched = JSON.parse(await call("propose_document_patch", {
+      path: "lore/world.md", sourceHash: located.sourceHash, summary: "调整越界动作",
+      edits: [{
+        anchorId: target.anchorId, spanHash: targetAnchor.spanHash, operation: "replace",
+        content: "她在红灯亮起前收住脚，转身贴住墙面。",
+      }],
+    })) as Record<string, unknown>;
+    assert.equal(patched.status, "pending");
+    const proposal = store.proposals().find(item => item.id === patched.proposalId)!;
+    assert.match(proposal.afterContent, /转身贴住墙面/u);
+    assert.doesNotMatch(proposal.afterContent, /她仍然跨过了门/u);
+    const blockedInspect = JSON.parse(await call("inspect_document", { path: "lore/world.md" })) as Record<string, unknown>;
+    assert.match(String(blockedInspect.error), /局部修改禁止/u);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("semantic locator reranks bounded anchors and whole-document revision stays isolated", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-isolated-revision-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "隔离修订");
+    const original = "# 规则\n\n旧称用于北区。\n\n南区也沿用旧称。\n\n结尾仍写旧称。\n";
+    project.writeRaw("lore/world.md", original);
+    store = new WriterStore(project);
+    const sessionId = store.createSession("隔离修订");
+    const model = { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "test" };
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      editScope: "document",
+      documentLocator: {
+        model,
+        run: async (_model, input) => ({
+          matches: [{ anchorId: input.candidates.at(-1)!.anchorId, confidence: 0.88, reason: "结尾命中" }],
+          requestCharacters: 600,
+        }),
+      },
+      documentRevisioner: {
+        model,
+        run: async (_model, input) => ({ content: input.content.replaceAll("旧称", "新称"), requestCharacters: input.content.length + 200 }),
+      },
+    };
+    const call = (name: string, input: Record<string, unknown>) => executeTool(
+      { id: name, name, arguments: JSON.stringify(input) }, project, store!, sessionId, () => {}, undefined, context,
+    );
+    const semantic = JSON.parse(await call("locate_document_span", {
+      path: "lore/world.md", query: "最后一次仍未更新名称的位置",
+    })) as Record<string, unknown>;
+    assert.equal(semantic.mode, "semantic");
+    assert.equal((semantic.matches as unknown[]).length, 1);
+    const sourceHash = project.hash(project.read("lore/world.md"));
+    const revised = JSON.parse(await call("revise_document_isolated", {
+      path: "lore/world.md", sourceHash, instruction: "把全文中的旧称统一改成新称", summary: "统一名称",
+    })) as Record<string, unknown>;
+    assert.equal(revised.status, "pending");
+    assert.equal(revised.revisionMode, "isolated_blocks");
+    assert.equal("content" in revised, false);
+    const proposal = store.proposals().find(item => item.id === revised.proposalId)!;
+    assert.doesNotMatch(proposal.afterContent, /旧称/u);
+    assert.equal(documentSpans(proposal.afterContent, project.hash(proposal.afterContent)).length, 4);
+    assert.equal(store.agentCheckpoint(sessionId)?.stage, "proposal_submitted");
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

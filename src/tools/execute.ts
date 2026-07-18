@@ -6,7 +6,9 @@ import {
   handleAuditProseStyle,
   handleInspectDocument,
   handleListDocuments,
+  handleLocateDocumentSpan,
   handleReadDocument,
+  handleReadDocumentSpan,
   handleSearchProject,
 } from "./documents.js";
 import {
@@ -30,6 +32,7 @@ import { handleInspectConversation, handleReadConversation } from "./conversatio
 import {
   handleProposeDocument,
   handleProposeDocumentPatch,
+  handleReviseDocumentIsolated,
 } from "./proposals.js";
 import {
   handleInspectFile,
@@ -59,7 +62,9 @@ const HANDLERS: Record<string, Handler> = {
   list_documents: handleListDocuments,
   audit_prose_style: handleAuditProseStyle,
   inspect_document: handleInspectDocument,
+  locate_document_span: handleLocateDocumentSpan,
   read_document: handleReadDocument,
+  read_document_span: handleReadDocumentSpan,
   search_project: handleSearchProject,
   list_files: handleListFiles,
   inspect_file: handleInspectFile,
@@ -79,6 +84,7 @@ const HANDLERS: Record<string, Handler> = {
   propose_chapter_draft: handleProposeChapterDraft,
   propose_document: handleProposeDocument,
   propose_document_patch: handleProposeDocumentPatch,
+  revise_document_isolated: handleReviseDocumentIsolated,
   propose_change_set: handleProposeChangeSet,
   list_characters: handleListCharacters,
   get_character: handleGetCharacter,

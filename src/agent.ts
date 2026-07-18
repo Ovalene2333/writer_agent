@@ -1,5 +1,6 @@
 import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, RequestComponentUsage, StepUsage } from "./types.js";
 import type { ChapterSceneDraft } from "./scene_pipeline.js";
+import { documentSpans } from "./document_spans.js";
 import { documentKind, isScenePipelineDocument, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { OutlineStore } from "./outline.js";
@@ -130,6 +131,7 @@ type ToolAccumulator = ToolCall;
 type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "character" | "simple_character" | "general";
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
 type CreativeDepth = "explore" | "shape" | "deliver";
+type EditScope = "point" | "section" | "document";
 
 interface WritingTask {
   mode: WritingTaskMode;
@@ -139,6 +141,7 @@ interface WritingTask {
   exampleIds: number[];
   documentContext: DocumentContextMode;
   creativeDepth: CreativeDepth;
+  editScope: EditScope;
   documentProposalRequired: boolean;
   continuation: boolean;
   todoPlan: string[];
@@ -352,6 +355,11 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
       ? `必须用逐场景正文草稿完成并 propose_chapter_draft；章节与 side/ 支线片段都禁止直接 propose_document/patch 或用最终回复代替正文。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
       : `必须提交文档提案或 change set 后结束；禁止用最终回复代替文件交付。单文档优先 patch；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接提案。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
     : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
+  const editScopeInstruction: Record<EditScope, string> = {
+    point: "局部修改：有原句/选区就直接 locate/read 锚点，最多读取目标及邻段；目标锁定后禁止 inspect 或按块通读；用 sourceHash+anchorId+spanHash 提交 patch。",
+    section: "分节修改：按标题或语义 locate，读取目标锚点范围与必要接缝；只 patch 命中范围，不读取无关章节。",
+    document: "通篇修改：inspect 一次取得 sourceHash 后调用 revise_document_isolated；主 Agent 不逐块读取全文，也不自行拼接完整 content。",
+  };
   const contextInstruction: Record<DocumentContextMode, string> = {
     // Soft none: pure craft may skip tools, but never invent lore when the user names project entities.
     none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，必须 search_project 一次（优先 scope=lore），不足再 inspect/read 最小片段。禁止通读全库、禁止把推测写成既有设定。",
@@ -373,6 +381,7 @@ ${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentP
 角色范围：${characterScopeInstruction}
 简易卡范围：${simpleCharacterScopeInstruction}
 写入：${documentInstruction}
+修改范围：${editScopeInstruction[task.editScope]}
 场景链参数：推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场；允许最多 ${scenePipeline.maxScenes} 场。按情节需要取值，不为达到推荐数拆场。
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
@@ -408,6 +417,7 @@ export function normalizeDocumentProposalRequired(mode: WritingTaskMode, request
 async function planWritingTask(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
   characterScope?: number[],
+  selectionCharacters = 0,
 ): Promise<{ task: WritingTask; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
@@ -430,7 +440,7 @@ async function planWritingTask(
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务规划器。不得调用工具；只输出一个 JSON，无 Markdown。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general)；creativeDepth(explore|shape|deliver)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。写文件完整度由 documentProposalRequired 决定。
 documentContext 判定（关键，勿默认 none）：
 - none：仅泛化写作技巧、闲聊、纯灵感且不依赖项目既有专名/组织/势力/世界观事实；或所需事实已完整出现在 recentHistory。
@@ -441,6 +451,7 @@ documentContext 判定（关键，勿默认 none）：
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
 正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，documentProposalRequired=true；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
 用户引用具体正文句段并指出问题或要求修改（不合理/OOC/改掉这句/换个说法等）时，一律 mode=rewrite，documentProposalRequired=true，documentContext=target；不得判为 audit（audit 只用于“审阅/检查/评价”而不动笔），也不得因目标是章节而改判 write_scene。
+editScope 仅描述既有文档修改范围：明确原句/网页选区/一小处→point；一个小节或若干相邻段→section；明确通篇/全文/整体统一调整且每部分都需处理→document。不要把“深度修改某一处”误判为document。
 只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
   }, {
@@ -451,6 +462,7 @@ documentContext 判定（关键，勿默认 none）：
       documentCatalogTruncated: allDocuments.length > documents.length,
       characters,
       examples,
+      selectionCharacters,
       recentHistory: recent,
     }),
   }];
@@ -477,6 +489,19 @@ documentContext 判定（关键，勿默认 none）：
   const creativeDepth = depths.includes(parsed.creativeDepth as CreativeDepth)
     ? parsed.creativeDepth as CreativeDepth
     : documentProposalRequired ? "shape" : "explore";
+  const editScopes: EditScope[] = ["point", "section", "document"];
+  const inferredEditScope: EditScope = selectionCharacters > 0
+    ? "point"
+    : /(?:通篇|全文|整篇|整体统一|从头到尾)/u.test(request)
+      ? "document"
+      : /[“「『"]|(?:这句|这一句|这段话|一小处|错别字|改个词)/u.test(request)
+        ? "point"
+        : "section";
+  const editScope: EditScope = mode === "rewrite"
+    ? selectionCharacters > 0
+      ? "point"
+      : editScopes.includes(parsed.editScope as EditScope) ? parsed.editScope as EditScope : inferredEditScope
+    : "section";
   let normalizedDocumentContext: DocumentContextMode = mode === "simple_character" || mode === "character"
     ? "search"
     : continuation
@@ -508,6 +533,7 @@ documentContext 判定（关键，勿默认 none）：
       exampleIds: Array.isArray(parsed.exampleIds) ? parsed.exampleIds.filter(id => validExampleIds.has(id)).slice(0, 2) : [],
       documentContext: normalizedDocumentContext,
       creativeDepth,
+      editScope,
       documentProposalRequired,
       continuation,
       todoPlan: requestedTodoPlan.length ? requestedTodoPlan : defaultTodoPlan(mode, documentProposalRequired),
@@ -680,11 +706,11 @@ export function taskInstructions(
 7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
-- 定位用户引用的原句：read_document 传 path+quote 一步取回行号与上下文；禁止为找一句话通读全章或反复 search_project。
+- 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再用 read_document_span 只读锚点邻域。禁止为找一句话通读全章或反复 search_project。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
-- 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。保留不规则表达；人设变化进提案 characterChanges。优先 patch。提交前：${proseMannerismPreflightLine()}`;
+- 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。point/section 用 sourceHash+anchorId+spanHash 提交最小 patch；只有 editScope=document 才 inspect 一次后调用 revise_document_isolated，禁止主 Agent 通读和拼接全文。人设变化进提案 characterChanges。提交前：${proseMannerismPreflightLine()}`;
   if (mode === "audit") return `工作流：
 - 先 audit_prose_style；优先 severity=error。
 - 每条问题含严重度、原文证据、违反约束、最小改法；无证据不提。
@@ -1017,6 +1043,7 @@ export async function runAgent(options: {
   const plannerModel = options.models?.summarizer ?? options.models?.inline ?? model;
   const planned = await planWritingTask(
     plannerModel, project, store, prompt, history, signal, characterScope,
+    options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
   );
   const task = planned.task;
   // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
@@ -1072,12 +1099,13 @@ export async function runAgent(options: {
   const todosPrompt = turnTodos.length
     ? `当前对话任务清单（绑定本轮任务，非会话全局残留；可用 manage_todos 更新）：\n${formatTodosForPrompt(turnTodos)}`
     : undefined;
-  const preferredSample = options.selectedDocumentBlocks
+  const preferredSample = task.mode === "rewrite" ? undefined : options.selectedDocumentBlocks
     ?.map((block) => block.text?.trim() ?? "")
     .filter(Boolean)
     .join("\n\n");
   const styleOptions = {
-    intensive: permissionMode !== "plan" && (isIntensiveWritingMode(task.mode) || task.documentProposalRequired),
+    intensive: permissionMode !== "plan" && task.editScope !== "point"
+      && (isIntensiveWritingMode(task.mode) || task.documentProposalRequired),
     targetPath: task.targetPath ?? continuationPath,
     exampleIds: task.exampleIds,
     preferredSample: preferredSample || undefined,
@@ -1095,9 +1123,14 @@ export async function runAgent(options: {
   const restoredChapterDraft = task.mode === "write_scene" && task.continuation
     ? restoreChapterDraftCheckpoint(store, sessionId, project, task.targetPath ?? continuationPath)
     : undefined;
+  const selectedEditLock = task.editScope === "point"
+    ? selectedBlockEditLock(project, options.selectedDocumentBlocks)
+    : undefined;
   let currentUsageStep: number | undefined;
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    editScope: task.editScope,
+    ...(selectedEditLock ? { editTargetLocked: selectedEditLock } : {}),
     modelUsageReporter: (callModel, callUsage, meta) => {
       emit(buildRecordedUsageEvent(store, sessionId, callModel, callUsage, {
         ...meta,
@@ -1121,6 +1154,17 @@ export async function runAgent(options: {
     chapterStyleRepairer: {
       model: options.models?.inline ?? executionModel,
       ...((options.models?.inline ?? executionModel) !== executionModel
+        ? { fallbackModel: executionModel }
+        : {}),
+      signal,
+    },
+    documentLocator: {
+      model: options.models?.inline ?? plannerModel,
+      signal,
+    },
+    documentRevisioner: {
+      model: options.models?.writer ?? executionModel,
+      ...((options.models?.writer ?? executionModel) !== executionModel
         ? { fallbackModel: executionModel }
         : {}),
       signal,
@@ -1281,7 +1325,7 @@ export async function runAgent(options: {
           // so the scene-boundary reset below is skipped for this step.
           chapterReviewInStep = true;
         }
-        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch" || call.name === "propose_change_set") {
+        if (call.name === "propose_document" || call.name === "propose_document_patch" || call.name === "revise_document_isolated" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch" || call.name === "propose_change_set") {
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (!("error" in parsed)) documentProposalSubmitted = true;
@@ -1500,10 +1544,42 @@ function selectedBlocksContext(project: WriterProject, references?: Array<{ path
   const sections = unique.map(reference => {
     const content = project.read(reference.path);
     const text = reference.text!.trim();
-    if (!content.includes(text)) throw new Error(`${reference.path} 中的选区已失效，请重新选择`);
-    return `文档：${reference.path} · 用户选区\n${text}`;
+    const start = content.indexOf(text);
+    if (start < 0) throw new Error(`${reference.path} 中的选区已失效，请重新选择`);
+    const sourceHash = project.hash(content);
+    const spans = documentSpans(content, sourceHash).filter(span => span.endOffset > start && span.startOffset < start + text.length);
+    const preview = text.length <= 800 ? text : `${text.slice(0, 360)}\n…[选区正文按锚点读取]…\n${text.slice(-360)}`;
+    return JSON.stringify({
+      path: reference.path,
+      sourceHash,
+      selectionCharacters: text.length,
+      startAnchorId: spans[0]?.anchorId,
+      endAnchorId: spans.at(-1)?.anchorId,
+      anchors: spans.slice(0, 12).map(span => ({ anchorId: span.anchorId, spanHash: span.spanHash, startLine: span.startLine, endLine: span.endLine })),
+      preview,
+      message: text.length <= 800
+        ? "选区已完整提供；直接用锚点 patch，禁止通读文档。"
+        : "选区较长；使用 startAnchorId/endAnchorId 调用 read_document_span，禁止按块通读。",
+    });
   });
-  return sections.length ? `用户从网页浏览器明确加入了以下文本选区。只把它们作为本轮上下文，不要自行扩展为整篇文档：\n\n${sections.join("\n\n---\n\n")}` : "";
+  return sections.length ? `用户从网页浏览器明确加入了以下文本选区锚点。只处理这些范围，不要扩展为整篇文档：\n${sections.join("\n")}` : "";
+}
+
+function selectedBlockEditLock(
+  project: WriterProject,
+  references?: Array<{ path: string; text?: string }>,
+): { path: string; sourceHash: string; anchorIds: string[] } | undefined {
+  const reference = references?.find(item => typeof item.path === "string" && typeof item.text === "string" && item.text.trim());
+  if (!reference?.text) return undefined;
+  const content = project.read(reference.path);
+  const text = reference.text.trim();
+  const start = content.indexOf(text);
+  if (start < 0) return undefined;
+  const sourceHash = project.hash(content);
+  const anchorIds = documentSpans(content, sourceHash)
+    .filter(span => span.endOffset > start && span.startOffset < start + text.length)
+    .map(span => span.anchorId);
+  return anchorIds.length ? { path: reference.path, sourceHash, anchorIds } : undefined;
 }
 
 /**
@@ -1547,7 +1623,7 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
   const restored: Array<Record<string, unknown>> = [];
   if (task.continuation) {
     for (const artifact of artifacts) {
-      if (artifact.kind !== "read_document" && artifact.kind !== "inspect_document"
+      if (artifact.kind !== "read_document" && artifact.kind !== "read_document_span" && artifact.kind !== "inspect_document"
         && artifact.kind !== "read_file" && artifact.kind !== "inspect_file") continue;
       if (artifact.path && activePath && artifact.path !== activePath) continue;
       if (activeHash && artifact.sourceHash !== activeHash) continue;
@@ -1584,7 +1660,7 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
     }
   }
   const catalog = artifacts
-    .filter(item => item.kind === "read_document" || item.kind === "inspect_document"
+    .filter(item => item.kind === "read_document" || item.kind === "read_document_span" || item.kind === "locate_document_span" || item.kind === "inspect_document"
       || item.kind === "read_file" || item.kind === "inspect_file"
       || item.kind === "get_outline_node" || item.kind === "list_outline_nodes")
     .map(({ id, kind, path, sourceHash, digest }) => ({
@@ -1715,9 +1791,9 @@ ${JSON.stringify({
   })}`;
 }
 
-const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "read_document", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
-const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "read_document", "inspect_file", "read_file"]);
-const DOCUMENT_BODY_READ_TOOLS = new Set(["read_document", "read_file"]);
+const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
+const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "locate_document_span", "read_document", "read_document_span", "inspect_file", "read_file"]);
+const DOCUMENT_BODY_READ_TOOLS = new Set(["read_document", "read_document_span", "read_file"]);
 const MAX_READS_PER_PATH_PER_RUN = 2;
 const MAX_DOCUMENT_READS_PER_RUN = 5;
 const MAX_DOCUMENT_READ_CHARACTERS_PER_JOB = 9_000;
@@ -1871,6 +1947,17 @@ async function executeToolCached(
   let input: Record<string, unknown>;
   try { input = JSON.parse(call.arguments || "{}") as Record<string, unknown>; }
   catch { return executeTool(call, project, store, sessionId, emit, characterScope, context); }
+  if (context.editScope === "point" && context.editTargetLocked
+    && input.path === context.editTargetLocked.path
+    && (call.name === "inspect_document"
+      || (call.name === "read_document" && !(typeof input.quote === "string" && input.quote.trim())))) {
+    return JSON.stringify({
+      error: "局部修改目标已锁定；禁止继续 inspect 或按块/节/行读取，请使用已读锚点提交 patch",
+      path: context.editTargetLocked.path,
+      sourceHash: context.editTargetLocked.sourceHash,
+      anchorIds: context.editTargetLocked.anchorIds,
+    });
+  }
   const normalized = Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) =>
     [key, typeof value === "string" ? value.trim() : value]));
   const path = typeof normalized.path === "string" ? normalized.path : undefined;

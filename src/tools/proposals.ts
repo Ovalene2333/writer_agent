@@ -4,6 +4,9 @@ import { isScenePipelineDocument } from "../project.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
 import { findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
+import { documentSpans } from "../document_spans.js";
+import { documentBlocks } from "../document_blocks.js";
+import { requestDocumentRevision } from "../document_revision.js";
 import type { WriterStore } from "../store.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
@@ -25,7 +28,8 @@ export const LIGHT_PATCH_MAX_REPLACE_CHARS = 1_500;
 
 function patchReplaceCharacters(edits: unknown[]): number {
   return edits.reduce<number>((sum, edit) => {
-    const replace = edit && typeof edit === "object" ? (edit as Record<string, unknown>).replace : undefined;
+    const row = edit && typeof edit === "object" ? edit as Record<string, unknown> : undefined;
+    const replace = row?.replace ?? row?.content;
     return sum + (typeof replace === "string" ? replace.length : 0);
   }, 0);
 }
@@ -208,11 +212,65 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   assertCreativeOutlineDesigned(context, path, "propose_document_patch");
   if (!lightPatch) assertWritePackReady(context, "propose_document_patch");
   const beforeContent = project.read(path);
+  const sourceHash = project.hash(beforeContent);
+  if (input.sourceHash !== undefined && input.sourceHash !== sourceHash) {
+    throw new Error(`文档快照已变化；期望 ${String(input.sourceHash)}，当前 ${sourceHash}。请重新定位锚点`);
+  }
   let content = beforeContent;
   const strippedMeta: string[] = [];
+  const anchorSpans = documentSpans(beforeContent, sourceHash);
+  const anchorOperations: Array<{ start: number; end: number; replacement: string; index: number }> = [];
+  const anchorEditCount = edits.filter(edit => edit && typeof edit === "object" && typeof (edit as Record<string, unknown>).anchorId === "string").length;
+  if (anchorEditCount > 0 && anchorEditCount !== edits.length) throw new Error("同一 patch 不能混用锚点 edit 与 legacy search/replace");
+  const pointLock = context.editScope === "point" ? context.editTargetLocked : undefined;
+  if (pointLock) {
+    if (pointLock.path !== path || pointLock.sourceHash !== sourceHash) {
+      throw new Error("局部修改目标已锁定到另一文档快照；请重新开始定位");
+    }
+    if (anchorEditCount !== edits.length) {
+      throw new Error("局部修改目标锁定后必须使用 anchorId+spanHash，禁止退回全文 search/replace");
+    }
+  }
   for (const [index, rawEdit] of edits.entries()) {
     if (!rawEdit || typeof rawEdit !== "object") throw new Error(`第 ${index + 1} 条 edit 格式无效`);
     const edit = rawEdit as Record<string, unknown>;
+    const anchorId = typeof edit.anchorId === "string" ? edit.anchorId.trim() : "";
+    if (anchorId) {
+      if (typeof input.sourceHash !== "string" || !input.sourceHash.trim()) {
+        throw new Error("锚点 patch 必须携带 locate/read 返回的 sourceHash");
+      }
+      const span = anchorSpans.find(item => item.anchorId === anchorId);
+      if (!span) throw new Error(`第 ${index + 1} 条 anchorId 已过期或不存在；请重新 locate`);
+      if (pointLock && !pointLock.anchorIds.includes(anchorId)) {
+        throw new Error(`第 ${index + 1} 条 anchorId 超出已锁定的局部修改范围`);
+      }
+      if (typeof edit.spanHash !== "string" || edit.spanHash !== span.spanHash) {
+        throw new Error(`第 ${index + 1} 条 spanHash 不匹配；目标段落已变化，请重新读取`);
+      }
+      const operation = typeof edit.operation === "string" ? edit.operation : "replace";
+      if (!(["replace", "delete", "insert_before", "insert_after"] as string[]).includes(operation)) {
+        throw new Error(`第 ${index + 1} 条 operation 无效`);
+      }
+      let replacement = operation === "delete" ? ""
+        : typeof edit.content === "string" ? edit.content
+        : typeof edit.replace === "string" ? edit.replace : undefined;
+      if (replacement === undefined) throw new Error(`缺少有效参数：edits[${index}].content`);
+      rejectCompressedPlaceholder(replacement, `edits[${index}].content`);
+      if (replacement) {
+        const cleaned = gateProseMetaLeaks(replacement, path);
+        replacement = cleaned.content;
+        strippedMeta.push(...cleaned.stripped);
+      }
+      if (operation === "insert_before") replacement = `${replacement}\n\n`;
+      if (operation === "insert_after") replacement = `\n\n${replacement}`;
+      anchorOperations.push({
+        start: operation === "insert_after" ? span.endOffset : span.startOffset,
+        end: operation === "insert_before" || operation === "insert_after" ? (operation === "insert_after" ? span.endOffset : span.startOffset) : span.endOffset,
+        replacement,
+        index,
+      });
+      continue;
+    }
     const search = requireString(edit.search, `edits[${index}].search`);
     let replace = typeof edit.replace === "string" ? edit.replace : undefined;
     if (replace === undefined) throw new Error(`缺少有效参数：edits[${index}].replace`);
@@ -226,6 +284,15 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     if (occurrences !== 1) throw new Error(`第 ${index + 1} 条 search 在原文中出现 ${occurrences} 次，必须唯一`);
     content = content.replace(search, replace);
   }
+  if (anchorOperations.length) {
+    const ordered = [...anchorOperations].sort((a, b) => b.start - a.start || b.end - a.end);
+    for (let index = 1; index < ordered.length; index += 1) {
+      if (ordered[index - 1].start < ordered[index].end) throw new Error("锚点修改范围重叠；请合并为一条 edit");
+    }
+    for (const operation of ordered) {
+      content = `${content.slice(0, operation.start)}${operation.replacement}${content.slice(operation.end)}`;
+    }
+  }
   await gateProseStyle(beforeContent, content, context);
   const proposal = store.createProposal(
     sessionId, path, content, requireString(input.summary, "summary"),
@@ -238,6 +305,113 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
     ...(uniqueStripped.length ? { metaSanitized: uniqueStripped } : {}),
   });
+}
+
+/** Whole-document rewrite without appending the original body to the parent Agent loop. */
+export async function handleReviseDocumentIsolated(args: ToolHandlerArgs): Promise<string> {
+  const { input, project, context } = args;
+  assertWritableMode(context.permissionMode, "revise_document_isolated");
+  if (context.editScope !== "document") throw new Error("仅通篇修改可使用 revise_document_isolated；局部/分节修改请使用锚点 patch");
+  if (!context.documentRevisioner) throw new Error("隔离文档修订器未配置");
+  const path = requireString(input.path, "path");
+  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  const beforeContent = project.read(path);
+  const sourceHash = project.hash(beforeContent);
+  if (typeof input.sourceHash !== "string" || input.sourceHash !== sourceHash) {
+    throw new Error("通篇修改必须携带 inspect_document 返回的当前 sourceHash");
+  }
+  if (beforeContent.length > 120_000) throw new Error("文档超过12万字符；请按章节或标题拆分后分别修订");
+  const instruction = requireString(input.instruction, "instruction").slice(0, 2_000);
+  const instructionHash = project.hash(instruction);
+  const blocks = documentBlocks(beforeContent, 5_000);
+  if (blocks.length > 32) throw new Error("文档分块超过32块；请缩小通篇修改范围");
+  const revisioner = context.documentRevisioner;
+  const models = [revisioner.model, revisioner.fallbackModel]
+    .filter((model): model is NonNullable<typeof model> => Boolean(model))
+    .filter((model, index, all) => all.findIndex(candidate => candidate.baseUrl === model.baseUrl && candidate.model === model.model) === index);
+  const checkpoint = args.store.agentCheckpoint(args.sessionId);
+  const savedDraft = checkpoint?.stage === "document_revision_started" && checkpoint.path === path
+    && checkpoint.sourceHash === sourceHash && checkpoint.draft && typeof checkpoint.draft === "object"
+    ? checkpoint.draft as Record<string, unknown>
+    : undefined;
+  const savedReplacements = savedDraft?.kind === "document_revision" && savedDraft.instructionHash === instructionHash
+    && Array.isArray(savedDraft.replacements)
+    ? savedDraft.replacements.flatMap(raw => {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+        const value = raw as Record<string, unknown>;
+        return typeof value.start === "number" && typeof value.end === "number" && typeof value.content === "string"
+          ? [{ start: value.start, end: value.end, content: value.content }] : [];
+      })
+    : [];
+  const replacements: Array<{ start: number; end: number; content: string }> = savedReplacements.slice(0, blocks.length);
+  for (const block of blocks.slice(replacements.length)) {
+    let revised: string | undefined;
+    const errors: string[] = [];
+    for (const model of models) {
+      try {
+        const result = await (revisioner.run ?? requestDocumentRevision)(model, {
+          instruction,
+          block: block.block,
+          blockCount: blocks.length,
+          content: block.content,
+          ...(block.block > 1 ? { previousTail: blocks[block.block - 2].content.slice(-500) } : {}),
+          ...(block.block < blocks.length ? { nextHead: blocks[block.block].content.slice(0, 500) } : {}),
+        }, revisioner.signal);
+        revised = result.content;
+        if (result.usage) context.modelUsageReporter?.(model, result.usage, {
+          callKind: "document_revision",
+          requestComponents: [{ kind: "other", label: `隔离文档修订 ${block.block}/${blocks.length}`,
+            characters: result.requestCharacters, estimatedTokens: Math.ceil(result.requestCharacters * 0.75), callKind: "document_revision" }],
+        });
+        break;
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240));
+      }
+    }
+    if (revised === undefined) {
+      return JSON.stringify({
+        status: "revision_failed", error: `第 ${block.block}/${blocks.length} 块隔离修订失败`, errors,
+        completedBlocks: replacements.length, message: "未创建提案；原文未修改。可缩小范围或重试。",
+      });
+    }
+    replacements.push({ start: block.startOffset, end: block.endOffset, content: revised });
+    args.store.saveAgentCheckpoint(args.sessionId, {
+      version: 1,
+      stage: "document_revision_started",
+      path,
+      sourceHash,
+      completedScenes: replacements.length,
+      totalScenes: blocks.length,
+      draft: { kind: "document_revision", instructionHash, replacements },
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  let afterContent = beforeContent;
+  for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
+    afterContent = `${afterContent.slice(0, replacement.start)}${replacement.content}${afterContent.slice(replacement.end)}`;
+  }
+  const result = await submitFullDocumentProposal(
+    args,
+    path,
+    afterContent,
+    requireString(input.summary, "summary"),
+    input.characterChanges,
+  );
+  try {
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    if (!("error" in parsed)) args.store.saveAgentCheckpoint(args.sessionId, {
+      version: 1, stage: "proposal_submitted", path, sourceHash,
+      proposalId: typeof parsed.proposalId === "number" ? parsed.proposalId : undefined,
+      updatedAt: new Date().toISOString(),
+    });
+    return JSON.stringify({
+      ...parsed,
+      revisionMode: "isolated_blocks",
+      revisedBlocks: replacements.length,
+      originalCharacters: beforeContent.length,
+      revisedCharacters: afterContent.length,
+    });
+  } catch { return result; }
 }
 
 export type { Proposal };
