@@ -3392,6 +3392,23 @@ button.agent-orb:focus-visible {
 .model-list-head { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; }
 .model-list-head h3 { margin: 0; }
 .model-list-head button { padding: 5px 10px; font-size: 11px; }
+.model-list-actions { display: flex; align-items: center; gap: 6px; }
+.model-list-actions button { display: inline-flex; align-items: center; gap: 6px; }
+.editor-feedback { margin: 10px 0; color: var(--accent); font-size: 12px; }
+.editor-feedback.error { color: var(--warn); }
+.model-scan-results { margin-bottom: 12px; border-block: 1px solid var(--border-light); }
+.model-scan-head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 9px 2px; }
+.model-scan-head > label { display: inline-flex; align-items: center; gap: 7px; margin: 0; font-size: 11px; font-weight: 650; }
+.model-scan-head > span { color: var(--text-faint); font-size: 11px; }
+.model-scan-head button { padding: 5px 9px; font-size: 11px; }
+.model-scan-head input, .model-scan-list input { width: 15px; height: 15px; accent-color: var(--accent); }
+.model-scan-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 210px; overflow: auto; border-top: 1px solid var(--border-light); }
+.model-scan-list label { display: flex; align-items: center; gap: 8px; min-width: 0; margin: 0; padding: 8px 6px; border-bottom: 1px solid var(--border-light); font-size: 11px; cursor: pointer; }
+.model-scan-list label:nth-child(odd) { padding-right: 12px; }
+.model-scan-list label:nth-child(even) { padding-left: 12px; border-left: 1px solid var(--border-light); }
+.model-scan-list label.already-added { color: var(--text-faint); cursor: default; }
+.model-scan-list label > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-scan-list small { margin-left: auto; color: var(--text-faint); font-size: 10px; white-space: nowrap; }
 .model-edit-list { display: flex; flex-direction: column; gap: 12px; }
 .model-edit-card { padding: 14px 14px 12px; border: 1px solid var(--border-light); border-radius: 11px; background: var(--surface2); }
 .model-edit-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
@@ -3409,6 +3426,11 @@ button.agent-orb:focus-visible {
   color: var(--text-faint); font-size: 11px; font-style: normal;
   font-weight: 500; line-height: 1.35; letter-spacing: .01em;
 }
+.billing-mode-field { grid-column: 1 / -1; }
+.billing-mode-field > span { display: block; margin-bottom: 6px; color: var(--text-dim); font-size: 12px; font-weight: 600; }
+.billing-mode-control { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: min(340px, 100%); padding: 3px; border: 1px solid var(--border-light); border-radius: 8px; background: var(--surface); }
+.billing-mode-control button { padding: 6px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--text-dim); font-size: 11px; }
+.billing-mode-control button.active { background: var(--accent-light); color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent); }
 .peak-billing-note {
   margin-top: 12px; padding: 10px 12px;
   border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-light));
@@ -3802,6 +3824,8 @@ header { padding-inline: 18px; }
   .scene-settings-grid { grid-template-columns: 1fr; }
   .provider-models { grid-template-columns: 1fr; }
   .role-card { grid-template-columns: 1fr; gap: 9px; }
+  .model-scan-list { grid-template-columns: 1fr; }
+  .model-scan-list label:nth-child(n) { padding-inline: 6px; border-left: 0; }
   .model-fields { grid-template-columns: 1fr; }
 }
 

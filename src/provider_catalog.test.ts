@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { modelSupportsToolChoice, thinkingRequestOptions } from "./model_compat.js";
 import { defaultPricing } from "./pricing.js";
-import { PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
+import { parseProviderModelIds, PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
 
 test("DeepSeek Thinking omits unsupported tool_choice", () => {
@@ -18,6 +18,53 @@ test("DeepSeek requests explicit Thinking", () => {
   assert.deepEqual(thinkingRequestOptions({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), {
     thinking: { type: "enabled" },
   });
+});
+
+test("provider model directory parser accepts compatible shapes and deduplicates ids", () => {
+  assert.deepEqual(parseProviderModelIds({
+    data: [{ id: "model-z" }, { id: " model-a " }, { id: "model-z" }, { object: "model" }, null],
+  }), ["model-a", "model-z"]);
+  assert.deepEqual(parseProviderModelIds({ models: ["beta", { id: "alpha" }, ""] }), ["alpha", "beta"]);
+  assert.deepEqual(parseProviderModelIds({ data: "invalid" }), []);
+});
+
+test("scanModels uses a saved key, returns default pricing, and does not mutate the catalog", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-scan-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const project = WriterProject.init(root, "扫描供应商模型");
+    const providers = new ProviderManager(project);
+    const catalog = providers.saveProfile({
+      name: "兼容供应商",
+      provider: "openai-compatible",
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "sk-scan-test",
+      models: [{ name: "configured-model" }],
+    });
+    const profile = catalog.providers.find(item => item.name === "兼容供应商")!;
+    let requestedUrl = "";
+    let authorization = "";
+    globalThis.fetch = async (input, init) => {
+      requestedUrl = String(input);
+      authorization = new Headers(init?.headers).get("authorization") ?? "";
+      return new Response(JSON.stringify({ data: [{ id: "model-b" }, { id: "model-a" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const before = providers.catalog();
+    const result = await providers.scanModels({ profileId: profile.id });
+
+    assert.equal(requestedUrl, "https://api.example.com/v1/models");
+    assert.equal(authorization, "Bearer sk-scan-test");
+    assert.deepEqual(result.models.map(model => model.name), ["model-a", "model-b"]);
+    assert.deepEqual(result.models[0].pricing, defaultPricing("openai-compatible", "model-a"));
+    assert.deepEqual(providers.catalog(), before);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("applySamplingDefaults writes temp/topP to all role-assigned models without api key", () => {

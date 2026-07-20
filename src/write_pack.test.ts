@@ -211,7 +211,8 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
       requireWritePack: true,
       requireScenePipeline: true,
       scenePipelineSettings: {
-        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, isolatedWriter: false, candidateCount: 1,
+        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
       },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
@@ -358,6 +359,10 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     const chapterReviewUsage: Array<{ model: string; callKind: string }> = [];
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      scenePipelineSettings: {
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+      },
       modelUsageReporter: (model, _usage, meta) => {
         chapterReviewUsage.push({ model: model.model, callKind: meta.callKind });
       },
@@ -409,7 +414,15 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       content: "门禁灯变红。".repeat(20),
       actualState: actualState("违规进入"),
     })) as Record<string, unknown>;
-    assert.match(String(oversizedNotes.error), /1500/);
+    assert.match(String(oversizedNotes.error), /3000/);
+    context.scenePipelineSettings!.notesMaxCharacters = 4_000;
+    const relaxedNotes = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: `## 场景目标\n${"主角继续向前。".repeat(450)}`,
+    })) as Record<string, unknown>;
+    assert.doesNotMatch(String(relaxedNotes.error), /notes 过长/u);
+    assert.match(String(relaxedNotes.error), /content/u);
+    context.scenePipelineSettings!.notesMaxCharacters = 3_000;
     const denseStyle = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。\n## 已知事实\n门禁灯会在违规时变红。",
@@ -574,7 +587,10 @@ test("scene candidate sampling skips clean originals without extra model calls",
     const sessionId = activeStore.createSession("候选跳过");
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
-      scenePipelineSettings: { preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5, isolatedWriter: false, candidateCount: 2 },
+      scenePipelineSettings: {
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
+      },
       // Unreachable endpoint: the test fails with skipped=rewrite_error if a rewrite call is ever attempted.
       sceneCandidates: { model: { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "test" } },
     };

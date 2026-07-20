@@ -11,7 +11,11 @@ import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
 import {
   ABSOLUTE_MAX_SCENES,
+  MAX_ISOLATED_WRITER_MAX_RATIO,
+  MAX_SCENE_NOTES_CHARACTERS,
   MAX_SCENE_CANDIDATES,
+  MIN_ISOLATED_WRITER_MAX_RATIO,
+  MIN_SCENE_NOTES_CHARACTERS,
   isPermissionMode,
   listProjectSkills,
   loadAgentSettings,
@@ -578,6 +582,11 @@ export async function startWriterServer(options: {
     catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/providers/scan", async (context) => {
+    try { return context.json(await options.providers.scanModels(await context.req.json())); }
+    catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.get("/api/agent-settings", (context) => {
     const settings = loadAgentSettings(options.project);
     const instructions = loadProjectInstructions(options.project);
@@ -612,6 +621,26 @@ export async function startWriterServer(options: {
         }
         if (body.scenePipeline.isolatedWriter !== undefined && typeof body.scenePipeline.isolatedWriter !== "boolean") {
           return context.json({ error: "isolatedWriter 必须是布尔值" }, 400);
+        }
+        const notesMaxCharacters = body.scenePipeline.notesMaxCharacters;
+        if (notesMaxCharacters !== undefined && (
+          !Number.isInteger(notesMaxCharacters)
+          || Number(notesMaxCharacters) < MIN_SCENE_NOTES_CHARACTERS
+          || Number(notesMaxCharacters) > MAX_SCENE_NOTES_CHARACTERS
+        )) {
+          return context.json({
+            error: `notesMaxCharacters 须为 ${MIN_SCENE_NOTES_CHARACTERS}—${MAX_SCENE_NOTES_CHARACTERS} 的整数`,
+          }, 400);
+        }
+        const writerMaxRatio = body.scenePipeline.isolatedWriterMaxRatio;
+        if (writerMaxRatio !== undefined && (
+          !Number.isFinite(writerMaxRatio)
+          || Number(writerMaxRatio) < MIN_ISOLATED_WRITER_MAX_RATIO
+          || Number(writerMaxRatio) > MAX_ISOLATED_WRITER_MAX_RATIO
+        )) {
+          return context.json({
+            error: `isolatedWriterMaxRatio 须在 ${MIN_ISOLATED_WRITER_MAX_RATIO}—${MAX_ISOLATED_WRITER_MAX_RATIO} 之间`,
+          }, 400);
         }
       }
       const settings = saveAgentSettings(options.project, {

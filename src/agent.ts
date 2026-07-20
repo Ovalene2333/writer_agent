@@ -12,6 +12,7 @@ import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { isDeepSeekModel, thinkingRequestOptions } from "./model_compat.js";
 import {
+  DEFAULT_SCENE_NOTES_CHARACTERS,
   formatTodosForPrompt,
   loadAgentSettings,
   permissionModeLabel,
@@ -133,6 +134,7 @@ type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "a
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
 type CreativeDepth = "explore" | "shape" | "deliver";
 type EditScope = "point" | "section" | "document";
+type AgentRoleModels = Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
 
 interface WritingTask {
   mode: WritingTaskMode;
@@ -376,7 +378,14 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   return `当前任务：${task.label}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；规划器/会话推断不得冒充用户选择。
 
-${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentProposalRequired, scenePipeline.isolatedWriter)}${reviewBlock}
+${taskInstructions(
+    task.mode,
+    task.creativeDepth,
+    permissionMode,
+    task.documentProposalRequired,
+    scenePipeline.isolatedWriter,
+    scenePipeline.notesMaxCharacters,
+  )}${reviewBlock}
 
 上下文：${contextInstruction[task.documentContext]}
 角色范围：${characterScopeInstruction}
@@ -498,6 +507,22 @@ async function repairToolArgumentsWithModel(
 
 function isCharacterMutationTool(name: string): boolean {
   return name === "save_character" || name === "save_simple_character" || name === "apply_character_changes";
+}
+
+export function executionModelForTask(
+  task: Pick<WritingTask, "mode" | "documentProposalRequired">,
+  models: AgentRoleModels,
+  fallback: ModelConfig,
+  isolatedWriter: boolean,
+): ModelConfig {
+  if (task.mode === "audit") return models.reviewer ?? fallback;
+  if (task.mode === "rewrite") return models.inline ?? fallback;
+  // Without an isolated Writer, prose is generated inside the outer tool call.
+  // Isolated mode keeps orchestration on Agent and delegates only prose to Writer.
+  if (task.mode === "write_scene" && task.documentProposalRequired && !isolatedWriter) {
+    return models.writer ?? fallback;
+  }
+  return fallback;
 }
 
 function isChapterSceneWriteTool(name: string): boolean {
@@ -825,6 +850,7 @@ export function taskInstructions(
   permissionMode: PermissionMode,
   documentProposalRequired: boolean,
   isolatedWriter = false,
+  notesMaxCharacters = DEFAULT_SCENE_NOTES_CHARACTERS,
 ): string {
   const pacing = creativePacing(creativeDepth);
   if (permissionMode === "plan") {
@@ -885,8 +911,8 @@ export function taskInstructions(
 3. 单个正文任务只交付用户指定的章节或支线片段：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
 5. ${isolatedWriter
-    ? "按场景链顺序循环，每场只调用一次 write_chapter_scene：把本场人物当下、已知事实、可见变化、可用行动线索与不可擅自确定项整理为不超过 1500 字的故事内 notes；不要生成 content 或 actualState，工具会用隔离的纯文本 Writer 写正文，再从成稿独立提取状态。事实可以只作静默约束，不要把所有资料列成必须落地的信息。规划要点直接放进 notes，禁止先输出计划、宣告开写或更新内置清单。"
-    : "按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。"}改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。${isolatedWriter ? "隔离模式不把风格统计或负面清单写进下一场 notes；这些问题只由整章出口门禁处理。" : "begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。"}
+    ? `按场景链顺序循环，每场只调用一次 write_chapter_scene：把本场人物当下、已知事实、可见变化、可用行动线索与不可擅自确定项整理为不超过 ${notesMaxCharacters} 字的故事内 notes；不要生成 content 或 actualState，工具会用隔离的纯文本 Writer 写正文，再从成稿独立提取状态。事实可以只作静默约束，不要把所有资料列成必须落地的信息。规划要点直接放进 notes，禁止先输出计划、宣告开写或更新内置清单。`
+    : `按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，当前上限 ${notesMaxCharacters} 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。`}改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。${isolatedWriter ? "隔离模式不把风格统计或负面清单写进下一场 notes；这些问题只由整章出口门禁处理。" : "begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。"}
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
 7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
@@ -1194,7 +1220,7 @@ export async function runAgent(options: {
   simpleCharacterScope?: number[];
   selectedDocumentBlocks?: Array<{ path: string; text?: string }>;
   model?: ModelConfig;
-  models?: Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
+  models?: AgentRoleModels;
   maxTurns?: number;
   /** 覆盖 .writer/agent.json 中的权限模式 */
   permissionMode?: PermissionMode;
@@ -1241,13 +1267,12 @@ export async function runAgent(options: {
   const task = planned.task;
   // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
   if (permissionMode === "plan") task.documentProposalRequired = false;
-  const executionModel = task.mode === "audit"
-    ? options.models?.reviewer ?? model
-    : task.mode === "rewrite"
-    ? options.models?.inline ?? model
-    : task.documentProposalRequired
-      ? options.models?.writer ?? model
-      : model;
+  const executionModel = executionModelForTask(
+    task,
+    options.models ?? {},
+    model,
+    scenePipelineSettings.isolatedWriter,
+  );
   // Build execution prefix and tool profile once, then reuse both byte-for-byte
   // for every step in this job. Profiles are stable and project-agnostic.
   const stableSystemPrefix = buildStableSystemPrefix(

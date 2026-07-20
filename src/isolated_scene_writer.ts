@@ -12,6 +12,7 @@ export type IsolatedSceneWriterInput = {
   previousTail?: string;
   currentState?: SceneActualState;
   voiceSample?: string;
+  maximumCharacters?: number;
   strictMaximumCharacters?: number;
 };
 
@@ -48,10 +49,19 @@ export class IsolatedSceneRequestError extends Error {
   }
 }
 
-const ISOLATED_WRITER_SYSTEM = `你是中文小说正文作者。你只负责写眼前这一场戏，不参与规划、审查、状态管理或工具调用。
-人物依据此刻所知、误判、欲望与代价采取行动；对白用于现场中的索取、隐瞒、试探、拒绝或关系变化，不替读者复述双方共有知识。环境只在被人物注意、利用或妨碍行动时进入正文，不罗列感官。允许停顿、未说出口和读者自行判断，不在动作后补写意义总结。
-量化是人物筛选信息并作出选择的方式，不是叙述文体。每场最多保留一个会改变下一步行动的测量簇；其余参数写成可感后果或省略。不要展开技术原理、计算过程或连续状态播报。
-背景事实只约束写作，不代表必须在正文中提及。只输出可直接入稿的本场正文，不要标题、说明、清单、JSON 或代码围栏。`;
+const ISOLATED_WRITER_SYSTEM = `你是成熟的中文小说作者，只写眼前正在发生的这一场戏。你不参与规划、审查、状态管理或工具调用，也不向读者展示写作材料的结构。
+
+一场戏的生命不在信息量，而在压力如何改变选择。始终贴住视角人物此刻能注意到什么、误会什么、想得到什么、又不愿付出什么；让每个动作既处理眼前问题，也暴露人物。转折应由此前动作招致，意外发生后要让人回看时觉得早有迹象。关键瞬间可以放慢，过门、解释和重复过程应果断压缩。
+
+对白是人物对彼此采取的行动。人物会索取、遮掩、试探、拖延、转移、刺痛或让步，很少把双方已经知道的事实完整说出来。让答非所问、停顿、动作与措辞承担潜台词；不同人物应有不同的注意力、句法和回避方式。
+
+环境不是布景清单。只写那些被人物利用、躲避、误读，或会改变身体感受和下一步动作的细节。情绪不要先命名再证明，而要落在注意力偏移、动作时机、身体失误、过度克制和没有说出口的话里。允许读者比人物早一步或晚一步明白，允许段落在余波尚未解释时结束。
+
+具体事实要以证据和后果出现，不以维护报告、设定讲义或作者总结出现。量化可以是人物决策的工具，却不能成为叙述腔；每场最多保留一个真正改变选择的测量簇，其余参数改写为可感后果或省略。技术原理、计算过程和状态播报只有在当下行动非知道不可时才占用篇幅。
+
+输入中的场景目标、转折和事实有主次，不是待逐项改写的清单。合并能够由同一动作完成的内容，舍弃不影响本场变化的背景，让场景沿一条清楚的欲望与阻力线生长。声线样本只用于学习叙述距离、节奏和措辞，不借用其中的人物、意象或事件。
+
+只输出可直接入稿的本场正文，不要标题、说明、清单、JSON 或代码围栏。`;
 
 const STATE_EXTRACTOR_SYSTEM = `你是小说场景状态压缩器。根据 previousState 和 sceneContent，输出正文结束时、下一场仍需要的最小当前状态；nextScene 只用于相关性筛选，不是已经发生的事实。
 删除已被新状态覆盖、与下一场无关或可从正文尾部直接看出的旧记录；不要保存计算过程、装饰性读数、技术原理或事件复述。只有会约束后续行动的伤势、位置、所知、关系、目标和未决问题才保留。不得把计划、推测或未发生事项写成事实。
@@ -60,60 +70,88 @@ const STATE_EXTRACTOR_SYSTEM = `你是小说场景状态压缩器。根据 previ
 export function buildIsolatedSceneWriterMessages(
   input: IsolatedSceneWriterInput,
 ): Array<{ role: "system" | "user"; content: string }> {
-  const sections: string[] = [];
+  const sections: string[] = [
+    "请把下面的材料化成一场正在发生的小说，而不是一份被扩写的提纲。人物当下和局面变化决定场景，背景事实只在需要时约束它。",
+  ];
   const voiceSample = input.voiceSample?.trim().slice(-1_200);
   const previousTail = input.previousTail?.trim().slice(-800);
-  if (voiceSample) sections.push(`［声线样本］\n${voiceSample}`);
-  if (previousTail) sections.push(`［紧接前文］\n${previousTail}`);
+  if (voiceSample) {
+    sections.push(`先听准这段文字的呼吸、叙述距离和用词习惯；只学写法，不沿用其中的内容：\n\n${voiceSample}`);
+  }
+  if (previousTail) {
+    sections.push(`故事刚刚停在这里。不要复述，接住它留下的动作、语气和未完成的压力：\n\n${previousTail}`);
+  }
 
   const currentState = formatCurrentState(input.currentState);
-  if (currentState) sections.push(`［当前局面］\n${currentState}`);
+  if (currentState) {
+    sections.push(`进入这一场时，仍然有效的局面是：${currentState.replace(/\n/gu, "；")}。`);
+  }
 
-  const pressure = compactLines([
-    input.scene.goal,
+  const characterPressure = compactLines([
     ...input.scene.entryState,
     ...input.scene.characterIntent,
-    input.scene.obstacle,
     ...input.writePack.characterState,
-    input.writePack.sceneGoal,
-    input.writePack.narrativeBrief,
   ]);
-  if (pressure.length) sections.push(`［人物与现场压力］\n${bullets(pressure)}`);
+  const sceneGoal = compactLines([input.scene.goal, input.writePack.sceneGoal]);
+  sections.push(
+    `这场戏要处理的是${naturalClause(sceneGoal)}。真正挡在人物面前的是${naturalClause([input.scene.obstacle])}。`
+    + (characterPressure.length ? `人物带进现场的压力包括${naturalClause(characterPressure)}。` : ""),
+  );
+  if (input.writePack.narrativeBrief.trim()) {
+    sections.push(`还有一层必要语境：${input.writePack.narrativeBrief.trim()}。它只帮助理解现场，不要求逐句兑现。`);
+  }
 
-  const visibleChange = compactLines([
-    input.scene.turn,
-    input.scene.outcome,
-    ...input.writePack.mustLand,
-  ]);
-  if (visibleChange.length) {
-    sections.push(`［本场可见变化］\n${bullets(visibleChange)}\n这些变化须由行动、反应、证据或后果让读者看见；不要为了交代而让人物直接宣读。`);
+  sections.push(
+    `局面应在过程中被“${input.scene.turn}”推偏，最后落到“${input.scene.outcome}”。`
+    + "让读者从行动、反应、证据和后果中亲眼看见这次变化，不让人物替材料作总结。",
+  );
+  const mustLand = compactLines(input.writePack.mustLand);
+  if (mustLand.length) {
+    sections.push(`正文还需要自然留下这些可被读者察觉的事实：${naturalClause(mustLand)}。尽量让一个动作同时承担事实、关系和后果。`);
   }
 
   const silentFacts = compactLines(input.writePack.knownFacts);
   if (silentFacts.length) {
-    sections.push(`［背景事实·只作约束］\n${bullets(silentFacts)}\n除非人物在现场有说或想的理由，否则不必写进正文。`);
+    sections.push(`以下事情已经成立：${naturalClause(silentFacts)}。它们是边界，不是台词任务；现场没有理由提起时就让它们保持沉默。`);
   }
 
   const actionPossibilities = compactLines(input.writePack.beatOrder).slice(0, 6);
   if (actionPossibilities.length) {
-    sections.push(`［可用行动线索］\n${bullets(actionPossibilities)}\n只作为可能性，不必逐项执行或保持清单顺序。`);
+    sections.push(`动作可能沿着${naturalClause(actionPossibilities)}发展。这只是几条可能的路径，可以合并、改序或舍弃；因果与人物选择比材料顺序重要。`);
   }
 
   const forbidden = compactLines(input.writePack.doNotInvent);
-  if (forbidden.length) sections.push(`［不可擅自确定］\n${bullets(forbidden)}`);
+  if (forbidden.length) {
+    sections.push(`有些空白现在必须保留：${naturalClause(forbidden)}。不要替后文提前作答。`);
+  }
+  const voiceNotes = compactLines(input.writePack.voiceNotes);
+  if (voiceNotes.length) {
+    sections.push(`叙述时还请记住：${naturalClause(voiceNotes)}。这些提醒服从现场，不要把它们写成可见技巧。`);
+  }
 
   const target = input.scene.targetCharacters;
+  const maximumCharacters = input.strictMaximumCharacters
+    ?? input.maximumCharacters
+    ?? (target ? Math.floor(target * 2) : undefined);
   sections.push(target
-    ? `目标篇幅 ${Math.ceil(target * 0.85)}—${Math.floor(target * 1.2)} 字，最多 ${Math.floor(target * 1.5)} 字；场景变化完成后自然结束，不用解释、原理展开或回顾来凑字数。`
-    : "场景变化完成后自然结束，不用解释或回顾来凑篇幅。");
+    ? `篇幅大致落在 ${Math.ceil(target * 0.85)}—${Math.floor(target * 1.2)} 字${maximumCharacters ? `，绝不要超过 ${maximumCharacters} 字` : ""}。变化完成、余波抵达时就结束，不用解释、原理展开或回顾来填满篇幅。`
+    : "变化完成、余波抵达时就结束，不用解释或回顾来填满篇幅。");
   if (input.strictMaximumCharacters) {
-    sections.push(`上一次生成超长。本次正文不得超过 ${input.strictMaximumCharacters} 字；压缩原理说明、重复读数和不改变选择的过程，不得截断结尾。`);
+    sections.push(`上一次写得太长。这一次把枝节留在场外，正文不得超过 ${input.strictMaximumCharacters} 字；先压缩原理说明、重复读数和不改变选择的过程，但要给结尾留下完整余波。`);
   }
 
   return [
     { role: "system", content: ISOLATED_WRITER_SYSTEM },
     { role: "user", content: sections.join("\n\n") },
   ];
+}
+
+function naturalClause(values: string[]): string {
+  const clean = compactLines(values).map(value => `“${value}”`);
+  if (!clean.length) return "眼前尚未解决的事";
+  if (clean.length === 1) return clean[0];
+  if (clean.length === 2) return `${clean[0]}和${clean[1]}`;
+  return `${clean.slice(0, -1).join("、")}以及${clean.at(-1)}`;
 }
 
 export function buildSceneStateExtractionMessages(
@@ -145,8 +183,7 @@ export async function requestIsolatedScene(
     model: model.model,
     messages,
     stream: false,
-    temperature: model.temperature ?? 0.85,
-    ...(model.topP === undefined ? {} : { top_p: model.topP }),
+    ...isolatedSceneWriterSamplingOptions(model),
     max_tokens: isolatedSceneWriterMaxTokens(input),
   });
   logModelRequest(endpoint, body);
@@ -190,8 +227,18 @@ export async function requestIsolatedScene(
   return { content, ...(usage ? { usage } : {}), requestCharacters };
 }
 
+export function isolatedSceneWriterSamplingOptions(
+  model: Pick<ModelConfig, "temperature" | "topP">,
+): { temperature?: number; top_p?: number } {
+  return {
+    ...(model.temperature === undefined ? {} : { temperature: model.temperature }),
+    ...(model.topP === undefined ? {} : { top_p: model.topP }),
+  };
+}
+
 export function isolatedSceneWriterMaxTokens(input: IsolatedSceneWriterInput): number {
   const outputCharacters = input.strictMaximumCharacters
+    ?? input.maximumCharacters
     ?? input.scene.targetCharacters
     ?? 2_500;
   return Math.min(12_000, Math.max(2_400, Math.ceil(outputCharacters * 22 / 10)));
@@ -293,10 +340,6 @@ function formatCurrentState(state?: SceneActualState): string {
 
 function compactLines(values: string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
-}
-
-function bullets(values: string[]): string {
-  return values.map(value => `- ${value}`).join("\n");
 }
 
 function cleanPlainProse(raw: string): string {

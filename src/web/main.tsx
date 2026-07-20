@@ -2265,7 +2265,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -2283,7 +2283,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -4835,7 +4835,7 @@ function App() {
 
       {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
-        scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, isolatedWriter: false, candidateCount: 1 }}
+        scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
         request={api}
         onClose={() => setManagementView(null)}
         onChanged={() => { void refresh(state.sessionId); }}

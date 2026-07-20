@@ -28,6 +28,8 @@ export interface PeakBilling {
 }
 
 export interface TokenPricing {
+  /** 缺省为按量计费；非按量模式仍记录 token，但不累计调用费用。 */
+  billingMode?: "metered" | "unmetered";
   /** 平时（非高峰）单价：百万 tokens */
   cacheHit: number;
   cacheMiss: number;

@@ -8,6 +8,7 @@ import {
   buildSceneStateExtractionMessages,
   IsolatedSceneRequestError,
   isolatedSceneWriterMaxTokens,
+  isolatedSceneWriterSamplingOptions,
   parseSceneActualState,
 } from "./isolated_scene_writer.js";
 import { nonThinkingRequestOptions } from "./model_compat.js";
@@ -38,7 +39,7 @@ const pack: WritePack = {
   knownFacts: ["双方都读过委托书上的装甲参数"],
   mustLand: ["装甲实际厚度比旧参数高三成"],
   characterState: ["林岚仍在怀疑自己的计算"],
-  voiceNotes: [],
+  voiceNotes: ["对白简短，动作留白"],
   doNotInvent: ["不要确定委托方是否故意造假"],
   narrativeBrief: "",
   structured: true,
@@ -60,12 +61,18 @@ test("isolated scene writer receives only the current prose packet", () => {
   assert.equal(messages.length, 2);
   assert.equal(messages[0].role, "system");
   assert.equal(messages[1].role, "user");
-  assert.match(messages[0].content, /只负责写眼前这一场戏/u);
-  assert.match(messages[0].content, /背景事实只约束写作/u);
-  assert.match(messages[1].content, /背景事实·只作约束/u);
+  assert.match(messages[0].content, /只写眼前正在发生的这一场戏/u);
+  assert.match(messages[0].content, /压力如何改变选择/u);
+  assert.match(messages[0].content, /对白是人物对彼此采取的行动/u);
+  assert.match(messages[0].content, /环境不是布景清单/u);
+  assert.match(messages[0].content, /不是待逐项改写的清单/u);
+  assert.match(messages[1].content, /以下事情已经成立/u);
   assert.match(messages[1].content, /双方都读过委托书/u);
-  assert.match(messages[1].content, /不要为了交代而让人物直接宣读/u);
-  assert.match(messages[1].content, /只作为可能性，不必逐项执行/u);
+  assert.match(messages[1].content, /不是台词任务/u);
+  assert.match(messages[1].content, /可以合并、改序或舍弃/u);
+  assert.match(messages[1].content, /对白简短，动作留白/u);
+  assert.match(messages[1].content, /绝不要超过 800 字/u);
+  assert.doesNotMatch(messages[1].content, /［|^\s*[-•]\s/mu);
   assert.doesNotMatch(messages[1].content, /chapters\//u);
   assert.doesNotMatch(messages[1].content, /write_chapter_scene|actualState|styleFeedback|todo/iu);
   assert.ok(messages.reduce((sum, message) => sum + message.content.length, 0) < 4_000);
@@ -100,7 +107,13 @@ test("scene state extraction receives only bounded next-scene relevance fields",
 
 test("isolated requests reserve output room and disable thinking for state extraction", () => {
   assert.equal(isolatedSceneWriterMaxTokens({ scene, writePack: pack }), 2_400);
+  assert.equal(isolatedSceneWriterMaxTokens({ scene, writePack: pack, maximumCharacters: 3_000 }), 6_600);
   assert.equal(isolatedSceneWriterMaxTokens({ scene, writePack: pack, strictMaximumCharacters: 3_000 }), 6_600);
+  assert.deepEqual(isolatedSceneWriterSamplingOptions({}), {});
+  assert.deepEqual(isolatedSceneWriterSamplingOptions({ temperature: 0.85, topP: 0.9 }), {
+    temperature: 0.85,
+    top_p: 0.9,
+  });
   assert.deepEqual(nonThinkingRequestOptions({
     provider: "deepseek", baseUrl: "https://api.deepseek.com/v1",
   }), { thinking: { type: "disabled" } });
@@ -132,7 +145,8 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
       requireWritePack: true,
       requireScenePipeline: true,
       scenePipelineSettings: {
-        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5, isolatedWriter: true, candidateCount: 1,
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,
       },
       modelUsageReporter: (_model, _usage, meta) => usageKinds.push(meta.callKind),
       isolatedSceneWriter: {
@@ -152,7 +166,8 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
               "truncated",
             );
           }
-          assert.equal(input.strictMaximumCharacters, 600);
+          assert.equal(input.maximumCharacters, 800);
+          assert.equal(input.strictMaximumCharacters, 800);
           return {
             content,
             usage: { promptTokens: 300, completionTokens: 200, cacheHitTokens: 0, cacheMissTokens: 300 },

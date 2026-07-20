@@ -359,7 +359,7 @@ export const TOOLS = deepFreeze([
           sceneId: { type: "string" },
           notes: {
             type: "string",
-            description: "要点式故事内短笔记（上限 1500 字）：仅本场目标、人物当下、事件顺序、已知事实、须自然落地与勿擅自补写项，不写成段落长文",
+            description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
           content: { type: "string", description: "仅本场正文，不含任何 markdown 标题（正文标题与 ## 场景小标题由组装自动生成）" },
           actualState: {

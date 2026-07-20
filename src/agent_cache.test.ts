@@ -21,6 +21,7 @@ import {
   chapterContinuationPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
+  executionModelForTask,
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
@@ -51,7 +52,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "9187724adb97c4e8");
+  assert.equal(agentToolSchemaHash(), "6d0ca11ad0c513ce");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -303,6 +304,27 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   });
 });
 
+test("isolated prose keeps orchestration on Agent and delegates only prose to Writer", () => {
+  const model = (name: string) => ({
+    provider: "openai-compatible" as const,
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "test",
+    model: name,
+  });
+  const agent = model("agent");
+  const writer = model("writer");
+  const inline = model("inline");
+  const reviewer = model("reviewer");
+  const models = { agent, writer, inline, reviewer };
+  const writing = { mode: "write_scene" as const, documentProposalRequired: true };
+
+  assert.equal(executionModelForTask(writing, models, agent, true), agent);
+  assert.equal(executionModelForTask(writing, models, agent, false), writer);
+  assert.equal(executionModelForTask({ mode: "outline", documentProposalRequired: true }, models, agent, true), agent);
+  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent, true), inline);
+  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent, true), reviewer);
+});
+
 test("provider usage parsing and tagged persistence include hidden model calls", () => {
   assert.deepEqual(parseModelTokenUsage({
     prompt_tokens: 120,
@@ -403,6 +425,7 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(isolated, /不要生成 content 或 actualState/);
   assert.match(isolated, /不把风格统计或负面清单写进下一场 notes/);
   assert.doesNotMatch(isolated, /每场默认一次 write_chapter_scene：/);
+  assert.match(taskInstructions("write_scene", "deliver", "ask", true, true, 4_200), /4200 字/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);
   assert.match(instructions, /直接创建提案/);

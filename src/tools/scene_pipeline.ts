@@ -41,6 +41,10 @@ import {
   type ChapterStyleRepairIssue,
 } from "../chapter_style_repair.js";
 import type { ToolExecutionContext } from "./types.js";
+import {
+  DEFAULT_ISOLATED_WRITER_MAX_RATIO,
+  DEFAULT_SCENE_NOTES_CHARACTERS,
+} from "../agent_runtime.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
 import {
   proseStyleGateIssues,
@@ -176,7 +180,10 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
   const sceneId = requireString(input.sceneId, "sceneId");
   const notes = requireString(input.notes, "notes");
-  if (notes.length > 1_500) throw new Error("notes 过长（上限 1500 字）；只写本场目标、关键事实与事件顺序的要点清单，不要写成长文");
+  const notesMaxCharacters = context.scenePipelineSettings?.notesMaxCharacters ?? DEFAULT_SCENE_NOTES_CHARACTERS;
+  if (notes.length > notesMaxCharacters) {
+    throw new Error(`notes 过长（当前上限 ${notesMaxCharacters} 字）；只保留会约束本场正文的材料`);
+  }
   const writePack = formatWritePackForWriter(compileWritePack(notes, { targetPath: draft.path }));
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const submitted = requireString(input.content, "content");
@@ -205,7 +212,10 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
     throw new Error(`必须按场景链顺序写作；下一场应为 ${draft.scenes[draft.completed.length]?.id ?? "（已完成）"}`);
   }
   const notes = requireString(input.notes, "notes");
-  if (notes.length > 1_500) throw new Error("notes 过长（上限 1500 字）；只保留本场人物、压力、事实与可见变化");
+  const notesMaxCharacters = context.scenePipelineSettings.notesMaxCharacters ?? DEFAULT_SCENE_NOTES_CHARACTERS;
+  if (notes.length > notesMaxCharacters) {
+    throw new Error(`notes 过长（当前上限 ${notesMaxCharacters} 字）；只保留会约束本场正文的材料`);
+  }
   const compiled = compileWritePack(notes, { targetPath: draft.path });
   const formatted = formatWritePackForWriter(compiled);
   if (!formatted.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
@@ -213,13 +223,15 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
   const previous = sceneIndex > 0 ? draft.completed[sceneIndex - 1] : undefined;
   const runner = context.isolatedSceneWriter.run ?? requestIsolatedScene;
   const targetCharacters = draft.scenes[sceneIndex].targetCharacters;
-  const maximumCharacters = targetCharacters ? Math.floor(targetCharacters * 1.5) : undefined;
+  const writerMaxRatio = context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO;
+  const maximumCharacters = targetCharacters ? Math.floor(targetCharacters * writerMaxRatio) : undefined;
   const writerInput = {
     scene: draft.scenes[sceneIndex],
     writePack: compiled,
     previousTail: previous?.content.slice(-800),
     currentState: previous?.actualState,
     voiceSample: chapterIsolatedVoiceSample({ project, store, context }, draft),
+    maximumCharacters,
   };
   const runWriter = async (strictMaximumCharacters?: number) => {
     const callKind = strictMaximumCharacters ? "isolated_scene_writer_length_retry" : "isolated_scene_writer";

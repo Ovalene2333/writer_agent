@@ -6,11 +6,21 @@ import type { WriterProject } from "./project.js";
 export type PermissionMode = "ask" | "auto" | "plan";
 
 export const ABSOLUTE_MAX_SCENES = 8;
+export const MIN_SCENE_NOTES_CHARACTERS = 500;
+export const MAX_SCENE_NOTES_CHARACTERS = 8_000;
+export const DEFAULT_SCENE_NOTES_CHARACTERS = 3_000;
+export const MIN_ISOLATED_WRITER_MAX_RATIO = 1.2;
+export const MAX_ISOLATED_WRITER_MAX_RATIO = 3;
+export const DEFAULT_ISOLATED_WRITER_MAX_RATIO = 2;
 
 export interface ScenePipelineSettings {
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
+  /** Maximum Agent-authored scene packet size before compilation. */
+  notesMaxCharacters: number;
+  /** Hard prose ceiling relative to each scene's targetCharacters. */
+  isolatedWriterMaxRatio: number;
   /** Experimental prose-only model call with a separate state extraction pass. */
   isolatedWriter: boolean;
   /**
@@ -70,6 +80,8 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
     maxScenes: 5,
+    notesMaxCharacters: DEFAULT_SCENE_NOTES_CHARACTERS,
+    isolatedWriterMaxRatio: DEFAULT_ISOLATED_WRITER_MAX_RATIO,
     isolatedWriter: false,
     candidateCount: 1,
   },
@@ -98,7 +110,17 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
     ? Math.min(MAX_SCENE_CANDIDATES, Math.max(1, Number(value?.candidateCount)))
     : DEFAULT_SETTINGS.scenePipeline.candidateCount;
   const isolatedWriter = value?.isolatedWriter === true;
-  return { preferredMinScenes, preferredMaxScenes, maxScenes, isolatedWriter, candidateCount };
+  const notesMaxCharacters = Number.isInteger(value?.notesMaxCharacters)
+    ? Math.min(MAX_SCENE_NOTES_CHARACTERS, Math.max(MIN_SCENE_NOTES_CHARACTERS, Number(value?.notesMaxCharacters)))
+    : DEFAULT_SETTINGS.scenePipeline.notesMaxCharacters;
+  const rawWriterRatio = Number(value?.isolatedWriterMaxRatio);
+  const isolatedWriterMaxRatio = Number.isFinite(rawWriterRatio)
+    ? Math.round(Math.min(MAX_ISOLATED_WRITER_MAX_RATIO, Math.max(MIN_ISOLATED_WRITER_MAX_RATIO, rawWriterRatio)) * 10) / 10
+    : DEFAULT_SETTINGS.scenePipeline.isolatedWriterMaxRatio;
+  return {
+    preferredMinScenes, preferredMaxScenes, maxScenes,
+    notesMaxCharacters, isolatedWriterMaxRatio, isolatedWriter, candidateCount,
+  };
 }
 
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {
