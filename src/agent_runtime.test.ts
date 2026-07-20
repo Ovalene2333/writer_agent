@@ -185,7 +185,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     const project = WriterProject.init(root, "测试");
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "ask",
-      scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, candidateCount: 1 },
+      scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, isolatedWriter: false, candidateCount: 1 },
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
@@ -193,7 +193,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     });
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "plan",
-      scenePipeline: { preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6, candidateCount: 1 },
+      scenePipeline: { preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6, isolatedWriter: false, candidateCount: 1 },
     });
     // Experimental best-of-N switch: persisted, clamped to 1—3.
     saveAgentSettings(project, { scenePipeline: { candidateCount: 9 } });
@@ -201,6 +201,8 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     saveAgentSettings(project, { scenePipeline: { candidateCount: 2 } });
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 2);
     assert.equal(loadAgentSettings(project).scenePipeline.maxScenes, 6, "candidate patch must not reset scene counts");
+    saveAgentSettings(project, { scenePipeline: { isolatedWriter: true } });
+    assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriter, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

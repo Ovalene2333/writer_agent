@@ -9,6 +9,12 @@ import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
 import type { DocumentRevisionInput } from "../document_revision.js";
+import type {
+  IsolatedSceneWriterInput,
+  IsolatedSceneWriterResult,
+  SceneStateExtractionInput,
+  SceneStateExtractionResult,
+} from "../isolated_scene_writer.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -144,6 +150,31 @@ export type ToolExecutionContext = {
   sceneCandidates?: {
     model: ModelConfig;
     signal?: AbortSignal;
+  };
+  /** Opt-in prose-only scene generation followed by a separate state extraction call. */
+  isolatedSceneWriter?: {
+    model: ModelConfig;
+    stateModel: ModelConfig;
+    signal?: AbortSignal;
+    run?: (
+      model: ModelConfig,
+      input: IsolatedSceneWriterInput,
+      signal?: AbortSignal,
+    ) => Promise<IsolatedSceneWriterResult>;
+    extractState?: (
+      model: ModelConfig,
+      input: SceneStateExtractionInput,
+      signal?: AbortSignal,
+    ) => Promise<SceneStateExtractionResult>;
+  };
+  /** One raw voice sample cached for the isolated writer during the chapter. */
+  isolatedSceneVoiceSample?: { forPath: string; text: string };
+  /** Complete prose retained when only isolated state extraction failed. */
+  isolatedPendingScene?: {
+    forPath: string;
+    sceneId: string;
+    content: string;
+    writerInputCharacters: number;
   };
   /**
    * Chapter-cached voice evidence for candidate rewrites: one exemplar window is

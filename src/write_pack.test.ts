@@ -211,7 +211,7 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
       requireWritePack: true,
       requireScenePipeline: true,
       scenePipelineSettings: {
-        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, candidateCount: 1,
+        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, isolatedWriter: false, candidateCount: 1,
       },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
@@ -354,6 +354,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     store = new WriterStore(project);
     const activeStore = store;
     const sessionId = activeStore.createSession("逐场写作");
+    const evolvingCharacter = activeStore.saveCharacter(emptyCharacter("学员"));
     const chapterReviewUsage: Array<{ model: string; callKind: string }> = [];
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
@@ -472,7 +473,21 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       summary: "新建第一章", chapterChange: "关系改变", reviewNotes: "已检查",
     })) as Record<string, unknown>;
     assert.match(String(beforeInspect.error), /inspect_chapter_draft/);
-    const inspectedRaw = await call("inspect_chapter_draft", { summary: "新建第一章" });
+    const inspectedRaw = await call("inspect_chapter_draft", {
+      summary: "新建第一章",
+      characterChanges: [{
+        characterId: evolvingCharacter.id,
+        reason: "正文中已经发生的变化",
+        changes: [
+          {
+            op: "upsert_story_state",
+            entry: { unanchored: true, label: "违规进入", description: "门禁转红后仍进入训练区" },
+          },
+          { op: "upsert_relationship", entry: { description: "缺少关系目标，应被隔离" } },
+          { op: "add_experience", entry: { label: "越过门禁", description: "在红灯下进入训练区" } },
+        ],
+      }],
+    });
     const inspected = JSON.parse(inspectedRaw) as Record<string, unknown>;
     assert.equal(inspected.status, "proposal_submitted");
     assert.equal(inspected.reviewCompleted, true);
@@ -480,9 +495,15 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(typeof inspected.contentCharacters, "number");
     assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
     assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
+    assert.equal((inspected.characterChangeWarnings as string[]).length, 1);
     assert.deepEqual(chapterReviewUsage, [], "single-scene chapters skip the cross-scene model review");
     const proposed = inspected.proposal as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
+    const storedProposal = activeStore.proposal(Number(proposed.proposalId));
+    assert.equal(storedProposal.characterChanges.length, 1);
+    assert.equal(storedProposal.characterChanges[0].changes.length, 2);
+    const normalizedState = storedProposal.characterChanges[0].changes.find(change => change.op === "upsert_story_state");
+    assert.equal((normalizedState?.entry as Record<string, unknown>).notes, "违规进入：门禁转红后仍进入训练区");
     assert.equal(project.documentExists("chapters/第一章.md"), false);
     assert.equal(context.chapterSceneDraft, undefined);
     assert.equal(context.completedChapterHandoff?.path, "chapters/第一章.md");
@@ -553,7 +574,7 @@ test("scene candidate sampling skips clean originals without extra model calls",
     const sessionId = activeStore.createSession("候选跳过");
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
-      scenePipelineSettings: { preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5, candidateCount: 2 },
+      scenePipelineSettings: { preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5, isolatedWriter: false, candidateCount: 2 },
       // Unreachable endpoint: the test fails with skipped=rewrite_error if a rewrite call is ever attempted.
       sceneCandidates: { model: { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "test" } },
     };

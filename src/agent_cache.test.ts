@@ -51,7 +51,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "a77addf7ec2e2cf5");
+  assert.equal(agentToolSchemaHash(), "9187724adb97c4e8");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -60,21 +60,26 @@ test("isolated chapter review carries the full draft once and returns bounded st
     sceneId: "arrival", title: "进入", plannedTurn: "门禁变红", plannedOutcome: "主角违规进入",
     actualState: { situation: ["主角违规进入"] },
   }];
-  const messages = buildChapterReviewMessages({ chapterGoal: "关系改变", content, scenes, context: "稳定项目约束" });
+  const proseSignals = { stats: { numericTokenDensityPer10k: 112 }, warnings: [] };
+  const messages = buildChapterReviewMessages({
+    chapterGoal: "关系改变", content, scenes, context: "稳定项目约束", proseSignals,
+  });
   assert.deepEqual(messages.map(message => message.role), ["system", "system", "user"]);
   assert.equal(messages[1].content, "稳定项目约束");
   assert.match(messages[2].content, /门禁灯由绿变红/u);
+  assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 
   const review = parseChapterReview(JSON.stringify({
     verdict: "revise",
     chapterChange: "主角从服从转为违规",
     reviewNotes: "结果与计划一致，但接缝需要补强。",
     issues: [{
-      severity: "blocker", kind: "seam", sceneId: "arrival",
-      evidence: ["门禁灯由绿变红。"], problem: "动作缺少直接后果", action: "在本场补出越界动作",
+      severity: "blocker", kind: "telemetry_pileup", sceneId: "arrival",
+      evidence: ["门禁灯由绿变红。"], problem: "读数堆砌遮蔽人物选择", action: "只保留改变行动的读数",
     }],
   }), new Set(["arrival"]), content);
   assert.equal(review.verdict, "revise");
+  assert.equal(review.issues[0].kind, "telemetry_pileup");
   assert.deepEqual(review.issues[0].evidence, ["门禁灯由绿变红。"]);
   assert.throws(() => parseChapterReview(JSON.stringify({
     verdict: "revise",
@@ -393,6 +398,11 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /禁止为句式问题重写整场/);
   assert.match(instructions, /禁止通读上一章全文/);
   assert.match(instructions, /工具内部完成 notes 编译/);
+  const isolated = taskInstructions("write_scene", "deliver", "ask", true, true);
+  assert.match(isolated, /每场只调用一次 write_chapter_scene/);
+  assert.match(isolated, /不要生成 content 或 actualState/);
+  assert.match(isolated, /不把风格统计或负面清单写进下一场 notes/);
+  assert.doesNotMatch(isolated, /每场默认一次 write_chapter_scene：/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);
   assert.match(instructions, /直接创建提案/);
@@ -460,6 +470,10 @@ test("scene continuation handoff carries seam tail, states and next card without
   assert.doesNotMatch(prompt, /钥匙句/);
   const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
   assert.ok(tailBlock.length > 0 && tailBlock.length < 1_000, `tail block out of bounds: ${tailBlock.length}`);
+  const isolatedPrompt = sceneContinuationPrompt(draft, { isolatedWriter: true });
+  assert.match(isolatedPrompt, /调用 write_chapter_scene/);
+  assert.match(isolatedPrompt, /只提交要点式 notes/);
+  assert.doesNotMatch(isolatedPrompt, /提交要点式 notes、正文与 actualState/);
 
   draft = writeChapterScene(draft, "s2", "教官在警报声里签下自己的名字。".repeat(10), {
     situation: ["违规被共同隐瞒"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],

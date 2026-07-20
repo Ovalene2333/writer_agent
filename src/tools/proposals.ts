@@ -1,5 +1,11 @@
 import type { AgentEvent, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
-import { characterChangeOpsHint, isCharacterChangeOp, normalizeCharacterChangeOp } from "../characters.js";
+import {
+  applyCharacterChanges,
+  characterChangeOpsHint,
+  isCharacterChangeOp,
+  normalizeCharacterChangeOp,
+  validateCharacters,
+} from "../characters.js";
 import { isScenePipelineDocument } from "../project.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
@@ -86,6 +92,91 @@ export function deferredCharacterChanges(value: unknown, characterScope?: number
     });
     return { characterId, reason, changes };
   });
+}
+
+export function tolerantDeferredCharacterChanges(
+  value: unknown,
+  store: WriterStore,
+  characterScope?: number[],
+): { changes: ProposalCharacterChange[]; warnings: string[] } {
+  if (value === undefined) return { changes: [], warnings: [] };
+  if (!Array.isArray(value)) return { changes: [], warnings: ["characterChanges 不是数组，已忽略角色演进"] };
+
+  let workingCharacters = store.characters();
+  const accepted = new Map<number, ProposalCharacterChange>();
+  const warnings: string[] = [];
+  for (const [rowIndex, raw] of value.slice(0, 8).entries()) {
+    let parsed: ProposalCharacterChange;
+    try {
+      parsed = deferredCharacterChanges([raw], characterScope)[0];
+    } catch (error) {
+      warnings.push(`characterChanges[${rowIndex}]：${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    let current = workingCharacters.find(character => character.id === parsed.characterId);
+    if (!current) {
+      warnings.push(`characterChanges[${rowIndex}]：角色 ${parsed.characterId} 不存在`);
+      continue;
+    }
+    const validOps: ProposalCharacterChange["changes"] = [];
+    for (const [changeIndex, change] of parsed.changes.entries()) {
+      const normalized = normalizeProposalCharacterChange(change);
+      const result = applyCharacterChanges(current, {
+        reason: parsed.reason,
+        changes: [normalized],
+      });
+      if (!result.applied.length || result.skipped.length) {
+        warnings.push(
+          `characterChanges[${rowIndex}].changes[${changeIndex}]：${result.skipped[0]?.reason ?? "未应用"}`,
+        );
+        continue;
+      }
+      const candidateCharacters = workingCharacters.map(character =>
+        character.id === current!.id ? result.character : character
+      );
+      try {
+        validateCharacters(candidateCharacters);
+      } catch (error) {
+        warnings.push(
+          `characterChanges[${rowIndex}].changes[${changeIndex}]：${error instanceof Error ? error.message : String(error)}`,
+        );
+        continue;
+      }
+      current = result.character;
+      workingCharacters = candidateCharacters;
+      validOps.push(normalized);
+    }
+    if (!validOps.length) continue;
+    const existing = accepted.get(parsed.characterId);
+    accepted.set(parsed.characterId, existing
+      ? {
+          ...existing,
+          reason: `${existing.reason}；${parsed.reason}`.slice(0, 400),
+          changes: [...existing.changes, ...validOps].slice(0, 12),
+        }
+      : { ...parsed, changes: validOps });
+  }
+  return { changes: [...accepted.values()], warnings: warnings.slice(0, 12) };
+}
+
+function normalizeProposalCharacterChange(
+  change: ProposalCharacterChange["changes"][number],
+): ProposalCharacterChange["changes"][number] {
+  if (normalizeCharacterChangeOp(String(change.op ?? "")) !== "upsert_story_state") return change;
+  const source = change.entry && typeof change.entry === "object" && !Array.isArray(change.entry)
+    ? change.entry as Record<string, unknown>
+    : change;
+  const hasStateContent = [source.location, source.physical, source.emotion, source.notes]
+    .some(value => typeof value === "string" && value.trim())
+    || [source.knowledge, source.beliefs, source.intentions, source.temporaryGoals]
+      .some(value => Array.isArray(value) && value.length > 0);
+  if (hasStateContent) return change;
+  const notes = [source.label, source.description]
+    .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+    .map(value => value.trim())
+    .join("：");
+  if (!notes) return change;
+  return { ...change, entry: { ...source, notes } };
 }
 
 export function maybeAutoAcceptProposal(

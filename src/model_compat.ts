@@ -20,3 +20,10 @@ export function thinkingRequestOptions(
 ): { thinking: { type: "enabled" } } | Record<string, never> {
   return isDeepSeekModel(model) ? { thinking: { type: "enabled" } } : {};
 }
+
+/** Keep deterministic extraction calls from spending their output budget on reasoning. */
+export function nonThinkingRequestOptions(
+  model: Pick<ModelConfig, "provider" | "baseUrl">,
+): { thinking: { type: "disabled" } } | Record<string, never> {
+  return isDeepSeekModel(model) ? { thinking: { type: "disabled" } } : {};
+}

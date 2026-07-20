@@ -3292,6 +3292,11 @@ button.agent-orb:focus-visible {
 .scene-settings-grid label > span { font-size: 12px; font-weight: 700; }
 .scene-settings-grid input { width: 100%; font-size: 20px; font-variant-numeric: tabular-nums; }
 .scene-settings-grid small { color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+.scene-experiment-toggle { display: flex; align-items: flex-start; gap: 11px; margin-top: 16px; padding: 13px 0; border-top: 1px solid var(--border-light); border-bottom: 1px solid var(--border-light); cursor: pointer; }
+.scene-experiment-toggle input { width: 17px; height: 17px; margin-top: 2px; accent-color: var(--accent); }
+.scene-experiment-toggle span { display: flex; flex: 1; flex-direction: column; gap: 4px; min-width: 0; }
+.scene-experiment-toggle strong { font-size: 13px; }
+.scene-experiment-toggle small { color: var(--text-faint); font-size: 11px; line-height: 1.5; }
 .scene-settings-summary { margin-top: 16px; padding: 11px 13px; border-radius: 10px; background: var(--accent-light); color: var(--accent); font-size: 12px; }
 .scene-settings-summary.invalid { background: var(--warn-light); color: var(--warn); }
 .scene-settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }

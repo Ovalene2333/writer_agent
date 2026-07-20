@@ -11,6 +11,8 @@ export interface ScenePipelineSettings {
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
+  /** Experimental prose-only model call with a separate state extraction pass. */
+  isolatedWriter: boolean;
   /**
    * Experimental best-of-N scene prose sampling: 1 = off (default);
    * 2–3 = per scene, request candidateCount-1 fact-preserving rewrites and keep
@@ -68,6 +70,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
     maxScenes: 5,
+    isolatedWriter: false,
     candidateCount: 1,
   },
 };
@@ -94,7 +97,8 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
   const candidateCount = Number.isInteger(value?.candidateCount)
     ? Math.min(MAX_SCENE_CANDIDATES, Math.max(1, Number(value?.candidateCount)))
     : DEFAULT_SETTINGS.scenePipeline.candidateCount;
-  return { preferredMinScenes, preferredMaxScenes, maxScenes, candidateCount };
+  const isolatedWriter = value?.isolatedWriter === true;
+  return { preferredMinScenes, preferredMaxScenes, maxScenes, isolatedWriter, candidateCount };
 }
 
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {

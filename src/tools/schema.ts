@@ -352,7 +352,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "write_chapter_scene",
-      description: "编译本场故事内笔记，并把正文与实际离场状态写入内存草稿；一次完成",
+      description: "写入一场章节草稿；隔离 Writer 模式只提交 notes，标准模式同时提交正文与状态",
       parameters: {
         type: "object",
         properties: {
@@ -377,7 +377,7 @@ export const TOOLS = deepFreeze([
             additionalProperties: false,
           },
         },
-        required: ["sceneId", "notes", "content", "actualState"],
+        required: ["sceneId", "notes"],
         additionalProperties: false,
       },
     },
@@ -697,7 +697,7 @@ export const TOOLS = deepFreeze([
           },
           changes: {
             type: "array",
-            description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,...}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
+            description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,location|physical|emotion|notes|knowledge|beliefs|intentions|temporaryGoals}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
             items: { type: "object", additionalProperties: true },
           },
         },

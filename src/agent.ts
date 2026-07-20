@@ -376,14 +376,14 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   return `当前任务：${task.label}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；规划器/会话推断不得冒充用户选择。
 
-${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentProposalRequired)}${reviewBlock}
+${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentProposalRequired, scenePipeline.isolatedWriter)}${reviewBlock}
 
 上下文：${contextInstruction[task.documentContext]}
 角色范围：${characterScopeInstruction}
 简易卡范围：${simpleCharacterScopeInstruction}
 写入：${documentInstruction}
 修改范围：${editScopeInstruction[task.editScope]}
-场景链参数：推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场；允许最多 ${scenePipeline.maxScenes} 场。按情节需要取值，不为达到推荐数拆场。
+场景链参数：推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场；允许最多 ${scenePipeline.maxScenes} 场。按情节需要取值，不为达到推荐数拆场。正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer 实验已启用" : "标准 Agent 内生成"}。
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
@@ -498,6 +498,10 @@ async function repairToolArgumentsWithModel(
 
 function isCharacterMutationTool(name: string): boolean {
   return name === "save_character" || name === "save_simple_character" || name === "apply_character_changes";
+}
+
+function isChapterSceneWriteTool(name: string): boolean {
+  return name === "write_chapter_scene";
 }
 
 function characterMutationDiagnostic(result: Record<string, unknown>): string {
@@ -820,6 +824,7 @@ export function taskInstructions(
   creativeDepth: CreativeDepth,
   permissionMode: PermissionMode,
   documentProposalRequired: boolean,
+  isolatedWriter = false,
 ): string {
   const pacing = creativePacing(creativeDepth);
   if (permissionMode === "plan") {
@@ -879,7 +884,9 @@ export function taskInstructions(
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单个正文任务只交付用户指定的章节或支线片段：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
 4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
+5. ${isolatedWriter
+    ? "按场景链顺序循环，每场只调用一次 write_chapter_scene：把本场人物当下、已知事实、可见变化、可用行动线索与不可擅自确定项整理为不超过 1500 字的故事内 notes；不要生成 content 或 actualState，工具会用隔离的纯文本 Writer 写正文，再从成稿独立提取状态。事实可以只作静默约束，不要把所有资料列成必须落地的信息。规划要点直接放进 notes，禁止先输出计划、宣告开写或更新内置清单。"
+    : "按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。"}改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。${isolatedWriter ? "隔离模式不把风格统计或负面清单写进下一场 notes；这些问题只由整章出口门禁处理。" : "begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。"}
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
 7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
@@ -1106,6 +1113,7 @@ export function chapterContinuationPrompt(parts: {
   todosText: string;
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
+  isolatedWriter?: boolean;
 }): string {
   const lines: string[] = [
     "上一份文档提案已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
@@ -1119,7 +1127,7 @@ export function chapterContinuationPrompt(parts: {
     lines.push(`上一章末场 actualState（人物与局面现状，续写以此为准）：${JSON.stringify(parts.handoff.finalActualState)}`);
   }
   lines.push(
-    "任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立场景链，再逐场 write_chapter_scene（要点式 notes+正文+actualState），整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。",
+    `任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立场景链，再逐场 write_chapter_scene（${parts.isolatedWriter ? "只提交要点式 notes" : "要点式 notes+正文+actualState"}），整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。`,
     parts.todosText,
   );
   return lines.join("\n");
@@ -1134,7 +1142,7 @@ export function chapterContinuationPrompt(parts: {
  */
 export function sceneContinuationPrompt(
   draft: ChapterSceneDraft,
-  extras: { styleFeedback?: string[]; stylePriorNotes?: string[] },
+  extras: { styleFeedback?: string[]; stylePriorNotes?: string[]; isolatedWriter?: boolean },
 ): string {
   const completedCount = draft.completed.length;
   const next = draft.scenes[completedCount];
@@ -1160,10 +1168,13 @@ export function sceneContinuationPrompt(
     lines.push(`styleFeedback（对已写正文的机器统计，写下一场必须遵守）：${extras.styleFeedback.join("；")}`);
   }
   if (next) {
+    const submission = extras.isolatedWriter
+      ? "在同一调用中只提交要点式 notes；隔离 Writer 会生成正文并独立提取 actualState"
+      : "在同一调用中提交要点式 notes、正文与 actualState";
     lines.push(
       `下一场场景卡：${JSON.stringify(next)}`,
       ...(remaining.length ? [`其后场景（暂不展开）：${JSON.stringify(remaining)}`] : []),
-      `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），在同一调用中提交要点式 notes、正文与 actualState；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
+      `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），${submission}；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
     );
   } else {
     lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft，并同时提供提案 summary 与已确认的 characterChanges；终审通过后工具会直接创建提案，不要再调用 propose_chapter_draft。");
@@ -1274,7 +1285,7 @@ export async function runAgent(options: {
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
   const artifactContext = recentArtifactsContext(store, sessionId, project, task);
-  const bootstrapContext = writingBootstrapContext(project, store, prompt, task);
+  const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
   const todosPrompt = turnTodos.length
     ? `当前对话任务清单（绑定本轮任务，非会话全局残留；可用 manage_todos 更新）：\n${formatTodosForPrompt(turnTodos)}`
     : undefined;
@@ -1289,7 +1300,11 @@ export async function runAgent(options: {
     exampleIds: task.exampleIds,
     preferredSample: preferredSample || undefined,
   };
-  const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
+  // In isolated-writer mode the Agent only prepares a compact scene packet; raw
+  // voice evidence belongs exclusively to the prose-only call.
+  const dynamicStyleContext = scenePipelineSettings.isolatedWriter && task.mode === "write_scene"
+    ? ""
+    : dynamicStyleGroundingPrompt(project, store, styleOptions);
   // Prefer cheap roles for prose snippet second pass (flash-class models).
   const adjudicatorModel = options.models?.inline
     ?? options.models?.summarizer
@@ -1358,6 +1373,18 @@ export async function runAgent(options: {
       signal,
       context: chapterReviewContext,
     },
+    ...(scenePipelineSettings.isolatedWriter
+      ? {
+          isolatedSceneWriter: {
+            model: options.models?.writer ?? executionModel,
+            stateModel: options.models?.inline
+              ?? options.models?.summarizer
+              ?? options.models?.reviewer
+              ?? model,
+            signal,
+          },
+        }
+      : {}),
     // Best-of-N scene sampling (experimental, off by default): rewrites use the
     // main writing model in a dedicated plain-text call, not the cheap adjudicator.
     ...(scenePipelineSettings && scenePipelineSettings.candidateCount > 1
@@ -1547,10 +1574,10 @@ export async function runAgent(options: {
             persistScenePipelineTodos(store, sessionId, "draft_started", emit);
             beginChapterSucceeded = true;
           }
-          if (!("error" in parsed) && call.name === "write_chapter_scene" && parsed.complete === true) {
+          if (!("error" in parsed) && isChapterSceneWriteTool(call.name) && parsed.complete === true) {
             persistScenePipelineTodos(store, sessionId, "draft_complete", emit);
           }
-          if (!("error" in parsed) && call.name === "write_chapter_scene"
+          if (!("error" in parsed) && isChapterSceneWriteTool(call.name)
             && (parsed.status === "written" || parsed.status === "revised")) {
             sceneWrittenFeedback = Array.isArray(parsed.styleFeedback)
               ? (parsed.styleFeedback as unknown[]).filter((item): item is string => typeof item === "string")
@@ -1612,6 +1639,7 @@ export async function runAgent(options: {
             content: sceneContinuationPrompt(toolContext.chapterSceneDraft, {
               styleFeedback: sceneWrittenFeedback,
               stylePriorNotes: toolContext.chapterStylePriorNotes,
+              isolatedWriter: scenePipelineSettings.isolatedWriter,
             }),
           });
           turnStart = messages.length;
@@ -1636,6 +1664,7 @@ export async function runAgent(options: {
             role: "user",
             content: chapterContinuationPrompt({
               todosText: formatTodosForPrompt(advanced.todos),
+              isolatedWriter: scenePipelineSettings.isolatedWriter,
               ...(latestProposal
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
                 : {}),
@@ -1658,6 +1687,8 @@ export async function runAgent(options: {
           toolContext.chapterSceneDraft = undefined;
           // Per-chapter scene-gate state: voice evidence and prior notes.
           toolContext.sceneStyleEvidence = undefined;
+          toolContext.isolatedSceneVoiceSample = undefined;
+          toolContext.isolatedPendingScene = undefined;
           toolContext.chapterStylePriorNotes = undefined;
           // Style verdicts are per-chapter sentences; stale entries only waste lookups.
           toolContext.proseVerdictCache = undefined;
@@ -1947,7 +1978,13 @@ export function restoreChapterDraftCheckpoint(
  * CACHE: miss-priced — never dump full outline prose or character cards here;
  * Step 1 tool reads remain the source of truth for actual content.
  */
-function writingBootstrapContext(project: WriterProject, store: WriterStore, prompt: string, task: WritingTask): string {
+function writingBootstrapContext(
+  project: WriterProject,
+  store: WriterStore,
+  prompt: string,
+  task: WritingTask,
+  scenePipeline: ScenePipelineSettings,
+): string {
   if (task.mode !== "write_scene" && task.mode !== "rewrite" && !task.continuation) return "";
   const chapterNum = parseChapterNumber(prompt) ?? parseChapterNumber(task.targetPath ?? "");
 
@@ -2016,7 +2053,7 @@ function writingBootstrapContext(project: WriterProject, store: WriterStore, pro
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
 - 需要人设：对 characterIndex 中的 id 调用 get_character（可带 sections；场景状态需传 outlineNodeId）。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
-- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? "先 begin_chapter_draft 按当前场景链参数建立因果场景链；章节与 side/ 支线片段都要逐场充分展开，每场根据最新 actualState 整理故事内 notes，并在一次 write_chapter_scene 中提交 notes、正文与 actualState；全文 inspect 后一次性提案。" : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
+- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? `先 begin_chapter_draft 按当前场景链参数建立因果场景链；章节与 side/ 支线片段都要逐场充分展开，每场根据最新 actualState 整理故事内 notes，并在一次 write_chapter_scene 中${scenePipeline.isolatedWriter ? "只提交 notes（隔离 Writer 生成正文与状态）" : "提交 notes、正文与 actualState"}；全文 inspect 后一次性提案。` : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
 - 单章正文的主要结构是 scene chain；outline 只作可选方向提示，不得扩展成其他章节任务。
 ${JSON.stringify({

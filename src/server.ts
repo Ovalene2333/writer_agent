@@ -610,6 +610,9 @@ export async function startWriterServer(options: {
         if (candidateCount !== undefined && (!Number.isInteger(candidateCount) || Number(candidateCount) < 1 || Number(candidateCount) > MAX_SCENE_CANDIDATES)) {
           return context.json({ error: `candidateCount 须为 1—${MAX_SCENE_CANDIDATES} 的整数（1 = 关闭候选采样）` }, 400);
         }
+        if (body.scenePipeline.isolatedWriter !== undefined && typeof body.scenePipeline.isolatedWriter !== "boolean") {
+          return context.json({ error: "isolatedWriter 必须是布尔值" }, 400);
+        }
       }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),

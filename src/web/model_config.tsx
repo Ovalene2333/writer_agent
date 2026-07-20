@@ -19,7 +19,13 @@ export type ProviderModel = { id: string; name: string; pricing: Pricing; temper
 export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
 export type ModelRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
-export type ScenePipelineSettings = { preferredMinScenes: number; preferredMaxScenes: number; maxScenes: number };
+export type ScenePipelineSettings = {
+  preferredMinScenes: number;
+  preferredMaxScenes: number;
+  maxScenes: number;
+  isolatedWriter: boolean;
+  candidateCount: number;
+};
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
@@ -251,6 +257,10 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
           <label><span>推荐最多场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/><small>模型默认在推荐区间内规划。</small></label>
           <label><span>允许最多场数</span><input type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>硬上限为 8；超过时 begin_chapter_draft 会拒绝。</small></label>
         </div>
+        <label className="scene-experiment-toggle">
+          <input type="checkbox" checked={sceneDraft.isolatedWriter} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriter: event.target.checked }))}/>
+          <span><strong>隔离正文 Writer（实验）</strong><small>主 Agent 只提交场景短笔记；正文使用独立纯文本调用生成，再由轻量模型提取离场状态。关闭时沿用现有场景写作。</small></span>
+        </label>
         <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"}>{sceneDraftValid ? `当前策略：推荐 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。` : "请确保：推荐最少 ≤ 推荐最多 ≤ 允许最多，且都在 1—8 之间。"}</div>
         <div className="scene-settings-actions"><button onClick={() => setSceneDraft(scenePipeline)} disabled={busy}>恢复当前值</button><button className="primary" onClick={() => void saveScenePipeline()} disabled={busy || !sceneDraftValid}>{busy ? "保存中…" : "保存场景链设置"}</button></div>
       </div>}
