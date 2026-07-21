@@ -513,16 +513,25 @@ export function executionModelForTask(
   task: Pick<WritingTask, "mode" | "documentProposalRequired">,
   models: AgentRoleModels,
   fallback: ModelConfig,
-  isolatedWriter: boolean,
 ): ModelConfig {
   if (task.mode === "audit") return models.reviewer ?? fallback;
   if (task.mode === "rewrite") return models.inline ?? fallback;
-  // Without an isolated Writer, prose is generated inside the outer tool call.
-  // Isolated mode keeps orchestration on Agent and delegates only prose to Writer.
-  if (task.mode === "write_scene" && task.documentProposalRequired && !isolatedWriter) {
-    return models.writer ?? fallback;
-  }
+  // Scene isolation changes how prose is produced, never which model orchestrates tools.
   return fallback;
+}
+
+export function executionModelForStep(
+  taskMode: WritingTaskMode,
+  agentModel: ModelConfig,
+  writerModel: ModelConfig | undefined,
+  isolatedWriter: boolean,
+  draft?: Pick<ChapterSceneDraft, "scenes" | "completed">,
+): ModelConfig {
+  if (taskMode === "write_scene" && !isolatedWriter && draft
+    && draft.completed.length < draft.scenes.length) {
+    return writerModel ?? agentModel;
+  }
+  return agentModel;
 }
 
 function isChapterSceneWriteTool(name: string): boolean {
@@ -1271,7 +1280,6 @@ export async function runAgent(options: {
     task,
     options.models ?? {},
     model,
-    scenePipelineSettings.isolatedWriter,
   );
   // Build execution prefix and tool profile once, then reuse both byte-for-byte
   // for every step in this job. Profiles are stable and project-agnostic.
@@ -1447,8 +1455,6 @@ export async function runAgent(options: {
   const toolCallCounts = new Map<string, number>();
   const isCharacterTask = task.mode === "character" || task.mode === "simple_character";
   const requiresCharacterMutation = isCharacterTask && permissionMode !== "plan";
-  // DeepSeek Thinking is fixed for the whole append-only tool job.
-  const jobThinkingOptions = thinkingRequestOptions(executionModel);
 
   try {
     // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
@@ -1461,23 +1467,31 @@ export async function runAgent(options: {
       const step = turn + 1;
       currentUsageStep = step;
       emit({ type: "step_start", step });
+      const stepModel = executionModelForStep(
+        task.mode,
+        executionModel,
+        options.models?.writer,
+        scenePipelineSettings.isolatedWriter,
+        toolContext.chapterSceneDraft,
+      );
+      const stepThinkingOptions = thinkingRequestOptions(stepModel);
       const requestComponents = buildRequestComponentUsage(messages, executionTools, 6, initialMessageCount);
-      const result = await streamCompletion(executionModel, messages, signal, (text) => {
+      const result = await streamCompletion(stepModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
       }, (text) => emit({ type: "text", text, channel: "reasoning" }), {
         tools: executionTools,
-        ...jobThinkingOptions,
+        ...stepThinkingOptions,
       });
       const ensureThinkingTranscriptCanContinue = () => {
-        if (isDeepSeekModel(executionModel) && "thinking" in jobThinkingOptions
-          && jobThinkingOptions.thinking.type === "enabled"
+        if (isDeepSeekModel(stepModel) && "thinking" in stepThinkingOptions
+          && stepThinkingOptions.thinking.type === "enabled"
           && !result.reasoningContent.trim()) {
           throw new Error(`DeepSeek Thinking 未返回 reasoning_content；当前结果已保留，但不能继续拼接下一次请求，请重试本任务${lastCharacterMutationDiagnostic ? `。本步工具诊断：${lastCharacterMutationDiagnostic}` : ""}`);
         }
       };
       if (result.usage) {
-        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step, "agent_step", options.jobId, requestComponents);
+        emitUsageEvent(emit, store, sessionId, stepModel, result.usage, step, "agent_step", options.jobId, requestComponents);
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });

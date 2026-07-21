@@ -22,6 +22,7 @@ import {
   compactCompletedToolCalls,
   compactRuntimeMessages,
   executionModelForTask,
+  executionModelForStep,
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
@@ -304,7 +305,7 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   });
 });
 
-test("isolated prose keeps orchestration on Agent and delegates only prose to Writer", () => {
+test("scene orchestration always stays on Agent regardless of Writer isolation", () => {
   const model = (name: string) => ({
     provider: "openai-compatible" as const,
     baseUrl: "https://api.example.com/v1",
@@ -318,11 +319,24 @@ test("isolated prose keeps orchestration on Agent and delegates only prose to Wr
   const models = { agent, writer, inline, reviewer };
   const writing = { mode: "write_scene" as const, documentProposalRequired: true };
 
-  assert.equal(executionModelForTask(writing, models, agent, true), agent);
-  assert.equal(executionModelForTask(writing, models, agent, false), writer);
-  assert.equal(executionModelForTask({ mode: "outline", documentProposalRequired: true }, models, agent, true), agent);
-  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent, true), inline);
-  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent, true), reviewer);
+  assert.equal(executionModelForTask(writing, models, agent), agent);
+  assert.equal(executionModelForTask({ mode: "outline", documentProposalRequired: true }, models, agent), agent);
+  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent), inline);
+  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), reviewer);
+});
+
+test("standard scene steps use Writer only while prose scenes remain pending", () => {
+  const model = (name: string) => ({ baseUrl: "https://api.example.com/v1", apiKey: "test", model: name });
+  const agent = model("agent");
+  const writer = model("writer");
+  const pending = { scenes: [{ id: "one" }], completed: [] } as unknown as Pick<import("./scene_pipeline.js").ChapterSceneDraft, "scenes" | "completed">;
+  const complete = { scenes: [{ id: "one" }], completed: [{ sceneId: "one" }] } as unknown as Pick<import("./scene_pipeline.js").ChapterSceneDraft, "scenes" | "completed">;
+
+  assert.equal(executionModelForStep("write_scene", agent, writer, false), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, false, pending), writer);
+  assert.equal(executionModelForStep("write_scene", agent, writer, false, complete), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, true, pending), agent);
+  assert.equal(executionModelForStep("outline", agent, writer, false, pending), agent);
 });
 
 test("provider usage parsing and tagged persistence include hidden model calls", () => {
