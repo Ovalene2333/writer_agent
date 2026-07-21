@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { emptyCharacter } from "./characters.js";
 import { OutlineStore } from "./outline.js";
-import { WriterProject } from "./project.js";
+import { orderedChapterPaths, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleInspectFile, handleListFiles, handleReadFile } from "./tools/files.js";
 import type { ToolHandlerArgs } from "./tools/types.js";
@@ -147,13 +147,17 @@ test("combined validation uses the proposed outline and restores outline metadat
   }
 });
 
-test("chapter file operations restore writer.yaml exactly on undo", () => {
+test("chapter file operations use filesystem paths without rewriting writer.yaml", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-change-set-config-"));
   try {
     const project = WriterProject.init(root, "config rollback");
+    assert.doesNotMatch(project.readRaw("writer.yaml"), /^chapters:/mu);
+    assert.equal(project.config().title, "config rollback");
+    project.writeRaw("writer.yaml", "title: config rollback\nlanguage: zh-CN\nchapters:\n  - 老版本/序章.md\n");
     project.writeRaw("chapters/chapter-002.md", "# Two\n");
-    project.registerChapter("chapters/chapter-002.md");
     const beforeConfig = project.readRaw("writer.yaml");
+    assert.match(project.export("md"), /# Two/);
+    assert.doesNotMatch(project.export("md"), /老版本/);
     const store = new WriterStore(project);
     const sessionId = store.createSession("config");
     const changeSet = store.createChangeSet(sessionId, "reorganize chapters", [
@@ -161,10 +165,11 @@ test("chapter file operations restore writer.yaml exactly on undo", () => {
       { operation: "move", path: "chapters/chapter-002.md", targetPath: "chapters/renamed.md" },
     ]);
     store.acceptChangeSet(changeSet.id);
-    assert.deepEqual(project.config().chapters, ["chapters/renamed.md"]);
+    assert.equal(project.readRaw("writer.yaml"), beforeConfig);
+    assert.deepEqual(orderedChapterPaths(project), ["chapters/renamed.md"]);
     store.undoChangeSet(changeSet.id);
     assert.equal(project.readRaw("writer.yaml"), beforeConfig);
-    assert.deepEqual(project.config().chapters, ["chapters/chapter-001.md", "chapters/chapter-002.md"]);
+    assert.deepEqual(orderedChapterPaths(project), ["chapters/chapter-001.md", "chapters/chapter-002.md"]);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

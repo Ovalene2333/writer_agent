@@ -1,7 +1,6 @@
 export interface WriterConfig {
   title: string;
   language: string;
-  chapters: string[];
   style?: string;
 }
 

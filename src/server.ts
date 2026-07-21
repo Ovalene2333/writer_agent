@@ -371,7 +371,6 @@ export async function startWriterServer(options: {
       if (options.project.documentExists(path)) throw new Error("文档已存在");
       const content = body.content?.trim() || "# 新文档\n\n";
       options.project.writeRaw(path, content);
-      options.project.registerChapter(path);
       options.store.reindex();
       return context.json({ ok: true, path, hash: options.project.hash(content) });
     } catch (error) {

@@ -1564,11 +1564,10 @@ export class WriterStore {
     }
   }
 
-  private writeManagedTextFile(path: string, content: string): void {
-    if (path.toLowerCase().endsWith(".md")) {
-      this.project.writeRaw(path, content);
-      this.project.registerChapter(path);
-    } else this.project.writeTextFile(path, content);
+    private writeManagedTextFile(path: string, content: string): void {
+      if (path.toLowerCase().endsWith(".md")) {
+        this.project.writeRaw(path, content);
+      } else this.project.writeTextFile(path, content);
   }
 
   private removeManagedTextFile(path: string): void {
@@ -1659,7 +1658,6 @@ export class WriterStore {
     }
     const evolved = this.evolveCharactersForProposal(proposal.path, proposal.summary, proposal.characterChanges);
     this.project.writeRaw(proposal.path, proposal.afterContent);
-    this.project.registerChapter(proposal.path);
     if (evolved.revisions.length) this.writeCharacters(evolved.characters);
     const now = new Date().toISOString();
     this.database.prepare(`
@@ -1730,7 +1728,6 @@ export class WriterStore {
     }
     if (characterRevisions.length) validateCharacters(restoredCharacters, this.outlineNodeIds());
     this.project.writeRaw(path, row.after_content as string);
-    this.project.registerChapter(path);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=0 WHERE id=?").run(row.id as number);
     this.reindex();
