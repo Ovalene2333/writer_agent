@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Columns3,
   Copy,
+  Download,
   Drama,
   Eye,
   EyeOff,
@@ -594,6 +595,15 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
     if (await failoverFrom(getActiveBase())) return attempt();
     throw error;
   }
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function activeStepIndex(steps: StreamStep[]): number {
@@ -1600,6 +1610,7 @@ function App() {
     localStorage.getItem("writer-documents-collapsed") === "true",
   );
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [focusedExportBusy, setFocusedExportBusy] = useState(false);
   const [sessionBatchMode, setSessionBatchMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [messageVersionViews, setMessageVersionViews] = useState<Record<number, MessageVersionBundle>>({});
@@ -3050,6 +3061,24 @@ function App() {
     setManagementView("models");
   }
 
+  async function exportFocusedDocument() {
+    if (!activePath) return;
+    const path = activePath;
+    setFocusedExportBusy(true);
+    setError("");
+    try {
+      const content = browsingVersion?.afterContent
+        ?? (await api<DocumentData>(`/api/document?path=${encodeURIComponent(path)}`)).content;
+      const filename = path.split("/").at(-1) || "document.md";
+      downloadBlob(new Blob([content], { type: "text/markdown;charset=utf-8" }), filename);
+      setNotice(`已下载 ${filename}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setFocusedExportBusy(false);
+    }
+  }
+
   async function deleteCharacter(character: Character) {
     if (!confirm(`Delete character “${character.identity.name}”?`)) return;
     await api(`/api/characters/${character.id}`, { method: "DELETE" });
@@ -3396,6 +3425,11 @@ function App() {
               </div>
             )}
             <div className="editor-bar-actions">
+              {!editingDocument && (
+                <button disabled={!activePath || focusedExportBusy} onClick={() => void exportFocusedDocument()} title="下载当前正在浏览的 Markdown 文件">
+                  <Download size={14} />下载
+                </button>
+              )}
               {browsingVersion ? (
                 <button className="primary" onClick={exitVersionBrowse} title="回到磁盘上的当前版本">
                   返回当前
