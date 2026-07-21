@@ -95,7 +95,7 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *       handoff (chapterContinuationPrompt), so the next chapter stops paying the
  *       previous chapter's scene transcript every step.
  *    b) Scene boundary: after each successful write_chapter_scene, truncate back
- *       to the post-begin context base (prep reads + scene chain lock survive) and
+ *       to the post-begin context base (prep reads + initial scene guide survive) and
  *       append one compact handoff (sceneContinuationPrompt), so later scenes stop
  *       paying earlier scenes' full prose; inspect_chapter_draft reviews the
  *       assembled chapter in an isolated call and returns a compact report.
@@ -824,7 +824,7 @@ function extractSearchQueryHint(
 }
 
 function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolean): string[] {
-  if (mode === "write_scene") return ["核对本篇必要事实与衔接", "建立本篇场景链", "逐场写作并传递状态", "全文审阅并提交提案"];
+  if (mode === "write_scene") return ["核对本篇必要事实与衔接", "建立初始场景引导", "按成稿结果推进正文", "全文审阅并提交提案"];
   if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
   if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
   if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
@@ -918,12 +918,12 @@ export function taskInstructions(
 1. 对齐「风格锚定」+ 动态声线证据；禁止通用腔。
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单个正文任务只交付用户指定的章节或支线片段：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
-4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
+4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先用 1—3 句话确定“全文从什么局面走到什么局面”，随后调用 begin_chapter_draft 建立初始 scene guide。guide 只提供下一步方向，不是预先锁死的正文提纲；支线片段初始引导遵守当前推荐场数，每场 targetCharacters 不低于 2000，不为凑数拆场。
 5. ${isolatedWriter
-    ? `按场景链顺序循环，每场只调用一次 write_chapter_scene：把本场人物当下、已知事实、可见变化、可用行动线索与不可擅自确定项整理为不超过 ${notesMaxCharacters} 字的故事内 notes；不要生成 content 或 actualState，工具会用隔离的纯文本 Writer 写正文，再从成稿独立提取状态。事实可以只作静默约束，不要把所有资料列成必须落地的信息。规划要点直接放进 notes，禁止先输出计划、宣告开写或更新内置清单。`
-    : `按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，当前上限 ${notesMaxCharacters} 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。`}改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。${isolatedWriter ? "隔离模式不把风格统计或负面清单写进下一场 notes；这些问题只由整章出口门禁处理。" : "begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。"}
+    ? `每次 write_chapter_scene 只处理当前一场：根据真实上一场结尾、actualState 与当前创作判断，提交不超过 ${notesMaxCharacters} 字的故事内 notes；不要生成 content 或 actualState，工具会用隔离 Writer 写正文并从成稿提取状态。`
+    : `每次 write_chapter_scene 只处理当前一场：根据真实上一场结尾、actualState 与当前创作判断提交要点式故事内 notes（上限 ${notesMaxCharacters} 字）、正文与 actualState。正文不要包含 markdown 标题；actualState 必须从实际正文归纳，不得照抄 guide。`}每场完成后先判断实际结果：若原引导仍自然就继续；若人物选择、因果或节奏已经偏移，用 revise_chapter_scene_guide 一次性替换全部未写引导；若章节目标已自然抵达，将 remainingScenes 置空后进入终审。不要为了显示“Agent 感”频繁改计划，也不要为了服从旧 guide 扭曲成稿。改变既有事件、事实或离场状态时才重写前场；禁止为句式问题重写整场，纯句式修订用 revise_chapter_draft_style。相邻逐字复读由工具自动删重；styleDeferred 留到全文门禁精确修订。${isolatedWriter ? "隔离模式不把风格统计写进下一场 notes。" : "stylePriorNotes/styleFeedback 只用于抑制正文自我复读。"}
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
+7. 当 Agent 根据实际正文判断章节已经完成，确保没有未写 scene guide（必要时先 revise_chapter_scene_guide 清空），再调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案。若返回 blocker，只修正有证据的问题，禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再按需读取锚点及关联上下文。
@@ -1162,7 +1162,7 @@ export function chapterContinuationPrompt(parts: {
     lines.push(`上一章末场 actualState（人物与局面现状，续写以此为准）：${JSON.stringify(parts.handoff.finalActualState)}`);
   }
   lines.push(
-    `任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立场景链，再逐场 write_chapter_scene（${parts.isolatedWriter ? "只提交要点式 notes" : "要点式 notes+正文+actualState"}），整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。`,
+    `任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立初始 scene guide，再依据每场实际结果自主推进或调整未写引导，整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。`,
     parts.todosText,
   );
   return lines.join("\n");
@@ -1207,12 +1207,12 @@ export function sceneContinuationPrompt(
       ? "在同一调用中只提交要点式 notes；隔离 Writer 会生成正文并独立提取 actualState"
       : "在同一调用中提交要点式 notes、正文与 actualState";
     lines.push(
-      `下一场场景卡：${JSON.stringify(next)}`,
-      ...(remaining.length ? [`其后场景（暂不展开）：${JSON.stringify(remaining)}`] : []),
-      `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），${submission}；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
+      `当前 scene guide 的下一场：${JSON.stringify(next)}`,
+      ...(remaining.length ? [`当前其后引导：${JSON.stringify(remaining)}`] : []),
+      `先以真实结尾和 actualState 判断 guide 是否仍成立：成立则调用 write_chapter_scene（sceneId=${next.id}），${submission}；不成立则调用 revise_chapter_scene_guide 替换全部未写引导；章节目标已经抵达则清空 remainingScenes 后终审。不要输出计划说明或更新任务清单。`,
     );
   } else {
-    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft，并同时提供提案 summary 与已确认的 characterChanges；终审通过后工具会直接创建提案，不要再调用 propose_chapter_draft。");
+    lines.push("当前没有未写 scene guide。若章节目标已由实际正文完成，调用 inspect_chapter_draft 并同时提供提案 summary 与已确认的 characterChanges；若仍缺少必要变化，先 revise_chapter_scene_guide 增加下一场引导。");
   }
   return lines.join("\n");
 }
@@ -1615,6 +1615,9 @@ export async function runAgent(options: {
           }
           if (!("error" in parsed) && isChapterSceneWriteTool(call.name) && parsed.complete === true) {
             persistScenePipelineTodos(store, sessionId, "draft_complete", emit);
+          }
+          if (!("error" in parsed) && call.name === "revise_chapter_scene_guide" && parsed.status === "guide_revised") {
+            persistScenePipelineTodos(store, sessionId, parsed.complete === true ? "draft_complete" : "draft_reopened", emit);
           }
           if (!("error" in parsed) && isChapterSceneWriteTool(call.name)
             && (parsed.status === "written" || parsed.status === "revised")) {
@@ -2088,13 +2091,13 @@ function writingBootstrapContext(
   }
 
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
-- outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接建立本章场景链，禁止为了写正文创建大纲。
+- outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接建立初始 scene guide，禁止为了写正文创建大纲。
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
 - 需要人设：对 characterIndex 中的 id 调用 get_character（可带 sections；场景状态需传 outlineNodeId）。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
-- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? `先 begin_chapter_draft 按当前场景链参数建立因果场景链；章节与 side/ 支线片段都要逐场充分展开，每场根据最新 actualState 整理故事内 notes，并在一次 write_chapter_scene 中${scenePipeline.isolatedWriter ? "只提交 notes（隔离 Writer 生成正文与状态）" : "提交 notes、正文与 actualState"}；全文 inspect 后一次性提案。` : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
+- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? `先 begin_chapter_draft 建立可调整的初始 scene guide；每场根据实际结尾与 latest actualState 决定继续、调整剩余引导或收束，write_chapter_scene 中${scenePipeline.isolatedWriter ? "只提交 notes（隔离 Writer 生成正文与状态）" : "提交 notes、正文与 actualState"}；全文 inspect 后一次性提案。` : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
-- 单章正文的主要结构是 scene chain；outline 只作可选方向提示，不得扩展成其他章节任务。
+- scene guide 与 outline 都只是当前章节的方向提示；实际正文、人物选择和 actualState 优先，不得扩展成其他章节任务。
 ${JSON.stringify({
     requestedChapter: chapterNum,
     confidence: outlineNodes?.length || targetCandidates.length ? "matched" : "low",

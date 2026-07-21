@@ -53,7 +53,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "6d0ca11ad0c513ce");
+  assert.equal(agentToolSchemaHash(), "eb1981f0bfecf5b3");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -203,7 +203,7 @@ test("task tool profiles are frozen order-preserving allow-lists", () => {
   assert.ok(Object.isFrozen(write));
   assert.ok(writeNames.length < catalog.length);
   assert.deepEqual(writeNames, catalog.filter(name => writeNames.includes(name)));
-  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "inspect_chapter_draft", "propose_chapter_draft"]) {
+  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
   assert.equal(writeNames.includes("save_character"), false);
@@ -428,17 +428,16 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   const instructions = taskInstructions("write_scene", "deliver", "ask", true);
   assert.match(instructions, /begin_chapter_draft/);
   assert.match(instructions, /write_chapter_scene/);
+  assert.match(instructions, /revise_chapter_scene_guide/);
   assert.match(instructions, /revise_chapter_draft_style/);
-  assert.match(instructions, /每场默认一次 write_chapter_scene/);
+  assert.match(instructions, /每次 write_chapter_scene 只处理当前一场/);
   assert.match(instructions, /styleDeferred/);
   assert.match(instructions, /禁止为句式问题重写整场/);
   assert.match(instructions, /禁止通读上一章全文/);
-  assert.match(instructions, /工具内部完成 notes 编译/);
   const isolated = taskInstructions("write_scene", "deliver", "ask", true, true);
-  assert.match(isolated, /每场只调用一次 write_chapter_scene/);
+  assert.match(isolated, /每次 write_chapter_scene 只处理当前一场/);
   assert.match(isolated, /不要生成 content 或 actualState/);
-  assert.match(isolated, /不把风格统计或负面清单写进下一场 notes/);
-  assert.doesNotMatch(isolated, /每场默认一次 write_chapter_scene：/);
+  assert.match(isolated, /隔离模式不把风格统计写进下一场 notes/);
   assert.match(taskInstructions("write_scene", "deliver", "ask", true, true, 4_200), /4200 字/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);
@@ -447,7 +446,7 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /禁止 propose_document\/patch/);
   assert.match(instructions, /大纲不是章节写作的前置条件/);
   assert.match(instructions, /禁止 design_creative_outline/);
-  assert.match(instructions, /重心放在因果场景链/);
+  assert.match(instructions, /guide 只提供下一步方向/);
   assert.match(instructions, /side\/ 的支线片段/u);
 });
 
@@ -500,9 +499,10 @@ test("scene continuation handoff carries seam tail, states and next card without
   assert.match(prompt, /警报已触发/);
   assert.match(prompt, /"id":"s2"/);
   assert.match(prompt, /sceneId=s2/);
+  assert.match(prompt, /revise_chapter_scene_guide/);
   assert.match(prompt, /禁用段首起笔/);
   assert.match(prompt, /目光×8/);
-  assert.match(prompt, /禁止先用单独一步输出计划/);
+  assert.match(prompt, /不要输出计划说明/);
   // Only the bounded tail of the finished scene survives — never its full prose.
   assert.doesNotMatch(prompt, /钥匙句/);
   const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
@@ -516,7 +516,7 @@ test("scene continuation handoff carries seam tail, states and next card without
     situation: ["违规被共同隐瞒"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
   }).draft;
   const complete = sceneContinuationPrompt(draft, {});
-  assert.match(complete, /全部场景已写完/);
+  assert.match(complete, /当前没有未写 scene guide/);
   assert.match(complete, /inspect_chapter_draft/);
 });
 

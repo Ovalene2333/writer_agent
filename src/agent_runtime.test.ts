@@ -35,16 +35,18 @@ test("normalizeTodos enforces single in_progress", () => {
 
 test("scene pipeline milestones advance the built-in chapter todos without model bookkeeping", () => {
   const initial: AgentTodoItem[] = [
-    { id: "t1", content: "核对本章必要事实与衔接", status: "in_progress" },
-    { id: "t2", content: "建立本章场景链", status: "pending" },
-    { id: "t3", content: "逐场写作并传递状态", status: "pending" },
-    { id: "t4", content: "整章审阅并提交提案", status: "pending" },
+    { id: "t1", content: "核对本篇必要事实与衔接", status: "in_progress" },
+    { id: "t2", content: "建立初始场景引导", status: "pending" },
+    { id: "t3", content: "按成稿结果推进正文", status: "pending" },
+    { id: "t4", content: "全文审阅并提交提案", status: "pending" },
   ];
   const started = advanceScenePipelineTodos(initial, "draft_started");
   assert.equal(started.changed, true);
   assert.deepEqual(started.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
   const complete = advanceScenePipelineTodos(started.todos, "draft_complete");
   assert.deepEqual(complete.todos.map(item => item.status), ["completed", "completed", "completed", "in_progress"]);
+  const reopened = advanceScenePipelineTodos(complete.todos, "draft_reopened");
+  assert.deepEqual(reopened.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
 });
 
 test("scene pipeline milestones do not infer phases from custom todo wording", () => {

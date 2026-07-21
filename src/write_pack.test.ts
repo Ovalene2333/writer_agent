@@ -16,6 +16,7 @@ import {
   beginChapterSceneDraft,
   chapterSceneDraftComplete,
   reviseChapterDraftStyle,
+  reviseChapterSceneGuide,
   writeChapterScene,
 } from "./scene_pipeline.js";
 import { emptyCharacter } from "./characters.js";
@@ -199,7 +200,7 @@ test("chapter scene pipeline assembles causal scenes without writing partial doc
   );
 });
 
-test("side prose uses a multi-scene pipeline with meaningful length targets", async () => {
+test("side prose treats scene count and target length as guidance", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-side-scene-pipeline-"));
   let store: WriterStore | undefined;
   try {
@@ -229,27 +230,16 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
       targetCharacters: 2_000,
     });
 
-    const tooFew = JSON.parse(await call("begin_chapter_draft", {
-      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
-      scenes: [makeScene(1), makeScene(2)],
-    })) as Record<string, unknown>;
-    assert.match(String(tooFew.error), /至少需要 3 个/u);
-
-    const missingTarget = JSON.parse(await call("begin_chapter_draft", {
-      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
-      scenes: [makeScene(1), { ...makeScene(2), targetCharacters: undefined }, makeScene(3)],
-    })) as Record<string, unknown>;
-    assert.match(String(missingTarget.error), /targetCharacters/u);
-
     const begun = JSON.parse(await call("begin_chapter_draft", {
       path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
-      scenes: [makeScene(1), makeScene(2), makeScene(3)],
+      scenes: [{ ...makeScene(1), targetCharacters: undefined }],
     })) as Record<string, unknown>;
     assert.equal(begun.status, "started");
-    assert.equal(begun.sceneCount, 3);
-    assert.throws(() => writeChapterScene(
+    assert.equal(begun.sceneCount, 1);
+    const written = writeChapterScene(
       context.chapterSceneDraft!, "side-1", "她向城门走去。".repeat(30), actualState("她抵达城门"),
-    ), /明显低于目标 2000 字/u);
+    );
+    assert.equal(written.draft.completed.length, 1);
 
     const bypass = JSON.parse(await call("propose_document", {
       path: "side/arc-08.md", content: "试图绕过场景链。".repeat(30), summary: "支线片段",
@@ -259,6 +249,38 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
     store?.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Agent can reshape the unwritten scene guide without changing completed prose", () => {
+  let draft = beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
+    baseContent: "", baseHash: "empty", scenes: [sceneChain[0]], maxScenes: 5,
+  });
+  draft = writeChapterScene(
+    draft, "arrival", "门禁灯从绿变红。".repeat(20), actualState("主角进入训练区"),
+  ).draft;
+  const completedBefore = draft.completed[0];
+
+  const expanded = reviseChapterSceneGuide(draft, [{
+    ...sceneChain[1], id: "argument", title: "争执", goal: "两人公开冲突", handoff: "冲突引来教官",
+  }, {
+    ...sceneChain[1], id: "choice", title: "选择", goal: "主角作出选择", turn: "教官拒绝代为决定", outcome: "主角承担后果",
+  }], 5);
+  assert.equal(expanded.draft.completed[0], completedBefore);
+  assert.deepEqual(expanded.addedSceneIds, ["argument", "choice"]);
+  assert.deepEqual(expanded.removedSceneIds, []);
+  assert.equal(expanded.draft.scenes[1].id, "argument");
+  assert.equal(chapterSceneDraftComplete(expanded.draft), false);
+
+  const finished = reviseChapterSceneGuide(expanded.draft, [], 5);
+  assert.deepEqual(finished.removedSceneIds, ["argument", "choice"]);
+  assert.equal(chapterSceneDraftComplete(finished.draft), true);
+
+  const reopened = reviseChapterSceneGuide(finished.draft, [{
+    ...sceneChain[1], id: "aftermath", title: "余波", goal: "让选择产生即时后果",
+  }], 5);
+  assert.equal(reopened.draft.scenes.at(-1)?.id, "aftermath");
+  assert.equal(chapterSceneDraftComplete(reopened.draft), false);
 });
 
 test("revising an earlier scene invalidates dependent later scenes", () => {

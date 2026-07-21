@@ -312,7 +312,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "begin_chapter_draft",
-      description: "为章节或支线片段建立场景链与内存草稿；不写项目文件",
+      description: "为章节或支线片段建立可调整的初始 scene guide 与内存草稿；不写项目文件",
       parameters: {
         type: "object",
         properties: {
@@ -322,7 +322,7 @@ export const TOOLS = deepFreeze([
           chapterGoal: { type: "string", description: "全文结束后真正改变什么" },
           scenes: {
             type: "array", minItems: 1, maxItems: 8,
-            description: "有因果承接的场景链；数量遵循当前场景链设置，不为凑数拆场",
+            description: "初始场景引导；写作中可按实际结果调整，不是必须逐项照抄的提纲",
             items: {
               type: "object",
               properties: {
@@ -336,7 +336,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "本场直接结果" },
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "预计字数 200—8000；side/ 支线必填且至少 2000，正文低于目标 70% 会退回" },
+                targetCharacters: { type: "number", description: "预计字数 200—8000，仅作篇幅引导" },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -378,6 +378,43 @@ export const TOOLS = deepFreeze([
           },
         },
         required: ["sceneId", "notes"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "revise_chapter_scene_guide",
+      description: "根据已写正文与 actualState 替换所有未写场景引导；可增删、合并、改序或清空后终审",
+      parameters: {
+        type: "object",
+        properties: {
+          remainingScenes: {
+            type: "array", minItems: 0, maxItems: 8,
+            description: "新的剩余场景引导；不含已完成场景，空数组表示当前正文已经收束",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string", description: "本文内唯一短 id，不得与已完成场景重复" },
+                title: { type: "string", description: "内部场景名，不写入正文" },
+                goal: { type: "string", description: "当前判断下本场要完成的变化" },
+                entryState: { type: "array", items: { type: "string" }, description: "从 actualState 出发的入场局面" },
+                characterIntent: { type: "array", items: { type: "string" }, description: "人物各自诉求" },
+                obstacle: { type: "string", description: "直接阻力" },
+                turn: { type: "string", description: "可能的落空、代价或变化方向，不要求正文照抄" },
+                outcome: { type: "string", description: "预期结果；实际正文可以合理偏离" },
+                handoff: { type: "string", description: "可能如何交给下一场；末场可空" },
+                dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
+                targetCharacters: { type: "number", description: "预计字数 200—8000，仅作篇幅引导" },
+              },
+              required: ["id", "goal", "obstacle", "turn", "outcome"],
+              additionalProperties: false,
+            },
+          },
+          reason: { type: "string", description: "根据已写结果调整引导的简短原因" },
+        },
+        required: ["remainingScenes"],
         additionalProperties: false,
       },
     },
@@ -870,7 +907,7 @@ const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
     ...DOCUMENT_READ_TOOLS,
     "list_outline_nodes", "get_outline_node", "validate_outline",
     ...CHARACTER_READ_TOOLS, "apply_character_changes",
-    "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style",
+    "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style",
     "inspect_chapter_draft", "propose_chapter_draft",
     ...META_TOOLS,
   ],
@@ -907,7 +944,7 @@ const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
 const WRITE_TOOLS = new Set([
   "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
   "revise_document_isolated",
-  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
+  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
 ]);
 

@@ -51,16 +51,23 @@ export interface ProjectSkill {
   body: string;
 }
 
-export type ScenePipelineMilestone = "draft_started" | "draft_complete";
+export type ScenePipelineMilestone = "draft_started" | "draft_reopened" | "draft_complete";
 
 const DEFAULT_SCENE_PIPELINE_TODOS = [
+  "核对本篇必要事实与衔接",
+  "建立初始场景引导",
+  "按成稿结果推进正文",
+  "全文审阅并提交提案",
+] as const;
+
+const PREVIOUS_SCENE_PIPELINE_TODOS = [
   "核对本篇必要事实与衔接",
   "建立本篇场景链",
   "逐场写作并传递状态",
   "全文审阅并提交提案",
 ] as const;
 
-const PREVIOUS_SCENE_PIPELINE_TODOS = [
+const OLDER_SCENE_PIPELINE_TODOS = [
   "核对本章必要事实与衔接",
   "建立本章场景链",
   "逐场写作并传递状态",
@@ -313,11 +320,33 @@ export function advanceScenePipelineTodos(
   todos: AgentTodoItem[],
   milestone: ScenePipelineMilestone,
 ): { todos: AgentTodoItem[]; changed: boolean } {
-  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, PREVIOUS_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
+  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, PREVIOUS_SCENE_PIPELINE_TODOS, OLDER_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
     .map(contents => contents.map(content => todos.findIndex(item => item.content === content)))
     .find(indexes => indexes.every(index => index >= 0));
   if (!signature) return { todos, changed: false };
   const indexes = signature;
+  if (milestone === "draft_reopened") {
+    let changed = false;
+    const next = todos.map(item => ({ ...item }));
+    for (let phase = 0; phase < 2; phase += 1) {
+      const item = next[indexes[phase]];
+      if (item.status !== "completed" && item.status !== "cancelled") {
+        item.status = "completed";
+        changed = true;
+      }
+    }
+    const writing = next[indexes[2]];
+    if (writing.status !== "cancelled" && writing.status !== "in_progress") {
+      writing.status = "in_progress";
+      changed = true;
+    }
+    const review = next[indexes[3]];
+    if (review.status !== "cancelled" && review.status !== "pending") {
+      review.status = "pending";
+      changed = true;
+    }
+    return { todos: next, changed };
+  }
   const completedThrough = milestone === "draft_started" ? 1 : 2;
   const activeIndex = indexes[completedThrough + 1];
   let changed = false;

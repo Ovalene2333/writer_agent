@@ -47,6 +47,7 @@ import {
   handleInspectChapterDraft,
   handleProposeChapterDraft,
   handleReviseChapterDraftStyle,
+  handleReviseChapterSceneGuide,
   handleWriteChapterScene,
 } from "./scene_pipeline.js";
 import {
@@ -79,6 +80,7 @@ const HANDLERS: Record<string, Handler> = {
   compile_write_pack: handleCompileWritePack,
   begin_chapter_draft: handleBeginChapterDraft,
   write_chapter_scene: handleWriteChapterScene,
+  revise_chapter_scene_guide: handleReviseChapterSceneGuide,
   revise_chapter_draft_style: handleReviseChapterDraftStyle,
   inspect_chapter_draft: handleInspectChapterDraft,
   propose_chapter_draft: handleProposeChapterDraft,

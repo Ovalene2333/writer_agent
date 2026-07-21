@@ -35,6 +35,12 @@ export type ChapterDraftStyleEdit = {
   replace: string;
 };
 
+export type ChapterSceneGuideRevision = {
+  draft: ChapterSceneDraft;
+  addedSceneIds: string[];
+  removedSceneIds: string[];
+};
+
 export type ChapterSceneDraft = {
   path: string;
   mode: ChapterDraftMode;
@@ -103,10 +109,6 @@ export function writeChapterScene(
   }
   const trimmed = content.trim();
   if (trimmed.length < 80) throw new Error("场景正文过短；如果本场确实不产生局面变化，应合并而不是保留空壳场景");
-  const targetCharacters = draft.scenes[index].targetCharacters;
-  if (targetCharacters !== undefined && trimmed.length < Math.ceil(targetCharacters * 0.7)) {
-    throw new Error(`场景正文仅 ${trimmed.length} 字，明显低于目标 ${targetCharacters} 字；请补足行动、阻力、转折与结果后重提`);
-  }
   if (trimmed.length > MAX_SCENE_CHARACTERS) throw new Error(`单场正文超过 ${MAX_SCENE_CHARACTERS} 字，请收紧场景边界`);
   if (/^#{1,6}\s/mu.test(trimmed)) throw new Error("场景正文不要包含任何 markdown 标题；章节标题与每场的 ## 场景小标题（取场景卡 title）都由组装自动生成");
   const actualState = normalizeActualState(actualStateValue);
@@ -127,6 +129,49 @@ export function writeChapterScene(
     },
     invalidatedSceneIds,
     revised,
+  };
+}
+
+/**
+ * Replace only the unwritten scene guide. Completed prose remains the source of
+ * truth; the Agent may reshape what comes next as actual scene outcomes emerge.
+ */
+export function reviseChapterSceneGuide(
+  draft: ChapterSceneDraft,
+  remainingScenesValue: unknown,
+  maxScenes = DEFAULT_MAX_SCENES,
+): ChapterSceneGuideRevision {
+  if (!Array.isArray(remainingScenesValue)) throw new Error("remainingScenes 必须是数组");
+  const limit = Number.isInteger(maxScenes) ? Math.min(8, Math.max(1, maxScenes)) : DEFAULT_MAX_SCENES;
+  const completedCount = draft.completed.length;
+  if (completedCount + remainingScenesValue.length < 1) throw new Error("正文尚未写入，场景引导不能为空");
+  if (completedCount + remainingScenesValue.length > limit) {
+    throw new Error(`已完成场景与剩余引导合计不能超过 ${limit} 场`);
+  }
+
+  const completedCards = draft.scenes.slice(0, completedCount);
+  const previousPending = draft.scenes.slice(completedCount);
+  const remaining = remainingScenesValue.map((raw, index) => normalizeSceneCard(raw, completedCount + index));
+  const scenes = [...completedCards, ...remaining];
+  const ids = new Set(scenes.map(scene => scene.id));
+  if (ids.size !== scenes.length) throw new Error("已完成场景与剩余引导的 id 必须唯一");
+  const repeated = repeatedExactSceneFunctions(scenes);
+  if (repeated.length) throw new Error(`场景引导存在功能完全重复的场景：${repeated.join("、")}`);
+  for (let index = 0; index < remaining.length - 1; index += 1) {
+    if (!remaining[index].handoff) throw new Error(`remainingScenes[${index}].handoff 不能为空；须说明如何因果交给下一场`);
+  }
+
+  const previousIds = new Set(previousPending.map(scene => scene.id));
+  const nextIds = new Set(remaining.map(scene => scene.id));
+  return {
+    draft: {
+      ...draft,
+      scenes,
+      version: draft.version + 1,
+      inspectedVersion: undefined,
+    },
+    addedSceneIds: remaining.filter(scene => !previousIds.has(scene.id)).map(scene => scene.id),
+    removedSceneIds: previousPending.filter(scene => !nextIds.has(scene.id)).map(scene => scene.id),
   };
 }
 

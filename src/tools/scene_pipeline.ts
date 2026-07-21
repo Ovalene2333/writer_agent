@@ -1,4 +1,4 @@
-import { documentKind, isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
+import { isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
@@ -7,6 +7,7 @@ import {
   chapterSceneLedger,
   nextChapterScene,
   reviseChapterDraftStyle,
+  reviseChapterSceneGuide,
   sceneCardForTool,
   MAX_SCENE_CHARACTERS,
   writeChapterScene,
@@ -87,22 +88,6 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
   if (mode !== "create" && !exists) throw new Error(`${mode} 模式目标文档不存在`);
   const baseContent = exists ? project.read(path) : "";
   const scenes = Array.isArray(input.scenes) ? input.scenes : [];
-  if (documentKind(path) === "side") {
-    const settings = context.scenePipelineSettings;
-    const maxScenes = settings?.maxScenes ?? 5;
-    const minimumScenes = Math.min(maxScenes, Math.max(2, settings?.preferredMinScenes ?? 3));
-    if (scenes.length < minimumScenes) {
-      throw new Error(`side/ 支线片段至少需要 ${minimumScenes} 个因果承接场景；请按场景链设置充分展开，而不是压缩成单场`);
-    }
-    for (const [index, scene] of scenes.entries()) {
-      const target = scene && typeof scene === "object" && !Array.isArray(scene)
-        ? Number((scene as Record<string, unknown>).targetCharacters)
-        : NaN;
-      if (!Number.isInteger(target) || target < 2_000) {
-        throw new Error(`side/ 支线片段 scenes[${index}].targetCharacters 必须至少为 2000，以避免场景过短`);
-      }
-    }
-  }
   const draft = beginChapterSceneDraft({
     path,
     mode,
@@ -139,8 +124,8 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
     nextScene: sceneCardForTool(nextChapterScene(draft)),
     ...(stylePriorNotes.length ? { stylePriorNotes } : {}),
     message: (context.scenePipelineSettings?.isolatedWriter
-      ? "场景链已锁定并保存在内存草稿中。按顺序为每场调用一次 write_chapter_scene，只提交故事内 notes；正文与 actualState 由隔离调用生成。"
-      : "场景链已锁定并保存在内存草稿中。按顺序为每场调用一次 write_chapter_scene，同时提交故事内 notes、正文和 actualState。")
+      ? "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 只提交故事内 notes，正文与状态由隔离调用生成。"
+      : "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 提交故事内 notes、正文和状态。")
       + (stylePriorNotes.length ? " stylePriorNotes 是从既有正文统计出的高频表达负面清单，写每一场时遵守。" : ""),
   });
 }
@@ -194,6 +179,36 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
     writePackCharacters: writePack.length,
     toolName: "write_chapter_scene",
     exposeCandidateContent: true,
+  });
+}
+
+export function handleReviseChapterSceneGuide({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
+  assertWritableMode(context.permissionMode, "revise_chapter_scene_guide");
+  const draft = context.chapterSceneDraft;
+  if (!draft) throw new Error("当前没有章节场景草稿");
+  const remainingScenes = input.remainingScenes;
+  const result = reviseChapterSceneGuide(
+    draft,
+    remainingScenes,
+    context.scenePipelineSettings?.maxScenes,
+  );
+  context.chapterSceneDraft = result.draft;
+  context.writePackCompiled = false;
+  context.writePackSceneId = undefined;
+  context.lastWritePack = undefined;
+  saveDraftCheckpoint({ store, sessionId }, "guide_revised", result.draft);
+  const next = nextChapterScene(result.draft);
+  return JSON.stringify({
+    status: "guide_revised",
+    completedScenes: result.draft.completed.length,
+    totalScenes: result.draft.scenes.length,
+    addedSceneIds: result.addedSceneIds,
+    removedSceneIds: result.removedSceneIds,
+    nextScene: sceneCardForTool(next),
+    complete: chapterSceneDraftComplete(result.draft),
+    message: next
+      ? "剩余 scene guide 已更新；根据当前 actualState 决定是否写下一场，guide 是导航而非必须照抄的提纲。"
+      : "剩余 scene guide 已清空；正文以当前实际结果收束，可以调用 inspect_chapter_draft 终审。",
   });
 }
 
@@ -427,8 +442,8 @@ async function acceptChapterScene(args: {
     complete: chapterSceneDraftComplete(result.draft),
     message: [
       next
-        ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 ${args.toolName} 中提交新的 notes。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
-        : "全部场景已写完；调用 inspect_chapter_draft 做整章接缝、重复功能与总变化审阅。",
+        ? `当前 guide 的下一场为 ${next.id}；先根据本场 actualState 判断是继续该方向，还是 revise_chapter_scene_guide 调整剩余引导。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
+        : "当前没有未写 scene guide；章节目标已抵达则 inspect_chapter_draft，否则先补充下一场引导。",
       dedup.removed.length
         ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
         : "",
