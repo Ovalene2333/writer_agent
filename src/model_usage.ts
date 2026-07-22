@@ -45,6 +45,7 @@ export function buildRecordedUsageEvent(
   const cacheMissTokens = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
   const normalized = { ...usage, cacheMissTokens };
   const call: StepUsage = {
+    model: model.model,
     promptTokens: usage.promptTokens,
     completionTokens: usage.completionTokens,
     cacheHitTokens: usage.cacheHitTokens,

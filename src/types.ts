@@ -291,6 +291,8 @@ export interface RequestComponentUsage {
 }
 
 export interface StepUsage {
+  /** Actual provider model used for this call; aggregate values may say multiple models. */
+  model?: string;
   promptTokens: number;
   completionTokens: number;
   cacheHitTokens: number;

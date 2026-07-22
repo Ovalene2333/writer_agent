@@ -75,6 +75,7 @@ type Message = {
   role: string;
   content: string;
   channel?: "agent" | "roleplay";
+  roleplayPerception?: string;
   variantGroupId?: string;
   variantCount?: number;
 };
@@ -186,6 +187,7 @@ type Character = {
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StepUsage = {
+  model?: string;
   promptTokens: number;
   completionTokens: number;
   cacheHitTokens: number;
@@ -196,6 +198,7 @@ type StepUsage = {
   estimated?: boolean;
   cacheHitRate?: number;
   callBreakdown?: Array<{
+    model?: string;
     callKind: string;
     promptTokens: number;
     completionTokens: number;
@@ -616,6 +619,16 @@ function activeStepIndex(steps: StreamStep[]): number {
 }
 
 const STEP_TRAIL_STORAGE_KEY = "writer-agent-step-trails";
+const STEP_TRAIL_MAX_SESSIONS = 20;
+const STEP_TRAIL_MAX_TEXT_LENGTH = 24_000;
+const STEP_TRAIL_MAX_STORAGE_LENGTH = 2_500_000;
+
+function compactStepTrailText(value: string): string {
+  if (value.length <= STEP_TRAIL_MAX_TEXT_LENGTH) return value;
+  const tailLength = 5_000;
+  const headLength = STEP_TRAIL_MAX_TEXT_LENGTH - tailLength;
+  return `${value.slice(0, headLength)}\n\n[内容过长，已截断]\n\n${value.slice(-tailLength)}`;
+}
 
 function readStepTrailMap(): Record<string, StoredStepTrail> {
   try {
@@ -637,22 +650,43 @@ function loadStepTrail(sessionId: string): StoredStepTrail | null {
 
 function saveStepTrail(sessionId: string, messageId: number, steps: StreamStep[]): void {
   if (!sessionId || !steps.length) return;
-  // Only persist completed trails against real message ids (not optimistic temp ids).
-  if (!Number.isFinite(messageId) || messageId <= 0) return;
+  // Negative ids are optimistic anchors. Persist them too so a refresh during a job
+  // does not erase the trail before the server assigns the real message id.
+  if (!Number.isFinite(messageId) || messageId === 0) return;
   const map = readStepTrailMap();
   map[sessionId] = {
     sessionId,
     messageId,
-    steps: steps.map((step) => ({ ...step, expanded: false })),
+    steps: steps.map((step) => ({
+      ...step,
+      output: compactStepTrailText(step.output),
+      reasoning: compactStepTrailText(step.reasoning),
+      expanded: false,
+    })),
     updatedAt: new Date().toISOString(),
   };
-  // Cap stored sessions to avoid unbounded localStorage growth.
+  // Bound both session count and serialized size. Full model output can otherwise
+  // exceed the browser quota and make setItem fail without preserving this run.
   const entries = Object.entries(map).sort((a, b) => (b[1].updatedAt || "").localeCompare(a[1].updatedAt || ""));
-  const trimmed = Object.fromEntries(entries.slice(0, 40));
+  const kept = entries.slice(0, STEP_TRAIL_MAX_SESSIONS);
+  let serialized = JSON.stringify(Object.fromEntries(kept));
+  while (serialized.length > STEP_TRAIL_MAX_STORAGE_LENGTH && kept.length > 1) {
+    kept.pop();
+    serialized = JSON.stringify(Object.fromEntries(kept));
+  }
   try {
-    localStorage.setItem(STEP_TRAIL_STORAGE_KEY, JSON.stringify(trimmed));
+    localStorage.setItem(STEP_TRAIL_STORAGE_KEY, serialized);
   } catch {
-    /* quota / private mode */
+    // Other local data may consume the quota. Retry after evicting older trails.
+    while (kept.length > 1) {
+      kept.pop();
+      try {
+        localStorage.setItem(STEP_TRAIL_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)));
+        return;
+      } catch {
+        /* keep evicting */
+      }
+    }
   }
 }
 
@@ -724,6 +758,10 @@ function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?: boole
 function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
   const withUsage = steps.filter((step) => step.usage);
   if (!withUsage.length) return undefined;
+  const models = [...new Set(withUsage.flatMap(step =>
+    step.usage?.callBreakdown?.map(call => call.model).filter((model): model is string => Boolean(model))
+      ?? (step.usage?.model ? [step.usage.model] : []),
+  ))];
   const currency = withUsage.find((step) => step.usage!.cost > 0)?.usage?.currency
     ?? withUsage[0].usage!.currency
     ?? "CNY";
@@ -731,6 +769,7 @@ function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
   const measuredHits = measured.reduce((sum, step) => sum + (step.usage?.cacheHitTokens ?? 0), 0);
   const measuredMisses = measured.reduce((sum, step) => sum + (step.usage?.cacheMissTokens ?? 0), 0);
   return {
+    ...(models.length ? { model: models.length === 1 ? models[0] : "多个模型" } : {}),
     promptTokens: withUsage.reduce((sum, step) => sum + (step.usage?.promptTokens ?? 0), 0),
     completionTokens: withUsage.reduce((sum, step) => sum + (step.usage?.completionTokens ?? 0), 0),
     cacheHitTokens: withUsage.reduce((sum, step) => sum + (step.usage?.cacheHitTokens ?? 0), 0),
@@ -904,6 +943,15 @@ function Markdown({ content, className, headingPrefix }: { content: string; clas
       className={`markdown ${className ?? ""}`}
       dangerouslySetInnerHTML={{ __html: html || "<p></p>" }}
     />
+  );
+}
+
+function RoleplayPerceptionDetails({ content }: { content: string }) {
+  return (
+    <details className="roleplay-perception-details">
+      <summary>角色感知到的内容</summary>
+      <Markdown content={content} className="roleplay-perception-content" />
+    </details>
   );
 }
 
@@ -1333,7 +1381,9 @@ function FileTreeItem({
 
 function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => void }) {
   const label =
-    step.status === "running"
+    step.id === 0
+      ? "Planning"
+      : step.status === "running"
       ? `Step ${step.id}`
       : step.status === "failed"
         ? `Step ${step.id} failed`
@@ -1376,6 +1426,8 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               ? (
                 <>
                   本步 token{step.usage.estimated ? "（估算）" : ""}：
+                  总计 {step.usage.totalTokens.toLocaleString()}
+                  {" · "}
                   输入 {step.usage.promptTokens.toLocaleString()}
                   {" · "}输出 {step.usage.completionTokens.toLocaleString()}
                   {" · "}缓存 {step.usage.cacheHitTokens.toLocaleString()}
@@ -1389,20 +1441,39 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               )
               : "本步暂无 token 数据（供应商未返回 usage 且未能估算）"}
           </div>
-          {(step.usage?.callBreakdown?.length ?? 0) > 1 ? (
+          {step.usage && ((step.usage.callBreakdown?.length ?? 0) > 0 || step.usage.model) ? (
             <details className="agent-step-context-breakdown" open>
               <summary>模型调用明细</summary>
               <div className="agent-step-context-list">
-                {step.usage!.callBreakdown!.map((call, index) => {
+                {(step.usage.callBreakdown?.length
+                  ? step.usage.callBreakdown
+                  : [{
+                      model: step.usage.model,
+                      callKind: "本步汇总",
+                      promptTokens: step.usage.promptTokens,
+                      completionTokens: step.usage.completionTokens,
+                      cacheHitTokens: step.usage.cacheHitTokens,
+                      cacheMissTokens: step.usage.cacheMissTokens,
+                      cost: step.usage.cost,
+                      currency: step.usage.currency,
+                    }]).map((call, index) => {
                   const measured = call.cacheHitTokens + call.cacheMissTokens;
                   const rate = measured > 0 ? call.cacheHitTokens / measured : 0;
                   return (
-                    <div className="agent-step-context-row" key={`${call.callKind}-${index}`}>
-                      <span>{call.callKind}</span>
-                      <span>
-                        输入 {call.promptTokens.toLocaleString()} · 缓存 {(rate * 100).toFixed(1)}% · 输出 {call.completionTokens.toLocaleString()}
-                        {call.cost > 0 ? ` · ${call.currency === "CNY" ? "¥" : "$"}${call.cost.toFixed(6)}` : ""}
-                      </span>
+                    <div className="agent-step-context-row agent-step-model-call-row" key={`${call.model ?? "unknown"}-${call.callKind}-${index}`}>
+                      <div className="agent-step-model-call-heading">
+                        <strong title={call.model ?? "未知模型"}>{call.model ?? "未知模型"}</strong>
+                        <span>{call.callKind}</span>
+                      </div>
+                      <div className="agent-step-model-call-metrics">
+                        <span><small>总计</small>{(call.promptTokens + call.completionTokens).toLocaleString()}</span>
+                        <span><small>输入</small>{call.promptTokens.toLocaleString()}</span>
+                        <span><small>输出</small>{call.completionTokens.toLocaleString()}</span>
+                        <span><small>缓存</small>{call.cacheHitTokens.toLocaleString()} <em>{(rate * 100).toFixed(1)}%</em></span>
+                        {call.cost > 0
+                          ? <span><small>费用</small>{call.currency === "CNY" ? "¥" : "$"}{call.cost.toFixed(6)}</span>
+                          : null}
+                      </div>
                     </div>
                   );
                 })}
@@ -1555,6 +1626,7 @@ function WorkspaceTopbar({
 
 function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, callKind = "unspecified"): StepUsage {
   const nextCall = {
+    model: next.model,
     callKind,
     promptTokens: next.promptTokens,
     completionTokens: next.completionTokens,
@@ -1569,6 +1641,7 @@ function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, cal
   const cacheMissTokens = current.cacheMissTokens + next.cacheMissTokens;
   const estimated = Boolean(current.estimated || next.estimated);
   return {
+    model: current.model === next.model ? current.model : "多个模型",
     promptTokens: current.promptTokens + next.promptTokens,
     completionTokens: current.completionTokens + next.completionTokens,
     cacheHitTokens,
@@ -1689,12 +1762,24 @@ function App() {
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
+  const streamStepsRef = useRef<StreamStep[]>([]);
+  const streamStepsAnchorIdRef = useRef<number | null>(null);
   const sessionIdRef = useRef<string | undefined>(undefined);
   const todosCompletionRef = useRef({ sessionId: "", complete: false });
   const activePathRef = useRef(activePath);
   const editingDocumentRef = useRef(editingDocument);
   activePathRef.current = activePath;
   editingDocumentRef.current = editingDocument;
+  const updateStreamSteps = useCallback((update: React.SetStateAction<StreamStep[]>) => {
+    const current = streamStepsRef.current;
+    const next = typeof update === "function" ? update(current) : update;
+    streamStepsRef.current = next;
+    setStreamSteps(next);
+  }, []);
+  const updateStreamStepsAnchorId = useCallback((messageId: number | null) => {
+    streamStepsAnchorIdRef.current = messageId;
+    setStreamStepsAnchorId(messageId);
+  }, []);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const createInputRef = useRef<HTMLInputElement>(null);
   const fileSearchRef = useRef<HTMLInputElement>(null);
@@ -1790,8 +1875,8 @@ function App() {
     if (options?.clearStorage) {
       clearStepTrail(options.sessionId ?? sessionIdRef.current ?? "");
     }
-    setStreamSteps([]);
-    setStreamStepsAnchorId(null);
+    updateStreamSteps([]);
+    updateStreamStepsAnchorId(null);
     streamOutputRef.current = "";
   }, []);
 
@@ -1952,11 +2037,11 @@ function App() {
       setCollapsedAssistantIds(new Set());
       const trail = loadStepTrail(nextId);
       if (trail) {
-        setStreamSteps(restoreTrailSteps(trail));
-        setStreamStepsAnchorId(trail.messageId);
+        updateStreamSteps(restoreTrailSteps(trail));
+        updateStreamStepsAnchorId(trail.messageId);
       } else {
-        setStreamSteps([]);
-        setStreamStepsAnchorId(null);
+        updateStreamSteps([]);
+        updateStreamStepsAnchorId(null);
       }
       setNotice("");
       setError("");
@@ -1992,22 +2077,38 @@ function App() {
     if (streamSteps.length > 0) return;
     const trail = loadStepTrail(state.sessionId);
     if (!trail) return;
-    const messageStillExists = state.messages.some((msg) => msg.id === trail.messageId);
-    if (!messageStillExists) {
+    const messageStillExists = trail.messageId < 0 || state.messages.some((msg) => msg.id === trail.messageId);
+    // A paginated initial response may not include an older anchor yet. Only delete
+    // the trail when all messages are loaded and the positive id is truly gone.
+    if (!messageStillExists && !state.messagesHasMore) {
       clearStepTrail(state.sessionId);
       return;
     }
-    setStreamSteps(restoreTrailSteps(trail));
-    setStreamStepsAnchorId(trail.messageId);
-  }, [state?.sessionId, state?.messages, busy, streamSteps.length]);
+    updateStreamSteps(restoreTrailSteps(trail));
+    updateStreamStepsAnchorId(trail.messageId);
+  }, [state?.sessionId, state?.messages, state?.messagesHasMore, busy, streamSteps.length, updateStreamSteps]);
 
   // Persist live/completed steps locally (collapsed) for the current user message.
   useEffect(() => {
     const sessionId = state?.sessionId;
-    if (!sessionId || streamStepsAnchorId == null || streamStepsAnchorId <= 0) return;
+    if (!sessionId || streamStepsAnchorId == null || streamStepsAnchorId === 0) return;
     if (!streamSteps.length) return;
-    saveStepTrail(sessionId, streamStepsAnchorId, streamSteps);
+    const timer = window.setTimeout(() => {
+      saveStepTrail(sessionId, streamStepsAnchorId, streamSteps);
+    }, 400);
+    return () => window.clearTimeout(timer);
   }, [state?.sessionId, streamStepsAnchorId, streamSteps]);
+
+  useEffect(() => {
+    const persistBeforeUnload = () => {
+      const sessionId = sessionIdRef.current;
+      const anchorId = streamStepsAnchorIdRef.current;
+      if (!sessionId || anchorId == null || anchorId === 0 || !streamStepsRef.current.length) return;
+      saveStepTrail(sessionId, anchorId, streamStepsRef.current);
+    };
+    window.addEventListener("beforeunload", persistBeforeUnload);
+    return () => window.removeEventListener("beforeunload", persistBeforeUnload);
+  }, []);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -2200,7 +2301,7 @@ function App() {
 
   function handleAgentEvent(event: AgentStreamEvent) {
     if (event.type === "step_start") {
-      setStreamSteps((current) => {
+      updateStreamSteps((current) => {
         const id = event.step ?? current.length + 1;
         if (current.some((s) => s.id === id)) return current;
         // New steps stay collapsed; expand only on user click. Content still streams into state.
@@ -2209,7 +2310,7 @@ function App() {
     }
     if (event.type === "text" && event.text) {
       if (event.channel !== "reasoning") streamOutputRef.current += event.text;
-      setStreamSteps((current) => {
+      updateStreamSteps((current) => {
         const idx = activeStepIndex(current);
         if (idx < 0) return current;
         const key = event.channel === "reasoning" ? "reasoning" : "output";
@@ -2217,7 +2318,7 @@ function App() {
       });
     }
     if (event.type === "tool" && event.name) {
-      setStreamSteps((current) => {
+      updateStreamSteps((current) => {
         const idx = activeStepIndex(current);
         return current.map((s, i) => (i === idx ? { ...s, tools: [...s.tools, event.name!] } : s));
       });
@@ -2227,24 +2328,35 @@ function App() {
         setState((prev) => (prev ? { ...prev, usage: event.usage! } : prev));
       }
       if (event.call) {
-        setStreamSteps((current) => {
+        updateStreamSteps((current) => {
           const targetId = event.step;
           const idx = targetId != null
             ? current.findIndex((s) => s.id === targetId)
             : activeStepIndex(current);
-          if (idx < 0) return current;
+          if (idx < 0) {
+            if (targetId == null) return current;
+            return [...current, {
+              id: targetId,
+              output: "",
+              reasoning: "",
+              tools: [],
+              status: "completed" as const,
+              expanded: false,
+              usage: mergeStepCallUsage(undefined, event.call!, event.callKind),
+            }].sort((left, right) => left.id - right.id);
+          }
           return current.map((s, i) => (i === idx ? { ...s, usage: mergeStepCallUsage(s.usage, event.call!, event.callKind) } : s));
         });
       }
     }
     if (event.type === "step_done") {
-      setStreamSteps((current) =>
+      updateStreamSteps((current) =>
         current.map((s) => (s.id === event.step ? { ...s, status: "completed", expanded: false } : s)),
       );
     }
     if (event.type === "error") {
       setError(event.message || "Agent failed");
-      setStreamSteps((current) =>
+      updateStreamSteps((current) =>
         current.map((s) => (s.status === "running" ? { ...s, status: "failed", expanded: false } : s)),
       );
     }
@@ -2333,6 +2445,7 @@ function App() {
           const line = block.split(/\r?\n/).find((item) => item.startsWith("data:"));
           if (!line) continue;
           const event = JSON.parse(line.slice(5)) as AgentStreamEvent;
+          if (sessionIdRef.current !== sessionId) continue;
           handleAgentEvent(event);
           if (event.type === "proposal" && event.proposal) completedProposal = event.proposal;
           if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
@@ -2343,13 +2456,18 @@ function App() {
         if (done) break;
       }
       if (terminal) {
+        if (sessionIdRef.current !== sessionId) return;
         // Intentionally keep streamSteps so the tool trail stays visible after completion.
         // Re-anchor to the persisted user message id (temp negative ids are replaced by refresh).
         const next = await refresh(sessionId);
         const lastUser = [...next.messages]
           .reverse()
           .find((msg) => msg.role === "user" && msg.content.trim());
-        setStreamStepsAnchorId(lastUser?.id ?? null);
+        const anchorId = lastUser?.id ?? streamStepsAnchorIdRef.current;
+        updateStreamStepsAnchorId(anchorId);
+        if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
+          saveStepTrail(sessionId, anchorId, streamStepsRef.current);
+        }
         // Auto mode may have written the open document; reload so the editor matches disk.
         const pathToReload = activePathRef.current;
         if (pathToReload && !editingDocumentRef.current) {
@@ -2393,16 +2511,27 @@ function App() {
   }
 
   useEffect(() => {
-    const job = state?.activeJobs?.[0];
+    const currentSessionId = state?.sessionId;
+    const job = state?.activeJobs?.find(item => item.sessionId === currentSessionId);
     if (!job || currentJobRef.current === job.id) return;
-    setStreamSteps([]);
+    updateStreamSteps([]);
     streamOutputRef.current = "";
-    const lastUser = [...(state.messages ?? [])]
+    const lastUser = [...(state?.messages ?? [])]
       .reverse()
       .find((msg) => msg.role === "user" && msg.content.trim());
-    setStreamStepsAnchorId(lastUser?.id ?? null);
+    updateStreamStepsAnchorId(lastUser?.id ?? null);
     void subscribeAgentJob(job.id, job.sessionId);
-  }, [state?.activeJobs?.[0]?.id]);
+  }, [state?.sessionId, state?.activeJobs]);
+
+  useEffect(() => {
+    if (!state?.activeJobs?.length) return;
+    const timer = window.setInterval(() => {
+      void api<{ activeJobs: AgentJob[] }>("/api/chat/jobs")
+        .then(result => setState(current => current ? { ...current, activeJobs: result.activeJobs } : current))
+        .catch(() => undefined);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [Boolean(state?.activeJobs?.length)]);
 
   async function sendChat(options?: {
     text?: string;
@@ -2426,8 +2555,8 @@ function App() {
     setNotice("");
     // New turn replaces the previous trail for this session.
     clearStepTrail(state.sessionId);
-    setStreamSteps([]);
-    setStreamStepsAnchorId(tempMessageId);
+    updateStreamSteps([]);
+    updateStreamStepsAnchorId(tempMessageId);
     streamOutputRef.current = "";
     setState((value) =>
       value
@@ -2458,7 +2587,7 @@ function App() {
           .filter((card) => !agentHiddenCharacterCards.has(`simple:${card.id}`))
           .map((card) => card.id)
         : undefined;
-      const result = await api<{ jobId: string }>("/api/chat", {
+      const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           sessionId: state.sessionId,
@@ -2474,6 +2603,9 @@ function App() {
             : {}),
         }),
       });
+      setState(current => current
+        ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
+        : current);
       setComposerBranch(null);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
@@ -3008,12 +3140,12 @@ function App() {
     setError("");
     setNotice("");
     clearStepTrail(state.sessionId);
-    setStreamSteps([]);
+    updateStreamSteps([]);
     // No user bubble for an opening; anchor the live stream to a temp id so it renders via the orphan path.
-    setStreamStepsAnchorId(-Date.now());
+    updateStreamStepsAnchorId(-Date.now());
     streamOutputRef.current = "";
     try {
-      const result = await api<{ jobId: string }>("/api/chat", {
+      const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           sessionId: state.sessionId,
@@ -3026,6 +3158,9 @@ function App() {
           scene: roleplay.scene,
         }),
       });
+      setState(current => current
+        ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
+        : current);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -3105,6 +3240,7 @@ function App() {
   }
 
   function toggleSessionSelected(id: string) {
+    if (state?.activeJobs?.some(job => job.sessionId === id)) return;
     setSelectedSessionIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -3737,7 +3873,12 @@ function App() {
                   ? <p className="msg-preview">{messagePreview(displayContent)}</p>
                   : <Markdown content={displayContent} />
               ) : (
-                <div>{displayContent}</div>
+                <>
+                  <div>{displayContent}</div>
+                  {msg.channel === "roleplay" && msg.roleplayPerception
+                    ? <RoleplayPerceptionDetails content={msg.roleplayPerception} />
+                    : null}
+                </>
               )}
               {msg.id > 0 && <div className="message-actions">
                 {(msg.variantCount ?? 1) > 1 && (() => {
@@ -3771,7 +3912,7 @@ function App() {
                     key={step.id}
                     step={step}
                     onToggle={() =>
-                      setStreamSteps((current) =>
+                      updateStreamSteps((current) =>
                         current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
                       )
                     }
@@ -3800,7 +3941,7 @@ function App() {
                   key={`orphan-${step.id}`}
                   step={step}
                   onToggle={() =>
-                    setStreamSteps((current) =>
+                    updateStreamSteps((current) =>
                       current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
                     )
                   }
@@ -4775,9 +4916,12 @@ function App() {
                     <label className="session-batch-select-all">
                       <input
                         type="checkbox"
-                        checked={state.sessions.length > 0 && selectedSessionIds.size === state.sessions.length}
+                        checked={state.sessions.some(session => !state.activeJobs?.some(job => job.sessionId === session.id))
+                          && selectedSessionIds.size === state.sessions.filter(session => !state.activeJobs?.some(job => job.sessionId === session.id)).length}
                         onChange={(e) => {
-                          if (e.target.checked) setSelectedSessionIds(new Set(state.sessions.map((s) => s.id)));
+                          if (e.target.checked) setSelectedSessionIds(new Set(state.sessions
+                            .filter(session => !state.activeJobs?.some(job => job.sessionId === session.id))
+                            .map(session => session.id)));
                           else setSelectedSessionIds(new Set());
                         }}
                       />
@@ -4795,9 +4939,11 @@ function App() {
                   </div>
                 )}
                 <div className="session-list">
-                  {state.sessions.map((session) => (
+                  {state.sessions.map((session) => {
+                    const running = state.activeJobs?.some(job => job.sessionId === session.id) ?? false;
+                    return (
                     <div
-                      className={`session-card ${session.id === state.sessionId ? "active" : ""} ${selectedSessionIds.has(session.id) ? "selected" : ""}`}
+                      className={`session-card ${session.id === state.sessionId ? "active" : ""} ${selectedSessionIds.has(session.id) ? "selected" : ""} ${running ? "running" : ""}`}
                       key={session.id}
                     >
                       {sessionBatchMode && (
@@ -4805,6 +4951,7 @@ function App() {
                           <input
                             type="checkbox"
                             checked={selectedSessionIds.has(session.id)}
+                            disabled={running}
                             onChange={() => toggleSessionSelected(session.id)}
                           />
                         </label>
@@ -4829,14 +4976,16 @@ function App() {
                         <span>{new Date(session.updatedAt).toLocaleString()}</span>
                       </button>
                       {session.id === state.sessionId && <span className="current-badge">Current</span>}
+                      {running && <span className="session-running-badge"><span aria-hidden="true" />Running</span>}
                       {!sessionBatchMode && (
                         <>
                           <button className="icon" aria-label="重命名会话" title="重命名" onClick={() => void renameSession(session.id, session.title)}><Pencil size={15} /></button>
-                          <button className="icon danger" aria-label="删除会话" title="删除" onClick={() => void deleteSession(session.id)}><Trash2 size={15} /></button>
+                          <button className="icon danger" aria-label="删除会话" title={running ? "任务运行时不能删除" : "删除"} disabled={running} onClick={() => void deleteSession(session.id)}><Trash2 size={15} /></button>
                         </>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                   {state.sessions.length === 0 && <div className="management-empty">暂无会话</div>}
                 </div>
               </div>

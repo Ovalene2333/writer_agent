@@ -43,7 +43,7 @@ import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
-import { parseModelTokenUsage } from "./model_usage.js";
+import { buildRecordedUsageEvent, parseModelTokenUsage } from "./model_usage.js";
 import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
 import { buildChapterStyleRepairMessages, CHAPTER_STYLE_REPAIR_BATCH_SIZE, parseChapterStyleRepair } from "./chapter_style_repair.js";
 import { documentSpans } from "./document_spans.js";
@@ -366,6 +366,13 @@ test("provider usage parsing and tagged persistence include hidden model calls",
     const project = WriterProject.init(root, "用量");
     store = new WriterStore(project);
     const sessionId = store.createSession("用量");
+    const event = buildRecordedUsageEvent(store, sessionId, {
+      provider: "openai-compatible", baseUrl: "http://localhost", apiKey: "", model: "flash-model",
+    }, {
+      promptTokens: 12, completionTokens: 3, cacheHitTokens: 8, cacheMissTokens: 4,
+    }, { callKind: "planner", step: 0 });
+    assert.equal(event.type, "usage");
+    if (event.type === "usage") assert.equal(event.call?.model, "flash-model");
     store.recordUsage(sessionId, "flash", {
       promptTokens: 120, completionTokens: 30, cacheHitTokens: 80, cacheMissTokens: 40,
     }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:00Z"), {

@@ -344,6 +344,9 @@ export class WriterStore {
     if (!messageColumns.some(column => column.name === "variant_group_id")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN variant_group_id TEXT");
     }
+    if (!messageColumns.some(column => column.name === "roleplay_perception")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_perception TEXT");
+    }
     const variantColumns = this.database.prepare("PRAGMA table_info(message_variants)").all() as Row[];
     if (!variantColumns.some(column => column.name === "prompt")) {
       this.database.exec("ALTER TABLE message_variants ADD COLUMN prompt TEXT NOT NULL DEFAULT ''");
@@ -1160,6 +1163,23 @@ export class WriterStore {
       .run(sessionId, role, content, now, normalized, variantGroupId ?? null);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
     return Number(result.lastInsertRowid);
+  }
+
+  /** Persist the model-safe projection of a raw roleplay user turn. */
+  saveRoleplayPerception(sessionId: string, messageId: number, content: string): void {
+    const result = this.database.prepare(`UPDATE messages SET roleplay_perception=?
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .run(content.trim().slice(0, 8_000), sessionId, messageId);
+    if (!result.changes) throw new Error("角色扮演消息不存在");
+  }
+
+  roleplayPerception(sessionId: string, messageId: number): string | undefined {
+    const row = this.database.prepare(`SELECT roleplay_perception FROM messages
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .get(sessionId, messageId) as Row | undefined;
+    return typeof row?.roleplay_perception === "string" && row.roleplay_perception.trim()
+      ? row.roleplay_perception
+      : undefined;
   }
 
   messages(sessionId: string, limit = 30, options?: { channel?: MessageChannel }): Message[] {

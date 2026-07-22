@@ -15,14 +15,26 @@ import {
   formatRoleplayAntiFormulaSlot,
   formatRoleplayMemorySlot,
   formatRoleplayOocDirective,
+  formatRoleplayPerception,
+  formatRoleplayPerceptionForModel,
+  formatRoleplayPlayerTurn,
   formatRoleplaySummarySlot,
   isRoleplayExitCommand,
   isRoleplayOocInput,
+  parseRoleplayPerception,
+  parseStoredRoleplayPerception,
   ROLEPLAY_RECENT_MESSAGES,
+  ROLEPLAY_EPISTEMIC_MEMORY_VERSION,
   roleplayContextKey,
+  roleplayPerceptionForMemory,
   roleplayPerformerKey,
   roleplaySampling,
+  roleplaySummaryBatchDue,
+  renderRoleplayWirePresentation,
   slimRoleplayCharacterViews,
+  serializeRoleplayPerception,
+  storedRoleplayPerceptionForDisplay,
+  storedRoleplayPerceptionForModel,
   stripRoleplayOocMarker,
 } from "./roleplay.js";
 import { WriterStore } from "./store.js";
@@ -70,19 +82,17 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /简洁、略带吐槽/);
     assert.match(prompt, /不要修改项目文档/);
     assert.match(prompt, /第一人称/);
-    assert.match(prompt, /看不到写作 Agent/);
     assert.match(prompt, /"name": "终焉协议"/);
     assert.match(prompt, /"summary": "尚未掌握的禁忌能力"/);
     assert.match(prompt, /"notInPlay"/);
     assert.doesNotMatch(prompt, /"unlocked": false/);
     assert.doesNotMatch(prompt, /未解锁能力的秘密说明|绝密|秘密资源|秘密限制|秘密代价/);
     assert.match(prompt, /未透露姓名的来访者/);
-    assert.match(prompt, /实时对手戏，不是问答/);
-    assert.match(prompt, /写出潜台词/);
-    assert.match(prompt, /问句收尾是稀缺手段/);
-    assert.match(prompt, /把场景当成对手戏的一部分/);
-    assert.match(prompt, /禁止把「动作→对白/);
-    assert.match(prompt, /滚动事实摘要/);
+    assert.match(prompt, /只决定一件事/);
+    assert.match(prompt, /只选择一个真正影响她的点/);
+    assert.match(prompt, /不要引用、改写或概括玩家原句/);
+    assert.match(prompt, /具体数值只能引用上下文中已有的数值/);
+    assert.match(prompt, /通常只需一句台词或一个动作/);
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
     assert.match(prompt, /exampleHint/);
@@ -117,7 +127,11 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /对话者设定/);
     assert.match(prompt, /泛亚基地教官/);
     assert.match(prompt, /训练结束后的医务室/);
-    assert.match(prompt, /不要替用户决定动作、台词或内心/);
+    assert.match(prompt, /叙事权限只覆盖/);
+    assert.match(prompt, /不要替对话者、其他角色或世界决定/);
+    assert.match(prompt, /current_perception/);
+    assert.match(prompt, /不列问题清单/);
+    assert.match(prompt, /答案会立即改变角色下一步行动/);
   });
 
   test("exit command detection accepts common variants", () => {
@@ -156,12 +170,123 @@ describe("roleplay prompts", () => {
       "system", "system", "system", "system", "user", "assistant", "user",
     ]);
     assert.equal(messages[0].content, "STABLE");
-    assert.match(messages[1].content, /滚动事实摘要/);
-    assert.match(messages[1].content, /训练事故/);
-    assert.match(messages[2].content, /现场记忆卡/);
-    assert.match(messages[2].content, /已连续 3 轮/);
-    assert.match(messages[3].content, /本轮反公式/);
-    assert.equal(messages[6].content, "看着我。");
+    assert.match(messages[1].content, /滚动记忆路由/);
+    assert.doesNotMatch(messages[1].content, /训练事故/);
+    assert.match(messages[2].content, /现场记忆路由/);
+    assert.doesNotMatch(messages[2].content, /已连续 3 轮/);
+    assert.match(messages[3].content, /固定回合契约/);
+    assert.match(messages[6].content, /本轮角色可用动态上下文/);
+    assert.match(messages[6].content, /训练事故/);
+    assert.match(messages[6].content, /现场记忆卡/);
+    assert.match(messages[6].content, /已连续 3 轮/);
+    assert.match(messages[6].content, /当前玩家回合/);
+    assert.match(messages[6].content, /看着我。/);
+    assert.match(messages[6].content, /本轮动态演出提示/);
+    assert.match(messages[6].content, /本轮演出/);
+    assert.equal(roleplayPerceptionForMemory(messages[6].content), "看着我。");
+  });
+
+  test("all four system slots stay cache-stable while live context remains after history", () => {
+    const base = {
+      stablePrefix: "stable", summary: "", state: { scene: "", proximity: "", mood: "", openThreads: [], promises: [], revealed: [], relationshipDelta: "", beat: "", timeInScene: "" },
+      history: [{ role: "assistant" as const, content: "「好。」" }], userText: "继续",
+    };
+    const first = buildRoleplayChatMessages({ ...base, recentAssistantReplies: ["「好。」"] });
+    const second = buildRoleplayChatMessages({
+      ...base,
+      summary: "更早的回合已经变化",
+      state: { ...base.state, scene: "新的现场", beat: "转折" },
+      recentAssistantReplies: ["「真的吗？」"],
+    });
+    assert.deepEqual(first.slice(0, 4), second.slice(0, 4));
+    assert.deepEqual(first.slice(4, -1), second.slice(4, -1));
+    assert.notEqual(first.at(-1)?.content, second.at(-1)?.content);
+    assert.equal(roleplayPerceptionForMemory(first.at(-1)?.content ?? ""), "继续");
+    assert.equal(roleplayPerceptionForMemory(second.at(-1)?.content ?? ""), "继续");
+  });
+
+  test("rewinding to one branch point preserves the full prefix before the edited player turn", () => {
+    const base = {
+      stablePrefix: "stable",
+      summary: "已经建立的摘要",
+      state: { scene: "医务室", proximity: "一臂", mood: "警惕", openThreads: [], promises: [], revealed: [], relationshipDelta: "", beat: "试探", timeInScene: "片刻后" },
+      recentAssistantReplies: ["「说吧。」"],
+      history: [
+        { role: "user" as const, content: "你好。" },
+        { role: "assistant" as const, content: "「说吧。」" },
+      ],
+    };
+    const original = buildRoleplayChatMessages({ ...base, userText: "原来的回合" });
+    const edited = buildRoleplayChatMessages({ ...base, userText: "编辑后的回合" });
+    assert.deepEqual(original.slice(0, -1), edited.slice(0, -1));
+    const originalTurn = original.at(-1)?.content ?? "";
+    const editedTurn = edited.at(-1)?.content ?? "";
+    const originalMarker = originalTurn.indexOf("原来的回合");
+    const editedMarker = editedTurn.indexOf("编辑后的回合");
+    assert.ok(originalMarker > 0);
+    assert.equal(originalTurn.slice(0, originalMarker), editedTurn.slice(0, editedMarker));
+  });
+
+  test("player turn envelope separates declarations from performer knowledge", () => {
+    const framed = formatRoleplayPlayerTurn("我心里已经知道真相，悄悄藏起钥匙。『你猜。』");
+    assert.match(framed, /不是自动成立的世界状态/);
+    assert.match(framed, /内心、意图、回忆、隐藏行为/);
+    assert.match(framed, /动作结果仍须留白/);
+    assert.match(framed, /<player_turn>/);
+    assert.match(framed, /我心里已经知道真相/);
+  });
+
+  test("roleplay wire protocol renders action, dialogue, and OOC deterministically", () => {
+    const rendered = renderRoleplayWirePresentation([
+      "<action>我把杯子推到桌边。</action>",
+      "<dialogue>「先喝一点。」</dialogue>",
+      "<ooc>场景将在这里暂停。</ooc>",
+    ].join("\n"));
+    assert.equal(rendered.valid, true);
+    assert.equal(rendered.blocks.length, 3);
+    assert.match(rendered.markdown, /^\*我把杯子推到桌边。\*/);
+    assert.match(rendered.markdown, /「先喝一点。」/);
+    assert.match(rendered.markdown, /> OOC：场景将在这里暂停。/);
+    assert.doesNotMatch(rendered.markdown, /<action>|<dialogue>|<ooc>/);
+    assert.equal(renderRoleplayWirePresentation("没有协议的混合文本").valid, false);
+    assert.equal(renderRoleplayWirePresentation("<action>*她点点头。*</action>").markdown, "*她点点头。*");
+  });
+
+  test("Flash perception projection omits private content from the performer payload", () => {
+    const projection = parseRoleplayPerception(JSON.stringify({
+      speech: ["第一次见面？"],
+      observableActions: ["对话者把一件无法辨认的东西收进口袋（动作尝试）"],
+      perceivedEffects: [],
+      privateOmitted: true,
+      ambiguousOmitted: false,
+    }));
+    const displayPayload = formatRoleplayPerception(projection);
+    const performerPayload = formatRoleplayPerceptionForModel(projection);
+    assert.match(displayPayload, /可听见的话语/);
+    assert.match(performerPayload, /第一次见面/);
+    assert.match(performerPayload, /无法辨认的东西/);
+    assert.match(performerPayload, /current_perception/);
+    assert.doesNotMatch(performerPayload, /可听见的话语|可观察的动作|^- /m);
+    assert.doesNotMatch(performerPayload, /卧底|照片里的人|privateOmitted/);
+    const stored = serializeRoleplayPerception(projection);
+    assert.deepEqual(parseStoredRoleplayPerception(stored), projection);
+    assert.equal(storedRoleplayPerceptionForModel(stored), performerPayload);
+    assert.equal(storedRoleplayPerceptionForDisplay(stored), displayPayload);
+    assert.throws(() => parseRoleplayPerception('{"speech":[],"observableActions":[]}'), /字段不完整/);
+  });
+
+  test("perception projection exposes an opaque bodily effect without its hidden mechanism", () => {
+    const projection = parseRoleplayPerception(JSON.stringify({
+      speech: [],
+      observableActions: ["对话者开始按摩角色的手臂"],
+      perceivedEffects: ["角色感到身体逐渐放松、舒适感增强，但来源不明"],
+      privateOmitted: true,
+      ambiguousOmitted: false,
+    }));
+    const performerPayload = formatRoleplayPerceptionForModel(projection);
+    assert.match(performerPayload, /放松、舒适感增强/);
+    assert.match(performerPayload, /来源不明/);
+    assert.doesNotMatch(performerPayload, /调试器|多巴胺|内啡肽|override/);
   });
 
   test("context key isolates identity and scene revisions", () => {
@@ -171,9 +296,10 @@ describe("roleplay prompts", () => {
     const scene = { id: 4, name: "医务室", setting: "基地", premise: "训练后", tone: "克制", timelineAnchor: "第一幕", performerGoal: "", identityGoal: "", stakes: [], openingVariants: [], endConditions: [], loreBindings: [], revision: 1, createdAt: "", updatedAt: "" };
     assert.notEqual(roleplayContextKey(performer, first, scene), roleplayContextKey(performer, second, scene));
     assert.notEqual(roleplayContextKey(performer, first, scene), roleplayContextKey(performer, first, { ...scene, revision: 2 }));
+    assert.match(roleplayContextKey(performer, first, scene), new RegExp(`knowledge:v${ROLEPLAY_EPISTEMIC_MEMORY_VERSION}$`));
   });
 
-  test("memory slot carries scene, facts, and lore without adding a fifth system slot", () => {
+  test("dynamic tail carries scene, facts, and lore without adding a fifth system slot", () => {
     const scene = { id: 1, name: "雨夜重逢", setting: "旧港", premise: "三年后重逢", tone: "紧张", timelineAnchor: "第二卷后", performerGoal: "追问", identityGoal: "隐瞒", stakes: ["身份暴露"], openingVariants: [], endConditions: ["一方离场"], loreBindings: ["lore/旧港.md"], revision: 1, createdAt: "", updatedAt: "" };
     const messages = buildRoleplayChatMessages({
       stablePrefix: "stable", summary: "", state: { scene: "旧港", proximity: "", mood: "", openThreads: [], promises: [], revealed: [], relationshipDelta: "", beat: "", timeInScene: "" },
@@ -183,18 +309,19 @@ describe("roleplay prompts", () => {
       recentAssistantReplies: [], history: [], userText: "继续",
     });
     assert.equal(messages.filter(message => message.role === "system").length, 4);
-    assert.match(messages[2].content, /雨夜重逢/);
-    assert.match(messages[2].content, /答应天亮前离开/);
-    assert.match(messages[2].content, /旧港午夜封锁/);
+    assert.doesNotMatch(messages[2].content, /雨夜重逢/);
+    assert.match(messages.at(-1)?.content ?? "", /雨夜重逢/);
+    assert.match(messages.at(-1)?.content ?? "", /答应天亮前离开/);
+    assert.match(messages.at(-1)?.content ?? "", /旧港午夜封锁/);
   });
 
   test("empty summary and memory use stable placeholders", () => {
-    assert.equal(formatRoleplaySummarySlot(""), "滚动事实摘要：无。");
+    assert.equal(formatRoleplaySummarySlot(""), "角色可用的滚动记忆：无。");
     assert.match(formatRoleplayMemorySlot({
       scene: "", proximity: "", mood: "", openThreads: [], promises: [],
       revealed: [], relationshipDelta: "", beat: "", timeInScene: "",
     }), /现场记忆卡：无/);
-    assert.match(formatRoleplayAntiFormulaSlot([]), /本轮反公式/);
+    assert.match(formatRoleplayAntiFormulaSlot([]), /本轮演出/);
   });
 
   test("anti-formula extracts openings and repeated gestures", () => {
@@ -209,8 +336,9 @@ describe("roleplay prompts", () => {
     const slot = formatRoleplayAntiFormulaSlot([
       "（目光低垂）你到底想怎样？",
     ]);
-    assert.match(slot, /禁用开场|本轮反公式/);
-    assert.match(slot, /不要再用问题收束|问句/);
+    assert.match(slot, /本轮演出/);
+    assert.match(slot, /直接开口|沉默/);
+    assert.doesNotMatch(slot, /禁用开场|目光低垂/);
   });
 
   test("anti-formula escalates on question-end streak and hard-bans question marks", () => {
@@ -224,11 +352,11 @@ describe("roleplay prompts", () => {
       "「那你想去哪？」",
       "「真的吗？」",
     ]);
-    assert.match(slot, /禁止出现问号/);
+    assert.match(slot, /陈述、动作或留白/);
     // Single question-end stays at the soft warning.
     const soft = extractAntiFormulaHints(["「好。」", "「真的吗？」"]);
     assert.equal(soft.questionEndStreak, 1);
-    assert.doesNotMatch(formatRoleplayAntiFormulaSlot(["「好。」", "「真的吗？」"]), /禁止出现问号/);
+    assert.doesNotMatch(formatRoleplayAntiFormulaSlot(["「好。」", "「真的吗？」"]), /连续用问题/);
   });
 
   test("anti-formula nudges scene participation when recent replies lack environment", () => {
@@ -237,7 +365,7 @@ describe("roleplay prompts", () => {
       "（别过脸）「我没这么说。」",
     ]);
     assert.equal(sceneless.lacksScene, true);
-    assert.match(formatRoleplayAntiFormulaSlot(["「随你。」", "（别过脸）「我没这么说。」"]), /场景存在感|环境参与/);
+    assert.match(formatRoleplayAntiFormulaSlot(["「随你。」", "（别过脸）「我没这么说。」"]), /已经建立的现场细节/);
     // Environment words in any recent reply suppress the nudge.
     const grounded = extractAntiFormulaHints([
       "（把杯子推过去）「喝完再说。」",
@@ -249,8 +377,15 @@ describe("roleplay prompts", () => {
   });
 
   test("recent window constant stays short for cache and anti-echo", () => {
-    assert.ok(ROLEPLAY_RECENT_MESSAGES <= 20);
-    assert.ok(ROLEPLAY_RECENT_MESSAGES >= 8);
+    assert.equal(ROLEPLAY_RECENT_MESSAGES, 8);
+  });
+
+  test("rolling summary waits for a full cold-history batch", () => {
+    const messages = Array.from({ length: 12 }, (_, index) => ({ id: index + 1 }));
+    assert.equal(roleplaySummaryBatchDue(messages, 8, 0), false);
+    assert.equal(roleplaySummaryBatchDue(messages, 9, 0), true);
+    assert.equal(roleplaySummaryBatchDue(messages, 12, 3), true);
+    assert.equal(roleplaySummaryBatchDue(messages, 12, 4), false);
   });
 
   test("normal identity card keeps relationship / scene / knowledge instead of blanking them", () => {
@@ -413,6 +548,20 @@ describe("message channel isolation", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("persists a roleplay perception separately from the raw player message", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-perception-"));
+    try {
+      const project = WriterProject.init(root, "感知投影");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("投影测试");
+      const messageId = store.addMessage(sessionId, "user", "我暗自认出卧底。『你好。』", "roleplay");
+      store.saveRoleplayPerception(sessionId, messageId, "可听见的话语：你好。");
+      assert.equal(store.roleplayPerception(sessionId, messageId), "可听见的话语：你好。");
+      assert.equal(store.messages(sessionId, 10, { channel: "roleplay" })[0].content, "我暗自认出卧底。『你好。』");
+      store.close();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

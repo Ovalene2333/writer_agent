@@ -24,17 +24,34 @@ import {
   type ScenePipelineSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
-import { generateRoleplayInterlocutor, recommendRoleplayDirectorActions, runRoleplayChat } from "./roleplay.js";
+import { generateRoleplayInterlocutor, recommendRoleplayDirectorActions, runRoleplayChat, storedRoleplayPerceptionForDisplay } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import type { AgentEvent, PermissionMode, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
+import type { AgentEvent, Message, PermissionMode, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
+
+export type WebConversationMessage = Message & { roleplayPerception?: string };
+
+export function conversationMessageForWeb(store: WriterStore, message: Message): WebConversationMessage {
+  if (message.channel !== "roleplay" || message.role !== "user") return message;
+  const stored = store.roleplayPerception(message.sessionId, message.id);
+  const roleplayPerception = stored ? storedRoleplayPerceptionForDisplay(stored).trim() : "";
+  return roleplayPerception ? { ...message, roleplayPerception } : message;
+}
+
+export type AgentJobInfo = {
+  id: string;
+  sessionId: string;
+  status: AgentJobStatus;
+  createdAt: string;
+  updatedAt: string;
+};
 
 function styleTemplatesForClient(project: WriterProject) {
   return project.styleTemplates().map(template => {
@@ -65,6 +82,7 @@ export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
 
   start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
+    if (this.activeJob(sessionId)) throw new Error("SESSION_JOB_ALREADY_RUNNING");
     const job: AgentJob = {
       id: randomBytes(12).toString("base64url"),
       sessionId,
@@ -91,10 +109,15 @@ export class BackgroundAgentJobs {
     return job;
   }
 
-  activeJobs(sessionId: string): Array<{ id: string; sessionId: string; status: AgentJobStatus; createdAt: string; updatedAt: string }> {
+  activeJobs(sessionId?: string): AgentJobInfo[] {
     return [...this.jobs.values()]
-      .filter(job => job.sessionId === sessionId && job.status === "running")
-      .map(({ id, sessionId, status, createdAt, updatedAt }) => ({ id, sessionId, status, createdAt, updatedAt }));
+      .filter(job => job.status === "running" && (sessionId === undefined || job.sessionId === sessionId))
+      .map(jobInfo);
+  }
+
+  activeJob(sessionId: string): AgentJobInfo | undefined {
+    const job = [...this.jobs.values()].find(item => item.sessionId === sessionId && item.status === "running");
+    return job ? jobInfo(job) : undefined;
   }
 
   get(id: string): AgentJob | undefined {
@@ -147,6 +170,10 @@ export class BackgroundAgentJobs {
   }
 }
 
+function jobInfo({ id, sessionId, status, createdAt, updatedAt }: AgentJob): AgentJobInfo {
+  return { id, sessionId, status, createdAt, updatedAt };
+}
+
 export async function startWriterServer(options: {
   project: WriterProject;
   store: WriterStore;
@@ -157,7 +184,14 @@ export async function startWriterServer(options: {
   requireToken?: boolean;
   /** 是否在终端打印访问地址 / 二维码，默认 true。`--share` 时由 CLI 统一打印双端点二维码。 */
   announce?: boolean;
-}): Promise<{ url: string; origin: string; localOrigin: string; token: string; close: () => Promise<void> }> {
+}): Promise<{
+  url: string;
+  origin: string;
+  localOrigin: string;
+  token: string;
+  setPublicOrigin: (origin: string | null) => void;
+  close: () => Promise<void>;
+}> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4096;
   const requireToken = options.requireToken !== false;
@@ -165,6 +199,7 @@ export async function startWriterServer(options: {
   const localBypassToken = randomBytes(24).toString("base64url");
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs();
+  let publicOrigin: string | null | undefined;
 
   // CORS：手机页在局域网 HTTP 打开时，离开家后 API 会跨域打到 Cloudflare HTTPS。
   app.use("/api/*", async (context, next) => {
@@ -193,7 +228,11 @@ export async function startWriterServer(options: {
     await next();
   });
 
-  app.get("/api/health", (context) => context.json({ ok: true, ts: Date.now() }));
+  app.get("/api/health", (context) => context.json({
+    ok: true,
+    ts: Date.now(),
+    ...(publicOrigin !== undefined ? { publicOrigin } : {}),
+  }));
 
   app.get("/api/state", (context) => {
     const requested = context.req.query("session");
@@ -211,7 +250,7 @@ export async function startWriterServer(options: {
       messages: options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, undefined, 50)
         .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
         .map(message => ({
-          ...message,
+          ...conversationMessageForWeb(options.store, message),
           content: stripDsmlText(message.content, "[工具调用已隐藏]"),
         }))),
       messagesHasMore: (() => {
@@ -239,7 +278,7 @@ export async function startWriterServer(options: {
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description,
       })),
-      activeJobs: agentJobs.activeJobs(sessionId),
+      activeJobs: agentJobs.activeJobs(),
       characterDirectory: "characters/",
       styleTemplates: styleTemplatesForClient(options.project),
     });
@@ -393,7 +432,10 @@ export async function startWriterServer(options: {
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 50;
       const messages = options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, beforeId, limit)
         .filter(message => message.content.trim())
-        .map(message => ({ ...message, content: stripDsmlText(message.content, "[tool call hidden]") })));
+        .map(message => ({
+          ...conversationMessageForWeb(options.store, message),
+          content: stripDsmlText(message.content, "[tool call hidden]"),
+        })));
       const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
       const hasMore = Boolean(messages.length && firstArchiveId !== undefined && messages[0].id > firstArchiveId);
       return context.json({ messages, hasMore });
@@ -414,7 +456,11 @@ export async function startWriterServer(options: {
 
   app.delete("/api/session/:id", async (context) => {
     try {
-      options.store.deleteSession(context.req.param("id"));
+      const sessionId = context.req.param("id");
+      if (agentJobs.activeJob(sessionId)) {
+        return context.json({ error: "Cannot delete a session while its Agent job is running" }, 409);
+      }
+      options.store.deleteSession(sessionId);
       return context.json({ ok: true });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
@@ -423,6 +469,9 @@ export async function startWriterServer(options: {
     try {
       const body = await context.req.json<{ ids?: string[]; keepSessionId?: string }>();
       const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0) : [];
+      if (ids.some(id => agentJobs.activeJob(id))) {
+        return context.json({ error: "Cannot delete sessions while their Agent jobs are running" }, 409);
+      }
       const result = options.store.deleteSessions(ids, body.keepSessionId);
       return context.json({ ok: true, ...result });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
@@ -784,6 +833,12 @@ export async function startWriterServer(options: {
 
   app.post("/api/chat", async (context) => {
     const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; documentSelections?: Array<{ path: string; text: string }> }>();
+    if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
+      return context.json({ error: "Session not found" }, 404);
+    }
+    if (agentJobs.activeJob(body.sessionId)) {
+      return context.json({ error: "This session already has a running Agent job" }, 409);
+    }
     // Roleplay openings are model-initiated and legitimately carry no prompt.
     if (!body.prompt?.trim() && !(body.mode === "roleplay" && body.opening)) return context.json({ error: "写作指令不能为空" }, 400);
     const characterScope = Array.isArray(body.characterScope)
@@ -849,6 +904,7 @@ export async function startWriterServer(options: {
             opening: body.opening === true,
             variantGroupId,
             model: options.providers.modelConfig("roleplay"),
+            perceptionModel: options.providers.modelConfig("flash"),
             summarizer: options.providers.summaryModelConfig(),
             signal,
             onEvent,
@@ -904,7 +960,11 @@ export async function startWriterServer(options: {
         stepDebug.flush();
       }
     });
-    return context.json({ jobId: job.id });
+    return context.json({ jobId: job.id, job: jobInfo(job) });
+  });
+
+  app.get("/api/chat/jobs", (context) => {
+    return context.json({ activeJobs: agentJobs.activeJobs() });
   });
 
   app.get("/api/chat/jobs/:id/events", (context) => {
@@ -1161,6 +1221,17 @@ export async function startWriterServer(options: {
     origin,
     localOrigin,
     token,
+    setPublicOrigin(nextOrigin) {
+      if (nextOrigin === null) {
+        publicOrigin = null;
+        return;
+      }
+      const parsed = new URL(nextOrigin);
+      if (parsed.protocol !== "https:" || !parsed.hostname.toLowerCase().endsWith(".trycloudflare.com")) {
+        throw new Error("Cloudflare 公网地址无效");
+      }
+      publicOrigin = parsed.origin;
+    },
     close: async () => {
       await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);
     },

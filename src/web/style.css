@@ -1627,6 +1627,33 @@ button.agent-orb:focus-visible {
     color-mix(in srgb, var(--accent-light) 45%, var(--surface))
   );
 }
+.roleplay-perception-details {
+  margin-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border-light));
+  color: var(--text-dim);
+}
+.roleplay-perception-details > summary {
+  width: max-content;
+  max-width: 100%;
+  padding: 8px 0 0;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+.roleplay-perception-details > summary:hover { color: var(--accent); }
+.roleplay-perception-content {
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border-light));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.roleplay-perception-content p,
+.roleplay-perception-content ul { margin-bottom: .55em; }
 /* Stage directions (actions / expressions) are emitted as *italics* — dim them so dialogue reads first. */
 .conversation .roleplay-msg .markdown em {
   color: var(--text-faint);
@@ -1741,6 +1768,10 @@ button.agent-orb:focus-visible {
 .agent-step-summary strong {
   font-size: 12px; font-weight: 650; color: var(--text); flex-shrink: 0;
   font-variant-numeric: tabular-nums;
+}
+.agent-step-model {
+  min-width: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-dim); font-family: var(--font-mono); font-size: 10px;
 }
 .agent-step-tokens {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1872,10 +1903,34 @@ button.agent-orb:focus-visible {
   display: flex; justify-content: space-between; gap: 12px;
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
 }
-.agent-step-context-row span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-step-context-row span:last-child { flex: 0 0 auto; color: var(--text-faint); }
+.agent-step-context-row > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-step-context-row > span:last-child { flex: 0 0 auto; color: var(--text-faint); }
+.agent-step-model-call-row { display: block; padding: 6px 0; line-height: 1.45; }
+.agent-step-model-call-row + .agent-step-model-call-row { border-top: 1px solid var(--border-light); }
+.agent-step-model-call-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 8px; min-width: 0; }
+.agent-step-model-call-heading strong {
+  min-width: 0; max-width: 100%; padding: 2px 6px; border-radius: 4px;
+  overflow-wrap: anywhere; color: color-mix(in srgb, var(--accent) 72%, var(--text));
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-light));
+  font-size: 11px; font-weight: 700;
+}
+.agent-step-model-call-heading span {
+  min-width: 0; overflow-wrap: anywhere; color: var(--text-faint); font-size: 10.5px;
+}
+.agent-step-model-call-metrics {
+  display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 5px;
+  color: var(--text-dim); font-variant-numeric: tabular-nums;
+}
+.agent-step-model-call-metrics span {
+  display: inline-flex; align-items: baseline; gap: 4px; min-width: 0;
+  color: var(--text-dim); white-space: nowrap;
+}
+.agent-step-model-call-metrics small { color: var(--text-faint); font-size: 10px; }
+.agent-step-model-call-metrics em { color: var(--text-faint); font-size: 10px; font-style: normal; }
 @container (max-width: 320px) {
   .agent-step-summary { gap: 6px; padding-inline: 10px; }
+  .agent-step-model,
   .agent-step-tools,
   .agent-step-tokens .tok-cache,
   .agent-step-tokens .tok-cost,
@@ -2752,6 +2807,7 @@ button.agent-orb:focus-visible {
 .session-list { display: flex; flex-direction: column; gap: 8px; }
 .session-card { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: 11px; background: var(--surface); transition: border-color var(--transition), box-shadow var(--transition); }
 .session-card.active { border-color: var(--accent); box-shadow: inset 3px 0 var(--accent); }
+.session-card.running:not(.active) { border-color: color-mix(in srgb, var(--status-running-fg) 45%, var(--border-light)); }
 .session-card.selected { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); background: color-mix(in srgb, var(--accent-light) 40%, var(--surface)); }
 .session-check { display: grid; place-items: center; flex: 0 0 28px; cursor: pointer; }
 .session-check input { width: auto; margin: 0; accent-color: var(--accent); }
@@ -2766,6 +2822,14 @@ button.agent-orb:focus-visible {
   flex-shrink: 0;
 }
 .current-badge { padding: 3px 8px; border-radius: 10px; background: var(--accent-light); color: var(--accent); font-size: 10px; font-weight: 700; }
+.session-running-badge {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 6px;
+  color: var(--status-running-fg); background: var(--status-running-bg); font-size: 10px; font-weight: 700;
+}
+.session-running-badge > span {
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  animation: statusDot 1.4s ease-in-out infinite;
+}
 .character-editor { width: min(720px, 100%); }
 
 /* ── Character editor (sheet layout) ───── */

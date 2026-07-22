@@ -1342,7 +1342,7 @@ export async function runAgent(options: {
     plannerModel, project, store, prompt, history, signal, characterScope,
     options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
     (usage, retry) => emitUsageEvent(
-      emit, store, sessionId, plannerModel, usage, undefined,
+      emit, store, sessionId, plannerModel, usage, 0,
       retry ? "planner_retry" : "planner", options.jobId,
     ),
   );
@@ -2629,7 +2629,7 @@ function emitUsageEvent(
   requestComponents?: RequestComponentUsage[],
 ): void {
   const estimated = usage.estimated === true;
-  const call = toStepUsage(usage, model.pricing);
+  const call = { ...toStepUsage(usage, model.pricing), model: model.model };
   if (!estimated) {
     emit(buildRecordedUsageEvent(store, sessionId, model, usage, {
       callKind,

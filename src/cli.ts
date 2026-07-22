@@ -169,7 +169,9 @@ program.command("web")
       requireToken: options.token,
       announce: !options.share,
     });
-    const tunnel = options.share ? startShareTunnel(port, server.token, server.origin) : undefined;
+    const tunnel = options.share
+      ? startShareTunnel(port, server.token, server.origin, server.setPublicOrigin)
+      : undefined;
     if (options.open && !options.lan && !options.share) openBrowser(server.url);
     const stop = async () => {
       tunnel?.kill();
