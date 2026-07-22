@@ -330,6 +330,32 @@ export interface AgentTodoItem {
   status: AgentTodoStatus;
 }
 
+export type AgentEvaluationStatus = "running" | "passed" | "failed" | "error";
+
+export interface AgentEvaluationCaseResult {
+  id: number;
+  runId: string;
+  caseId: string;
+  sessionId: string;
+  prompt: string;
+  status: Exclude<AgentEvaluationStatus, "running">;
+  expected: Record<string, unknown>;
+  result: Record<string, unknown>;
+  events: AgentEvent[];
+  createdAt: string;
+}
+
+export interface AgentEvaluationRun {
+  id: string;
+  providerSource: string;
+  model: string;
+  status: AgentEvaluationStatus;
+  summary: Record<string, unknown>;
+  createdAt: string;
+  completedAt?: string;
+  cases?: AgentEvaluationCaseResult[];
+}
+
 /** A compact character card containing only the essentials needed for roleplay. */
 export interface SimpleCharacterCard {
   name: string;
@@ -449,6 +475,14 @@ export type PermissionMode = "ask" | "auto" | "plan";
 
 export type AgentEvent =
   | { type: "step_start"; step: number }
+  | { type: "task_contract"; contract: {
+      mode: string;
+      outcome: "answer" | "document" | "character" | "review" | "multiple";
+      evidence: "none" | "project" | "target" | "continuation";
+      mutation: "none" | "document" | "character" | "mixed";
+      planning: "direct" | "adaptive";
+      capabilities: string[];
+    } }
   | { type: "text"; text: string; channel?: "output" | "reasoning" }
   | { type: "tool"; name: string }
   | { type: "step_done"; step: number }

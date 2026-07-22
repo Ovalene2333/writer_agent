@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
   RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
@@ -283,6 +283,29 @@ export class WriterStore {
         undone INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS agent_evaluation_runs (
+        id TEXT PRIMARY KEY,
+        provider_source TEXT NOT NULL,
+        model TEXT NOT NULL,
+        status TEXT NOT NULL,
+        summary_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS agent_evaluation_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES agent_evaluation_runs(id) ON DELETE CASCADE,
+        case_id TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        expected_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        events_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, case_id)
+      );
+      CREATE INDEX IF NOT EXISTS agent_evaluation_cases_run ON agent_evaluation_cases(run_id, id);
       CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(path UNINDEXED, content);
     `);
     const revisionColumns = this.database.prepare("PRAGMA table_info(revisions)").all() as Row[];
@@ -517,6 +540,24 @@ export class WriterStore {
       beforeContent, afterContent, new Date().toISOString(),
     );
     return character;
+  }
+
+  applyCharacterChangesWithRevision(
+    sessionId: string,
+    messageId: number,
+    id: number,
+    input: ApplyCharacterChangesInput,
+  ): { character: Character; applied: AppliedCharacterChange[]; skipped: SkippedCharacterChange[] } {
+    const before = this.characters().find(item => item.id === id);
+    if (!before) throw new Error("要修改的角色不存在");
+    const result = this.applyCharacterChanges(id, input);
+    this.database.prepare(`INSERT INTO character_revisions(
+      session_id,message_id,character_id,before_file,after_file,before_content,after_content,created_at
+    ) VALUES(?,?,?,?,?,?,?,?)`).run(
+      sessionId, messageId, id, "characters.jsonl", "characters.jsonl",
+      JSON.stringify(before), JSON.stringify(result.character), new Date().toISOString(),
+    );
+    return result;
   }
 
   deleteCharacter(id: number): void {
@@ -1185,6 +1226,70 @@ export class WriterStore {
     return rows.map((row) => this.messageFromRow(row as Row));
   }
 
+  createAgentEvaluationRun(providerSource: string, model: string): AgentEvaluationRun {
+    const now = new Date().toISOString();
+    this.database.prepare(`UPDATE agent_evaluation_runs
+      SET status='error',summary_json=?,completed_at=? WHERE status='running'`)
+      .run(JSON.stringify({ error: "evaluation process interrupted before completion" }), now);
+    const run: AgentEvaluationRun = {
+      id: randomUUID(),
+      providerSource,
+      model,
+      status: "running",
+      summary: {},
+      createdAt: now,
+    };
+    this.database.prepare(`INSERT INTO agent_evaluation_runs(id,provider_source,model,status,summary_json,created_at)
+      VALUES(?,?,?,?,?,?)`).run(run.id, run.providerSource, run.model, run.status, "{}", run.createdAt);
+    return run;
+  }
+
+  recordAgentEvaluationCase(input: {
+    runId: string;
+    caseId: string;
+    sessionId: string;
+    prompt: string;
+    status: Exclude<AgentEvaluationStatus, "running">;
+    expected: Record<string, unknown>;
+    result: Record<string, unknown>;
+    events: import("./types.js").AgentEvent[];
+  }): AgentEvaluationCaseResult {
+    const createdAt = new Date().toISOString();
+    const row = this.database.prepare(`INSERT INTO agent_evaluation_cases(run_id,case_id,session_id,prompt,status,expected_json,result_json,events_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?) RETURNING id`).get(
+      input.runId, input.caseId, input.sessionId, input.prompt, input.status,
+      JSON.stringify(input.expected), JSON.stringify(input.result), JSON.stringify(input.events), createdAt,
+    ) as Row;
+    return { id: Number(row.id), ...input, createdAt };
+  }
+
+  finishAgentEvaluationRun(
+    id: string,
+    status: Exclude<AgentEvaluationStatus, "running">,
+    summary: Record<string, unknown>,
+  ): AgentEvaluationRun {
+    const completedAt = new Date().toISOString();
+    this.database.prepare("UPDATE agent_evaluation_runs SET status=?,summary_json=?,completed_at=? WHERE id=?")
+      .run(status, JSON.stringify(summary), completedAt, id);
+    const run = this.agentEvaluationRun(id);
+    if (!run) throw new Error("Agent evaluation run 不存在");
+    return run;
+  }
+
+  agentEvaluationRun(id: string): AgentEvaluationRun | undefined {
+    const row = this.database.prepare("SELECT * FROM agent_evaluation_runs WHERE id=?").get(id) as Row | undefined;
+    if (!row) return undefined;
+    const cases = this.database.prepare("SELECT * FROM agent_evaluation_cases WHERE run_id=? ORDER BY id")
+      .all(id).map(value => this.agentEvaluationCaseFromRow(value as Row));
+    return this.agentEvaluationRunFromRow(row, cases);
+  }
+
+  listAgentEvaluationRuns(limit = 20): AgentEvaluationRun[] {
+    const bounded = Math.max(1, Math.min(100, Math.round(limit)));
+    return this.database.prepare("SELECT * FROM agent_evaluation_runs ORDER BY created_at DESC LIMIT ?")
+      .all(bounded).map(value => this.agentEvaluationRunFromRow(value as Row));
+  }
+
   recordUsage(sessionId: string, model: string, usage: {
     promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number;
   }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number; requestComponents?: import("./types.js").RequestComponentUsage[] } = {}): UsageSummary {
@@ -1214,6 +1319,50 @@ export class WriterStore {
       cacheMissTokens, totalTokens: promptTokens + completionTokens,
       cost: Number(row.cost), currency: String(row.currency), lastPromptTokens: Number(row.last_prompt_tokens),
       cacheHitRate: measuredInput > 0 ? cacheHitTokens / measuredInput : 0,
+    };
+  }
+
+  private agentEvaluationRunFromRow(row: Row, cases?: AgentEvaluationCaseResult[]): AgentEvaluationRun {
+    let summary: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(String(row.summary_json ?? "{}")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) summary = parsed as Record<string, unknown>;
+    } catch { /* malformed historical summaries degrade to an empty object */ }
+    return {
+      id: String(row.id),
+      providerSource: String(row.provider_source),
+      model: String(row.model),
+      status: row.status as AgentEvaluationStatus,
+      summary,
+      createdAt: String(row.created_at),
+      ...(typeof row.completed_at === "string" ? { completedAt: row.completed_at } : {}),
+      ...(cases ? { cases } : {}),
+    };
+  }
+
+  private agentEvaluationCaseFromRow(row: Row): AgentEvaluationCaseResult {
+    const parseObject = (value: unknown): Record<string, unknown> => {
+      try {
+        const parsed = JSON.parse(String(value ?? "{}")) as unknown;
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      } catch { return {}; }
+    };
+    let events: import("./types.js").AgentEvent[] = [];
+    try {
+      const parsed = JSON.parse(String(row.events_json ?? "[]")) as unknown;
+      if (Array.isArray(parsed)) events = parsed as import("./types.js").AgentEvent[];
+    } catch { /* malformed historical event payloads degrade to [] */ }
+    return {
+      id: Number(row.id),
+      runId: String(row.run_id),
+      caseId: String(row.case_id),
+      sessionId: String(row.session_id),
+      prompt: String(row.prompt),
+      status: row.status as AgentEvaluationCaseResult["status"],
+      expected: parseObject(row.expected_json),
+      result: parseObject(row.result_json),
+      events,
+      createdAt: String(row.created_at),
     };
   }
 
@@ -1735,6 +1884,40 @@ export class WriterStore {
     return path;
   }
 
+  private rewindProposalRevision(row: Row): { path: string; characterNames: string[] } {
+    const path = String(row.path);
+    const current = this.project.documentExists(path) ? this.project.read(path) : "";
+    if (this.project.hash(current) !== String(row.after_hash)) {
+      throw new Error(`文档已在提案通过后发生变化，无法安全回退：${path}`);
+    }
+    const revisions = parseProposalCharacterRevisions(row.character_revisions_json);
+    const restoredCharacters = this.reverseCharacterRevisions(revisions, "after");
+    if (Number(row.created_file) === 1) this.project.removeDocument(path);
+    else this.project.writeRaw(path, String(row.before_content));
+    if (revisions.length) this.writeCharacters(restoredCharacters);
+    this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(Number(row.id));
+    return {
+      path,
+      characterNames: revisions.map(revision => this.normalizeCharacter(revision.after).identity.name),
+    };
+  }
+
+  private rewindCharacterRevision(row: Row): string {
+    const after = this.normalizeCharacter(JSON.parse(String(row.after_content)) as Character);
+    const characters = this.characters();
+    const current = characters.find(item => item.id === after.id);
+    if (!current || JSON.stringify(current) !== JSON.stringify(after)) {
+      throw new Error(`角色卡 ${after.id} 已在修改后发生变化，无法安全回退`);
+    }
+    const restored = characters.filter(item => item.id !== after.id);
+    if (typeof row.before_content === "string") {
+      restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character));
+    }
+    this.writeCharacters(restored);
+    this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(Number(row.id));
+    return after.identity.name;
+  }
+
   rewindFromMessage(
     sessionId: string,
     targetId: number,
@@ -1753,40 +1936,32 @@ export class WriterStore {
     const undonePaths: string[] = [];
     const undoneCharacters: string[] = [];
     if (!keepChanges) {
-      const proposalsToUndo = (this.database.prepare(
-        "SELECT id, status FROM proposals WHERE session_id=? AND created_at>=? AND status='accepted' ORDER BY id DESC",
-      ).all(sessionId, fromTime) as Row[]);
-      for (const row of proposalsToUndo) {
-        const revRow = this.database.prepare(
-          "SELECT * FROM revisions WHERE proposal_id=? AND undone=0 ORDER BY id DESC LIMIT 1",
-        ).get(row.id as number) as Row | undefined;
-        if (!revRow) continue;
-        const path = revRow.path as string;
-        const current = this.project.documentExists(path) ? this.project.read(path) : "";
-        if (this.project.hash(current) !== revRow.after_hash) continue;
-        if (revRow.created_file === 1) this.project.removeDocument(path);
-        else this.project.writeRaw(path, revRow.before_content as string);
-        this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(revRow.id as number);
-        undonePaths.push(path);
-      }
-      const characterRows = this.database.prepare(
-        "SELECT * FROM character_revisions WHERE session_id=? AND message_id>=? AND undone=0 ORDER BY id DESC",
-      ).all(sessionId, fromId) as Row[];
-      for (const row of characterRows) {
-        let after: Character;
-        try { after = this.normalizeCharacter(JSON.parse(row.after_content as string) as Character); }
-        catch { continue; }
-        const characters = this.characters();
-        const current = characters.find(item => item.id === after.id);
-        if (!current || JSON.stringify(current) !== JSON.stringify(after)) continue;
-        let restored = characters.filter(item => item.id !== after.id);
-        if (typeof row.before_content === "string") {
-          try { restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character)); }
-          catch { continue; }
+      const actions: Array<{ kind: "change_set" | "proposal" | "character"; createdAt: string; row: Row }> = [
+        ...(this.database.prepare(
+          "SELECT * FROM change_sets WHERE session_id=? AND created_at>=? AND status='accepted' AND undone=0",
+        ).all(sessionId, fromTime) as Row[]).map(row => ({ kind: "change_set" as const, createdAt: String(row.created_at), row })),
+        ...(this.database.prepare(`
+          SELECT r.* FROM revisions r
+          JOIN proposals p ON p.id=r.proposal_id
+          WHERE p.session_id=? AND p.created_at>=? AND p.status='accepted' AND r.undone=0
+        `).all(sessionId, fromTime) as Row[]).map(row => ({ kind: "proposal" as const, createdAt: String(row.created_at), row })),
+        ...(this.database.prepare(
+          "SELECT * FROM character_revisions WHERE session_id=? AND message_id>=? AND undone=0",
+        ).all(sessionId, fromId) as Row[]).map(row => ({ kind: "character" as const, createdAt: String(row.created_at), row })),
+      ].sort((left, right) => right.createdAt.localeCompare(left.createdAt) || Number(right.row.id) - Number(left.row.id));
+      for (const action of actions) {
+        if (action.kind === "change_set") {
+          const revisions = parseProposalCharacterRevisions(action.row.character_revisions_json);
+          const changeSet = this.undoChangeSet(Number(action.row.id));
+          undonePaths.push(...changeSet.files.map(file => file.targetPath ?? file.path));
+          undoneCharacters.push(...revisions.map(revision => this.normalizeCharacter(revision.after).identity.name));
+        } else if (action.kind === "proposal") {
+          const undone = this.rewindProposalRevision(action.row);
+          undonePaths.push(undone.path);
+          undoneCharacters.push(...undone.characterNames);
+        } else {
+          undoneCharacters.push(this.rewindCharacterRevision(action.row));
         }
-        this.writeCharacters(restored);
-        this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(row.id as number);
-        undoneCharacters.push(after.identity.name);
       }
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);

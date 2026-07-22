@@ -20,7 +20,6 @@ import {
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
-  persistFinalizedSessionTodos,
   saveAgentSettings,
   type ScenePipelineSettings,
 } from "./agent_runtime.js";
@@ -892,11 +891,6 @@ export async function startWriterServer(options: {
               },
             });
           } catch { /* title is best-effort */ }
-        }
-        // Safety net: only close a dangling in_progress item. Never auto-complete
-        // pending multi-chapter writing steps (those must stay open until written).
-        if (!signal.aborted && deferred.some(event => event.type === "done")) {
-          persistFinalizedSessionTodos(options.store, body.sessionId, emit, "dangling_in_progress");
         }
         for (const event of deferred) {
           stepDebug.onEvent(event);

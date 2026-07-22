@@ -93,6 +93,10 @@ export function createAgentStepDebugLogger(meta?: {
     if (!stepDebugEnabled()) return;
 
     switch (event.type) {
+      case "task_contract": {
+        write(`[WRITER STEP] contract → ${JSON.stringify(event.contract)}`);
+        break;
+      }
       case "step_start": {
         flush();
         current = {

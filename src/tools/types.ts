@@ -31,6 +31,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** User message that owns mutations made by this Agent job. */
+  sourceMessageId?: number;
   /** Planner-classified rewrite scope; point edits enforce a narrow read lock. */
   editScope?: "point" | "section" | "document";
   /** Set after an exact quote/anchor read so point edits cannot drift into bulk reads. */

@@ -1,4 +1,4 @@
-import { loadSkillById, normalizeTodos } from "../agent_runtime.js";
+import { loadSkillById, normalizeTodos, reconcileManagedTodos } from "../agent_runtime.js";
 import { chapterSceneDraftComplete, nextChapterScene } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { requireString } from "./helpers.js";
@@ -16,7 +16,9 @@ export function handleAskUser({ input }: ToolHandlerArgs): string {
 }
 
 export function handleManageTodos({ input, store, sessionId, emit, context }: ToolHandlerArgs): string {
-  const todos = normalizeTodos(input.todos);
+  const requested = normalizeTodos(input.todos);
+  const reconciled = reconcileManagedTodos(store.sessionTodos(sessionId), requested);
+  const todos = reconciled.todos;
   store.saveSessionTodos(sessionId, todos);
   emit({ type: "todos", todos });
   const completed = todos.filter(item => item.status === "completed").length;
@@ -34,6 +36,7 @@ export function handleManageTodos({ input, store, sessionId, emit, context }: To
     summary: { total: todos.length, completed, inProgress: active },
     message: [
       active.length ? `任务清单已更新；进行中：${active.join("、")}` : "任务清单已更新",
+      reconciled.scenePipelineProtected ? "内置章节阶段只能由实际场景工具结果推进；本次手动状态变更未应用。" : "",
       draftNudge,
     ].filter(Boolean).join(" "),
   });

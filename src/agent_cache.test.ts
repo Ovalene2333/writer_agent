@@ -18,6 +18,7 @@ import {
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
   buildToolArgumentRepairMessages,
+  characterMutationCompletesTask,
   chapterContinuationPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
@@ -196,17 +197,18 @@ test("validated checkpoints restore drafts and clear with task state", () => {
   }
 });
 
-test("task tool profiles are frozen order-preserving allow-lists", () => {
+test("task modes share one frozen universal capability catalog", () => {
   const catalog = agentToolNames();
   const write = agentToolsForTask("write_scene", "ask");
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
-  assert.ok(writeNames.length < catalog.length);
-  assert.deepEqual(writeNames, catalog.filter(name => writeNames.includes(name)));
+  assert.deepEqual(writeNames, catalog);
   for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
-  assert.equal(writeNames.includes("save_character"), false);
+  assert.equal(writeNames.includes("save_character"), true);
+  assert.deepEqual(agentToolsForTask("brainstorm", "ask").map(tool => tool.function.name), writeNames);
+  assert.deepEqual(agentToolsForTask("audit", "ask").map(tool => tool.function.name), writeNames);
 
   const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
   assert.equal(planNames.includes("write_chapter_scene"), false);
@@ -235,9 +237,16 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.equal(normalizeDocumentProposalRequired("character", true), false);
   assert.equal(normalizeDocumentProposalRequired("simple_character", true), false);
   assert.equal(normalizeDocumentProposalRequired("write_scene", true), true);
+  assert.equal(characterMutationCompletesTask("character", "auto"), true);
+  assert.equal(characterMutationCompletesTask("simple_character", "ask"), true);
+  assert.equal(characterMutationCompletesTask("write_scene", "auto"), false);
+  assert.equal(characterMutationCompletesTask("rewrite", "ask"), false);
+  assert.equal(characterMutationCompletesTask("character", "plan"), false);
 
   const normal = taskInstructions("character", "deliver", "ask", false);
   assert.match(normal, /检查同名卡/);
+  assert.match(normal, /角色保存成功即完成本任务/);
+  assert.match(normal, /禁止再提交文档提案或 change set/);
   assert.match(normal, /必须 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
   assert.match(normal, /结构化错误/);

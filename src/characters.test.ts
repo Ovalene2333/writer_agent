@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { characterEditorSaveInput } from "./character_editor_payload.js";
 import {
   applyCharacterChanges,
   applyCharacterInput,
@@ -157,6 +158,26 @@ test("saveCharacter upserts arrays and supports replaceSections", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("web character editor save replaces deleted experiences and story states", () => {
+  const base = normalizeV3Character({
+    ...emptyCharacter("甲"),
+    id: 1,
+    updatedAt: "",
+    experiences: [{ id: "exp-old", label: "旧经历", description: "应被删除", sourceRefs: [] }],
+    storyStates: [{
+      id: "state-old", unanchored: true, location: "旧地点", physical: "", emotion: "",
+      knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [],
+    }],
+  });
+  const saved = applyCharacterInput(base, characterEditorSaveInput({
+    ...base,
+    experiences: [],
+    storyStates: [],
+  }));
+  assert.deepEqual(saved.experiences, []);
+  assert.deepEqual(saved.storyStates, []);
 });
 
 test("applyCharacterChanges unlocks, adds experience, and updates personality", () => {

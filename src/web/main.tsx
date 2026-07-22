@@ -42,6 +42,7 @@ import {
 } from "lucide-react";
 import { Marked, type Token, type Tokens } from "marked";
 import { documentDiff, renderDiffHtml } from "../diff";
+import { characterEditorSaveInput } from "../character_editor_payload";
 import { CharacterEditor } from "./character_editor";
 import {
   apiUrl,
@@ -277,6 +278,7 @@ type Provider = {
   apiKeyHint: string;
   source: "project" | "environment";
   pricing: {
+    billingMode?: "metered" | "unmetered";
     cacheHit: number;
     cacheMiss: number;
     output: number;
@@ -1444,6 +1446,7 @@ function WorkspaceTopbar({
   usagePct,
   usageCost,
   usageCurrency,
+  usageUnmetered,
   busy,
   theme,
   settingsOpen,
@@ -1469,6 +1472,7 @@ function WorkspaceTopbar({
   usagePct: number;
   usageCost: number;
   usageCurrency: string;
+  usageUnmetered: boolean;
   busy: boolean;
   theme: UiThemeId;
   settingsOpen: boolean;
@@ -1527,7 +1531,7 @@ function WorkspaceTopbar({
             <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
           </span>
           <span>{usagePct}%</span>
-          <span className="usage-cost">{usageCurrency === "CNY" ? "¥" : "$"}{usageCost.toFixed(4)}</span>
+          <span className="usage-cost">{usageUnmetered ? "非按量计费" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(4)}`}</span>
           <ChevronDown size={13} aria-hidden="true" />
         </button>
         <div className="settings-anchor">
@@ -2359,24 +2363,6 @@ function App() {
           }
         }
         if (clearContextOnDone && terminalType === "done") {
-          // Client safety net: if server still has open todos after a successful job, show them closed.
-          // Persist path is server-side; this only heals stale UI if an older process missed finalize.
-          const openTodos = (next.todos ?? []).filter(
-            (item) => item.status === "pending" || item.status === "in_progress",
-          );
-          if (openTodos.length > 0) {
-            setState((prev) => {
-              if (!prev?.todos?.length) return prev;
-              return {
-                ...prev,
-                todos: prev.todos.map((item) =>
-                  item.status === "pending" || item.status === "in_progress"
-                    ? { ...item, status: "completed" as const }
-                    : item,
-                ),
-              };
-            });
-          }
           const pendingCount = (next.proposals ?? []).filter((item) => item.status === "pending").length;
           setNotice(
             completedProposal?.status === "accepted"
@@ -2783,7 +2769,10 @@ function App() {
 
   async function saveCharacter() {
     if (!characterDraft?.identity.name.trim()) return;
-    await api("/api/characters", { method: "POST", body: JSON.stringify(characterDraft) });
+    await api("/api/characters", {
+      method: "POST",
+      body: JSON.stringify(characterEditorSaveInput(characterDraft)),
+    });
     setCharacterDraft(null);
     await refresh(state?.sessionId);
   }
@@ -3143,7 +3132,6 @@ function App() {
 
   const pendingProposals = state.proposals.filter((p) => p.status === "pending");
   const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
-  const visibleChangeSets = state.changeSets.filter((item) => item.status !== "rejected").slice(0, 10);
   const visibleMessages = state.messages.filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.content.trim());
   const usagePct = state.provider.pricing.contextWindow
     ? Math.round((state.usage.lastPromptTokens / state.provider.pricing.contextWindow) * 100)
@@ -3173,6 +3161,7 @@ function App() {
         usagePct={usagePct}
         usageCost={state.usage.cost}
         usageCurrency={state.usage.currency}
+        usageUnmetered={state.provider.pricing.billingMode === "unmetered"}
         busy={busy}
         theme={theme}
         settingsOpen={settingsMenuOpen}
@@ -3841,9 +3830,9 @@ function App() {
             </button>
           )}
         </div>
-        {(visibleChangeSets.length > 0 || pendingProposals.length > 0) && (
+        {(pendingChangeSets.length > 0 || pendingProposals.length > 0) && (
           <ReviewDock
-            changeSets={visibleChangeSets}
+            changeSets={pendingChangeSets}
             proposals={pendingProposals}
             pendingCount={pendingChangeSets.length + pendingProposals.length}
             open={reviewOpen}
@@ -4581,7 +4570,9 @@ function App() {
               <div className="usage-detail-row">
                 <span className="usage-detail-label">累计费用</span>
                 <span className="usage-detail-value usage-number">
-                  {state.usage.currency === "CNY" ? "¥" : "$"}{state.usage.cost.toFixed(4)}
+                  {state.provider.pricing.billingMode === "unmetered"
+                    ? "非按量计费"
+                    : `${state.usage.currency === "CNY" ? "¥" : "$"}${state.usage.cost.toFixed(4)}`}
                 </span>
               </div>
             </div>

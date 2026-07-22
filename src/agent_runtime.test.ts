@@ -6,19 +6,22 @@ import test from "node:test";
 import {
   advanceScenePipelineTodos,
   advanceTodosAfterProposal,
-  finalizeDanglingInProgressTodos,
-  finalizeOpenTodos,
+  completeCharacterTaskTodos,
   formatTodosForPrompt,
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
   normalizeTodos,
   persistAdvancedTodosAfterProposal,
-  persistFinalizedSessionTodos,
+  persistCompletedCharacterTaskTodos,
+  reconcileManagedTodos,
   saveAgentSettings,
 } from "./agent_runtime.js";
+import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
+import { handleApplyCharacterChanges } from "./tools/characters.js";
+import type { ToolHandlerArgs } from "./tools/types.js";
 import type { AgentTodoItem } from "./types.js";
 
 test("normalizeTodos enforces single in_progress", () => {
@@ -59,6 +62,25 @@ test("scene pipeline milestones do not infer phases from custom todo wording", (
   assert.equal(result.todos, custom);
 });
 
+test("manage_todos cannot manually complete the built-in scene pipeline", () => {
+  const current: AgentTodoItem[] = [
+    { id: "t1", content: "核对本篇必要事实与衔接", status: "in_progress" },
+    { id: "t2", content: "建立初始场景引导", status: "pending" },
+    { id: "t3", content: "按成稿结果推进正文", status: "pending" },
+    { id: "t4", content: "全文审阅并提交提案", status: "pending" },
+  ];
+  const requested = current.map(item => ({ ...item, status: "completed" as const }));
+  const result = reconcileManagedTodos(current, requested);
+  assert.equal(result.scenePipelineProtected, true);
+  assert.equal(result.todos, current);
+
+  const custom = [{ id: "x1", content: "自定义步骤", status: "completed" as const }];
+  assert.deepEqual(reconcileManagedTodos([], custom), {
+    todos: custom,
+    scenePipelineProtected: false,
+  });
+});
+
 test("scene pipeline milestones migrate the legacy chapter todo labels", () => {
   const legacy: AgentTodoItem[] = [
     { id: "t1", content: "核对大纲、人设与衔接", status: "completed" },
@@ -71,19 +93,19 @@ test("scene pipeline milestones migrate the legacy chapter todo labels", () => {
   assert.deepEqual(result.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
 });
 
-test("finalizeOpenTodos completes pending and in_progress, keeps cancelled", () => {
-  const { todos, changed } = finalizeOpenTodos([
-    { id: "t1", content: "done", status: "completed" },
-    { id: "t2", content: "writing", status: "in_progress" },
-    { id: "t3", content: "propose", status: "pending" },
-    { id: "t4", content: "skip", status: "cancelled" },
+test("completeCharacterTaskTodos completes a saved character task and keeps cancelled", () => {
+  const { todos, changed } = completeCharacterTaskTodos([
+    { id: "t1", content: "读取角色卡", status: "completed" },
+    { id: "t2", content: "更新角色卡", status: "in_progress" },
+    { id: "t3", content: "核对保存结果", status: "pending" },
+    { id: "t4", content: "无需处理", status: "cancelled" },
   ]);
   assert.equal(changed, true);
   assert.equal(todos.find(item => item.id === "t1")?.status, "completed");
   assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
   assert.equal(todos.find(item => item.id === "t3")?.status, "completed");
   assert.equal(todos.find(item => item.id === "t4")?.status, "cancelled");
-  assert.equal(finalizeOpenTodos(todos).changed, false);
+  assert.equal(completeCharacterTaskTodos(todos).changed, false);
 });
 
 test("advanceTodosAfterProposal keeps multi-chapter pending open and continues", () => {
@@ -110,18 +132,7 @@ test("advanceTodosAfterProposal closes single-scene soft checklist and stops", (
   assert.equal(todos.every(item => item.status === "completed"), true);
 });
 
-test("finalizeDanglingInProgressTodos does not close pending chapters", () => {
-  const { todos, changed } = finalizeDanglingInProgressTodos([
-    { id: "t1", content: "撰写第1章初稿", status: "completed" },
-    { id: "t2", content: "撰写第2章初稿", status: "in_progress" },
-    { id: "t3", content: "撰写第3章初稿", status: "pending" },
-  ]);
-  assert.equal(changed, true);
-  assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
-  assert.equal(todos.find(item => item.id === "t3")?.status, "pending");
-});
-
-test("persistFinalizedSessionTodos closes last open item after proposal-like turn", () => {
+test("persistCompletedCharacterTaskTodos closes todos after a character save", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
     const project = WriterProject.init(root, "测试");
@@ -133,7 +144,7 @@ test("persistFinalizedSessionTodos closes last open item after proposal-like tur
       { id: "t3", content: "提交文档提案", status: "pending" },
     ]);
     const emitted: AgentTodoItem[][] = [];
-    const todos = persistFinalizedSessionTodos(store, sessionId, event => {
+    const todos = persistCompletedCharacterTaskTodos(store, sessionId, event => {
       emitted.push(event.todos);
     });
     assert.equal(todos.every(item => item.status === "completed"), true);
@@ -382,6 +393,67 @@ test("message rerun can keep accepted document changes", () => {
     assert.equal(project.documentExists("chapters/第2章.md"), false);
     // Chapter 1 was kept earlier and not part of this second rewind scope after new messages only undid ch2.
     assert.equal(project.documentExists("chapters/第1章.md"), true);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("message rerun rolls back Agent character tool revisions", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-rerun-"));
+  try {
+    const project = WriterProject.init(root, "角色工具回退");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("character-rerun");
+    const character = store.saveCharacter(emptyCharacter("甲"));
+    const userId = store.addMessage(sessionId, "user", "给甲补充经历");
+    const args: ToolHandlerArgs = {
+      input: {
+        id: character.id,
+        reason: "用户确认",
+        changes: [{ op: "append_experience", label: "测试经历", description: "用于验证回退" }],
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      characterScope: [character.id],
+      context: { permissionMode: "ask", sourceMessageId: userId },
+    };
+    handleApplyCharacterChanges(args);
+    store.addMessage(sessionId, "assistant", "已更新角色卡");
+    assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 1);
+
+    store.prepareMessageRerun(sessionId, userId, { keepChanges: false });
+    assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 0);
+    const revision = store.database.prepare("SELECT undone FROM character_revisions WHERE session_id=?").get(sessionId) as { undone: number };
+    assert.equal(revision.undone, 1);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("message rerun rolls back accepted character-only change sets", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-change-set-rerun-"));
+  try {
+    const project = WriterProject.init(root, "角色 change set 回退");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("character-change-set-rerun");
+    const character = store.saveCharacter(emptyCharacter("乙"));
+    const userId = store.addMessage(sessionId, "user", "修改乙的角色卡");
+    const changeSet = store.createChangeSet(sessionId, "角色卡修改", [], [{
+      characterId: character.id,
+      reason: "用户确认",
+      changes: [{ op: "append_experience", label: "测试经历", description: "用于验证 change set 回退" }],
+    }]);
+    store.acceptChangeSet(changeSet.id);
+    store.addMessage(sessionId, "assistant", "已提交并接受修改");
+    assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 1);
+
+    store.prepareMessageRerun(sessionId, userId, { keepChanges: false });
+    assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 0);
+    assert.equal(store.changeSet(changeSet.id).undone, true);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

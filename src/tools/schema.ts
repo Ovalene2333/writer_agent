@@ -9,9 +9,9 @@ import type { ToolDefinition } from "./types.js";
  * - Descriptions may document conventions (lore/outline/chapters) but must not embed
  *   live project path lists, character ids, or session state.
  * - Prefer free-form string/number parameters over enums that grow with the project.
- * - The tool-free planner selects one stable task profile. That profile is an
- *   order-preserving subset of this catalog and stays frozen for the whole job.
- *   Never derive profiles from project paths/ids or swap profiles mid-job.
+ * - Every non-plan task receives the same order-preserving catalog. Semantic
+ *   task contracts authorize side effects at runtime; never remove recovery
+ *   capabilities because of a fallible mode label or live project state.
  * - After structural changes, update agentToolSchemaHash expectations in tests.
  */
 
@@ -889,58 +889,6 @@ export const TOOLS = deepFreeze([
 
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
-const META_TOOLS = ["inspect_conversation", "read_conversation", "read_context_artifact", "ask_user", "manage_todos", "load_skill"] as const;
-const DOCUMENT_READ_TOOLS = ["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project"] as const;
-const FILE_READ_TOOLS = ["list_files", "inspect_file", "read_file", "search_files"] as const;
-const CHARACTER_READ_TOOLS = ["list_characters", "get_character", "list_simple_characters", "get_simple_character"] as const;
-
-const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
-  brainstorm: [...DOCUMENT_READ_TOOLS, ...CHARACTER_READ_TOOLS, ...META_TOOLS],
-  outline: [
-    ...DOCUMENT_READ_TOOLS,
-    "design_creative_outline", "list_outline_nodes", "get_outline_node", "propose_outline_patch",
-    "validate_outline", "compare_outline_with_draft",
-    "list_characters", "get_character", "apply_character_changes",
-    ...META_TOOLS,
-  ],
-  write_scene: [
-    ...DOCUMENT_READ_TOOLS,
-    "list_outline_nodes", "get_outline_node", "validate_outline",
-    ...CHARACTER_READ_TOOLS, "apply_character_changes",
-    "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style",
-    "inspect_chapter_draft", "propose_chapter_draft",
-    ...META_TOOLS,
-  ],
-  rewrite: [
-    ...DOCUMENT_READ_TOOLS, "audit_prose_style",
-    ...CHARACTER_READ_TOOLS, "apply_character_changes",
-    "propose_document", "propose_document_patch", "revise_document_isolated", "propose_change_set",
-    ...META_TOOLS,
-  ],
-  audit: [
-    ...DOCUMENT_READ_TOOLS, "audit_prose_style",
-    "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft",
-    "propose_document", "propose_document_patch", "propose_outline_patch",
-    ...META_TOOLS,
-  ],
-  character: [
-    ...DOCUMENT_READ_TOOLS, "list_outline_nodes", "get_outline_node",
-    "list_characters", "get_character", "save_character", "apply_character_changes",
-    ...META_TOOLS,
-  ],
-  simple_character: [
-    ...DOCUMENT_READ_TOOLS,
-    "list_characters", "get_character", "list_simple_characters", "get_simple_character", "save_simple_character",
-    ...META_TOOLS,
-  ],
-  general: [
-    ...DOCUMENT_READ_TOOLS, ...FILE_READ_TOOLS, ...CHARACTER_READ_TOOLS,
-    "propose_document", "propose_document_patch", "propose_change_set",
-    "save_character", "apply_character_changes", "save_simple_character",
-    ...META_TOOLS,
-  ],
-};
-
 const WRITE_TOOLS = new Set([
   "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
   "revise_document_isolated",
@@ -948,11 +896,13 @@ const WRITE_TOOLS = new Set([
   "save_character", "apply_character_changes", "save_simple_character",
 ]);
 
-/** Stable, project-agnostic tool allow-list selected once after planning. */
-export function agentToolsForTask(mode: string, permissionMode: "ask" | "auto" | "plan"): readonly ToolDefinition[] {
-  const allowed = new Set(TASK_TOOL_PROFILES[mode] ?? TASK_TOOL_PROFILES.general);
-  return Object.freeze(TOOLS.filter(tool => allowed.has(tool.function.name)
-    && (permissionMode !== "plan" || !WRITE_TOOLS.has(tool.function.name))));
+/**
+ * Stable universal capability surface. `mode` is retained for API compatibility
+ * but no longer removes recovery paths after a fallible semantic classification.
+ * Side effects are authorized by the runtime task contract before execution.
+ */
+export function agentToolsForTask(_mode: string, permissionMode: "ask" | "auto" | "plan"): readonly ToolDefinition[] {
+  return Object.freeze(TOOLS.filter(tool => permissionMode !== "plan" || !WRITE_TOOLS.has(tool.function.name)));
 }
 
 /** Stable schema fingerprint: tool order and definitions are part of the provider KV-cache prefix. */

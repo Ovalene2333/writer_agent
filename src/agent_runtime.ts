@@ -81,6 +81,13 @@ const LEGACY_SCENE_PIPELINE_TODOS = [
   "整章审阅并提交提案",
 ] as const;
 
+const SCENE_PIPELINE_TODO_SIGNATURES = [
+  DEFAULT_SCENE_PIPELINE_TODOS,
+  PREVIOUS_SCENE_PIPELINE_TODOS,
+  OLDER_SCENE_PIPELINE_TODOS,
+  LEGACY_SCENE_PIPELINE_TODOS,
+] as const;
+
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
   scenePipeline: {
@@ -320,7 +327,7 @@ export function advanceScenePipelineTodos(
   todos: AgentTodoItem[],
   milestone: ScenePipelineMilestone,
 ): { todos: AgentTodoItem[]; changed: boolean } {
-  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, PREVIOUS_SCENE_PIPELINE_TODOS, OLDER_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
+  const signature = SCENE_PIPELINE_TODO_SIGNATURES
     .map(contents => contents.map(content => todos.findIndex(item => item.content === content)))
     .find(indexes => indexes.every(index => index >= 0));
   if (!signature) return { todos, changed: false };
@@ -472,18 +479,10 @@ export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
   return { todos: next, changed, shouldContinue: false };
 }
 
-/**
- * When a turn truly ends (final assistant reply with no remaining multi-chapter work),
- * mark remaining open todos completed so the UI does not stay stuck at e.g. 1/3.
- * Cancelled items are left alone.
- *
- * Prefer `advanceTodosAfterProposal` on propose_* success so multi-chapter plans are not
- * falsely closed after the first chapter.
- */
-export function finalizeOpenTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
+/** A successful character mutation is the terminal deliverable for character-only tasks. */
+export function completeCharacterTaskTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
   let changed = false;
   const next = todos.map(item => {
-    // Treat anything not already completed/cancelled as open (covers bad model statuses).
     if (item.status !== "completed" && item.status !== "cancelled") {
       changed = true;
       return { ...item, status: "completed" as const };
@@ -493,39 +492,32 @@ export function finalizeOpenTodos(todos: AgentTodoItem[]): { todos: AgentTodoIte
   return { todos: next, changed };
 }
 
-/**
- * Safety-net close used by the HTTP job wrapper: only complete dangling in_progress
- * items. Never auto-complete pending multi-chapter writing steps.
- */
-export function finalizeDanglingInProgressTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
-  let changed = false;
-  const next = todos.map(item => {
-    if (item.status === "in_progress") {
-      changed = true;
-      return { ...item, status: "completed" as const };
-    }
-    return item;
-  });
-  return { todos: next, changed };
+/** Built-in scene progress is owned by structured scene tool milestones, not manage_todos. */
+export function reconcileManagedTodos(
+  current: AgentTodoItem[],
+  requested: AgentTodoItem[],
+): { todos: AgentTodoItem[]; scenePipelineProtected: boolean } {
+  const hasScenePipeline = SCENE_PIPELINE_TODO_SIGNATURES.some(contents =>
+    current.length === contents.length
+      && contents.every(content => current.some(item => item.content === content)),
+  );
+  return hasScenePipeline
+    ? { todos: current, scenePipelineProtected: true }
+    : { todos: requested, scenePipelineProtected: false };
 }
 
-/** Persist finalized session todos and optionally emit a stream event. */
-export function persistFinalizedSessionTodos(
+/** Persist completion after the character-only task's save tool succeeds. */
+export function persistCompletedCharacterTaskTodos(
   store: {
     sessionTodos(sessionId: string): AgentTodoItem[];
     saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void;
   },
   sessionId: string,
   emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
-  mode: "all_open" | "dangling_in_progress" | "after_proposal" = "all_open",
 ): AgentTodoItem[] {
   const current = store.sessionTodos(sessionId);
   if (!current.length) return current;
-  const result = mode === "dangling_in_progress"
-    ? finalizeDanglingInProgressTodos(current)
-    : mode === "after_proposal"
-      ? advanceTodosAfterProposal(current)
-      : finalizeOpenTodos(current);
+  const result = completeCharacterTaskTodos(current);
   if (!result.changed) return current;
   store.saveSessionTodos(sessionId, result.todos);
   emit?.({ type: "todos", todos: result.todos });

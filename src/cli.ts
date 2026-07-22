@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { Command } from "commander";
 import { runAgent } from "./agent.js";
+import { DEFAULT_AGENT_EVALUATION_CASES, prepareAgentEvaluationFixtures, runPersistedAgentEvaluation } from "./agent_eval.js";
 import { isPermissionMode, loadAgentSettings, saveAgentSettings } from "./agent_runtime.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { WriterProject } from "./project.js";
@@ -82,6 +83,59 @@ program.command("run")
       }
       if (!options.json) process.stdout.write("\n");
     } finally { store.close(); }
+  });
+
+program.command("agent-eval")
+  .description("使用真实供应商运行可持久化的 Agent 契约与工具轨迹测试")
+  .option("-p, --project <directory>", "评测项目与结果数据库", "writer-agent-data/agent-eval-project")
+  .option("--provider-project <directory>", "读取供应商配置的项目", "../jn2")
+  .option("--case <ids...>", "只运行指定 case id")
+  .option("--list", "只列出历史评测，不调用模型")
+  .option("--json", "输出 JSON")
+  .action(async (options: { project: string; providerProject: string; case?: string[]; list?: boolean; json?: boolean }) => {
+    const evaluationRoot = resolve(options.project);
+    const project = existsSync(resolve(evaluationRoot, "writer.yaml"))
+      ? new WriterProject(evaluationRoot)
+      : WriterProject.init(evaluationRoot, "Agent 自动评测");
+    const store = new WriterStore(project);
+    try {
+      if (options.list) {
+        const runs = store.listAgentEvaluationRuns();
+        process.stdout.write(`${JSON.stringify(runs, null, options.json ? 0 : 2)}\n`);
+        return;
+      }
+      const providerProject = new WriterProject(resolve(options.providerProject));
+      if (!providerProject.exists()) throw new Error("供应商项目不存在或不是 Writer 项目");
+      const providers = new ProviderManager(providerProject);
+      prepareAgentEvaluationFixtures(project);
+      const cases = options.case?.length
+        ? DEFAULT_AGENT_EVALUATION_CASES.filter(item => options.case!.includes(item.id))
+        : DEFAULT_AGENT_EVALUATION_CASES;
+      if (!cases.length) throw new Error(`未找到评测 case：${options.case?.join("、") ?? ""}`);
+      const result = await runPersistedAgentEvaluation({
+        project,
+        store,
+        providerSource: providers.path,
+        cases,
+        models: {
+          agent: providers.modelConfig("agent"),
+          writer: providers.modelConfig("writer"),
+          inline: providers.modelConfig("inline"),
+          reviewer: providers.modelConfig("reviewer"),
+          summarizer: providers.summaryModelConfig(),
+        },
+        onCase: item => {
+          if (options.json) return;
+          process.stdout.write(`${item.passed ? "PASS" : "FAIL"}\t${item.caseId}${item.failures.length ? `\t${item.failures.join("; ")}` : ""}\n`);
+        },
+      });
+      process.stdout.write(options.json
+        ? `${JSON.stringify(result)}\n`
+        : `run=${result.id}\tstatus=${result.status}\t${JSON.stringify(result.summary)}\ndatabase=${resolve(project.privateDir, "writer.db")}\n`);
+      if (result.status !== "passed") process.exitCode = 1;
+    } finally {
+      store.close();
+    }
   });
 
 program.command("web")
