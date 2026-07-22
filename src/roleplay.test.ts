@@ -18,10 +18,13 @@ import {
   formatRoleplayPerception,
   formatRoleplayPerceptionForModel,
   formatRoleplayPlayerTurn,
+  formatRoleplayQualityRewrite,
+  formatRoleplayRerunDirections,
   formatRoleplaySummarySlot,
   isRoleplayExitCommand,
   isRoleplayOocInput,
   parseRoleplayPerception,
+  parseRoleplayQualityReview,
   parseStoredRoleplayPerception,
   ROLEPLAY_RECENT_MESSAGES,
   ROLEPLAY_EPISTEMIC_MEMORY_VERSION,
@@ -92,7 +95,7 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /只选择一个真正影响她的点/);
     assert.match(prompt, /不要引用、改写或概括玩家原句/);
     assert.match(prompt, /具体数值只能引用上下文中已有的数值/);
-    assert.match(prompt, /通常只需一句台词或一个动作/);
+    assert.match(prompt, /一句台词或一个动作能够成立就立即停止/);
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
     assert.match(prompt, /exampleHint/);
@@ -203,6 +206,37 @@ describe("roleplay prompts", () => {
     assert.notEqual(first.at(-1)?.content, second.at(-1)?.content);
     assert.equal(roleplayPerceptionForMemory(first.at(-1)?.content ?? ""), "继续");
     assert.equal(roleplayPerceptionForMemory(second.at(-1)?.content ?? ""), "继续");
+  });
+
+  test("directed reruns only change the dynamic tail", () => {
+    const base = {
+      stablePrefix: "stable",
+      summary: "",
+      state: { scene: "", proximity: "", mood: "", openThreads: [], promises: [], revealed: [], relationshipDelta: "", beat: "", timeInScene: "" },
+      recentAssistantReplies: ["「好。」"],
+      history: [{ role: "assistant" as const, content: "「好。」" }],
+      userText: "<current_perception>\n听见对话者说：继续。\n</current_perception>",
+    };
+    const normal = buildRoleplayChatMessages(base);
+    const directed = buildRoleplayChatMessages({ ...base, rerunDirections: ["shorter", "no_question"] });
+    assert.deepEqual(normal.slice(0, -1), directed.slice(0, -1));
+    assert.match(directed.at(-1)?.content ?? "", /本轮定向重演/);
+    assert.match(directed.at(-1)?.content ?? "", /更短|不用问题/);
+    assert.doesNotMatch(normal.at(-1)?.content ?? "", /本轮定向重演/);
+    assert.equal(formatRoleplayRerunDirections(["shorter", "shorter", "no_question"]).match(/^- /gm)?.length, 2);
+  });
+
+  test("quality review parsing and rewrite instructions stay structural", () => {
+    assert.deepEqual(parseRoleplayQualityReview('{"pass":false,"issues":["analysis_report","invented_fact","unknown"]}'), {
+      pass: false,
+      issues: ["analysis_report", "invented_fact"],
+    });
+    assert.deepEqual(parseRoleplayQualityReview('{"pass":true,"issues":[]}'), { pass: true, issues: [] });
+    const rewrite = formatRoleplayQualityRewrite(["analysis_report", "question_list"], ["dialogue_only"]);
+    assert.match(rewrite, /不是新的剧情回合/);
+    assert.match(rewrite, /删除评估、解释和报告腔/);
+    assert.match(rewrite, /不要列问题/);
+    assert.match(rewrite, /只输出一块 dialogue/);
   });
 
   test("rewinding to one branch point preserves the full prefix before the edited player turn", () => {
@@ -560,6 +594,53 @@ describe("message channel isolation", () => {
       store.saveRoleplayPerception(sessionId, messageId, "可听见的话语：你好。");
       assert.equal(store.roleplayPerception(sessionId, messageId), "可听见的话语：你好。");
       assert.equal(store.messages(sessionId, 10, { channel: "roleplay" })[0].content, "我暗自认出卧底。『你好。』");
+      store.close();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("roleplay branches restore messages, perceptions, and working memory", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-branches-"));
+    try {
+      const project = WriterProject.init(root, "分支切换");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("分支");
+      const firstUser = store.addMessage(sessionId, "user", "第一版输入", "roleplay");
+      const firstProjection = serializeRoleplayPerception({
+        speech: ["第一版"], observableActions: [], perceivedEffects: [], privateOmitted: false, ambiguousOmitted: false,
+      });
+      store.saveRoleplayPerception(sessionId, firstUser, firstProjection);
+      const firstAssistant = store.addMessage(sessionId, "assistant", "「第一版回复。」", "roleplay");
+      const firstMemory = { ...emptyRoleplaySessionMemory("context"), summary: "第一版记忆", turnCount: 1 };
+      store.saveRoleplayMemory(sessionId, firstMemory);
+      store.saveRoleplayMemorySnapshot(sessionId, firstAssistant, firstMemory);
+
+      const rerun = store.prepareMessageRerun(sessionId, firstAssistant);
+      const secondUser = store.addMessage(sessionId, "user", "第一版输入", "roleplay", rerun.variantGroupId);
+      const secondProjection = serializeRoleplayPerception({
+        speech: ["第二版"], observableActions: [], perceivedEffects: [], privateOmitted: false, ambiguousOmitted: false,
+      });
+      store.saveRoleplayPerception(sessionId, secondUser, secondProjection);
+      const secondAssistant = store.addMessage(sessionId, "assistant", "「第二版回复。」", "roleplay", rerun.variantGroupId);
+      const secondMemory = { ...emptyRoleplaySessionMemory("context"), summary: "第二版记忆", turnCount: 1 };
+      store.saveRoleplayMemory(sessionId, secondMemory);
+      store.saveRoleplayMemorySnapshot(sessionId, secondAssistant, secondMemory);
+
+      const firstBranch = store.roleplayBranches(sessionId, rerun.variantGroupId)[0];
+      assert.ok(firstBranch);
+      store.activateRoleplayBranch(sessionId, firstBranch.id);
+      assert.equal(store.messages(sessionId, 20, { channel: "roleplay" }).at(-1)?.content, "「第一版回复。」");
+      const restoredFirstUser = store.messages(sessionId, 20, { channel: "roleplay" }).find(message => message.role === "user")!;
+      assert.equal(store.roleplayPerception(sessionId, restoredFirstUser.id), firstProjection);
+      assert.equal(store.roleplayMemory(sessionId)?.summary, "第一版记忆");
+
+      const secondBranch = store.roleplayBranches(sessionId, rerun.variantGroupId)
+        .find(branch => branch.preview.includes("第二版回复"));
+      assert.ok(secondBranch);
+      store.activateRoleplayBranch(sessionId, secondBranch.id);
+      assert.equal(store.messages(sessionId, 20, { channel: "roleplay" }).at(-1)?.content, "「第二版回复。」");
+      const restoredSecondUser = store.messages(sessionId, 20, { channel: "roleplay" }).find(message => message.role === "user")!;
+      assert.equal(store.roleplayPerception(sessionId, restoredSecondUser.id), secondProjection);
+      assert.equal(store.roleplayMemory(sessionId)?.summary, "第二版记忆");
       store.close();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

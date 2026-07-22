@@ -39,6 +39,40 @@ export const ROLEPLAY_STATE_REFRESH_EVERY = 4;
 /** Bump when persisted memory semantics change; old domains remain inspectable but are not injected. */
 export const ROLEPLAY_EPISTEMIC_MEMORY_VERSION = 4;
 
+export const ROLEPLAY_RERUN_DIRECTIONS = [
+  "shorter",
+  "more_emotional",
+  "less_explanation",
+  "dialogue_only",
+  "with_action",
+  "no_question",
+] as const;
+export type RoleplayRerunDirection = typeof ROLEPLAY_RERUN_DIRECTIONS[number];
+
+const ROLEPLAY_RERUN_DIRECTION_LINES: Record<RoleplayRerunDirection, string> = {
+  shorter: "比上一版更短，只保留不可替代的一拍。",
+  more_emotional: "让情绪通过措辞、停顿或动作自然显露，不解释情绪。",
+  less_explanation: "删除解释、归纳和分析，只演角色的即时反应。",
+  dialogue_only: "本轮只输出一块 dialogue，不添加动作或旁白。",
+  with_action: "本轮可以用一个角色自身动作承载反应，但不要写动作清单。",
+  no_question: "本轮不用问题推进，以陈述、动作或留白结束。",
+};
+
+export function normalizeRoleplayRerunDirections(value: unknown): RoleplayRerunDirection[] {
+  if (!Array.isArray(value)) return [];
+  const allowed = new Set<string>(ROLEPLAY_RERUN_DIRECTIONS);
+  return [...new Set(value.filter((item): item is RoleplayRerunDirection =>
+    typeof item === "string" && allowed.has(item),
+  ))].slice(0, 3);
+}
+
+export function formatRoleplayRerunDirections(value: readonly RoleplayRerunDirection[]): string {
+  const directions = normalizeRoleplayRerunDirections(value);
+  return directions.length
+    ? ["本轮定向重演：", ...directions.map(item => `- ${ROLEPLAY_RERUN_DIRECTION_LINES[item]}`)].join("\n")
+    : "";
+}
+
 export function roleplaySummaryBatchDue(
   messages: Array<{ id: number }>,
   firstRecentId: number,
@@ -94,7 +128,7 @@ export function formatRoleplayOocDirective(instruction: string): string {
   return `［OOC 导演指示——这不是角色对白，而是用户以“导演/旁观”身份提出的调整要求。请据此调整接下来的演出（例如推进时间、切换场景、改变态度、设定新前提等），但不要把这段文字当作台词来回应，也不要替对话者（用户）说话或行动。指示：${instruction}］`;
 }
 
-/** Generate short, actionable director prompts with the independently assigned flash model. */
+/** Generate concrete next-beat director prompts with the roleplay model. */
 export async function recommendRoleplayDirectorActions(options: {
   store: WriterStore;
   sessionId: string;
@@ -108,7 +142,15 @@ export async function recommendRoleplayDirectorActions(options: {
   const facts = options.store.roleplayMemoryFacts(options.sessionId, memory?.performerKey)
     .filter(fact => fact.status === "active")
     .slice(0, 8);
-  const recent = options.store.messages(options.sessionId, 8, { channel: "roleplay" });
+  const recent = options.store.messages(options.sessionId, 6, { channel: "roleplay" })
+    .map(message => message.role === "user"
+      ? {
+          role: message.role,
+          content: storedRoleplayPerceptionForModel(
+            options.store.roleplayPerception(options.sessionId, message.id) ?? "［该玩家回合没有可用感知。］",
+          ),
+        }
+      : { role: message.role, content: message.content });
   const scene = options.scene
     ? {
         name: options.scene.name,
@@ -125,12 +167,12 @@ export async function recommendRoleplayDirectorActions(options: {
     {
       role: "system",
       content: [
-        "你是角色扮演的轻量导演助手。",
-        "根据当前人物、场景与最近进展，推荐 3 条彼此不同、可以直接发送的导演指令。",
-        "三条分别选择节奏、冲突、信息揭示、情绪或场景变化中的一个方向。",
-        "每条只包含一项核心调整，使用祈使句，不铺陈动作过程，不写角色对白，不解释。",
-        "每条控制在 12～24 个汉字，最多使用一个逗号。",
-        "只输出严格 JSON，键名为 suggestions，值为三个字符串。",
+        "你是角色对戏的场景导演，只设计下一拍，不替任何角色写台词。",
+        "根据已建立的现场、角色当前目标、未解决张力和最近一次反应，给出 3 个真正能改变下一回合的导演选择。",
+        "每个选择必须锚定输入中已有的具体人物、物件、承诺、冲突或现场细节；不得发明新设定，不得要求玩家角色产生指定情绪或行动。",
+        "三个选择应分别偏向：角色主动行动、关系或情绪转折、现场节奏变化。没有足够依据时，使用保持沉默、拉开距离或延后回答等低假设动作。",
+        "每条是一项可直接发送的祈使指令，14～32 个汉字，不写对白，不解释原因，不使用抽象的‘推进剧情’或‘增加冲突’。",
+        "只输出严格 JSON：{\"suggestions\":[\"...\",\"...\",\"...\"]}。",
       ].join("\n"),
     },
     {
@@ -141,7 +183,7 @@ export async function recommendRoleplayDirectorActions(options: {
         scene,
         memory: memory ? { summary: memory.summary, state: memory.state } : null,
         facts: facts.map(fact => fact.content),
-        recent: recent.map(message => ({ role: message.role, content: message.content.slice(0, 800) })),
+        recent: recent.map(message => ({ role: message.role, content: message.content.slice(0, 500) })),
       }),
     },
   ], options.signal);
@@ -152,7 +194,7 @@ export async function recommendRoleplayDirectorActions(options: {
   const cleaned = content.trim();
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error("Flash 模型没有返回有效的导演推荐");
+  if (start < 0 || end <= start) throw new Error("角色模型没有返回有效的导演建议");
   const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { suggestions?: unknown };
   const suggestions = Array.isArray(parsed.suggestions)
     ? parsed.suggestions
@@ -161,8 +203,8 @@ export async function recommendRoleplayDirectorActions(options: {
         .filter(Boolean)
         .slice(0, 3)
     : [];
-  if (!suggestions.length) throw new Error("Flash 模型没有返回有效的导演推荐");
-  return suggestions;
+  if (suggestions.length < 3) throw new Error("角色模型没有返回足够的导演建议");
+  return [...new Set(suggestions)].slice(0, 3);
 }
 
 /** Opening prompt: have the character initiate the scene before the user speaks. */
@@ -486,6 +528,91 @@ export async function compileRoleplayPerception(options: {
   return parseRoleplayPerception(completed.content);
 }
 
+export const ROLEPLAY_QUALITY_ISSUES = [
+  "echoes_player",
+  "analysis_report",
+  "invented_fact",
+  "knowledge_leak",
+  "controls_player",
+  "question_list",
+  "direction_missed",
+] as const;
+export type RoleplayQualityIssue = typeof ROLEPLAY_QUALITY_ISSUES[number];
+
+export interface RoleplayQualityReview {
+  pass: boolean;
+  issues: RoleplayQualityIssue[];
+}
+
+const ROLEPLAY_QUALITY_SYSTEM = `你是即时角色对戏的语义质检员，不续写，也不评价文采。比较角色本轮可感知内容与候选演出，判断是否存在会破坏对戏的实质问题。
+仅检查：
+- echoes_player：通过引用、改写或逐项回应来复述玩家输入，而非直接反应；
+- analysis_report：像评估报告、技术说明、人格分析、风险分析或答题解析；
+- invented_fact：出现上下文没有依据的具体数值、制度、机制、经历或结论；
+- knowledge_leak：角色使用了 current_perception 中没有、且不能由既有现场记忆获得的信息；
+- controls_player：替玩家角色决定动作、内心、情绪或结果；
+- question_list：连续列问题，或把多个输入分句逐项处理；
+- direction_missed：没有遵守本轮明确的定向重演要求。
+正常的简短承接、符合角色口吻的推断、一个必要问题或单纯格式瑕疵不算失败。只输出严格 JSON：{"pass":true|false,"issues":["..."]}。`;
+
+export function parseRoleplayQualityReview(text: string): RoleplayQualityReview {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("角色演出质检没有返回有效 JSON");
+  const raw = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
+  const allowed = new Set<string>(ROLEPLAY_QUALITY_ISSUES);
+  const issues = Array.isArray(raw.issues)
+    ? [...new Set(raw.issues.filter((item): item is RoleplayQualityIssue =>
+        typeof item === "string" && allowed.has(item),
+      ))]
+    : [];
+  return { pass: raw.pass === true && issues.length === 0, issues };
+}
+
+async function reviewRoleplayPerformance(options: {
+  model: ModelConfig;
+  perception: string;
+  reply: string;
+  rerunDirections: RoleplayRerunDirection[];
+  signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
+}): Promise<RoleplayQualityReview> {
+  const completed = await completeJsonText(options.model, [
+    { role: "system", content: ROLEPLAY_QUALITY_SYSTEM },
+    { role: "user", content: JSON.stringify({
+      currentPerception: options.perception,
+      requestedDirections: normalizeRoleplayRerunDirections(options.rerunDirections),
+      candidatePerformance: options.reply,
+    }) },
+  ], options.signal);
+  if (completed.usage) options.usageReporter?.(options.model, completed.usage, { callKind: "roleplay_quality_review" });
+  return parseRoleplayQualityReview(completed.content);
+}
+
+const ROLEPLAY_QUALITY_REWRITE_LINES: Record<RoleplayQualityIssue, string> = {
+  echoes_player: "不要复述或逐项承接玩家输入，直接给出角色此刻的一个反应。",
+  analysis_report: "删除评估、解释和报告腔，把含义留在台词或动作里。",
+  invented_fact: "删除无依据的数值、机制和结论，只使用已建立事实。",
+  knowledge_leak: "删除角色不可能知道的信息，只依据本轮感知和既有记忆。",
+  controls_player: "不要替玩家角色决定动作、内心、情绪或结果。",
+  question_list: "不要列问题或逐句回答，只保留一个真正必要的反应。",
+  direction_missed: "严格执行本轮定向重演要求。",
+};
+
+export function formatRoleplayQualityRewrite(
+  issues: readonly RoleplayQualityIssue[],
+  directions: readonly RoleplayRerunDirection[] = [],
+): string {
+  const uniqueIssues = [...new Set(issues)].filter(item => ROLEPLAY_QUALITY_ISSUES.includes(item));
+  return [
+    "［演出修正：上一版未通过内部质检。这不是新的剧情回合；不要回应这段说明。保持同一时刻、同一事实和同一角色意图，完整重写上一版。］",
+    ...uniqueIssues.map(item => `- ${ROLEPLAY_QUALITY_REWRITE_LINES[item]}`),
+    formatRoleplayRerunDirections(directions),
+    "只输出修正后的 <action> / <dialogue> / <ooc> 块。",
+  ].filter(Boolean).join("\n");
+}
+
 export type RoleplayPresentationKind = "action" | "dialogue" | "ooc";
 export interface RoleplayPresentationBlock { kind: RoleplayPresentationKind; text: string }
 
@@ -724,8 +851,12 @@ export function buildRoleplayChatMessages(parts: {
   recentAssistantReplies: string[];
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userText: string;
+  rerunDirections?: RoleplayRerunDirection[];
 }): ChatMessage[] {
-  const dynamicTurnHints = formatRoleplayAntiFormulaSlot(parts.recentAssistantReplies);
+  const dynamicTurnHints = [
+    formatRoleplayAntiFormulaSlot(parts.recentAssistantReplies),
+    formatRoleplayRerunDirections(parts.rerunDirections ?? []),
+  ].filter(Boolean).join("\n");
   const dynamicContext = [
     ROLEPLAY_DYNAMIC_CONTEXT_MARKER + formatRoleplaySummarySlot(parts.summary),
     formatRoleplayMemorySlot(parts.state, parts.sameBeatTurns ?? 0, parts.scene, parts.facts, parts.lore),
@@ -789,6 +920,8 @@ export async function runRoleplayChat(options: {
   /** Model-initiated opening: the character speaks first, no user message is written. */
   opening?: boolean;
   variantGroupId?: string;
+  rerunDirections?: RoleplayRerunDirection[];
+  perceptionOverride?: RoleplayPerceptionProjection;
   jobId?: string;
   model: ModelConfig;
   /** General-purpose Flash model used to compile raw player input into a safe perception projection. */
@@ -859,7 +992,7 @@ export async function runRoleplayChat(options: {
     modelUserText = formatRoleplayOocDirective(stripRoleplayOocMarker(userText));
     storedPerception = modelUserText;
   } else {
-    const projection = await compileRoleplayPerception({
+    const projection = options.perceptionOverride ?? await compileRoleplayPerception({
         model: options.perceptionModel ?? options.summarizer ?? options.model,
         input: userText,
         performerName: performerDisplayName,
@@ -923,6 +1056,7 @@ export async function runRoleplayChat(options: {
     recentAssistantReplies,
     history,
     userText: modelUserText,
+    rerunDirections: options.rerunDirections,
   });
   if (currentUserMessageId !== undefined && storedPerception !== undefined) {
     options.store.saveRoleplayPerception(
@@ -932,31 +1066,46 @@ export async function runRoleplayChat(options: {
     );
   }
 
-  let rawFull = "";
-  const presentationStream = new RoleplayPresentationStream((text) => {
-    emit({ type: "text", text, channel: "output" });
-  });
   try {
-    const result = await streamRoleplayText(options.model, messages, options.signal, (text) => {
-      rawFull += text;
-      presentationStream.push(text);
-    });
-    presentationStream.finish();
-    const rawReply = (rawFull || result.content).trim();
-    const rendered = renderRoleplayWirePresentation(rawReply);
-    const reply = rendered.valid
-      ? rendered.markdown
-      : rawReply
-        ? await repairRoleplayPresentation({
-            model: options.perceptionModel ?? options.summarizer ?? options.model,
-            source: rawReply,
-            signal: options.signal,
-            usageReporter: reportInternalUsage,
-          })
-        : `*${participant.name} 沉默了一会儿。*`;
-    if (presentationStream.emittedBlocks === 0) {
-      emit({ type: "text", text: reply, channel: "output" });
+    const result = await streamRoleplayText(options.model, messages, options.signal, () => undefined);
+    let rawReply = result.content.trim();
+    const qualityModel = options.perceptionModel ?? options.summarizer ?? options.model;
+    const quality = rawReply
+      ? await reviewRoleplayPerformance({
+          model: qualityModel,
+          perception: modelUserText,
+          reply: rawReply,
+          rerunDirections: options.rerunDirections ?? [],
+          signal: options.signal,
+          usageReporter: reportInternalUsage,
+        }).catch(() => ({ pass: true, issues: [] as RoleplayQualityIssue[] }))
+      : { pass: true, issues: [] as RoleplayQualityIssue[] };
+    let rewriteResult: Awaited<ReturnType<typeof streamRoleplayText>> | undefined;
+    if (!quality.pass && rawReply) {
+      rewriteResult = await streamRoleplayText(options.model, [
+        ...messages,
+        { role: "assistant", content: rawReply },
+        { role: "user", content: formatRoleplayQualityRewrite(quality.issues, options.rerunDirections ?? []) },
+      ], options.signal, () => undefined);
+      rawReply = rewriteResult.content.trim() || rawReply;
     }
+    const budget = opening ? ROLEPLAY_OPENING_PRESENTATION_BUDGET : ROLEPLAY_TURN_PRESENTATION_BUDGET;
+    const rendered = renderRoleplayWirePresentation(rawReply);
+    let reply = "";
+    if (rendered.valid && roleplayPresentationWithinBudget(rendered.blocks, budget)) {
+      reply = rendered.markdown;
+    } else if (rawReply) {
+      const repaired = await repairRoleplayPresentation({
+        model: qualityModel,
+        source: rawReply,
+        budget,
+        signal: options.signal,
+        usageReporter: reportInternalUsage,
+      });
+      reply = repaired.map(renderRoleplayPresentationBlock).filter(Boolean).join("\n\n");
+    }
+    if (!reply) reply = `*${participant.name} 沉默了一会儿。*`;
+    emit({ type: "text", text: reply, channel: "output" });
     const assistantMessageId = options.store.addMessage(options.sessionId, "assistant", reply, "roleplay", options.variantGroupId);
 
     // Lightweight post-turn bookkeeping (no extra model call).
@@ -970,6 +1119,9 @@ export async function runRoleplayChat(options: {
 
     if (result.usage) {
       emitUsage(emit, options.store, options.sessionId, options.model, result.usage, 1, "roleplay_reply", options.jobId);
+    }
+    if (rewriteResult?.usage) {
+      emitUsage(emit, options.store, options.sessionId, options.model, rewriteResult.usage, 1, "roleplay_reply_rewrite", options.jobId);
     }
 
     // Refresh rolling summary / working-state now that the reply is out (best-effort).

@@ -24,7 +24,17 @@ import {
   type ScenePipelineSettings,
 } from "./agent_runtime.js";
 import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
-import { generateRoleplayInterlocutor, recommendRoleplayDirectorActions, runRoleplayChat, storedRoleplayPerceptionForDisplay } from "./roleplay.js";
+import {
+  generateRoleplayInterlocutor,
+  normalizeRoleplayRerunDirections,
+  parseRoleplayPerception,
+  parseStoredRoleplayPerception,
+  recommendRoleplayDirectorActions,
+  runRoleplayChat,
+  serializeRoleplayPerception,
+  storedRoleplayPerceptionForDisplay,
+  type RoleplayPerceptionProjection,
+} from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
 import { WriterProject } from "./project.js";
@@ -36,13 +46,19 @@ import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
-export type WebConversationMessage = Message & { roleplayPerception?: string };
+export type WebConversationMessage = Message & {
+  roleplayPerception?: string;
+  roleplayPerceptionData?: RoleplayPerceptionProjection;
+};
 
 export function conversationMessageForWeb(store: WriterStore, message: Message): WebConversationMessage {
   if (message.channel !== "roleplay" || message.role !== "user") return message;
   const stored = store.roleplayPerception(message.sessionId, message.id);
   const roleplayPerception = stored ? storedRoleplayPerceptionForDisplay(stored).trim() : "";
-  return roleplayPerception ? { ...message, roleplayPerception } : message;
+  const roleplayPerceptionData = stored ? parseStoredRoleplayPerception(stored) : undefined;
+  return roleplayPerception
+    ? { ...message, roleplayPerception, ...(roleplayPerceptionData ? { roleplayPerceptionData } : {}) }
+    : message;
 }
 
 export type AgentJobInfo = {
@@ -823,7 +839,7 @@ export async function startWriterServer(options: {
         performer: active.performer,
         identity: active.identity,
         scene: active.scene,
-        model: options.providers.modelConfig("flash"),
+        model: options.providers.modelConfig("roleplay"),
       });
       return context.json({ suggestions });
     } catch (error) {
@@ -832,7 +848,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
@@ -903,6 +919,10 @@ export async function startWriterServer(options: {
             inputMode: body.inputMode === "director" ? "director" : "dialogue",
             opening: body.opening === true,
             variantGroupId,
+            rerunDirections: normalizeRoleplayRerunDirections(body.rerunDirections),
+            ...(body.perceptionOverride
+              ? { perceptionOverride: parseRoleplayPerception(JSON.stringify(body.perceptionOverride)) }
+              : {}),
             model: options.providers.modelConfig("roleplay"),
             perceptionModel: options.providers.modelConfig("flash"),
             summarizer: options.providers.summaryModelConfig(),
@@ -1130,6 +1150,40 @@ export async function startWriterServer(options: {
       return context.json(options.store.prepareMessageRerun(sessionId, targetId, {
         keepChanges: Boolean(body.keepChanges),
       }));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.put("/api/roleplay/messages/:id/perception", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string; perception?: unknown }>();
+      const sessionId = body.sessionId ?? "";
+      const messageId = Number(context.req.param("id"));
+      if (!sessionId || !Number.isInteger(messageId) || messageId < 1) throw new Error("参数无效");
+      const perception = parseRoleplayPerception(JSON.stringify(body.perception));
+      options.store.saveRoleplayPerception(sessionId, messageId, serializeRoleplayPerception(perception));
+      return context.json({
+        perception,
+        display: storedRoleplayPerceptionForDisplay(serializeRoleplayPerception(perception)),
+      });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.get("/api/roleplay/branches", (context) => {
+    try {
+      const sessionId = context.req.query("session") ?? "";
+      const groupId = context.req.query("group")?.trim() || undefined;
+      if (!sessionId) throw new Error("参数无效");
+      return context.json({ branches: options.store.roleplayBranches(sessionId, groupId) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/roleplay/branches/:id/activate", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string }>();
+      const sessionId = body.sessionId ?? "";
+      if (!sessionId) throw new Error("参数无效");
+      if (agentJobs.activeJob(sessionId)) return context.json({ error: "角色演出运行期间不能切换分支" }, 409);
+      return context.json(options.store.activateRoleplayBranch(sessionId, context.req.param("id")));
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 

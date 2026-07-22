@@ -76,8 +76,34 @@ type Message = {
   content: string;
   channel?: "agent" | "roleplay";
   roleplayPerception?: string;
+  roleplayPerceptionData?: RoleplayPerceptionProjection;
   variantGroupId?: string;
   variantCount?: number;
+};
+type RoleplayPerceptionProjection = {
+  speech: string[];
+  observableActions: string[];
+  perceivedEffects: string[];
+  privateOmitted: boolean;
+  ambiguousOmitted: boolean;
+};
+type RoleplayRerunDirection = "shorter" | "more_emotional" | "less_explanation" | "dialogue_only" | "with_action" | "no_question";
+const ROLEPLAY_RERUN_DIRECTION_OPTIONS: Array<{ id: RoleplayRerunDirection; label: string }> = [
+  { id: "shorter", label: "更简短" },
+  { id: "more_emotional", label: "更有情绪" },
+  { id: "less_explanation", label: "少解释" },
+  { id: "dialogue_only", label: "只说台词" },
+  { id: "with_action", label: "加入动作" },
+  { id: "no_question", label: "不要提问" },
+];
+type RoleplayBranchSummary = {
+  id: string;
+  groupId: string;
+  fromMessageId: number;
+  label: string;
+  preview: string;
+  messageCount: number;
+  createdAt: string;
 };
 type MessageVersionBundle = {
   current: number;
@@ -946,11 +972,59 @@ function Markdown({ content, className, headingPrefix }: { content: string; clas
   );
 }
 
-function RoleplayPerceptionDetails({ content }: { content: string }) {
+function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }: {
+  content: string;
+  data?: RoleplayPerceptionProjection;
+  disabled?: boolean;
+  onSave: (value: RoleplayPerceptionProjection) => Promise<void>;
+  onReplay: (value: RoleplayPerceptionProjection) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<RoleplayPerceptionProjection | null>(null);
+  const [saving, setSaving] = useState(false);
+  const beginEdit = () => {
+    if (!data) return;
+    setDraft({ ...data, speech: [...data.speech], observableActions: [...data.observableActions], perceivedEffects: [...data.perceivedEffects] });
+    setEditing(true);
+  };
+  const setLines = (key: "speech" | "observableActions" | "perceivedEffects", value: string) => {
+    setDraft(current => current ? { ...current, [key]: value.split("\n").map(item => item.trim()).filter(Boolean) } : current);
+  };
+  const submit = async (replay: boolean) => {
+    if (!draft || saving) return;
+    setSaving(true);
+    try {
+      if (replay) await onReplay(draft);
+      else await onSave(draft);
+      setEditing(false);
+    } finally { setSaving(false); }
+  };
   return (
     <details className="roleplay-perception-details">
       <summary>角色感知到的内容</summary>
-      <Markdown content={content} className="roleplay-perception-content" />
+      {!editing ? (
+        <>
+          <Markdown content={content} className="roleplay-perception-content" />
+          {data && <button className="roleplay-perception-edit" type="button" disabled={disabled} onClick={beginEdit} title="修正角色实际能够感知的内容">
+            <Pencil size={13} aria-hidden="true" />编辑感知
+          </button>}
+        </>
+      ) : draft ? (
+        <div className="roleplay-perception-editor">
+          <label><span>可听见的话语</span><textarea value={draft.speech.join("\n")} onChange={event => setLines("speech", event.target.value)} /></label>
+          <label><span>可观察的动作</span><textarea value={draft.observableActions.join("\n")} onChange={event => setLines("observableActions", event.target.value)} /></label>
+          <label><span>角色自身感受到的变化</span><textarea value={draft.perceivedEffects.join("\n")} onChange={event => setLines("perceivedEffects", event.target.value)} /></label>
+          <div className="roleplay-perception-flags">
+            <label><input type="checkbox" checked={draft.privateOmitted} onChange={event => setDraft({ ...draft, privateOmitted: event.target.checked })} />已排除私密信息</label>
+            <label><input type="checkbox" checked={draft.ambiguousOmitted} onChange={event => setDraft({ ...draft, ambiguousOmitted: event.target.checked })} />已排除无法确认的信息</label>
+          </div>
+          <div className="roleplay-perception-actions">
+            <button type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
+            <button type="button" disabled={saving} onClick={() => void submit(false)}><Save size={13} aria-hidden="true" />保存</button>
+            <button type="button" className="primary" disabled={saving} onClick={() => void submit(true)}><RefreshCw size={13} aria-hidden="true" />保存并重演</button>
+          </div>
+        </div>
+      ) : null}
     </details>
   );
 }
@@ -1700,7 +1774,14 @@ function App() {
   const [branchConfirm, setBranchConfirm] = useState<{
     mode: "edit" | "rerun";
     message: Message;
+    rerunDirections: RoleplayRerunDirection[];
+    perceptionOverride?: RoleplayPerceptionProjection;
   } | null>(null);
+  const [roleplayBranchTimeline, setRoleplayBranchTimeline] = useState<{
+    message: Message;
+    branches: RoleplayBranchSummary[];
+  } | null>(null);
+  const [roleplayBranchBusy, setRoleplayBranchBusy] = useState(false);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
@@ -2134,7 +2215,7 @@ function App() {
       || showUsagePopover || settingsMenuOpen || managementView !== null
       || styleDraft !== null || characterDraft !== null || simpleCardDraft !== null
       || roleplaySetup !== null || roleplaySceneDraft !== null || roleplayFactDraft !== null
-      || branchConfirm !== null;
+      || branchConfirm !== null || roleplayBranchTimeline !== null;
     if (!overlayOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -2149,6 +2230,7 @@ function App() {
       if (roleplaySceneDraft) { setRoleplaySceneDraft(null); return; }
       if (roleplaySetup && !roleplaySetupBusy) { setRoleplaySetup(null); return; }
       if (branchConfirm) { setBranchConfirm(null); return; }
+      if (roleplayBranchTimeline) { setRoleplayBranchTimeline(null); return; }
       if (settingsMenuOpen) { setSettingsMenuOpen(false); return; }
       if (showUsagePopover) { setShowUsagePopover(false); return; }
       if (showThemePicker) { setShowThemePicker(false); return; }
@@ -2167,7 +2249,7 @@ function App() {
   }, [
     showThemePicker, showStylePicker, showConnectionPanel, showUsagePopover, settingsMenuOpen,
     managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
-    roleplaySceneDraft, roleplayFactDraft, branchConfirm,
+    roleplaySceneDraft, roleplayFactDraft, branchConfirm, roleplayBranchTimeline,
   ]);
 
   useEffect(() => {
@@ -2538,6 +2620,8 @@ function App() {
     channel?: "agent" | "roleplay";
     variantGroupId?: string;
     replaceFromId?: number;
+    rerunDirections?: RoleplayRerunDirection[];
+    perceptionOverride?: RoleplayPerceptionProjection;
   }) {
     const text = (options?.text ?? prompt).trim();
     const requestedChannel = options?.channel ?? composerBranch?.channel;
@@ -2594,6 +2678,8 @@ function App() {
           prompt: text,
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           ...(variantGroupId ? { variantGroupId } : {}),
+          ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
+          ...(options?.perceptionOverride ? { perceptionOverride: options.perceptionOverride } : {}),
           ...(!activeRoleplay ? {
             ...(characterScope !== undefined ? { characterScope } : {}),
             ...(simpleCharacterScope !== undefined ? { simpleCharacterScope } : {}),
@@ -2637,21 +2723,29 @@ function App() {
       setError("当前角色扮演身份已退出，无法编辑这条扮演消息。");
       return;
     }
-    setBranchConfirm({ mode: "edit", message });
+    setBranchConfirm({ mode: "edit", message, rerunDirections: [] });
   }
 
-  function requestRerunMessage(message: Message) {
+  function requestRerunMessage(message: Message, perceptionOverride?: RoleplayPerceptionProjection) {
     if (!state || busy || message.id < 1) return;
     if (message.channel === "roleplay" && !roleplay) {
       setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
       return;
     }
-    setBranchConfirm({ mode: "rerun", message });
+    const sourcePerception = perceptionOverride ?? message.roleplayPerceptionData ?? (message.channel === "roleplay"
+      ? [...state.messages].reverse().find(item => item.id <= message.id && item.role === "user" && item.channel === "roleplay")?.roleplayPerceptionData
+      : undefined);
+    setBranchConfirm({
+      mode: "rerun",
+      message,
+      rerunDirections: [],
+      perceptionOverride: sourcePerception,
+    });
   }
 
   async function confirmBranchAction(keepChanges: boolean) {
     if (!state || !branchConfirm) return;
-    const { mode, message } = branchConfirm;
+    const { mode, message, rerunDirections, perceptionOverride } = branchConfirm;
     setBranchConfirm(null);
     setError("");
     setNotice("");
@@ -2696,6 +2790,8 @@ function App() {
         channel: result.channel,
         variantGroupId: result.variantGroupId,
         replaceFromId: result.fromId,
+        rerunDirections,
+        perceptionOverride,
       });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -3183,6 +3279,51 @@ function App() {
   function openProviderSettings() {
     setSettingsMenuOpen(false);
     setManagementView("models");
+  }
+
+  async function saveRoleplayPerception(message: Message, perception: RoleplayPerceptionProjection): Promise<void> {
+    if (!state) return;
+    const result = await api<{ perception: RoleplayPerceptionProjection; display: string }>(
+      `/api/roleplay/messages/${message.id}/perception`,
+      { method: "PUT", body: JSON.stringify({ sessionId: state.sessionId, perception }) },
+    );
+    setState(current => current ? {
+      ...current,
+      messages: current.messages.map(item => item.id === message.id
+        ? { ...item, roleplayPerception: result.display, roleplayPerceptionData: result.perception }
+        : item),
+    } : current);
+  }
+
+  async function saveAndReplayRoleplayPerception(message: Message, perception: RoleplayPerceptionProjection): Promise<void> {
+    await saveRoleplayPerception(message, perception);
+    requestRerunMessage({ ...message, roleplayPerceptionData: perception }, perception);
+  }
+
+  async function openRoleplayBranchTimeline(message: Message) {
+    if (!state || !message.variantGroupId) return;
+    try {
+      const result = await api<{ branches: RoleplayBranchSummary[] }>(
+        `/api/roleplay/branches?session=${encodeURIComponent(state.sessionId)}&group=${encodeURIComponent(message.variantGroupId)}`,
+      );
+      setRoleplayBranchTimeline({ message, branches: result.branches });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function activateRoleplayBranch(branch: RoleplayBranchSummary) {
+    if (!state || roleplayBranchBusy) return;
+    setRoleplayBranchBusy(true);
+    try {
+      await api(`/api/roleplay/branches/${encodeURIComponent(branch.id)}/activate`, {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setRoleplayBranchTimeline(null);
+      setMessageVersionViews({});
+      clearAgentStream({ abort: true, clearStorage: true, sessionId: state.sessionId });
+      await refresh(state.sessionId);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setRoleplayBranchBusy(false); }
   }
 
   async function exportFocusedDocument() {
@@ -3876,7 +4017,13 @@ function App() {
                 <>
                   <div>{displayContent}</div>
                   {msg.channel === "roleplay" && msg.roleplayPerception
-                    ? <RoleplayPerceptionDetails content={msg.roleplayPerception} />
+                    ? <RoleplayPerceptionDetails
+                        content={msg.roleplayPerception}
+                        data={msg.roleplayPerceptionData}
+                        disabled={busy}
+                        onSave={(value) => saveRoleplayPerception(msg, value)}
+                        onReplay={(value) => saveAndReplayRoleplayPerception(msg, value)}
+                      />
                     : null}
                 </>
               )}
@@ -3900,6 +4047,9 @@ function App() {
                 })()}
                 {msg.role === "user" && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
                 <button disabled={busy} onClick={() => requestRerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
+                {msg.channel === "roleplay" && msg.variantGroupId && (msg.variantCount ?? 1) > 1
+                  ? <button disabled={busy} onClick={() => void openRoleplayBranchTimeline(msg)} title="查看并切换这一轮保存的完整对话分支">分支</button>
+                  : null}
                 {msg.channel === "roleplay" && <button disabled={busy} onClick={() => { setRoleplayFactDraft(newFactDraft(msg)); setRoleplayMemoryOpen(true); }} title="把这条消息保存为可纠错的事实记忆">记住</button>}
               </div>}
             </article>
@@ -3992,7 +4142,7 @@ function App() {
                     <small>推荐用于推进与校准剧情</small>
                   </div>
                   <button type="button" disabled={busy || directorSuggestionBusy} onClick={() => void requestDirectorSuggestions()}>
-                    {directorSuggestionBusy ? "推荐中…" : directorSuggestions.length ? "换一组" : "Flash 推荐"}
+                    {directorSuggestionBusy ? "建议生成中…" : directorSuggestions.length ? "换一组" : "导演建议"}
                   </button>
                 </div>
                 <p>说明场景、时间、节奏、角色态度或新增前提；角色对白请切回「角色内」。</p>
@@ -4011,7 +4161,7 @@ function App() {
                           {suggestion}
                         </button>
                       ))
-                    : <span className="director-mode-empty">使用通用 Flash 模型，根据当前场景与最近对话生成可直接发送的指令。</span>}
+                    : <span className="director-mode-empty">由当前角色模型读取现场目标、张力与最近对话，生成三个具体的下一拍选择。</span>}
                 </div>
               </div>
             )}
@@ -4075,6 +4225,30 @@ function App() {
               当前回答会保存为历史版本；此消息之后的对话会撤销。
               已接受的<strong>文档修改</strong>与<strong>角色卡修改</strong>可选择保留或回退。
             </p>
+            {branchConfirm.mode === "rerun" && branchConfirm.message.channel === "roleplay" && (
+              <fieldset className="roleplay-rerun-directions">
+                <legend>定向重演 <small>最多选择 3 项</small></legend>
+                <div>
+                  {ROLEPLAY_RERUN_DIRECTION_OPTIONS.map(option => {
+                    const checked = branchConfirm.rerunDirections.includes(option.id);
+                    return <label key={option.id}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={!checked && branchConfirm.rerunDirections.length >= 3}
+                        onChange={() => setBranchConfirm(current => current ? {
+                          ...current,
+                          rerunDirections: checked
+                            ? current.rerunDirections.filter(item => item !== option.id)
+                            : [...current.rerunDirections, option.id],
+                        } : current)}
+                      />
+                      <span>{option.label}</span>
+                    </label>;
+                  })}
+                </div>
+              </fieldset>
+            )}
             <div className="modal-actions branch-confirm-actions">
               <button type="button" onClick={() => setBranchConfirm(null)}>取消</button>
               <button
@@ -4094,6 +4268,34 @@ function App() {
                 保留更改
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {roleplayBranchTimeline && (
+        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => !roleplayBranchBusy && setRoleplayBranchTimeline(null)}>
+          <div className="modal roleplay-branch-modal" role="dialog" aria-modal="true" aria-labelledby="roleplay-branch-title" onMouseDown={event => event.stopPropagation()}>
+            <span className="eyebrow">Roleplay branches</span>
+            <h2 id="roleplay-branch-title">分支时间线</h2>
+            <p>切换会同时恢复该分支的消息、角色感知、现场记忆和来源事实。</p>
+            <div className="roleplay-branch-list">
+              <div className="roleplay-branch-item current">
+                <div><strong>当前分支</strong><span>正在使用的对话上下文</span></div>
+                <span className="roleplay-branch-current">当前</span>
+              </div>
+              {roleplayBranchTimeline.branches.map((branch, index) => (
+                <div className="roleplay-branch-item" key={branch.id}>
+                  <div>
+                    <strong>版本 {roleplayBranchTimeline.branches.length - index}</strong>
+                    <span>{branch.preview || branch.label}</span>
+                    <small>{new Date(branch.createdAt).toLocaleString()} · {branch.messageCount} 条消息</small>
+                  </div>
+                  <button type="button" disabled={roleplayBranchBusy} onClick={() => void activateRoleplayBranch(branch)}>切换</button>
+                </div>
+              ))}
+              {!roleplayBranchTimeline.branches.length && <div className="roleplay-branch-empty">还没有可切换的历史分支。</div>}
+            </div>
+            <div className="modal-actions"><button type="button" disabled={roleplayBranchBusy} onClick={() => setRoleplayBranchTimeline(null)}>关闭</button></div>
           </div>
         </div>
       )}

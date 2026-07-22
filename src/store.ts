@@ -28,6 +28,31 @@ import { WriterProject } from "./project.js";
 type Row = Record<string, unknown>;
 type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
 
+export interface RoleplayBranchSummary {
+  id: string;
+  groupId: string;
+  fromMessageId: number;
+  label: string;
+  preview: string;
+  messageCount: number;
+  createdAt: string;
+}
+
+type RoleplayBranchPayload = {
+  messages: Array<{
+    id: number;
+    role: Message["role"];
+    content: string;
+    createdAt: string;
+    channel: MessageChannel;
+    variantGroupId?: string;
+    roleplayPerception?: string;
+  }>;
+  memory?: RoleplaySessionMemory;
+  memorySnapshots: Array<{ throughMessageId: number; contextKey: string; memoryJson: string; createdAt: string }>;
+  facts: Array<Record<string, unknown>>;
+};
+
 function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[] {
   if (typeof value !== "string" || !value.trim()) return [];
   try {
@@ -102,6 +127,19 @@ export class WriterStore {
         created_at TEXT NOT NULL,
         UNIQUE(session_id, group_id, version_index)
       );
+      CREATE TABLE IF NOT EXISTS roleplay_branches (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        group_id TEXT NOT NULL,
+        base_message_id INTEGER NOT NULL,
+        from_message_id INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        preview TEXT NOT NULL DEFAULT '',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS roleplay_branches_group ON roleplay_branches(session_id,group_id,created_at);
       CREATE TABLE IF NOT EXISTS proposals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2038,6 +2076,7 @@ export class WriterStore {
     }
     const channel: MessageChannel = user.channel === "roleplay" ? "roleplay" : "agent";
     const prompt = String(user.content);
+    if (channel === "roleplay") this.archiveRoleplayBranch(sessionId, fromId, groupId);
     const rewound = this.rewindFromMessage(sessionId, fromId, options);
     return {
       fromId: rewound.fromId,
@@ -2046,6 +2085,137 @@ export class WriterStore {
       variantGroupId: groupId,
       keepChanges: rewound.keepChanges,
     };
+  }
+
+  archiveRoleplayBranch(sessionId: string, fromMessageId: number, groupId: string): RoleplayBranchSummary | undefined {
+    const user = this.database.prepare(`SELECT id,content FROM messages
+      WHERE session_id=? AND id=? AND role='user' AND channel='roleplay'`).get(sessionId, fromMessageId) as Row | undefined;
+    if (!user) return undefined;
+    const existingBase = this.database.prepare(`SELECT MIN(base_message_id) AS value FROM roleplay_branches
+      WHERE session_id=? AND group_id=?`).get(sessionId, groupId) as Row;
+    const immediateBase = this.database.prepare("SELECT COALESCE(MAX(id),0) AS value FROM messages WHERE session_id=? AND id<?")
+      .get(sessionId, fromMessageId) as Row;
+    const baseMessageId = existingBase.value === null || existingBase.value === undefined
+      ? Number(immediateBase.value) || 0
+      : Number(existingBase.value) || 0;
+    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception
+      FROM messages WHERE session_id=? AND id>? ORDER BY id`).all(sessionId, baseMessageId) as Row[];
+    const dialogueRows = rows.filter(row => row.role === "user" || row.role === "assistant");
+    if (dialogueRows.some(row => row.channel !== "roleplay")) return undefined;
+    const messages: RoleplayBranchPayload["messages"] = rows.map(row => ({
+      id: Number(row.id),
+      role: row.role as Message["role"],
+      content: String(row.content),
+      createdAt: String(row.created_at),
+      channel: row.channel === "roleplay" ? "roleplay" : "agent",
+      ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
+      ...(typeof row.roleplay_perception === "string" ? { roleplayPerception: row.roleplay_perception } : {}),
+    }));
+    if (!messages.length) return undefined;
+    const memorySnapshots = (this.database.prepare(`SELECT through_message_id,context_key,memory_json,created_at
+      FROM roleplay_memory_snapshots WHERE session_id=? AND through_message_id>? ORDER BY through_message_id`)
+      .all(sessionId, baseMessageId) as Row[]).map(row => ({
+        throughMessageId: Number(row.through_message_id),
+        contextKey: String(row.context_key),
+        memoryJson: String(row.memory_json),
+        createdAt: String(row.created_at),
+      }));
+    const facts = this.database.prepare(`SELECT * FROM roleplay_memory_facts
+      WHERE session_id=? AND source_message_id>? AND pinned=0 ORDER BY id`).all(sessionId, baseMessageId) as Row[];
+    const payload: RoleplayBranchPayload = {
+      messages,
+      memory: this.roleplayMemory(sessionId),
+      memorySnapshots,
+      facts,
+    };
+    const payloadJson = JSON.stringify(payload);
+    const duplicate = this.database.prepare(`SELECT id FROM roleplay_branches
+      WHERE session_id=? AND group_id=? AND payload_json=? LIMIT 1`).get(sessionId, groupId, payloadJson) as Row | undefined;
+    if (duplicate) return this.roleplayBranches(sessionId, groupId).find(item => item.id === duplicate.id);
+    const assistant = [...dialogueRows].reverse().find(row => row.role === "assistant");
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const label = String(user.content).replace(/\s+/g, " ").trim().slice(0, 48) || "角色扮演分支";
+    const preview = assistant ? String(assistant.content).replace(/\s+/g, " ").trim().slice(0, 100) : "尚无角色回复";
+    this.database.prepare(`INSERT INTO roleplay_branches(
+      id,session_id,group_id,base_message_id,from_message_id,label,preview,message_count,payload_json,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      id, sessionId, groupId, baseMessageId, fromMessageId, label, preview, dialogueRows.length, payloadJson, now,
+    );
+    return { id, groupId, fromMessageId, label, preview, messageCount: dialogueRows.length, createdAt: now };
+  }
+
+  roleplayBranches(sessionId: string, groupId?: string): RoleplayBranchSummary[] {
+    const rows = groupId
+      ? this.database.prepare(`SELECT id,group_id,from_message_id,label,preview,message_count,created_at
+          FROM roleplay_branches WHERE session_id=? AND group_id=? ORDER BY created_at DESC`).all(sessionId, groupId)
+      : this.database.prepare(`SELECT id,group_id,from_message_id,label,preview,message_count,created_at
+          FROM roleplay_branches WHERE session_id=? ORDER BY created_at DESC LIMIT 100`).all(sessionId);
+    return (rows as Row[]).map(row => ({
+      id: String(row.id),
+      groupId: String(row.group_id),
+      fromMessageId: Number(row.from_message_id),
+      label: String(row.label),
+      preview: String(row.preview),
+      messageCount: Number(row.message_count),
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  activateRoleplayBranch(sessionId: string, branchId: string): { groupId: string; fromMessageId: number } {
+    const branch = this.database.prepare("SELECT * FROM roleplay_branches WHERE id=? AND session_id=?")
+      .get(branchId, sessionId) as Row | undefined;
+    if (!branch) throw new Error("角色扮演分支不存在");
+    let payload: RoleplayBranchPayload;
+    try { payload = JSON.parse(String(branch.payload_json)) as RoleplayBranchPayload; }
+    catch { throw new Error("角色扮演分支数据已损坏"); }
+    if (!Array.isArray(payload.messages) || !payload.messages.length) throw new Error("角色扮演分支为空");
+    const groupId = String(branch.group_id);
+    const liveUser = this.database.prepare(`SELECT id FROM messages
+      WHERE session_id=? AND variant_group_id=? AND role='user' AND channel='roleplay' ORDER BY id LIMIT 1`)
+      .get(sessionId, groupId) as Row | undefined;
+    if (liveUser) this.archiveRoleplayBranch(sessionId, Number(liveUser.id), groupId);
+    const baseMessageId = Number(branch.base_message_id) || 0;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>?").run(sessionId, baseMessageId);
+      this.database.prepare("DELETE FROM roleplay_memory_snapshots WHERE session_id=? AND through_message_id>?")
+        .run(sessionId, baseMessageId);
+      this.database.prepare("DELETE FROM roleplay_memory_facts WHERE session_id=? AND source_message_id>? AND pinned=0")
+        .run(sessionId, baseMessageId);
+      const insertMessage = this.database.prepare(`INSERT INTO messages(
+        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception
+      ) VALUES(?,?,?,?,?,?,?,?)`);
+      for (const message of payload.messages) insertMessage.run(
+        message.id, sessionId, message.role, message.content, message.createdAt, message.channel,
+        message.variantGroupId ?? null, message.roleplayPerception ?? null,
+      );
+      if (payload.memory) this.saveRoleplayMemory(sessionId, payload.memory);
+      else this.database.prepare("DELETE FROM roleplay_memory WHERE session_id=?").run(sessionId);
+      const insertSnapshot = this.database.prepare(`INSERT INTO roleplay_memory_snapshots(
+        session_id,through_message_id,context_key,memory_json,created_at
+      ) VALUES(?,?,?,?,?)`);
+      for (const snapshot of payload.memorySnapshots ?? []) insertSnapshot.run(
+        sessionId, snapshot.throughMessageId, snapshot.contextKey, snapshot.memoryJson, snapshot.createdAt,
+      );
+      const insertFact = this.database.prepare(`INSERT INTO roleplay_memory_facts(
+        id,session_id,context_key,kind,content,source_message_id,known_by_json,importance,status,pinned,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const fact of payload.facts ?? []) insertFact.run(
+        Number(fact.id), sessionId, String(fact.context_key), String(fact.kind), String(fact.content),
+        fact.source_message_id === null || fact.source_message_id === undefined ? null : Number(fact.source_message_id),
+        String(fact.known_by_json), Number(fact.importance), String(fact.status), Number(fact.pinned),
+        String(fact.created_at), String(fact.updated_at),
+      );
+      this.database.prepare("DELETE FROM roleplay_branches WHERE id=? AND session_id=?").run(branchId, sessionId);
+      this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(new Date().toISOString(), sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    this.reindex();
+    return { groupId, fromMessageId: Number(branch.from_message_id) };
   }
 
   messageVersions(sessionId: string, messageId: number): {

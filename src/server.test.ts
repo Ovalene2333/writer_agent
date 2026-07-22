@@ -69,7 +69,9 @@ test("web roleplay messages expose the parsed perception without internal turn h
     );
     const message = store.messages(sessionId, 1, { channel: "roleplay" })[0];
 
-    assert.match(conversationMessageForWeb(store, message).roleplayPerception ?? "", /可听见的话语：\n- 你好。/);
+    const webMessage = conversationMessageForWeb(store, message);
+    assert.match(webMessage.roleplayPerception ?? "", /可听见的话语：\n- 你好。/);
+    assert.deepEqual(webMessage.roleplayPerceptionData?.speech, ["你好。"]);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

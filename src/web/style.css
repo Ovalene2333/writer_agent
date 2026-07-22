@@ -1654,6 +1654,28 @@ button.agent-orb:focus-visible {
 }
 .roleplay-perception-content p,
 .roleplay-perception-content ul { margin-bottom: .55em; }
+.roleplay-perception-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  padding: 4px 7px;
+  font-size: 11px;
+}
+.roleplay-perception-editor {
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-light));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+}
+.roleplay-perception-editor label { display: block; margin: 0 0 9px; }
+.roleplay-perception-editor label > span { display: block; margin-bottom: 4px; font-size: 11px; font-weight: 700; }
+.roleplay-perception-editor textarea { width: 100%; min-height: 54px; resize: vertical; font-size: 12px; line-height: 1.5; }
+.roleplay-perception-flags { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.roleplay-perception-flags label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 11px; font-weight: 500; }
+.roleplay-perception-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+.roleplay-perception-actions button { display: inline-flex; align-items: center; gap: 5px; }
 /* Stage directions (actions / expressions) are emitted as *italics* — dim them so dialogue reads first. */
 .conversation .roleplay-msg .markdown em {
   color: var(--text-faint);
@@ -2323,6 +2345,49 @@ button.agent-orb:focus-visible {
 }
 .branch-confirm-actions .danger {
   margin-right: 0;
+}
+.roleplay-rerun-directions { margin: 16px 0 4px; padding: 0; border: 0; }
+.roleplay-rerun-directions legend { margin-bottom: 8px; color: var(--text); font-size: 12px; font-weight: 700; }
+.roleplay-rerun-directions legend small { margin-left: 5px; color: var(--text-faint); font-weight: 500; }
+.roleplay-rerun-directions > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.roleplay-rerun-directions label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  font-size: 12px;
+  font-weight: 550;
+}
+.roleplay-rerun-directions label > span { margin: 0; color: var(--text-dim); font-size: 12px; }
+.roleplay-branch-modal { width: min(560px, calc(100vw - 24px)); }
+.roleplay-branch-modal > p { margin: -8px 0 14px; color: var(--text-dim); font-size: 13px; }
+.roleplay-branch-list { display: grid; gap: 8px; max-height: min(56vh, 520px); overflow: auto; }
+.roleplay-branch-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+}
+.roleplay-branch-item.current { border-color: color-mix(in srgb, var(--accent) 38%, var(--border-light)); }
+.roleplay-branch-item > div { min-width: 0; }
+.roleplay-branch-item strong,
+.roleplay-branch-item span,
+.roleplay-branch-item small { display: block; }
+.roleplay-branch-item span { margin-top: 3px; overflow: hidden; color: var(--text-dim); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.roleplay-branch-item small { margin-top: 4px; color: var(--text-faint); font-size: 10px; }
+.roleplay-branch-item .roleplay-branch-current { margin: 0; color: var(--accent); font-size: 11px; font-weight: 700; }
+.roleplay-branch-empty { padding: 18px; color: var(--text-faint); text-align: center; font-size: 12px; }
+@media (max-width: 560px) {
+  .roleplay-rerun-directions > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 .roleplay-setup-modal p {
   margin: -10px 0 16px;
