@@ -42,7 +42,7 @@ export class ProviderManager {
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
     const { profile, model } = this.assigned(role); const baseUrl = process.env.WRITER_BASE_URL || profile.baseUrl;
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
+    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
   }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {

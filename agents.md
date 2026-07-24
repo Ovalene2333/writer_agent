@@ -26,10 +26,7 @@
 - 角色扮演链路遵守 `src/roleplay.ts` 的独立固定 4 槽位前缀策略，不与主 Agent 的前缀布局混用。
 
 ## npm 与运行环境
-- 只有进行整体修改完成之后才进行语法检查和`npm run build`!避免频繁进行typecheck和build
-- 安装依赖使用 `npm install`。依赖发生变化时，必须同时提交 `package.json` 和 `package-lock.json`，不得手工修改锁文件。
-- 不要无故升级依赖、重写锁文件或删除现有 `node_modules`；仅处理当前任务需要的依赖变化。
-- 提交代码前至少运行与改动范围相匹配的检查。提示词、消息组装或工具 schema 相关改动必须运行 `npm test`；仅类型层面的改动至少运行 `npm run typecheck`。
+- 整体修改完成之后才进行`npm run build`,不要做非必要的测试
 - 项目采用 ESM（`"type": "module"`）。TypeScript 源码中的本地运行时导入继续使用 `.js` 后缀，并遵循现有模块风格。
 
 ## 修改原则

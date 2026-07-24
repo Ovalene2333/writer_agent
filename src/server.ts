@@ -29,6 +29,7 @@ import {
   normalizeRoleplayRerunDirections,
   parseRoleplayPerception,
   parseStoredRoleplayPerception,
+  generateRoleplayAutoReply,
   recommendRoleplayDirectorActions,
   runRoleplayChat,
   serializeRoleplayPerception,
@@ -847,16 +848,39 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.post("/api/roleplay/auto-reply", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string }>();
+      if (!body.sessionId || !options.store.sessionExists(body.sessionId)) throw new Error("会话不存在");
+      if (agentJobs.activeJob(body.sessionId)) throw new Error("当前会话仍有任务运行");
+      const active = options.store.activeRoleplay(body.sessionId);
+      if (!active) throw new Error("请先进入角色扮演");
+      const reply = await generateRoleplayAutoReply({
+        store: options.store,
+        sessionId: body.sessionId,
+        performer: active.performer,
+        identity: active.identity,
+        scene: active.scene,
+        model: options.providers.modelConfig("roleplay"),
+      });
+      return context.json({ reply });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
     if (agentJobs.activeJob(body.sessionId)) {
       return context.json({ error: "This session already has a running Agent job" }, 409);
     }
-    // Roleplay openings are model-initiated and legitimately carry no prompt.
-    if (!body.prompt?.trim() && !(body.mode === "roleplay" && body.opening)) return context.json({ error: "写作指令不能为空" }, 400);
+    // Model-initiated roleplay turns legitimately carry no player prompt.
+    if (!body.prompt?.trim() && !(body.mode === "roleplay" && (body.opening || body.performerAutoReply))) {
+      return context.json({ error: "写作指令不能为空" }, 400);
+    }
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
       : undefined;
@@ -918,13 +942,15 @@ export async function startWriterServer(options: {
             jobId: job.id,
             inputMode: body.inputMode === "director" ? "director" : "dialogue",
             opening: body.opening === true,
+            performerAutoReply: body.performerAutoReply === true,
             variantGroupId,
             rerunDirections: normalizeRoleplayRerunDirections(body.rerunDirections),
             ...(body.perceptionOverride
               ? { perceptionOverride: parseRoleplayPerception(JSON.stringify(body.perceptionOverride)) }
               : {}),
             model: options.providers.modelConfig("roleplay"),
-            perceptionModel: options.providers.modelConfig("flash"),
+            perceptionModel: options.providers.modelConfig("roleplay"),
+            qualityModel: options.providers.modelConfig("flash"),
             summarizer: options.providers.summaryModelConfig(),
             signal,
             onEvent,

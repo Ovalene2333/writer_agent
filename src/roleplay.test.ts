@@ -7,6 +7,9 @@ import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import {
   buildRoleplayChatMessages,
+  buildRoleplayAutoReplyMessages,
+  buildRoleplayPerceptionMessages,
+  buildRoleplayPerceptionRetryMessages,
   buildRoleplayStablePrefix,
   buildRoleplaySystemPrompt,
   deriveInterlocutorFromCharacter,
@@ -15,6 +18,7 @@ import {
   formatRoleplayAntiFormulaSlot,
   formatRoleplayMemorySlot,
   formatRoleplayOocDirective,
+  formatRoleplayPerformerAutoReplyDirective,
   formatRoleplayPerception,
   formatRoleplayPerceptionForModel,
   formatRoleplayPlayerTurn,
@@ -24,11 +28,13 @@ import {
   isRoleplayExitCommand,
   isRoleplayOocInput,
   parseRoleplayPerception,
+  parseRoleplayAutoReply,
   parseRoleplayQualityReview,
   parseStoredRoleplayPerception,
   ROLEPLAY_RECENT_MESSAGES,
   ROLEPLAY_EPISTEMIC_MEMORY_VERSION,
   roleplayContextKey,
+  roleplayPerceptionNeedsSemanticRetry,
   roleplayPerceptionForMemory,
   roleplayPerformerKey,
   roleplaySampling,
@@ -91,11 +97,18 @@ describe("roleplay prompts", () => {
     assert.doesNotMatch(prompt, /"unlocked": false/);
     assert.doesNotMatch(prompt, /未解锁能力的秘密说明|绝密|秘密资源|秘密限制|秘密代价/);
     assert.match(prompt, /未透露姓名的来访者/);
-    assert.match(prompt, /只决定一件事/);
-    assert.match(prompt, /只选择一个真正影响她的点/);
+    assert.match(prompt, /只决定一个核心反应/);
+    assert.match(prompt, /完整的小节拍/);
     assert.match(prompt, /不要引用、改写或概括玩家原句/);
+    assert.match(prompt, /默认零解释/);
+    assert.match(prompt, /解释角色为什么这样想、这样感受或这样行动/);
+    assert.match(prompt, /普通回合默认零提问/);
+    assert.match(prompt, /缺失的信息会立即阻塞角色已经选择的当前行动/);
     assert.match(prompt, /具体数值只能引用上下文中已有的数值/);
-    assert.match(prompt, /一句台词或一个动作能够成立就立即停止/);
+    assert.match(prompt, /普通回合围绕一个核心反应自然展开/);
+    assert.match(prompt, /通常不超过 3 个块/);
+    assert.doesNotMatch(prompt, /字符|回复长度/);
+    assert.match(prompt, /不要为了追求短而截断表达/);
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
     assert.match(prompt, /exampleHint/);
@@ -133,8 +146,8 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /叙事权限只覆盖/);
     assert.match(prompt, /不要替对话者、其他角色或世界决定/);
     assert.match(prompt, /current_perception/);
-    assert.match(prompt, /不列问题清单/);
-    assert.match(prompt, /答案会立即改变角色下一步行动/);
+    assert.match(prompt, /普通回合默认零提问/);
+    assert.match(prompt, /无法用观察、陈述、动作或留白继续/);
   });
 
   test("exit command detection accepts common variants", () => {
@@ -178,6 +191,7 @@ describe("roleplay prompts", () => {
     assert.match(messages[2].content, /现场记忆路由/);
     assert.doesNotMatch(messages[2].content, /已连续 3 轮/);
     assert.match(messages[3].content, /固定回合契约/);
+    assert.match(messages[3].content, /默认零解释、零提问/);
     assert.match(messages[6].content, /本轮角色可用动态上下文/);
     assert.match(messages[6].content, /训练事故/);
     assert.match(messages[6].content, /现场记忆卡/);
@@ -289,10 +303,9 @@ describe("roleplay prompts", () => {
   test("Flash perception projection omits private content from the performer payload", () => {
     const projection = parseRoleplayPerception(JSON.stringify({
       speech: ["第一次见面？"],
-      observableActions: ["对话者把一件无法辨认的东西收进口袋（动作尝试）"],
-      perceivedEffects: [],
-      privateOmitted: true,
-      ambiguousOmitted: false,
+      knowableFacts: ["对话者把一件无法辨认的东西收进口袋（动作尝试）"],
+      unknowableFacts: ["对话者认出照片里的人是卧底"],
+      potentialSensations: [],
     }));
     const displayPayload = formatRoleplayPerception(projection);
     const performerPayload = formatRoleplayPerceptionForModel(projection);
@@ -301,26 +314,97 @@ describe("roleplay prompts", () => {
     assert.match(performerPayload, /无法辨认的东西/);
     assert.match(performerPayload, /current_perception/);
     assert.doesNotMatch(performerPayload, /可听见的话语|可观察的动作|^- /m);
-    assert.doesNotMatch(performerPayload, /卧底|照片里的人|privateOmitted/);
+    assert.match(displayPayload, /不可知事实/);
+    assert.doesNotMatch(performerPayload, /卧底|照片里的人|unknowableFacts/);
     const stored = serializeRoleplayPerception(projection);
+    assert.match(stored, /"version":2/);
     assert.deepEqual(parseStoredRoleplayPerception(stored), projection);
     assert.equal(storedRoleplayPerceptionForModel(stored), performerPayload);
     assert.equal(storedRoleplayPerceptionForDisplay(stored), displayPayload);
-    assert.throws(() => parseRoleplayPerception('{"speech":[],"observableActions":[]}'), /字段不完整/);
+    assert.throws(() => parseRoleplayPerception('{"speech":[],"knowableFacts":[]}'), /四个规定字段/);
+    assert.throws(() => parseRoleplayPerception('```json\n{"speech":[],"knowableFacts":[],"unknowableFacts":[],"potentialSensations":[]}\n```'), /严格 JSON/);
+    assert.throws(() => parseRoleplayPerception('{"speech":[],"knowableFacts":[],"unknowableFacts":[],"potentialSensations":[],"note":"extra"}'), /只能返回四个规定字段/);
+  });
+
+  test("perception compiler receives only the current player turn", () => {
+    const messages = buildRoleplayPerceptionMessages("我把杯子推过去。「喝吧。」");
+    const nextTurn = buildRoleplayPerceptionMessages("我走到门边，按下开关。");
+    assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
+    // The Token Plan endpoint only reports cache hits once the stable prefix spans its 1024-token block.
+    assert.ok(messages[0].content.length >= 2_200);
+    assert.equal(messages[0].content, nextTurn[0].content);
+    assert.notEqual(messages[1].content, nextTurn[1].content);
+    assert.match(messages[0].content, /currentPlayerTurn 是唯一内容来源/);
+    assert.match(messages[0].content, /第一人称叙述不自动等于 speech/);
+    assert.match(messages[0].content, /来自“角色内”输入框/);
+    assert.match(messages[0].content, /按扮演角色本轮的认知权限拆入四类/);
+    assert.match(messages[0].content, /knowableFacts（可知事实）/);
+    assert.match(messages[0].content, /unknowableFacts（不可知事实）/);
+    assert.match(messages[0].content, /potentialSensations（潜在感受）/);
+    assert.match(messages[0].content, /必须且只能包含这四个键/);
+    assert.deepEqual(JSON.parse(messages[1].content), {
+      inputMode: "in_character",
+      currentPlayerTurn: "我把杯子推过去。「喝吧。」",
+    });
+    assert.doesNotMatch(messages[1].content, /observableWorkingState|establishedScene|performer|playerIdentity/);
+  });
+
+  test("four-way perception receives a semantic coverage finalizer", () => {
+    const input = "千夏，根据上面的安排，现在你已经和 bci 和超算适应了一段时间了，是时候展开一些压测了，过程可能会不舒服。";
+    const empty = {
+      speech: [], knowableFacts: [], unknowableFacts: [], potentialSensations: [],
+    };
+    assert.equal(roleplayPerceptionNeedsSemanticRetry(empty), true);
+    assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, unknowableFacts: [input] }), false);
+    assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, speech: [input] }), false);
+
+    const messages = buildRoleplayPerceptionRetryMessages(input, empty);
+    assert.deepEqual(messages.map(message => message.role), ["system", "user", "assistant", "user"]);
+    assert.deepEqual(JSON.parse(messages[1].content), { inputMode: "in_character", currentPlayerTurn: input });
+    assert.deepEqual(JSON.parse(messages[2].content), empty);
+    assert.match(messages[3].content, /semantic_coverage_finalize/);
+    assert.match(messages[3].content, /每个实质语义单元恰好进入四类之一/);
+    assert.match(messages[3].content, /连续发言的尾随解释和列表仍属于 speech/);
   });
 
   test("perception projection exposes an opaque bodily effect without its hidden mechanism", () => {
     const projection = parseRoleplayPerception(JSON.stringify({
       speech: [],
-      observableActions: ["对话者开始按摩角色的手臂"],
-      perceivedEffects: ["角色感到身体逐渐放松、舒适感增强，但来源不明"],
-      privateOmitted: true,
-      ambiguousOmitted: false,
+      knowableFacts: ["对话者开始按摩角色的手臂"],
+      unknowableFacts: ["对话者正在暗中调节神经递质"],
+      potentialSensations: ["手臂可能逐渐放松，并出现舒适感"],
     }));
     const performerPayload = formatRoleplayPerceptionForModel(projection);
     assert.match(performerPayload, /放松、舒适感增强/);
     assert.match(performerPayload, /来源不明/);
     assert.doesNotMatch(performerPayload, /调试器|多巴胺|内啡肽|override/);
+  });
+
+  test("automatic reply writes only the player-side identity turn", () => {
+    const performer = { kind: "simple" as const, id: 1, name: "林千夏", card: { name: "林千夏", identity: "机娘", relationship: "搭档", knowledge: "知道训练安排", scene: "医务室", goal: "隐瞒伤势" } };
+    const identity = { kind: "simple" as const, id: 2, name: "苏远", card: { name: "苏远", identity: "教官", relationship: "搭档", knowledge: "知道她刚结束训练", scene: "医务室", goal: "确认她的状态" } };
+    const messages = buildRoleplayAutoReplyMessages({
+      performer,
+      identity,
+      recentTranscript: [
+        { role: "assistant", content: "<dialogue>「我没事。」</dialogue>" },
+      ],
+    });
+    assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
+    assert.match(messages[0].content, /不扮演对面的 performer/);
+    assert.match(messages[0].content, /不得替 performer 或其他角色决定/);
+    assert.match(messages[0].content, /必须始终采用第一人称主观视角/);
+    assert.match(messages[0].content, /不得用 identity 的姓名、“他”“她”或“TA”指代 identity 自己/);
+    assert.match(messages[0].content, /角色卡即使以第三人称描述，也不能改变 reply 的第一人称视角/);
+    assert.match(messages[0].content, /30–100 个汉字/);
+    const payload = JSON.parse(messages[1].content) as Record<string, unknown>;
+    assert.equal(payload.identity, "苏远");
+    assert.equal(payload.performer, "林千夏");
+    assert.deepEqual(payload.recentTranscript, [
+      { role: "assistant", content: "<dialogue>「我没事。」</dialogue>" },
+    ]);
+    assert.equal(parseRoleplayAutoReply('{"reply":"我把水杯推近一点。「先喝水。」"}'), "我把水杯推近一点。「先喝水。」");
+    assert.throws(() => parseRoleplayAutoReply('{"reply":"   "}'), /空的身份代答/);
   });
 
   test("context key isolates identity and scene revisions", () => {
@@ -466,6 +550,14 @@ describe("roleplay prompts", () => {
     assert.match(formatRoleplayOocDirective("时间跳到当晚"), /OOC 导演指示/);
     assert.match(formatRoleplayOocDirective("时间跳到当晚"), /时间跳到当晚/);
   });
+
+  test("performer auto reply continues without inventing a player turn", () => {
+    const directive = formatRoleplayPerformerAutoReplyDirective("林千夏");
+    assert.match(directive, /当前没有新的玩家言行/);
+    assert.match(directive, /主动延续一个自然的小节拍/);
+    assert.match(directive, /不要假定对话者已经回答、移动、产生情绪或接受任何结果/);
+    assert.match(directive, /林千夏/);
+  });
 });
 
 describe("roleplay memory store", () => {
@@ -598,6 +690,29 @@ describe("message channel isolation", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  test("director input mode is persisted and returned when rerunning the turn", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-director-mode-"));
+    try {
+      const project = WriterProject.init(root, "导演消息模式");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("导演消息");
+      const userId = store.addMessage(
+        sessionId,
+        "user",
+        "把时间推进到第二天。",
+        "roleplay",
+        undefined,
+        "director",
+      );
+      store.saveRoleplayPerception(sessionId, userId, "［OOC 导演指示——把时间推进到第二天。］");
+      const assistantId = store.addMessage(sessionId, "assistant", "次日清晨。", "roleplay");
+
+      assert.equal(store.messages(sessionId, 10, { channel: "roleplay" })[0].roleplayInputMode, "director");
+      assert.equal(store.prepareMessageRerun(sessionId, assistantId).inputMode, "director");
+      store.close();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("roleplay branches restore messages, perceptions, and working memory", () => {
     const root = mkdtempSync(join(tmpdir(), "writer-roleplay-branches-"));
     try {
@@ -606,7 +721,7 @@ describe("message channel isolation", () => {
       const sessionId = store.createSession("分支");
       const firstUser = store.addMessage(sessionId, "user", "第一版输入", "roleplay");
       const firstProjection = serializeRoleplayPerception({
-        speech: ["第一版"], observableActions: [], perceivedEffects: [], privateOmitted: false, ambiguousOmitted: false,
+        speech: ["第一版"], knowableFacts: [], unknowableFacts: [], potentialSensations: [],
       });
       store.saveRoleplayPerception(sessionId, firstUser, firstProjection);
       const firstAssistant = store.addMessage(sessionId, "assistant", "「第一版回复。」", "roleplay");
@@ -617,7 +732,7 @@ describe("message channel isolation", () => {
       const rerun = store.prepareMessageRerun(sessionId, firstAssistant);
       const secondUser = store.addMessage(sessionId, "user", "第一版输入", "roleplay", rerun.variantGroupId);
       const secondProjection = serializeRoleplayPerception({
-        speech: ["第二版"], observableActions: [], perceivedEffects: [], privateOmitted: false, ambiguousOmitted: false,
+        speech: ["第二版"], knowableFacts: [], unknowableFacts: [], potentialSensations: [],
       });
       store.saveRoleplayPerception(sessionId, secondUser, secondProjection);
       const secondAssistant = store.addMessage(sessionId, "assistant", "「第二版回复。」", "roleplay", rerun.variantGroupId);
@@ -828,6 +943,38 @@ describe("saved roleplay interlocutors", () => {
       assert.equal(restored?.performer.name, "苏远");
       assert.equal(restored?.identity.kind, "normal");
       assert.equal(restored?.identity.name, "林千夏");
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reruns a model-initiated opening without requiring or borrowing a user instruction", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-roleplay-opening-rerun-"));
+    try {
+      const project = WriterProject.init(root, "开场重跑");
+      const store = new WriterStore(project);
+      const sessionId = store.createSession("开场");
+      store.addMessage(sessionId, "user", "先前的写作任务", "agent");
+      store.addMessage(sessionId, "assistant", "先前的写作回复", "agent");
+      const openingId = store.addMessage(sessionId, "assistant", "「第一次开场。」", "roleplay");
+      const memory = { ...emptyRoleplaySessionMemory("context"), summary: "第一次开场记忆", turnCount: 1 };
+      store.saveRoleplayMemory(sessionId, memory);
+      store.saveRoleplayMemorySnapshot(sessionId, openingId, memory);
+
+      const rerun = store.prepareMessageRerun(sessionId, openingId);
+      assert.equal(rerun.modelInitiatedRoleplay, "opening");
+      assert.equal(rerun.fromId, openingId);
+      assert.equal(rerun.prompt, "");
+      assert.equal(rerun.channel, "roleplay");
+      assert.equal(store.messages(sessionId, 20, { channel: "roleplay" }).length, 0);
+      assert.equal(store.roleplayMemory(sessionId), undefined);
+
+      const secondOpeningId = store.addMessage(sessionId, "assistant", "「第二次开场。」", "roleplay", rerun.variantGroupId);
+      assert.deepEqual(
+        store.messageVersions(sessionId, secondOpeningId).versions.map(version => version.content),
+        ["「第一次开场。」", "「第二次开场。」"],
+      );
       store.close();
     } finally {
       rmSync(root, { recursive: true, force: true });

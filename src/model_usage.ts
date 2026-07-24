@@ -46,6 +46,8 @@ export function buildRecordedUsageEvent(
   const normalized = { ...usage, cacheMissTokens };
   const call: StepUsage = {
     model: model.model,
+    providerName: model.providerName?.trim()
+      || (model.provider === "deepseek" ? "DeepSeek" : "API"),
     promptTokens: usage.promptTokens,
     completionTokens: usage.completionTokens,
     cacheHitTokens: usage.cacheHitTokens,

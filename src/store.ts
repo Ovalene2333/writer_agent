@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
-  RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
+  RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
@@ -47,6 +47,7 @@ type RoleplayBranchPayload = {
     channel: MessageChannel;
     variantGroupId?: string;
     roleplayPerception?: string;
+    roleplayInputMode?: RoleplayInputMode;
   }>;
   memory?: RoleplaySessionMemory;
   memorySnapshots: Array<{ throughMessageId: number; contextKey: string; memoryJson: string; createdAt: string }>;
@@ -385,6 +386,16 @@ export class WriterStore {
     if (!messageColumns.some(column => column.name === "roleplay_perception")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_perception TEXT");
     }
+    if (!messageColumns.some(column => column.name === "roleplay_input_mode")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_input_mode TEXT");
+    }
+    this.database.exec(`UPDATE messages
+      SET roleplay_input_mode=CASE
+        WHEN roleplay_perception LIKE '［OOC 导演指示%' THEN 'director'
+        ELSE 'dialogue'
+      END
+      WHERE channel='roleplay' AND role='user'
+        AND roleplay_input_mode IS NULL`);
     const variantColumns = this.database.prepare("PRAGMA table_info(message_variants)").all() as Row[];
     if (!variantColumns.some(column => column.name === "prompt")) {
       this.database.exec("ALTER TABLE message_variants ADD COLUMN prompt TEXT NOT NULL DEFAULT ''");
@@ -1194,11 +1205,22 @@ export class WriterStore {
     return { deleted: unique, remainingSessionId };
   }
 
-  addMessage(sessionId: string, role: Message["role"], content: string, channel: MessageChannel = "agent", variantGroupId?: string): number {
+  addMessage(
+    sessionId: string,
+    role: Message["role"],
+    content: string,
+    channel: MessageChannel = "agent",
+    variantGroupId?: string,
+    roleplayInputMode?: RoleplayInputMode,
+  ): number {
     const now = new Date().toISOString();
     const normalized = channel === "roleplay" ? "roleplay" : "agent";
-    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id) VALUES(?,?,?,?,?,?)")
-      .run(sessionId, role, content, now, normalized, variantGroupId ?? null);
+    const normalizedInputMode = normalized === "roleplay" && role === "user"
+      && (roleplayInputMode === "director" || roleplayInputMode === "dialogue")
+      ? roleplayInputMode
+      : null;
+    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode) VALUES(?,?,?,?,?,?,?)")
+      .run(sessionId, role, content, now, normalized, variantGroupId ?? null, normalizedInputMode);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
     return Number(result.lastInsertRowid);
   }
@@ -1224,11 +1246,11 @@ export class WriterStore {
     const channel = options?.channel;
     const rows = channel
       ? this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND channel=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, channel, limit)
       : this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -1262,10 +1284,10 @@ export class WriterStore {
     const afterId = Number.isInteger(options.afterId) && (options.afterId ?? 0) > 0 ? options.afterId! : 0;
     const limit = Math.max(1, Math.min(100, Math.round(options.limit ?? 40)));
     const rows = options.channel
-      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND channel=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, options.channel, afterId, limit)
-      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, afterId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -1275,10 +1297,10 @@ export class WriterStore {
   conversationMessagesBefore(sessionId: string, beforeId?: number, limit = 50): Message[] {
     const normalizedLimit = Math.max(1, Math.min(100, Math.round(limit)));
     const rows = beforeId !== undefined && Number.isInteger(beforeId) && beforeId > 0
-      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id<? ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, beforeId, normalizedLimit)
-      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, normalizedLimit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -1432,6 +1454,9 @@ export class WriterStore {
       content: row.content as string,
       createdAt: row.created_at as string,
       channel: row.channel === "roleplay" ? "roleplay" : "agent",
+      ...(row.roleplay_input_mode === "director" || row.roleplay_input_mode === "dialogue"
+        ? { roleplayInputMode: row.roleplay_input_mode }
+        : {}),
       ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
     };
   }
@@ -2050,11 +2075,47 @@ export class WriterStore {
     options?: { keepChanges?: boolean },
   ): {
     fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string; keepChanges: boolean;
+    inputMode?: RoleplayInputMode;
+    modelInitiatedRoleplay?: "opening";
   } {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
-    const target = this.database.prepare("SELECT id FROM messages WHERE id=? AND session_id=?").get(targetId, sessionId) as Row | undefined;
+    const target = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id
+      FROM messages WHERE id=? AND session_id=?`).get(targetId, sessionId) as Row | undefined;
     if (!target) throw new Error("消息不存在");
-    const user = this.database.prepare(`SELECT id,content,channel,variant_group_id FROM messages
+    if (target.role === "assistant" && target.channel === "roleplay") {
+      const precedingRoleplayUser = this.database.prepare(`SELECT id FROM messages
+        WHERE session_id=? AND role='user' AND channel='roleplay' AND id<=? ORDER BY id DESC LIMIT 1`)
+        .get(sessionId, targetId) as Row | undefined;
+      if (!precedingRoleplayUser) {
+        const fromId = Number(target.id);
+        const groupId = typeof target.variant_group_id === "string" ? target.variant_group_id : randomUUID();
+        this.database.prepare("UPDATE messages SET variant_group_id=? WHERE session_id=? AND id=?")
+          .run(groupId, sessionId, fromId);
+        const duplicate = this.database.prepare(`SELECT id FROM message_variants
+          WHERE session_id=? AND group_id=? AND prompt='' AND content=? LIMIT 1`)
+          .get(sessionId, groupId, String(target.content)) as Row | undefined;
+        if (!duplicate) {
+          const max = this.database.prepare("SELECT COALESCE(MAX(version_index),0) AS value FROM message_variants WHERE session_id=? AND group_id=?")
+            .get(sessionId, groupId) as Row;
+          this.database.prepare("INSERT INTO message_variants(session_id,group_id,version_index,prompt,content,created_at) VALUES(?,?,?,?,?,?)")
+            .run(sessionId, groupId, Number(max.value) + 1, "", String(target.content), new Date().toISOString());
+        }
+        this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
+        this.clearSessionTaskState(sessionId);
+        this.restoreRoleplayMemoryBefore(sessionId, fromId);
+        this.addSystemMessage(sessionId, `已撤销角色主动开场 #${fromId} 及其后续对话，准备重新演出。`);
+        this.reindex();
+        return {
+          fromId,
+          prompt: "",
+          channel: "roleplay",
+          variantGroupId: groupId,
+          keepChanges: Boolean(options?.keepChanges),
+          modelInitiatedRoleplay: "opening",
+        };
+      }
+    }
+    const user = this.database.prepare(`SELECT id,content,channel,variant_group_id,roleplay_input_mode,roleplay_perception FROM messages
       WHERE session_id=? AND role='user' AND id<=? ORDER BY id DESC LIMIT 1`).get(sessionId, targetId) as Row | undefined;
     if (!user) throw new Error("该位置之前没有可重新运行的用户指令");
     const fromId = Number(user.id);
@@ -2076,6 +2137,12 @@ export class WriterStore {
     }
     const channel: MessageChannel = user.channel === "roleplay" ? "roleplay" : "agent";
     const prompt = String(user.content);
+    const inputMode: RoleplayInputMode | undefined = channel === "roleplay"
+      ? user.roleplay_input_mode === "director"
+        || (typeof user.roleplay_perception === "string" && user.roleplay_perception.startsWith("［OOC 导演指示"))
+        ? "director"
+        : "dialogue"
+      : undefined;
     if (channel === "roleplay") this.archiveRoleplayBranch(sessionId, fromId, groupId);
     const rewound = this.rewindFromMessage(sessionId, fromId, options);
     return {
@@ -2084,6 +2151,7 @@ export class WriterStore {
       channel,
       variantGroupId: groupId,
       keepChanges: rewound.keepChanges,
+      ...(inputMode ? { inputMode } : {}),
     };
   }
 
@@ -2098,7 +2166,7 @@ export class WriterStore {
     const baseMessageId = existingBase.value === null || existingBase.value === undefined
       ? Number(immediateBase.value) || 0
       : Number(existingBase.value) || 0;
-    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception
+    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
       FROM messages WHERE session_id=? AND id>? ORDER BY id`).all(sessionId, baseMessageId) as Row[];
     const dialogueRows = rows.filter(row => row.role === "user" || row.role === "assistant");
     if (dialogueRows.some(row => row.channel !== "roleplay")) return undefined;
@@ -2110,6 +2178,9 @@ export class WriterStore {
       channel: row.channel === "roleplay" ? "roleplay" : "agent",
       ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
       ...(typeof row.roleplay_perception === "string" ? { roleplayPerception: row.roleplay_perception } : {}),
+      ...(row.roleplay_input_mode === "director" || row.roleplay_input_mode === "dialogue"
+        ? { roleplayInputMode: row.roleplay_input_mode }
+        : {}),
     }));
     if (!messages.length) return undefined;
     const memorySnapshots = (this.database.prepare(`SELECT through_message_id,context_key,memory_json,created_at
@@ -2184,11 +2255,17 @@ export class WriterStore {
       this.database.prepare("DELETE FROM roleplay_memory_facts WHERE session_id=? AND source_message_id>? AND pinned=0")
         .run(sessionId, baseMessageId);
       const insertMessage = this.database.prepare(`INSERT INTO messages(
-        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception
-      ) VALUES(?,?,?,?,?,?,?,?)`);
+        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
+      ) VALUES(?,?,?,?,?,?,?,?,?)`);
       for (const message of payload.messages) insertMessage.run(
         message.id, sessionId, message.role, message.content, message.createdAt, message.channel,
         message.variantGroupId ?? null, message.roleplayPerception ?? null,
+        message.roleplayInputMode === "director" || message.roleplayInputMode === "dialogue"
+          ? message.roleplayInputMode
+          : message.channel === "roleplay" && message.role === "user"
+            && message.roleplayPerception?.startsWith("［OOC 导演指示")
+            ? "director"
+            : message.channel === "roleplay" && message.role === "user" ? "dialogue" : null,
       );
       if (payload.memory) this.saveRoleplayMemory(sessionId, payload.memory);
       else this.database.prepare("DELETE FROM roleplay_memory WHERE session_id=?").run(sessionId);

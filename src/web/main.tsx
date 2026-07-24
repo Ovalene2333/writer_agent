@@ -75,6 +75,7 @@ type Message = {
   role: string;
   content: string;
   channel?: "agent" | "roleplay";
+  roleplayInputMode?: RoleplayInputMode;
   roleplayPerception?: string;
   roleplayPerceptionData?: RoleplayPerceptionProjection;
   variantGroupId?: string;
@@ -82,10 +83,9 @@ type Message = {
 };
 type RoleplayPerceptionProjection = {
   speech: string[];
-  observableActions: string[];
-  perceivedEffects: string[];
-  privateOmitted: boolean;
-  ambiguousOmitted: boolean;
+  knowableFacts: string[];
+  unknowableFacts: string[];
+  potentialSensations: string[];
 };
 type RoleplayRerunDirection = "shorter" | "more_emotional" | "less_explanation" | "dialogue_only" | "with_action" | "no_question";
 const ROLEPLAY_RERUN_DIRECTION_OPTIONS: Array<{ id: RoleplayRerunDirection; label: string }> = [
@@ -214,6 +214,7 @@ type Character = {
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StepUsage = {
   model?: string;
+  providerName?: string;
   promptTokens: number;
   completionTokens: number;
   cacheHitTokens: number;
@@ -225,6 +226,7 @@ type StepUsage = {
   cacheHitRate?: number;
   callBreakdown?: Array<{
     model?: string;
+    providerName?: string;
     callKind: string;
     promptTokens: number;
     completionTokens: number;
@@ -972,6 +974,11 @@ function Markdown({ content, className, headingPrefix }: { content: string; clas
   );
 }
 
+function shortProviderName(value?: string): string {
+  const full = value?.trim();
+  return full ? Array.from(full).slice(0, 2).join("") : "未知";
+}
+
 function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }: {
   content: string;
   data?: RoleplayPerceptionProjection;
@@ -984,10 +991,10 @@ function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }
   const [saving, setSaving] = useState(false);
   const beginEdit = () => {
     if (!data) return;
-    setDraft({ ...data, speech: [...data.speech], observableActions: [...data.observableActions], perceivedEffects: [...data.perceivedEffects] });
+    setDraft({ ...data, speech: [...data.speech], knowableFacts: [...data.knowableFacts], unknowableFacts: [...data.unknowableFacts], potentialSensations: [...data.potentialSensations] });
     setEditing(true);
   };
-  const setLines = (key: "speech" | "observableActions" | "perceivedEffects", value: string) => {
+  const setLines = (key: keyof RoleplayPerceptionProjection, value: string) => {
     setDraft(current => current ? { ...current, [key]: value.split("\n").map(item => item.trim()).filter(Boolean) } : current);
   };
   const submit = async (replay: boolean) => {
@@ -999,25 +1006,41 @@ function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }
       setEditing(false);
     } finally { setSaving(false); }
   };
+  const perceptionGroups = data ? [
+    { key: "speech", label: "话语", items: data.speech },
+    { key: "knowable", label: "可知事实", items: data.knowableFacts },
+    { key: "unknowable", label: "不可知事实", items: data.unknowableFacts },
+    { key: "sensations", label: "潜在感受", items: data.potentialSensations },
+  ].filter(group => group.items.length > 0) : [];
   return (
     <details className="roleplay-perception-details">
-      <summary>角色感知到的内容</summary>
+      <summary>角色感知</summary>
       {!editing ? (
         <>
-          <Markdown content={content} className="roleplay-perception-content" />
+          {data ? (
+            <div className="roleplay-perception-content">
+              {perceptionGroups.length ? perceptionGroups.map(group => (
+                <div className="roleplay-perception-group" key={group.key}>
+                  <span>{group.label}</span>
+                  <div>{group.items.map((item, index) => <p key={`${group.key}-${index}`}>{item}</p>)}</div>
+                </div>
+              )) : (
+                <p className="roleplay-perception-empty">没有可确认的可感知内容</p>
+              )}
+            </div>
+          ) : (
+            <Markdown content={content} className="roleplay-perception-content roleplay-perception-legacy" />
+          )}
           {data && <button className="roleplay-perception-edit" type="button" disabled={disabled} onClick={beginEdit} title="修正角色实际能够感知的内容">
             <Pencil size={13} aria-hidden="true" />编辑感知
           </button>}
         </>
       ) : draft ? (
         <div className="roleplay-perception-editor">
-          <label><span>可听见的话语</span><textarea value={draft.speech.join("\n")} onChange={event => setLines("speech", event.target.value)} /></label>
-          <label><span>可观察的动作</span><textarea value={draft.observableActions.join("\n")} onChange={event => setLines("observableActions", event.target.value)} /></label>
-          <label><span>角色自身感受到的变化</span><textarea value={draft.perceivedEffects.join("\n")} onChange={event => setLines("perceivedEffects", event.target.value)} /></label>
-          <div className="roleplay-perception-flags">
-            <label><input type="checkbox" checked={draft.privateOmitted} onChange={event => setDraft({ ...draft, privateOmitted: event.target.checked })} />已排除私密信息</label>
-            <label><input type="checkbox" checked={draft.ambiguousOmitted} onChange={event => setDraft({ ...draft, ambiguousOmitted: event.target.checked })} />已排除无法确认的信息</label>
-          </div>
+          <label><span>话语</span><textarea value={draft.speech.join("\n")} onChange={event => setLines("speech", event.target.value)} /></label>
+          <label><span>可知事实</span><textarea value={draft.knowableFacts.join("\n")} onChange={event => setLines("knowableFacts", event.target.value)} /></label>
+          <label><span>不可知事实</span><textarea value={draft.unknowableFacts.join("\n")} onChange={event => setLines("unknowableFacts", event.target.value)} /></label>
+          <label><span>潜在感受</span><textarea value={draft.potentialSensations.join("\n")} onChange={event => setLines("potentialSensations", event.target.value)} /></label>
           <div className="roleplay-perception-actions">
             <button type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
             <button type="button" disabled={saving} onClick={() => void submit(false)}><Save size={13} aria-hidden="true" />保存</button>
@@ -1523,6 +1546,7 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
                   ? step.usage.callBreakdown
                   : [{
                       model: step.usage.model,
+                      providerName: step.usage.providerName,
                       callKind: "本步汇总",
                       promptTokens: step.usage.promptTokens,
                       completionTokens: step.usage.completionTokens,
@@ -1536,6 +1560,9 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
                   return (
                     <div className="agent-step-context-row agent-step-model-call-row" key={`${call.model ?? "unknown"}-${call.callKind}-${index}`}>
                       <div className="agent-step-model-call-heading">
+                        <span className="agent-step-provider-chip" title={call.providerName?.trim() || "供应商信息未记录"}>
+                          {shortProviderName(call.providerName)}
+                        </span>
                         <strong title={call.model ?? "未知模型"}>{call.model ?? "未知模型"}</strong>
                         <span>{call.callKind}</span>
                       </div>
@@ -1701,6 +1728,7 @@ function WorkspaceTopbar({
 function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, callKind = "unspecified"): StepUsage {
   const nextCall = {
     model: next.model,
+    providerName: next.providerName,
     callKind,
     promptTokens: next.promptTokens,
     completionTokens: next.completionTokens,
@@ -1716,6 +1744,7 @@ function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, cal
   const estimated = Boolean(current.estimated || next.estimated);
   return {
     model: current.model === next.model ? current.model : "多个模型",
+    providerName: current.providerName === next.providerName ? current.providerName : undefined,
     promptTokens: current.promptTokens + next.promptTokens,
     completionTokens: current.completionTokens + next.completionTokens,
     cacheHitTokens,
@@ -1774,6 +1803,7 @@ function App() {
   const [branchConfirm, setBranchConfirm] = useState<{
     mode: "edit" | "rerun";
     message: Message;
+    inputMode?: RoleplayInputMode;
     rerunDirections: RoleplayRerunDirection[];
     perceptionOverride?: RoleplayPerceptionProjection;
   } | null>(null);
@@ -1828,6 +1858,7 @@ function App() {
   const [directorSuggestions, setDirectorSuggestions] = useState<string[]>([]);
   const [directorSuggestionBusy, setDirectorSuggestionBusy] = useState(false);
   const [directorSuggestionError, setDirectorSuggestionError] = useState("");
+  const [roleplayAutoReplyBusy, setRoleplayAutoReplyBusy] = useState<"performer" | "identity" | null>(null);
   const [roleplaySetupBusy, setRoleplaySetupBusy] = useState(false);
   const [roleplaySetupPhase, setRoleplaySetupPhase] = useState<RoleplaySetupPhase | null>(null);
   const [roleplaySetupElapsed, setRoleplaySetupElapsed] = useState(0);
@@ -2618,6 +2649,7 @@ function App() {
   async function sendChat(options?: {
     text?: string;
     channel?: "agent" | "roleplay";
+    inputMode?: RoleplayInputMode;
     variantGroupId?: string;
     replaceFromId?: number;
     rerunDirections?: RoleplayRerunDirection[];
@@ -2653,6 +2685,7 @@ function App() {
               role: "user",
               content: text,
               channel: activeRoleplay ? "roleplay" : "agent",
+              ...(activeRoleplay ? { roleplayInputMode: options?.inputMode ?? roleplayInputMode } : {}),
             },
           ],
         }
@@ -2685,7 +2718,7 @@ function App() {
             ...(simpleCharacterScope !== undefined ? { simpleCharacterScope } : {}),
           } : {}),
           ...(activeRoleplay
-            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: roleplayInputMode }
+            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: options?.inputMode ?? roleplayInputMode }
             : {}),
         }),
       });
@@ -2723,7 +2756,12 @@ function App() {
       setError("当前角色扮演身份已退出，无法编辑这条扮演消息。");
       return;
     }
-    setBranchConfirm({ mode: "edit", message, rerunDirections: [] });
+    setBranchConfirm({
+      mode: "edit",
+      message,
+      inputMode: message.channel === "roleplay" ? message.roleplayInputMode ?? "dialogue" : undefined,
+      rerunDirections: [],
+    });
   }
 
   function requestRerunMessage(message: Message, perceptionOverride?: RoleplayPerceptionProjection) {
@@ -2732,12 +2770,19 @@ function App() {
       setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
       return;
     }
-    const sourcePerception = perceptionOverride ?? message.roleplayPerceptionData ?? (message.channel === "roleplay"
-      ? [...state.messages].reverse().find(item => item.id <= message.id && item.role === "user" && item.channel === "roleplay")?.roleplayPerceptionData
-      : undefined);
+    const sourceUser = message.role === "user"
+      ? message
+      : [...state.messages].reverse().find(item => item.id <= message.id && item.role === "user" && item.channel === "roleplay");
+    const inputMode = sourceUser
+      ? sourceUser.roleplayInputMode ?? "dialogue"
+      : undefined;
+    const sourcePerception = inputMode === "director"
+      ? undefined
+      : perceptionOverride ?? sourceUser?.roleplayPerceptionData;
     setBranchConfirm({
       mode: "rerun",
       message,
+      inputMode,
       rerunDirections: [],
       perceptionOverride: sourcePerception,
     });
@@ -2745,7 +2790,7 @@ function App() {
 
   async function confirmBranchAction(keepChanges: boolean) {
     if (!state || !branchConfirm) return;
-    const { mode, message, rerunDirections, perceptionOverride } = branchConfirm;
+    const { mode, message, inputMode, rerunDirections, perceptionOverride } = branchConfirm;
     setBranchConfirm(null);
     setError("");
     setNotice("");
@@ -2758,6 +2803,8 @@ function App() {
         channel: "agent" | "roleplay";
         variantGroupId: string;
         keepChanges?: boolean;
+        inputMode?: RoleplayInputMode;
+        modelInitiatedRoleplay?: "opening";
       }>(`/api/messages/${message.id}/rerun`, {
         method: "POST",
         body: JSON.stringify({ sessionId: state.sessionId, keepChanges }),
@@ -2780,18 +2827,28 @@ function App() {
           fromId: result.fromId,
         });
         setPrompt(result.prompt);
+        if (result.channel === "roleplay") setRoleplayInputMode(inputMode ?? result.inputMode ?? "dialogue");
         await refresh(state.sessionId);
         requestAnimationFrame(() => composerRef.current?.focus());
         return;
       }
       setComposerBranch(null);
+      if (result.modelInitiatedRoleplay === "opening") {
+        await requestRoleplayOpening({
+          variantGroupId: result.variantGroupId,
+          replaceFromId: result.fromId,
+          rerunDirections,
+        });
+        return;
+      }
       await sendChat({
         text: result.prompt,
         channel: result.channel,
+        inputMode: inputMode ?? result.inputMode,
         variantGroupId: result.variantGroupId,
         replaceFromId: result.fromId,
         rerunDirections,
-        perceptionOverride,
+        perceptionOverride: (inputMode ?? result.inputMode) === "director" ? undefined : perceptionOverride,
       });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -3231,7 +3288,11 @@ function App() {
     }
   }
 
-  async function requestRoleplayOpening() {
+  async function requestRoleplayOpening(options?: {
+    variantGroupId?: string;
+    replaceFromId?: number;
+    rerunDirections?: RoleplayRerunDirection[];
+  }) {
     if (!state || busy || !roleplay) return;
     setError("");
     setNotice("");
@@ -3240,6 +3301,12 @@ function App() {
     // No user bubble for an opening; anchor the live stream to a temp id so it renders via the orphan path.
     updateStreamStepsAnchorId(-Date.now());
     streamOutputRef.current = "";
+    if (options?.replaceFromId !== undefined) {
+      setState(current => current ? {
+        ...current,
+        messages: current.messages.filter(message => message.id < options.replaceFromId!),
+      } : current);
+    }
     try {
       const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
         method: "POST",
@@ -3248,6 +3315,8 @@ function App() {
           prompt: "",
           mode: "roleplay",
           opening: true,
+          ...(options?.variantGroupId ? { variantGroupId: options.variantGroupId } : {}),
+          ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           performer: roleplay.performer,
           identity: roleplay.identity,
@@ -3262,6 +3331,62 @@ function App() {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
       clearAgentStream();
+    }
+  }
+
+  async function requestPerformerAutoReply() {
+    if (!state || busy || roleplayAutoReplyBusy || !roleplay) return;
+    setRoleplayAutoReplyBusy("performer");
+    setError("");
+    setNotice("");
+    clearStepTrail(state.sessionId);
+    updateStreamSteps([]);
+    updateStreamStepsAnchorId(-Date.now());
+    streamOutputRef.current = "";
+    try {
+      const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: state.sessionId,
+          prompt: "",
+          mode: "roleplay",
+          performerAutoReply: true,
+          permissionMode: state.agentSettings?.permissionMode ?? "ask",
+          performer: roleplay.performer,
+          identity: roleplay.identity,
+          scene: roleplay.scene,
+        }),
+      });
+      setState(current => current
+        ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
+        : current);
+      await subscribeAgentJob(result.jobId, state.sessionId, true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(false);
+      clearAgentStream();
+    } finally {
+      setRoleplayAutoReplyBusy(null);
+    }
+  }
+
+  async function requestRoleplayAutoReply() {
+    if (!state?.sessionId || !roleplay || busy || roleplayAutoReplyBusy) return;
+    setRoleplayAutoReplyBusy("identity");
+    setError("");
+    setNotice("");
+    try {
+      const result = await api<{ reply: string }>("/api/roleplay/auto-reply", {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setRoleplayInputMode("dialogue");
+      setPrompt(result.reply);
+      requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRoleplayAutoReplyBusy(null);
     }
   }
 
@@ -3923,16 +4048,41 @@ function App() {
                 <button type="button" className={roleplayInputMode === "dialogue" ? "active" : ""} onClick={() => setRoleplayInputMode("dialogue")}>角色内</button>
                 <button type="button" className={roleplayInputMode === "director" ? "active" : ""} onClick={() => setRoleplayInputMode("director")}>导演</button>
               </div>
-              <div className="roleplay-action-group">
-                <button type="button" disabled={busy} title={`让「${roleplay.performer.name}」根据场景先开口`} onClick={() => void requestRoleplayOpening()}>主动开场</button>
-                <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)}>事实记忆</button>
+              <div className="roleplay-action-group roleplay-action-group-primary">
+                <button type="button" disabled={busy} title={`让「${roleplay.performer.name}」根据场景先开口`} onClick={() => void requestRoleplayOpening()}>
+                  <Drama size={13} aria-hidden="true" />主动开场
+                </button>
+                <button
+                  type="button"
+                  className="roleplay-primary-action"
+                  disabled={busy || Boolean(roleplayAutoReplyBusy)}
+                  title={`让「${roleplay.performer.name}」在没有新玩家输入时继续演绎当前场景`}
+                  onClick={() => void requestPerformerAutoReply()}
+                >
+                  <MessageSquare size={13} aria-hidden="true" />{roleplayAutoReplyBusy === "performer" ? "续演中…" : "角色续演"}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || Boolean(roleplayAutoReplyBusy)}
+                  title={`让「${roleplay.identity.name}」生成一段简短的下一轮草稿`}
+                  onClick={() => void requestRoleplayAutoReply()}
+                >
+                  <WandSparkles size={13} aria-hidden="true" />{roleplayAutoReplyBusy === "identity" ? "生成中…" : "身份代答"}
+                </button>
                 {roleplay.identity.kind === "generated" && (
                   <button type="button" disabled={busy} onClick={() => void saveCurrentRoleplayInterlocutor()}>保存身份</button>
                 )}
               </div>
               <div className="roleplay-action-group roleplay-action-group-secondary">
-                <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()}>更换设定</button>
-                <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()}>退出</button>
+                <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
+                  <History size={13} aria-hidden="true" /><span>记忆</span>
+                </button>
+                <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()} title="更换角色与场景设定">
+                  <Settings size={13} aria-hidden="true" /><span>设定</span>
+                </button>
+                <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()} title="退出角色扮演">
+                  <X size={13} aria-hidden="true" /><span>退出</span>
+                </button>
               </div>
             </div>
           </div>
@@ -4006,7 +4156,14 @@ function App() {
               ) : (
                 <div className="msg-label">
                   <span>You</span>
-                  {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
+                  {msg.channel === "roleplay" ? (
+                    <span
+                      className="msg-channel-tag"
+                      title={msg.roleplayInputMode === "director" ? "导演指示" : "角色内消息"}
+                    >
+                      {msg.roleplayInputMode === "director" ? "导演" : "扮演"}
+                    </span>
+                  ) : null}
                 </div>
               )}
               {msg.role === "assistant" ? (
@@ -4015,7 +4172,9 @@ function App() {
                   : <Markdown content={displayContent} />
               ) : (
                 <>
-                  <div>{displayContent}</div>
+                  {msg.channel === "roleplay"
+                    ? <Markdown content={displayContent} />
+                    : <div>{displayContent}</div>}
                   {msg.channel === "roleplay" && msg.roleplayPerception
                     ? <RoleplayPerceptionDetails
                         content={msg.roleplayPerception}
@@ -4186,7 +4345,7 @@ function App() {
                   ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
                   : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
                 : "Describe your writing task… (Ctrl+Enter to send)"}
-              disabled={busy}
+              disabled={busy || Boolean(roleplayAutoReplyBusy)}
             />
             <div className="composer-actions">
               <span className="composer-hint">
@@ -4195,7 +4354,7 @@ function App() {
               <button
                 className={`composer-send ${busy ? "stop" : "primary"}`}
                 onClick={busy ? stop : () => void sendChat()}
-                disabled={!busy && !prompt.trim()}
+                disabled={Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim())}
               >
                 {busy ? "Stop" : "Send"}
               </button>
@@ -4225,6 +4384,28 @@ function App() {
               当前回答会保存为历史版本；此消息之后的对话会撤销。
               已接受的<strong>文档修改</strong>与<strong>角色卡修改</strong>可选择保留或回退。
             </p>
+            {branchConfirm.message.channel === "roleplay" && branchConfirm.inputMode && (
+              <div className="roleplay-input-mode" role="group" aria-label="重新发送的角色扮演输入模式">
+                <button
+                  type="button"
+                  className={branchConfirm.inputMode === "dialogue" ? "active" : ""}
+                  onClick={() => setBranchConfirm(current => current ? { ...current, inputMode: "dialogue" } : current)}
+                >
+                  角色内
+                </button>
+                <button
+                  type="button"
+                  className={branchConfirm.inputMode === "director" ? "active" : ""}
+                  onClick={() => setBranchConfirm(current => current ? {
+                    ...current,
+                    inputMode: "director",
+                    perceptionOverride: undefined,
+                  } : current)}
+                >
+                  导演
+                </button>
+              </div>
+            )}
             {branchConfirm.mode === "rerun" && branchConfirm.message.channel === "roleplay" && (
               <fieldset className="roleplay-rerun-directions">
                 <legend>定向重演 <small>最多选择 3 项</small></legend>
@@ -4484,7 +4665,7 @@ function App() {
       )}
 
       {simpleCardDraft && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSimpleCardDraft(null)}>
+        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => setSimpleCardDraft(null)}>
           <div className="modal roleplay-setup-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
             <span className="eyebrow">Simple character card</span>
             <h2>{simpleCardDraft.id ? "编辑简易角色卡" : "新建简易角色卡"}</h2>

@@ -2629,7 +2629,12 @@ function emitUsageEvent(
   requestComponents?: RequestComponentUsage[],
 ): void {
   const estimated = usage.estimated === true;
-  const call = { ...toStepUsage(usage, model.pricing), model: model.model };
+  const call = {
+    ...toStepUsage(usage, model.pricing),
+    model: model.model,
+    providerName: model.providerName?.trim()
+      || (model.provider === "deepseek" ? "DeepSeek" : "API"),
+  };
   if (!estimated) {
     emit(buildRecordedUsageEvent(store, sessionId, model, usage, {
       callKind,

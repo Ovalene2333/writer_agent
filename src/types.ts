@@ -10,6 +10,8 @@ export interface ModelConfig {
   apiKey: string;
   model: string;
   provider?: ProviderId;
+  /** User-facing provider profile name for per-call usage attribution. */
+  providerName?: string;
   pricing?: TokenPricing;
   temperature?: number;
   topP?: number;
@@ -129,6 +131,8 @@ export interface Message {
   createdAt: string;
   /** agent=写作协作；roleplay=角色扮演试演。默认 agent。 */
   channel: MessageChannel;
+  /** How a roleplay user message was submitted. Omitted for non-roleplay and assistant messages. */
+  roleplayInputMode?: RoleplayInputMode;
   /** Stable group shared by regenerated copies of the same turn. */
   variantGroupId?: string;
   /** Number of saved/live assistant answers in this regeneration group. */
@@ -293,6 +297,8 @@ export interface RequestComponentUsage {
 export interface StepUsage {
   /** Actual provider model used for this call; aggregate values may say multiple models. */
   model?: string;
+  /** Provider profile used for this call. */
+  providerName?: string;
   promptTokens: number;
   completionTokens: number;
   cacheHitTokens: number;
