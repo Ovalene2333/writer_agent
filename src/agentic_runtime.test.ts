@@ -70,6 +70,23 @@ test("reusable grounded context satisfies an evidence obligation", () => {
   assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
 });
 
+test("self-contained document creation only requires a delivered artifact", () => {
+  const progress = createAgentExecutionProgress();
+  const contract: AgentTaskContract = {
+    mode: "write_scene",
+    outcome: "document",
+    evidence: "none",
+    mutation: "document",
+    planning: "adaptive",
+    capabilities: ["documents", "scenes"],
+  };
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "尚未成功提交文档提案或 change set",
+  ]);
+  recordAgentToolResult(progress, "propose_document", { status: "pending" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
 test("mixed contracts require and authorize both artifact families", () => {
   const contract: AgentTaskContract = {
     ...documentContract,

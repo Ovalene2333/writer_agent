@@ -26,6 +26,8 @@ import {
 import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
 import {
   generateRoleplayInterlocutor,
+  generateRoleplayScene,
+  normalizeRoleplayRerunControls,
   normalizeRoleplayRerunDirections,
   parseRoleplayPerception,
   parseStoredRoleplayPerception,
@@ -42,7 +44,7 @@ import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import type { AgentEvent, Message, PermissionMode, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
+import type { AgentEvent, Message, PermissionMode, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
@@ -54,6 +56,7 @@ export type WebConversationMessage = Message & {
 
 export function conversationMessageForWeb(store: WriterStore, message: Message): WebConversationMessage {
   if (message.channel !== "roleplay" || message.role !== "user") return message;
+  if (message.roleplayInputMode === "director") return message;
   const stored = store.roleplayPerception(message.sessionId, message.id);
   const roleplayPerception = stored ? storedRoleplayPerceptionForDisplay(stored).trim() : "";
   const roleplayPerceptionData = stored ? parseStoredRoleplayPerception(stored) : undefined;
@@ -656,6 +659,7 @@ export async function startWriterServer(options: {
     const instructions = loadProjectInstructions(options.project);
     return context.json({
       permissionMode: settings.permissionMode,
+      characterEvolutionEnabled: settings.characterEvolutionEnabled,
       scenePipeline: settings.scenePipeline,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
@@ -666,9 +670,12 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; scenePipeline?: Partial<ScenePipelineSettings> }>();
+      const body = await context.req.json<{ permissionMode?: string; characterEvolutionEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
+      }
+      if (body.characterEvolutionEnabled !== undefined && typeof body.characterEvolutionEnabled !== "boolean") {
+        return context.json({ error: "characterEvolutionEnabled 必须是布尔值" }, 400);
       }
       if (body.scenePipeline !== undefined) {
         const values = [
@@ -709,10 +716,12 @@ export async function startWriterServer(options: {
       }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
+        ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
+        characterEvolutionEnabled: settings.characterEvolutionEnabled,
         scenePipeline: settings.scenePipeline,
       });
     } catch (error) {
@@ -768,6 +777,30 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.post("/api/roleplay/scenes/generate", async (context) => {
+    try {
+      const body = await context.req.json<{
+        sessionId?: string;
+        request?: string;
+        performer?: RoleplayParticipant;
+        identity?: RoleplayParticipant;
+        currentScene?: RoleplayScene;
+      }>();
+      const active = body.sessionId ? options.store.activeRoleplay(body.sessionId) : undefined;
+      const scene = await generateRoleplayScene({
+        request: body.request ?? "",
+        performer: body.performer ?? active?.performer,
+        identity: body.identity ?? active?.identity,
+        currentScene: body.currentScene ?? active?.scene,
+        model: options.providers.modelConfig("roleplay"),
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
+      });
+      return context.json(scene);
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.delete("/api/roleplay/scenes/:id", (context) => {
     try {
       const id = Number(context.req.param("id"));
@@ -805,13 +838,15 @@ export async function startWriterServer(options: {
 
   app.put("/api/roleplay/state", async (context) => {
     try {
-      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; sceneId?: number }>();
+      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; sceneId?: number; sceneIds?: number[]; sceneIndex?: number; contentRating?: RoleplayContentRating }>();
       if (!body.sessionId) throw new Error("缺少会话 ID");
       const performer = body.performer ?? body.characterId;
       const identity = body.identity ?? body.interlocutor;
       if (!performer) throw new Error("缺少扮演者角色卡");
       if (!identity) throw new Error("缺少当前身份角色卡");
-      return context.json(options.store.saveActiveRoleplay(body.sessionId, performer, identity, body.sceneId));
+      return context.json(options.store.saveActiveRoleplay(
+        body.sessionId, performer, identity, body.sceneId, body.contentRating, body.sceneIds, body.sceneIndex,
+      ));
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }
@@ -821,7 +856,9 @@ export async function startWriterServer(options: {
     try {
       const sessionId = context.req.param("sessionId");
       if (!options.store.sessionExists(sessionId)) throw new Error("会话不存在");
-      options.store.clearActiveRoleplay(sessionId);
+      // Exiting the UI mode must not discard the just-finished scene state: the
+      // writing Agent uses it to turn the roleplay transcript into faithful prose.
+      options.store.clearActiveRoleplay(sessionId, { preserveMemory: true });
       return context.json({ ok: true });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
@@ -870,7 +907,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
     if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
@@ -945,6 +982,7 @@ export async function startWriterServer(options: {
             performerAutoReply: body.performerAutoReply === true,
             variantGroupId,
             rerunDirections: normalizeRoleplayRerunDirections(body.rerunDirections),
+            rerunControls: normalizeRoleplayRerunControls(body.rerunControls),
             ...(body.perceptionOverride
               ? { perceptionOverride: parseRoleplayPerception(JSON.stringify(body.perceptionOverride)) }
               : {}),

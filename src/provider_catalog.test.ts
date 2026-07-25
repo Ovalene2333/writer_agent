@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { modelSupportsToolChoice, thinkingRequestOptions } from "./model_compat.js";
+import { modelSupportsToolChoice, nonThinkingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { defaultPricing } from "./pricing.js";
 import { parseProviderModelIds, PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
@@ -18,6 +18,11 @@ test("DeepSeek requests explicit Thinking", () => {
   assert.deepEqual(thinkingRequestOptions({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), {
     thinking: { type: "enabled" },
   });
+});
+
+test("DeepSeek continuation can explicitly disable Thinking after a missing reasoning payload", () => {
+  const model = { provider: "deepseek" as const, baseUrl: "https://api.deepseek.com" };
+  assert.deepEqual(nonThinkingRequestOptions(model), { thinking: { type: "disabled" } });
 });
 
 test("provider model directory parser accepts compatible shapes and deduplicates ids", () => {

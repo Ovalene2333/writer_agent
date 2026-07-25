@@ -68,12 +68,13 @@ test("shouldAdjudicateForProposal when dense hard mannerisms exist", () => {
   assert.equal(shouldAdjudicateForProposal(dense, denseIssues), true);
 });
 
-test("split not-A-is-B narration always receives semantic proposal review", () => {
+test("split not-A-is-B narration is deterministic and cannot be adjudicated away", () => {
   const text = "她不是被叫醒。是自己醒的。";
   const issues = analyzeProseStyle(text);
   const split = issues.find(item => item.subtype === "split_redefinition");
   assert.ok(split);
   assert.equal(shouldAdjudicateForProposal(text, issues), true);
+  assert.equal(selectAdjudicationCandidates(issues).some(item => item.id === split.id), false);
 
   const blocked = applyProseVerdicts(text, issues, [{ id: split.id, verdict: "block", reason: "刻意拆句重定义" }]);
   assert.ok(proseStyleIssuesError(blocked));
@@ -82,7 +83,12 @@ test("split not-A-is-B narration always receives semantic proposal review", () =
   const freshSplit = fresh.find(item => item.subtype === "split_redefinition");
   assert.ok(freshSplit);
   const allowed = applyProseVerdicts(text, fresh, [{ id: freshSplit.id, verdict: "allow", reason: "必要事实排除" }]);
-  assert.equal(proseStyleIssuesError(allowed), undefined);
+  assert.ok(proseStyleIssuesError(allowed));
+
+  const cache: ProseVerdictCache = new Map([
+    [proseVerdictCacheKey(freshSplit), { verdict: "allow", reason: "旧缓存误放行" }],
+  ]);
+  assert.ok(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)));
 });
 
 test("cached verdicts replay across gate rounds and keep re-gates deterministic", () => {

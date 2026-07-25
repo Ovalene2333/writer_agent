@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { basename, dirname, join, resolve } from "node:path";
 import type { WriterProject } from "./project.js";
 
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
@@ -34,6 +35,8 @@ export interface ScenePipelineSettings {
 
 export interface AgentRuntimeSettings {
   permissionMode: PermissionMode;
+  /** Allow narrative tasks to append character experiences and story state. */
+  characterEvolutionEnabled: boolean;
   scenePipeline: ScenePipelineSettings;
 }
 
@@ -90,6 +93,7 @@ const SCENE_PIPELINE_TODO_SIGNATURES = [
 
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
+  characterEvolutionEnabled: true,
   scenePipeline: {
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
@@ -145,7 +149,11 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
     const mode = typeof raw.permissionMode === "string" && isPermissionMode(raw.permissionMode)
       ? raw.permissionMode
       : DEFAULT_SETTINGS.permissionMode;
-    return { permissionMode: mode, scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline) };
+    return {
+      permissionMode: mode,
+      characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
+      scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
+    };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -153,13 +161,16 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
 
 export function saveAgentSettings(
   project: WriterProject,
-  patch: { permissionMode?: PermissionMode; scenePipeline?: Partial<ScenePipelineSettings> },
+  patch: { permissionMode?: PermissionMode; characterEvolutionEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> },
 ): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
   const next: AgentRuntimeSettings = {
     permissionMode: patch.permissionMode && isPermissionMode(patch.permissionMode)
       ? patch.permissionMode
       : current.permissionMode,
+    characterEvolutionEnabled: typeof patch.characterEvolutionEnabled === "boolean"
+      ? patch.characterEvolutionEnabled
+      : current.characterEvolutionEnabled,
     scenePipeline: patch.scenePipeline
       ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
       : current.scenePipeline,
@@ -225,14 +236,17 @@ function parseSkillMarkdown(raw: string, fallbackName: string): { name: string; 
   return { name: title, description, body: trimmed };
 }
 
+const BUILTIN_SKILLS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+
 function skillRoots(project: WriterProject): string[] {
   return [
     resolve(project.root, ".writer", "skills"),
     resolve(project.root, ".agents", "skills"),
+    BUILTIN_SKILLS_ROOT,
   ];
 }
 
-/** 扫描项目技能目录（仿 code agent skills）。 */
+/** 扫描项目技能目录，并以项目同名技能覆盖内置技能。 */
 export function listProjectSkills(project: WriterProject): ProjectSkill[] {
   const skills: ProjectSkill[] = [];
   const seen = new Set<string>();
@@ -257,6 +271,8 @@ export function listProjectSkills(project: WriterProject): ProjectSkill[] {
         const parsed = parseSkillMarkdown(raw, id);
         const relative = file.startsWith(project.root)
           ? file.slice(project.root.length + 1).replace(/\\/g, "/")
+          : file.startsWith(BUILTIN_SKILLS_ROOT)
+            ? `builtin/${file.slice(BUILTIN_SKILLS_ROOT.length + 1).replace(/\\/g, "/")}`
           : file;
         skills.push({
           id,

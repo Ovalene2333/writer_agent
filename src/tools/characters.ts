@@ -136,6 +136,9 @@ function parseSourceRef(value: unknown): CharacterSourceRef | undefined {
 
 export function handleApplyCharacterChanges({ input, store, sessionId, characterScope, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "apply_character_changes");
+  if (context.characterEvolutionEnabled === false) {
+    throw new Error("角色演进已关闭；本轮不能自动添加角色经历或故事状态。显式角色卡编辑仍可使用 save_character");
+  }
   const id = optionalPositiveInteger(input.id, "id");
   if (!id) throw new Error("缺少有效参数：id（仅可更新已有角色）");
   if (characterScope !== undefined && !characterScope.includes(id)) {

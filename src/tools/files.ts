@@ -1,8 +1,8 @@
 import { documentBlocks } from "../document_blocks.js";
-import { documentKind, isScenePipelineDocument } from "../project.js";
+import { documentKind } from "../project.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
-import { deferredCharacterChanges, gateProseStyle } from "./proposals.js";
+import { gateProseStyle, prepareDeferredCharacterChanges } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
 
 const READ_BLOCK_TARGET_CHARACTERS = 3_000;
@@ -137,14 +137,12 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
       ...(edits ? { edits } : {}),
     };
   });
-  if (!files.length && !Array.isArray(input.characterChanges)) throw new Error("change set 至少需要 files 或 characterChanges");
+  const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
+  if (!files.length && !preparedCharacterChanges.changes.length) {
+    if (preparedCharacterChanges.skipped) throw new Error("角色演进已关闭；不能创建仅含角色演进的 change set");
+    throw new Error("change set 至少需要 files 或 characterChanges");
+  }
   for (const file of files) {
-    if (context.requireScenePipeline && (file.operation === "write" || file.operation === "patch") && isScenePipelineDocument(file.path)) {
-      throw new Error("完整章节或支线片段写作不能用 propose_change_set 绕过场景流水线；请先完成正文草稿提案，再在后续 change set 管理其他文件");
-    }
-    if (context.requireWritePack && !context.writePackCompiled && (file.operation === "write" || file.operation === "patch")) {
-      throw new Error("写作任务创建 change set 前必须先调用 compile_write_pack");
-    }
     if ((file.operation === "write" || file.operation === "patch") && documentKind(file.path) === "chapter") {
       const before = project.textFileExists(file.path) ? project.readTextFile(file.path) : "";
       let after = file.content ?? before;
@@ -156,16 +154,19 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
     sessionId,
     requireString(input.summary, "summary"),
     files,
-    deferredCharacterChanges(input.characterChanges, characterScope),
+    preparedCharacterChanges.changes,
   );
   emit({ type: "change_set", changeSet });
   if (context.permissionMode !== "auto") {
-    return JSON.stringify({ changeSetId: changeSet.id, status: changeSet.status, files: changeSet.files.length, message: "change set 已等待用户统一审批" });
+    return JSON.stringify({ changeSetId: changeSet.id, status: changeSet.status, files: changeSet.files.length,
+      ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
+      message: "change set 已等待用户统一审批" });
   }
   try {
     const accepted = store.acceptChangeSet(changeSet.id);
     emit({ type: "change_set", changeSet: accepted });
-    return JSON.stringify({ changeSetId: accepted.id, status: accepted.status, files: accepted.files.length, autoAccepted: true });
+    return JSON.stringify({ changeSetId: accepted.id, status: accepted.status, files: accepted.files.length, autoAccepted: true,
+      ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}) });
   } catch (error) {
     return JSON.stringify({ changeSetId: changeSet.id, status: "pending",
       message: `自动接受失败，change set 仍待审批：${error instanceof Error ? error.message : String(error)}` });

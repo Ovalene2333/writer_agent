@@ -295,6 +295,18 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
     throw new Error(`隔离正文 Writer 连续两次超出本场上限 ${maximumCharacters} 字；请收紧 notes 中的事件范围后重试`);
   }
   rejectCompressedPlaceholder(generated.content, "隔离正文 Writer content");
+  const generationStyleError = sceneMannerismGateError(generated.content);
+  if (generationStyleError) {
+    context.isolatedPendingScene = undefined;
+    return JSON.stringify({
+      status: "style_revision_required",
+      code: "SCENE_STYLE_DENSE",
+      error: generationStyleError,
+      sceneId,
+      complete: false,
+      message: "本场未写入草稿。保持原场景事实与目标，用同一 sceneId 重新生成；直接陈述成立事实，不再使用命中的否定—改判或说明式句法。",
+    });
+  }
   context.isolatedPendingScene = {
     forPath: draft.path,
     sceneId,
@@ -392,10 +404,17 @@ async function acceptChapterScene(args: {
       message: "本场未入库；保留 notes，用同一 sceneId 重新调用 write_chapter_scene。",
     });
   }
-  // Never spend another full-scene generation on sentence-level density. Keep
-  // the accepted scene and defer exact offending sentences to the mandatory
-  // chapter inspection/revise gate. Structural and length failures still reject.
-  const deferredStyleError = sceneMannerismGateError(content);
+  const styleError = sceneMannerismGateError(content);
+  if (styleError) {
+    return JSON.stringify({
+      status: "style_revision_required",
+      code: "SCENE_STYLE_DENSE",
+      error: styleError,
+      sceneId,
+      complete: false,
+      message: "本场未写入草稿。只改门禁命中的句子后，用同一 sceneId 重新提交；保留场景事实、因果和人物选择。",
+    });
+  }
   // Experimental best-of-N prose sampling: the submitted scene is candidate 0;
   // fact-preserving rewrites compete on the deterministic prose score. Any
   // rewrite failure silently keeps the original — this never blocks a scene.
@@ -435,7 +454,6 @@ async function acceptChapterScene(args: {
     ...(styleFeedback.length ? { styleFeedback } : {}),
     ...(candidateReport ? { candidateSampling: candidateReport } : {}),
     ...(dedup.removed.length ? { autoFixes: { duplicateSentencesRemoved: dedup.removed.slice(0, 5) } } : {}),
-    ...(deferredStyleError ? { styleDeferred: { code: "SCENE_STYLE_DENSE", error: deferredStyleError } } : {}),
     // When a rewrite wins, the model's own submission is NOT what entered the
     // draft — return the stored text so later inspect/revise work on real bytes.
     ...(args.exposeCandidateContent && candidateReport?.chosen === "rewrite" ? { content: selectedContent } : {}),
@@ -446,9 +464,6 @@ async function acceptChapterScene(args: {
         : "当前没有未写 scene guide；章节目标已抵达则 inspect_chapter_draft，否则先补充下一场引导。",
       dedup.removed.length
         ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
-        : "",
-      deferredStyleError
-        ? "本场带 styleDeferred 入稿：不要重写本场；整章 inspect 会硬拦截，届时把命中句用 revise_chapter_draft_style 精确替换修完并复检。"
         : "",
       candidateReport?.chosen === "rewrite"
         ? "候选采样选中了重写稿并已写入草稿（见 content 字段）；本场后续审阅与精确替换一律以该文本为准，不要引用你提交的原稿字句。"
@@ -711,11 +726,12 @@ async function submitPassedChapterReview(
   const { draft, proposalSummary, contentCharacters, metrics, styleWarnings, ledger, chapterReview } = values;
   draft.inspectedVersion = draft.version;
   saveDraftCheckpoint(args, "review_passed", draft);
-  const preparedCharacterChanges = tolerantDeferredCharacterChanges(
-    input.characterChanges,
-    args.store,
-    args.characterScope,
-  );
+  const characterEvolutionSkipped = args.context.characterEvolutionEnabled === false
+    && input.characterChanges !== undefined
+    && (!Array.isArray(input.characterChanges) || input.characterChanges.length > 0);
+  const preparedCharacterChanges = args.context.characterEvolutionEnabled === false
+    ? { changes: [], warnings: characterEvolutionSkipped ? ["角色演进已关闭，已忽略本次 characterChanges"] : [] }
+    : tolerantDeferredCharacterChanges(input.characterChanges, args.store, args.characterScope);
   let proposalResult: string;
   try {
     proposalResult = await submitChapterDraftProposal(args, {
@@ -760,6 +776,7 @@ async function submitPassedChapterReview(
     ...(preparedCharacterChanges.warnings.length
       ? { characterChangeWarnings: preparedCharacterChanges.warnings }
       : {}),
+    ...(characterEvolutionSkipped ? { characterEvolutionSkipped: true } : {}),
     message: "整章终审已完成且提案已创建；不要再调用 propose_chapter_draft。",
   });
 }
@@ -774,6 +791,14 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     throw new Error(`场景尚未写完（${draft.completed.length}/${draft.scenes.length}）`);
   }
   let content = assembleChapterSceneDraft(draft);
+  if (context.chapterDraftPreviewed?.path !== draft.path) {
+    context.chapterDraftPreviewed = { path: draft.path };
+    args.emit({
+      type: "text",
+      channel: "output",
+      text: `\n\n草稿预览（终审仍在继续）：${draft.path}\n\n${content}\n\n`,
+    });
+  }
   const beforeContent = project.documentExists(draft.path) ? project.read(draft.path) : "";
   const styleRepair = await autoRepairChapterStyle(args, beforeContent);
   draft = context.chapterSceneDraft ?? draft;
@@ -984,7 +1009,6 @@ async function submitChapterDraftProposal(
     assembleChapterSceneDraft(draft),
     values.summary,
     values.characterChanges,
-    true,
     true,
   );
   try {

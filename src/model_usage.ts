@@ -44,10 +44,11 @@ export function buildRecordedUsageEvent(
 ): AgentEvent {
   const cacheMissTokens = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
   const normalized = { ...usage, cacheMissTokens };
+  const providerName = model.providerName?.trim()
+    || (model.provider === "deepseek" ? "DeepSeek" : "API");
   const call: StepUsage = {
     model: model.model,
-    providerName: model.providerName?.trim()
-      || (model.provider === "deepseek" ? "DeepSeek" : "API"),
+    providerName,
     promptTokens: usage.promptTokens,
     completionTokens: usage.completionTokens,
     cacheHitTokens: usage.cacheHitTokens,
@@ -63,7 +64,7 @@ export function buildRecordedUsageEvent(
       : {}),
   };
   const summary = model.pricing
-    ? store.recordUsage(sessionId, model.model, normalized, model.pricing, new Date(), meta)
+    ? store.recordUsage(sessionId, model.model, normalized, model.pricing, new Date(), { ...meta, providerName })
     : store.usage(sessionId);
   return {
     type: "usage",

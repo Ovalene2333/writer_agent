@@ -78,6 +78,7 @@ export function applyCachedProseVerdicts(
   if (!cache?.size) return issues;
   const verdicts: ProseAdjudicationVerdict[] = [];
   for (const issue of issues) {
+    if (isDeterministicNarrativeContrast(issue)) continue;
     const hit = cache.get(proseVerdictCacheKey(issue));
     if (hit) verdicts.push({ id: issue.id, verdict: hit.verdict, ...(hit.reason ? { reason: hit.reason } : {}) });
   }
@@ -111,6 +112,7 @@ const DISCOVERY_SIGNAL = /(?:这(?:说明|意味着|表明)|显然|无疑|根本
 export function selectAdjudicationCandidates(issues: ProseStyleIssue[]): ProseStyleIssue[] {
   const ranked = issues
     .filter(issue => {
+      if (isDeterministicNarrativeContrast(issue)) return false;
       if (issue.severity === "error") return true;
       if (issue.severity === "warning") return true;
       if (issue.severity === "info" && (issue.subtype === "ambiguous_dash" || issue.subtype === "appositive_definition")) {
@@ -193,6 +195,7 @@ export function applyProseVerdicts(
 ): ProseStyleIssue[] {
   const byId = new Map(verdicts.map(item => [item.id, item]));
   for (const issue of issues) {
+    if (isDeterministicNarrativeContrast(issue)) continue;
     const hit = byId.get(issue.id);
     if (!hit) continue;
     if (hit.verdict === "allow") {
@@ -219,6 +222,11 @@ export function applyProseVerdicts(
     }
   }
   return escalateHardMannerisms(text, issues);
+}
+
+function isDeterministicNarrativeContrast(issue: ProseStyleIssue): boolean {
+  return issue.subtype === "split_redefinition"
+    || (issue.kind === "contrast" && issue.severity === "error");
 }
 
 /**

@@ -31,6 +31,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Whether narrative tasks may append experiences and story state to character cards. */
+  characterEvolutionEnabled?: boolean;
   /** User message that owns mutations made by this Agent job. */
   sourceMessageId?: number;
   /** Planner-classified rewrite scope; point edits enforce a narrow read lock. */
@@ -59,19 +61,12 @@ export type ToolExecutionContext = {
   requireCreativeOutlineDesign?: boolean;
   /** Set true after design_creative_outline succeeds this run. */
   creativeOutlineDesigned?: boolean;
-  /**
-   * When true (write_scene delivery), propose_document / patch require a prior
-   * compile_write_pack in this run so prose is grounded on diegetic materials only.
-   */
-  requireWritePack?: boolean;
   /** Set true after compile_write_pack succeeds this run. */
   writePackCompiled?: boolean;
   /** Last compiled write pack text (for debugging / optional agent reuse). */
   lastWritePack?: string;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
-  /** Long-form chapter/side delivery uses the scene pipeline instead of a one-shot proposal. */
-  requireScenePipeline?: boolean;
   /** Current project scene-chain guidance and enforced per-document limit. */
   scenePipelineSettings?: ScenePipelineSettings;
   /** In-run narrative draft; never writes a partial document to the project. */
@@ -195,6 +190,8 @@ export type ToolExecutionContext = {
    * revise_chapter_draft_style. Reset at chapter boundaries.
    */
   proseVerdictCache?: ProseVerdictCache;
+  /** Full read-only chapter preview already streamed before the first inspection. */
+  chapterDraftPreviewed?: { path: string };
 };
 
 export type ToolHandlerArgs = {

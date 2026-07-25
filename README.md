@@ -14,7 +14,7 @@
 - **任务清单**：`manage_todos` 多步任务跟踪，会话内可查看
 - **工具模块化**：Agent 工具 schema 与 handler 拆分在 `src/tools/`（documents / outline / characters / proposals / meta）
 - **项目指令**：自动加载 `WRITER.md` / `AGENTS.md` / `CLAUDE.md` / `.writer/instructions.md`
-- **项目技能**：`.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md`，按需 `load_skill`
+- **可加载技能**：内置 `chapter-planning` 章节规划 Skill；项目可通过 `.writer/skills/<id>/SKILL.md` 或 `.agents/skills/<id>/SKILL.md` 新增或覆盖，Agent 按描述调用 `load_skill`
 - **修改提案与撤销**：Agent 默认不直接覆盖正文，提案可接受 / 拒绝，并支持 undo / redo
 - **纯文本工作区与 change set**：Agent 可在 `resource/` 内读取和管理 UTF-8 纯文本；多文件写入、补丁、移动、删除及角色演进可整组预览、审批、回滚和重做
 - **角色卡**：结构化角色资料，可供检索与写作引用
@@ -125,7 +125,7 @@ writer run "..." --debug-steps      # 仅 step 调试输出
 | `auto` | 提案创建后自动写入文件（可 undo） |
 | `plan` | 禁止写入类工具，只做检索与规划 |
 
-设置保存在 `.writer/agent.json`。
+设置保存在 `.writer/agent.json`。Web 端“写作”设置可关闭角色演进；关闭后叙事任务不会自动追加角色经历或故事状态，显式角色卡编辑不受影响。
 
 项目指令（自动注入 system prompt，按优先级取第一个存在的文件）：
 
@@ -255,6 +255,8 @@ style: ""   # 可设为风格模板 id，如 light-novel
 5. **提案、审批与追问**：修改以提案交付；仅在缺少不可推断的关键决策时暂停并询问用户
 
 Agent 可用的主要能力包括：列出与检视 Markdown 文档、按块 / 节 / 行读取、全文检索、大纲节点读写与校验、通用纯文本文件读取，以及通过 change set 整组提议文件创建 / 补丁 / 移动 / 删除与角色演进。
+
+正文交付不绑定固定场景流水线。Agent 可以直接提交完整文档、按锚点局部修改、按需编译 write pack，或在长篇连续状态和逐场修订确有收益时主动启用场景草稿链；这些能力互不构成形式上的前置条件。
 
 真实 Agent 轨迹可用 `npm run eval:agent` 自动评测。默认从 `../jn2` 只读加载各角色供应商配置，在 `writer-agent-data/agent-eval-project` 的独立项目中运行；任务契约、工具序列、终止状态、提案结果和失败原因会持久化到该项目的 `.writer/writer.db`。编译后可用 `node dist/cli.js agent-eval --list` 查看历史结果。
 

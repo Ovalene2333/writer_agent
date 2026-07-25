@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  ArrowDown,
+  ArrowUp,
   Bot,
   BookOpenText,
   ChevronDown,
@@ -20,6 +22,7 @@ import {
   History,
   IdCard,
   Library,
+  ListOrdered,
   Menu,
   MessageSquare,
   Minus,
@@ -34,6 +37,7 @@ import {
   Search,
   Save,
   Settings,
+  ShieldCheck,
   Sun,
   Trash2,
   WandSparkles,
@@ -87,14 +91,40 @@ type RoleplayPerceptionProjection = {
   unknowableFacts: string[];
   potentialSensations: string[];
 };
-type RoleplayRerunDirection = "shorter" | "more_emotional" | "less_explanation" | "dialogue_only" | "with_action" | "no_question";
-const ROLEPLAY_RERUN_DIRECTION_OPTIONS: Array<{ id: RoleplayRerunDirection; label: string }> = [
-  { id: "shorter", label: "更简短" },
-  { id: "more_emotional", label: "更有情绪" },
-  { id: "less_explanation", label: "少解释" },
-  { id: "dialogue_only", label: "只说台词" },
-  { id: "with_action", label: "加入动作" },
-  { id: "no_question", label: "不要提问" },
+type RoleplayRerunDirection = "shorter" | "more_emotional" | "less_explanation" | "more_subtext" | "warmer" | "more_confrontational" | "dialogue_only" | "with_action" | "no_question" | "change_tactic";
+type RoleplayContentRating = "default" | "sfw" | "nsfw";
+type RoleplayRerunControls = {
+  length: number;
+  pace: number;
+  emotion: number;
+  action: number;
+  initiative: number;
+  contentRating: RoleplayContentRating;
+};
+type RoleplayRerunSliderKey = Exclude<keyof RoleplayRerunControls, "contentRating">;
+const DEFAULT_ROLEPLAY_RERUN_CONTROLS: RoleplayRerunControls = {
+  length: 0,
+  pace: 0,
+  emotion: 0,
+  action: 0,
+  initiative: 0,
+  contentRating: "default",
+};
+const ROLEPLAY_CONTINUATION_PLACEHOLDER = "<续演>";
+const ROLEPLAY_RERUN_SLIDERS: Array<{ id: RoleplayRerunSliderKey; label: string; low: string; high: string }> = [
+  { id: "length", label: "篇幅", low: "精简", high: "充分" },
+  { id: "pace", label: "节奏", low: "舒缓", high: "紧凑" },
+  { id: "emotion", label: "情绪", low: "克制", high: "强烈" },
+  { id: "action", label: "动作占比", low: "台词", high: "动作" },
+  { id: "initiative", label: "主动程度", low: "迟疑", high: "主动" },
+];
+const ROLEPLAY_RERUN_DIRECTION_OPTIONS: Array<{ id: RoleplayRerunDirection; label: string; description: string }> = [
+  { id: "less_explanation", label: "减少解释", description: "删除分析与归纳" },
+  { id: "more_subtext", label: "增加潜台词", description: "把意图留在言外" },
+  { id: "warmer", label: "更加柔和", description: "表达更多善意" },
+  { id: "more_confrontational", label: "更有锋芒", description: "表达直接且有张力" },
+  { id: "no_question", label: "不要提问", description: "不以问题推进" },
+  { id: "change_tactic", label: "改变策略", description: "目标不变，换一种做法" },
 ];
 type RoleplayBranchSummary = {
   id: string;
@@ -133,6 +163,9 @@ type ActiveRoleplayState = {
   performer: RoleplayParticipant;
   identity: RoleplayParticipant;
   scene?: RoleplayScene;
+  sceneSequence: RoleplayScene[];
+  sceneIndex: number;
+  contentRating: RoleplayContentRating;
 };
 type ChangeSet = {
   id: number;
@@ -160,7 +193,14 @@ type RoleplayMemoryFact = {
   content: string; sourceMessageId?: number; knownBy: Array<"public" | "performer" | "identity">;
   importance: number; status: "active" | "superseded" | "retracted"; pinned: boolean; createdAt: string; updatedAt: string;
 };
-type RoleplaySessionMemory = { performerKey: string; summary: string; summarizedThroughId: number; turnCount: number; sameBeatTurns: number };
+type RoleplaySessionMemory = {
+  performerKey: string;
+  summary: string;
+  summarizedThroughId: number;
+  state: { scene: string };
+  turnCount: number;
+  sameBeatTurns: number;
+};
 type RoleplaySetupPhase = "generating" | "saving" | "entering";
 const ROLEPLAY_SETUP_PHASE_LABELS: Record<RoleplaySetupPhase, string> = {
   generating: "\u6b63\u5728\u751f\u6210\u7b80\u6613\u89d2\u8272\u5361",
@@ -300,6 +340,17 @@ type Usage = {
   currency: string;
   lastPromptTokens: number;
   cacheHitRate?: number;
+  callBreakdown: Array<{
+    providerName: string;
+    model: string;
+    callCount: number;
+    promptTokens: number;
+    completionTokens: number;
+    cacheHitTokens: number;
+    cacheMissTokens: number;
+    cost: number;
+    currency: string;
+  }>;
 };
 type Provider = {
   provider: "deepseek" | "openai-compatible";
@@ -365,7 +416,7 @@ type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode; scenePipeline: ScenePipelineSettings };
+  agentSettings?: { permissionMode: PermissionMode; characterEvolutionEnabled: boolean; scenePipeline: ScenePipelineSettings };
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;
 };
@@ -1805,6 +1856,7 @@ function App() {
     message: Message;
     inputMode?: RoleplayInputMode;
     rerunDirections: RoleplayRerunDirection[];
+    rerunControls: RoleplayRerunControls;
     perceptionOverride?: RoleplayPerceptionProjection;
   } | null>(null);
   const [roleplayBranchTimeline, setRoleplayBranchTimeline] = useState<{
@@ -1852,6 +1904,10 @@ function App() {
   const [roleplaySetup, setRoleplaySetup] = useState<{ performer: RoleplayParticipant | null; identity: RoleplayParticipant | null; scene: RoleplayScene | null; request: string; persist: boolean } | null>(null);
   const [simpleCardDraft, setSimpleCardDraft] = useState<(RoleplayInterlocutor & { id?: number }) | null>(null);
   const [roleplaySceneDraft, setRoleplaySceneDraft] = useState<RoleplaySceneDraft | null>(null);
+  const [roleplaySceneGenerateRequest, setRoleplaySceneGenerateRequest] = useState("");
+  const [roleplaySceneGenerateBusy, setRoleplaySceneGenerateBusy] = useState(false);
+  const [roleplaySceneManagerOpen, setRoleplaySceneManagerOpen] = useState(false);
+  const [roleplaySceneManagerBusy, setRoleplaySceneManagerBusy] = useState(false);
   const [roleplayMemoryOpen, setRoleplayMemoryOpen] = useState(false);
   const [roleplayFactDraft, setRoleplayFactDraft] = useState<RoleplayFactDraft | null>(null);
   const [roleplayInputMode, setRoleplayInputMode] = useState<RoleplayInputMode>("dialogue");
@@ -2245,7 +2301,7 @@ function App() {
     const overlayOpen = showThemePicker || showStylePicker || showConnectionPanel
       || showUsagePopover || settingsMenuOpen || managementView !== null
       || styleDraft !== null || characterDraft !== null || simpleCardDraft !== null
-      || roleplaySetup !== null || roleplaySceneDraft !== null || roleplayFactDraft !== null
+      || roleplaySetup !== null || roleplaySceneDraft !== null || roleplaySceneManagerOpen || roleplayFactDraft !== null
       || branchConfirm !== null || roleplayBranchTimeline !== null;
     if (!overlayOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -2258,7 +2314,8 @@ function App() {
       if (characterDraft) { setCharacterDraft(null); return; }
       if (simpleCardDraft) { setSimpleCardDraft(null); return; }
       if (roleplayFactDraft) { setRoleplayFactDraft(null); return; }
-      if (roleplaySceneDraft) { setRoleplaySceneDraft(null); return; }
+      if (roleplaySceneDraft && !roleplaySceneGenerateBusy) { setRoleplaySceneDraft(null); return; }
+      if (roleplaySceneManagerOpen && !roleplaySceneManagerBusy) { setRoleplaySceneManagerOpen(false); return; }
       if (roleplaySetup && !roleplaySetupBusy) { setRoleplaySetup(null); return; }
       if (branchConfirm) { setBranchConfirm(null); return; }
       if (roleplayBranchTimeline) { setRoleplayBranchTimeline(null); return; }
@@ -2280,7 +2337,7 @@ function App() {
   }, [
     showThemePicker, showStylePicker, showConnectionPanel, showUsagePopover, settingsMenuOpen,
     managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
-    roleplaySceneDraft, roleplayFactDraft, branchConfirm, roleplayBranchTimeline,
+    roleplaySceneDraft, roleplaySceneGenerateBusy, roleplaySceneManagerOpen, roleplaySceneManagerBusy, roleplayFactDraft, branchConfirm, roleplayBranchTimeline,
   ]);
 
   useEffect(() => {
@@ -2427,7 +2484,10 @@ function App() {
         const idx = activeStepIndex(current);
         if (idx < 0) return current;
         const key = event.channel === "reasoning" ? "reasoning" : "output";
-        return current.map((s, i) => (i === idx ? { ...s, [key]: s[key] + event.text } : s));
+        const isDraftPreview = event.channel !== "reasoning" && event.text!.includes("草稿预览（终审仍在继续）");
+        return current.map((s, i) => (i === idx
+          ? { ...s, [key]: s[key] + event.text, ...(isDraftPreview ? { expanded: true } : {}) }
+          : s));
       });
     }
     if (event.type === "tool" && event.name) {
@@ -2464,7 +2524,9 @@ function App() {
     }
     if (event.type === "step_done") {
       updateStreamSteps((current) =>
-        current.map((s) => (s.id === event.step ? { ...s, status: "completed", expanded: false } : s)),
+        current.map((s) => (s.id === event.step
+          ? { ...s, status: "completed", expanded: s.output.includes("草稿预览（终审仍在继续）") }
+          : s)),
       );
     }
     if (event.type === "error") {
@@ -2505,7 +2567,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -2523,7 +2585,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -2646,6 +2708,14 @@ function App() {
     return () => window.clearInterval(timer);
   }, [Boolean(state?.activeJobs?.length)]);
 
+  function roleplayRequestControls(controls?: RoleplayRerunControls): RoleplayRerunControls {
+    return {
+      ...DEFAULT_ROLEPLAY_RERUN_CONTROLS,
+      ...controls,
+      contentRating: roleplay?.contentRating ?? "default",
+    };
+  }
+
   async function sendChat(options?: {
     text?: string;
     channel?: "agent" | "roleplay";
@@ -2653,6 +2723,7 @@ function App() {
     variantGroupId?: string;
     replaceFromId?: number;
     rerunDirections?: RoleplayRerunDirection[];
+    rerunControls?: RoleplayRerunControls;
     perceptionOverride?: RoleplayPerceptionProjection;
   }) {
     const text = (options?.text ?? prompt).trim();
@@ -2712,6 +2783,7 @@ function App() {
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           ...(variantGroupId ? { variantGroupId } : {}),
           ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
+          ...(activeRoleplay ? { rerunControls: roleplayRequestControls(options?.rerunControls) } : {}),
           ...(options?.perceptionOverride ? { perceptionOverride: options.perceptionOverride } : {}),
           ...(!activeRoleplay ? {
             ...(characterScope !== undefined ? { characterScope } : {}),
@@ -2761,6 +2833,7 @@ function App() {
       message,
       inputMode: message.channel === "roleplay" ? message.roleplayInputMode ?? "dialogue" : undefined,
       rerunDirections: [],
+      rerunControls: { ...DEFAULT_ROLEPLAY_RERUN_CONTROLS },
     });
   }
 
@@ -2784,13 +2857,14 @@ function App() {
       message,
       inputMode,
       rerunDirections: [],
+      rerunControls: { ...DEFAULT_ROLEPLAY_RERUN_CONTROLS },
       perceptionOverride: sourcePerception,
     });
   }
 
   async function confirmBranchAction(keepChanges: boolean) {
     if (!state || !branchConfirm) return;
-    const { mode, message, inputMode, rerunDirections, perceptionOverride } = branchConfirm;
+    const { mode, message, inputMode, rerunDirections, rerunControls, perceptionOverride } = branchConfirm;
     setBranchConfirm(null);
     setError("");
     setNotice("");
@@ -2804,7 +2878,7 @@ function App() {
         variantGroupId: string;
         keepChanges?: boolean;
         inputMode?: RoleplayInputMode;
-        modelInitiatedRoleplay?: "opening";
+        modelInitiatedRoleplay?: "opening" | "continuation";
       }>(`/api/messages/${message.id}/rerun`, {
         method: "POST",
         body: JSON.stringify({ sessionId: state.sessionId, keepChanges }),
@@ -2838,6 +2912,16 @@ function App() {
           variantGroupId: result.variantGroupId,
           replaceFromId: result.fromId,
           rerunDirections,
+          rerunControls,
+        });
+        return;
+      }
+      if (result.modelInitiatedRoleplay === "continuation") {
+        await requestPerformerAutoReply({
+          variantGroupId: result.variantGroupId,
+          replaceFromId: result.fromId,
+          rerunDirections,
+          rerunControls,
         });
         return;
       }
@@ -2848,6 +2932,7 @@ function App() {
         variantGroupId: result.variantGroupId,
         replaceFromId: result.fromId,
         rerunDirections,
+        rerunControls,
         perceptionOverride: (inputMode ?? result.inputMode) === "director" ? undefined : perceptionOverride,
       });
     } catch (cause) {
@@ -3120,8 +3205,24 @@ function App() {
         performer: value.performer,
         identity: value.identity,
         sceneId: value.scene?.id,
+        sceneIds: value.sceneSequence.map(scene => scene.id),
+        sceneIndex: value.sceneIndex,
+        contentRating: value.contentRating,
       }),
     });
+  }
+
+  async function updateRoleplayContentRating(contentRating: RoleplayContentRating) {
+    if (!roleplay || busy) return;
+    const previous = roleplay;
+    const next = { ...roleplay, contentRating };
+    setRoleplay(next);
+    try {
+      setRoleplay(await persistActiveRoleplay(next));
+    } catch (cause) {
+      setRoleplay(previous);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
   async function confirmRoleplaySetup() {
@@ -3148,10 +3249,21 @@ function App() {
         } else identity = { kind: "generated", name: generated.name, card: generated };
       }
       setRoleplaySetupPhase("entering");
+      const previousSequence = roleplay?.sceneSequence ?? [];
+      const selectedSceneIndex = roleplaySetup.scene
+        ? previousSequence.findIndex(scene => scene.id === roleplaySetup.scene!.id)
+        : -1;
+      const sceneSequence = roleplaySetup.scene
+        ? selectedSceneIndex >= 0 ? previousSequence : [roleplaySetup.scene]
+        : [];
+      const sceneIndex = selectedSceneIndex >= 0 ? selectedSceneIndex : 0;
       const active = await persistActiveRoleplay({
         performer: roleplaySetup.performer,
         identity,
         ...(roleplaySetup.scene ? { scene: roleplaySetup.scene } : {}),
+        sceneSequence,
+        sceneIndex,
+        contentRating: roleplay?.contentRating ?? "default",
       });
       setRoleplay(active);
       setRoleplaySetup(null);
@@ -3226,6 +3338,16 @@ function App() {
       const saved = await api<RoleplayScene>("/api/roleplay/scenes", { method: "PUT", body: JSON.stringify(roleplaySceneDraft) });
       setRoleplaySceneDraft(null);
       if (roleplaySetup) setRoleplaySetup({ ...roleplaySetup, scene: saved });
+      if (roleplay?.sceneSequence.some(scene => scene.id === saved.id)) {
+        const sceneSequence = roleplay.sceneSequence.map(scene => scene.id === saved.id ? saved : scene);
+        const active = await persistActiveRoleplay({
+          ...roleplay,
+          sceneSequence,
+          ...(roleplay.scene?.id === saved.id ? { scene: saved } : {}),
+        });
+        setRoleplay(active);
+        setState(current => current ? { ...current, activeRoleplay: active } : current);
+      }
       await refresh(state?.sessionId);
       setNotice(roleplaySceneDraft.id ? "场景卡已更新" : "场景卡已创建");
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
@@ -3237,8 +3359,101 @@ function App() {
       await api(`/api/roleplay/scenes/${id}`, { method: "DELETE" });
       setRoleplaySceneDraft(null);
       if (roleplaySetup?.scene?.id === id) setRoleplaySetup({ ...roleplaySetup, scene: null });
+      if (roleplay?.sceneSequence.some(scene => scene.id === id)) {
+        const sceneSequence = roleplay.sceneSequence.filter(scene => scene.id !== id);
+        const sceneIndex = Math.min(roleplay.sceneIndex, Math.max(0, sceneSequence.length - 1));
+        const { scene: _removedScene, ...rest } = roleplay;
+        const active = await persistActiveRoleplay({
+          ...rest,
+          ...(sceneSequence[sceneIndex] ? { scene: sceneSequence[sceneIndex] } : {}),
+          sceneSequence,
+          sceneIndex,
+        });
+        setRoleplay(active);
+        setState(current => current ? { ...current, activeRoleplay: active } : current);
+      }
       await refresh(state?.sessionId);
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  function beginRoleplaySceneDraft(scene?: RoleplayScene) {
+    setRoleplaySceneGenerateRequest("");
+    setRoleplaySceneDraft(scene ? { ...scene } : emptyRoleplayScene());
+  }
+
+  async function generateRoleplaySceneDraft() {
+    if (!state || !roleplaySceneDraft || roleplaySceneDraft.id || !roleplaySceneGenerateRequest.trim() || roleplaySceneGenerateBusy) return;
+    setRoleplaySceneGenerateBusy(true);
+    setError("");
+    try {
+      const generated = await api<Pick<RoleplayScene, "name" | "setting" | "premise">>("/api/roleplay/scenes/generate", {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: state.sessionId,
+          request: roleplaySceneGenerateRequest,
+          performer: roleplaySetup?.performer ?? roleplay?.performer,
+          identity: roleplaySetup?.identity ?? roleplay?.identity,
+          currentScene: roleplay?.scene,
+        }),
+      });
+      setRoleplaySceneDraft(current => current ? { ...current, ...generated } : current);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRoleplaySceneGenerateBusy(false);
+    }
+  }
+
+  async function updateRoleplaySceneSequence(sceneSequence: RoleplayScene[], requestedIndex: number) {
+    if (!roleplay || roleplaySceneManagerBusy) return;
+    const previous = roleplay;
+    const sceneIndex = sceneSequence.length
+      ? Math.min(Math.max(requestedIndex, 0), sceneSequence.length - 1)
+      : 0;
+    const { scene: _previousScene, ...rest } = roleplay;
+    const next: ActiveRoleplayState = {
+      ...rest,
+      ...(sceneSequence[sceneIndex] ? { scene: sceneSequence[sceneIndex] } : {}),
+      sceneSequence,
+      sceneIndex,
+    };
+    setRoleplay(next);
+    setRoleplaySceneManagerBusy(true);
+    try {
+      const saved = await persistActiveRoleplay(next);
+      setRoleplay(saved);
+      setState(current => current ? { ...current, activeRoleplay: saved } : current);
+    } catch (cause) {
+      setRoleplay(previous);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRoleplaySceneManagerBusy(false);
+    }
+  }
+
+  function addRoleplaySceneToSequence(scene: RoleplayScene) {
+    if (!roleplay || roleplay.sceneSequence.some(item => item.id === scene.id)) return;
+    const sceneSequence = [...roleplay.sceneSequence, scene];
+    void updateRoleplaySceneSequence(sceneSequence, roleplay.sceneSequence.length ? roleplay.sceneIndex : 0);
+  }
+
+  function moveRoleplaySceneInSequence(index: number, offset: -1 | 1) {
+    if (!roleplay) return;
+    const target = index + offset;
+    if (target < 0 || target >= roleplay.sceneSequence.length) return;
+    const sceneSequence = [...roleplay.sceneSequence];
+    [sceneSequence[index], sceneSequence[target]] = [sceneSequence[target], sceneSequence[index]];
+    const sceneIndex = roleplay.sceneIndex === index ? target : roleplay.sceneIndex === target ? index : roleplay.sceneIndex;
+    void updateRoleplaySceneSequence(sceneSequence, sceneIndex);
+  }
+
+  function removeRoleplaySceneFromSequence(index: number) {
+    if (!roleplay) return;
+    const sceneSequence = roleplay.sceneSequence.filter((_, itemIndex) => itemIndex !== index);
+    const sceneIndex = index < roleplay.sceneIndex
+      ? roleplay.sceneIndex - 1
+      : Math.min(roleplay.sceneIndex, Math.max(0, sceneSequence.length - 1));
+    void updateRoleplaySceneSequence(sceneSequence, sceneIndex);
   }
 
   function newFactDraft(source?: Message): RoleplayFactDraft {
@@ -3292,6 +3507,7 @@ function App() {
     variantGroupId?: string;
     replaceFromId?: number;
     rerunDirections?: RoleplayRerunDirection[];
+    rerunControls?: RoleplayRerunControls;
   }) {
     if (!state || busy || !roleplay) return;
     setError("");
@@ -3317,6 +3533,7 @@ function App() {
           opening: true,
           ...(options?.variantGroupId ? { variantGroupId: options.variantGroupId } : {}),
           ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
+          rerunControls: roleplayRequestControls(options?.rerunControls),
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           performer: roleplay.performer,
           identity: roleplay.identity,
@@ -3334,15 +3551,34 @@ function App() {
     }
   }
 
-  async function requestPerformerAutoReply() {
+  async function requestPerformerAutoReply(options?: {
+    variantGroupId?: string;
+    replaceFromId?: number;
+    rerunDirections?: RoleplayRerunDirection[];
+    rerunControls?: RoleplayRerunControls;
+  }) {
     if (!state || busy || roleplayAutoReplyBusy || !roleplay) return;
+    const tempMessageId = -Date.now();
     setRoleplayAutoReplyBusy("performer");
     setError("");
     setNotice("");
     clearStepTrail(state.sessionId);
     updateStreamSteps([]);
-    updateStreamStepsAnchorId(-Date.now());
+    updateStreamStepsAnchorId(tempMessageId);
     streamOutputRef.current = "";
+    setState(current => current ? {
+      ...current,
+      messages: [
+        ...current.messages.filter(message => options?.replaceFromId === undefined || message.id < options.replaceFromId),
+        {
+          id: tempMessageId,
+          role: "user",
+          content: ROLEPLAY_CONTINUATION_PLACEHOLDER,
+          channel: "roleplay",
+          roleplayInputMode: "dialogue",
+        },
+      ],
+    } : current);
     try {
       const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
         method: "POST",
@@ -3351,6 +3587,9 @@ function App() {
           prompt: "",
           mode: "roleplay",
           performerAutoReply: true,
+          ...(options?.variantGroupId ? { variantGroupId: options.variantGroupId } : {}),
+          ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
+          rerunControls: roleplayRequestControls(options?.rerunControls),
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           performer: roleplay.performer,
           identity: roleplay.identity,
@@ -3365,6 +3604,7 @@ function App() {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
       clearAgentStream();
+      await refresh(state.sessionId).catch(() => undefined);
     } finally {
       setRoleplayAutoReplyBusy(null);
     }
@@ -4022,7 +4262,9 @@ function App() {
               <div className="roleplay-banner-heading">
                 <span className="roleplay-banner-kicker">角色扮演</span>
                 <strong>「{roleplay.performer.name}」×「{roleplay.identity.name}」</strong>
-                {roleplay.scene && <span className="roleplay-scene-chip">{roleplay.scene.name}</span>}
+                {roleplay.scene && <span className="roleplay-scene-chip">
+                  {roleplay.sceneSequence.length > 1 ? `${roleplay.sceneIndex + 1}/${roleplay.sceneSequence.length} · ` : ""}{roleplay.scene.name}
+                </span>}
               </div>
               <details className="roleplay-session-details">
                 <summary>查看当前角色与场景设定</summary>
@@ -4036,8 +4278,8 @@ function App() {
                     <div><dt>目标</dt><dd>{roleplay.identity.card.goal}</dd></div>
                     {roleplay.scene && <>
                       <div><dt>独立场景</dt><dd>{roleplay.scene.name}</dd></div>
-                      <div><dt>前提</dt><dd>{roleplay.scene.premise}</dd></div>
-                      <div><dt>时间</dt><dd>{roleplay.scene.timelineAnchor}</dd></div>
+                      <div><dt>地点/时间</dt><dd>{roleplay.scene.setting}</dd></div>
+                      <div><dt>场景要点</dt><dd>{roleplay.scene.premise}</dd></div>
                     </>}
                   </dl>
                 </div>
@@ -4074,6 +4316,36 @@ function App() {
                 )}
               </div>
               <div className="roleplay-action-group roleplay-action-group-secondary">
+                <button type="button" disabled={busy} onClick={() => setRoleplaySceneManagerOpen(true)} title="场景管理与场景序列">
+                  <ListOrdered size={13} aria-hidden="true" /><span>场景</span>
+                </button>
+                <details className={`roleplay-rating-menu rating-${roleplay.contentRating ?? "default"}`}>
+                  <summary title={`内容分级：${(roleplay.contentRating ?? "default") === "default" ? "默认" : (roleplay.contentRating ?? "default").toUpperCase()}`}>
+                    <ShieldCheck size={13} aria-hidden="true" /><span>分级</span>
+                  </summary>
+                  <div role="menu" aria-label="角色扮演内容分级">
+                    {(["default", "sfw", "nsfw"] as RoleplayContentRating[]).map(contentRating => {
+                      const active = (roleplay.contentRating ?? "default") === contentRating;
+                      return (
+                        <button
+                          key={contentRating}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={active}
+                          className={active ? "active" : ""}
+                          disabled={busy}
+                          title={contentRating === "default" ? "沿用角色与场景设定" : contentRating === "sfw" ? "强制非露骨内容" : "强制成人向内容；仅限明确成年角色"}
+                          onClick={(event) => {
+                            event.currentTarget.closest("details")?.removeAttribute("open");
+                            void updateRoleplayContentRating(contentRating);
+                          }}
+                        >
+                          <span>{contentRating === "default" ? "默认" : contentRating.toUpperCase()}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </details>
                 <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
                   <History size={13} aria-hidden="true" /><span>记忆</span>
                 </button>
@@ -4132,8 +4404,11 @@ function App() {
             {(() => {
               const displayContent = messageVersionViews[msg.id]?.versions[messageVersionViews[msg.id].current]?.content ?? msg.content;
               const assistantCollapsed = msg.role === "assistant" && collapsedAssistantIds.has(msg.id);
+              const directorMessage = msg.role === "user" && msg.channel === "roleplay" && msg.roleplayInputMode === "director";
+              const continuationMessage = msg.role === "user" && msg.channel === "roleplay"
+                && displayContent === ROLEPLAY_CONTINUATION_PLACEHOLDER;
               return (
-            <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}${assistantCollapsed ? " collapsed" : ""}`}>
+            <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}${directorMessage ? " roleplay-director-msg" : ""}${continuationMessage ? " roleplay-continuation-msg" : ""}${assistantCollapsed ? " collapsed" : ""}`}>
               {msg.role === "assistant" ? (
                 <button
                   type="button"
@@ -4153,10 +4428,12 @@ function App() {
                   {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
                   <span className="msg-chevron" aria-hidden="true">{assistantCollapsed ? "▾" : "▴"}</span>
                 </button>
-              ) : (
+              ) : !continuationMessage ? (
                 <div className="msg-label">
-                  <span>You</span>
-                  {msg.channel === "roleplay" ? (
+                  {directorMessage
+                    ? <><Drama size={12} aria-hidden="true" /><span>导演指令</span></>
+                    : <span>You</span>}
+                  {msg.channel === "roleplay" && !directorMessage ? (
                     <span
                       className="msg-channel-tag"
                       title={msg.roleplayInputMode === "director" ? "导演指示" : "角色内消息"}
@@ -4165,7 +4442,7 @@ function App() {
                     </span>
                   ) : null}
                 </div>
-              )}
+              ) : null}
               {msg.role === "assistant" ? (
                 assistantCollapsed
                   ? <p className="msg-preview">{messagePreview(displayContent)}</p>
@@ -4173,9 +4450,28 @@ function App() {
               ) : (
                 <>
                   {msg.channel === "roleplay"
-                    ? <Markdown content={displayContent} />
+                    ? continuationMessage
+                      ? <div className="roleplay-continuation-placeholder">
+                          <RefreshCw size={14} aria-hidden="true" />
+                          <strong>续演</strong>
+                          <span>角色主动推进当前场景</span>
+                          {msg.id > 0 && (
+                            <button
+                              type="button"
+                              className="roleplay-continuation-rerun"
+                              disabled={busy}
+                              onClick={() => requestRerunMessage(msg)}
+                              title="重新运行续演"
+                              aria-label="重新运行续演"
+                            >
+                              <RefreshCw size={13} aria-hidden="true" />
+                            </button>
+                          )}
+                        </div>
+                      : <Markdown content={displayContent} />
                     : <div>{displayContent}</div>}
-                  {msg.channel === "roleplay" && msg.roleplayPerception
+                  {msg.channel === "roleplay" && msg.roleplayInputMode !== "director" && msg.roleplayPerception
+                    && displayContent !== ROLEPLAY_CONTINUATION_PLACEHOLDER
                     ? <RoleplayPerceptionDetails
                         content={msg.roleplayPerception}
                         data={msg.roleplayPerceptionData}
@@ -4186,7 +4482,7 @@ function App() {
                     : null}
                 </>
               )}
-              {msg.id > 0 && <div className="message-actions">
+              {msg.id > 0 && !continuationMessage && <div className="message-actions">
                 {(msg.variantCount ?? 1) > 1 && (() => {
                   const current = messageVersionViews[msg.id]?.current ?? (msg.variantCount ?? 1) - 1;
                   const total = messageVersionViews[msg.id]?.versions.length ?? msg.variantCount ?? 1;
@@ -4204,12 +4500,12 @@ function App() {
                     >›</button>
                   </span>;
                 })()}
-                {msg.role === "user" && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
+                {msg.role === "user" && !continuationMessage && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
                 <button disabled={busy} onClick={() => requestRerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
                 {msg.channel === "roleplay" && msg.variantGroupId && (msg.variantCount ?? 1) > 1
                   ? <button disabled={busy} onClick={() => void openRoleplayBranchTimeline(msg)} title="查看并切换这一轮保存的完整对话分支">分支</button>
                   : null}
-                {msg.channel === "roleplay" && <button disabled={busy} onClick={() => { setRoleplayFactDraft(newFactDraft(msg)); setRoleplayMemoryOpen(true); }} title="把这条消息保存为可纠错的事实记忆">记住</button>}
+                {msg.channel === "roleplay" && msg.roleplayInputMode !== "director" && !continuationMessage && <button disabled={busy} onClick={() => { setRoleplayFactDraft(newFactDraft(msg)); setRoleplayMemoryOpen(true); }} title="把这条消息保存为可纠错的事实记忆">记住</button>}
               </div>}
             </article>
               );
@@ -4408,11 +4704,40 @@ function App() {
             )}
             {branchConfirm.mode === "rerun" && branchConfirm.message.channel === "roleplay" && (
               <fieldset className="roleplay-rerun-directions">
-                <legend>定向重演 <small>最多选择 3 项</small></legend>
-                <div>
+                <legend>演出调整</legend>
+                <div className="roleplay-rerun-sliders">
+                  {ROLEPLAY_RERUN_SLIDERS.map(slider => {
+                    const value = branchConfirm.rerunControls[slider.id];
+                    return <label key={slider.id}>
+                      <span className="roleplay-slider-heading">
+                        <strong>{slider.label}</strong>
+                        <small>{value === 0 ? "默认" : value < 0 ? slider.low : slider.high}{value === 0 ? "" : ` ${Math.abs(value)}/2`}</small>
+                      </span>
+                      <span className="roleplay-slider-control">
+                        <small>{slider.low}</small>
+                        <input
+                          type="range"
+                          min="-2"
+                          max="2"
+                          step="1"
+                          value={value}
+                          onChange={event => {
+                            const next = Number(event.currentTarget.value);
+                            setBranchConfirm(current => current ? {
+                              ...current,
+                              rerunControls: { ...current.rerunControls, [slider.id]: next },
+                            } : current);
+                          }}
+                        />
+                        <small>{slider.high}</small>
+                      </span>
+                    </label>;
+                  })}
+                </div>
+                <div className="roleplay-rerun-options">
                   {ROLEPLAY_RERUN_DIRECTION_OPTIONS.map(option => {
                     const checked = branchConfirm.rerunDirections.includes(option.id);
-                    return <label key={option.id}>
+                    return <label key={option.id} className={checked ? "selected" : ""}>
                       <input
                         type="checkbox"
                         checked={checked}
@@ -4424,7 +4749,7 @@ function App() {
                             : [...current.rerunDirections, option.id],
                         } : current)}
                       />
-                      <span>{option.label}</span>
+                      <span><strong>{option.label}</strong><small>{option.description}</small></span>
                     </label>;
                   })}
                 </div>
@@ -4522,7 +4847,7 @@ function App() {
               </select>
             </label>
             <label>
-              <span>场景卡（可选）</span>
+              <span>场景卡（可选，开始后可编排序列）</span>
               <select
                 value={roleplaySetup.scene?.id ?? ""}
                 disabled={roleplaySetupBusy}
@@ -4533,8 +4858,8 @@ function App() {
               </select>
             </label>
             <div className="roleplay-inline-actions">
-              <button type="button" disabled={roleplaySetupBusy} onClick={() => setRoleplaySceneDraft(emptyRoleplayScene())}>新建场景</button>
-              {roleplaySetup.scene && <button type="button" disabled={roleplaySetupBusy} onClick={() => setRoleplaySceneDraft({ ...roleplaySetup.scene! })}>编辑当前场景</button>}
+              <button type="button" disabled={roleplaySetupBusy} onClick={() => beginRoleplaySceneDraft()}>新建场景</button>
+              {roleplaySetup.scene && <button type="button" disabled={roleplaySetupBusy} onClick={() => beginRoleplaySceneDraft(roleplaySetup.scene!)}>编辑当前场景</button>}
             </div>
             {!roleplaySetup.identity && <>
             <label>
@@ -4590,31 +4915,116 @@ function App() {
         </div>
       )}
 
+      {roleplaySceneManagerOpen && roleplay && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => !roleplaySceneManagerBusy && setRoleplaySceneManagerOpen(false)}>
+          <div className="modal roleplay-scene-manager-modal" role="dialog" aria-modal="true" aria-labelledby="roleplay-scene-manager-title" onMouseDown={event => event.stopPropagation()}>
+            <div className="roleplay-scene-manager-head">
+              <div>
+                <span className="eyebrow">Roleplay scenes</span>
+                <h2 id="roleplay-scene-manager-title">场景管理</h2>
+              </div>
+              <button type="button" onClick={() => beginRoleplaySceneDraft()} disabled={roleplaySceneManagerBusy}>
+                <Plus size={14} aria-hidden="true" />新建场景
+              </button>
+            </div>
+            <div className="roleplay-scene-manager-layout">
+              {state.roleplayMemory?.state.scene && (
+                <div className="roleplay-live-scene">
+                  <strong>当前现场</strong>
+                  <p>{state.roleplayMemory.state.scene}</p>
+                </div>
+              )}
+              <section>
+                <header>
+                  <strong>当前序列</strong>
+                  <small>{roleplay.sceneSequence.length ? `${roleplay.sceneIndex + 1} / ${roleplay.sceneSequence.length}` : "尚未添加"}</small>
+                </header>
+                <div className="roleplay-scene-sequence">
+                  {roleplay.sceneSequence.length ? roleplay.sceneSequence.map((scene, index) => (
+                    <div key={scene.id} className={`roleplay-scene-sequence-item${index === roleplay.sceneIndex ? " current" : ""}`}>
+                      <button
+                        type="button"
+                        className="roleplay-scene-sequence-main"
+                        disabled={roleplaySceneManagerBusy}
+                        onClick={() => void updateRoleplaySceneSequence(roleplay.sceneSequence, index)}
+                      >
+                        <span>{index + 1}</span>
+                        <span><strong>{scene.name}</strong><small>{scene.setting || "未填写地点/时间"}</small></span>
+                      </button>
+                      <div className="roleplay-scene-sequence-actions">
+                        <button type="button" title="上移" disabled={roleplaySceneManagerBusy || index === 0} onClick={() => moveRoleplaySceneInSequence(index, -1)}><ArrowUp size={14} /></button>
+                        <button type="button" title="下移" disabled={roleplaySceneManagerBusy || index === roleplay.sceneSequence.length - 1} onClick={() => moveRoleplaySceneInSequence(index, 1)}><ArrowDown size={14} /></button>
+                        <button type="button" title="移出序列" disabled={roleplaySceneManagerBusy} onClick={() => removeRoleplaySceneFromSequence(index)}><X size={14} /></button>
+                      </div>
+                    </div>
+                  )) : <div className="roleplay-scene-empty">从右侧场景卡加入场景</div>}
+                </div>
+              </section>
+              <section>
+                <header><strong>场景卡</strong><small>{state.roleplayScenes.length} 张</small></header>
+                <div className="roleplay-scene-library">
+                  {state.roleplayScenes.length ? state.roleplayScenes.map(scene => {
+                    const included = roleplay.sceneSequence.some(item => item.id === scene.id);
+                    return <article key={scene.id}>
+                      <div>
+                        <strong>{scene.name}</strong>
+                        <small>{scene.setting || "未填写地点/时间"}</small>
+                        {scene.premise && <p>{scene.premise}</p>}
+                      </div>
+                      <div>
+                        <button type="button" title="编辑场景" disabled={roleplaySceneManagerBusy} onClick={() => beginRoleplaySceneDraft(scene)}><Pencil size={14} /></button>
+                        <button type="button" title={included ? "已在序列中" : "加入序列"} disabled={roleplaySceneManagerBusy || included} onClick={() => addRoleplaySceneToSequence(scene)}><Plus size={14} /></button>
+                      </div>
+                    </article>;
+                  }) : <div className="roleplay-scene-empty">还没有场景卡</div>}
+                </div>
+              </section>
+            </div>
+            <div className="modal-actions">
+              <button type="button" disabled={roleplaySceneManagerBusy} onClick={() => setRoleplaySceneManagerOpen(false)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {roleplaySceneDraft && (
-        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => setRoleplaySceneDraft(null)}>
-          <div className="modal roleplay-setup-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => !roleplaySceneGenerateBusy && setRoleplaySceneDraft(null)}>
+          <div className="modal roleplay-setup-modal roleplay-scene-editor-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
             <span className="eyebrow">Roleplay scene</span>
             <h2>{roleplaySceneDraft.id ? "编辑场景卡" : "新建场景卡"}</h2>
-            <p>场景独立于角色卡，可复用于不同角色；绑定的 lore 会经过语义重排后按需注入。</p>
+            <p>只记录本场演出需要的基础信息，可在不同角色和场景序列中复用。</p>
+            {!roleplaySceneDraft.id && (
+              <div className="roleplay-scene-generator">
+                <label>
+                  <span>场景描述</span>
+                  <textarea
+                    autoFocus
+                    rows={3}
+                    disabled={roleplaySceneGenerateBusy}
+                    value={roleplaySceneGenerateRequest}
+                    placeholder="例如：第二天清晨，两人在旧港仓库外准备分别，但昨夜的争执还没有解决。"
+                    onChange={event => setRoleplaySceneGenerateRequest(event.target.value)}
+                    onKeyDown={event => {
+                      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") void generateRoleplaySceneDraft();
+                    }}
+                  />
+                </label>
+                <button type="button" disabled={roleplaySceneGenerateBusy || !roleplaySceneGenerateRequest.trim()} onClick={() => void generateRoleplaySceneDraft()}>
+                  <WandSparkles size={14} aria-hidden="true" />{roleplaySceneGenerateBusy ? "生成中…" : "自动生成"}
+                </button>
+              </div>
+            )}
             {([[
-              "name", "名称（必填）"], ["setting", "地点与环境"], ["premise", "场景前提"], ["tone", "基调"],
-              ["timelineAnchor", "时间/剧情阶段"], ["performerGoal", "AI 角色目标"], ["identityGoal", "用户身份目标"],
+              "name", "名称（必填）"], ["setting", "地点/时间"], ["premise", "场景要点"],
             ] as Array<[keyof RoleplaySceneDraft, string]>).map(([field, label]) => <label key={field}>
               <span>{label}</span>
               {field === "name" ? <input value={String(roleplaySceneDraft[field])} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value })} />
-                : <textarea rows={2} value={String(roleplaySceneDraft[field])} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value })} />}
-            </label>)}
-            {([[
-              "stakes", "风险/悬念（每行一项）"], ["openingVariants", "开场意图（每行一项）"],
-              ["endConditions", "结束条件（每行一项）"], ["loreBindings", "绑定 lore 路径（每行一项，如 lore/组织.md）"],
-            ] as Array<["stakes" | "openingVariants" | "endConditions" | "loreBindings", string]>).map(([field, label]) => <label key={field}>
-              <span>{label}</span>
-              <textarea rows={3} value={roleplaySceneDraft[field].join("\n")} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) })} />
+                : <textarea rows={field === "premise" ? 4 : 2} value={String(roleplaySceneDraft[field])} onChange={event => setRoleplaySceneDraft({ ...roleplaySceneDraft, [field]: event.target.value })} />}
             </label>)}
             <div className="modal-actions">
-              {roleplaySceneDraft.id && <button type="button" className="danger" onClick={() => void deleteRoleplayScene(roleplaySceneDraft.id!)}>删除</button>}
-              <button type="button" onClick={() => setRoleplaySceneDraft(null)}>取消</button>
-              <button type="button" className="primary" disabled={!roleplaySceneDraft.name.trim()} onClick={() => void saveRoleplayScene()}>保存场景</button>
+              {roleplaySceneDraft.id && <button type="button" className="danger" disabled={roleplaySceneGenerateBusy} onClick={() => void deleteRoleplayScene(roleplaySceneDraft.id!)}>删除</button>}
+              <button type="button" disabled={roleplaySceneGenerateBusy} onClick={() => setRoleplaySceneDraft(null)}>取消</button>
+              <button type="button" className="primary" disabled={roleplaySceneGenerateBusy || !roleplaySceneDraft.name.trim()} onClick={() => void saveRoleplayScene()}>保存场景</button>
             </div>
           </div>
           </div>
@@ -5073,15 +5483,24 @@ function App() {
               <IconButton label="关闭" onClick={() => setShowUsagePopover(false)}><X size={17} /></IconButton>
             </div>
             <div className="usage-detail">
-              <div className="usage-detail-row">
-                <span className="usage-detail-label">模型</span>
-                <span className="usage-detail-value">{state.provider.model}</span>
-              </div>
+              {state.usage.callBreakdown?.map((call, index) => (
+                <div className="usage-detail-row usage-model-row" key={`${call.providerName}-${call.model}-${index}`}>
+                  <span className="usage-detail-label usage-model-label">
+                    <small>{call.providerName}</small>
+                    <span>{call.model}</span>
+                  </span>
+                  <span className="usage-detail-value usage-model-value">
+                    <strong>{(call.promptTokens + call.completionTokens).toLocaleString()} tokens</strong>
+                    <small>
+                      输入 {call.promptTokens.toLocaleString()} · 输出 {call.completionTokens.toLocaleString()} · 缓存 {call.cacheHitTokens.toLocaleString()}
+                      {call.cost > 0 ? ` · ${call.currency === "CNY" ? "¥" : "$"}${call.cost.toFixed(6)}` : ""}
+                    </small>
+                  </span>
+                </div>
+              ))}
               <div className="usage-detail-row">
                 <span className="usage-detail-label">上下文占用</span>
-                <span className="usage-detail-value">
-                  {usagePct}% · {state.usage.lastPromptTokens.toLocaleString()} / {state.provider.pricing.contextWindow.toLocaleString()}
-                </span>
+                <span className="usage-detail-value">{usagePct}% · {state.usage.lastPromptTokens.toLocaleString()} / {state.provider.pricing.contextWindow.toLocaleString()}</span>
               </div>
               <div className="usage-detail-row">
                 <span className="usage-detail-label">累计 tokens</span>
@@ -5093,11 +5512,9 @@ function App() {
               </div>
               <div className="usage-detail-row">
                 <span className="usage-detail-label">累计费用</span>
-                <span className="usage-detail-value usage-number">
-                  {state.provider.pricing.billingMode === "unmetered"
-                    ? "非按量计费"
-                    : `${state.usage.currency === "CNY" ? "¥" : "$"}${state.usage.cost.toFixed(4)}`}
-                </span>
+                <span className="usage-detail-value usage-number">{state.provider.pricing.billingMode === "unmetered"
+                  ? "非按量计费"
+                  : `${state.usage.currency === "CNY" ? "¥" : "$"}${state.usage.cost.toFixed(4)}`}</span>
               </div>
             </div>
             <div className="usage-popover-actions">
@@ -5393,6 +5810,7 @@ function App() {
       {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
         scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
+        characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
         request={api}
         onClose={() => setManagementView(null)}
         onChanged={() => { void refresh(state.sessionId); }}
@@ -5400,7 +5818,16 @@ function App() {
           ...previous,
           agentSettings: {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
             scenePipeline,
+          },
+        } : previous)}
+        onCharacterEvolutionChanged={characterEvolutionEnabled => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            characterEvolutionEnabled,
+            scenePipeline: previous.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           },
         } : previous)}
       />}

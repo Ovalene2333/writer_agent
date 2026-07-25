@@ -9,6 +9,7 @@ import {
   completeCharacterTaskTodos,
   formatTodosForPrompt,
   listProjectSkills,
+  loadSkillById,
   loadAgentSettings,
   loadProjectInstructions,
   normalizeTodos,
@@ -20,7 +21,7 @@ import {
 import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
-import { handleApplyCharacterChanges } from "./tools/characters.js";
+import { handleApplyCharacterChanges, handleSaveCharacter } from "./tools/characters.js";
 import type { ToolHandlerArgs } from "./tools/types.js";
 import type { AgentTodoItem } from "./types.js";
 
@@ -198,6 +199,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     const project = WriterProject.init(root, "测试");
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "ask",
+      characterEvolutionEnabled: true,
       scenePipeline: {
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
@@ -205,6 +207,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
+      characterEvolutionEnabled: false,
       scenePipeline: {
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4,
@@ -212,6 +215,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     });
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "plan",
+      characterEvolutionEnabled: false,
       scenePipeline: {
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 1,
@@ -227,15 +231,20 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriterMaxRatio, 2.4);
     saveAgentSettings(project, { scenePipeline: { isolatedWriter: true } });
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriter, true);
+    assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("listProjectSkills reads .writer/skills", () => {
+test("listProjectSkills merges built-in skills with project overrides", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
     const project = WriterProject.init(root, "测试");
+    const builtIn = loadSkillById(project, "chapter-planning");
+    assert.equal(builtIn?.path, "builtin/chapter-planning/SKILL.md");
+    assert.match(builtIn?.description ?? "", /完整章节/);
+    assert.match(builtIn?.body ?? "", /不得把任何工具或固定顺序当成前置条件/);
     const skillDir = join(project.privateDir, "skills", "scene-open");
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, "SKILL.md"), `---
@@ -248,9 +257,15 @@ description: 用动作切入
 先写具体动作。
 `, "utf8");
     const skills = listProjectSkills(project);
-    assert.equal(skills.length, 1);
-    assert.equal(skills[0].id, "scene-open");
-    assert.equal(skills[0].name, "场景开场");
+    assert.equal(skills.length, 2);
+    assert.equal(skills.find(skill => skill.id === "scene-open")?.name, "场景开场");
+
+    const overrideDir = join(project.privateDir, "skills", "chapter-planning");
+    mkdirSync(overrideDir, { recursive: true });
+    writeFileSync(join(overrideDir, "SKILL.md"), "---\nname: 项目章节规划\ndescription: 项目自定义章节方法\n---\n\n# 自定义\n", "utf8");
+    const overridden = loadSkillById(project, "chapter-planning");
+    assert.equal(overridden?.name, "项目章节规划");
+    assert.equal(overridden?.path, ".writer/skills/chapter-planning/SKILL.md");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -393,6 +408,40 @@ test("message rerun can keep accepted document changes", () => {
     assert.equal(project.documentExists("chapters/第2章.md"), false);
     // Chapter 1 was kept earlier and not part of this second rewind scope after new messages only undid ch2.
     assert.equal(project.documentExists("chapters/第1章.md"), true);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("character evolution tool is blocked when the setting is disabled", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-toggle-"));
+  try {
+    const project = WriterProject.init(root, "角色演进开关");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("character-toggle");
+    const character = store.saveCharacter(emptyCharacter("甲"));
+    const args: ToolHandlerArgs = {
+      input: {
+        id: character.id,
+        reason: "调试写作",
+        changes: [{ op: "append_experience", label: "不应写入", description: "开关关闭" }],
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      characterScope: [character.id],
+      context: { permissionMode: "ask", characterEvolutionEnabled: false },
+    };
+    assert.throws(() => handleApplyCharacterChanges(args), /角色演进已关闭/);
+    assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 0);
+    const saved = JSON.parse(handleSaveCharacter({
+      ...args,
+      input: { identity: { name: "乙" } },
+      characterScope: undefined,
+    })) as Record<string, unknown>;
+    assert.equal(saved.created, true, "explicit character-card editing remains available");
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -78,6 +78,16 @@ test("isolated scene writer receives only the current prose packet", () => {
   assert.ok(messages.reduce((sum, message) => sum + message.content.length, 0) < 4_000);
 });
 
+test("isolated scene writer explicitly suppresses narrator negation-redefinition frames", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+  });
+  assert.match(messages[0].content, /先否定、再改判/);
+  assert.match(messages[0].content, /不是……。是……。/);
+  assert.match(messages[0].content, /对白中符合人物语气的即时纠正不受此限/);
+});
+
 test("scene state extraction receives only bounded next-scene relevance fields", () => {
   const messages = buildSceneStateExtractionMessages({
     previousState: state("炮位已经暴露"),
@@ -142,8 +152,6 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     ].join("\n\n");
     const context: ToolExecutionContext = {
       permissionMode: "ask",
-      requireWritePack: true,
-      requireScenePipeline: true,
       scenePipelineSettings: {
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,

@@ -6,7 +6,6 @@ import {
   normalizeCharacterChangeOp,
   validateCharacters,
 } from "../characters.js";
-import { isScenePipelineDocument } from "../project.js";
 import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
 import { findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
@@ -14,40 +13,8 @@ import { documentSpans } from "../document_spans.js";
 import { documentBlocks } from "../document_blocks.js";
 import { requestDocumentRevision } from "../document_revision.js";
 import type { WriterStore } from "../store.js";
-import type { ToolHandlerArgs } from "./types.js";
+import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
 import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
-
-function assertWritePackReady(context: ToolHandlerArgs["context"], toolName: string): void {
-  if (!context.requireWritePack) return;
-  if (context.writePackCompiled) return;
-  throw new Error(
-    `${toolName} 前须先调用 compile_write_pack：把大纲/设定/衔接笔记编译为故事内「可写材料」，再据此提交正文。禁止跳过编译直接提案。`,
-  );
-}
-
-/**
- * Sentence-level fixes must stay cheap: patches whose total replacement text fits
- * this budget skip the scene pipeline and write-pack gates. Anything larger is
- * chapter (re)writing and keeps the full delivery contract.
- */
-export const LIGHT_PATCH_MAX_REPLACE_CHARS = 1_500;
-
-function patchReplaceCharacters(edits: unknown[]): number {
-  return edits.reduce<number>((sum, edit) => {
-    const row = edit && typeof edit === "object" ? edit as Record<string, unknown> : undefined;
-    const replace = row?.replace ?? row?.content;
-    return sum + (typeof replace === "string" ? replace.length : 0);
-  }, 0);
-}
-
-function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], path: string, toolName: string): void {
-  if (!context.requireScenePipeline || !isScenePipelineDocument(path)) return;
-  throw new Error(
-    `${toolName} 不能跳过逐场景正文流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
-    `再用 inspect_chapter_draft 终审并直接创建提案。已有正文的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
-    "可直接用 propose_document_patch，不受此限。",
-  );
-}
 
 /** Auto-fix referential meta leaks; block if residual high-confidence leaks remain. */
 function gateProseMetaLeaks(content: string, path: string): { content: string; stripped: string[] } {
@@ -92,6 +59,18 @@ export function deferredCharacterChanges(value: unknown, characterScope?: number
     });
     return { characterId, reason, changes };
   });
+}
+
+export function prepareDeferredCharacterChanges(
+  value: unknown,
+  context: Pick<ToolExecutionContext, "characterEvolutionEnabled">,
+  characterScope?: number[],
+): { changes: ProposalCharacterChange[]; skipped: boolean } {
+  const requested = value !== undefined && (!Array.isArray(value) || value.length > 0);
+  if (context.characterEvolutionEnabled === false) {
+    return { changes: [], skipped: requested };
+  }
+  return { changes: deferredCharacterChanges(value, characterScope), skipped: false };
 }
 
 export function tolerantDeferredCharacterChanges(
@@ -249,7 +228,6 @@ export async function proseStyleGateIssues(
 export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
-  assertDirectChapterWriteAllowed(context, path, "propose_document");
   return submitFullDocumentProposal(
     { input, project, store, sessionId, emit, context, characterScope },
     path,
@@ -265,26 +243,26 @@ export async function submitFullDocumentProposal(
   proposedContent: string,
   summary: string,
   characterChanges: unknown,
-  scenePipelineAssembled = false,
   proseStyleApproved = false,
 ): Promise<string> {
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document");
-  if (!scenePipelineAssembled) assertWritePackReady(context, "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
   const beforeContent = project.documentExists(path) ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
   if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
+  const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId,
     path,
     meta.content,
     summary,
-    deferredCharacterChanges(characterChanges, characterScope),
+    preparedCharacterChanges.changes,
   );
   emit({ type: "proposal", proposal });
   return JSON.stringify({
     ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
   });
 }
@@ -294,14 +272,8 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   const path = requireString(input.path, "path");
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
-  // Light patches (sentence-level fixes) skip the chapter pipeline / write-pack
-  // gates: forcing begin_chapter_draft + compile_write_pack to fix one OOC line
-  // costs a full chapter regeneration for a few-hundred-character change.
-  const lightPatch = patchReplaceCharacters(edits) <= LIGHT_PATCH_MAX_REPLACE_CHARS;
-  if (!lightPatch) assertDirectChapterWriteAllowed(context, path, "propose_document_patch");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document_patch");
-  if (!lightPatch) assertWritePackReady(context, "propose_document_patch");
   const beforeContent = project.read(path);
   const sourceHash = project.hash(beforeContent);
   if (input.sourceHash !== undefined && input.sourceHash !== sourceHash) {
@@ -385,15 +357,17 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     }
   }
   await gateProseStyle(beforeContent, content, context);
+  const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId, path, content, requireString(input.summary, "summary"),
-    deferredCharacterChanges(input.characterChanges, characterScope),
+    preparedCharacterChanges.changes,
   );
   emit({ type: "proposal", proposal });
   const uniqueStripped = [...new Set(strippedMeta)];
   return JSON.stringify({
     edits: edits.length,
     ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(uniqueStripped.length ? { metaSanitized: uniqueStripped } : {}),
   });
 }

@@ -67,16 +67,19 @@ function TestStatusIcon({ status }: { status: TestStatus }) {
 type ModelConfigProps = {
   initialCatalog: ProviderCatalog;
   scenePipeline: ScenePipelineSettings;
+  characterEvolutionEnabled: boolean;
   request: Request;
   onClose: () => void;
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
+  onCharacterEvolutionChanged: (enabled: boolean) => void;
 };
 
-export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, onChanged, onScenePipelineChanged }: ModelConfigProps) {
+export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionEnabled, request, onClose, onChanged, onScenePipelineChanged, onCharacterEvolutionChanged }: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
   const [tab, setTab] = useState<"models" | "scene-pipeline">("models");
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
+  const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -88,6 +91,7 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
   const [error, setError] = useState("");
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
+  useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
   const sceneDraftValid = [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
@@ -239,16 +243,18 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
     else setMessage(summary);
   }
 
-  async function saveScenePipeline() {
+  async function saveWritingSettings() {
     setBusy(true); setError(""); setMessage("");
     try {
       const result = await request("/api/agent-settings", {
         method: "POST",
-        body: JSON.stringify({ scenePipeline: sceneDraft }),
-      }) as { scenePipeline: ScenePipelineSettings };
+        body: JSON.stringify({ scenePipeline: sceneDraft, characterEvolutionEnabled: characterEvolutionDraft }),
+      }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean };
       setSceneDraft(result.scenePipeline);
+      setCharacterEvolutionDraft(result.characterEvolutionEnabled);
       onScenePipelineChanged(result.scenePipeline);
-      setMessage("场景链设置已保存，将从下一次 Agent 任务开始生效");
+      onCharacterEvolutionChanged(result.characterEvolutionEnabled);
+      setMessage("写作设置已保存，将从下一次 Agent 任务开始生效");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -261,7 +267,7 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
       <div className="management-head"><div><span className="eyebrow">Settings</span><h2>模型配置</h2></div><div className="management-actions">{tab === "models" && <button onClick={addProfile}><Plus size={15} />添加供应商</button>}<button className="icon" title="返回工作区" aria-label="返回工作区" onClick={onClose}><X size={17} /></button></div></div>
       <nav className="settings-tabs" aria-label="设置分类">
         <button className={tab === "models" ? "active" : ""} onClick={() => { setTab("models"); setError(""); setMessage(""); }}>模型</button>
-        <button className={tab === "scene-pipeline" ? "active" : ""} onClick={() => { setTab("scene-pipeline"); setError(""); setMessage(""); }}>场景链</button>
+        <button className={tab === "scene-pipeline" ? "active" : ""} onClick={() => { setTab("scene-pipeline"); setError(""); setMessage(""); }}>写作</button>
       </nav>
       {(error || message) && <div className={error ? "config-feedback error" : "config-feedback"} style={{ whiteSpace: "pre-wrap" }}>{error || message}</div>}
       {tab === "models" && <div className="model-config-layout">
@@ -321,23 +327,27 @@ export function ModelConfig({ initialCatalog, scenePipeline, request, onClose, o
       </div>}
       {tab === "scene-pipeline" && <div className="scene-settings">
         <div className="scene-settings-copy">
-          <span className="eyebrow">Narrative pipeline</span>
-          <h3>章节与支线场景链</h3>
-          <p>完整章节和 side/ 支线片段都会逐场写作。支线至少使用推荐最少场数，且每场会校验目标篇幅；场景越多，模型调用和累计 input 通常越高。</p>
+          <span className="eyebrow">Writing behavior</span>
+          <h3>写作行为与可选场景链</h3>
+          <p>Agent 会按任务自主选择直接成稿、局部修改或场景链。以下参数只在它选择场景链时生效；场景越多，模型调用和累计 input 通常越高。</p>
         </div>
         <div className="scene-settings-grid">
-          <label><span>推荐最少场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><small>支线片段会把它作为最低场数；完整章节仍按情节弹性取值。</small></label>
+          <label><span>推荐最少场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><small>选择场景链后，模型通常在推荐范围内规划。</small></label>
           <label><span>推荐最多场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/><small>模型默认在推荐区间内规划。</small></label>
           <label><span>允许最多场数</span><input type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>硬上限为 8；超过时 begin_chapter_draft 会拒绝。</small></label>
           <label><span>场景 notes 上限</span><input type="number" min="500" max="8000" step="100" value={sceneDraft.notesMaxCharacters} onChange={event => setSceneDraft(current => ({ ...current, notesMaxCharacters: Number(event.target.value) }))}/><small>主 Agent 每场可提交 500—8000 字；默认 3000。</small></label>
           <label><span>正文硬上限倍率</span><input type="number" min="1.2" max="3" step="0.1" value={sceneDraft.isolatedWriterMaxRatio} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriterMaxRatio: Number(event.target.value) }))}/><small>相对场景目标篇幅；建议区间仍为目标的 85%—120%。</small></label>
         </div>
         <label className="scene-experiment-toggle">
+          <input type="checkbox" checked={characterEvolutionDraft} onChange={event => setCharacterEvolutionDraft(event.target.checked)}/>
+          <span><strong>角色演进</strong><small>允许叙事任务自动追加角色经历和故事状态。关闭后仍可显式新建或编辑角色卡。</small></span>
+        </label>
+        <label className="scene-experiment-toggle">
           <input type="checkbox" checked={sceneDraft.isolatedWriter} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriter: event.target.checked }))}/>
           <span><strong>隔离正文 Writer（实验）</strong><small>主 Agent 只提交场景短笔记；正文使用独立纯文本调用生成，再由轻量模型提取离场状态。关闭时沿用现有场景写作。</small></span>
         </label>
         <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"}>{sceneDraftValid ? `当前策略：推荐 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场；notes 最多 ${sceneDraft.notesMaxCharacters} 字，正文硬上限为目标的 ${sceneDraft.isolatedWriterMaxRatio.toFixed(1)} 倍。` : "请检查场景数量、notes 上限（500—8000）与正文倍率（1.2—3.0）。"}</div>
-        <div className="scene-settings-actions"><button onClick={() => setSceneDraft(scenePipeline)} disabled={busy}>恢复当前值</button><button className="primary" onClick={() => void saveScenePipeline()} disabled={busy || !sceneDraftValid}>{busy ? "保存中…" : "保存场景链设置"}</button></div>
+        <div className="scene-settings-actions"><button onClick={() => { setSceneDraft(scenePipeline); setCharacterEvolutionDraft(characterEvolutionEnabled); }} disabled={busy}>恢复当前值</button><button className="primary" onClick={() => void saveWritingSettings()} disabled={busy || !sceneDraftValid}>{busy ? "保存中…" : "保存写作设置"}</button></div>
       </div>}
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>

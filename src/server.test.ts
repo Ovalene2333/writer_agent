@@ -80,6 +80,25 @@ test("web roleplay messages expose the parsed perception without internal turn h
   }
 });
 
+test("web director messages hide the internal OOC wrapper", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-server-director-message-"));
+  try {
+    const project = WriterProject.init(root, "Director message");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("roleplay");
+    const messageId = store.addMessage(sessionId, "user", "推进到第二天。", "roleplay", undefined, "director");
+    store.saveRoleplayPerception(sessionId, messageId, "［OOC 导演指示——推进到第二天。］");
+    const message = store.messages(sessionId, 1, { channel: "roleplay" })[0];
+
+    const webMessage = conversationMessageForWeb(store, message);
+    assert.equal(webMessage.roleplayInputMode, "director");
+    assert.equal(webMessage.roleplayPerception, undefined);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("agent jobs run concurrently across sessions and serialize each session", async () => {
   let releaseFirst!: () => void;
   let releaseSecond!: () => void;

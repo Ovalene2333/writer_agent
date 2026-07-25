@@ -52,6 +52,20 @@ export interface UsageSummary {
   lastPromptTokens: number;
   /** Provider-reported cache hit ratio. Estimated calls are never persisted or included. */
   cacheHitRate: number;
+  /** Session totals grouped by provider profile and model for billing inspection. */
+  callBreakdown: UsageCallSummary[];
+}
+
+export interface UsageCallSummary {
+  providerName: string;
+  model: string;
+  callCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  cost: number;
+  currency: string;
 }
 
 /** Provider-reported token counts before pricing/UI normalization. */
@@ -393,10 +407,15 @@ export type RoleplayParticipant = {
 };
 
 /** Session-scoped roleplay selection restored after refresh/session switching. */
+export type RoleplayContentRating = "default" | "sfw" | "nsfw";
+
 export interface ActiveRoleplayState {
   performer: RoleplayParticipant;
   identity: RoleplayParticipant;
   scene?: RoleplayScene;
+  sceneSequence: RoleplayScene[];
+  sceneIndex: number;
+  contentRating: RoleplayContentRating;
 }
 
 export type RoleplayInputMode = "dialogue" | "director";

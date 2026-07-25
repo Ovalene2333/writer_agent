@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
-  RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
+  RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
@@ -47,6 +47,7 @@ type RoleplayBranchPayload = {
     channel: MessageChannel;
     variantGroupId?: string;
     roleplayPerception?: string;
+    roleplayModelInput?: string;
     roleplayInputMode?: RoleplayInputMode;
   }>;
   memory?: RoleplaySessionMemory;
@@ -386,6 +387,9 @@ export class WriterStore {
     if (!messageColumns.some(column => column.name === "roleplay_perception")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_perception TEXT");
     }
+    if (!messageColumns.some(column => column.name === "roleplay_model_input")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_model_input TEXT");
+    }
     if (!messageColumns.some(column => column.name === "roleplay_input_mode")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_input_mode TEXT");
     }
@@ -412,6 +416,9 @@ export class WriterStore {
     }
     if (!usageColumns.some(column => column.name === "request_components_json")) {
       this.database.exec("ALTER TABLE model_usage ADD COLUMN request_components_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!usageColumns.some(column => column.name === "provider_name")) {
+      this.database.exec("ALTER TABLE model_usage ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -767,9 +774,27 @@ export class WriterStore {
         this.clearActiveRoleplay(sessionId);
         return undefined;
       }
-      const sceneId = Number(raw.sceneId);
-      const scene = Number.isInteger(sceneId) && sceneId > 0 ? this.roleplayScenes().find(item => item.id === sceneId) : undefined;
-      return { performer, identity, ...(scene ? { scene } : {}) };
+      const scenes = this.roleplayScenes();
+      const storedSceneIds = Array.isArray(raw.sceneIds)
+        ? [...new Set(raw.sceneIds.map(Number).filter(id => Number.isInteger(id) && id > 0))]
+        : [];
+      const legacySceneId = Number(raw.sceneId);
+      const sceneIds = Array.isArray(raw.sceneIds)
+        ? storedSceneIds
+        : Number.isInteger(legacySceneId) && legacySceneId > 0 ? [legacySceneId] : [];
+      const sceneSequence = sceneIds.flatMap(id => {
+        const scene = scenes.find(item => item.id === id);
+        return scene ? [scene] : [];
+      });
+      const storedSceneIndex = Number(raw.sceneIndex);
+      const sceneIndex = sceneSequence.length
+        ? Math.min(Math.max(Number.isInteger(storedSceneIndex) ? storedSceneIndex : 0, 0), sceneSequence.length - 1)
+        : 0;
+      const scene = sceneSequence[sceneIndex];
+      const contentRating: RoleplayContentRating = raw.contentRating === "sfw" || raw.contentRating === "nsfw"
+        ? raw.contentRating
+        : "default";
+      return { performer, identity, ...(scene ? { scene } : {}), sceneSequence, sceneIndex, contentRating };
     }
     // Compatibility with the previous shape: normal performer + interlocutor JSON.
     const character = this.characters().find(item => item.id === characterId);
@@ -785,6 +810,9 @@ export class WriterStore {
     return {
       performer: normalRoleplayParticipant(character),
       identity: saved ? simpleRoleplayParticipant(saved) : { kind: "generated", name: base.name, card: base },
+      sceneSequence: [],
+      sceneIndex: 0,
+      contentRating: "default",
     };
   }
 
@@ -793,6 +821,9 @@ export class WriterStore {
     performerInput: number | RoleplayParticipant,
     identityInput: RoleplayParticipant | RoleplayInterlocutor | SavedRoleplayInterlocutor,
     sceneInput?: number | RoleplayScene,
+    contentRatingInput?: RoleplayContentRating,
+    sceneSequenceInput?: number[],
+    sceneIndexInput?: number,
   ): ActiveRoleplayState {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
     const performer = typeof performerInput === "number"
@@ -812,16 +843,42 @@ export class WriterStore {
       identity = { kind: "generated", name: base.name, card: base };
     }
     if (!identity) throw new Error("当前身份角色卡不存在");
+    const scenes = this.roleplayScenes();
     const sceneId = typeof sceneInput === "number" ? sceneInput : sceneInput?.id;
-    const scene = Number.isInteger(sceneId) ? this.roleplayScenes().find(item => item.id === sceneId) : undefined;
-    if (sceneId !== undefined && !scene) throw new Error("角色扮演场景不存在");
-    const active: ActiveRoleplayState = { performer: normalizedPerformer, identity, ...(scene ? { scene } : {}) };
+    const legacyScene = Number.isInteger(sceneId) ? scenes.find(item => item.id === sceneId) : undefined;
+    if (sceneId !== undefined && !legacyScene) throw new Error("角色扮演场景不存在");
+    const requestedSceneIds = sceneSequenceInput === undefined
+      ? (legacyScene ? [legacyScene.id] : [])
+      : [...new Set(sceneSequenceInput.map(Number).filter(id => Number.isInteger(id) && id > 0))];
+    const sceneSequence = requestedSceneIds.map(id => {
+      const scene = scenes.find(item => item.id === id);
+      if (!scene) throw new Error("角色扮演场景不存在");
+      return scene;
+    });
+    const requestedSceneIndex = Number(sceneIndexInput);
+    const sceneIndex = sceneSequence.length
+      ? Math.min(Math.max(Number.isInteger(requestedSceneIndex) ? requestedSceneIndex : 0, 0), sceneSequence.length - 1)
+      : 0;
+    const scene = sceneSequence[sceneIndex];
+    const contentRating: RoleplayContentRating = contentRatingInput === "sfw" || contentRatingInput === "nsfw"
+      ? contentRatingInput
+      : "default";
+    const active: ActiveRoleplayState = {
+      performer: normalizedPerformer, identity, ...(scene ? { scene } : {}), sceneSequence, sceneIndex, contentRating,
+    };
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO active_roleplays(session_id,character_id,interlocutor_json,updated_at)
       VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
       character_id=excluded.character_id,interlocutor_json=excluded.interlocutor_json,updated_at=excluded.updated_at`)
       .run(sessionId, normalizedPerformer.kind === "normal" ? (normalizedPerformer.id ?? 0) : 0,
-        JSON.stringify({ performer: active.performer, identity: active.identity, ...(scene ? { sceneId: scene.id } : {}) }), now);
+        JSON.stringify({
+          performer: active.performer,
+          identity: active.identity,
+          ...(scene ? { sceneId: scene.id } : {}),
+          sceneIds: sceneSequence.map(item => item.id),
+          sceneIndex,
+          contentRating,
+        }), now);
     return active;
   }
 
@@ -844,9 +901,9 @@ export class WriterStore {
     return undefined;
   }
 
-  clearActiveRoleplay(sessionId: string): void {
+  clearActiveRoleplay(sessionId: string, options?: { preserveMemory?: boolean }): void {
     this.database.prepare("DELETE FROM active_roleplays WHERE session_id=?").run(sessionId);
-    this.clearRoleplayMemory(sessionId);
+    if (!options?.preserveMemory) this.clearRoleplayMemory(sessionId);
   }
 
   roleplayMemory(sessionId: string): RoleplaySessionMemory | undefined {
@@ -1242,6 +1299,37 @@ export class WriterStore {
       : undefined;
   }
 
+  /** Persist the exact user message sent to the roleplay model for prefix-cache replay. */
+  saveRoleplayModelInput(sessionId: string, messageId: number, content: string): void {
+    const result = this.database.prepare(`UPDATE messages SET roleplay_model_input=?
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .run(content, sessionId, messageId);
+    if (!result.changes) throw new Error("角色扮演消息不存在");
+  }
+
+  roleplayModelInput(sessionId: string, messageId: number): string | undefined {
+    const row = this.database.prepare(`SELECT roleplay_model_input FROM messages
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .get(sessionId, messageId) as Row | undefined;
+    return typeof row?.roleplay_model_input === "string" && row.roleplay_model_input
+      ? row.roleplay_model_input
+      : undefined;
+  }
+
+  roleplayModelInputs(sessionId: string, messageIds: number[]): Map<number, string> {
+    const ids = [...new Set(messageIds.filter(id => Number.isInteger(id) && id > 0))];
+    if (!ids.length) return new Map();
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.database.prepare(`SELECT id,roleplay_model_input FROM messages
+      WHERE session_id=? AND channel='roleplay' AND role='user' AND id IN (${placeholders})`)
+      .all(sessionId, ...ids) as Row[];
+    return new Map(rows.flatMap(row =>
+      typeof row.roleplay_model_input === "string" && row.roleplay_model_input
+        ? [[Number(row.id), row.roleplay_model_input] as const]
+        : [],
+    ));
+  }
+
   messages(sessionId: string, limit = 30, options?: { channel?: MessageChannel }): Message[] {
     const channel = options?.channel;
     const rows = channel
@@ -1372,11 +1460,11 @@ export class WriterStore {
 
   recordUsage(sessionId: string, model: string, usage: {
     promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number;
-  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number; requestComponents?: import("./types.js").RequestComponentUsage[] } = {}): UsageSummary {
+  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number; providerName?: string; requestComponents?: import("./types.js").RequestComponentUsage[] } = {}): UsageSummary {
     const miss = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
     const cost = calculateUsageCost({ ...usage, cacheMissTokens: miss }, pricing, at);
-    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step,request_components_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null, JSON.stringify(meta.requestComponents ?? []));
+    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step,request_components_json,provider_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null, JSON.stringify(meta.requestComponents ?? []), meta.providerName?.trim() ?? "");
     return this.usage(sessionId);
   }
 
@@ -1394,11 +1482,32 @@ export class WriterStore {
     const cacheHitTokens = Number(row.cache_hit_tokens);
     const cacheMissTokens = Number(row.cache_miss_tokens);
     const measuredInput = cacheHitTokens + cacheMissTokens;
+    const callBreakdown = (this.database.prepare(`SELECT
+      provider_name, model, COUNT(*) call_count,
+      COALESCE(SUM(prompt_tokens),0) prompt_tokens,
+      COALESCE(SUM(completion_tokens),0) completion_tokens,
+      COALESCE(SUM(cache_hit_tokens),0) cache_hit_tokens,
+      COALESCE(SUM(cache_miss_tokens),0) cache_miss_tokens,
+      COALESCE(SUM(cost),0) cost, COALESCE(MAX(currency),'CNY') currency,
+      MAX(id) recent_id
+      FROM model_usage WHERE session_id=?
+      GROUP BY provider_name,model,currency ORDER BY recent_id DESC`).all(sessionId) as Row[]).map(item => ({
+        providerName: String(item.provider_name || "未记录"),
+        model: String(item.model),
+        callCount: Number(item.call_count),
+        promptTokens: Number(item.prompt_tokens),
+        completionTokens: Number(item.completion_tokens),
+        cacheHitTokens: Number(item.cache_hit_tokens),
+        cacheMissTokens: Number(item.cache_miss_tokens),
+        cost: Number(item.cost),
+        currency: String(item.currency),
+      }));
     return {
       promptTokens, completionTokens, cacheHitTokens,
       cacheMissTokens, totalTokens: promptTokens + completionTokens,
       cost: Number(row.cost), currency: String(row.currency), lastPromptTokens: Number(row.last_prompt_tokens),
       cacheHitRate: measuredInput > 0 ? cacheHitTokens / measuredInput : 0,
+      callBreakdown,
     };
   }
 
@@ -2076,7 +2185,7 @@ export class WriterStore {
   ): {
     fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string; keepChanges: boolean;
     inputMode?: RoleplayInputMode;
-    modelInitiatedRoleplay?: "opening";
+    modelInitiatedRoleplay?: "opening" | "continuation";
   } {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
     const target = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id
@@ -2152,6 +2261,9 @@ export class WriterStore {
       variantGroupId: groupId,
       keepChanges: rewound.keepChanges,
       ...(inputMode ? { inputMode } : {}),
+      ...(channel === "roleplay" && prompt === "<续演>"
+        ? { modelInitiatedRoleplay: "continuation" as const }
+        : {}),
     };
   }
 
@@ -2166,7 +2278,7 @@ export class WriterStore {
     const baseMessageId = existingBase.value === null || existingBase.value === undefined
       ? Number(immediateBase.value) || 0
       : Number(existingBase.value) || 0;
-    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
+    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_model_input,roleplay_input_mode
       FROM messages WHERE session_id=? AND id>? ORDER BY id`).all(sessionId, baseMessageId) as Row[];
     const dialogueRows = rows.filter(row => row.role === "user" || row.role === "assistant");
     if (dialogueRows.some(row => row.channel !== "roleplay")) return undefined;
@@ -2178,6 +2290,7 @@ export class WriterStore {
       channel: row.channel === "roleplay" ? "roleplay" : "agent",
       ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
       ...(typeof row.roleplay_perception === "string" ? { roleplayPerception: row.roleplay_perception } : {}),
+      ...(typeof row.roleplay_model_input === "string" ? { roleplayModelInput: row.roleplay_model_input } : {}),
       ...(row.roleplay_input_mode === "director" || row.roleplay_input_mode === "dialogue"
         ? { roleplayInputMode: row.roleplay_input_mode }
         : {}),
@@ -2255,11 +2368,11 @@ export class WriterStore {
       this.database.prepare("DELETE FROM roleplay_memory_facts WHERE session_id=? AND source_message_id>? AND pinned=0")
         .run(sessionId, baseMessageId);
       const insertMessage = this.database.prepare(`INSERT INTO messages(
-        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
-      ) VALUES(?,?,?,?,?,?,?,?,?)`);
+        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_model_input,roleplay_input_mode
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`);
       for (const message of payload.messages) insertMessage.run(
         message.id, sessionId, message.role, message.content, message.createdAt, message.channel,
-        message.variantGroupId ?? null, message.roleplayPerception ?? null,
+        message.variantGroupId ?? null, message.roleplayPerception ?? null, message.roleplayModelInput ?? null,
         message.roleplayInputMode === "director" || message.roleplayInputMode === "dialogue"
           ? message.roleplayInputMode
           : message.channel === "roleplay" && message.role === "user"
