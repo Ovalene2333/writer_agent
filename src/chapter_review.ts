@@ -15,7 +15,7 @@ export type ChapterReviewScene = {
 export type ChapterReviewIssue = {
   severity: "blocker" | "warning";
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
-    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo";
+    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo" | "generic_prose";
   sceneId?: string;
   evidence: string[];
   problem: string;
@@ -53,8 +53,9 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。完整阅读全文后
 - telemetry_pileup：同一现场连续播报角度、频率、温度、百分比、状态值，读数没有改变人物下一步选择；
 - expository_mechanics：动作已经成立后，叙述又展开原理、计算或教程式过程，挤压人物反应与环境后果；
 - semantic_echo：相邻句段换一种说法重复同一动作、判断或结论，没有新增事实。
-单个准确数字、确实触发选择的测量、角色偶尔使用技术语言均可保留，不得仅因出现术语或数字判错。只有同类堆砌在一个场景内反复出现并明显遮蔽行动、关系或留白时，才把对应场景判 blocker；轻微问题列 warning。句式符号已由独立门禁处理，不做全文润色。evidence 必须逐字引用短句。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|telemetry_pileup|expository_mechanics|semantic_echo、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。`;
+- generic_prose：句子换掉人名、地点后仍能原样放进多数别的故事——用「气氛/仿佛/某种/一切」这类泛化标签代替此时此地才成立的物件、动作或后果；现场只被叙述者报告，没有被人物看见、听见、摸到。这是唯一一类"写得没错但没有画面"的问题，其余检查都发现不了它，请主动找。
+单个准确数字、确实触发选择的测量、角色偶尔使用技术语言均可保留，不得仅因出现术语或数字判错。只有同类堆砌在一个场景内反复出现并明显遮蔽行动、关系或留白时，才把对应场景判 blocker；轻微问题列 warning。generic_prose 仅在整场都停留在泛化叙述、读者无法看见任何具体现场时才判 blocker；零星抽象句列 warning。句式符号已由独立门禁处理，不做全文润色。evidence 必须逐字引用短句。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
+字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -102,7 +103,7 @@ export function parseChapterReview(
 
   const kinds = new Set<ChapterReviewIssue["kind"]>([
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
-    "telemetry_pileup", "expository_mechanics", "semantic_echo",
+    "telemetry_pileup", "expository_mechanics", "semantic_echo", "generic_prose",
   ]);
   const rows = Array.isArray(value.issues) ? value.issues.slice(0, 8) : [];
   const issues: ChapterReviewIssue[] = [];

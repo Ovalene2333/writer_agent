@@ -78,6 +78,54 @@ test("isolated scene writer receives only the current prose packet", () => {
   assert.ok(messages.reduce((sum, message) => sum + message.content.length, 0) < 4_000);
 });
 
+test("isolated scene writer receives the project's style directives as its own system slot", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    styleDirectives: "本作品的激活风格模板：悬疑推理\n模板要求：线索先于结论出现。",
+  });
+  assert.equal(messages.length, 3);
+  assert.equal(messages[1].role, "system");
+  assert.match(messages[1].content, /悬疑推理/u);
+  // The craft prompt must stay byte-identical across projects so it can be reasoned
+  // about (and cached) independently of whichever template is active.
+  assert.doesNotMatch(messages[0].content, /悬疑推理/u);
+});
+
+test("exemplar and continuation are separate slots with different jobs", () => {
+  const withSeam = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    voiceSample: "范文：檐下的水滴砸在铁皮上。",
+    voiceContinuation: "本作旧稿：他把灯关了。",
+    previousTail: "第一发炮弹撞上装甲，火光一闪就灭了。",
+  });
+  // Mid-chapter: the in-chapter seam is the continuity anchor, so the project tail
+  // drops out — but the outside exemplar always stays.
+  assert.match(withSeam[1].content, /范文：檐下的水滴/u);
+  assert.match(withSeam[1].content, /火光一闪就灭了/u);
+  assert.doesNotMatch(withSeam[1].content, /本作旧稿/u);
+
+  const chapterOpening = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    voiceSample: "范文：檐下的水滴砸在铁皮上。",
+    voiceContinuation: "本作旧稿：他把灯关了。",
+  });
+  assert.match(chapterOpening[1].content, /范文：檐下的水滴/u);
+  assert.match(chapterOpening[1].content, /本作旧稿/u);
+});
+
+test("isolated scene writer receives the anti-self-imitation notes the standard path always had", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    avoidNotes: ["上一章高频段首：「他的」；本章换用不同的开场形态。", "感官通道只有 2/5 出场。"],
+  });
+  assert.match(messages[1].content, /上一章高频段首/u);
+  assert.match(messages[1].content, /感官通道只有 2\/5/u);
+});
+
 test("isolated scene writer explicitly suppresses narrator negation-redefinition frames", () => {
   const messages = buildIsolatedSceneWriterMessages({
     scene,

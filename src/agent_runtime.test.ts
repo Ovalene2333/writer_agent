@@ -202,7 +202,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
       characterEvolutionEnabled: true,
       scenePipeline: {
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
       },
     });
     saveAgentSettings(project, {
@@ -218,14 +218,14 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
       characterEvolutionEnabled: false,
       scenePipeline: {
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
-        notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 2,
       },
     });
-    // Experimental best-of-N switch: persisted, clamped to 1—3.
+    // Best-of-N switch: persisted, clamped to 1—3 (2 by default).
     saveAgentSettings(project, { scenePipeline: { candidateCount: 9 } });
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 3);
-    saveAgentSettings(project, { scenePipeline: { candidateCount: 2 } });
-    assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 2);
+    saveAgentSettings(project, { scenePipeline: { candidateCount: 1 } });
+    assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 1);
     assert.equal(loadAgentSettings(project).scenePipeline.maxScenes, 6, "candidate patch must not reset scene counts");
     assert.equal(loadAgentSettings(project).scenePipeline.notesMaxCharacters, 4_200);
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriterMaxRatio, 2.4);

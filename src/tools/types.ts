@@ -5,6 +5,7 @@ import type { ChapterSceneDraft, SceneActualState } from "../scene_pipeline.js";
 import type { ScenePipelineSettings } from "../agent_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
+import type { IsolatedWriterVoiceEvidence } from "../style_grounding.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
@@ -146,6 +147,11 @@ export type ToolExecutionContext = {
    */
   sceneCandidates?: {
     model: ModelConfig;
+    /**
+     * Reader-side selector: picks the winning candidate by judgment rather than by
+     * rule score. Absent = deterministic rerank only.
+     */
+    judgeModel?: ModelConfig;
     signal?: AbortSignal;
   };
   /** Opt-in prose-only scene generation followed by a separate state extraction call. */
@@ -164,8 +170,10 @@ export type ToolExecutionContext = {
       signal?: AbortSignal,
     ) => Promise<SceneStateExtractionResult>;
   };
-  /** One raw voice sample cached for the isolated writer during the chapter. */
-  isolatedSceneVoiceSample?: { forPath: string; text: string };
+  /** Exemplar + continuation voice slots cached for the isolated writer during the chapter. */
+  isolatedSceneVoiceSample?: { forPath: string; evidence: IsolatedWriterVoiceEvidence };
+  /** Template + craft baseline for the isolated writer; project-scoped, built once. */
+  isolatedSceneStyleDirectives?: string;
   /** Complete prose retained when only isolated state extraction failed. */
   isolatedPendingScene?: {
     forPath: string;

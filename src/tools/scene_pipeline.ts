@@ -15,13 +15,24 @@ import {
   type ChapterSceneCard,
   type ChapterSceneDraft,
 } from "../scene_pipeline.js";
-import { pickBestSceneCandidate, rewriteSceneCandidate, sceneRewriteLengthOk, SCENE_CANDIDATE_SKIP_SCORE } from "../scene_candidates.js";
+import {
+  judgeSceneCandidates,
+  pickBestSceneCandidate,
+  rewriteSceneCandidate,
+  sceneRewriteLengthOk,
+  shouldSkipSceneCandidates,
+} from "../scene_candidates.js";
 import {
   IsolatedSceneRequestError,
   requestIsolatedScene,
   requestSceneStateExtraction,
 } from "../isolated_scene_writer.js";
-import { dynamicStyleGroundingPrompt, isolatedWriterVoiceSample } from "../style_grounding.js";
+import {
+  dynamicStyleGroundingPrompt,
+  isolatedWriterStyleDirectives,
+  isolatedWriterVoiceEvidence,
+  type IsolatedWriterVoiceEvidence,
+} from "../style_grounding.js";
 import type { WriterStore } from "../store.js";
 import { previewProseStyleGateError } from "../prose_adjudicate.js";
 import {
@@ -31,8 +42,9 @@ import {
   priorChapterNegativeList,
   removeAdjacentDuplicateSentences,
   sceneAntiFormulaFeedback,
-  sceneProseScore,
+  sceneProseScoreBreakdown,
 } from "../prose_metrics.js";
+import { analyzeProseVividness, formatVividnessSummary, sceneVividnessFeedback } from "../prose_vividness.js";
 import { proseStyleIssuesError, sceneMannerismGateError, type ProseStyleIssue } from "../prose_quality.js";
 import { ChapterReviewRequestError, reviewChapterDraft, type ChapterReviewResult } from "../chapter_review.js";
 import {
@@ -105,11 +117,14 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
   context.priorProseContext = undefined;
   context.sceneStyleEvidence = undefined;
   context.isolatedSceneVoiceSample = undefined;
+  // Rebuilt per chapter so a style-template switch mid-session takes effect.
+  context.isolatedSceneStyleDirectives = undefined;
   context.isolatedPendingScene = undefined;
   const priorText = priorProseText(project, draft, context);
-  const stylePriorNotes = context.scenePipelineSettings?.isolatedWriter
-    ? []
-    : priorText ? priorChapterNegativeList(priorText) : [];
+  // Applies to both writing paths: the isolated writer re-reads the work's own prose
+  // every scene, so it needs the previous chapter's negative list more than the
+  // standard path does, not less. It reaches that call via avoidNotes.
+  const stylePriorNotes = priorText ? priorChapterNegativeList(priorText) : [];
   // Stashed for scene-boundary handoffs: the begin exchange leaves the request
   // after the first scene reset, but these notes must keep applying to every scene.
   context.chapterStylePriorNotes = stylePriorNotes;
@@ -240,12 +255,29 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
   const targetCharacters = draft.scenes[sceneIndex].targetCharacters;
   const writerMaxRatio = context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO;
   const maximumCharacters = targetCharacters ? Math.floor(targetCharacters * writerMaxRatio) : undefined;
+  const voiceEvidence = chapterIsolatedVoiceEvidence({ project, store, context }, draft);
+  const chapterSoFar = draft.completed.map(scene => scene.content).join("\n\n");
+  const avoidNotes = [
+    ...(context.chapterStylePriorNotes ?? []),
+    ...(chapterSoFar.trim()
+      ? [
+        ...sceneAntiFormulaFeedback({
+          chapterSoFar,
+          priorChapterText: priorProseText(project, draft, context) || undefined,
+        }),
+        ...sceneVividnessFeedback(chapterSoFar),
+      ]
+      : []),
+  ];
   const writerInput = {
     scene: draft.scenes[sceneIndex],
     writePack: compiled,
     previousTail: previous?.content.slice(-800),
     currentState: previous?.actualState,
-    voiceSample: chapterIsolatedVoiceSample({ project, store, context }, draft),
+    voiceSample: voiceEvidence.exemplar,
+    voiceContinuation: voiceEvidence.continuation,
+    styleDirectives: chapterIsolatedStyleDirectives(context, project),
+    ...(avoidNotes.length ? { avoidNotes } : {}),
     maximumCharacters,
   };
   const runWriter = async (strictMaximumCharacters?: number) => {
@@ -435,12 +467,19 @@ async function acceptChapterScene(args: {
   // Anti-self-imitation hints for the NEXT scene: measured from prose already in the
   // draft (not model self-report), zero extra model calls — scene-chain counterpart
   // of the roleplay anti-formula slot.
-  const styleFeedback = next && !context.scenePipelineSettings?.isolatedWriter
-    ? sceneAntiFormulaFeedback({
-      chapterSoFar: result.draft.completed.map(scene => scene.content).join("\n\n"),
-      priorChapterText: priorProseText(project, result.draft, context) || undefined,
-    })
+  // Vividness feedback is the additive counterpart: anti-formula says what to stop,
+  // sceneVividnessFeedback says what the page is still missing.
+  const chapterSoFar = result.draft.completed.map(scene => scene.content).join("\n\n");
+  const styleFeedback = next
+    ? [
+      ...sceneAntiFormulaFeedback({
+        chapterSoFar,
+        priorChapterText: priorProseText(project, result.draft, context) || undefined,
+      }),
+      ...sceneVividnessFeedback(chapterSoFar),
+    ]
     : [];
+  const sceneVividness = analyzeProseVividness(selectedContent).stats;
   return JSON.stringify({
     status: result.revised ? "revised" : "written",
     sceneId,
@@ -451,6 +490,7 @@ async function acceptChapterScene(args: {
     ...(args.generation ? { generation: args.generation } : {}),
     actualState: result.draft.completed.at(-1)?.actualState,
     nextScene: sceneCardForTool(next),
+    sceneVividness: formatVividnessSummary(sceneVividness),
     ...(styleFeedback.length ? { styleFeedback } : {}),
     ...(candidateReport ? { candidateSampling: candidateReport } : {}),
     ...(dedup.removed.length ? { autoFixes: { duplicateSentencesRemoved: dedup.removed.slice(0, 5) } } : {}),
@@ -460,7 +500,7 @@ async function acceptChapterScene(args: {
     complete: chapterSceneDraftComplete(result.draft),
     message: [
       next
-        ? `当前 guide 的下一场为 ${next.id}；先根据本场 actualState 判断是继续该方向，还是 revise_chapter_scene_guide 调整剩余引导。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
+        ? `当前 guide 的下一场为 ${next.id}；先根据本场 actualState 判断是继续该方向，还是 revise_chapter_scene_guide 调整剩余引导。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计：其中的禁用与压降要求必须遵守，现场感缺口是加分项，按本场叙事需要处理，不要为凑指标堆砌感官或对白。" : ""}`
         : "当前没有未写 scene guide；章节目标已抵达则 inspect_chapter_draft，否则先补充下一场引导。",
       dedup.removed.length
         ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
@@ -477,15 +517,21 @@ type SceneCandidateReport = {
   generated: number;
   eligible: number;
   scores: number[];
+  vividness: number[];
   chosen: "original" | "rewrite";
+  selectedBy?: "judge" | "score";
+  judgeReason?: string;
   skipped?: string;
 };
 
 /**
  * Best-of-N prose sampling for one scene (candidateCount > 1). The submitted
  * prose is candidate 0 and wins ties; rewrites must pass the same generation
- * gates before competing on the deterministic prose score. All failures fall
- * back to the original — this stage may improve a scene, never reject one.
+ * gates before competing. All failures fall back to the original — this stage
+ * may improve a scene, never reject one.
+ *
+ * Winner selection prefers a judge model reading for "which draft earns the next
+ * page"; the deterministic score is the fallback and the eligibility floor.
  */
 async function sampleSceneCandidates(
   args: { project: WriterProject; store: WriterStore; context: ToolExecutionContext },
@@ -496,14 +542,28 @@ async function sampleSceneCandidates(
   const requested = args.context.scenePipelineSettings?.candidateCount ?? 1;
   const sampler = args.context.sceneCandidates;
   if (requested <= 1) return { content: original };
-  if (!sampler) return { content: original, candidateReport: { requested, generated: 0, eligible: 0, scores: [], chosen: "original", skipped: "no_model" } };
-  // Conditional trigger: a rewrite must strictly beat the original, so sampling a
-  // clean scene is (candidateCount−1) full-scene generations spent on noise.
-  const originalScore = sceneProseScore(original);
-  if (originalScore >= SCENE_CANDIDATE_SKIP_SCORE) {
+  if (!sampler) {
     return {
       content: original,
-      candidateReport: { requested, generated: 0, eligible: 0, scores: [originalScore], chosen: "original", skipped: "original_clean" },
+      candidateReport: { requested, generated: 0, eligible: 0, scores: [], vividness: [], chosen: "original", skipped: "no_model" },
+    };
+  }
+  // Conditional trigger: skip only when the scene is both clean AND already reads
+  // as a scene. Cleanliness alone used to satisfy this check, which meant the one
+  // case worth sampling — correct but flat prose — was the case that never sampled.
+  const originalBreakdown = sceneProseScoreBreakdown(original);
+  if (shouldSkipSceneCandidates(originalBreakdown)) {
+    return {
+      content: original,
+      candidateReport: {
+        requested,
+        generated: 0,
+        eligible: 0,
+        scores: [originalBreakdown.total],
+        vividness: [originalBreakdown.vividness],
+        chosen: "original",
+        skipped: "original_clean_and_vivid",
+      },
     };
   }
 
@@ -540,7 +600,30 @@ async function sampleSceneCandidates(
       && !findAdjacentDuplicateSentences(rewrite).length,
     );
   const candidates = [original, ...eligibleRewrites];
-  const { index, scores } = pickBestSceneCandidate(candidates);
+  const { index: scoreIndex, scores } = pickBestSceneCandidate(candidates);
+  const vividness = candidates.map(candidate => sceneProseScoreBreakdown(candidate).vividness);
+
+  // A judge only has something to decide when a rewrite survived eligibility.
+  let index = scoreIndex;
+  let selectedBy: "judge" | "score" = "score";
+  let judgeReason = "";
+  const judgeModel = sampler.judgeModel;
+  if (judgeModel && eligibleRewrites.length) {
+    try {
+      const judged = await judgeSceneCandidates({
+        model: judgeModel,
+        signal: sampler.signal,
+        sceneBrief: sceneCardBrief(sceneCard),
+        candidates,
+        usageReporter: args.context.modelUsageReporter,
+      });
+      index = judged.index;
+      selectedBy = "judge";
+      judgeReason = judged.reason;
+    } catch {
+      // Judge outage must not change what ships: keep the deterministic winner.
+    }
+  }
   return {
     content: candidates[index],
     candidateReport: {
@@ -548,7 +631,10 @@ async function sampleSceneCandidates(
       generated,
       eligible: eligibleRewrites.length,
       scores,
+      vividness,
       chosen: index === 0 ? "original" : "rewrite",
+      selectedBy,
+      ...(judgeReason ? { judgeReason } : {}),
       ...(generated < requested - 1 ? { skipped: "rewrite_error" } : {}),
     },
   };
@@ -570,15 +656,23 @@ function chapterStyleEvidence(
   return text;
 }
 
-function chapterIsolatedVoiceSample(
+function chapterIsolatedVoiceEvidence(
   args: { project: WriterProject; store: WriterStore; context: ToolExecutionContext },
   draft: ChapterSceneDraft,
-): string {
+): IsolatedWriterVoiceEvidence {
   const cached = args.context.isolatedSceneVoiceSample;
-  if (cached?.forPath === draft.path) return cached.text;
-  const text = isolatedWriterVoiceSample(args.project, args.store, draft.path);
-  args.context.isolatedSceneVoiceSample = { forPath: draft.path, text };
-  return text;
+  if (cached?.forPath === draft.path) return cached.evidence;
+  const evidence = isolatedWriterVoiceEvidence(args.project, args.store, draft.path);
+  args.context.isolatedSceneVoiceSample = { forPath: draft.path, evidence };
+  return evidence;
+}
+
+/** Template + craft baseline is project-scoped; build it once per draft. */
+function chapterIsolatedStyleDirectives(context: ToolExecutionContext, project: WriterProject): string {
+  if (context.isolatedSceneStyleDirectives === undefined) {
+    context.isolatedSceneStyleDirectives = isolatedWriterStyleDirectives(project);
+  }
+  return context.isolatedSceneStyleDirectives;
 }
 
 function sceneCardBrief(scene: ChapterSceneCard | undefined): string {
@@ -718,12 +812,17 @@ async function submitPassedChapterReview(
     contentCharacters: number;
     metrics: ReturnType<typeof analyzeChapterProseMetrics>;
     styleWarnings: Array<{ code: string; message: string; examples: string[] }>;
+    vividness: ReturnType<typeof analyzeProseVividness>;
+    vividnessWarnings: Array<{ code: string; message: string; examples: string[] }>;
     ledger: ReturnType<typeof chapterSceneLedger>;
     chapterReview: ChapterReviewResult;
   },
 ): Promise<string> {
   const { input } = args;
-  const { draft, proposalSummary, contentCharacters, metrics, styleWarnings, ledger, chapterReview } = values;
+  const {
+    draft, proposalSummary, contentCharacters, metrics, styleWarnings,
+    vividness, vividnessWarnings, ledger, chapterReview,
+  } = values;
   draft.inspectedVersion = draft.version;
   saveDraftCheckpoint(args, "review_passed", draft);
   const characterEvolutionSkipped = args.context.characterEvolutionEnabled === false
@@ -771,6 +870,8 @@ async function submitPassedChapterReview(
     proseStyle: "passed",
     proseMetrics: metrics.stats,
     ...(styleWarnings.length ? { styleWarnings } : {}),
+    proseVividness: { summary: formatVividnessSummary(vividness.stats), stats: vividness.stats },
+    ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
     ledger,
     chapterReview,
     ...(preparedCharacterChanges.warnings.length
@@ -845,8 +946,16 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     message: issue.message,
     examples: issue.examples.slice(0, 5),
   }));
+  // Additive layer: never blocks, only tells the reviewer and the agent where the
+  // chapter is correct but has no picture in it.
+  const vividness = analyzeProseVividness(scenesText);
+  const vividnessWarnings = vividness.issues.map(issue => ({
+    code: issue.code,
+    message: issue.message,
+    examples: issue.examples.slice(0, 5),
+  }));
   const ledger = chapterSceneLedger(draft);
-  if (draft.completed.length === 1 && !styleWarnings.length) {
+  if (draft.completed.length === 1 && !styleWarnings.length && !vividnessWarnings.length) {
     const scene = draft.scenes[0];
     return submitPassedChapterReview(args, {
       draft,
@@ -854,6 +963,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       contentCharacters: content.length,
       metrics,
       styleWarnings,
+      vividness,
+      vividnessWarnings,
       ledger,
       chapterReview: {
         verdict: "pass",
@@ -885,6 +996,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           proseSignals: {
             stats: metrics.stats,
             warnings: styleWarnings,
+            vividness: vividness.stats,
+            vividnessWarnings,
           },
         }, reviewer.signal);
         if (reviewed.usage) {
@@ -920,6 +1033,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             proseStyle: "passed",
             proseMetrics: metrics.stats,
             ...(styleWarnings.length ? { styleWarnings } : {}),
+            proseVividness: formatVividnessSummary(vividness.stats),
+            ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
             ledger,
             chapterReview: reviewed.review,
             targetScenes,
@@ -932,6 +1047,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           contentCharacters: content.length,
           metrics,
           styleWarnings,
+          vividness,
+          vividnessWarnings,
           ledger,
           chapterReview: reviewed.review,
         });
@@ -960,6 +1077,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     proseStyle: "passed",
     proseMetrics: metrics.stats,
     ...(styleWarnings.length ? { styleWarnings } : {}),
+    proseVividness: formatVividnessSummary(vividness.stats),
+    ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
     ledger,
     // Only the compatibility fallback appends the full chapter to the Agent loop.
     content,
@@ -969,6 +1088,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "人物关系、信息、目标或处境是否逐场发生变化",
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
+      "有没有换掉人名地点仍能套进多数故事的句子；现场是否只被叙述者报告、没有被人物看见听见摸到",
     ],
     message: "隔离终审不可用，已回退到主 Agent 通读：content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
       + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",

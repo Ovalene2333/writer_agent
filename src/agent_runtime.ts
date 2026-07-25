@@ -25,10 +25,13 @@ export interface ScenePipelineSettings {
   /** Experimental prose-only model call with a separate state extraction pass. */
   isolatedWriter: boolean;
   /**
-   * Experimental best-of-N scene prose sampling: 1 = off (default);
-   * 2–3 = per scene, request candidateCount-1 fact-preserving rewrites and keep
-   * the highest-scoring candidate. Adds one plain-text model call per extra
-   * candidate per scene.
+   * Best-of-N scene prose sampling: 1 = off; 2–3 = per scene, request
+   * candidateCount-1 fact-preserving rewrites and keep the winner (judge model if
+   * configured, deterministic score otherwise). Adds one plain-text model call per
+   * extra candidate per scene, plus one cheap judging call when a rewrite survives.
+   *
+   * Defaults to 2: sampling is skipped outright for scenes that are already clean
+   * and vivid, so the cost only lands where a second draft has something to win.
    */
   candidateCount: number;
 }
@@ -101,7 +104,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     notesMaxCharacters: DEFAULT_SCENE_NOTES_CHARACTERS,
     isolatedWriterMaxRatio: DEFAULT_ISOLATED_WRITER_MAX_RATIO,
     isolatedWriter: false,
-    candidateCount: 1,
+    candidateCount: 2,
   },
 };
 

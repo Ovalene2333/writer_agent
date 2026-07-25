@@ -24,8 +24,8 @@ import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { executeTool } from "./tools/execute.js";
 import type { ToolExecutionContext } from "./tools/types.js";
-import { sceneProseScore } from "./prose_metrics.js";
-import { SCENE_CANDIDATE_SKIP_SCORE } from "./scene_candidates.js";
+import { sceneProseScoreBreakdown } from "./prose_metrics.js";
+import { shouldSkipSceneCandidates } from "./scene_candidates.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
 import { documentSpans } from "./document_spans.js";
 import type { AgentEvent } from "./types.js";
@@ -631,7 +631,10 @@ test("scene candidate sampling skips clean originals without extra model calls",
       "他没有立刻回答，先把一根柴推进去，看着火苗舔上来，才说：「去。」",
       "夜里下了点雨，屋檐滴水的声音断断续续，到天亮才停。",
     ].join("\n\n");
-    assert.ok(sceneProseScore(clean) >= SCENE_CANDIDATE_SKIP_SCORE, "fixture must score clean");
+    assert.ok(
+      shouldSkipSceneCandidates(sceneProseScoreBreakdown(clean)),
+      "fixture must be both clean and vivid enough to skip sampling",
+    );
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。",
@@ -640,7 +643,7 @@ test("scene candidate sampling skips clean originals without extra model calls",
     })) as Record<string, unknown>;
     assert.equal(written.status, "written");
     const sampling = written.candidateSampling as Record<string, unknown>;
-    assert.equal(sampling.skipped, "original_clean");
+    assert.equal(sampling.skipped, "original_clean_and_vivid");
     assert.equal(sampling.chosen, "original");
     assert.equal(sampling.generated, 0);
   } finally {

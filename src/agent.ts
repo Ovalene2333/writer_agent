@@ -1589,10 +1589,18 @@ export async function runAgent(options: {
           },
         }
       : {}),
-    // Best-of-N scene sampling (experimental, off by default): rewrites use the
-    // main writing model in a dedicated plain-text call, not the cheap adjudicator.
+    // Best-of-N scene sampling: rewrites use the main writing model in a dedicated
+    // plain-text call, not the cheap adjudicator. The winner is picked by the
+    // reviewer model reading both drafts — a rule score cannot rank "worth reading",
+    // which is the only reason to generate a second candidate at all.
     ...(scenePipelineSettings && scenePipelineSettings.candidateCount > 1
-      ? { sceneCandidates: { model, signal } }
+      ? {
+          sceneCandidates: {
+            model,
+            judgeModel: options.models?.reviewer ?? options.models?.inline ?? model,
+            signal,
+          },
+        }
       : {}),
   };
   // Assemble per PROMPT / PREFIX-CACHE CONTRACT (top of this file):
