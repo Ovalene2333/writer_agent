@@ -39,6 +39,11 @@ export function normalizePricing(
   existing?: TokenPricing,
 ): TokenPricing {
   const defaults = defaultPricing(provider, model);
+  const billingMode = input?.billingMode === "unmetered" || input?.billingMode === "metered"
+    ? input.billingMode
+    : existing?.billingMode === "unmetered" || existing?.billingMode === "metered"
+      ? existing.billingMode
+      : undefined;
   const cacheHit = rate(input?.cacheHit ?? existing?.cacheHit, defaults.cacheHit);
   const cacheMiss = rate(input?.cacheMiss ?? existing?.cacheMiss, defaults.cacheMiss);
   const output = rate(input?.output ?? existing?.output, defaults.output);
@@ -77,7 +82,7 @@ export function normalizePricing(
       output: rate(existing.peakBilling.output, output * DEEPSEEK_PEAK_MULTIPLIER),
     };
   }
-  return { cacheHit, cacheMiss, output, currency, contextWindow, peakBilling };
+  return { billingMode, cacheHit, cacheMiss, output, currency, contextWindow, peakBilling };
 }
 
 export function resolveRates(pricing: TokenPricing, at: Date = new Date()): TokenRates & { isPeak: boolean } {
@@ -99,6 +104,7 @@ export function calculateUsageCost(
   pricing: TokenPricing,
   at: Date = new Date(),
 ): number {
+  if (pricing.billingMode === "unmetered") return 0;
   const miss = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
   const rates = resolveRates(pricing, at);
   return (usage.cacheHitTokens * rates.cacheHit + miss * rates.cacheMiss + usage.completionTokens * rates.output) / 1_000_000;

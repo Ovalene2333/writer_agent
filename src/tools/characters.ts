@@ -92,7 +92,7 @@ export function handleGetSimpleCharacter({ input, store, context }: ToolHandlerA
   return JSON.stringify(card);
 }
 
-export function handleSaveCharacter({ input, store, characterScope, context }: ToolHandlerArgs): string {
+export function handleSaveCharacter({ input, store, sessionId, characterScope, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "save_character");
   const id = typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined;
   const existing = id ? store.characters().find(item => item.id === id) : undefined;
@@ -112,7 +112,9 @@ export function handleSaveCharacter({ input, store, characterScope, context }: T
       }
     }
   }
-  const character = store.saveCharacter({ ...(input as CharacterInput), id, identity });
+  const character = context.sourceMessageId
+    ? store.saveCharacterWithRevision(sessionId, context.sourceMessageId, { ...(input as CharacterInput), id, identity })
+    : store.saveCharacter({ ...(input as CharacterInput), id, identity });
   if (!id && characterScope && !characterScope.includes(character.id)) characterScope.push(character.id);
   return JSON.stringify({
     id: character.id,
@@ -132,7 +134,7 @@ function parseSourceRef(value: unknown): CharacterSourceRef | undefined {
   return { type, ref, ...(note ? { note } : {}) };
 }
 
-export function handleApplyCharacterChanges({ input, store, characterScope, context }: ToolHandlerArgs): string {
+export function handleApplyCharacterChanges({ input, store, sessionId, characterScope, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "apply_character_changes");
   const id = optionalPositiveInteger(input.id, "id");
   if (!id) throw new Error("缺少有效参数：id（仅可更新已有角色）");
@@ -164,7 +166,9 @@ export function handleApplyCharacterChanges({ input, store, characterScope, cont
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
       .map(item => ({ op: String((item as { op?: unknown }).op ?? ""), ...item })),
   };
-  const result = store.applyCharacterChanges(id, payload);
+  const result = context.sourceMessageId
+    ? store.applyCharacterChangesWithRevision(sessionId, context.sourceMessageId, id, payload)
+    : store.applyCharacterChanges(id, payload);
   return JSON.stringify({
     id: result.character.id,
     name: result.character.identity.name,

@@ -6,11 +6,23 @@ import type { WriterProject } from "./project.js";
 export type PermissionMode = "ask" | "auto" | "plan";
 
 export const ABSOLUTE_MAX_SCENES = 8;
+export const MIN_SCENE_NOTES_CHARACTERS = 500;
+export const MAX_SCENE_NOTES_CHARACTERS = 8_000;
+export const DEFAULT_SCENE_NOTES_CHARACTERS = 3_000;
+export const MIN_ISOLATED_WRITER_MAX_RATIO = 1.2;
+export const MAX_ISOLATED_WRITER_MAX_RATIO = 3;
+export const DEFAULT_ISOLATED_WRITER_MAX_RATIO = 2;
 
 export interface ScenePipelineSettings {
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
+  /** Maximum Agent-authored scene packet size before compilation. */
+  notesMaxCharacters: number;
+  /** Hard prose ceiling relative to each scene's targetCharacters. */
+  isolatedWriterMaxRatio: number;
+  /** Experimental prose-only model call with a separate state extraction pass. */
+  isolatedWriter: boolean;
   /**
    * Experimental best-of-N scene prose sampling: 1 = off (default);
    * 2–3 = per scene, request candidateCount-1 fact-preserving rewrites and keep
@@ -39,16 +51,23 @@ export interface ProjectSkill {
   body: string;
 }
 
-export type ScenePipelineMilestone = "draft_started" | "draft_complete";
+export type ScenePipelineMilestone = "draft_started" | "draft_reopened" | "draft_complete";
 
 const DEFAULT_SCENE_PIPELINE_TODOS = [
+  "核对本篇必要事实与衔接",
+  "建立初始场景引导",
+  "按成稿结果推进正文",
+  "全文审阅并提交提案",
+] as const;
+
+const PREVIOUS_SCENE_PIPELINE_TODOS = [
   "核对本篇必要事实与衔接",
   "建立本篇场景链",
   "逐场写作并传递状态",
   "全文审阅并提交提案",
 ] as const;
 
-const PREVIOUS_SCENE_PIPELINE_TODOS = [
+const OLDER_SCENE_PIPELINE_TODOS = [
   "核对本章必要事实与衔接",
   "建立本章场景链",
   "逐场写作并传递状态",
@@ -62,12 +81,22 @@ const LEGACY_SCENE_PIPELINE_TODOS = [
   "整章审阅并提交提案",
 ] as const;
 
+const SCENE_PIPELINE_TODO_SIGNATURES = [
+  DEFAULT_SCENE_PIPELINE_TODOS,
+  PREVIOUS_SCENE_PIPELINE_TODOS,
+  OLDER_SCENE_PIPELINE_TODOS,
+  LEGACY_SCENE_PIPELINE_TODOS,
+] as const;
+
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
   scenePipeline: {
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
     maxScenes: 5,
+    notesMaxCharacters: DEFAULT_SCENE_NOTES_CHARACTERS,
+    isolatedWriterMaxRatio: DEFAULT_ISOLATED_WRITER_MAX_RATIO,
+    isolatedWriter: false,
     candidateCount: 1,
   },
 };
@@ -94,7 +123,18 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
   const candidateCount = Number.isInteger(value?.candidateCount)
     ? Math.min(MAX_SCENE_CANDIDATES, Math.max(1, Number(value?.candidateCount)))
     : DEFAULT_SETTINGS.scenePipeline.candidateCount;
-  return { preferredMinScenes, preferredMaxScenes, maxScenes, candidateCount };
+  const isolatedWriter = value?.isolatedWriter === true;
+  const notesMaxCharacters = Number.isInteger(value?.notesMaxCharacters)
+    ? Math.min(MAX_SCENE_NOTES_CHARACTERS, Math.max(MIN_SCENE_NOTES_CHARACTERS, Number(value?.notesMaxCharacters)))
+    : DEFAULT_SETTINGS.scenePipeline.notesMaxCharacters;
+  const rawWriterRatio = Number(value?.isolatedWriterMaxRatio);
+  const isolatedWriterMaxRatio = Number.isFinite(rawWriterRatio)
+    ? Math.round(Math.min(MAX_ISOLATED_WRITER_MAX_RATIO, Math.max(MIN_ISOLATED_WRITER_MAX_RATIO, rawWriterRatio)) * 10) / 10
+    : DEFAULT_SETTINGS.scenePipeline.isolatedWriterMaxRatio;
+  return {
+    preferredMinScenes, preferredMaxScenes, maxScenes,
+    notesMaxCharacters, isolatedWriterMaxRatio, isolatedWriter, candidateCount,
+  };
 }
 
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {
@@ -287,11 +327,33 @@ export function advanceScenePipelineTodos(
   todos: AgentTodoItem[],
   milestone: ScenePipelineMilestone,
 ): { todos: AgentTodoItem[]; changed: boolean } {
-  const signature = [DEFAULT_SCENE_PIPELINE_TODOS, PREVIOUS_SCENE_PIPELINE_TODOS, LEGACY_SCENE_PIPELINE_TODOS]
+  const signature = SCENE_PIPELINE_TODO_SIGNATURES
     .map(contents => contents.map(content => todos.findIndex(item => item.content === content)))
     .find(indexes => indexes.every(index => index >= 0));
   if (!signature) return { todos, changed: false };
   const indexes = signature;
+  if (milestone === "draft_reopened") {
+    let changed = false;
+    const next = todos.map(item => ({ ...item }));
+    for (let phase = 0; phase < 2; phase += 1) {
+      const item = next[indexes[phase]];
+      if (item.status !== "completed" && item.status !== "cancelled") {
+        item.status = "completed";
+        changed = true;
+      }
+    }
+    const writing = next[indexes[2]];
+    if (writing.status !== "cancelled" && writing.status !== "in_progress") {
+      writing.status = "in_progress";
+      changed = true;
+    }
+    const review = next[indexes[3]];
+    if (review.status !== "cancelled" && review.status !== "pending") {
+      review.status = "pending";
+      changed = true;
+    }
+    return { todos: next, changed };
+  }
   const completedThrough = milestone === "draft_started" ? 1 : 2;
   const activeIndex = indexes[completedThrough + 1];
   let changed = false;
@@ -417,18 +479,10 @@ export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
   return { todos: next, changed, shouldContinue: false };
 }
 
-/**
- * When a turn truly ends (final assistant reply with no remaining multi-chapter work),
- * mark remaining open todos completed so the UI does not stay stuck at e.g. 1/3.
- * Cancelled items are left alone.
- *
- * Prefer `advanceTodosAfterProposal` on propose_* success so multi-chapter plans are not
- * falsely closed after the first chapter.
- */
-export function finalizeOpenTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
+/** A successful character mutation is the terminal deliverable for character-only tasks. */
+export function completeCharacterTaskTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
   let changed = false;
   const next = todos.map(item => {
-    // Treat anything not already completed/cancelled as open (covers bad model statuses).
     if (item.status !== "completed" && item.status !== "cancelled") {
       changed = true;
       return { ...item, status: "completed" as const };
@@ -438,39 +492,32 @@ export function finalizeOpenTodos(todos: AgentTodoItem[]): { todos: AgentTodoIte
   return { todos: next, changed };
 }
 
-/**
- * Safety-net close used by the HTTP job wrapper: only complete dangling in_progress
- * items. Never auto-complete pending multi-chapter writing steps.
- */
-export function finalizeDanglingInProgressTodos(todos: AgentTodoItem[]): { todos: AgentTodoItem[]; changed: boolean } {
-  let changed = false;
-  const next = todos.map(item => {
-    if (item.status === "in_progress") {
-      changed = true;
-      return { ...item, status: "completed" as const };
-    }
-    return item;
-  });
-  return { todos: next, changed };
+/** Built-in scene progress is owned by structured scene tool milestones, not manage_todos. */
+export function reconcileManagedTodos(
+  current: AgentTodoItem[],
+  requested: AgentTodoItem[],
+): { todos: AgentTodoItem[]; scenePipelineProtected: boolean } {
+  const hasScenePipeline = SCENE_PIPELINE_TODO_SIGNATURES.some(contents =>
+    current.length === contents.length
+      && contents.every(content => current.some(item => item.content === content)),
+  );
+  return hasScenePipeline
+    ? { todos: current, scenePipelineProtected: true }
+    : { todos: requested, scenePipelineProtected: false };
 }
 
-/** Persist finalized session todos and optionally emit a stream event. */
-export function persistFinalizedSessionTodos(
+/** Persist completion after the character-only task's save tool succeeds. */
+export function persistCompletedCharacterTaskTodos(
   store: {
     sessionTodos(sessionId: string): AgentTodoItem[];
     saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void;
   },
   sessionId: string,
   emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
-  mode: "all_open" | "dangling_in_progress" | "after_proposal" = "all_open",
 ): AgentTodoItem[] {
   const current = store.sessionTodos(sessionId);
   if (!current.length) return current;
-  const result = mode === "dangling_in_progress"
-    ? finalizeDanglingInProgressTodos(current)
-    : mode === "after_proposal"
-      ? advanceTodosAfterProposal(current)
-      : finalizeOpenTodos(current);
+  const result = completeCharacterTaskTodos(current);
   if (!result.changed) return current;
   store.saveSessionTodos(sessionId, result.todos);
   emit?.({ type: "todos", todos: result.todos });

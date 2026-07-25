@@ -99,9 +99,15 @@ export function formatTunnelFailureReport(failures: TunnelFailure[]): string {
   return `${lines.join("\n")}\n`;
 }
 
-export function startShareTunnel(port: number, token: string, lanOrigin: string): ShareTunnelController {
+export function startShareTunnel(
+  port: number,
+  token: string,
+  lanOrigin: string,
+  onPublicOrigin: (origin: string | null) => void = () => undefined,
+): ShareTunnelController {
   process.stdout.write("正在创建公网临时访问地址（cloudflared）...\n");
   process.stdout.write(`本机/局域网源：${lanOrigin}\n`);
+  onPublicOrigin(null);
 
   let active: ChildProcessWithoutNullStreams | undefined;
   let restartTimer: NodeJS.Timeout | undefined;
@@ -131,6 +137,7 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
     const printAccess = () => {
       if (printed || !publicOrigin) return;
       printed = true;
+      onPublicOrigin(publicOrigin);
       if (readinessTimer) clearTimeout(readinessTimer);
       // 二维码走局域网入口：页在 HTTP 上，才能在局域网/Cloudflare 间自动切 API（HTTPS 页无法探测 HTTP 局域网）。
       const dualEntry = buildShareEntryUrl(lanOrigin, token, "public", publicOrigin);
@@ -161,6 +168,7 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
           const diagnosis = diagnoseTunnelFailure(outputBuffer);
           process.stderr.write(`公网隧道仍在连接，cloudflared 正在切换边缘节点。当前判断：${diagnosis.cause}\n`);
         }, 15_000);
+        if (registered) printAccess();
       }
       if (!registered && /Registered tunnel connection/i.test(outputBuffer)) {
         registered = true;
@@ -189,6 +197,7 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
       }
 
       if (registered) {
+        onPublicOrigin(null);
         failures.length = 0;
         const delay = RESTART_DELAYS_MS[0];
         const diagnosis = diagnoseTunnelFailure(outputBuffer);
@@ -215,6 +224,7 @@ export function startShareTunnel(port: number, token: string, lanOrigin: string)
   return {
     kill() {
       stopped = true;
+      onPublicOrigin(null);
       if (restartTimer) clearTimeout(restartTimer);
       active?.kill();
     },

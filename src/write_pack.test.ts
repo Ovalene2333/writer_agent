@@ -16,6 +16,7 @@ import {
   beginChapterSceneDraft,
   chapterSceneDraftComplete,
   reviseChapterDraftStyle,
+  reviseChapterSceneGuide,
   writeChapterScene,
 } from "./scene_pipeline.js";
 import { emptyCharacter } from "./characters.js";
@@ -199,7 +200,7 @@ test("chapter scene pipeline assembles causal scenes without writing partial doc
   );
 });
 
-test("side prose uses a multi-scene pipeline with meaningful length targets", async () => {
+test("side prose treats scene count and target length as guidance", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-side-scene-pipeline-"));
   let store: WriterStore | undefined;
   try {
@@ -211,7 +212,8 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
       requireWritePack: true,
       requireScenePipeline: true,
       scenePipelineSettings: {
-        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, candidateCount: 1,
+        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
       },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
@@ -228,27 +230,16 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
       targetCharacters: 2_000,
     });
 
-    const tooFew = JSON.parse(await call("begin_chapter_draft", {
-      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
-      scenes: [makeScene(1), makeScene(2)],
-    })) as Record<string, unknown>;
-    assert.match(String(tooFew.error), /至少需要 3 个/u);
-
-    const missingTarget = JSON.parse(await call("begin_chapter_draft", {
-      path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
-      scenes: [makeScene(1), { ...makeScene(2), targetCharacters: undefined }, makeScene(3)],
-    })) as Record<string, unknown>;
-    assert.match(String(missingTarget.error), /targetCharacters/u);
-
     const begun = JSON.parse(await call("begin_chapter_draft", {
       path: "side/arc-08.md", mode: "create", heading: "ARC-08", chapterGoal: "城邦覆灭",
-      scenes: [makeScene(1), makeScene(2), makeScene(3)],
+      scenes: [{ ...makeScene(1), targetCharacters: undefined }],
     })) as Record<string, unknown>;
     assert.equal(begun.status, "started");
-    assert.equal(begun.sceneCount, 3);
-    assert.throws(() => writeChapterScene(
+    assert.equal(begun.sceneCount, 1);
+    const written = writeChapterScene(
       context.chapterSceneDraft!, "side-1", "她向城门走去。".repeat(30), actualState("她抵达城门"),
-    ), /明显低于目标 2000 字/u);
+    );
+    assert.equal(written.draft.completed.length, 1);
 
     const bypass = JSON.parse(await call("propose_document", {
       path: "side/arc-08.md", content: "试图绕过场景链。".repeat(30), summary: "支线片段",
@@ -258,6 +249,38 @@ test("side prose uses a multi-scene pipeline with meaningful length targets", as
     store?.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Agent can reshape the unwritten scene guide without changing completed prose", () => {
+  let draft = beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
+    baseContent: "", baseHash: "empty", scenes: [sceneChain[0]], maxScenes: 5,
+  });
+  draft = writeChapterScene(
+    draft, "arrival", "门禁灯从绿变红。".repeat(20), actualState("主角进入训练区"),
+  ).draft;
+  const completedBefore = draft.completed[0];
+
+  const expanded = reviseChapterSceneGuide(draft, [{
+    ...sceneChain[1], id: "argument", title: "争执", goal: "两人公开冲突", handoff: "冲突引来教官",
+  }, {
+    ...sceneChain[1], id: "choice", title: "选择", goal: "主角作出选择", turn: "教官拒绝代为决定", outcome: "主角承担后果",
+  }], 5);
+  assert.equal(expanded.draft.completed[0], completedBefore);
+  assert.deepEqual(expanded.addedSceneIds, ["argument", "choice"]);
+  assert.deepEqual(expanded.removedSceneIds, []);
+  assert.equal(expanded.draft.scenes[1].id, "argument");
+  assert.equal(chapterSceneDraftComplete(expanded.draft), false);
+
+  const finished = reviseChapterSceneGuide(expanded.draft, [], 5);
+  assert.deepEqual(finished.removedSceneIds, ["argument", "choice"]);
+  assert.equal(chapterSceneDraftComplete(finished.draft), true);
+
+  const reopened = reviseChapterSceneGuide(finished.draft, [{
+    ...sceneChain[1], id: "aftermath", title: "余波", goal: "让选择产生即时后果",
+  }], 5);
+  assert.equal(reopened.draft.scenes.at(-1)?.id, "aftermath");
+  assert.equal(chapterSceneDraftComplete(reopened.draft), false);
 });
 
 test("revising an earlier scene invalidates dependent later scenes", () => {
@@ -354,9 +377,14 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     store = new WriterStore(project);
     const activeStore = store;
     const sessionId = activeStore.createSession("逐场写作");
+    const evolvingCharacter = activeStore.saveCharacter(emptyCharacter("学员"));
     const chapterReviewUsage: Array<{ model: string; callKind: string }> = [];
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      scenePipelineSettings: {
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+      },
       modelUsageReporter: (model, _usage, meta) => {
         chapterReviewUsage.push({ model: model.model, callKind: meta.callKind });
       },
@@ -408,7 +436,15 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       content: "门禁灯变红。".repeat(20),
       actualState: actualState("违规进入"),
     })) as Record<string, unknown>;
-    assert.match(String(oversizedNotes.error), /1500/);
+    assert.match(String(oversizedNotes.error), /3000/);
+    context.scenePipelineSettings!.notesMaxCharacters = 4_000;
+    const relaxedNotes = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: `## 场景目标\n${"主角继续向前。".repeat(450)}`,
+    })) as Record<string, unknown>;
+    assert.doesNotMatch(String(relaxedNotes.error), /notes 过长/u);
+    assert.match(String(relaxedNotes.error), /content/u);
+    context.scenePipelineSettings!.notesMaxCharacters = 3_000;
     const denseStyle = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。\n## 已知事实\n门禁灯会在违规时变红。",
@@ -472,7 +508,21 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       summary: "新建第一章", chapterChange: "关系改变", reviewNotes: "已检查",
     })) as Record<string, unknown>;
     assert.match(String(beforeInspect.error), /inspect_chapter_draft/);
-    const inspectedRaw = await call("inspect_chapter_draft", { summary: "新建第一章" });
+    const inspectedRaw = await call("inspect_chapter_draft", {
+      summary: "新建第一章",
+      characterChanges: [{
+        characterId: evolvingCharacter.id,
+        reason: "正文中已经发生的变化",
+        changes: [
+          {
+            op: "upsert_story_state",
+            entry: { unanchored: true, label: "违规进入", description: "门禁转红后仍进入训练区" },
+          },
+          { op: "upsert_relationship", entry: { description: "缺少关系目标，应被隔离" } },
+          { op: "add_experience", entry: { label: "越过门禁", description: "在红灯下进入训练区" } },
+        ],
+      }],
+    });
     const inspected = JSON.parse(inspectedRaw) as Record<string, unknown>;
     assert.equal(inspected.status, "proposal_submitted");
     assert.equal(inspected.reviewCompleted, true);
@@ -480,9 +530,15 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(typeof inspected.contentCharacters, "number");
     assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
     assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
+    assert.equal((inspected.characterChangeWarnings as string[]).length, 1);
     assert.deepEqual(chapterReviewUsage, [], "single-scene chapters skip the cross-scene model review");
     const proposed = inspected.proposal as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
+    const storedProposal = activeStore.proposal(Number(proposed.proposalId));
+    assert.equal(storedProposal.characterChanges.length, 1);
+    assert.equal(storedProposal.characterChanges[0].changes.length, 2);
+    const normalizedState = storedProposal.characterChanges[0].changes.find(change => change.op === "upsert_story_state");
+    assert.equal((normalizedState?.entry as Record<string, unknown>).notes, "违规进入：门禁转红后仍进入训练区");
     assert.equal(project.documentExists("chapters/第一章.md"), false);
     assert.equal(context.chapterSceneDraft, undefined);
     assert.equal(context.completedChapterHandoff?.path, "chapters/第一章.md");
@@ -553,7 +609,10 @@ test("scene candidate sampling skips clean originals without extra model calls",
     const sessionId = activeStore.createSession("候选跳过");
     const context: ToolExecutionContext = {
       permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
-      scenePipelineSettings: { preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5, candidateCount: 2 },
+      scenePipelineSettings: {
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
+      },
       // Unreachable endpoint: the test fails with skipped=rewrite_error if a rewrite call is ever attempted.
       sceneCandidates: { model: { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "test" } },
     };

@@ -9,9 +9,9 @@ import type { ToolDefinition } from "./types.js";
  * - Descriptions may document conventions (lore/outline/chapters) but must not embed
  *   live project path lists, character ids, or session state.
  * - Prefer free-form string/number parameters over enums that grow with the project.
- * - The tool-free planner selects one stable task profile. That profile is an
- *   order-preserving subset of this catalog and stays frozen for the whole job.
- *   Never derive profiles from project paths/ids or swap profiles mid-job.
+ * - Every non-plan task receives the same order-preserving catalog. Semantic
+ *   task contracts authorize side effects at runtime; never remove recovery
+ *   capabilities because of a fallible mode label or live project state.
  * - After structural changes, update agentToolSchemaHash expectations in tests.
  */
 
@@ -312,7 +312,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "begin_chapter_draft",
-      description: "为章节或支线片段建立场景链与内存草稿；不写项目文件",
+      description: "为章节或支线片段建立可调整的初始 scene guide 与内存草稿；不写项目文件",
       parameters: {
         type: "object",
         properties: {
@@ -322,7 +322,7 @@ export const TOOLS = deepFreeze([
           chapterGoal: { type: "string", description: "全文结束后真正改变什么" },
           scenes: {
             type: "array", minItems: 1, maxItems: 8,
-            description: "有因果承接的场景链；数量遵循当前场景链设置，不为凑数拆场",
+            description: "初始场景引导；写作中可按实际结果调整，不是必须逐项照抄的提纲",
             items: {
               type: "object",
               properties: {
@@ -336,7 +336,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "本场直接结果" },
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "预计字数 200—8000；side/ 支线必填且至少 2000，正文低于目标 70% 会退回" },
+                targetCharacters: { type: "number", description: "预计字数 200—8000，仅作篇幅引导" },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -352,14 +352,14 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "write_chapter_scene",
-      description: "编译本场故事内笔记，并把正文与实际离场状态写入内存草稿；一次完成",
+      description: "写入一场章节草稿；隔离 Writer 模式只提交 notes，标准模式同时提交正文与状态",
       parameters: {
         type: "object",
         properties: {
           sceneId: { type: "string" },
           notes: {
             type: "string",
-            description: "要点式故事内短笔记（上限 1500 字）：仅本场目标、人物当下、事件顺序、已知事实、须自然落地与勿擅自补写项，不写成段落长文",
+            description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
           content: { type: "string", description: "仅本场正文，不含任何 markdown 标题（正文标题与 ## 场景小标题由组装自动生成）" },
           actualState: {
@@ -377,7 +377,44 @@ export const TOOLS = deepFreeze([
             additionalProperties: false,
           },
         },
-        required: ["sceneId", "notes", "content", "actualState"],
+        required: ["sceneId", "notes"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "revise_chapter_scene_guide",
+      description: "根据已写正文与 actualState 替换所有未写场景引导；可增删、合并、改序或清空后终审",
+      parameters: {
+        type: "object",
+        properties: {
+          remainingScenes: {
+            type: "array", minItems: 0, maxItems: 8,
+            description: "新的剩余场景引导；不含已完成场景，空数组表示当前正文已经收束",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string", description: "本文内唯一短 id，不得与已完成场景重复" },
+                title: { type: "string", description: "内部场景名，不写入正文" },
+                goal: { type: "string", description: "当前判断下本场要完成的变化" },
+                entryState: { type: "array", items: { type: "string" }, description: "从 actualState 出发的入场局面" },
+                characterIntent: { type: "array", items: { type: "string" }, description: "人物各自诉求" },
+                obstacle: { type: "string", description: "直接阻力" },
+                turn: { type: "string", description: "可能的落空、代价或变化方向，不要求正文照抄" },
+                outcome: { type: "string", description: "预期结果；实际正文可以合理偏离" },
+                handoff: { type: "string", description: "可能如何交给下一场；末场可空" },
+                dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
+                targetCharacters: { type: "number", description: "预计字数 200—8000，仅作篇幅引导" },
+              },
+              required: ["id", "goal", "obstacle", "turn", "outcome"],
+              additionalProperties: false,
+            },
+          },
+          reason: { type: "string", description: "根据已写结果调整引导的简短原因" },
+        },
+        required: ["remainingScenes"],
         additionalProperties: false,
       },
     },
@@ -697,7 +734,7 @@ export const TOOLS = deepFreeze([
           },
           changes: {
             type: "array",
-            description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,...}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
+            description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,location|physical|emotion|notes|knowledge|beliefs|intentions|temporaryGoals}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
             items: { type: "object", additionalProperties: true },
           },
         },
@@ -852,70 +889,20 @@ export const TOOLS = deepFreeze([
 
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
-const META_TOOLS = ["inspect_conversation", "read_conversation", "read_context_artifact", "ask_user", "manage_todos", "load_skill"] as const;
-const DOCUMENT_READ_TOOLS = ["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project"] as const;
-const FILE_READ_TOOLS = ["list_files", "inspect_file", "read_file", "search_files"] as const;
-const CHARACTER_READ_TOOLS = ["list_characters", "get_character", "list_simple_characters", "get_simple_character"] as const;
-
-const TASK_TOOL_PROFILES: Record<string, readonly string[]> = {
-  brainstorm: [...DOCUMENT_READ_TOOLS, ...CHARACTER_READ_TOOLS, ...META_TOOLS],
-  outline: [
-    ...DOCUMENT_READ_TOOLS,
-    "design_creative_outline", "list_outline_nodes", "get_outline_node", "propose_outline_patch",
-    "validate_outline", "compare_outline_with_draft",
-    "list_characters", "get_character", "apply_character_changes",
-    ...META_TOOLS,
-  ],
-  write_scene: [
-    ...DOCUMENT_READ_TOOLS,
-    "list_outline_nodes", "get_outline_node", "validate_outline",
-    ...CHARACTER_READ_TOOLS, "apply_character_changes",
-    "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style",
-    "inspect_chapter_draft", "propose_chapter_draft",
-    ...META_TOOLS,
-  ],
-  rewrite: [
-    ...DOCUMENT_READ_TOOLS, "audit_prose_style",
-    ...CHARACTER_READ_TOOLS, "apply_character_changes",
-    "propose_document", "propose_document_patch", "revise_document_isolated", "propose_change_set",
-    ...META_TOOLS,
-  ],
-  audit: [
-    ...DOCUMENT_READ_TOOLS, "audit_prose_style",
-    "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft",
-    "propose_document", "propose_document_patch", "propose_outline_patch",
-    ...META_TOOLS,
-  ],
-  character: [
-    ...DOCUMENT_READ_TOOLS, "list_outline_nodes", "get_outline_node",
-    "list_characters", "get_character", "save_character", "apply_character_changes",
-    ...META_TOOLS,
-  ],
-  simple_character: [
-    ...DOCUMENT_READ_TOOLS,
-    "list_characters", "get_character", "list_simple_characters", "get_simple_character", "save_simple_character",
-    ...META_TOOLS,
-  ],
-  general: [
-    ...DOCUMENT_READ_TOOLS, ...FILE_READ_TOOLS, ...CHARACTER_READ_TOOLS,
-    "propose_document", "propose_document_patch", "propose_change_set",
-    "save_character", "apply_character_changes", "save_simple_character",
-    ...META_TOOLS,
-  ],
-};
-
 const WRITE_TOOLS = new Set([
   "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
   "revise_document_isolated",
-  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
+  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
 ]);
 
-/** Stable, project-agnostic tool allow-list selected once after planning. */
-export function agentToolsForTask(mode: string, permissionMode: "ask" | "auto" | "plan"): readonly ToolDefinition[] {
-  const allowed = new Set(TASK_TOOL_PROFILES[mode] ?? TASK_TOOL_PROFILES.general);
-  return Object.freeze(TOOLS.filter(tool => allowed.has(tool.function.name)
-    && (permissionMode !== "plan" || !WRITE_TOOLS.has(tool.function.name))));
+/**
+ * Stable universal capability surface. `mode` is retained for API compatibility
+ * but no longer removes recovery paths after a fallible semantic classification.
+ * Side effects are authorized by the runtime task contract before execution.
+ */
+export function agentToolsForTask(_mode: string, permissionMode: "ask" | "auto" | "plan"): readonly ToolDefinition[] {
+  return Object.freeze(TOOLS.filter(tool => permissionMode !== "plan" || !WRITE_TOOLS.has(tool.function.name)));
 }
 
 /** Stable schema fingerprint: tool order and definitions are part of the provider KV-cache prefix. */

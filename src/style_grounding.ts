@@ -184,6 +184,27 @@ export function dynamicStyleGroundingPrompt(
 }
 
 /**
+ * One raw prose window for the isolated scene writer. Unlike the Agent's dynamic
+ * grounding block this deliberately returns no notes, source paths or template
+ * instructions: the prose-only call gets imitation evidence, not workflow text.
+ */
+export function isolatedWriterVoiceSample(
+  project: WriterProject,
+  store: WriterStore,
+  targetPath?: string,
+  random: () => number = Math.random,
+): string {
+  const projectSample = pickProjectVoiceSample(project, targetPath);
+  if (projectSample) return projectSample.text.slice(-1_200);
+
+  const config = project.config();
+  const template = config.style ? project.styleTemplate(config.style) : undefined;
+  const example = pickStyleExamples(store, template?.name, undefined, random)[0];
+  if (example) return sampleProseWindow(example.content, 1_200, random);
+  return template?.exampleContent ? sampleProseWindow(template.exampleContent, 1_200, random) : "";
+}
+
+/**
  * Lightweight rhythm fingerprint. No longer injected into writing prompts
  * (statistical style summaries do not anchor imitation — raw prose does);
  * kept for diagnostics, tests and potential UI display.

@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Columns3,
   Copy,
+  Download,
   Drama,
   Eye,
   EyeOff,
@@ -41,6 +42,7 @@ import {
 } from "lucide-react";
 import { Marked, type Token, type Tokens } from "marked";
 import { documentDiff, renderDiffHtml } from "../diff";
+import { characterEditorSaveInput } from "../character_editor_payload";
 import { CharacterEditor } from "./character_editor";
 import {
   apiUrl,
@@ -73,8 +75,35 @@ type Message = {
   role: string;
   content: string;
   channel?: "agent" | "roleplay";
+  roleplayInputMode?: RoleplayInputMode;
+  roleplayPerception?: string;
+  roleplayPerceptionData?: RoleplayPerceptionProjection;
   variantGroupId?: string;
   variantCount?: number;
+};
+type RoleplayPerceptionProjection = {
+  speech: string[];
+  knowableFacts: string[];
+  unknowableFacts: string[];
+  potentialSensations: string[];
+};
+type RoleplayRerunDirection = "shorter" | "more_emotional" | "less_explanation" | "dialogue_only" | "with_action" | "no_question";
+const ROLEPLAY_RERUN_DIRECTION_OPTIONS: Array<{ id: RoleplayRerunDirection; label: string }> = [
+  { id: "shorter", label: "更简短" },
+  { id: "more_emotional", label: "更有情绪" },
+  { id: "less_explanation", label: "少解释" },
+  { id: "dialogue_only", label: "只说台词" },
+  { id: "with_action", label: "加入动作" },
+  { id: "no_question", label: "不要提问" },
+];
+type RoleplayBranchSummary = {
+  id: string;
+  groupId: string;
+  fromMessageId: number;
+  label: string;
+  preview: string;
+  messageCount: number;
+  createdAt: string;
 };
 type MessageVersionBundle = {
   current: number;
@@ -184,6 +213,8 @@ type Character = {
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StepUsage = {
+  model?: string;
+  providerName?: string;
   promptTokens: number;
   completionTokens: number;
   cacheHitTokens: number;
@@ -194,6 +225,8 @@ type StepUsage = {
   estimated?: boolean;
   cacheHitRate?: number;
   callBreakdown?: Array<{
+    model?: string;
+    providerName?: string;
     callKind: string;
     promptTokens: number;
     completionTokens: number;
@@ -276,6 +309,7 @@ type Provider = {
   apiKeyHint: string;
   source: "project" | "environment";
   pricing: {
+    billingMode?: "metered" | "unmetered";
     cacheHit: number;
     cacheMiss: number;
     output: number;
@@ -596,6 +630,15 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   }
 }
 
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 function activeStepIndex(steps: StreamStep[]): number {
   for (let i = steps.length - 1; i >= 0; i -= 1) {
     if (steps[i].status === "running") return i;
@@ -604,6 +647,16 @@ function activeStepIndex(steps: StreamStep[]): number {
 }
 
 const STEP_TRAIL_STORAGE_KEY = "writer-agent-step-trails";
+const STEP_TRAIL_MAX_SESSIONS = 20;
+const STEP_TRAIL_MAX_TEXT_LENGTH = 24_000;
+const STEP_TRAIL_MAX_STORAGE_LENGTH = 2_500_000;
+
+function compactStepTrailText(value: string): string {
+  if (value.length <= STEP_TRAIL_MAX_TEXT_LENGTH) return value;
+  const tailLength = 5_000;
+  const headLength = STEP_TRAIL_MAX_TEXT_LENGTH - tailLength;
+  return `${value.slice(0, headLength)}\n\n[内容过长，已截断]\n\n${value.slice(-tailLength)}`;
+}
 
 function readStepTrailMap(): Record<string, StoredStepTrail> {
   try {
@@ -625,22 +678,43 @@ function loadStepTrail(sessionId: string): StoredStepTrail | null {
 
 function saveStepTrail(sessionId: string, messageId: number, steps: StreamStep[]): void {
   if (!sessionId || !steps.length) return;
-  // Only persist completed trails against real message ids (not optimistic temp ids).
-  if (!Number.isFinite(messageId) || messageId <= 0) return;
+  // Negative ids are optimistic anchors. Persist them too so a refresh during a job
+  // does not erase the trail before the server assigns the real message id.
+  if (!Number.isFinite(messageId) || messageId === 0) return;
   const map = readStepTrailMap();
   map[sessionId] = {
     sessionId,
     messageId,
-    steps: steps.map((step) => ({ ...step, expanded: false })),
+    steps: steps.map((step) => ({
+      ...step,
+      output: compactStepTrailText(step.output),
+      reasoning: compactStepTrailText(step.reasoning),
+      expanded: false,
+    })),
     updatedAt: new Date().toISOString(),
   };
-  // Cap stored sessions to avoid unbounded localStorage growth.
+  // Bound both session count and serialized size. Full model output can otherwise
+  // exceed the browser quota and make setItem fail without preserving this run.
   const entries = Object.entries(map).sort((a, b) => (b[1].updatedAt || "").localeCompare(a[1].updatedAt || ""));
-  const trimmed = Object.fromEntries(entries.slice(0, 40));
+  const kept = entries.slice(0, STEP_TRAIL_MAX_SESSIONS);
+  let serialized = JSON.stringify(Object.fromEntries(kept));
+  while (serialized.length > STEP_TRAIL_MAX_STORAGE_LENGTH && kept.length > 1) {
+    kept.pop();
+    serialized = JSON.stringify(Object.fromEntries(kept));
+  }
   try {
-    localStorage.setItem(STEP_TRAIL_STORAGE_KEY, JSON.stringify(trimmed));
+    localStorage.setItem(STEP_TRAIL_STORAGE_KEY, serialized);
   } catch {
-    /* quota / private mode */
+    // Other local data may consume the quota. Retry after evicting older trails.
+    while (kept.length > 1) {
+      kept.pop();
+      try {
+        localStorage.setItem(STEP_TRAIL_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)));
+        return;
+      } catch {
+        /* keep evicting */
+      }
+    }
   }
 }
 
@@ -712,6 +786,10 @@ function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?: boole
 function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
   const withUsage = steps.filter((step) => step.usage);
   if (!withUsage.length) return undefined;
+  const models = [...new Set(withUsage.flatMap(step =>
+    step.usage?.callBreakdown?.map(call => call.model).filter((model): model is string => Boolean(model))
+      ?? (step.usage?.model ? [step.usage.model] : []),
+  ))];
   const currency = withUsage.find((step) => step.usage!.cost > 0)?.usage?.currency
     ?? withUsage[0].usage!.currency
     ?? "CNY";
@@ -719,6 +797,7 @@ function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
   const measuredHits = measured.reduce((sum, step) => sum + (step.usage?.cacheHitTokens ?? 0), 0);
   const measuredMisses = measured.reduce((sum, step) => sum + (step.usage?.cacheMissTokens ?? 0), 0);
   return {
+    ...(models.length ? { model: models.length === 1 ? models[0] : "多个模型" } : {}),
     promptTokens: withUsage.reduce((sum, step) => sum + (step.usage?.promptTokens ?? 0), 0),
     completionTokens: withUsage.reduce((sum, step) => sum + (step.usage?.completionTokens ?? 0), 0),
     cacheHitTokens: withUsage.reduce((sum, step) => sum + (step.usage?.cacheHitTokens ?? 0), 0),
@@ -892,6 +971,84 @@ function Markdown({ content, className, headingPrefix }: { content: string; clas
       className={`markdown ${className ?? ""}`}
       dangerouslySetInnerHTML={{ __html: html || "<p></p>" }}
     />
+  );
+}
+
+function shortProviderName(value?: string): string {
+  const full = value?.trim();
+  return full ? Array.from(full).slice(0, 2).join("") : "未知";
+}
+
+function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }: {
+  content: string;
+  data?: RoleplayPerceptionProjection;
+  disabled?: boolean;
+  onSave: (value: RoleplayPerceptionProjection) => Promise<void>;
+  onReplay: (value: RoleplayPerceptionProjection) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<RoleplayPerceptionProjection | null>(null);
+  const [saving, setSaving] = useState(false);
+  const beginEdit = () => {
+    if (!data) return;
+    setDraft({ ...data, speech: [...data.speech], knowableFacts: [...data.knowableFacts], unknowableFacts: [...data.unknowableFacts], potentialSensations: [...data.potentialSensations] });
+    setEditing(true);
+  };
+  const setLines = (key: keyof RoleplayPerceptionProjection, value: string) => {
+    setDraft(current => current ? { ...current, [key]: value.split("\n").map(item => item.trim()).filter(Boolean) } : current);
+  };
+  const submit = async (replay: boolean) => {
+    if (!draft || saving) return;
+    setSaving(true);
+    try {
+      if (replay) await onReplay(draft);
+      else await onSave(draft);
+      setEditing(false);
+    } finally { setSaving(false); }
+  };
+  const perceptionGroups = data ? [
+    { key: "speech", label: "话语", items: data.speech },
+    { key: "knowable", label: "可知事实", items: data.knowableFacts },
+    { key: "unknowable", label: "不可知事实", items: data.unknowableFacts },
+    { key: "sensations", label: "潜在感受", items: data.potentialSensations },
+  ].filter(group => group.items.length > 0) : [];
+  return (
+    <details className="roleplay-perception-details">
+      <summary>角色感知</summary>
+      {!editing ? (
+        <>
+          {data ? (
+            <div className="roleplay-perception-content">
+              {perceptionGroups.length ? perceptionGroups.map(group => (
+                <div className="roleplay-perception-group" key={group.key}>
+                  <span>{group.label}</span>
+                  <div>{group.items.map((item, index) => <p key={`${group.key}-${index}`}>{item}</p>)}</div>
+                </div>
+              )) : (
+                <p className="roleplay-perception-empty">没有可确认的可感知内容</p>
+              )}
+            </div>
+          ) : (
+            <Markdown content={content} className="roleplay-perception-content roleplay-perception-legacy" />
+          )}
+          {data && <button className="roleplay-perception-edit" type="button" disabled={disabled} onClick={beginEdit} title="修正角色实际能够感知的内容">
+            <Pencil size={13} aria-hidden="true" />编辑感知
+          </button>}
+        </>
+      ) : draft ? (
+        <div className="roleplay-perception-editor">
+          <label><span>话语</span><textarea value={draft.speech.join("\n")} onChange={event => setLines("speech", event.target.value)} /></label>
+          <label><span>可知事实</span><textarea value={draft.knowableFacts.join("\n")} onChange={event => setLines("knowableFacts", event.target.value)} /></label>
+          <label><span>不可知事实</span><textarea value={draft.unknowableFacts.join("\n")} onChange={event => setLines("unknowableFacts", event.target.value)} /></label>
+          <label><span>潜在感受</span><textarea value={draft.potentialSensations.join("\n")} onChange={event => setLines("potentialSensations", event.target.value)} /></label>
+          <div className="roleplay-perception-actions">
+            <button type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
+            <button type="button" disabled={saving} onClick={() => void submit(false)}><Save size={13} aria-hidden="true" />保存</button>
+            <button type="button" className="primary" disabled={saving} onClick={() => void submit(true)}><RefreshCw size={13} aria-hidden="true" />保存并重演</button>
+          </div>
+        </div>
+      ) : null}
+    </details>
   );
 }
 
@@ -1321,7 +1478,9 @@ function FileTreeItem({
 
 function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => void }) {
   const label =
-    step.status === "running"
+    step.id === 0
+      ? "Planning"
+      : step.status === "running"
       ? `Step ${step.id}`
       : step.status === "failed"
         ? `Step ${step.id} failed`
@@ -1364,6 +1523,8 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               ? (
                 <>
                   本步 token{step.usage.estimated ? "（估算）" : ""}：
+                  总计 {step.usage.totalTokens.toLocaleString()}
+                  {" · "}
                   输入 {step.usage.promptTokens.toLocaleString()}
                   {" · "}输出 {step.usage.completionTokens.toLocaleString()}
                   {" · "}缓存 {step.usage.cacheHitTokens.toLocaleString()}
@@ -1377,20 +1538,43 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
               )
               : "本步暂无 token 数据（供应商未返回 usage 且未能估算）"}
           </div>
-          {(step.usage?.callBreakdown?.length ?? 0) > 1 ? (
+          {step.usage && ((step.usage.callBreakdown?.length ?? 0) > 0 || step.usage.model) ? (
             <details className="agent-step-context-breakdown" open>
               <summary>模型调用明细</summary>
               <div className="agent-step-context-list">
-                {step.usage!.callBreakdown!.map((call, index) => {
+                {(step.usage.callBreakdown?.length
+                  ? step.usage.callBreakdown
+                  : [{
+                      model: step.usage.model,
+                      providerName: step.usage.providerName,
+                      callKind: "本步汇总",
+                      promptTokens: step.usage.promptTokens,
+                      completionTokens: step.usage.completionTokens,
+                      cacheHitTokens: step.usage.cacheHitTokens,
+                      cacheMissTokens: step.usage.cacheMissTokens,
+                      cost: step.usage.cost,
+                      currency: step.usage.currency,
+                    }]).map((call, index) => {
                   const measured = call.cacheHitTokens + call.cacheMissTokens;
                   const rate = measured > 0 ? call.cacheHitTokens / measured : 0;
                   return (
-                    <div className="agent-step-context-row" key={`${call.callKind}-${index}`}>
-                      <span>{call.callKind}</span>
-                      <span>
-                        输入 {call.promptTokens.toLocaleString()} · 缓存 {(rate * 100).toFixed(1)}% · 输出 {call.completionTokens.toLocaleString()}
-                        {call.cost > 0 ? ` · ${call.currency === "CNY" ? "¥" : "$"}${call.cost.toFixed(6)}` : ""}
-                      </span>
+                    <div className="agent-step-context-row agent-step-model-call-row" key={`${call.model ?? "unknown"}-${call.callKind}-${index}`}>
+                      <div className="agent-step-model-call-heading">
+                        <span className="agent-step-provider-chip" title={call.providerName?.trim() || "供应商信息未记录"}>
+                          {shortProviderName(call.providerName)}
+                        </span>
+                        <strong title={call.model ?? "未知模型"}>{call.model ?? "未知模型"}</strong>
+                        <span>{call.callKind}</span>
+                      </div>
+                      <div className="agent-step-model-call-metrics">
+                        <span><small>总计</small>{(call.promptTokens + call.completionTokens).toLocaleString()}</span>
+                        <span><small>输入</small>{call.promptTokens.toLocaleString()}</span>
+                        <span><small>输出</small>{call.completionTokens.toLocaleString()}</span>
+                        <span><small>缓存</small>{call.cacheHitTokens.toLocaleString()} <em>{(rate * 100).toFixed(1)}%</em></span>
+                        {call.cost > 0
+                          ? <span><small>费用</small>{call.currency === "CNY" ? "¥" : "$"}{call.cost.toFixed(6)}</span>
+                          : null}
+                      </div>
                     </div>
                   );
                 })}
@@ -1434,6 +1618,7 @@ function WorkspaceTopbar({
   usagePct,
   usageCost,
   usageCurrency,
+  usageUnmetered,
   busy,
   theme,
   settingsOpen,
@@ -1459,6 +1644,7 @@ function WorkspaceTopbar({
   usagePct: number;
   usageCost: number;
   usageCurrency: string;
+  usageUnmetered: boolean;
   busy: boolean;
   theme: UiThemeId;
   settingsOpen: boolean;
@@ -1517,7 +1703,7 @@ function WorkspaceTopbar({
             <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
           </span>
           <span>{usagePct}%</span>
-          <span className="usage-cost">{usageCurrency === "CNY" ? "¥" : "$"}{usageCost.toFixed(4)}</span>
+          <span className="usage-cost">{usageUnmetered ? "非按量计费" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(4)}`}</span>
           <ChevronDown size={13} aria-hidden="true" />
         </button>
         <div className="settings-anchor">
@@ -1541,6 +1727,8 @@ function WorkspaceTopbar({
 
 function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, callKind = "unspecified"): StepUsage {
   const nextCall = {
+    model: next.model,
+    providerName: next.providerName,
     callKind,
     promptTokens: next.promptTokens,
     completionTokens: next.completionTokens,
@@ -1555,6 +1743,8 @@ function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, cal
   const cacheMissTokens = current.cacheMissTokens + next.cacheMissTokens;
   const estimated = Boolean(current.estimated || next.estimated);
   return {
+    model: current.model === next.model ? current.model : "多个模型",
+    providerName: current.providerName === next.providerName ? current.providerName : undefined,
     promptTokens: current.promptTokens + next.promptTokens,
     completionTokens: current.completionTokens + next.completionTokens,
     cacheHitTokens,
@@ -1600,6 +1790,7 @@ function App() {
     localStorage.getItem("writer-documents-collapsed") === "true",
   );
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [focusedExportBusy, setFocusedExportBusy] = useState(false);
   const [sessionBatchMode, setSessionBatchMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [messageVersionViews, setMessageVersionViews] = useState<Record<number, MessageVersionBundle>>({});
@@ -1612,7 +1803,15 @@ function App() {
   const [branchConfirm, setBranchConfirm] = useState<{
     mode: "edit" | "rerun";
     message: Message;
+    inputMode?: RoleplayInputMode;
+    rerunDirections: RoleplayRerunDirection[];
+    perceptionOverride?: RoleplayPerceptionProjection;
   } | null>(null);
+  const [roleplayBranchTimeline, setRoleplayBranchTimeline] = useState<{
+    message: Message;
+    branches: RoleplayBranchSummary[];
+  } | null>(null);
+  const [roleplayBranchBusy, setRoleplayBranchBusy] = useState(false);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
@@ -1659,6 +1858,7 @@ function App() {
   const [directorSuggestions, setDirectorSuggestions] = useState<string[]>([]);
   const [directorSuggestionBusy, setDirectorSuggestionBusy] = useState(false);
   const [directorSuggestionError, setDirectorSuggestionError] = useState("");
+  const [roleplayAutoReplyBusy, setRoleplayAutoReplyBusy] = useState<"performer" | "identity" | null>(null);
   const [roleplaySetupBusy, setRoleplaySetupBusy] = useState(false);
   const [roleplaySetupPhase, setRoleplaySetupPhase] = useState<RoleplaySetupPhase | null>(null);
   const [roleplaySetupElapsed, setRoleplaySetupElapsed] = useState(0);
@@ -1674,12 +1874,24 @@ function App() {
   const abortRef = useRef<AbortController | undefined>(undefined);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
+  const streamStepsRef = useRef<StreamStep[]>([]);
+  const streamStepsAnchorIdRef = useRef<number | null>(null);
   const sessionIdRef = useRef<string | undefined>(undefined);
   const todosCompletionRef = useRef({ sessionId: "", complete: false });
   const activePathRef = useRef(activePath);
   const editingDocumentRef = useRef(editingDocument);
   activePathRef.current = activePath;
   editingDocumentRef.current = editingDocument;
+  const updateStreamSteps = useCallback((update: React.SetStateAction<StreamStep[]>) => {
+    const current = streamStepsRef.current;
+    const next = typeof update === "function" ? update(current) : update;
+    streamStepsRef.current = next;
+    setStreamSteps(next);
+  }, []);
+  const updateStreamStepsAnchorId = useCallback((messageId: number | null) => {
+    streamStepsAnchorIdRef.current = messageId;
+    setStreamStepsAnchorId(messageId);
+  }, []);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const createInputRef = useRef<HTMLInputElement>(null);
   const fileSearchRef = useRef<HTMLInputElement>(null);
@@ -1775,8 +1987,8 @@ function App() {
     if (options?.clearStorage) {
       clearStepTrail(options.sessionId ?? sessionIdRef.current ?? "");
     }
-    setStreamSteps([]);
-    setStreamStepsAnchorId(null);
+    updateStreamSteps([]);
+    updateStreamStepsAnchorId(null);
     streamOutputRef.current = "";
   }, []);
 
@@ -1937,11 +2149,11 @@ function App() {
       setCollapsedAssistantIds(new Set());
       const trail = loadStepTrail(nextId);
       if (trail) {
-        setStreamSteps(restoreTrailSteps(trail));
-        setStreamStepsAnchorId(trail.messageId);
+        updateStreamSteps(restoreTrailSteps(trail));
+        updateStreamStepsAnchorId(trail.messageId);
       } else {
-        setStreamSteps([]);
-        setStreamStepsAnchorId(null);
+        updateStreamSteps([]);
+        updateStreamStepsAnchorId(null);
       }
       setNotice("");
       setError("");
@@ -1977,22 +2189,38 @@ function App() {
     if (streamSteps.length > 0) return;
     const trail = loadStepTrail(state.sessionId);
     if (!trail) return;
-    const messageStillExists = state.messages.some((msg) => msg.id === trail.messageId);
-    if (!messageStillExists) {
+    const messageStillExists = trail.messageId < 0 || state.messages.some((msg) => msg.id === trail.messageId);
+    // A paginated initial response may not include an older anchor yet. Only delete
+    // the trail when all messages are loaded and the positive id is truly gone.
+    if (!messageStillExists && !state.messagesHasMore) {
       clearStepTrail(state.sessionId);
       return;
     }
-    setStreamSteps(restoreTrailSteps(trail));
-    setStreamStepsAnchorId(trail.messageId);
-  }, [state?.sessionId, state?.messages, busy, streamSteps.length]);
+    updateStreamSteps(restoreTrailSteps(trail));
+    updateStreamStepsAnchorId(trail.messageId);
+  }, [state?.sessionId, state?.messages, state?.messagesHasMore, busy, streamSteps.length, updateStreamSteps]);
 
   // Persist live/completed steps locally (collapsed) for the current user message.
   useEffect(() => {
     const sessionId = state?.sessionId;
-    if (!sessionId || streamStepsAnchorId == null || streamStepsAnchorId <= 0) return;
+    if (!sessionId || streamStepsAnchorId == null || streamStepsAnchorId === 0) return;
     if (!streamSteps.length) return;
-    saveStepTrail(sessionId, streamStepsAnchorId, streamSteps);
+    const timer = window.setTimeout(() => {
+      saveStepTrail(sessionId, streamStepsAnchorId, streamSteps);
+    }, 400);
+    return () => window.clearTimeout(timer);
   }, [state?.sessionId, streamStepsAnchorId, streamSteps]);
+
+  useEffect(() => {
+    const persistBeforeUnload = () => {
+      const sessionId = sessionIdRef.current;
+      const anchorId = streamStepsAnchorIdRef.current;
+      if (!sessionId || anchorId == null || anchorId === 0 || !streamStepsRef.current.length) return;
+      saveStepTrail(sessionId, anchorId, streamStepsRef.current);
+    };
+    window.addEventListener("beforeunload", persistBeforeUnload);
+    return () => window.removeEventListener("beforeunload", persistBeforeUnload);
+  }, []);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -2018,7 +2246,7 @@ function App() {
       || showUsagePopover || settingsMenuOpen || managementView !== null
       || styleDraft !== null || characterDraft !== null || simpleCardDraft !== null
       || roleplaySetup !== null || roleplaySceneDraft !== null || roleplayFactDraft !== null
-      || branchConfirm !== null;
+      || branchConfirm !== null || roleplayBranchTimeline !== null;
     if (!overlayOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -2033,6 +2261,7 @@ function App() {
       if (roleplaySceneDraft) { setRoleplaySceneDraft(null); return; }
       if (roleplaySetup && !roleplaySetupBusy) { setRoleplaySetup(null); return; }
       if (branchConfirm) { setBranchConfirm(null); return; }
+      if (roleplayBranchTimeline) { setRoleplayBranchTimeline(null); return; }
       if (settingsMenuOpen) { setSettingsMenuOpen(false); return; }
       if (showUsagePopover) { setShowUsagePopover(false); return; }
       if (showThemePicker) { setShowThemePicker(false); return; }
@@ -2051,7 +2280,7 @@ function App() {
   }, [
     showThemePicker, showStylePicker, showConnectionPanel, showUsagePopover, settingsMenuOpen,
     managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
-    roleplaySceneDraft, roleplayFactDraft, branchConfirm,
+    roleplaySceneDraft, roleplayFactDraft, branchConfirm, roleplayBranchTimeline,
   ]);
 
   useEffect(() => {
@@ -2185,7 +2414,7 @@ function App() {
 
   function handleAgentEvent(event: AgentStreamEvent) {
     if (event.type === "step_start") {
-      setStreamSteps((current) => {
+      updateStreamSteps((current) => {
         const id = event.step ?? current.length + 1;
         if (current.some((s) => s.id === id)) return current;
         // New steps stay collapsed; expand only on user click. Content still streams into state.
@@ -2194,7 +2423,7 @@ function App() {
     }
     if (event.type === "text" && event.text) {
       if (event.channel !== "reasoning") streamOutputRef.current += event.text;
-      setStreamSteps((current) => {
+      updateStreamSteps((current) => {
         const idx = activeStepIndex(current);
         if (idx < 0) return current;
         const key = event.channel === "reasoning" ? "reasoning" : "output";
@@ -2202,7 +2431,7 @@ function App() {
       });
     }
     if (event.type === "tool" && event.name) {
-      setStreamSteps((current) => {
+      updateStreamSteps((current) => {
         const idx = activeStepIndex(current);
         return current.map((s, i) => (i === idx ? { ...s, tools: [...s.tools, event.name!] } : s));
       });
@@ -2212,24 +2441,35 @@ function App() {
         setState((prev) => (prev ? { ...prev, usage: event.usage! } : prev));
       }
       if (event.call) {
-        setStreamSteps((current) => {
+        updateStreamSteps((current) => {
           const targetId = event.step;
           const idx = targetId != null
             ? current.findIndex((s) => s.id === targetId)
             : activeStepIndex(current);
-          if (idx < 0) return current;
+          if (idx < 0) {
+            if (targetId == null) return current;
+            return [...current, {
+              id: targetId,
+              output: "",
+              reasoning: "",
+              tools: [],
+              status: "completed" as const,
+              expanded: false,
+              usage: mergeStepCallUsage(undefined, event.call!, event.callKind),
+            }].sort((left, right) => left.id - right.id);
+          }
           return current.map((s, i) => (i === idx ? { ...s, usage: mergeStepCallUsage(s.usage, event.call!, event.callKind) } : s));
         });
       }
     }
     if (event.type === "step_done") {
-      setStreamSteps((current) =>
+      updateStreamSteps((current) =>
         current.map((s) => (s.id === event.step ? { ...s, status: "completed", expanded: false } : s)),
       );
     }
     if (event.type === "error") {
       setError(event.message || "Agent failed");
-      setStreamSteps((current) =>
+      updateStreamSteps((current) =>
         current.map((s) => (s.status === "running" ? { ...s, status: "failed", expanded: false } : s)),
       );
     }
@@ -2265,7 +2505,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 } }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -2283,7 +2523,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 } }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -2318,6 +2558,7 @@ function App() {
           const line = block.split(/\r?\n/).find((item) => item.startsWith("data:"));
           if (!line) continue;
           const event = JSON.parse(line.slice(5)) as AgentStreamEvent;
+          if (sessionIdRef.current !== sessionId) continue;
           handleAgentEvent(event);
           if (event.type === "proposal" && event.proposal) completedProposal = event.proposal;
           if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
@@ -2328,13 +2569,18 @@ function App() {
         if (done) break;
       }
       if (terminal) {
+        if (sessionIdRef.current !== sessionId) return;
         // Intentionally keep streamSteps so the tool trail stays visible after completion.
         // Re-anchor to the persisted user message id (temp negative ids are replaced by refresh).
         const next = await refresh(sessionId);
         const lastUser = [...next.messages]
           .reverse()
           .find((msg) => msg.role === "user" && msg.content.trim());
-        setStreamStepsAnchorId(lastUser?.id ?? null);
+        const anchorId = lastUser?.id ?? streamStepsAnchorIdRef.current;
+        updateStreamStepsAnchorId(anchorId);
+        if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
+          saveStepTrail(sessionId, anchorId, streamStepsRef.current);
+        }
         // Auto mode may have written the open document; reload so the editor matches disk.
         const pathToReload = activePathRef.current;
         if (pathToReload && !editingDocumentRef.current) {
@@ -2348,24 +2594,6 @@ function App() {
           }
         }
         if (clearContextOnDone && terminalType === "done") {
-          // Client safety net: if server still has open todos after a successful job, show them closed.
-          // Persist path is server-side; this only heals stale UI if an older process missed finalize.
-          const openTodos = (next.todos ?? []).filter(
-            (item) => item.status === "pending" || item.status === "in_progress",
-          );
-          if (openTodos.length > 0) {
-            setState((prev) => {
-              if (!prev?.todos?.length) return prev;
-              return {
-                ...prev,
-                todos: prev.todos.map((item) =>
-                  item.status === "pending" || item.status === "in_progress"
-                    ? { ...item, status: "completed" as const }
-                    : item,
-                ),
-              };
-            });
-          }
           const pendingCount = (next.proposals ?? []).filter((item) => item.status === "pending").length;
           setNotice(
             completedProposal?.status === "accepted"
@@ -2396,22 +2624,36 @@ function App() {
   }
 
   useEffect(() => {
-    const job = state?.activeJobs?.[0];
+    const currentSessionId = state?.sessionId;
+    const job = state?.activeJobs?.find(item => item.sessionId === currentSessionId);
     if (!job || currentJobRef.current === job.id) return;
-    setStreamSteps([]);
+    updateStreamSteps([]);
     streamOutputRef.current = "";
-    const lastUser = [...(state.messages ?? [])]
+    const lastUser = [...(state?.messages ?? [])]
       .reverse()
       .find((msg) => msg.role === "user" && msg.content.trim());
-    setStreamStepsAnchorId(lastUser?.id ?? null);
+    updateStreamStepsAnchorId(lastUser?.id ?? null);
     void subscribeAgentJob(job.id, job.sessionId);
-  }, [state?.activeJobs?.[0]?.id]);
+  }, [state?.sessionId, state?.activeJobs]);
+
+  useEffect(() => {
+    if (!state?.activeJobs?.length) return;
+    const timer = window.setInterval(() => {
+      void api<{ activeJobs: AgentJob[] }>("/api/chat/jobs")
+        .then(result => setState(current => current ? { ...current, activeJobs: result.activeJobs } : current))
+        .catch(() => undefined);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [Boolean(state?.activeJobs?.length)]);
 
   async function sendChat(options?: {
     text?: string;
     channel?: "agent" | "roleplay";
+    inputMode?: RoleplayInputMode;
     variantGroupId?: string;
     replaceFromId?: number;
+    rerunDirections?: RoleplayRerunDirection[];
+    perceptionOverride?: RoleplayPerceptionProjection;
   }) {
     const text = (options?.text ?? prompt).trim();
     const requestedChannel = options?.channel ?? composerBranch?.channel;
@@ -2429,8 +2671,8 @@ function App() {
     setNotice("");
     // New turn replaces the previous trail for this session.
     clearStepTrail(state.sessionId);
-    setStreamSteps([]);
-    setStreamStepsAnchorId(tempMessageId);
+    updateStreamSteps([]);
+    updateStreamStepsAnchorId(tempMessageId);
     streamOutputRef.current = "";
     setState((value) =>
       value
@@ -2443,6 +2685,7 @@ function App() {
               role: "user",
               content: text,
               channel: activeRoleplay ? "roleplay" : "agent",
+              ...(activeRoleplay ? { roleplayInputMode: options?.inputMode ?? roleplayInputMode } : {}),
             },
           ],
         }
@@ -2461,22 +2704,27 @@ function App() {
           .filter((card) => !agentHiddenCharacterCards.has(`simple:${card.id}`))
           .map((card) => card.id)
         : undefined;
-      const result = await api<{ jobId: string }>("/api/chat", {
+      const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           sessionId: state.sessionId,
           prompt: text,
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           ...(variantGroupId ? { variantGroupId } : {}),
+          ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
+          ...(options?.perceptionOverride ? { perceptionOverride: options.perceptionOverride } : {}),
           ...(!activeRoleplay ? {
             ...(characterScope !== undefined ? { characterScope } : {}),
             ...(simpleCharacterScope !== undefined ? { simpleCharacterScope } : {}),
           } : {}),
           ...(activeRoleplay
-            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: roleplayInputMode }
+            ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: options?.inputMode ?? roleplayInputMode }
             : {}),
         }),
       });
+      setState(current => current
+        ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
+        : current);
       setComposerBranch(null);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
@@ -2508,21 +2756,41 @@ function App() {
       setError("当前角色扮演身份已退出，无法编辑这条扮演消息。");
       return;
     }
-    setBranchConfirm({ mode: "edit", message });
+    setBranchConfirm({
+      mode: "edit",
+      message,
+      inputMode: message.channel === "roleplay" ? message.roleplayInputMode ?? "dialogue" : undefined,
+      rerunDirections: [],
+    });
   }
 
-  function requestRerunMessage(message: Message) {
+  function requestRerunMessage(message: Message, perceptionOverride?: RoleplayPerceptionProjection) {
     if (!state || busy || message.id < 1) return;
     if (message.channel === "roleplay" && !roleplay) {
       setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
       return;
     }
-    setBranchConfirm({ mode: "rerun", message });
+    const sourceUser = message.role === "user"
+      ? message
+      : [...state.messages].reverse().find(item => item.id <= message.id && item.role === "user" && item.channel === "roleplay");
+    const inputMode = sourceUser
+      ? sourceUser.roleplayInputMode ?? "dialogue"
+      : undefined;
+    const sourcePerception = inputMode === "director"
+      ? undefined
+      : perceptionOverride ?? sourceUser?.roleplayPerceptionData;
+    setBranchConfirm({
+      mode: "rerun",
+      message,
+      inputMode,
+      rerunDirections: [],
+      perceptionOverride: sourcePerception,
+    });
   }
 
   async function confirmBranchAction(keepChanges: boolean) {
     if (!state || !branchConfirm) return;
-    const { mode, message } = branchConfirm;
+    const { mode, message, inputMode, rerunDirections, perceptionOverride } = branchConfirm;
     setBranchConfirm(null);
     setError("");
     setNotice("");
@@ -2535,6 +2803,8 @@ function App() {
         channel: "agent" | "roleplay";
         variantGroupId: string;
         keepChanges?: boolean;
+        inputMode?: RoleplayInputMode;
+        modelInitiatedRoleplay?: "opening";
       }>(`/api/messages/${message.id}/rerun`, {
         method: "POST",
         body: JSON.stringify({ sessionId: state.sessionId, keepChanges }),
@@ -2557,16 +2827,28 @@ function App() {
           fromId: result.fromId,
         });
         setPrompt(result.prompt);
+        if (result.channel === "roleplay") setRoleplayInputMode(inputMode ?? result.inputMode ?? "dialogue");
         await refresh(state.sessionId);
         requestAnimationFrame(() => composerRef.current?.focus());
         return;
       }
       setComposerBranch(null);
+      if (result.modelInitiatedRoleplay === "opening") {
+        await requestRoleplayOpening({
+          variantGroupId: result.variantGroupId,
+          replaceFromId: result.fromId,
+          rerunDirections,
+        });
+        return;
+      }
       await sendChat({
         text: result.prompt,
         channel: result.channel,
+        inputMode: inputMode ?? result.inputMode,
         variantGroupId: result.variantGroupId,
         replaceFromId: result.fromId,
+        rerunDirections,
+        perceptionOverride: (inputMode ?? result.inputMode) === "director" ? undefined : perceptionOverride,
       });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -2772,7 +3054,10 @@ function App() {
 
   async function saveCharacter() {
     if (!characterDraft?.identity.name.trim()) return;
-    await api("/api/characters", { method: "POST", body: JSON.stringify(characterDraft) });
+    await api("/api/characters", {
+      method: "POST",
+      body: JSON.stringify(characterEditorSaveInput(characterDraft)),
+    });
     setCharacterDraft(null);
     await refresh(state?.sessionId);
   }
@@ -3003,34 +3288,105 @@ function App() {
     }
   }
 
-  async function requestRoleplayOpening() {
+  async function requestRoleplayOpening(options?: {
+    variantGroupId?: string;
+    replaceFromId?: number;
+    rerunDirections?: RoleplayRerunDirection[];
+  }) {
     if (!state || busy || !roleplay) return;
     setError("");
     setNotice("");
     clearStepTrail(state.sessionId);
-    setStreamSteps([]);
+    updateStreamSteps([]);
     // No user bubble for an opening; anchor the live stream to a temp id so it renders via the orphan path.
-    setStreamStepsAnchorId(-Date.now());
+    updateStreamStepsAnchorId(-Date.now());
     streamOutputRef.current = "";
+    if (options?.replaceFromId !== undefined) {
+      setState(current => current ? {
+        ...current,
+        messages: current.messages.filter(message => message.id < options.replaceFromId!),
+      } : current);
+    }
     try {
-      const result = await api<{ jobId: string }>("/api/chat", {
+      const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           sessionId: state.sessionId,
           prompt: "",
           mode: "roleplay",
           opening: true,
+          ...(options?.variantGroupId ? { variantGroupId: options.variantGroupId } : {}),
+          ...(options?.rerunDirections?.length ? { rerunDirections: options.rerunDirections } : {}),
           permissionMode: state.agentSettings?.permissionMode ?? "ask",
           performer: roleplay.performer,
           identity: roleplay.identity,
           scene: roleplay.scene,
         }),
       });
+      setState(current => current
+        ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
+        : current);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
       clearAgentStream();
+    }
+  }
+
+  async function requestPerformerAutoReply() {
+    if (!state || busy || roleplayAutoReplyBusy || !roleplay) return;
+    setRoleplayAutoReplyBusy("performer");
+    setError("");
+    setNotice("");
+    clearStepTrail(state.sessionId);
+    updateStreamSteps([]);
+    updateStreamStepsAnchorId(-Date.now());
+    streamOutputRef.current = "";
+    try {
+      const result = await api<{ jobId: string; job: AgentJob }>("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: state.sessionId,
+          prompt: "",
+          mode: "roleplay",
+          performerAutoReply: true,
+          permissionMode: state.agentSettings?.permissionMode ?? "ask",
+          performer: roleplay.performer,
+          identity: roleplay.identity,
+          scene: roleplay.scene,
+        }),
+      });
+      setState(current => current
+        ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
+        : current);
+      await subscribeAgentJob(result.jobId, state.sessionId, true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(false);
+      clearAgentStream();
+    } finally {
+      setRoleplayAutoReplyBusy(null);
+    }
+  }
+
+  async function requestRoleplayAutoReply() {
+    if (!state?.sessionId || !roleplay || busy || roleplayAutoReplyBusy) return;
+    setRoleplayAutoReplyBusy("identity");
+    setError("");
+    setNotice("");
+    try {
+      const result = await api<{ reply: string }>("/api/roleplay/auto-reply", {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setRoleplayInputMode("dialogue");
+      setPrompt(result.reply);
+      requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRoleplayAutoReplyBusy(null);
     }
   }
 
@@ -3048,6 +3404,69 @@ function App() {
   function openProviderSettings() {
     setSettingsMenuOpen(false);
     setManagementView("models");
+  }
+
+  async function saveRoleplayPerception(message: Message, perception: RoleplayPerceptionProjection): Promise<void> {
+    if (!state) return;
+    const result = await api<{ perception: RoleplayPerceptionProjection; display: string }>(
+      `/api/roleplay/messages/${message.id}/perception`,
+      { method: "PUT", body: JSON.stringify({ sessionId: state.sessionId, perception }) },
+    );
+    setState(current => current ? {
+      ...current,
+      messages: current.messages.map(item => item.id === message.id
+        ? { ...item, roleplayPerception: result.display, roleplayPerceptionData: result.perception }
+        : item),
+    } : current);
+  }
+
+  async function saveAndReplayRoleplayPerception(message: Message, perception: RoleplayPerceptionProjection): Promise<void> {
+    await saveRoleplayPerception(message, perception);
+    requestRerunMessage({ ...message, roleplayPerceptionData: perception }, perception);
+  }
+
+  async function openRoleplayBranchTimeline(message: Message) {
+    if (!state || !message.variantGroupId) return;
+    try {
+      const result = await api<{ branches: RoleplayBranchSummary[] }>(
+        `/api/roleplay/branches?session=${encodeURIComponent(state.sessionId)}&group=${encodeURIComponent(message.variantGroupId)}`,
+      );
+      setRoleplayBranchTimeline({ message, branches: result.branches });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function activateRoleplayBranch(branch: RoleplayBranchSummary) {
+    if (!state || roleplayBranchBusy) return;
+    setRoleplayBranchBusy(true);
+    try {
+      await api(`/api/roleplay/branches/${encodeURIComponent(branch.id)}/activate`, {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.sessionId }),
+      });
+      setRoleplayBranchTimeline(null);
+      setMessageVersionViews({});
+      clearAgentStream({ abort: true, clearStorage: true, sessionId: state.sessionId });
+      await refresh(state.sessionId);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setRoleplayBranchBusy(false); }
+  }
+
+  async function exportFocusedDocument() {
+    if (!activePath) return;
+    const path = activePath;
+    setFocusedExportBusy(true);
+    setError("");
+    try {
+      const content = browsingVersion?.afterContent
+        ?? (await api<DocumentData>(`/api/document?path=${encodeURIComponent(path)}`)).content;
+      const filename = path.split("/").at(-1) || "document.md";
+      downloadBlob(new Blob([content], { type: "text/markdown;charset=utf-8" }), filename);
+      setNotice(`已下载 ${filename}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setFocusedExportBusy(false);
+    }
   }
 
   async function deleteCharacter(character: Character) {
@@ -3087,6 +3506,7 @@ function App() {
   }
 
   function toggleSessionSelected(id: string) {
+    if (state?.activeJobs?.some(job => job.sessionId === id)) return;
     setSelectedSessionIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -3114,7 +3534,6 @@ function App() {
 
   const pendingProposals = state.proposals.filter((p) => p.status === "pending");
   const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
-  const visibleChangeSets = state.changeSets.filter((item) => item.status !== "rejected").slice(0, 10);
   const visibleMessages = state.messages.filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.content.trim());
   const usagePct = state.provider.pricing.contextWindow
     ? Math.round((state.usage.lastPromptTokens / state.provider.pricing.contextWindow) * 100)
@@ -3144,6 +3563,7 @@ function App() {
         usagePct={usagePct}
         usageCost={state.usage.cost}
         usageCurrency={state.usage.currency}
+        usageUnmetered={state.provider.pricing.billingMode === "unmetered"}
         busy={busy}
         theme={theme}
         settingsOpen={settingsMenuOpen}
@@ -3396,6 +3816,11 @@ function App() {
               </div>
             )}
             <div className="editor-bar-actions">
+              {!editingDocument && (
+                <button disabled={!activePath || focusedExportBusy} onClick={() => void exportFocusedDocument()} title="下载当前正在浏览的 Markdown 文件">
+                  <Download size={14} />下载
+                </button>
+              )}
               {browsingVersion ? (
                 <button className="primary" onClick={exitVersionBrowse} title="回到磁盘上的当前版本">
                   返回当前
@@ -3623,16 +4048,41 @@ function App() {
                 <button type="button" className={roleplayInputMode === "dialogue" ? "active" : ""} onClick={() => setRoleplayInputMode("dialogue")}>角色内</button>
                 <button type="button" className={roleplayInputMode === "director" ? "active" : ""} onClick={() => setRoleplayInputMode("director")}>导演</button>
               </div>
-              <div className="roleplay-action-group">
-                <button type="button" disabled={busy} title={`让「${roleplay.performer.name}」根据场景先开口`} onClick={() => void requestRoleplayOpening()}>主动开场</button>
-                <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)}>事实记忆</button>
+              <div className="roleplay-action-group roleplay-action-group-primary">
+                <button type="button" disabled={busy} title={`让「${roleplay.performer.name}」根据场景先开口`} onClick={() => void requestRoleplayOpening()}>
+                  <Drama size={13} aria-hidden="true" />主动开场
+                </button>
+                <button
+                  type="button"
+                  className="roleplay-primary-action"
+                  disabled={busy || Boolean(roleplayAutoReplyBusy)}
+                  title={`让「${roleplay.performer.name}」在没有新玩家输入时继续演绎当前场景`}
+                  onClick={() => void requestPerformerAutoReply()}
+                >
+                  <MessageSquare size={13} aria-hidden="true" />{roleplayAutoReplyBusy === "performer" ? "续演中…" : "角色续演"}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || Boolean(roleplayAutoReplyBusy)}
+                  title={`让「${roleplay.identity.name}」生成一段简短的下一轮草稿`}
+                  onClick={() => void requestRoleplayAutoReply()}
+                >
+                  <WandSparkles size={13} aria-hidden="true" />{roleplayAutoReplyBusy === "identity" ? "生成中…" : "身份代答"}
+                </button>
                 {roleplay.identity.kind === "generated" && (
                   <button type="button" disabled={busy} onClick={() => void saveCurrentRoleplayInterlocutor()}>保存身份</button>
                 )}
               </div>
               <div className="roleplay-action-group roleplay-action-group-secondary">
-                <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()}>更换设定</button>
-                <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()}>退出</button>
+                <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
+                  <History size={13} aria-hidden="true" /><span>记忆</span>
+                </button>
+                <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()} title="更换角色与场景设定">
+                  <Settings size={13} aria-hidden="true" /><span>设定</span>
+                </button>
+                <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()} title="退出角色扮演">
+                  <X size={13} aria-hidden="true" /><span>退出</span>
+                </button>
               </div>
             </div>
           </div>
@@ -3706,7 +4156,14 @@ function App() {
               ) : (
                 <div className="msg-label">
                   <span>You</span>
-                  {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
+                  {msg.channel === "roleplay" ? (
+                    <span
+                      className="msg-channel-tag"
+                      title={msg.roleplayInputMode === "director" ? "导演指示" : "角色内消息"}
+                    >
+                      {msg.roleplayInputMode === "director" ? "导演" : "扮演"}
+                    </span>
+                  ) : null}
                 </div>
               )}
               {msg.role === "assistant" ? (
@@ -3714,7 +4171,20 @@ function App() {
                   ? <p className="msg-preview">{messagePreview(displayContent)}</p>
                   : <Markdown content={displayContent} />
               ) : (
-                <div>{displayContent}</div>
+                <>
+                  {msg.channel === "roleplay"
+                    ? <Markdown content={displayContent} />
+                    : <div>{displayContent}</div>}
+                  {msg.channel === "roleplay" && msg.roleplayPerception
+                    ? <RoleplayPerceptionDetails
+                        content={msg.roleplayPerception}
+                        data={msg.roleplayPerceptionData}
+                        disabled={busy}
+                        onSave={(value) => saveRoleplayPerception(msg, value)}
+                        onReplay={(value) => saveAndReplayRoleplayPerception(msg, value)}
+                      />
+                    : null}
+                </>
               )}
               {msg.id > 0 && <div className="message-actions">
                 {(msg.variantCount ?? 1) > 1 && (() => {
@@ -3736,6 +4206,9 @@ function App() {
                 })()}
                 {msg.role === "user" && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
                 <button disabled={busy} onClick={() => requestRerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
+                {msg.channel === "roleplay" && msg.variantGroupId && (msg.variantCount ?? 1) > 1
+                  ? <button disabled={busy} onClick={() => void openRoleplayBranchTimeline(msg)} title="查看并切换这一轮保存的完整对话分支">分支</button>
+                  : null}
                 {msg.channel === "roleplay" && <button disabled={busy} onClick={() => { setRoleplayFactDraft(newFactDraft(msg)); setRoleplayMemoryOpen(true); }} title="把这条消息保存为可纠错的事实记忆">记住</button>}
               </div>}
             </article>
@@ -3748,7 +4221,7 @@ function App() {
                     key={step.id}
                     step={step}
                     onToggle={() =>
-                      setStreamSteps((current) =>
+                      updateStreamSteps((current) =>
                         current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
                       )
                     }
@@ -3777,7 +4250,7 @@ function App() {
                   key={`orphan-${step.id}`}
                   step={step}
                   onToggle={() =>
-                    setStreamSteps((current) =>
+                    updateStreamSteps((current) =>
                       current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
                     )
                   }
@@ -3807,9 +4280,9 @@ function App() {
             </button>
           )}
         </div>
-        {(visibleChangeSets.length > 0 || pendingProposals.length > 0) && (
+        {(pendingChangeSets.length > 0 || pendingProposals.length > 0) && (
           <ReviewDock
-            changeSets={visibleChangeSets}
+            changeSets={pendingChangeSets}
             proposals={pendingProposals}
             pendingCount={pendingChangeSets.length + pendingProposals.length}
             open={reviewOpen}
@@ -3828,7 +4301,7 @@ function App() {
                     <small>推荐用于推进与校准剧情</small>
                   </div>
                   <button type="button" disabled={busy || directorSuggestionBusy} onClick={() => void requestDirectorSuggestions()}>
-                    {directorSuggestionBusy ? "推荐中…" : directorSuggestions.length ? "换一组" : "Flash 推荐"}
+                    {directorSuggestionBusy ? "建议生成中…" : directorSuggestions.length ? "换一组" : "导演建议"}
                   </button>
                 </div>
                 <p>说明场景、时间、节奏、角色态度或新增前提；角色对白请切回「角色内」。</p>
@@ -3847,7 +4320,7 @@ function App() {
                           {suggestion}
                         </button>
                       ))
-                    : <span className="director-mode-empty">使用通用 Flash 模型，根据当前场景与最近对话生成可直接发送的指令。</span>}
+                    : <span className="director-mode-empty">由当前角色模型读取现场目标、张力与最近对话，生成三个具体的下一拍选择。</span>}
                 </div>
               </div>
             )}
@@ -3872,7 +4345,7 @@ function App() {
                   ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
                   : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
                 : "Describe your writing task… (Ctrl+Enter to send)"}
-              disabled={busy}
+              disabled={busy || Boolean(roleplayAutoReplyBusy)}
             />
             <div className="composer-actions">
               <span className="composer-hint">
@@ -3881,7 +4354,7 @@ function App() {
               <button
                 className={`composer-send ${busy ? "stop" : "primary"}`}
                 onClick={busy ? stop : () => void sendChat()}
-                disabled={!busy && !prompt.trim()}
+                disabled={Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim())}
               >
                 {busy ? "Stop" : "Send"}
               </button>
@@ -3911,6 +4384,52 @@ function App() {
               当前回答会保存为历史版本；此消息之后的对话会撤销。
               已接受的<strong>文档修改</strong>与<strong>角色卡修改</strong>可选择保留或回退。
             </p>
+            {branchConfirm.message.channel === "roleplay" && branchConfirm.inputMode && (
+              <div className="roleplay-input-mode" role="group" aria-label="重新发送的角色扮演输入模式">
+                <button
+                  type="button"
+                  className={branchConfirm.inputMode === "dialogue" ? "active" : ""}
+                  onClick={() => setBranchConfirm(current => current ? { ...current, inputMode: "dialogue" } : current)}
+                >
+                  角色内
+                </button>
+                <button
+                  type="button"
+                  className={branchConfirm.inputMode === "director" ? "active" : ""}
+                  onClick={() => setBranchConfirm(current => current ? {
+                    ...current,
+                    inputMode: "director",
+                    perceptionOverride: undefined,
+                  } : current)}
+                >
+                  导演
+                </button>
+              </div>
+            )}
+            {branchConfirm.mode === "rerun" && branchConfirm.message.channel === "roleplay" && (
+              <fieldset className="roleplay-rerun-directions">
+                <legend>定向重演 <small>最多选择 3 项</small></legend>
+                <div>
+                  {ROLEPLAY_RERUN_DIRECTION_OPTIONS.map(option => {
+                    const checked = branchConfirm.rerunDirections.includes(option.id);
+                    return <label key={option.id}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={!checked && branchConfirm.rerunDirections.length >= 3}
+                        onChange={() => setBranchConfirm(current => current ? {
+                          ...current,
+                          rerunDirections: checked
+                            ? current.rerunDirections.filter(item => item !== option.id)
+                            : [...current.rerunDirections, option.id],
+                        } : current)}
+                      />
+                      <span>{option.label}</span>
+                    </label>;
+                  })}
+                </div>
+              </fieldset>
+            )}
             <div className="modal-actions branch-confirm-actions">
               <button type="button" onClick={() => setBranchConfirm(null)}>取消</button>
               <button
@@ -3930,6 +4449,34 @@ function App() {
                 保留更改
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {roleplayBranchTimeline && (
+        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => !roleplayBranchBusy && setRoleplayBranchTimeline(null)}>
+          <div className="modal roleplay-branch-modal" role="dialog" aria-modal="true" aria-labelledby="roleplay-branch-title" onMouseDown={event => event.stopPropagation()}>
+            <span className="eyebrow">Roleplay branches</span>
+            <h2 id="roleplay-branch-title">分支时间线</h2>
+            <p>切换会同时恢复该分支的消息、角色感知、现场记忆和来源事实。</p>
+            <div className="roleplay-branch-list">
+              <div className="roleplay-branch-item current">
+                <div><strong>当前分支</strong><span>正在使用的对话上下文</span></div>
+                <span className="roleplay-branch-current">当前</span>
+              </div>
+              {roleplayBranchTimeline.branches.map((branch, index) => (
+                <div className="roleplay-branch-item" key={branch.id}>
+                  <div>
+                    <strong>版本 {roleplayBranchTimeline.branches.length - index}</strong>
+                    <span>{branch.preview || branch.label}</span>
+                    <small>{new Date(branch.createdAt).toLocaleString()} · {branch.messageCount} 条消息</small>
+                  </div>
+                  <button type="button" disabled={roleplayBranchBusy} onClick={() => void activateRoleplayBranch(branch)}>切换</button>
+                </div>
+              ))}
+              {!roleplayBranchTimeline.branches.length && <div className="roleplay-branch-empty">还没有可切换的历史分支。</div>}
+            </div>
+            <div className="modal-actions"><button type="button" disabled={roleplayBranchBusy} onClick={() => setRoleplayBranchTimeline(null)}>关闭</button></div>
           </div>
         </div>
       )}
@@ -4118,7 +4665,7 @@ function App() {
       )}
 
       {simpleCardDraft && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSimpleCardDraft(null)}>
+        <div className="modal-backdrop nested" role="presentation" onMouseDown={() => setSimpleCardDraft(null)}>
           <div className="modal roleplay-setup-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
             <span className="eyebrow">Simple character card</span>
             <h2>{simpleCardDraft.id ? "编辑简易角色卡" : "新建简易角色卡"}</h2>
@@ -4547,7 +5094,9 @@ function App() {
               <div className="usage-detail-row">
                 <span className="usage-detail-label">累计费用</span>
                 <span className="usage-detail-value usage-number">
-                  {state.usage.currency === "CNY" ? "¥" : "$"}{state.usage.cost.toFixed(4)}
+                  {state.provider.pricing.billingMode === "unmetered"
+                    ? "非按量计费"
+                    : `${state.usage.currency === "CNY" ? "¥" : "$"}${state.usage.cost.toFixed(4)}`}
                 </span>
               </div>
             </div>
@@ -4750,9 +5299,12 @@ function App() {
                     <label className="session-batch-select-all">
                       <input
                         type="checkbox"
-                        checked={state.sessions.length > 0 && selectedSessionIds.size === state.sessions.length}
+                        checked={state.sessions.some(session => !state.activeJobs?.some(job => job.sessionId === session.id))
+                          && selectedSessionIds.size === state.sessions.filter(session => !state.activeJobs?.some(job => job.sessionId === session.id)).length}
                         onChange={(e) => {
-                          if (e.target.checked) setSelectedSessionIds(new Set(state.sessions.map((s) => s.id)));
+                          if (e.target.checked) setSelectedSessionIds(new Set(state.sessions
+                            .filter(session => !state.activeJobs?.some(job => job.sessionId === session.id))
+                            .map(session => session.id)));
                           else setSelectedSessionIds(new Set());
                         }}
                       />
@@ -4770,9 +5322,11 @@ function App() {
                   </div>
                 )}
                 <div className="session-list">
-                  {state.sessions.map((session) => (
+                  {state.sessions.map((session) => {
+                    const running = state.activeJobs?.some(job => job.sessionId === session.id) ?? false;
+                    return (
                     <div
-                      className={`session-card ${session.id === state.sessionId ? "active" : ""} ${selectedSessionIds.has(session.id) ? "selected" : ""}`}
+                      className={`session-card ${session.id === state.sessionId ? "active" : ""} ${selectedSessionIds.has(session.id) ? "selected" : ""} ${running ? "running" : ""}`}
                       key={session.id}
                     >
                       {sessionBatchMode && (
@@ -4780,6 +5334,7 @@ function App() {
                           <input
                             type="checkbox"
                             checked={selectedSessionIds.has(session.id)}
+                            disabled={running}
                             onChange={() => toggleSessionSelected(session.id)}
                           />
                         </label>
@@ -4804,14 +5359,16 @@ function App() {
                         <span>{new Date(session.updatedAt).toLocaleString()}</span>
                       </button>
                       {session.id === state.sessionId && <span className="current-badge">Current</span>}
+                      {running && <span className="session-running-badge"><span aria-hidden="true" />Running</span>}
                       {!sessionBatchMode && (
                         <>
                           <button className="icon" aria-label="重命名会话" title="重命名" onClick={() => void renameSession(session.id, session.title)}><Pencil size={15} /></button>
-                          <button className="icon danger" aria-label="删除会话" title="删除" onClick={() => void deleteSession(session.id)}><Trash2 size={15} /></button>
+                          <button className="icon danger" aria-label="删除会话" title={running ? "任务运行时不能删除" : "删除"} disabled={running} onClick={() => void deleteSession(session.id)}><Trash2 size={15} /></button>
                         </>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                   {state.sessions.length === 0 && <div className="management-empty">暂无会话</div>}
                 </div>
               </div>
@@ -4835,7 +5392,7 @@ function App() {
 
       {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
-        scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5 }}
+        scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
         request={api}
         onClose={() => setManagementView(null)}
         onChanged={() => { void refresh(state.sessionId); }}

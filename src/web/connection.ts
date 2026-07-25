@@ -54,6 +54,15 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+function isCloudflareTunnelUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname.toLowerCase().endsWith(".trycloudflare.com");
+  } catch {
+    return false;
+  }
+}
+
 function isLoopbackBase(value: string): boolean {
   try {
     const hostname = new URL(value).hostname.toLowerCase();
@@ -168,7 +177,7 @@ function parseBootstrapHash(): { token?: string; tokenless?: boolean; lan?: stri
     token: tokenValue,
     tokenless: params.get("auth") === "none",
     lan: lan && isHttpUrl(lan) ? normalizeBase(lan) : undefined,
-    public: pub && isHttpUrl(pub) ? normalizeBase(pub) : undefined,
+    public: pub && isCloudflareTunnelUrl(pub) ? new URL(pub).origin : undefined,
   };
 }
 
@@ -199,13 +208,15 @@ export function initConnection(): string {
   const pageIsTunnel = typeof location !== "undefined" && /trycloudflare\.com$/i.test(location.hostname);
 
   lanBase = boot.lan
-    || (restoreStoredConnection ? stored?.lanBase : undefined)
     || (pageIsLan ? pageOrigin : null)
+    || (restoreStoredConnection ? stored?.lanBase : undefined)
     || null;
 
   publicBase = boot.public
-    || (restoreStoredConnection ? stored?.publicBase : undefined)
     || (pageIsTunnel ? pageOrigin : null)
+    || (restoreStoredConnection && stored?.publicBase && isCloudflareTunnelUrl(stored.publicBase)
+      ? new URL(stored.publicBase).origin
+      : undefined)
     || null;
 
   // 当前页自身也是一端时补全
@@ -265,6 +276,25 @@ export function subscribeConnection(listener: Listener): () => void {
   };
 }
 
+function syncPublicBase(value: unknown): void {
+  let next: string | null;
+  if (value === null) {
+    next = null;
+  } else {
+    if (typeof value !== "string" || !isCloudflareTunnelUrl(value)) return;
+    try {
+      const parsed = new URL(value);
+      next = parsed.origin;
+    } catch {
+      return;
+    }
+  }
+  if (publicBase === next) return;
+  publicBase = next;
+  persist();
+  emit();
+}
+
 async function probe(base: string): Promise<boolean> {
   if (!canFetchBase(base) || (!token && !tokenless && !isLoopbackBase(base))) return false;
   try {
@@ -273,7 +303,12 @@ async function probe(base: string): Promise<boolean> {
       signal: timeoutSignal(PROBE_MS),
       cache: "no-store",
     });
-    return response.ok;
+    if (!response.ok) return false;
+    const health = await response.json().catch(() => null) as { publicOrigin?: unknown } | null;
+    if (health && Object.prototype.hasOwnProperty.call(health, "publicOrigin")) {
+      syncPublicBase(health.publicOrigin);
+    }
+    return true;
   } catch {
     return false;
   }
@@ -336,31 +371,35 @@ export async function ensureConnection(): Promise<ConnectionInfo> {
     return currentInfo();
   }
   selecting = (async () => {
-    if (preference === "lan" && lanBase && canFetchBase(lanBase)) {
-      if (await probe(lanBase)) {
-        setRoute("lan", lanBase);
+    // Capture candidates for this selection pass. A health response may update the
+    // latest tunnel address while these probes are in flight.
+    const preferredLan = lanBase;
+    const preferredPublic = publicBase;
+    if (preference === "lan" && preferredLan && canFetchBase(preferredLan)) {
+      if (await probe(preferredLan)) {
+        setRoute("lan", preferredLan);
         return;
       }
       // 锁定局域网但不可达：若公网可用则降级并保留偏好（回家后监控会再试局域网）
-      if (publicBase && canFetchBase(publicBase) && await probe(publicBase)) {
-        setRoute("public", publicBase);
+      if (preferredPublic && canFetchBase(preferredPublic) && await probe(preferredPublic)) {
+        setRoute("public", preferredPublic);
         return;
       }
     }
-    if (preference === "public" && publicBase && canFetchBase(publicBase)) {
-      if (await probe(publicBase)) {
-        setRoute("public", publicBase);
+    if (preference === "public" && preferredPublic && canFetchBase(preferredPublic)) {
+      if (await probe(preferredPublic)) {
+        setRoute("public", preferredPublic);
         return;
       }
     }
     if (preference === "auto" || preference === "lan") {
-      if (lanBase && canFetchBase(lanBase) && await probe(lanBase)) {
-        setRoute("lan", lanBase);
+      if (preferredLan && canFetchBase(preferredLan) && await probe(preferredLan)) {
+        setRoute("lan", preferredLan);
         return;
       }
     }
-    if (publicBase && canFetchBase(publicBase) && await probe(publicBase)) {
-      setRoute("public", publicBase);
+    if (preferredPublic && canFetchBase(preferredPublic) && await probe(preferredPublic)) {
+      setRoute("public", preferredPublic);
       return;
     }
     // 保底：当前页同源（可能尚未写入 public/lan）
@@ -403,11 +442,9 @@ export async function failoverFrom(failedBase?: string): Promise<boolean> {
 
 /** 后台监控：回家庭局域网、离开后切公网。 */
 export function startConnectionMonitor(): () => void {
-  if (!lanBase || !publicBase) return () => undefined;
-
   let stopped = false;
   const tick = () => {
-    if (stopped) return;
+    if (stopped || (!lanBase && !publicBase)) return;
     void ensureConnection();
   };
 

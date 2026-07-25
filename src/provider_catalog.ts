@@ -12,6 +12,15 @@ type ModelReference = { providerId: string; modelId: string };
 type SavedCatalog = { version: 2; activeProviderId: string; activeModelId: string; assignments: Record<ModelUsageRole, ModelReference>; providers: SavedProfile[] };
 type LegacyConfig = { provider: ProviderId; baseUrl: string; proxyUrl?: string; model: string; apiKey: string; pricing?: TokenPricing; temperature?: number; topP?: number };
 
+export type ScannedProviderModel = { name: string; pricing: TokenPricing };
+export type ScanProviderModelsInput = {
+  profileId?: string;
+  provider?: ProviderId;
+  baseUrl?: string;
+  proxyUrl?: string;
+  apiKey?: string;
+};
+
 export const DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"] as const;
 
 /** Canonical provider catalog filename under `.writer/` (portable; copy this file to migrate). */
@@ -33,7 +42,7 @@ export class ProviderManager {
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
     const { profile, model } = this.assigned(role); const baseUrl = process.env.WRITER_BASE_URL || profile.baseUrl;
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
+    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
   }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {
@@ -168,6 +177,33 @@ export class ProviderManager {
     };
   }
 
+  /** 读取 OpenAI 兼容供应商的模型目录，不保存或修改当前配置。 */
+  async scanModels(input: ScanProviderModelsInput = {}): Promise<{ models: ScannedProviderModel[] }> {
+    const profile = input.profileId
+      ? this.saved.providers.find(item => item.id === input.profileId)
+      : undefined;
+    if (input.profileId && !profile) throw new Error("供应商不存在");
+
+    const provider = validateProvider(input.provider ?? profile?.provider ?? "openai-compatible");
+    const baseUrl = normalizeBaseUrl(input.baseUrl ?? profile?.baseUrl ?? "");
+    const proxyUrl = input.proxyUrl !== undefined
+      ? normalizeProxyUrl(input.proxyUrl)
+      : profile?.proxyUrl;
+    const apiKey = input.apiKey?.trim() || profile?.apiKey || "";
+    if (!apiKey) throw new Error("请先配置 API Key");
+
+    const response = await modelFetch(`${baseUrl}/models`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(15_000),
+    }, proxyUrl);
+    if (!response.ok) {
+      throw new Error(`扫描模型失败（${response.status}）：${(await response.text()).slice(0, 300)}`);
+    }
+    const names = parseProviderModelIds(await response.json());
+    if (!names.length) throw new Error("供应商未返回可用的模型列表");
+    return { models: names.map(name => ({ name, pricing: defaultPricing(provider, name) })) };
+  }
+
   private active() { const profile = this.saved.providers.find(item => item.id === this.saved.activeProviderId) ?? this.saved.providers[0]; const model = profile.models.find(item => item.id === this.saved.activeModelId) ?? profile.models[0]; return { profile, model }; }
   private assigned(role: ModelUsageRole) { const ref = this.saved.assignments[role]; const profile = this.saved.providers.find(item => item.id === ref?.providerId) ?? this.active().profile; const model = profile.models.find(item => item.id === ref?.modelId) ?? profile.models[0]; return { profile, model }; }
   private publicProfile(profile: SavedProfile): ProviderProfilePublic { return { id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, proxyUrl: profile.proxyUrl, apiKeyConfigured: Boolean(profile.apiKey), apiKeyHint: maskKey(profile.apiKey), models: profile.models }; }
@@ -218,6 +254,27 @@ export class ProviderManager {
       try { unlinkSync(temporary); } catch { /* Windows 可能短暂锁定临时文件。 */ }
     }
   }
+}
+
+/** 解析常见的 OpenAI 兼容模型目录响应，并稳定去重、排序。 */
+export function parseProviderModelIds(payload: unknown): string[] {
+  const record = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : undefined;
+  const entries = Array.isArray(payload)
+    ? payload
+    : Array.isArray(record?.data)
+      ? record.data
+      : Array.isArray(record?.models)
+        ? record.models
+        : [];
+  const names = entries.flatMap((entry): string[] => {
+    if (typeof entry === "string") return entry.trim() ? [entry.trim()] : [];
+    if (!entry || typeof entry !== "object") return [];
+    const id = (entry as Record<string, unknown>).id;
+    return typeof id === "string" && id.trim() ? [id.trim()] : [];
+  });
+  return [...new Set(names)].sort((left, right) => left.localeCompare(right, "en"));
 }
 
 function resolveProvidersPath(project: WriterProject): string {

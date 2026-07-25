@@ -78,6 +78,12 @@ test("calculateUsageCost uses peak rates at peak time", () => {
   assert.equal(peakCost, 6);
 });
 
+test("unmetered pricing records no usage cost", () => {
+  const pricing = { ...defaultPricing("deepseek", "deepseek-v4-flash"), billingMode: "unmetered" as const };
+  const usage = { promptTokens: 1_000_000, completionTokens: 1_000_000, cacheHitTokens: 0, cacheMissTokens: 1_000_000 };
+  assert.equal(calculateUsageCost(usage, pricing, shanghaiTime(2026, 7, 12, 10, 0)), 0);
+});
+
 test("normalizePricing backfills peak billing for DeepSeek", () => {
   const normalized = normalizePricing("deepseek", "deepseek-v4-pro", undefined, {
     cacheHit: 0.025,
@@ -89,4 +95,15 @@ test("normalizePricing backfills peak billing for DeepSeek", () => {
   assert.ok(normalized.peakBilling);
   assert.equal(normalized.peakBilling!.cacheMiss, 6);
   assert.deepEqual(normalized.peakBilling!.windows, WINDOWS);
+});
+
+test("normalizePricing persists and can switch billing modes", () => {
+  const unmetered = normalizePricing("openai-compatible", "subscription-model", {
+    billingMode: "unmetered",
+  });
+  assert.equal(unmetered.billingMode, "unmetered");
+  const metered = normalizePricing("openai-compatible", "subscription-model", {
+    billingMode: "metered",
+  }, unmetered);
+  assert.equal(metered.billingMode, "metered");
 });

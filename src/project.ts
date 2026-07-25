@@ -19,7 +19,6 @@ import { getStyleTemplate, listStyleTemplates, normalizeStyleTemplate } from "./
 const DEFAULT_CONFIG: WriterConfig = {
   title: "未命名作品",
   language: "zh-CN",
-  chapters: ["chapters/chapter-001.md"],
   style: "",
 };
 
@@ -49,23 +48,10 @@ export function isScenePipelineDocument(path: string): boolean {
   return kind === "chapter" || kind === "side";
 }
 
-/**
- * Chapter documents in NARRATIVE order: writer.yaml's `chapters` list first
- * (it is appended to on every chapters/ write, so its order is authoring order),
- * then any unregistered chapter docs. Path sorting alone misorders hanzi-numbered
- * chapters（第一章/第二章/第十章）, so callers that need "the latest / previous
- * chapter" must use this instead of localeCompare.
- */
+/** Chapter documents in the natural path order exposed by the file manager. */
 export function orderedChapterPaths(project: WriterProject): string[] {
-  const visible = new Set(
-    project.listDocuments().filter(path => !project.isDocumentHidden(path)),
-  );
-  const registered = project.config().chapters.filter(path => visible.has(path));
-  const registeredSet = new Set(registered);
-  const rest = [...visible]
-    .filter(path => documentKind(path) === "chapter" && !registeredSet.has(path))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  return [...registered, ...rest];
+  return project.listDocuments()
+    .filter(path => documentKind(path) === "chapter" && !project.isDocumentHidden(path));
 }
 
 /** Resolve the primary outline markdown path for structured outline tools. */
@@ -157,13 +143,12 @@ export class WriterProject {
 
   config(): WriterConfig {
     const parsed = YAML.parse(this.readRaw("writer.yaml")) as Partial<WriterConfig> | null;
-    if (!parsed || typeof parsed.title !== "string" || !Array.isArray(parsed.chapters)) {
+    if (!parsed || typeof parsed.title !== "string") {
       throw new Error("writer.yaml 格式无效");
     }
     return {
       title: parsed.title,
       language: parsed.language || "zh-CN",
-      chapters: parsed.chapters.filter((item): item is string => typeof item === "string"),
       style: typeof parsed.style === "string" ? parsed.style : "",
     };
   }
@@ -344,23 +329,9 @@ export class WriterProject {
     }
   }
 
-  registerChapter(path: string): void {
-    path = normalizeDocumentPath(path);
-    if (!path.startsWith("chapters/") || !path.endsWith(".md")) return;
-    const config = this.config();
-    if (config.chapters.includes(path)) return;
-    config.chapters.push(path);
-    this.writeRaw("writer.yaml", YAML.stringify(config));
-  }
-
   removeDocument(path: string): void {
     path = normalizeDocumentPath(path);
     unlinkSync(this.resolveSafe(path));
-    if (path.startsWith("chapters/")) {
-      const config = this.config();
-      config.chapters = config.chapters.filter((chapter) => chapter !== path);
-      this.writeRaw("writer.yaml", YAML.stringify(config));
-    }
   }
 
   renameDocument(fromPath: string, toPath: string): void {
@@ -375,9 +346,6 @@ export class WriterProject {
     if (existsSync(to)) throw new Error("目标文档已经存在");
     mkdirSync(dirname(to), { recursive: true });
     renameSync(from, to);
-    const config = this.config();
-    config.chapters = config.chapters.map(path => path === fromPath ? toPath : path);
-    this.writeRaw("writer.yaml", YAML.stringify(config));
     if (wasHidden) this.writeVisibility([...this.hiddenDocuments(), toPath].filter(path => path !== fromPath).sort(), this.hiddenFolders());
   }
 
@@ -489,9 +457,6 @@ export class WriterProject {
     const rewritePath = (path: string) => path === fromFolder || path.startsWith(`${fromFolder}/`)
       ? `${toFolder}${path.slice(fromFolder.length)}`
       : path;
-    const config = this.config();
-    config.chapters = config.chapters.map(rewritePath);
-    this.writeRaw("writer.yaml", YAML.stringify(config));
     this.writeVisibility(
       hiddenDocuments.map(rewritePath).sort(),
       hiddenFolders.map(rewritePath).sort(),
@@ -620,7 +585,7 @@ export class WriterProject {
 
   export(format: "md" | "txt"): string {
     const config = this.config();
-    const parts = config.chapters.map((path) => this.read(path));
+    const parts = orderedChapterPaths(this).map((path) => this.read(path));
     if (format === "md") return `# ${config.title}\n\n${parts.join("\n\n---\n\n")}`;
     return `${config.title}\n\n${parts
       .join("\n\n")

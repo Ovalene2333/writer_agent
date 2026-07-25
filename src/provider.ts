@@ -40,6 +40,7 @@ export class ProviderManager {
     const baseUrl = process.env.WRITER_BASE_URL || this.saved.baseUrl;
     return {
       provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : this.saved.provider,
+      providerName: baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "API",
       baseUrl,
       apiKey: process.env.WRITER_API_KEY || this.saved.apiKey,
       model: process.env.WRITER_MODEL || this.saved.model,

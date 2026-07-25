@@ -8,7 +8,8 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
-    "test": "tsc -p tsconfig.json && node --test --test-isolation=none dist/characters.test.js dist/roleplay.test.js dist/agent_cache.test.js dist/agent_runtime.test.js dist/change_sets.test.js dist/tools/schema.test.js dist/creative_outline.test.js dist/outline.test.js dist/pricing.test.js dist/prose_quality.test.js dist/prose_metrics.test.js dist/scene_candidates.test.js dist/prose_adjudicate.test.js dist/diff.test.js dist/style_grounding.test.js dist/provider_catalog.test.js dist/server.test.js dist/share_tunnel.test.js dist/write_pack.test.js",
+    "test": "tsc -p tsconfig.json && node --test --test-isolation=none dist/characters.test.js dist/roleplay.test.js dist/agent_cache.test.js dist/agent_runtime.test.js dist/agentic_runtime.test.js dist/agent_eval.test.js dist/change_sets.test.js dist/tools/schema.test.js dist/creative_outline.test.js dist/outline.test.js dist/pricing.test.js dist/prose_quality.test.js dist/prose_metrics.test.js dist/scene_candidates.test.js dist/isolated_scene_writer.test.js dist/prose_adjudicate.test.js dist/diff.test.js dist/style_grounding.test.js dist/provider_catalog.test.js dist/server.test.js dist/share_tunnel.test.js dist/write_pack.test.js",
+    "eval:agent": "tsc -p tsconfig.json && node dist/cli.js agent-eval --provider-project ../jn2",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json"
   },

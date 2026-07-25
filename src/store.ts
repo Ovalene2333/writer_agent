@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
-  RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
+  RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
@@ -27,6 +27,32 @@ import { WriterProject } from "./project.js";
 
 type Row = Record<string, unknown>;
 type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
+
+export interface RoleplayBranchSummary {
+  id: string;
+  groupId: string;
+  fromMessageId: number;
+  label: string;
+  preview: string;
+  messageCount: number;
+  createdAt: string;
+}
+
+type RoleplayBranchPayload = {
+  messages: Array<{
+    id: number;
+    role: Message["role"];
+    content: string;
+    createdAt: string;
+    channel: MessageChannel;
+    variantGroupId?: string;
+    roleplayPerception?: string;
+    roleplayInputMode?: RoleplayInputMode;
+  }>;
+  memory?: RoleplaySessionMemory;
+  memorySnapshots: Array<{ throughMessageId: number; contextKey: string; memoryJson: string; createdAt: string }>;
+  facts: Array<Record<string, unknown>>;
+};
 
 function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[] {
   if (typeof value !== "string" || !value.trim()) return [];
@@ -102,6 +128,19 @@ export class WriterStore {
         created_at TEXT NOT NULL,
         UNIQUE(session_id, group_id, version_index)
       );
+      CREATE TABLE IF NOT EXISTS roleplay_branches (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        group_id TEXT NOT NULL,
+        base_message_id INTEGER NOT NULL,
+        from_message_id INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        preview TEXT NOT NULL DEFAULT '',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS roleplay_branches_group ON roleplay_branches(session_id,group_id,created_at);
       CREATE TABLE IF NOT EXISTS proposals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -283,6 +322,29 @@ export class WriterStore {
         undone INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS agent_evaluation_runs (
+        id TEXT PRIMARY KEY,
+        provider_source TEXT NOT NULL,
+        model TEXT NOT NULL,
+        status TEXT NOT NULL,
+        summary_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS agent_evaluation_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES agent_evaluation_runs(id) ON DELETE CASCADE,
+        case_id TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        expected_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        events_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, case_id)
+      );
+      CREATE INDEX IF NOT EXISTS agent_evaluation_cases_run ON agent_evaluation_cases(run_id, id);
       CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(path UNINDEXED, content);
     `);
     const revisionColumns = this.database.prepare("PRAGMA table_info(revisions)").all() as Row[];
@@ -321,6 +383,19 @@ export class WriterStore {
     if (!messageColumns.some(column => column.name === "variant_group_id")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN variant_group_id TEXT");
     }
+    if (!messageColumns.some(column => column.name === "roleplay_perception")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_perception TEXT");
+    }
+    if (!messageColumns.some(column => column.name === "roleplay_input_mode")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_input_mode TEXT");
+    }
+    this.database.exec(`UPDATE messages
+      SET roleplay_input_mode=CASE
+        WHEN roleplay_perception LIKE '［OOC 导演指示%' THEN 'director'
+        ELSE 'dialogue'
+      END
+      WHERE channel='roleplay' AND role='user'
+        AND roleplay_input_mode IS NULL`);
     const variantColumns = this.database.prepare("PRAGMA table_info(message_variants)").all() as Row[];
     if (!variantColumns.some(column => column.name === "prompt")) {
       this.database.exec("ALTER TABLE message_variants ADD COLUMN prompt TEXT NOT NULL DEFAULT ''");
@@ -517,6 +592,24 @@ export class WriterStore {
       beforeContent, afterContent, new Date().toISOString(),
     );
     return character;
+  }
+
+  applyCharacterChangesWithRevision(
+    sessionId: string,
+    messageId: number,
+    id: number,
+    input: ApplyCharacterChangesInput,
+  ): { character: Character; applied: AppliedCharacterChange[]; skipped: SkippedCharacterChange[] } {
+    const before = this.characters().find(item => item.id === id);
+    if (!before) throw new Error("要修改的角色不存在");
+    const result = this.applyCharacterChanges(id, input);
+    this.database.prepare(`INSERT INTO character_revisions(
+      session_id,message_id,character_id,before_file,after_file,before_content,after_content,created_at
+    ) VALUES(?,?,?,?,?,?,?,?)`).run(
+      sessionId, messageId, id, "characters.jsonl", "characters.jsonl",
+      JSON.stringify(before), JSON.stringify(result.character), new Date().toISOString(),
+    );
+    return result;
   }
 
   deleteCharacter(id: number): void {
@@ -1112,24 +1205,52 @@ export class WriterStore {
     return { deleted: unique, remainingSessionId };
   }
 
-  addMessage(sessionId: string, role: Message["role"], content: string, channel: MessageChannel = "agent", variantGroupId?: string): number {
+  addMessage(
+    sessionId: string,
+    role: Message["role"],
+    content: string,
+    channel: MessageChannel = "agent",
+    variantGroupId?: string,
+    roleplayInputMode?: RoleplayInputMode,
+  ): number {
     const now = new Date().toISOString();
     const normalized = channel === "roleplay" ? "roleplay" : "agent";
-    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id) VALUES(?,?,?,?,?,?)")
-      .run(sessionId, role, content, now, normalized, variantGroupId ?? null);
+    const normalizedInputMode = normalized === "roleplay" && role === "user"
+      && (roleplayInputMode === "director" || roleplayInputMode === "dialogue")
+      ? roleplayInputMode
+      : null;
+    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode) VALUES(?,?,?,?,?,?,?)")
+      .run(sessionId, role, content, now, normalized, variantGroupId ?? null, normalizedInputMode);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
     return Number(result.lastInsertRowid);
+  }
+
+  /** Persist the model-safe projection of a raw roleplay user turn. */
+  saveRoleplayPerception(sessionId: string, messageId: number, content: string): void {
+    const result = this.database.prepare(`UPDATE messages SET roleplay_perception=?
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .run(content.trim().slice(0, 8_000), sessionId, messageId);
+    if (!result.changes) throw new Error("角色扮演消息不存在");
+  }
+
+  roleplayPerception(sessionId: string, messageId: number): string | undefined {
+    const row = this.database.prepare(`SELECT roleplay_perception FROM messages
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .get(sessionId, messageId) as Row | undefined;
+    return typeof row?.roleplay_perception === "string" && row.roleplay_perception.trim()
+      ? row.roleplay_perception
+      : undefined;
   }
 
   messages(sessionId: string, limit = 30, options?: { channel?: MessageChannel }): Message[] {
     const channel = options?.channel;
     const rows = channel
       ? this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND channel=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, channel, limit)
       : this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -1163,10 +1284,10 @@ export class WriterStore {
     const afterId = Number.isInteger(options.afterId) && (options.afterId ?? 0) > 0 ? options.afterId! : 0;
     const limit = Math.max(1, Math.min(100, Math.round(options.limit ?? 40)));
     const rows = options.channel
-      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND channel=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, options.channel, afterId, limit)
-      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, afterId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -1176,13 +1297,77 @@ export class WriterStore {
   conversationMessagesBefore(sessionId: string, beforeId?: number, limit = 50): Message[] {
     const normalizedLimit = Math.max(1, Math.min(100, Math.round(limit)));
     const rows = beforeId !== undefined && Number.isInteger(beforeId) && beforeId > 0
-      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id<? ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, beforeId, normalizedLimit)
-      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id FROM messages
+      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
           WHERE session_id=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, normalizedLimit);
     return rows.map((row) => this.messageFromRow(row as Row));
+  }
+
+  createAgentEvaluationRun(providerSource: string, model: string): AgentEvaluationRun {
+    const now = new Date().toISOString();
+    this.database.prepare(`UPDATE agent_evaluation_runs
+      SET status='error',summary_json=?,completed_at=? WHERE status='running'`)
+      .run(JSON.stringify({ error: "evaluation process interrupted before completion" }), now);
+    const run: AgentEvaluationRun = {
+      id: randomUUID(),
+      providerSource,
+      model,
+      status: "running",
+      summary: {},
+      createdAt: now,
+    };
+    this.database.prepare(`INSERT INTO agent_evaluation_runs(id,provider_source,model,status,summary_json,created_at)
+      VALUES(?,?,?,?,?,?)`).run(run.id, run.providerSource, run.model, run.status, "{}", run.createdAt);
+    return run;
+  }
+
+  recordAgentEvaluationCase(input: {
+    runId: string;
+    caseId: string;
+    sessionId: string;
+    prompt: string;
+    status: Exclude<AgentEvaluationStatus, "running">;
+    expected: Record<string, unknown>;
+    result: Record<string, unknown>;
+    events: import("./types.js").AgentEvent[];
+  }): AgentEvaluationCaseResult {
+    const createdAt = new Date().toISOString();
+    const row = this.database.prepare(`INSERT INTO agent_evaluation_cases(run_id,case_id,session_id,prompt,status,expected_json,result_json,events_json,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?) RETURNING id`).get(
+      input.runId, input.caseId, input.sessionId, input.prompt, input.status,
+      JSON.stringify(input.expected), JSON.stringify(input.result), JSON.stringify(input.events), createdAt,
+    ) as Row;
+    return { id: Number(row.id), ...input, createdAt };
+  }
+
+  finishAgentEvaluationRun(
+    id: string,
+    status: Exclude<AgentEvaluationStatus, "running">,
+    summary: Record<string, unknown>,
+  ): AgentEvaluationRun {
+    const completedAt = new Date().toISOString();
+    this.database.prepare("UPDATE agent_evaluation_runs SET status=?,summary_json=?,completed_at=? WHERE id=?")
+      .run(status, JSON.stringify(summary), completedAt, id);
+    const run = this.agentEvaluationRun(id);
+    if (!run) throw new Error("Agent evaluation run 不存在");
+    return run;
+  }
+
+  agentEvaluationRun(id: string): AgentEvaluationRun | undefined {
+    const row = this.database.prepare("SELECT * FROM agent_evaluation_runs WHERE id=?").get(id) as Row | undefined;
+    if (!row) return undefined;
+    const cases = this.database.prepare("SELECT * FROM agent_evaluation_cases WHERE run_id=? ORDER BY id")
+      .all(id).map(value => this.agentEvaluationCaseFromRow(value as Row));
+    return this.agentEvaluationRunFromRow(row, cases);
+  }
+
+  listAgentEvaluationRuns(limit = 20): AgentEvaluationRun[] {
+    const bounded = Math.max(1, Math.min(100, Math.round(limit)));
+    return this.database.prepare("SELECT * FROM agent_evaluation_runs ORDER BY created_at DESC LIMIT ?")
+      .all(bounded).map(value => this.agentEvaluationRunFromRow(value as Row));
   }
 
   recordUsage(sessionId: string, model: string, usage: {
@@ -1217,6 +1402,50 @@ export class WriterStore {
     };
   }
 
+  private agentEvaluationRunFromRow(row: Row, cases?: AgentEvaluationCaseResult[]): AgentEvaluationRun {
+    let summary: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(String(row.summary_json ?? "{}")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) summary = parsed as Record<string, unknown>;
+    } catch { /* malformed historical summaries degrade to an empty object */ }
+    return {
+      id: String(row.id),
+      providerSource: String(row.provider_source),
+      model: String(row.model),
+      status: row.status as AgentEvaluationStatus,
+      summary,
+      createdAt: String(row.created_at),
+      ...(typeof row.completed_at === "string" ? { completedAt: row.completed_at } : {}),
+      ...(cases ? { cases } : {}),
+    };
+  }
+
+  private agentEvaluationCaseFromRow(row: Row): AgentEvaluationCaseResult {
+    const parseObject = (value: unknown): Record<string, unknown> => {
+      try {
+        const parsed = JSON.parse(String(value ?? "{}")) as unknown;
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      } catch { return {}; }
+    };
+    let events: import("./types.js").AgentEvent[] = [];
+    try {
+      const parsed = JSON.parse(String(row.events_json ?? "[]")) as unknown;
+      if (Array.isArray(parsed)) events = parsed as import("./types.js").AgentEvent[];
+    } catch { /* malformed historical event payloads degrade to [] */ }
+    return {
+      id: Number(row.id),
+      runId: String(row.run_id),
+      caseId: String(row.case_id),
+      sessionId: String(row.session_id),
+      prompt: String(row.prompt),
+      status: row.status as AgentEvaluationCaseResult["status"],
+      expected: parseObject(row.expected_json),
+      result: parseObject(row.result_json),
+      events,
+      createdAt: String(row.created_at),
+    };
+  }
+
   private messageFromRow(row: Row): Message {
     return {
       id: row.id as number,
@@ -1225,6 +1454,9 @@ export class WriterStore {
       content: row.content as string,
       createdAt: row.created_at as string,
       channel: row.channel === "roleplay" ? "roleplay" : "agent",
+      ...(row.roleplay_input_mode === "director" || row.roleplay_input_mode === "dialogue"
+        ? { roleplayInputMode: row.roleplay_input_mode }
+        : {}),
       ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
     };
   }
@@ -1564,11 +1796,10 @@ export class WriterStore {
     }
   }
 
-  private writeManagedTextFile(path: string, content: string): void {
-    if (path.toLowerCase().endsWith(".md")) {
-      this.project.writeRaw(path, content);
-      this.project.registerChapter(path);
-    } else this.project.writeTextFile(path, content);
+    private writeManagedTextFile(path: string, content: string): void {
+      if (path.toLowerCase().endsWith(".md")) {
+        this.project.writeRaw(path, content);
+      } else this.project.writeTextFile(path, content);
   }
 
   private removeManagedTextFile(path: string): void {
@@ -1659,7 +1890,6 @@ export class WriterStore {
     }
     const evolved = this.evolveCharactersForProposal(proposal.path, proposal.summary, proposal.characterChanges);
     this.project.writeRaw(proposal.path, proposal.afterContent);
-    this.project.registerChapter(proposal.path);
     if (evolved.revisions.length) this.writeCharacters(evolved.characters);
     const now = new Date().toISOString();
     this.database.prepare(`
@@ -1730,12 +1960,45 @@ export class WriterStore {
     }
     if (characterRevisions.length) validateCharacters(restoredCharacters, this.outlineNodeIds());
     this.project.writeRaw(path, row.after_content as string);
-    this.project.registerChapter(path);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=0 WHERE id=?").run(row.id as number);
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已重做文档修改：${path}`);
     return path;
+  }
+
+  private rewindProposalRevision(row: Row): { path: string; characterNames: string[] } {
+    const path = String(row.path);
+    const current = this.project.documentExists(path) ? this.project.read(path) : "";
+    if (this.project.hash(current) !== String(row.after_hash)) {
+      throw new Error(`文档已在提案通过后发生变化，无法安全回退：${path}`);
+    }
+    const revisions = parseProposalCharacterRevisions(row.character_revisions_json);
+    const restoredCharacters = this.reverseCharacterRevisions(revisions, "after");
+    if (Number(row.created_file) === 1) this.project.removeDocument(path);
+    else this.project.writeRaw(path, String(row.before_content));
+    if (revisions.length) this.writeCharacters(restoredCharacters);
+    this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(Number(row.id));
+    return {
+      path,
+      characterNames: revisions.map(revision => this.normalizeCharacter(revision.after).identity.name),
+    };
+  }
+
+  private rewindCharacterRevision(row: Row): string {
+    const after = this.normalizeCharacter(JSON.parse(String(row.after_content)) as Character);
+    const characters = this.characters();
+    const current = characters.find(item => item.id === after.id);
+    if (!current || JSON.stringify(current) !== JSON.stringify(after)) {
+      throw new Error(`角色卡 ${after.id} 已在修改后发生变化，无法安全回退`);
+    }
+    const restored = characters.filter(item => item.id !== after.id);
+    if (typeof row.before_content === "string") {
+      restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character));
+    }
+    this.writeCharacters(restored);
+    this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(Number(row.id));
+    return after.identity.name;
   }
 
   rewindFromMessage(
@@ -1756,40 +2019,32 @@ export class WriterStore {
     const undonePaths: string[] = [];
     const undoneCharacters: string[] = [];
     if (!keepChanges) {
-      const proposalsToUndo = (this.database.prepare(
-        "SELECT id, status FROM proposals WHERE session_id=? AND created_at>=? AND status='accepted' ORDER BY id DESC",
-      ).all(sessionId, fromTime) as Row[]);
-      for (const row of proposalsToUndo) {
-        const revRow = this.database.prepare(
-          "SELECT * FROM revisions WHERE proposal_id=? AND undone=0 ORDER BY id DESC LIMIT 1",
-        ).get(row.id as number) as Row | undefined;
-        if (!revRow) continue;
-        const path = revRow.path as string;
-        const current = this.project.documentExists(path) ? this.project.read(path) : "";
-        if (this.project.hash(current) !== revRow.after_hash) continue;
-        if (revRow.created_file === 1) this.project.removeDocument(path);
-        else this.project.writeRaw(path, revRow.before_content as string);
-        this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(revRow.id as number);
-        undonePaths.push(path);
-      }
-      const characterRows = this.database.prepare(
-        "SELECT * FROM character_revisions WHERE session_id=? AND message_id>=? AND undone=0 ORDER BY id DESC",
-      ).all(sessionId, fromId) as Row[];
-      for (const row of characterRows) {
-        let after: Character;
-        try { after = this.normalizeCharacter(JSON.parse(row.after_content as string) as Character); }
-        catch { continue; }
-        const characters = this.characters();
-        const current = characters.find(item => item.id === after.id);
-        if (!current || JSON.stringify(current) !== JSON.stringify(after)) continue;
-        let restored = characters.filter(item => item.id !== after.id);
-        if (typeof row.before_content === "string") {
-          try { restored.push(this.normalizeCharacter(JSON.parse(row.before_content) as Character)); }
-          catch { continue; }
+      const actions: Array<{ kind: "change_set" | "proposal" | "character"; createdAt: string; row: Row }> = [
+        ...(this.database.prepare(
+          "SELECT * FROM change_sets WHERE session_id=? AND created_at>=? AND status='accepted' AND undone=0",
+        ).all(sessionId, fromTime) as Row[]).map(row => ({ kind: "change_set" as const, createdAt: String(row.created_at), row })),
+        ...(this.database.prepare(`
+          SELECT r.* FROM revisions r
+          JOIN proposals p ON p.id=r.proposal_id
+          WHERE p.session_id=? AND p.created_at>=? AND p.status='accepted' AND r.undone=0
+        `).all(sessionId, fromTime) as Row[]).map(row => ({ kind: "proposal" as const, createdAt: String(row.created_at), row })),
+        ...(this.database.prepare(
+          "SELECT * FROM character_revisions WHERE session_id=? AND message_id>=? AND undone=0",
+        ).all(sessionId, fromId) as Row[]).map(row => ({ kind: "character" as const, createdAt: String(row.created_at), row })),
+      ].sort((left, right) => right.createdAt.localeCompare(left.createdAt) || Number(right.row.id) - Number(left.row.id));
+      for (const action of actions) {
+        if (action.kind === "change_set") {
+          const revisions = parseProposalCharacterRevisions(action.row.character_revisions_json);
+          const changeSet = this.undoChangeSet(Number(action.row.id));
+          undonePaths.push(...changeSet.files.map(file => file.targetPath ?? file.path));
+          undoneCharacters.push(...revisions.map(revision => this.normalizeCharacter(revision.after).identity.name));
+        } else if (action.kind === "proposal") {
+          const undone = this.rewindProposalRevision(action.row);
+          undonePaths.push(undone.path);
+          undoneCharacters.push(...undone.characterNames);
+        } else {
+          undoneCharacters.push(this.rewindCharacterRevision(action.row));
         }
-        this.writeCharacters(restored);
-        this.database.prepare("UPDATE character_revisions SET undone=1 WHERE id=?").run(row.id as number);
-        undoneCharacters.push(after.identity.name);
       }
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
@@ -1820,11 +2075,47 @@ export class WriterStore {
     options?: { keepChanges?: boolean },
   ): {
     fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string; keepChanges: boolean;
+    inputMode?: RoleplayInputMode;
+    modelInitiatedRoleplay?: "opening";
   } {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
-    const target = this.database.prepare("SELECT id FROM messages WHERE id=? AND session_id=?").get(targetId, sessionId) as Row | undefined;
+    const target = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id
+      FROM messages WHERE id=? AND session_id=?`).get(targetId, sessionId) as Row | undefined;
     if (!target) throw new Error("消息不存在");
-    const user = this.database.prepare(`SELECT id,content,channel,variant_group_id FROM messages
+    if (target.role === "assistant" && target.channel === "roleplay") {
+      const precedingRoleplayUser = this.database.prepare(`SELECT id FROM messages
+        WHERE session_id=? AND role='user' AND channel='roleplay' AND id<=? ORDER BY id DESC LIMIT 1`)
+        .get(sessionId, targetId) as Row | undefined;
+      if (!precedingRoleplayUser) {
+        const fromId = Number(target.id);
+        const groupId = typeof target.variant_group_id === "string" ? target.variant_group_id : randomUUID();
+        this.database.prepare("UPDATE messages SET variant_group_id=? WHERE session_id=? AND id=?")
+          .run(groupId, sessionId, fromId);
+        const duplicate = this.database.prepare(`SELECT id FROM message_variants
+          WHERE session_id=? AND group_id=? AND prompt='' AND content=? LIMIT 1`)
+          .get(sessionId, groupId, String(target.content)) as Row | undefined;
+        if (!duplicate) {
+          const max = this.database.prepare("SELECT COALESCE(MAX(version_index),0) AS value FROM message_variants WHERE session_id=? AND group_id=?")
+            .get(sessionId, groupId) as Row;
+          this.database.prepare("INSERT INTO message_variants(session_id,group_id,version_index,prompt,content,created_at) VALUES(?,?,?,?,?,?)")
+            .run(sessionId, groupId, Number(max.value) + 1, "", String(target.content), new Date().toISOString());
+        }
+        this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
+        this.clearSessionTaskState(sessionId);
+        this.restoreRoleplayMemoryBefore(sessionId, fromId);
+        this.addSystemMessage(sessionId, `已撤销角色主动开场 #${fromId} 及其后续对话，准备重新演出。`);
+        this.reindex();
+        return {
+          fromId,
+          prompt: "",
+          channel: "roleplay",
+          variantGroupId: groupId,
+          keepChanges: Boolean(options?.keepChanges),
+          modelInitiatedRoleplay: "opening",
+        };
+      }
+    }
+    const user = this.database.prepare(`SELECT id,content,channel,variant_group_id,roleplay_input_mode,roleplay_perception FROM messages
       WHERE session_id=? AND role='user' AND id<=? ORDER BY id DESC LIMIT 1`).get(sessionId, targetId) as Row | undefined;
     if (!user) throw new Error("该位置之前没有可重新运行的用户指令");
     const fromId = Number(user.id);
@@ -1846,6 +2137,13 @@ export class WriterStore {
     }
     const channel: MessageChannel = user.channel === "roleplay" ? "roleplay" : "agent";
     const prompt = String(user.content);
+    const inputMode: RoleplayInputMode | undefined = channel === "roleplay"
+      ? user.roleplay_input_mode === "director"
+        || (typeof user.roleplay_perception === "string" && user.roleplay_perception.startsWith("［OOC 导演指示"))
+        ? "director"
+        : "dialogue"
+      : undefined;
+    if (channel === "roleplay") this.archiveRoleplayBranch(sessionId, fromId, groupId);
     const rewound = this.rewindFromMessage(sessionId, fromId, options);
     return {
       fromId: rewound.fromId,
@@ -1853,7 +2151,148 @@ export class WriterStore {
       channel,
       variantGroupId: groupId,
       keepChanges: rewound.keepChanges,
+      ...(inputMode ? { inputMode } : {}),
     };
+  }
+
+  archiveRoleplayBranch(sessionId: string, fromMessageId: number, groupId: string): RoleplayBranchSummary | undefined {
+    const user = this.database.prepare(`SELECT id,content FROM messages
+      WHERE session_id=? AND id=? AND role='user' AND channel='roleplay'`).get(sessionId, fromMessageId) as Row | undefined;
+    if (!user) return undefined;
+    const existingBase = this.database.prepare(`SELECT MIN(base_message_id) AS value FROM roleplay_branches
+      WHERE session_id=? AND group_id=?`).get(sessionId, groupId) as Row;
+    const immediateBase = this.database.prepare("SELECT COALESCE(MAX(id),0) AS value FROM messages WHERE session_id=? AND id<?")
+      .get(sessionId, fromMessageId) as Row;
+    const baseMessageId = existingBase.value === null || existingBase.value === undefined
+      ? Number(immediateBase.value) || 0
+      : Number(existingBase.value) || 0;
+    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
+      FROM messages WHERE session_id=? AND id>? ORDER BY id`).all(sessionId, baseMessageId) as Row[];
+    const dialogueRows = rows.filter(row => row.role === "user" || row.role === "assistant");
+    if (dialogueRows.some(row => row.channel !== "roleplay")) return undefined;
+    const messages: RoleplayBranchPayload["messages"] = rows.map(row => ({
+      id: Number(row.id),
+      role: row.role as Message["role"],
+      content: String(row.content),
+      createdAt: String(row.created_at),
+      channel: row.channel === "roleplay" ? "roleplay" : "agent",
+      ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
+      ...(typeof row.roleplay_perception === "string" ? { roleplayPerception: row.roleplay_perception } : {}),
+      ...(row.roleplay_input_mode === "director" || row.roleplay_input_mode === "dialogue"
+        ? { roleplayInputMode: row.roleplay_input_mode }
+        : {}),
+    }));
+    if (!messages.length) return undefined;
+    const memorySnapshots = (this.database.prepare(`SELECT through_message_id,context_key,memory_json,created_at
+      FROM roleplay_memory_snapshots WHERE session_id=? AND through_message_id>? ORDER BY through_message_id`)
+      .all(sessionId, baseMessageId) as Row[]).map(row => ({
+        throughMessageId: Number(row.through_message_id),
+        contextKey: String(row.context_key),
+        memoryJson: String(row.memory_json),
+        createdAt: String(row.created_at),
+      }));
+    const facts = this.database.prepare(`SELECT * FROM roleplay_memory_facts
+      WHERE session_id=? AND source_message_id>? AND pinned=0 ORDER BY id`).all(sessionId, baseMessageId) as Row[];
+    const payload: RoleplayBranchPayload = {
+      messages,
+      memory: this.roleplayMemory(sessionId),
+      memorySnapshots,
+      facts,
+    };
+    const payloadJson = JSON.stringify(payload);
+    const duplicate = this.database.prepare(`SELECT id FROM roleplay_branches
+      WHERE session_id=? AND group_id=? AND payload_json=? LIMIT 1`).get(sessionId, groupId, payloadJson) as Row | undefined;
+    if (duplicate) return this.roleplayBranches(sessionId, groupId).find(item => item.id === duplicate.id);
+    const assistant = [...dialogueRows].reverse().find(row => row.role === "assistant");
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const label = String(user.content).replace(/\s+/g, " ").trim().slice(0, 48) || "角色扮演分支";
+    const preview = assistant ? String(assistant.content).replace(/\s+/g, " ").trim().slice(0, 100) : "尚无角色回复";
+    this.database.prepare(`INSERT INTO roleplay_branches(
+      id,session_id,group_id,base_message_id,from_message_id,label,preview,message_count,payload_json,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      id, sessionId, groupId, baseMessageId, fromMessageId, label, preview, dialogueRows.length, payloadJson, now,
+    );
+    return { id, groupId, fromMessageId, label, preview, messageCount: dialogueRows.length, createdAt: now };
+  }
+
+  roleplayBranches(sessionId: string, groupId?: string): RoleplayBranchSummary[] {
+    const rows = groupId
+      ? this.database.prepare(`SELECT id,group_id,from_message_id,label,preview,message_count,created_at
+          FROM roleplay_branches WHERE session_id=? AND group_id=? ORDER BY created_at DESC`).all(sessionId, groupId)
+      : this.database.prepare(`SELECT id,group_id,from_message_id,label,preview,message_count,created_at
+          FROM roleplay_branches WHERE session_id=? ORDER BY created_at DESC LIMIT 100`).all(sessionId);
+    return (rows as Row[]).map(row => ({
+      id: String(row.id),
+      groupId: String(row.group_id),
+      fromMessageId: Number(row.from_message_id),
+      label: String(row.label),
+      preview: String(row.preview),
+      messageCount: Number(row.message_count),
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  activateRoleplayBranch(sessionId: string, branchId: string): { groupId: string; fromMessageId: number } {
+    const branch = this.database.prepare("SELECT * FROM roleplay_branches WHERE id=? AND session_id=?")
+      .get(branchId, sessionId) as Row | undefined;
+    if (!branch) throw new Error("角色扮演分支不存在");
+    let payload: RoleplayBranchPayload;
+    try { payload = JSON.parse(String(branch.payload_json)) as RoleplayBranchPayload; }
+    catch { throw new Error("角色扮演分支数据已损坏"); }
+    if (!Array.isArray(payload.messages) || !payload.messages.length) throw new Error("角色扮演分支为空");
+    const groupId = String(branch.group_id);
+    const liveUser = this.database.prepare(`SELECT id FROM messages
+      WHERE session_id=? AND variant_group_id=? AND role='user' AND channel='roleplay' ORDER BY id LIMIT 1`)
+      .get(sessionId, groupId) as Row | undefined;
+    if (liveUser) this.archiveRoleplayBranch(sessionId, Number(liveUser.id), groupId);
+    const baseMessageId = Number(branch.base_message_id) || 0;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>?").run(sessionId, baseMessageId);
+      this.database.prepare("DELETE FROM roleplay_memory_snapshots WHERE session_id=? AND through_message_id>?")
+        .run(sessionId, baseMessageId);
+      this.database.prepare("DELETE FROM roleplay_memory_facts WHERE session_id=? AND source_message_id>? AND pinned=0")
+        .run(sessionId, baseMessageId);
+      const insertMessage = this.database.prepare(`INSERT INTO messages(
+        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
+      ) VALUES(?,?,?,?,?,?,?,?,?)`);
+      for (const message of payload.messages) insertMessage.run(
+        message.id, sessionId, message.role, message.content, message.createdAt, message.channel,
+        message.variantGroupId ?? null, message.roleplayPerception ?? null,
+        message.roleplayInputMode === "director" || message.roleplayInputMode === "dialogue"
+          ? message.roleplayInputMode
+          : message.channel === "roleplay" && message.role === "user"
+            && message.roleplayPerception?.startsWith("［OOC 导演指示")
+            ? "director"
+            : message.channel === "roleplay" && message.role === "user" ? "dialogue" : null,
+      );
+      if (payload.memory) this.saveRoleplayMemory(sessionId, payload.memory);
+      else this.database.prepare("DELETE FROM roleplay_memory WHERE session_id=?").run(sessionId);
+      const insertSnapshot = this.database.prepare(`INSERT INTO roleplay_memory_snapshots(
+        session_id,through_message_id,context_key,memory_json,created_at
+      ) VALUES(?,?,?,?,?)`);
+      for (const snapshot of payload.memorySnapshots ?? []) insertSnapshot.run(
+        sessionId, snapshot.throughMessageId, snapshot.contextKey, snapshot.memoryJson, snapshot.createdAt,
+      );
+      const insertFact = this.database.prepare(`INSERT INTO roleplay_memory_facts(
+        id,session_id,context_key,kind,content,source_message_id,known_by_json,importance,status,pinned,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const fact of payload.facts ?? []) insertFact.run(
+        Number(fact.id), sessionId, String(fact.context_key), String(fact.kind), String(fact.content),
+        fact.source_message_id === null || fact.source_message_id === undefined ? null : Number(fact.source_message_id),
+        String(fact.known_by_json), Number(fact.importance), String(fact.status), Number(fact.pinned),
+        String(fact.created_at), String(fact.updated_at),
+      );
+      this.database.prepare("DELETE FROM roleplay_branches WHERE id=? AND session_id=?").run(branchId, sessionId);
+      this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(new Date().toISOString(), sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    this.reindex();
+    return { groupId, fromMessageId: Number(branch.from_message_id) };
   }
 
   messageVersions(sessionId: string, messageId: number): {

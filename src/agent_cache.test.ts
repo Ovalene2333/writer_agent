@@ -18,9 +18,12 @@ import {
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
   buildToolArgumentRepairMessages,
+  characterMutationCompletesTask,
   chapterContinuationPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
+  executionModelForTask,
+  executionModelForStep,
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
@@ -40,7 +43,7 @@ import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
-import { parseModelTokenUsage } from "./model_usage.js";
+import { buildRecordedUsageEvent, parseModelTokenUsage } from "./model_usage.js";
 import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
 import { buildChapterStyleRepairMessages, CHAPTER_STYLE_REPAIR_BATCH_SIZE, parseChapterStyleRepair } from "./chapter_style_repair.js";
 import { documentSpans } from "./document_spans.js";
@@ -51,7 +54,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "a77addf7ec2e2cf5");
+  assert.equal(agentToolSchemaHash(), "eb1981f0bfecf5b3");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -60,21 +63,26 @@ test("isolated chapter review carries the full draft once and returns bounded st
     sceneId: "arrival", title: "进入", plannedTurn: "门禁变红", plannedOutcome: "主角违规进入",
     actualState: { situation: ["主角违规进入"] },
   }];
-  const messages = buildChapterReviewMessages({ chapterGoal: "关系改变", content, scenes, context: "稳定项目约束" });
+  const proseSignals = { stats: { numericTokenDensityPer10k: 112 }, warnings: [] };
+  const messages = buildChapterReviewMessages({
+    chapterGoal: "关系改变", content, scenes, context: "稳定项目约束", proseSignals,
+  });
   assert.deepEqual(messages.map(message => message.role), ["system", "system", "user"]);
   assert.equal(messages[1].content, "稳定项目约束");
   assert.match(messages[2].content, /门禁灯由绿变红/u);
+  assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 
   const review = parseChapterReview(JSON.stringify({
     verdict: "revise",
     chapterChange: "主角从服从转为违规",
     reviewNotes: "结果与计划一致，但接缝需要补强。",
     issues: [{
-      severity: "blocker", kind: "seam", sceneId: "arrival",
-      evidence: ["门禁灯由绿变红。"], problem: "动作缺少直接后果", action: "在本场补出越界动作",
+      severity: "blocker", kind: "telemetry_pileup", sceneId: "arrival",
+      evidence: ["门禁灯由绿变红。"], problem: "读数堆砌遮蔽人物选择", action: "只保留改变行动的读数",
     }],
   }), new Set(["arrival"]), content);
   assert.equal(review.verdict, "revise");
+  assert.equal(review.issues[0].kind, "telemetry_pileup");
   assert.deepEqual(review.issues[0].evidence, ["门禁灯由绿变红。"]);
   assert.throws(() => parseChapterReview(JSON.stringify({
     verdict: "revise",
@@ -189,17 +197,18 @@ test("validated checkpoints restore drafts and clear with task state", () => {
   }
 });
 
-test("task tool profiles are frozen order-preserving allow-lists", () => {
+test("task modes share one frozen universal capability catalog", () => {
   const catalog = agentToolNames();
   const write = agentToolsForTask("write_scene", "ask");
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
-  assert.ok(writeNames.length < catalog.length);
-  assert.deepEqual(writeNames, catalog.filter(name => writeNames.includes(name)));
-  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "inspect_chapter_draft", "propose_chapter_draft"]) {
+  assert.deepEqual(writeNames, catalog);
+  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
-  assert.equal(writeNames.includes("save_character"), false);
+  assert.equal(writeNames.includes("save_character"), true);
+  assert.deepEqual(agentToolsForTask("brainstorm", "ask").map(tool => tool.function.name), writeNames);
+  assert.deepEqual(agentToolsForTask("audit", "ask").map(tool => tool.function.name), writeNames);
 
   const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
   assert.equal(planNames.includes("write_chapter_scene"), false);
@@ -228,9 +237,16 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.equal(normalizeDocumentProposalRequired("character", true), false);
   assert.equal(normalizeDocumentProposalRequired("simple_character", true), false);
   assert.equal(normalizeDocumentProposalRequired("write_scene", true), true);
+  assert.equal(characterMutationCompletesTask("character", "auto"), true);
+  assert.equal(characterMutationCompletesTask("simple_character", "ask"), true);
+  assert.equal(characterMutationCompletesTask("write_scene", "auto"), false);
+  assert.equal(characterMutationCompletesTask("rewrite", "ask"), false);
+  assert.equal(characterMutationCompletesTask("character", "plan"), false);
 
   const normal = taskInstructions("character", "deliver", "ask", false);
   assert.match(normal, /检查同名卡/);
+  assert.match(normal, /角色保存成功即完成本任务/);
+  assert.match(normal, /禁止再提交文档提案或 change set/);
   assert.match(normal, /必须 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
   assert.match(normal, /结构化错误/);
@@ -298,6 +314,40 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   });
 });
 
+test("scene orchestration always stays on Agent regardless of Writer isolation", () => {
+  const model = (name: string) => ({
+    provider: "openai-compatible" as const,
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "test",
+    model: name,
+  });
+  const agent = model("agent");
+  const writer = model("writer");
+  const inline = model("inline");
+  const reviewer = model("reviewer");
+  const models = { agent, writer, inline, reviewer };
+  const writing = { mode: "write_scene" as const, documentProposalRequired: true };
+
+  assert.equal(executionModelForTask(writing, models, agent), agent);
+  assert.equal(executionModelForTask({ mode: "outline", documentProposalRequired: true }, models, agent), agent);
+  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent), inline);
+  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), reviewer);
+});
+
+test("standard scene steps use Writer only while prose scenes remain pending", () => {
+  const model = (name: string) => ({ baseUrl: "https://api.example.com/v1", apiKey: "test", model: name });
+  const agent = model("agent");
+  const writer = model("writer");
+  const pending = { scenes: [{ id: "one" }], completed: [] } as unknown as Pick<import("./scene_pipeline.js").ChapterSceneDraft, "scenes" | "completed">;
+  const complete = { scenes: [{ id: "one" }], completed: [{ sceneId: "one" }] } as unknown as Pick<import("./scene_pipeline.js").ChapterSceneDraft, "scenes" | "completed">;
+
+  assert.equal(executionModelForStep("write_scene", agent, writer, false), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, false, pending), writer);
+  assert.equal(executionModelForStep("write_scene", agent, writer, false, complete), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, true, pending), agent);
+  assert.equal(executionModelForStep("outline", agent, writer, false, pending), agent);
+});
+
 test("provider usage parsing and tagged persistence include hidden model calls", () => {
   assert.deepEqual(parseModelTokenUsage({
     prompt_tokens: 120,
@@ -316,6 +366,16 @@ test("provider usage parsing and tagged persistence include hidden model calls",
     const project = WriterProject.init(root, "用量");
     store = new WriterStore(project);
     const sessionId = store.createSession("用量");
+    const event = buildRecordedUsageEvent(store, sessionId, {
+      provider: "openai-compatible", providerName: "本地供应商", baseUrl: "http://localhost", apiKey: "", model: "flash-model",
+    }, {
+      promptTokens: 12, completionTokens: 3, cacheHitTokens: 8, cacheMissTokens: 4,
+    }, { callKind: "planner", step: 0 });
+    assert.equal(event.type, "usage");
+    if (event.type === "usage") {
+      assert.equal(event.call?.model, "flash-model");
+      assert.equal(event.call?.providerName, "本地供应商");
+    }
     store.recordUsage(sessionId, "flash", {
       promptTokens: 120, completionTokens: 30, cacheHitTokens: 80, cacheMissTokens: 40,
     }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:00Z"), {
@@ -387,12 +447,17 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   const instructions = taskInstructions("write_scene", "deliver", "ask", true);
   assert.match(instructions, /begin_chapter_draft/);
   assert.match(instructions, /write_chapter_scene/);
+  assert.match(instructions, /revise_chapter_scene_guide/);
   assert.match(instructions, /revise_chapter_draft_style/);
-  assert.match(instructions, /每场默认一次 write_chapter_scene/);
+  assert.match(instructions, /每次 write_chapter_scene 只处理当前一场/);
   assert.match(instructions, /styleDeferred/);
   assert.match(instructions, /禁止为句式问题重写整场/);
   assert.match(instructions, /禁止通读上一章全文/);
-  assert.match(instructions, /工具内部完成 notes 编译/);
+  const isolated = taskInstructions("write_scene", "deliver", "ask", true, true);
+  assert.match(isolated, /每次 write_chapter_scene 只处理当前一场/);
+  assert.match(isolated, /不要生成 content 或 actualState/);
+  assert.match(isolated, /隔离模式不把风格统计写进下一场 notes/);
+  assert.match(taskInstructions("write_scene", "deliver", "ask", true, true, 4_200), /4200 字/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /propose_chapter_draft/);
   assert.match(instructions, /直接创建提案/);
@@ -400,7 +465,7 @@ test("chapter workflow uses the model-driven scene tool chain", () => {
   assert.match(instructions, /禁止 propose_document\/patch/);
   assert.match(instructions, /大纲不是章节写作的前置条件/);
   assert.match(instructions, /禁止 design_creative_outline/);
-  assert.match(instructions, /重心放在因果场景链/);
+  assert.match(instructions, /guide 只提供下一步方向/);
   assert.match(instructions, /side\/ 的支线片段/u);
 });
 
@@ -453,19 +518,24 @@ test("scene continuation handoff carries seam tail, states and next card without
   assert.match(prompt, /警报已触发/);
   assert.match(prompt, /"id":"s2"/);
   assert.match(prompt, /sceneId=s2/);
+  assert.match(prompt, /revise_chapter_scene_guide/);
   assert.match(prompt, /禁用段首起笔/);
   assert.match(prompt, /目光×8/);
-  assert.match(prompt, /禁止先用单独一步输出计划/);
+  assert.match(prompt, /不要输出计划说明/);
   // Only the bounded tail of the finished scene survives — never its full prose.
   assert.doesNotMatch(prompt, /钥匙句/);
   const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
   assert.ok(tailBlock.length > 0 && tailBlock.length < 1_000, `tail block out of bounds: ${tailBlock.length}`);
+  const isolatedPrompt = sceneContinuationPrompt(draft, { isolatedWriter: true });
+  assert.match(isolatedPrompt, /调用 write_chapter_scene/);
+  assert.match(isolatedPrompt, /只提交要点式 notes/);
+  assert.doesNotMatch(isolatedPrompt, /提交要点式 notes、正文与 actualState/);
 
   draft = writeChapterScene(draft, "s2", "教官在警报声里签下自己的名字。".repeat(10), {
     situation: ["违规被共同隐瞒"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
   }).draft;
   const complete = sceneContinuationPrompt(draft, {});
-  assert.match(complete, /全部场景已写完/);
+  assert.match(complete, /当前没有未写 scene guide/);
   assert.match(complete, /inspect_chapter_draft/);
 });
 

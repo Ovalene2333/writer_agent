@@ -12,11 +12,26 @@ import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { isDeepSeekModel, thinkingRequestOptions } from "./model_compat.js";
 import {
+  agentCompletionGaps,
+  completionRecoveryPrompt,
+  contractAllowsTool,
+  createAgentExecutionProgress,
+  recordAgentToolResult,
+  resolveAgentPlanningStrategy,
+  type AgentCapability,
+  type AgentEvidenceRequirement,
+  type AgentMutationRequirement,
+  type AgentPlanningStrategy,
+  type AgentTaskContract,
+  type AgentTaskOutcome,
+} from "./agentic_runtime.js";
+import {
+  DEFAULT_SCENE_NOTES_CHARACTERS,
   formatTodosForPrompt,
   loadAgentSettings,
   permissionModeLabel,
   persistAdvancedTodosAfterProposal,
-  persistFinalizedSessionTodos,
+  persistCompletedCharacterTaskTodos,
   persistScenePipelineTodos,
   projectInstructionsPrompt,
   skillsCatalogPrompt,
@@ -94,7 +109,7 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *       handoff (chapterContinuationPrompt), so the next chapter stops paying the
  *       previous chapter's scene transcript every step.
  *    b) Scene boundary: after each successful write_chapter_scene, truncate back
- *       to the post-begin context base (prep reads + scene chain lock survive) and
+ *       to the post-begin context base (prep reads + initial scene guide survive) and
  *       append one compact handoff (sceneContinuationPrompt), so later scenes stop
  *       paying earlier scenes' full prose; inspect_chapter_draft reviews the
  *       assembled chapter in an isolated call and returns a compact report.
@@ -107,14 +122,15 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    miss at every scene boundary.
  *
  * 5) TOOLS SCHEMA
- *    src/tools/schema.ts TOOLS is the stable catalog. After the tool-free planner,
- *    select one project-agnostic task profile and freeze it for the entire job.
- *    Profiles preserve catalog order and never contain live paths/ids/state.
+ *    src/tools/schema.ts TOOLS is the stable universal capability catalog. Keep
+ *    it byte-identical throughout a job and across task modes. The semantic task
+ *    contract authorizes side effects at execution time; a fallible mode label
+ *    must never make recovery/read capabilities disappear.
  *
- * 6) PLANNER
- *    planWritingTask is a small, tool-free Flash call. It does not pretend to
- *    warm execution: provider measurements show planner/execution diverge before
- *    the tools payload, so attaching 36 tools only adds miss-priced input/output.
+ * 6) TASK CONTRACT COMPILER
+ *    compileWritingTaskContract is a small, tool-free Flash call. It declares the
+ *    outcome, evidence and mutation obligations but does not prescribe a frozen
+ *    execution path. The main Agent owns and revises the live plan from tool facts.
  *
  * 7) DEDUPE
  *    Prefer one compact rule + cross-reference over pasting the same mannerism /
@@ -133,8 +149,9 @@ type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "a
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
 type CreativeDepth = "explore" | "shape" | "deliver";
 type EditScope = "point" | "section" | "document";
+type AgentRoleModels = Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
 
-interface WritingTask {
+interface WritingTask extends AgentTaskContract {
   mode: WritingTaskMode;
   label: string;
   searchQuery: string;
@@ -374,16 +391,25 @@ function dynamicContextPrompt(project: WriterProject, store: WriterStore, reques
   };
   const reviewBlock = task.mode === "audit" ? `\n\n${REVIEW_PROMPT}` : "";
   return `当前任务：${task.label}
-本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；规划器/会话推断不得冒充用户选择。
+任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities })}
+mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后用 manage_todos 修订剩余计划。
+本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
 
-${taskInstructions(task.mode, task.creativeDepth, permissionMode, task.documentProposalRequired)}${reviewBlock}
+${taskInstructions(
+    task.mode,
+    task.creativeDepth,
+    permissionMode,
+    task.documentProposalRequired,
+    scenePipeline.isolatedWriter,
+    scenePipeline.notesMaxCharacters,
+  )}${reviewBlock}
 
 上下文：${contextInstruction[task.documentContext]}
 角色范围：${characterScopeInstruction}
 简易卡范围：${simpleCharacterScopeInstruction}
 写入：${documentInstruction}
 修改范围：${editScopeInstruction[task.editScope]}
-场景链参数：推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场；允许最多 ${scenePipeline.maxScenes} 场。按情节需要取值，不为达到推荐数拆场。
+场景链参数：推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场；允许最多 ${scenePipeline.maxScenes} 场。按情节需要取值，不为达到推荐数拆场。正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer 实验已启用" : "标准 Agent 内生成"}。
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
@@ -500,6 +526,35 @@ function isCharacterMutationTool(name: string): boolean {
   return name === "save_character" || name === "save_simple_character" || name === "apply_character_changes";
 }
 
+export function executionModelForTask(
+  task: Pick<WritingTask, "mode" | "documentProposalRequired">,
+  models: AgentRoleModels,
+  fallback: ModelConfig,
+): ModelConfig {
+  if (task.mode === "audit") return models.reviewer ?? fallback;
+  if (task.mode === "rewrite") return models.inline ?? fallback;
+  // Scene isolation changes how prose is produced, never which model orchestrates tools.
+  return fallback;
+}
+
+export function executionModelForStep(
+  taskMode: WritingTaskMode,
+  agentModel: ModelConfig,
+  writerModel: ModelConfig | undefined,
+  isolatedWriter: boolean,
+  draft?: Pick<ChapterSceneDraft, "scenes" | "completed">,
+): ModelConfig {
+  if (taskMode === "write_scene" && !isolatedWriter && draft
+    && draft.completed.length < draft.scenes.length) {
+    return writerModel ?? agentModel;
+  }
+  return agentModel;
+}
+
+function isChapterSceneWriteTool(name: string): boolean {
+  return name === "write_chapter_scene";
+}
+
 function characterMutationDiagnostic(result: Record<string, unknown>): string {
   const diagnostic = {
     ...(typeof result.code === "string" ? { code: result.code } : {}),
@@ -537,6 +592,10 @@ export function normalizeDocumentProposalRequired(mode: WritingTaskMode, request
   return mode === "character" || mode === "simple_character" ? false : requested;
 }
 
+export function characterMutationCompletesTask(mode: WritingTaskMode, permissionMode: PermissionMode): boolean {
+  return permissionMode !== "plan" && (mode === "character" || mode === "simple_character");
+}
+
 /** Exact catalog resolution for short follow-ups; no semantic keyword guessing. */
 export function resolveRecentCharacterIds(
   catalog: Array<{ id: number; name: string; aliases?: string[] }>,
@@ -555,11 +614,12 @@ export function resolveRecentCharacterIds(
 }
 
 /**
- * Task planner: a compact tool-free call, normally assigned to Flash.
+ * Task-contract compiler: a compact tool-free call, normally assigned to Flash.
  * CACHE: Keep stable rules in the first message and project/request data in the
- * final user message. Execution has a different prefix and is not warmed here.
+ * final user message. It declares obligations and capability hints, never a
+ * frozen execution path. Execution has a different prefix and is not warmed here.
  */
-async function planWritingTask(
+async function compileWritingTaskContract(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
   characterScope?: number[],
   selectionCharacters = 0,
@@ -579,26 +639,30 @@ async function planWritingTask(
     .filter(item => !item.title.startsWith("[风格模板]") || item.title === `[风格模板] ${activeStyle?.name}`)
     .map(item => ({ id: item.id, title: item.title, category: item.category }))
     .slice(0, 24);
-  const recent = history.slice(-3).map(item => item.role === "user"
-    ? { content: item.content?.slice(0, 160) ?? "" }
-    : { role: item.role, content: item.content?.slice(0, 120) ?? "" });
+  const recent = history.slice(-3).map(item => ({
+    role: item.role,
+    content: item.content?.slice(0, item.role === "user" ? 160 : 120) ?? "",
+  }));
   const planningMessages: ApiMessage[] = [{
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
-    content: `写作任务规划器。不得调用工具；只输出一个 JSON，无 Markdown。
+    content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
 JSON 总长度不超过 1200 字符；字符串保持简短，todoPlan 每项不超过 40 字。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；documentProposalRequired(创作/修改正文或大纲为 true；纯讨论/分析/角色卡操作为 false)；continuation；todoPlan(2—5 步或[])。
-creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。写文件完整度由 documentProposalRequired 决定。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；todoPlan(仅复杂任务给2—5个初始步骤，否则[])。
+契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
+正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
+creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
 documentContext 判定（关键，勿默认 none）：
 - none：仅泛化写作技巧、闲聊、纯灵感且不依赖项目既有专名/组织/势力/世界观事实；或所需事实已完整出现在 recentHistory。
 - search：用户讨论、分析、推演项目内设定/组织/实体/专名/关系/军政势力，或答案正确性依赖 lore/outline 中未在对话里写清的事实（即使 mode=brainstorm/general 也要用 search）。searchQuery 填核心专名。
 - target：用户指定或语义可确定单篇文档要读/改。
 - continuation：承接上一轮正文续写。
-纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件或多文件原子变更时，mode=general、documentProposalRequired=true；非 Markdown 文件不必出现在 documents 目录，执行阶段先用 list_files 定位，再用 propose_change_set。
+纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件或多文件原子变更时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；非 Markdown 文件不必出现在 documents 目录，执行阶段先用 list_files 定位，再用 propose_change_set。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
-用户要求创作/设计一个具体人物，并主要描述其身份、外貌、性格、能力或关系时，即使没有说“角色卡”，也使用 character；只有明确要求“一段/片段/场景/章节/正文”来表现该人物时才使用 write_scene。
-正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，documentProposalRequired=true；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
-用户引用具体正文句段并指出问题或要求修改（不合理/OOC/改掉这句/换个说法等）时，一律 mode=rewrite，documentProposalRequired=true，documentContext=target；不得判为 audit（audit 只用于“审阅/检查/评价”而不动笔），也不得因目标是章节而改判 write_scene。
+连续对话中，若 recentHistory 已明确当前操作对象是角色卡，当前 user 用“修复/调整/删除/改成”等省略说法继续修改该对象，仍用 character、outcome=character、mutation=character；除非当前 user 明确改为正文、大纲或 resource/ 文档任务。不得仅因动作是“修改”就判为 rewrite；rewrite 的交付对象必须是文档正文。
+用户要求创作/设计一个具体人物，并主要描述其身份、外貌、性格、能力或关系时，即使没有说“角色卡”，也使用 character，outcome=character、mutation=character；只有明确要求“一段/片段/场景/章节/正文”来表现该人物时才使用 write_scene。
+正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，outcome=document、mutation=document、planning=adaptive；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
+用户引用具体正文句段并指出问题或要求修改（不合理/OOC/改掉这句/换个说法等）时，一律 mode=rewrite，outcome=document、mutation=document、evidence=target、documentContext=target；不得判为 audit（audit 只用于“审阅/检查/评价”而不动笔），也不得因目标是章节而改判 write_scene。
 editScope 仅描述既有文档修改范围：明确原句/网页选区/一小处→point；一个小节或若干相邻段→section；明确通篇/全文/整体统一调整且每部分都需处理→document。不要把“深度修改某一处”误判为document。
 只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
@@ -635,7 +699,7 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
     if (retry.usage) onUsage?.(retry.usage, true);
     parsed = parsePlannerJson(retry.content);
     if (!parsed) {
-      throw new Error(`任务规划器连续两次没有返回有效 JSON（首次 finish=${result.finishReason ?? "unknown"}、${result.content.length} 字符；重试 finish=${retry.finishReason ?? "unknown"}、${retry.content.length} 字符）`);
+      throw new Error(`任务契约编译器连续两次没有返回有效 JSON（首次 finish=${result.finishReason ?? "unknown"}、${result.content.length} 字符；重试 finish=${retry.finishReason ?? "unknown"}、${retry.content.length} 字符）`);
     }
     result = retry;
   }
@@ -650,9 +714,25 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
   const validExampleIds = new Set(examples.map(item => item.id));
   const validDocumentPaths = new Set(documents);
   const continuation = parsed.continuation === true;
-  // Character cards are persisted by save_character/save_simple_character, not document proposals.
-  // Treat contradictory planner JSON as invalid instead of forcing a second, unrelated artifact.
-  const documentProposalRequired = normalizeDocumentProposalRequired(mode, parsed.documentProposalRequired === true);
+  const mutations: AgentMutationRequirement[] = ["none", "document", "character", "mixed"];
+  let mutation = mutations.includes(parsed.mutation as AgentMutationRequirement)
+    ? parsed.mutation as AgentMutationRequirement
+    : parsed.documentProposalRequired === true ? "document" : "none";
+  if ((mode === "character" || mode === "simple_character") && mutation !== "mixed") mutation = "character";
+  if ((mode === "write_scene" || mode === "rewrite") && mutation !== "mixed") mutation = "document";
+  const documentProposalRequired = mutation === "mixed"
+    ? true
+    : normalizeDocumentProposalRequired(mode, mutation === "document");
+  if (!documentProposalRequired && mutation === "document") mutation = "none";
+  const outcomes: AgentTaskOutcome[] = ["answer", "document", "character", "review", "multiple"];
+  let outcome = outcomes.includes(parsed.outcome as AgentTaskOutcome)
+    ? parsed.outcome as AgentTaskOutcome
+    : mutation === "document" ? "document"
+      : mutation === "character" ? "character"
+        : mode === "audit" ? "review" : "answer";
+  if (mutation === "document") outcome = "document";
+  if (mutation === "character") outcome = "character";
+  if (mutation === "mixed") outcome = "multiple";
   const depths: CreativeDepth[] = ["explore", "shape", "deliver"];
   const creativeDepth = depths.includes(parsed.creativeDepth as CreativeDepth)
     ? parsed.creativeDepth as CreativeDepth
@@ -674,7 +754,7 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
     ? "search"
     : continuation
     ? "continuation"
-    : documentProposalRequired && documentContext === "none" ? "target" : documentContext;
+    : documentContext;
   // Safety net: LLM often marks lore discussion as none; upgrade when request hits project entities.
   if (normalizedDocumentContext === "none") {
     const historyBlob = recent.map(item => item.content).join("\n");
@@ -689,6 +769,32 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
   const requestedTodoPlan = Array.isArray(parsed.todoPlan)
     ? parsed.todoPlan.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map(item => item.trim().slice(0, 120)).slice(0, 5)
     : [];
+  const evidenceValues: AgentEvidenceRequirement[] = ["none", "project", "target", "continuation"];
+  let evidence = evidenceValues.includes(parsed.evidence as AgentEvidenceRequirement)
+    ? parsed.evidence as AgentEvidenceRequirement
+    : normalizedDocumentContext === "search" ? "project"
+      : normalizedDocumentContext === "target" ? "target"
+        : normalizedDocumentContext === "continuation" ? "continuation" : "none";
+  if (mode === "character" || mode === "simple_character") evidence = "project";
+  if ((mutation === "document" || mutation === "mixed") && evidence === "none") {
+    evidence = mode === "rewrite" || mode === "audit" ? "target" : "project";
+  }
+  const capabilityValues: AgentCapability[] = ["research", "documents", "files", "outline", "scenes", "characters", "review"];
+  const requestedCapabilities = Array.isArray(parsed.capabilities)
+    ? parsed.capabilities.filter((item): item is AgentCapability => capabilityValues.includes(item as AgentCapability))
+    : [];
+  const baselineCapabilities: Record<WritingTaskMode, AgentCapability[]> = {
+    brainstorm: ["research", "documents", "characters"],
+    outline: ["research", "documents", "outline", "characters"],
+    write_scene: ["research", "documents", "outline", "scenes", "characters", "review"],
+    rewrite: ["research", "documents", "files", "characters", "review"],
+    audit: ["research", "documents", "outline", "review"],
+    character: ["research", "documents", "outline", "characters"],
+    simple_character: ["research", "documents", "characters"],
+    general: ["research", "documents", "files", "characters"],
+  };
+  const capabilities = [...new Set([...baselineCapabilities[mode], ...requestedCapabilities])];
+  const planning = resolveAgentPlanningStrategy(mutation, parsed.planning, requestedTodoPlan.length);
   const searchQuery = typeof parsed.searchQuery === "string" && parsed.searchQuery.trim()
     ? parsed.searchQuery.slice(0, 200)
     : extractSearchQueryHint(request, documents, characters) || request.slice(0, 200);
@@ -705,6 +811,11 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
     task: {
       mode,
       label: TASK_LABELS[mode],
+      outcome,
+      evidence,
+      mutation,
+      planning,
+      capabilities,
       searchQuery,
       characterIds: selectedCharacterIds,
       exampleIds: Array.isArray(parsed.exampleIds) ? parsed.exampleIds.filter(id => validExampleIds.has(id)).slice(0, 2) : [],
@@ -786,7 +897,7 @@ function extractSearchQueryHint(
 }
 
 function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolean): string[] {
-  if (mode === "write_scene") return ["核对本篇必要事实与衔接", "建立本篇场景链", "逐场写作并传递状态", "全文审阅并提交提案"];
+  if (mode === "write_scene") return ["核对本篇必要事实与衔接", "建立初始场景引导", "按成稿结果推进正文", "全文审阅并提交提案"];
   if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
   if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
   if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
@@ -820,6 +931,8 @@ export function taskInstructions(
   creativeDepth: CreativeDepth,
   permissionMode: PermissionMode,
   documentProposalRequired: boolean,
+  isolatedWriter = false,
+  notesMaxCharacters = DEFAULT_SCENE_NOTES_CHARACTERS,
 ): string {
   const pacing = creativePacing(creativeDepth);
   if (permissionMode === "plan") {
@@ -852,12 +965,12 @@ export function taskInstructions(
 - 不要调用 save_simple_character；不得因现有卡内容为空、简略或不完整而新建同名角色。
 - 新建或大改用 save_character；有依据的情节演进优先 apply_character_changes。只填写用户提供或项目材料支持的内容，未知处留空。
 - 更新已有卡时保留原 id，优先只提交实际修改的分区；需要核对关联信息时可以继续读取相关分区或项目资料。数组条目沿用已有 ASCII id，新增条目提供唯一 ASCII id。
-- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试，保存成功后再结束。`;
+- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试。角色保存成功即完成本任务，禁止再提交文档提案或 change set。`;
   if (mode === "simple_character") return `本次工作流：
 - 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终调用 save_simple_character 保存。
 - 先调用 list_characters 检查同名或相关普通角色卡；若存在相关角色，用 get_character 读取必要分区。
 - 按上下文决策检索相关 lore/ 与 outline/，只读取最小必要片段。
-- 将项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定处留空或标为“未明确”。可按需继续检查同名角色和项目资料，工具报错时修正后继续保存。`;
+- 将项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定处留空或标为“未明确”。可按需继续检查同名角色和项目资料，工具报错时修正后继续保存。角色保存成功即完成本任务，禁止再提交文档提案或 change set。`;
   if (mode === "brainstorm") return `本次工作流：
 - ${pacing}
 - 候选应具体到画面、人物选择或关系变化，不必把每个火花都补成完整因果链。
@@ -878,10 +991,12 @@ export function taskInstructions(
 1. 对齐「风格锚定」+ 动态声线证据；禁止通用腔。
 2. 大纲不是章节写作的前置条件。只有系统已给出与本章精确匹配的 outlineNode ID，或用户明确指定某个大纲节点时，才 get_outline_node 一次；没有对应大纲就直接依据用户要求、必要设定和衔接写作，禁止创建/扩写大纲来“补准备”。衔接上一章优先 inspect_document 看 ending，或 read 末 1 节/末约 800–1500 字；禁止通读上一章全文。出场且可能转折的角色可 get_character。unlocked=false 的能力不可用，也不得写成卡面播报。
 3. 单个正文任务只交付用户指定的章节或支线片段：禁止 design_creative_outline、禁止 propose 任何 outline、禁止规划或创建其他章节；禁止通读整本大纲、list_outline_nodes>1、同路径反复 read。
-4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先在内部用 1—3 句话确定“全文从什么局面走到什么局面”，随后立即调用 begin_chapter_draft，把重心放在因果场景链。支线片段至少按当前“推荐最少场数”拆分，每场 targetCharacters 不低于 2000；场景数量不为凑数拆分，每场必须充分展开目标、阻力、行动、小转折、结果和离场状态，相邻场靠前场后果承接。
-5. 按场景链顺序循环，每场默认一次 write_chapter_scene：将本场事实与上一场 actualState 整理为要点式故事内 notes（只列目标、关键事实、事件顺序等要点，上限 1500 字，勿写成长文），并在同一调用中提交正文与 actualState；工具内部完成 notes 编译。正文不要包含任何 markdown 标题：组装时会自动以场景卡 title 生成每场的 ## 小标题，场景卡 title 因此要起成可读的小节名。规划与写作合并为一步：要点直接写进 notes 参数，禁止先用单独一步输出场景计划、宣告开写或为内置阶段调用 manage_todos。此前场景的完整正文不会保留在对话中，衔接只依据系统提供的上一场结尾与各场 actualState。actualState 必须从实际正文归纳局面/身体/知识/关系/目标变化、未决线索与已用意象，不得照抄计划。改变事件、事实或离场状态时，重写前场会使后续场景失效；纯句式、标点或说明密度修订不得重写场景。相邻逐字复读句由工具在入稿时自动删重（返回 autoFixes，入稿文本为准），无需重提。若返回 styleDeferred，本场已经入稿，禁止为句式问题重写整场；继续后续场景，全文 inspect 会硬拦截这些问题，再用 revise_chapter_draft_style 精确替换并复检。begin 返回的 stylePriorNotes 与每场返回的 styleFeedback 是对已写正文的机器统计（高频段首/母题句/超标密度），写下一场时遵守其中的禁用与压降要求，防止句式与意象自我复读。
+4. 目标为 chapters/ 的完整章节或 side/ 的支线片段时，先用 1—3 句话确定“全文从什么局面走到什么局面”，随后调用 begin_chapter_draft 建立初始 scene guide。guide 只提供下一步方向，不是预先锁死的正文提纲；支线片段初始引导遵守当前推荐场数，每场 targetCharacters 不低于 2000，不为凑数拆场。
+5. ${isolatedWriter
+    ? `每次 write_chapter_scene 只处理当前一场：根据真实上一场结尾、actualState 与当前创作判断，提交不超过 ${notesMaxCharacters} 字的故事内 notes；不要生成 content 或 actualState，工具会用隔离 Writer 写正文并从成稿提取状态。`
+    : `每次 write_chapter_scene 只处理当前一场：根据真实上一场结尾、actualState 与当前创作判断提交要点式故事内 notes（上限 ${notesMaxCharacters} 字）、正文与 actualState。正文不要包含 markdown 标题；actualState 必须从实际正文归纳，不得照抄 guide。`}每场完成后先判断实际结果：若原引导仍自然就继续；若人物选择、因果或节奏已经偏移，用 revise_chapter_scene_guide 一次性替换全部未写引导；若章节目标已自然抵达，将 remainingScenes 置空后进入终审。不要为了显示“Agent 感”频繁改计划，也不要为了服从旧 guide 扭曲成稿。改变既有事件、事实或离场状态时才重写前场；禁止为句式问题重写整场，纯句式修订用 revise_chapter_draft_style。相邻逐字复读由工具自动删重；styleDeferred 留到全文门禁精确修订。${isolatedWriter ? "隔离模式不把风格统计写进下一场 notes。" : "stylePriorNotes/styleFeedback 只用于抑制正文自我复读。"}
 6. 笔记、writePack 与正文禁止写章节名指称、路径、大纲/草案/工具 JSON/分区名；回忆用故事内锚点。对白区分人物；冲突/情欲/暴力按剧情直写。每场提交前：${proseMannerismPreflightLine()}
-7. 全部场景完成后调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案，禁止再调用 propose_chapter_draft。若返回 blocker，只重写 targetScenes；隔离修复不可用时才按返回提示使用 revise_chapter_draft_style。禁止为查看门禁结果反复 inspect。
+7. 当 Agent 根据实际正文判断章节已经完成，确保没有未写 scene guide（必要时先 revise_chapter_scene_guide 清空），再调用 inspect_chapter_draft，并在同一调用提交 proposal summary 与已确认的 characterChanges。工具会对组装全文执行风格门禁、必要的隔离局部修复与结构终审；通过后直接创建提案。若返回 blocker，只修正有证据的问题，禁止为查看门禁结果反复 inspect。
 8. 完整章节与 side/ 支线片段由 inspect_chapter_draft 终审通过后一次性提交；propose_chapter_draft 仅用于隔离终审回退或提案参数失败后的兼容重试。禁止 propose_document/patch 绕过场景链（例外：仅修正已有正文的少量句段、总替换 ≤1500 字时，可直接 propose_document_patch）。清单仍有后续正文时继续下一项并重新 begin。仅正文兑现的能力可进 characterChanges；已确认事实才 apply_character_changes。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再按需读取锚点及关联上下文。
@@ -1106,6 +1221,7 @@ export function chapterContinuationPrompt(parts: {
   todosText: string;
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
+  isolatedWriter?: boolean;
 }): string {
   const lines: string[] = [
     "上一份文档提案已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
@@ -1119,7 +1235,7 @@ export function chapterContinuationPrompt(parts: {
     lines.push(`上一章末场 actualState（人物与局面现状，续写以此为准）：${JSON.stringify(parts.handoff.finalActualState)}`);
   }
   lines.push(
-    "任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立场景链，再逐场 write_chapter_scene（要点式 notes+正文+actualState），整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。",
+    `任务清单仍有未完成的写作步骤，请立即继续下一项：完整章节先 begin_chapter_draft 建立初始 scene guide，再依据每场实际结果自主推进或调整未写引导，整章 inspect 后一次性提案；缺少事实时先做最小读取补齐，不要重读已交付章节全文。`,
     parts.todosText,
   );
   return lines.join("\n");
@@ -1134,7 +1250,7 @@ export function chapterContinuationPrompt(parts: {
  */
 export function sceneContinuationPrompt(
   draft: ChapterSceneDraft,
-  extras: { styleFeedback?: string[]; stylePriorNotes?: string[] },
+  extras: { styleFeedback?: string[]; stylePriorNotes?: string[]; isolatedWriter?: boolean },
 ): string {
   const completedCount = draft.completed.length;
   const next = draft.scenes[completedCount];
@@ -1160,13 +1276,16 @@ export function sceneContinuationPrompt(
     lines.push(`styleFeedback（对已写正文的机器统计，写下一场必须遵守）：${extras.styleFeedback.join("；")}`);
   }
   if (next) {
+    const submission = extras.isolatedWriter
+      ? "在同一调用中只提交要点式 notes；隔离 Writer 会生成正文并独立提取 actualState"
+      : "在同一调用中提交要点式 notes、正文与 actualState";
     lines.push(
-      `下一场场景卡：${JSON.stringify(next)}`,
-      ...(remaining.length ? [`其后场景（暂不展开）：${JSON.stringify(remaining)}`] : []),
-      `下一步：本回复的第一个动作就是调用 write_chapter_scene（sceneId=${next.id}），在同一调用中提交要点式 notes、正文与 actualState；规划要点直接写进 notes 参数，禁止先用单独一步输出计划、宣告开写或更新任务清单（进度清单由系统自动维护，调用 manage_todos 只会浪费一步）。`,
+      `当前 scene guide 的下一场：${JSON.stringify(next)}`,
+      ...(remaining.length ? [`当前其后引导：${JSON.stringify(remaining)}`] : []),
+      `先以真实结尾和 actualState 判断 guide 是否仍成立：成立则调用 write_chapter_scene（sceneId=${next.id}），${submission}；不成立则调用 revise_chapter_scene_guide 替换全部未写引导；章节目标已经抵达则清空 remainingScenes 后终审。不要输出计划说明或更新任务清单。`,
     );
   } else {
-    lines.push("全部场景已写完。下一步：本回复的第一个动作就是调用 inspect_chapter_draft，并同时提供提案 summary 与已确认的 characterChanges；终审通过后工具会直接创建提案，不要再调用 propose_chapter_draft。");
+    lines.push("当前没有未写 scene guide。若章节目标已由实际正文完成，调用 inspect_chapter_draft 并同时提供提案 summary 与已确认的 characterChanges；若仍缺少必要变化，先 revise_chapter_scene_guide 增加下一场引导。");
   }
   return lines.join("\n");
 }
@@ -1183,7 +1302,7 @@ export async function runAgent(options: {
   simpleCharacterScope?: number[];
   selectedDocumentBlocks?: Array<{ path: string; text?: string }>;
   model?: ModelConfig;
-  models?: Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
+  models?: AgentRoleModels;
   maxTurns?: number;
   /** 覆盖 .writer/agent.json 中的权限模式 */
   permissionMode?: PermissionMode;
@@ -1209,36 +1328,48 @@ export async function runAgent(options: {
   emit({ type: "mode", mode: permissionMode });
 
   // 写作 Agent 可读全部通道；扮演试演会标注 channel=roleplay，供人设/对白参考。
-  // 24 条足够规划器 + 历史预览；更早内容靠 inspect/read_conversation。
+  // 24 条足够契约编译器 + 历史预览；更早内容靠 inspect/read_conversation。
   const history = compactHistory(
     store.messages(sessionId, 24)
       .filter((message) => message.role !== "tool" && message.role !== "system")
       .map((message) => ({ role: message.role, content: message.content, channel: message.channel })),
   );
   const previousTaskState = store.sessionContext(sessionId);
-  // Planning is classification/routing, not prose generation. Prefer the cheap
-  // summarizer/Flash assignment and keep the request tool-free.
+  // Contract compilation declares outcome/evidence/mutation obligations, but
+  // never freezes the execution path. Prefer Flash and keep the call tool-free.
   const plannerModel = options.models?.summarizer ?? options.models?.inline ?? model;
-  const planned = await planWritingTask(
+  const planned = await compileWritingTaskContract(
     plannerModel, project, store, prompt, history, signal, characterScope,
     options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
     (usage, retry) => emitUsageEvent(
-      emit, store, sessionId, plannerModel, usage, undefined,
+      emit, store, sessionId, plannerModel, usage, 0,
       retry ? "planner_retry" : "planner", options.jobId,
     ),
   );
   const task = planned.task;
-  // plan 模式下即使规划器要求提案，也不强制写入，避免与权限冲突
-  if (permissionMode === "plan") task.documentProposalRequired = false;
-  const executionModel = task.mode === "audit"
-    ? options.models?.reviewer ?? model
-    : task.mode === "rewrite"
-    ? options.models?.inline ?? model
-    : task.documentProposalRequired
-      ? options.models?.writer ?? model
-      : model;
-  // Build execution prefix and tool profile once, then reuse both byte-for-byte
-  // for every step in this job. Profiles are stable and project-agnostic.
+  // Permission policy is orthogonal to semantic mode and always wins.
+  if (permissionMode === "plan") {
+    task.documentProposalRequired = false;
+    task.mutation = "none";
+  }
+  emit({
+    type: "task_contract",
+    contract: {
+      mode: task.mode,
+      outcome: task.outcome,
+      evidence: task.evidence,
+      mutation: task.mutation,
+      planning: task.planning,
+      capabilities: task.capabilities,
+    },
+  });
+  const executionModel = executionModelForTask(
+    task,
+    options.models ?? {},
+    model,
+  );
+  // Build the prefix and universal capability surface once, then reuse both
+  // byte-for-byte for every step. The contract guards side effects at runtime.
   const stableSystemPrefix = buildStableSystemPrefix(
     project, store, permissionMode, { intensive: false }, "general",
   );
@@ -1248,11 +1379,12 @@ export async function runAgent(options: {
   // - continuation: reuse prior active doc / todos / tool memory
   // - same mode without continuation: keep todos (multi-turn ask_user etc.), but never sticky-inherit a doc via COALESCE
   // - mode change without continuation: drop prior task residue entirely
-  const previousMode = previousTaskState.currentIntent.split(":")[0]?.trim() ?? "";
+  const taskIdentity = `${task.mode}/${task.outcome}/${task.mutation}`;
+  const previousIdentity = previousTaskState.currentIntent.split(":")[0]?.trim() ?? "";
   const continuationPath = task.continuation
     ? task.targetPath ?? previousTaskState.activeDocument ?? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
     : undefined;
-  if (!task.continuation && previousMode !== task.mode) {
+  if (!task.continuation && previousIdentity !== taskIdentity) {
     store.clearSessionTaskState(sessionId);
   }
   // A fresh request in the same mode may keep its todo list, but must never
@@ -1261,7 +1393,7 @@ export async function runAgent(options: {
   const activeDocument = task.targetPath ?? continuationPath;
   store.saveSessionContext(sessionId, {
     activeDocument,
-    currentIntent: `${task.mode}: ${prompt.slice(0, 240)}`,
+    currentIntent: `${taskIdentity}: ${prompt.slice(0, 240)}`,
   });
   let turnTodos = store.sessionTodos(sessionId);
   if (!turnTodos.length && task.todoPlan.length) {
@@ -1269,12 +1401,12 @@ export async function runAgent(options: {
     store.saveSessionTodos(sessionId, turnTodos);
   }
   emit({ type: "todos", todos: turnTodos });
-  store.addMessage(sessionId, "user", prompt, "agent", options.variantGroupId);
+  const sourceMessageId = store.addMessage(sessionId, "user", prompt, "agent", options.variantGroupId);
   const archiveContext = `会话归档元数据（注入历史仅为预览；完整史用 inspect/read_conversation）：${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
   const artifactContext = recentArtifactsContext(store, sessionId, project, task);
-  const bootstrapContext = writingBootstrapContext(project, store, prompt, task);
+  const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
   const todosPrompt = turnTodos.length
     ? `当前对话任务清单（绑定本轮任务，非会话全局残留；可用 manage_todos 更新）：\n${formatTodosForPrompt(turnTodos)}`
     : undefined;
@@ -1289,7 +1421,11 @@ export async function runAgent(options: {
     exampleIds: task.exampleIds,
     preferredSample: preferredSample || undefined,
   };
-  const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
+  // In isolated-writer mode the Agent only prepares a compact scene packet; raw
+  // voice evidence belongs exclusively to the prose-only call.
+  const dynamicStyleContext = scenePipelineSettings.isolatedWriter && task.mode === "write_scene"
+    ? ""
+    : dynamicStyleGroundingPrompt(project, store, styleOptions);
   // Prefer cheap roles for prose snippet second pass (flash-class models).
   const adjudicatorModel = options.models?.inline
     ?? options.models?.summarizer
@@ -1308,6 +1444,7 @@ export async function runAgent(options: {
   let currentUsageStep: number | undefined;
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    sourceMessageId,
     editScope: task.editScope,
     ...(selectedEditLock ? { editTargetLocked: selectedEditLock } : {}),
     modelUsageReporter: (callModel, callUsage, meta) => {
@@ -1358,6 +1495,18 @@ export async function runAgent(options: {
       signal,
       context: chapterReviewContext,
     },
+    ...(scenePipelineSettings.isolatedWriter
+      ? {
+          isolatedSceneWriter: {
+            model: options.models?.writer ?? executionModel,
+            stateModel: options.models?.inline
+              ?? options.models?.summarizer
+              ?? options.models?.reviewer
+              ?? model,
+            signal,
+          },
+        }
+      : {}),
     // Best-of-N scene sampling (experimental, off by default): rewrites use the
     // main writing model in a dedicated plain-text call, not the cheap adjudicator.
     ...(scenePipelineSettings && scenePipelineSettings.candidateCount > 1
@@ -1393,10 +1542,14 @@ export async function runAgent(options: {
   let lastCharacterMutationDiagnostic = "";
   let waitingForUser = false;
   const toolCallCounts = new Map<string, number>();
-  const isCharacterTask = task.mode === "character" || task.mode === "simple_character";
-  const requiresCharacterMutation = isCharacterTask && permissionMode !== "plan";
-  // DeepSeek Thinking is fixed for the whole append-only tool job.
-  const jobThinkingOptions = thinkingRequestOptions(executionModel);
+  const requiresCharacterMutation = permissionMode !== "plan"
+    && (task.mutation === "character" || task.mutation === "mixed");
+  const executionProgress = createAgentExecutionProgress(Boolean(
+    options.selectedDocumentBlocks?.some(block => Boolean(block.text?.trim()) && block.text!.trim().length <= 800)
+      || (task.continuation && artifactContext)
+      || toolContext.chapterSceneDraft,
+  ));
+  const replannedFailures = new Set<string>();
 
   try {
     // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
@@ -1409,42 +1562,36 @@ export async function runAgent(options: {
       const step = turn + 1;
       currentUsageStep = step;
       emit({ type: "step_start", step });
+      const stepModel = executionModelForStep(
+        task.mode,
+        executionModel,
+        options.models?.writer,
+        scenePipelineSettings.isolatedWriter,
+        toolContext.chapterSceneDraft,
+      );
+      const stepThinkingOptions = thinkingRequestOptions(stepModel);
       const requestComponents = buildRequestComponentUsage(messages, executionTools, 6, initialMessageCount);
-      const result = await streamCompletion(executionModel, messages, signal, (text) => {
+      const result = await streamCompletion(stepModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
       }, (text) => emit({ type: "text", text, channel: "reasoning" }), {
         tools: executionTools,
-        ...jobThinkingOptions,
+        ...stepThinkingOptions,
       });
       const ensureThinkingTranscriptCanContinue = () => {
-        if (isDeepSeekModel(executionModel) && "thinking" in jobThinkingOptions
-          && jobThinkingOptions.thinking.type === "enabled"
+        if (isDeepSeekModel(stepModel) && "thinking" in stepThinkingOptions
+          && stepThinkingOptions.thinking.type === "enabled"
           && !result.reasoningContent.trim()) {
           throw new Error(`DeepSeek Thinking 未返回 reasoning_content；当前结果已保留，但不能继续拼接下一次请求，请重试本任务${lastCharacterMutationDiagnostic ? `。本步工具诊断：${lastCharacterMutationDiagnostic}` : ""}`);
         }
       };
       if (result.usage) {
-        emitUsageEvent(emit, store, sessionId, executionModel, result.usage, step, "agent_step", options.jobId, requestComponents);
+        emitUsageEvent(emit, store, sessionId, stepModel, result.usage, step, "agent_step", options.jobId, requestComponents);
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
-        if (requiresCharacterMutation) {
-          messages.push({
-            role: "assistant",
-            content: stripDsmlText(result.content || "", "[本步未调用保存工具]"),
-            ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
-          });
-          messages.push({
-            role: "user",
-            content: task.mode === "simple_character"
-              ? "本任务尚未保存简易角色卡。请根据已有资料调用 save_simple_character；如果还缺资料，可以继续读取后再保存。"
-              : "本任务尚未保存普通角色卡。请继续完成必要读取，并调用 save_character 或 apply_character_changes；若工具返回错误，按结构化错误修正。",
-          });
-          ensureThinkingTranscriptCanContinue();
-          continue;
-        }
-        if (task.documentProposalRequired) {
+        const gaps = agentCompletionGaps(task, executionProgress, store.sessionTodos(sessionId));
+        if (gaps.length) {
           messages.push({
             role: "assistant",
             content: stripDsmlText(result.content || "", "[本步未调用工具]"),
@@ -1454,14 +1601,13 @@ export async function runAgent(options: {
             // CACHE: user role — a mid-job system message flips DeepSeek's
             // whole-request rendering and forfeits the cached prefix (§4).
             role: "user",
-            content: "当前任务要求实际提交文档提案，但尚未成功创建提案。请依据已有工具结果继续；若工具返回结构化错误，修正参数或补充必要读取后重试。",
+            content: completionRecoveryPrompt(gaps, executionProgress),
           });
           ensureThinkingTranscriptCanContinue();
           continue;
         }
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
         store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
-        persistFinalizedSessionTodos(store, sessionId, emit);
         emit({ type: "done", sessionId });
         return;
       }
@@ -1525,11 +1671,26 @@ export async function runAgent(options: {
         }
         let toolResult: string;
         if (!executionToolNames.has(call.name)) {
-          toolResult = JSON.stringify({ error: `工具 ${call.name} 不在当前 ${task.mode} 任务的固定允许集中；请使用已提供的工具继续` });
+          toolResult = JSON.stringify({ error: `工具 ${call.name} 不在当前权限模式的稳定能力集中` });
+        } else if (!contractAllowsTool(task, permissionMode, call.name)) {
+          toolResult = JSON.stringify({
+            error: `任务契约不允许执行 ${call.name}`,
+            code: "CONTRACT_MUTATION_DENIED",
+            contract: { outcome: task.outcome, mutation: task.mutation },
+            nextAllowedActions: ["manage_todos", "ask_user"],
+          });
         } else {
           toolResult = await executeToolCached(effectiveCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
         toolResult = boundToolResultForModel(effectiveCall, toolResult, project, store, sessionId);
+        let structuredToolResult: Record<string, unknown> | undefined;
+        try {
+          const parsed = JSON.parse(toolResult) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            structuredToolResult = parsed as Record<string, unknown>;
+          }
+        } catch { /* 非 JSON 工具结果仍会作为失败/不可验证观察记录。 */ }
+        recordAgentToolResult(executionProgress, call.name, structuredToolResult);
         try {
           const parsed = JSON.parse(toolResult) as Record<string, unknown>;
           if (call.name === "save_character" || call.name === "save_simple_character" || call.name === "apply_character_changes") {
@@ -1547,10 +1708,13 @@ export async function runAgent(options: {
             persistScenePipelineTodos(store, sessionId, "draft_started", emit);
             beginChapterSucceeded = true;
           }
-          if (!("error" in parsed) && call.name === "write_chapter_scene" && parsed.complete === true) {
+          if (!("error" in parsed) && isChapterSceneWriteTool(call.name) && parsed.complete === true) {
             persistScenePipelineTodos(store, sessionId, "draft_complete", emit);
           }
-          if (!("error" in parsed) && call.name === "write_chapter_scene"
+          if (!("error" in parsed) && call.name === "revise_chapter_scene_guide" && parsed.status === "guide_revised") {
+            persistScenePipelineTodos(store, sessionId, parsed.complete === true ? "draft_complete" : "draft_reopened", emit);
+          }
+          if (!("error" in parsed) && isChapterSceneWriteTool(call.name)
             && (parsed.status === "written" || parsed.status === "revised")) {
             sceneWrittenFeedback = Array.isArray(parsed.styleFeedback)
               ? (parsed.styleFeedback as unknown[]).filter((item): item is string => typeof item === "string")
@@ -1580,18 +1744,32 @@ export async function runAgent(options: {
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       emit({ type: "step_done", step });
-      if (characterMutationSubmitted) {
-        const answer = stripDsmlText(transcript, "").trim()
-          || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
-        store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
-        persistFinalizedSessionTodos(store, sessionId, emit);
-        emit({ type: "done", sessionId });
-        return;
+      if (characterMutationSubmitted && task.mutation === "character") {
+        persistCompletedCharacterTaskTodos(store, sessionId, emit);
+        const gaps = agentCompletionGaps(task, executionProgress, store.sessionTodos(sessionId));
+        if (!gaps.length) {
+          const answer = stripDsmlText(transcript, "").trim()
+            || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
+          store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+          emit({ type: "done", sessionId });
+          return;
+        }
+        messages.push({ role: "user", content: completionRecoveryPrompt(gaps, executionProgress) });
       }
       if (requiresCharacterMutation && characterMutationFailedThisStep) {
         messages.push({
           role: "user",
           content: `上一次角色卡保存失败。请根据结构化错误修正参数后继续；必要时可以重新读取相关角色或项目资料。错误：${lastCharacterMutationDiagnostic}`,
+        });
+      }
+      const newlyRepeatedFailures = [...executionProgress.failedTools]
+        .filter(([name, count]) => count >= 2 && !replannedFailures.has(name))
+        .map(([name]) => name);
+      if (newlyRepeatedFailures.length) {
+        newlyRepeatedFailures.forEach(name => replannedFailures.add(name));
+        messages.push({
+          role: "user",
+          content: `执行路径出现重复失败（${newlyRepeatedFailures.join("、")}）。先根据结构化错误调用 manage_todos 修订剩余计划，再换用不同工具或更小范围；只有缺少不可推断的用户决策时才 ask_user。`,
         });
       }
       // §4b anchor: keep prep reads + the scene chain lock inside the cached base.
@@ -1612,6 +1790,7 @@ export async function runAgent(options: {
             content: sceneContinuationPrompt(toolContext.chapterSceneDraft, {
               styleFeedback: sceneWrittenFeedback,
               stylePriorNotes: toolContext.chapterStylePriorNotes,
+              isolatedWriter: scenePipelineSettings.isolatedWriter,
             }),
           });
           turnStart = messages.length;
@@ -1636,6 +1815,7 @@ export async function runAgent(options: {
             role: "user",
             content: chapterContinuationPrompt({
               todosText: formatTodosForPrompt(advanced.todos),
+              isolatedWriter: scenePipelineSettings.isolatedWriter,
               ...(latestProposal
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
                 : {}),
@@ -1658,9 +1838,18 @@ export async function runAgent(options: {
           toolContext.chapterSceneDraft = undefined;
           // Per-chapter scene-gate state: voice evidence and prior notes.
           toolContext.sceneStyleEvidence = undefined;
+          toolContext.isolatedSceneVoiceSample = undefined;
+          toolContext.isolatedPendingScene = undefined;
           toolContext.chapterStylePriorNotes = undefined;
           // Style verdicts are per-chapter sentences; stale entries only waste lookups.
           toolContext.proseVerdictCache = undefined;
+          ensureThinkingTranscriptCanContinue();
+          continue;
+        }
+        const gaps = agentCompletionGaps(task, executionProgress, advanced.todos);
+        if (gaps.length && !waitingForUser) {
+          documentProposalSubmitted = false;
+          messages.push({ role: "user", content: completionRecoveryPrompt(gaps, executionProgress) });
           ensureThinkingTranscriptCanContinue();
           continue;
         }
@@ -1947,7 +2136,13 @@ export function restoreChapterDraftCheckpoint(
  * CACHE: miss-priced — never dump full outline prose or character cards here;
  * Step 1 tool reads remain the source of truth for actual content.
  */
-function writingBootstrapContext(project: WriterProject, store: WriterStore, prompt: string, task: WritingTask): string {
+function writingBootstrapContext(
+  project: WriterProject,
+  store: WriterStore,
+  prompt: string,
+  task: WritingTask,
+  scenePipeline: ScenePipelineSettings,
+): string {
   if (task.mode !== "write_scene" && task.mode !== "rewrite" && !task.continuation) return "";
   const chapterNum = parseChapterNumber(prompt) ?? parseChapterNumber(task.targetPath ?? "");
 
@@ -2012,13 +2207,13 @@ function writingBootstrapContext(project: WriterProject, store: WriterStore, pro
   }
 
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
-- outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接建立本章场景链，禁止为了写正文创建大纲。
+- outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接建立初始 scene guide，禁止为了写正文创建大纲。
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
 - 需要人设：对 characterIndex 中的 id 调用 get_character（可带 sections；场景状态需传 outlineNodeId）。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
-- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? "先 begin_chapter_draft 按当前场景链参数建立因果场景链；章节与 side/ 支线片段都要逐场充分展开，每场根据最新 actualState 整理故事内 notes，并在一次 write_chapter_scene 中提交 notes、正文与 actualState；全文 inspect 后一次性提案。" : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
+- 写正文前：${task.mode === "write_scene" && (!task.targetPath || isScenePipelineDocument(task.targetPath)) ? `先 begin_chapter_draft 建立可调整的初始 scene guide；每场根据实际结尾与 latest actualState 决定继续、调整剩余引导或收束，write_chapter_scene 中${scenePipeline.isolatedWriter ? "只提交 notes（隔离 Writer 生成正文与状态）" : "提交 notes、正文与 actualState"}；全文 inspect 后一次性提案。` : "将上述材料整理为故事内笔记并 compile_write_pack；提案只依据返回的 writePack。"}
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
-- 单章正文的主要结构是 scene chain；outline 只作可选方向提示，不得扩展成其他章节任务。
+- scene guide 与 outline 都只是当前章节的方向提示；实际正文、人物选择和 actualState 优先，不得扩展成其他章节任务。
 ${JSON.stringify({
     requestedChapter: chapterNum,
     confidence: outlineNodes?.length || targetCandidates.length ? "matched" : "low",
@@ -2434,7 +2629,12 @@ function emitUsageEvent(
   requestComponents?: RequestComponentUsage[],
 ): void {
   const estimated = usage.estimated === true;
-  const call = toStepUsage(usage, model.pricing);
+  const call = {
+    ...toStepUsage(usage, model.pricing),
+    model: model.model,
+    providerName: model.providerName?.trim()
+      || (model.provider === "deepseek" ? "DeepSeek" : "API"),
+  };
   if (!estimated) {
     emit(buildRecordedUsageEvent(store, sessionId, model, usage, {
       callKind,
@@ -2556,8 +2756,8 @@ export function buildRequestComponentUsage(
 
 /**
  * Low-level chat completion. CACHE: execution receives one frozen, order-stable
- * task profile for the whole job. Never derive tools from project paths/ids or
- * replace the profile between steps.
+ * universal catalog for the whole job. Never derive tools from project paths/ids
+ * or replace the catalog between steps.
  */
 async function streamCompletion(
   model: ModelConfig,

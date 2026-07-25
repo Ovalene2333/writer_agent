@@ -1,7 +1,6 @@
 export interface WriterConfig {
   title: string;
   language: string;
-  chapters: string[];
   style?: string;
 }
 
@@ -11,6 +10,8 @@ export interface ModelConfig {
   apiKey: string;
   model: string;
   provider?: ProviderId;
+  /** User-facing provider profile name for per-call usage attribution. */
+  providerName?: string;
   pricing?: TokenPricing;
   temperature?: number;
   topP?: number;
@@ -28,6 +29,8 @@ export interface PeakBilling {
 }
 
 export interface TokenPricing {
+  /** 缺省为按量计费；非按量模式仍记录 token，但不累计调用费用。 */
+  billingMode?: "metered" | "unmetered";
   /** 平时（非高峰）单价：百万 tokens */
   cacheHit: number;
   cacheMiss: number;
@@ -128,6 +131,8 @@ export interface Message {
   createdAt: string;
   /** agent=写作协作；roleplay=角色扮演试演。默认 agent。 */
   channel: MessageChannel;
+  /** How a roleplay user message was submitted. Omitted for non-roleplay and assistant messages. */
+  roleplayInputMode?: RoleplayInputMode;
   /** Stable group shared by regenerated copies of the same turn. */
   variantGroupId?: string;
   /** Number of saved/live assistant answers in this regeneration group. */
@@ -290,6 +295,10 @@ export interface RequestComponentUsage {
 }
 
 export interface StepUsage {
+  /** Actual provider model used for this call; aggregate values may say multiple models. */
+  model?: string;
+  /** Provider profile used for this call. */
+  providerName?: string;
   promptTokens: number;
   completionTokens: number;
   cacheHitTokens: number;
@@ -309,7 +318,7 @@ export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancell
 
 export interface AgentCheckpoint {
   version: 1;
-  stage: "task_started" | "draft_started" | "scene_written" | "style_repaired" | "review_blocked" | "review_passed" |
+  stage: "task_started" | "draft_started" | "scene_written" | "guide_revised" | "style_repaired" | "review_blocked" | "review_passed" |
     "document_revision_started" | "proposal_submitted";
   path?: string;
   sourceHash?: string;
@@ -327,6 +336,32 @@ export interface AgentTodoItem {
   id: string;
   content: string;
   status: AgentTodoStatus;
+}
+
+export type AgentEvaluationStatus = "running" | "passed" | "failed" | "error";
+
+export interface AgentEvaluationCaseResult {
+  id: number;
+  runId: string;
+  caseId: string;
+  sessionId: string;
+  prompt: string;
+  status: Exclude<AgentEvaluationStatus, "running">;
+  expected: Record<string, unknown>;
+  result: Record<string, unknown>;
+  events: AgentEvent[];
+  createdAt: string;
+}
+
+export interface AgentEvaluationRun {
+  id: string;
+  providerSource: string;
+  model: string;
+  status: AgentEvaluationStatus;
+  summary: Record<string, unknown>;
+  createdAt: string;
+  completedAt?: string;
+  cases?: AgentEvaluationCaseResult[];
 }
 
 /** A compact character card containing only the essentials needed for roleplay. */
@@ -448,6 +483,14 @@ export type PermissionMode = "ask" | "auto" | "plan";
 
 export type AgentEvent =
   | { type: "step_start"; step: number }
+  | { type: "task_contract"; contract: {
+      mode: string;
+      outcome: "answer" | "document" | "character" | "review" | "multiple";
+      evidence: "none" | "project" | "target" | "continuation";
+      mutation: "none" | "document" | "character" | "mixed";
+      planning: "direct" | "adaptive";
+      capabilities: string[];
+    } }
   | { type: "text"; text: string; channel?: "output" | "reasoning" }
   | { type: "tool"; name: string }
   | { type: "step_done"; step: number }

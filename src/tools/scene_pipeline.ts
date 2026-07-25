@@ -1,4 +1,4 @@
-import { documentKind, isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
+import { isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
@@ -7,6 +7,7 @@ import {
   chapterSceneLedger,
   nextChapterScene,
   reviseChapterDraftStyle,
+  reviseChapterSceneGuide,
   sceneCardForTool,
   MAX_SCENE_CHARACTERS,
   writeChapterScene,
@@ -15,7 +16,12 @@ import {
   type ChapterSceneDraft,
 } from "../scene_pipeline.js";
 import { pickBestSceneCandidate, rewriteSceneCandidate, sceneRewriteLengthOk, SCENE_CANDIDATE_SKIP_SCORE } from "../scene_candidates.js";
-import { dynamicStyleGroundingPrompt } from "../style_grounding.js";
+import {
+  IsolatedSceneRequestError,
+  requestIsolatedScene,
+  requestSceneStateExtraction,
+} from "../isolated_scene_writer.js";
+import { dynamicStyleGroundingPrompt, isolatedWriterVoiceSample } from "../style_grounding.js";
 import type { WriterStore } from "../store.js";
 import { previewProseStyleGateError } from "../prose_adjudicate.js";
 import {
@@ -36,8 +42,16 @@ import {
   type ChapterStyleRepairIssue,
 } from "../chapter_style_repair.js";
 import type { ToolExecutionContext } from "./types.js";
+import {
+  DEFAULT_ISOLATED_WRITER_MAX_RATIO,
+  DEFAULT_SCENE_NOTES_CHARACTERS,
+} from "../agent_runtime.js";
 import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
-import { proseStyleGateIssues, submitFullDocumentProposal } from "./proposals.js";
+import {
+  proseStyleGateIssues,
+  submitFullDocumentProposal,
+  tolerantDeferredCharacterChanges,
+} from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
 
 function saveDraftCheckpoint(
@@ -74,22 +88,6 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
   if (mode !== "create" && !exists) throw new Error(`${mode} 模式目标文档不存在`);
   const baseContent = exists ? project.read(path) : "";
   const scenes = Array.isArray(input.scenes) ? input.scenes : [];
-  if (documentKind(path) === "side") {
-    const settings = context.scenePipelineSettings;
-    const maxScenes = settings?.maxScenes ?? 5;
-    const minimumScenes = Math.min(maxScenes, Math.max(2, settings?.preferredMinScenes ?? 3));
-    if (scenes.length < minimumScenes) {
-      throw new Error(`side/ 支线片段至少需要 ${minimumScenes} 个因果承接场景；请按场景链设置充分展开，而不是压缩成单场`);
-    }
-    for (const [index, scene] of scenes.entries()) {
-      const target = scene && typeof scene === "object" && !Array.isArray(scene)
-        ? Number((scene as Record<string, unknown>).targetCharacters)
-        : NaN;
-      if (!Number.isInteger(target) || target < 2_000) {
-        throw new Error(`side/ 支线片段 scenes[${index}].targetCharacters 必须至少为 2000，以避免场景过短`);
-      }
-    }
-  }
   const draft = beginChapterSceneDraft({
     path,
     mode,
@@ -106,8 +104,12 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
   context.lastWritePack = undefined;
   context.priorProseContext = undefined;
   context.sceneStyleEvidence = undefined;
+  context.isolatedSceneVoiceSample = undefined;
+  context.isolatedPendingScene = undefined;
   const priorText = priorProseText(project, draft, context);
-  const stylePriorNotes = priorText ? priorChapterNegativeList(priorText) : [];
+  const stylePriorNotes = context.scenePipelineSettings?.isolatedWriter
+    ? []
+    : priorText ? priorChapterNegativeList(priorText) : [];
   // Stashed for scene-boundary handoffs: the begin exchange leaves the request
   // after the first scene reset, but these notes must keep applying to every scene.
   context.chapterStylePriorNotes = stylePriorNotes;
@@ -121,7 +123,9 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
     scenePolicy: context.scenePipelineSettings,
     nextScene: sceneCardForTool(nextChapterScene(draft)),
     ...(stylePriorNotes.length ? { stylePriorNotes } : {}),
-    message: "场景链已锁定并保存在内存草稿中。按顺序为每场调用一次 write_chapter_scene，同时提交故事内 notes、正文和 actualState。"
+    message: (context.scenePipelineSettings?.isolatedWriter
+      ? "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 只提交故事内 notes，正文与状态由隔离调用生成。"
+      : "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 提交故事内 notes、正文和状态。")
       + (stylePriorNotes.length ? " stylePriorNotes 是从既有正文统计出的高频表达负面清单，写每一场时遵守。" : ""),
   });
 }
@@ -154,18 +158,227 @@ function priorProseText(project: WriterProject, draft: ChapterSceneDraft, contex
 
 export async function handleWriteChapterScene({ input, project, store, sessionId, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "write_chapter_scene");
+  if (context.scenePipelineSettings?.isolatedWriter) {
+    return handleWriteChapterSceneIsolated({ input, project, store, sessionId, context, emit: () => undefined });
+  }
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
   const sceneId = requireString(input.sceneId, "sceneId");
   const notes = requireString(input.notes, "notes");
-  if (notes.length > 1_500) throw new Error("notes 过长（上限 1500 字）；只写本场目标、关键事实与事件顺序的要点清单，不要写成长文");
+  const notesMaxCharacters = context.scenePipelineSettings?.notesMaxCharacters ?? DEFAULT_SCENE_NOTES_CHARACTERS;
+  if (notes.length > notesMaxCharacters) {
+    throw new Error(`notes 过长（当前上限 ${notesMaxCharacters} 字）；只保留会约束本场正文的材料`);
+  }
   const writePack = formatWritePackForWriter(compileWritePack(notes, { targetPath: draft.path }));
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const submitted = requireString(input.content, "content");
   rejectCompressedPlaceholder(submitted, "content");
+  return acceptChapterScene({
+    project, store, sessionId, context, draft, sceneId, submitted,
+    actualState: input.actualState,
+    writePackCharacters: writePack.length,
+    toolName: "write_chapter_scene",
+    exposeCandidateContent: true,
+  });
+}
+
+export function handleReviseChapterSceneGuide({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
+  assertWritableMode(context.permissionMode, "revise_chapter_scene_guide");
+  const draft = context.chapterSceneDraft;
+  if (!draft) throw new Error("当前没有章节场景草稿");
+  const remainingScenes = input.remainingScenes;
+  const result = reviseChapterSceneGuide(
+    draft,
+    remainingScenes,
+    context.scenePipelineSettings?.maxScenes,
+  );
+  context.chapterSceneDraft = result.draft;
+  context.writePackCompiled = false;
+  context.writePackSceneId = undefined;
+  context.lastWritePack = undefined;
+  saveDraftCheckpoint({ store, sessionId }, "guide_revised", result.draft);
+  const next = nextChapterScene(result.draft);
+  return JSON.stringify({
+    status: "guide_revised",
+    completedScenes: result.draft.completed.length,
+    totalScenes: result.draft.scenes.length,
+    addedSceneIds: result.addedSceneIds,
+    removedSceneIds: result.removedSceneIds,
+    nextScene: sceneCardForTool(next),
+    complete: chapterSceneDraftComplete(result.draft),
+    message: next
+      ? "剩余 scene guide 已更新；根据当前 actualState 决定是否写下一场，guide 是导航而非必须照抄的提纲。"
+      : "剩余 scene guide 已清空；正文以当前实际结果收束，可以调用 inspect_chapter_draft 终审。",
+  });
+}
+
+async function handleWriteChapterSceneIsolated({ input, project, store, sessionId, context }: ToolHandlerArgs): Promise<string> {
+  if (!context.scenePipelineSettings?.isolatedWriter || !context.isolatedSceneWriter) {
+    throw new Error("隔离正文实验缺少 Writer 配置");
+  }
+  const draft = context.chapterSceneDraft;
+  if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
+  const submittedSceneId = typeof input.sceneId === "string" ? input.sceneId.trim() : "";
+  const sceneId = submittedSceneId || draft.scenes[draft.completed.length]?.id;
+  if (!sceneId) throw new Error("sceneId 缺失，且当前没有待写场景");
+  const sceneIndex = draft.scenes.findIndex(scene => scene.id === sceneId);
+  if (sceneIndex < 0) throw new Error(`场景不存在：${sceneId}`);
+  if (sceneIndex > draft.completed.length) {
+    throw new Error(`必须按场景链顺序写作；下一场应为 ${draft.scenes[draft.completed.length]?.id ?? "（已完成）"}`);
+  }
+  const notes = requireString(input.notes, "notes");
+  const notesMaxCharacters = context.scenePipelineSettings.notesMaxCharacters ?? DEFAULT_SCENE_NOTES_CHARACTERS;
+  if (notes.length > notesMaxCharacters) {
+    throw new Error(`notes 过长（当前上限 ${notesMaxCharacters} 字）；只保留会约束本场正文的材料`);
+  }
+  const compiled = compileWritePack(notes, { targetPath: draft.path });
+  const formatted = formatWritePackForWriter(compiled);
+  if (!formatted.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
+
+  const previous = sceneIndex > 0 ? draft.completed[sceneIndex - 1] : undefined;
+  const runner = context.isolatedSceneWriter.run ?? requestIsolatedScene;
+  const targetCharacters = draft.scenes[sceneIndex].targetCharacters;
+  const writerMaxRatio = context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO;
+  const maximumCharacters = targetCharacters ? Math.floor(targetCharacters * writerMaxRatio) : undefined;
+  const writerInput = {
+    scene: draft.scenes[sceneIndex],
+    writePack: compiled,
+    previousTail: previous?.content.slice(-800),
+    currentState: previous?.actualState,
+    voiceSample: chapterIsolatedVoiceSample({ project, store, context }, draft),
+    maximumCharacters,
+  };
+  const runWriter = async (strictMaximumCharacters?: number) => {
+    const callKind = strictMaximumCharacters ? "isolated_scene_writer_length_retry" : "isolated_scene_writer";
+    try {
+      const generated = await runner(context.isolatedSceneWriter!.model, {
+        ...writerInput,
+        ...(strictMaximumCharacters ? { strictMaximumCharacters } : {}),
+      }, context.isolatedSceneWriter!.signal);
+      if (generated.usage) {
+        context.modelUsageReporter?.(context.isolatedSceneWriter!.model, generated.usage, { callKind });
+      }
+      return generated;
+    } catch (error) {
+      if (error instanceof IsolatedSceneRequestError && error.usage) {
+        context.modelUsageReporter?.(context.isolatedSceneWriter!.model, error.usage, {
+          callKind: `${callKind}_failed`,
+        });
+      }
+      throw error;
+    }
+  };
+  const pending = context.isolatedPendingScene?.forPath === draft.path
+    && context.isolatedPendingScene.sceneId === sceneId
+    ? context.isolatedPendingScene
+    : undefined;
+  let generated = pending
+    ? { content: pending.content, requestCharacters: pending.writerInputCharacters }
+    : undefined;
+  let retriedForLength = false;
+  if (!generated) {
+    try {
+      generated = await runWriter();
+    } catch (error) {
+      if (!(error instanceof IsolatedSceneRequestError)
+        || error.stage !== "writer"
+        || error.failureKind !== "truncated"
+        || !maximumCharacters) throw error;
+      generated = await runWriter(maximumCharacters);
+      retriedForLength = true;
+    }
+  }
+  if (!retriedForLength && maximumCharacters && generated.content.trim().length > maximumCharacters) {
+    generated = await runWriter(maximumCharacters);
+  }
+  if (maximumCharacters && generated.content.trim().length > maximumCharacters) {
+    throw new Error(`隔离正文 Writer 连续两次超出本场上限 ${maximumCharacters} 字；请收紧 notes 中的事件范围后重试`);
+  }
+  rejectCompressedPlaceholder(generated.content, "隔离正文 Writer content");
+  context.isolatedPendingScene = {
+    forPath: draft.path,
+    sceneId,
+    content: generated.content,
+    writerInputCharacters: generated.requestCharacters,
+  };
+
+  const extractor = context.isolatedSceneWriter.extractState ?? requestSceneStateExtraction;
+  const stateInput = {
+    previousState: previous?.actualState,
+    sceneContent: generated.content,
+    nextScene: draft.scenes[sceneIndex + 1],
+  };
+  const runExtractor = async (retryJsonOnly = false) => {
+    const callKind = retryJsonOnly ? "isolated_scene_state_retry" : "isolated_scene_state";
+    try {
+      const extracted = await extractor(context.isolatedSceneWriter!.stateModel, {
+        ...stateInput,
+        ...(retryJsonOnly ? { retryJsonOnly: true } : {}),
+      }, context.isolatedSceneWriter!.signal);
+      if (extracted.usage) {
+        context.modelUsageReporter?.(context.isolatedSceneWriter!.stateModel, extracted.usage, { callKind });
+      }
+      return extracted;
+    } catch (error) {
+      if (error instanceof IsolatedSceneRequestError && error.usage) {
+        context.modelUsageReporter?.(context.isolatedSceneWriter!.stateModel, error.usage, {
+          callKind: `${callKind}_failed`,
+        });
+      }
+      throw error;
+    }
+  };
+  let extracted;
+  try {
+    extracted = await runExtractor();
+  } catch (error) {
+    if (!(error instanceof IsolatedSceneRequestError)
+      || error.stage !== "state"
+      || (error.failureKind !== "truncated" && error.failureKind !== "invalid_output")) throw error;
+    try {
+      extracted = await runExtractor(true);
+    } catch (retryError) {
+      const message = retryError instanceof Error ? retryError.message : String(retryError);
+      throw new Error(`正文已暂存，仅场景状态提取连续失败；用同一场景再次调用即可只重试状态提取：${message}`, {
+        cause: retryError,
+      });
+    }
+  }
+
+  const accepted = await acceptChapterScene({
+    project, store, sessionId, context, draft, sceneId,
+    submitted: generated.content,
+    actualState: extracted.actualState,
+    writePackCharacters: formatted.length,
+    toolName: "write_chapter_scene",
+    generation: {
+      mode: "isolated",
+      writerInputCharacters: generated.requestCharacters,
+      stateInputCharacters: extracted.requestCharacters,
+    },
+  });
+  context.isolatedPendingScene = undefined;
+  return accepted;
+}
+
+async function acceptChapterScene(args: {
+  project: WriterProject;
+  store: WriterStore;
+  sessionId: string;
+  context: ToolExecutionContext;
+  draft: ChapterSceneDraft;
+  sceneId: string;
+  submitted: string;
+  actualState: unknown;
+  writePackCharacters: number;
+  toolName: "write_chapter_scene";
+  exposeCandidateContent?: boolean;
+  generation?: { mode: "isolated"; writerInputCharacters: number; stateInputCharacters: number };
+}): Promise<string> {
+  const { project, store, sessionId, context, draft, sceneId } = args;
   // AA-repeat generation bug ("S。S。") — objective defect with a mechanical fix:
   // dedupe in-tool instead of spending a full round-trip on regeneration.
-  const dedup = removeAdjacentDuplicateSentences(submitted);
+  const dedup = removeAdjacentDuplicateSentences(args.submitted);
   const content = dedup.text;
   const residualDuplicates = findAdjacentDuplicateSentences(content);
   if (residualDuplicates.length) {
@@ -176,7 +389,7 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
       error: `本场存在相邻逐字复读句：${residualDuplicates.slice(0, 3).map(item => `「${item}」`).join("、")}`,
       sceneId,
       complete: false,
-      message: "删去每处复读中的重复句后，用同一 sceneId 重新调用 write_chapter_scene（notes 可保留）。",
+      message: "本场未入库；保留 notes，用同一 sceneId 重新调用 write_chapter_scene。",
     });
   }
   // Never spend another full-scene generation on sentence-level density. Keep
@@ -192,7 +405,7 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
     sceneId,
     content,
   );
-  const result = writeChapterScene(draft, sceneId, selectedContent, input.actualState);
+  const result = writeChapterScene(draft, sceneId, selectedContent, args.actualState);
   context.chapterSceneDraft = result.draft;
   saveDraftCheckpoint({ store, sessionId }, "scene_written", result.draft);
   // A write pack belongs to exactly one scene. The next/revised scene must recompile.
@@ -203,7 +416,7 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   // Anti-self-imitation hints for the NEXT scene: measured from prose already in the
   // draft (not model self-report), zero extra model calls — scene-chain counterpart
   // of the roleplay anti-formula slot.
-  const styleFeedback = next
+  const styleFeedback = next && !context.scenePipelineSettings?.isolatedWriter
     ? sceneAntiFormulaFeedback({
       chapterSoFar: result.draft.completed.map(scene => scene.content).join("\n\n"),
       priorChapterText: priorProseText(project, result.draft, context) || undefined,
@@ -215,7 +428,8 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
     completedScenes: result.draft.completed.length,
     totalScenes: result.draft.scenes.length,
     invalidatedSceneIds: result.invalidatedSceneIds,
-    writePackCharacters: writePack.length,
+    writePackCharacters: args.writePackCharacters,
+    ...(args.generation ? { generation: args.generation } : {}),
     actualState: result.draft.completed.at(-1)?.actualState,
     nextScene: sceneCardForTool(next),
     ...(styleFeedback.length ? { styleFeedback } : {}),
@@ -224,12 +438,12 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
     ...(deferredStyleError ? { styleDeferred: { code: "SCENE_STYLE_DENSE", error: deferredStyleError } } : {}),
     // When a rewrite wins, the model's own submission is NOT what entered the
     // draft — return the stored text so later inspect/revise work on real bytes.
-    ...(candidateReport?.chosen === "rewrite" ? { content: selectedContent } : {}),
+    ...(args.exposeCandidateContent && candidateReport?.chosen === "rewrite" ? { content: selectedContent } : {}),
     complete: chapterSceneDraftComplete(result.draft),
     message: [
       next
-        ? `下一场为 ${next.id}；根据本场 actualState 更新人物与局面，在下一次 write_chapter_scene 中提交新的 notes。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
-        : "全部场景已写完；调用 inspect_chapter_draft 做整章接缝、重复功能与总变化审阅。",
+        ? `当前 guide 的下一场为 ${next.id}；先根据本场 actualState 判断是继续该方向，还是 revise_chapter_scene_guide 调整剩余引导。${styleFeedback.length ? "styleFeedback 是对已写正文的机器统计，写下一场时遵守其中的禁用与压降要求。" : ""}`
+        : "当前没有未写 scene guide；章节目标已抵达则 inspect_chapter_draft，否则先补充下一场引导。",
       dedup.removed.length
         ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
         : "",
@@ -338,6 +552,17 @@ function chapterStyleEvidence(
   if (cached?.forPath === draft.path) return cached.text;
   const text = dynamicStyleGroundingPrompt(args.project, args.store, { intensive: true, targetPath: draft.path });
   args.context.sceneStyleEvidence = { forPath: draft.path, text };
+  return text;
+}
+
+function chapterIsolatedVoiceSample(
+  args: { project: WriterProject; store: WriterStore; context: ToolExecutionContext },
+  draft: ChapterSceneDraft,
+): string {
+  const cached = args.context.isolatedSceneVoiceSample;
+  if (cached?.forPath === draft.path) return cached.text;
+  const text = isolatedWriterVoiceSample(args.project, args.store, draft.path);
+  args.context.isolatedSceneVoiceSample = { forPath: draft.path, text };
   return text;
 }
 
@@ -486,13 +711,18 @@ async function submitPassedChapterReview(
   const { draft, proposalSummary, contentCharacters, metrics, styleWarnings, ledger, chapterReview } = values;
   draft.inspectedVersion = draft.version;
   saveDraftCheckpoint(args, "review_passed", draft);
+  const preparedCharacterChanges = tolerantDeferredCharacterChanges(
+    input.characterChanges,
+    args.store,
+    args.characterScope,
+  );
   let proposalResult: string;
   try {
     proposalResult = await submitChapterDraftProposal(args, {
       summary: proposalSummary,
       chapterChange: chapterReview.chapterChange,
       reviewNotes: chapterReview.reviewNotes,
-      characterChanges: input.characterChanges,
+      characterChanges: preparedCharacterChanges.changes,
     });
   } catch (error) {
     return JSON.stringify({
@@ -527,6 +757,9 @@ async function submitPassedChapterReview(
     ...(styleWarnings.length ? { styleWarnings } : {}),
     ledger,
     chapterReview,
+    ...(preparedCharacterChanges.warnings.length
+      ? { characterChangeWarnings: preparedCharacterChanges.warnings }
+      : {}),
     message: "整章终审已完成且提案已创建；不要再调用 propose_chapter_draft。",
   });
 }
@@ -588,7 +821,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     examples: issue.examples.slice(0, 5),
   }));
   const ledger = chapterSceneLedger(draft);
-  if (draft.completed.length === 1) {
+  if (draft.completed.length === 1 && !styleWarnings.length) {
     const scene = draft.scenes[0];
     return submitPassedChapterReview(args, {
       draft,
@@ -624,6 +857,10 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           content,
           scenes: ledger,
           context: reviewer.context,
+          proseSignals: {
+            stats: metrics.stats,
+            warnings: styleWarnings,
+          },
         }, reviewer.signal);
         if (reviewed.usage) {
           context.modelUsageReporter?.(reviewModel, reviewed.usage, {
