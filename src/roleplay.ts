@@ -432,9 +432,10 @@ export function slimRoleplayCharacterViews(
       id: views.stable.id,
       identity: views.stable.identity,
       profile: {
+        appearance: views.stable.profile.appearance.slice(0, 600),
         appearanceSummary: views.stable.profile.appearanceSummary,
-        distinguishingFeatures: views.stable.profile.distinguishingFeatures.slice(0, 6),
-        backgroundSummary: views.stable.profile.backgroundSummary.slice(0, 400),
+        background: views.stable.profile.background.slice(0, 800),
+        backgroundSummary: views.stable.profile.backgroundSummary,
       },
       psychology: {
         summary: views.stable.psychology.summary,
@@ -443,6 +444,7 @@ export function slimRoleplayCharacterViews(
         fears: views.stable.psychology.fears.slice(0, 4),
         conflicts: views.stable.psychology.conflicts.slice(0, 4),
       },
+      features: views.stable.features.slice(0, 8),
       competencies: views.stable.competencies,
       experiences: (views.stable.experiences ?? []).slice(-3).map(item => ({
         label: item.label,

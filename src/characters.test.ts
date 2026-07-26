@@ -10,12 +10,14 @@ import {
   competenciesWritingPayload,
   competencyPromptView,
   emptyCharacter,
+  characterSummaryCard,
   normalizeV3Character,
   resolveCharacterAt,
   upsertById,
 } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
+import { handleGetCharacter, handleListCharacters, handleSaveCharacter } from "./tools/characters.js";
 import type { Character, OutlineNode } from "./types.js";
 
 test("competency unlock state is normalized and defaults to locked", () => {
@@ -160,6 +162,115 @@ test("saveCharacter upserts arrays and supports replaceSections", () => {
   }
 });
 
+test("features persist separately from competencies and first-pass view exposes summaries only", () => {
+  const card = normalizeV3Character({
+    ...emptyCharacter("Tester"),
+    id: 1,
+    updatedAt: "",
+    identity: { ...emptyCharacter("Tester").identity, summary: "调查员" },
+    profile: { ...emptyCharacter().profile, appearanceSummary: "总戴着旧手套" },
+    voice: { ...emptyCharacter().voice, summary: "短句，常省略主语" },
+    features: [{
+      id: "feature-cold", name: "怕冷", summary: "低温时动作会变得僵硬\n右手尤其明显", description: "旧伤导致，右手最明显",
+    }],
+    competencies: [{
+      id: "skill-track", name: "追踪", summary: "擅长辨认足迹\n能判断移动方向", level: "熟练", unlocked: true,
+      description: "能从泥土判断负重", resources: [], limitations: [], costs: [],
+    }],
+  });
+  const summary = characterSummaryCard(card);
+  assert.equal(card.features[0].description, "旧伤导致，右手最明显");
+  assert.equal(summary.features[0].summary, "低温时动作会变得僵硬 右手尤其明显");
+  assert.equal(summary.competencies[0].summary, "擅长辨认足迹 能判断移动方向");
+  assert.equal("description" in summary.features[0], false);
+  assert.equal("description" in summary.competencies[0], false);
+  assert.equal(summary.identity.summary, "调查员");
+  assert.equal(summary.appearance.summary, "总戴着旧手套");
+  assert.equal(summary.voice.summary, "短句，常省略主语");
+});
+
+test("legacy v3 profile fields normalize into detailed appearance/background plus summaries", () => {
+  const base = emptyCharacter("旧卡");
+  const card = normalizeV3Character({
+    ...base,
+    id: 1,
+    updatedAt: "",
+    profile: {
+      appearanceSummary: "旧版完整外貌",
+      distinguishingFeatures: ["浅琥珀色虹膜", "右耳银钉"],
+      backgroundSummary: "旧版较长的完整背景",
+      biography: "详细传记",
+    },
+  });
+  assert.equal(card.profile.appearance, "旧版完整外貌");
+  assert.equal(card.profile.appearanceSummary, "浅琥珀色虹膜\n右耳银钉");
+  assert.equal(card.profile.background, "旧版较长的完整背景");
+  assert.equal(card.profile.backgroundSummary, "旧版较长的完整背景");
+  assert.equal(card.profile.biography, "详细传记");
+  assert.equal("distinguishingFeatures" in card.profile, false);
+});
+
+test("character tools route summary, section, and edit views without an extra edit read", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-views-"));
+  try {
+    const project = WriterProject.init(root, "分层读卡");
+    const store = new WriterStore(project);
+    const card = store.saveCharacter({
+      ...emptyCharacter("闻溪"),
+      features: [{ id: "feature-cold", name: "怕冷", summary: "低温时动作僵硬", description: "右手旧伤最明显" }],
+    });
+    const sessionId = store.createSession("编辑角色");
+    const args = {
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      context: { permissionMode: "auto" as const },
+    };
+
+    const directory = JSON.parse(handleListCharacters({ ...args, input: {} })) as Array<{
+      updatedAt: string; sections: { features: number };
+    }>;
+    assert.equal(directory[0].sections.features, 1);
+    assert.equal(directory[0].updatedAt, card.updatedAt);
+
+    const summary = JSON.parse(handleGetCharacter({
+      ...args, input: { id: card.id, view: "summary" },
+    })) as Record<string, unknown>;
+    assert.equal(JSON.stringify(summary).includes("右手旧伤最明显"), false);
+
+    const selected = JSON.parse(handleGetCharacter({
+      ...args, input: { id: card.id, view: "edit", sections: ["features"] },
+    })) as { updatedAt: string; features: Array<{ description: string }> };
+    assert.equal(selected.features[0].description, "右手旧伤最明显");
+
+    const edit = JSON.parse(handleGetCharacter({
+      ...args, input: { id: card.id, view: "edit" },
+    })) as Character;
+    assert.equal(edit.features[0].id, "feature-cold");
+
+    assert.throws(() => handleSaveCharacter({
+      ...args, input: { id: card.id, features: [] },
+    }), /expectedUpdatedAt/);
+    const saved = JSON.parse(handleSaveCharacter({
+      ...args,
+      input: {
+        id: card.id,
+        expectedUpdatedAt: selected.updatedAt,
+        features: [{ id: "feature-cold", name: "怕冷", summary: "严寒时右手僵硬", description: "右手旧伤最明显" }],
+      },
+    })) as { updatedAt: string };
+    assert.ok(saved.updatedAt);
+    assert.throws(() => handleSaveCharacter({
+      ...args,
+      input: { id: card.id, expectedUpdatedAt: "1970-01-01T00:00:00.000Z", notes: "过期写入" },
+    }), /重新读取/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("web character editor save replaces deleted experiences and story states", () => {
   const base = normalizeV3Character({
     ...emptyCharacter("甲"),
@@ -273,7 +384,8 @@ test("v2 cards migrate once with deterministic entries and backup", () => {
     project.writeCharacterCardsJsonl(`${JSON.stringify(v2)}\n`);
     let store = new WriterStore(project);
     const card = store.characters()[0];
-    assert.equal(card.schemaVersion, 3); assert.equal(card.identity.name, "千夏"); assert.equal(card.profile.appearanceSummary, "红围巾");
+    assert.equal(card.schemaVersion, 3); assert.equal(card.identity.name, "千夏"); assert.equal(card.profile.appearance, "红围巾"); assert.equal(card.profile.appearanceSummary, "红围巾");
+    assert.equal(card.profile.background, "北城长大"); assert.equal(card.profile.backgroundSummary, "北城长大");
     assert.equal(card.psychology.summary, "谨慎"); assert.equal(card.motivations[0].id, "goal-1-long-term"); assert.equal(card.updatedAt, v2.updatedAt);
     assert.deepEqual(card.experiences, []);
     assert.ok(existsSync(join(project.charactersDir, "characters.v2.backup.jsonl")));
@@ -355,6 +467,13 @@ test("proposal approval applies deferred ability unlock and undo keeps it atomic
     let competency = store.characters()[0].competencies[0];
     assert.equal(competency.unlocked, true);
     assert.equal("sourceRefs" in competency, false);
+    const versionCount = store.documentVersions("chapters/觉醒.md").length;
+    assert.equal(store.acceptProposal(proposal.id).status, "accepted");
+    assert.equal(store.documentVersions("chapters/觉醒.md").length, versionCount);
+
+    const repeatedReject = store.createProposal(sessionId, "chapters/拒绝.md", "不会写入。", "拒绝测试");
+    assert.equal(store.rejectProposal(repeatedReject.id).status, "rejected");
+    assert.equal(store.rejectProposal(repeatedReject.id).status, "rejected");
 
     store.undo(sessionId);
     assert.equal(store.characters()[0].competencies[0].unlocked, false);

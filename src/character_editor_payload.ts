@@ -2,6 +2,7 @@ import type { CharacterInput, CharacterReplaceSection } from "./characters.js";
 
 export const CHARACTER_EDITOR_REPLACE_SECTIONS: CharacterReplaceSection[] = [
   "motivations",
+  "features",
   "competencies",
   "relationships",
   "storyStates",

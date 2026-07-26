@@ -202,7 +202,7 @@ export async function generateCharacter(input: {
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
-    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/experiences/notes；结构化条目必须有稳定 ASCII id，演进记录可包含 status/validFrom/validUntil。competencies 每项必须填写 name、summary 和 unlocked；summary 是无论是否解锁都会展示的简短能力概述，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
+    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/features/competencies/storyStates/experiences/notes；profile 固定使用 appearance/appearanceSummary/background/backgroundSummary/biography，其中 appearance 与 background 放完整资料，两个 Summary 以换行分隔要点、每行一项，不限定固定总字数。结构化条目必须有稳定 ASCII id，演进记录可包含 status/validFrom/validUntil。features 用于不属于能力但会影响描写的稳定细节，每项填写 name、summary、description，summary 使用自然短段落。competencies 每项必须填写 name、summary 和 unlocked；summary 使用自然短段落，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
   const usesToolLoop = Boolean(input.project && input.allowedDocumentPaths?.length);
@@ -214,6 +214,76 @@ export async function generateCharacter(input: {
   if (result.usage && !usesToolLoop) input.usageReporter?.(input.model, result.usage, { callKind: "character_generation" });
   const parsed = parseJsonObject(result.content);
   return normalizeCharacterDraft(parsed);
+}
+
+export type CharacterSummaryKind =
+  | "identity"
+  | "appearance"
+  | "background"
+  | "psychology"
+  | "voice"
+  | "feature"
+  | "competency";
+
+const CHARACTER_SUMMARY_REQUIREMENTS: Record<CharacterSummaryKind, string> = {
+  identity: "60～140 个中文字符。交代角色是什么人、在故事中的位置或职责，并保留最有辨识度的背景/处境/反差；不要只复述姓名、标签或头衔。",
+  appearance: "每行一个外貌辨识点。只写已有事实，不加标题、编号或符号。",
+  background: "每行一个背景事实或当前影响。只写已有事实，不加标题、编号或符号。",
+  psychology: "60～140 个中文字符。至少覆盖外显行为模式、内在驱动力，以及明显的价值冲突/恐惧/关系反应中的两项；不要只堆形容词。",
+  voice: "50～120 个中文字符。覆盖句子节奏、语域或用词倾向、与人互动时的态度，并在资料支持时说明压力下的变化；不要照抄对白示例。",
+  feature: "45～110 个中文字符。说明特性本身、显现情形和可观察影响；不要只改写名称。",
+  competency: "45～110 个中文字符。概括能力性质、核心效果与边界。未解锁时也会展示，不泄露具体机制、数值、资源或代价。",
+};
+
+function hasCharacterSummarySource(value: unknown): boolean {
+  if (typeof value === "string") return Boolean(value.trim());
+  if (typeof value === "number" || value === true) return true;
+  if (Array.isArray(value)) return value.some(hasCharacterSummarySource);
+  if (value && typeof value === "object") return Object.values(value as Record<string, unknown>).some(hasCharacterSummarySource);
+  return false;
+}
+
+export async function summarizeCharacterField(input: {
+  model: ModelConfig;
+  kind: CharacterSummaryKind;
+  source: unknown;
+  signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
+}): Promise<string> {
+  if (!(input.kind in CHARACTER_SUMMARY_REQUIREMENTS)) throw new Error("不支持的角色摘要类型");
+  if (!hasCharacterSummarySource(input.source)) throw new Error("可供归纳的角色资料不能为空");
+  const source = JSON.stringify(input.source).slice(0, 12_000);
+  const result = await completeText(input.model, [
+    {
+      role: "system",
+      content: "你是角色卡摘要器。只用输入事实，不补设定。外貌、背景摘要每行一个要点；其他摘要写一两句自然短文。只输出正文。",
+    },
+    {
+      role: "user",
+      content: `摘要类型：${input.kind}
+具体要求：${CHARACTER_SUMMARY_REQUIREMENTS[input.kind]}
+资料（JSON）：${source}`,
+    },
+  ], input.signal);
+  if (result.usage) input.usageReporter?.(input.model, result.usage, { callKind: `character_${input.kind}_summary` });
+  const lineItemSummary = input.kind === "appearance" || input.kind === "background";
+  const withoutHeading = result.content
+    .replace(/\r\n?/g, "\n")
+    .trim()
+    .replace(/^(?:身份|外貌|背景|性格|心理|声线|特性|能力)?摘要[:：]\s*/, "");
+  const summary = lineItemSummary
+    ? withoutHeading
+      .split("\n")
+      .map(line => line.trim().replace(/^(?:[-*•·]|\d+[.)、])\s*/, "").trim())
+      .filter(Boolean)
+      .join("\n")
+    : withoutHeading
+      .replace(/\s+/g, " ")
+      .replace(/^["“]|["”]$/g, "")
+      .trim()
+      .slice(0, 300);
+  if (!summary) throw new Error("摘要模型没有返回有效内容");
+  return summary;
 }
 
 export async function summarizeCharacterCompetency(input: {
@@ -240,23 +310,13 @@ export async function summarizeCharacterCompetency(input: {
   if (![competency.name, competency.level, competency.description, ...competency.resources, ...competency.limitations, ...competency.costs].some(Boolean)) {
     throw new Error("能力内容不能为空");
   }
-  const result = await completeText(input.model, [
-    {
-      role: "system",
-      content: "你是角色卡能力摘要器。根据给定能力资料写一条简洁中文 summary，概括能力性质和核心效果。summary 即使能力未解锁也会展示，因此只写高层概述，不泄露具体机制、精确数值、资源清单、限制细节或代价细节。要求 20～80 个中文字符；只输出摘要正文，不加标题、引号、列表或解释；资料不足时忠实概括，不补造设定。",
-    },
-    { role: "user", content: JSON.stringify(competency) },
-  ], input.signal);
-  if (result.usage) input.usageReporter?.(input.model, result.usage, { callKind: "character_competency_summary" });
-  const summary = result.content
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/^(?:能力)?摘要[:：]\s*/, "")
-    .replace(/^["“]|["”]$/g, "")
-    .trim()
-    .slice(0, 200);
-  if (!summary) throw new Error("摘要模型没有返回有效内容");
-  return summary;
+  return summarizeCharacterField({
+    model: input.model,
+    kind: "competency",
+    source: competency,
+    signal: input.signal,
+    usageReporter: input.usageReporter,
+  });
 }
 
 export async function updateCharacterFromConversation(input: {

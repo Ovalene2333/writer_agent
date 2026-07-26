@@ -193,12 +193,13 @@ test("project instructions prefer WRITER.md", () => {
   }
 });
 
-test("agent settings round-trip permission mode and scene pipeline", () => {
+test("agent settings round-trip permission, writing mode, and scene pipeline", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
     const project = WriterProject.init(root, "测试");
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "ask",
+      writingMode: "delegated",
       characterEvolutionEnabled: true,
       scenePipeline: {
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
@@ -207,6 +208,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
+      writingMode: "fast",
       characterEvolutionEnabled: false,
       scenePipeline: {
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
@@ -215,6 +217,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     });
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "plan",
+      writingMode: "fast",
       characterEvolutionEnabled: false,
       scenePipeline: {
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
@@ -231,6 +234,7 @@ test("agent settings round-trip permission mode and scene pipeline", () => {
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriterMaxRatio, 2.4);
     saveAgentSettings(project, { scenePipeline: { isolatedWriter: true } });
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriter, true);
+    assert.equal(loadAgentSettings(project).writingMode, "fast", "scene patch must preserve writing mode");
     assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
   } finally {
     rmSync(root, { recursive: true, force: true });

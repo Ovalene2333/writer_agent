@@ -21,9 +21,20 @@ import {
   loadAgentSettings,
   loadProjectInstructions,
   saveAgentSettings,
+  isWritingExecutionMode,
   type ScenePipelineSettings,
+  type WritingExecutionMode,
 } from "./agent_runtime.js";
-import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
+import {
+  generateCharacter,
+  maybeAutoTitleSession,
+  suggestActions,
+  summarizeCharacterCompetency,
+  summarizeCharacterField,
+  updateCharacterFromConversation,
+  type CharacterSummaryKind,
+  type WritingMode,
+} from "./generation.js";
 import {
   generateRoleplayInterlocutor,
   generateRoleplayScene,
@@ -522,6 +533,21 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/characters/summarize", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string; kind?: CharacterSummaryKind; source?: unknown }>();
+      if (!body.kind) throw new Error("缺少摘要类型");
+      const summary = await summarizeCharacterField({
+        model: options.providers.summaryModelConfig(),
+        kind: body.kind,
+        source: body.source,
+        signal: context.req.raw.signal,
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
+      });
+      return context.json({ summary });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.delete("/api/characters/:id", (context) => {
     try {
       const id = Number(context.req.param("id"));
@@ -659,6 +685,7 @@ export async function startWriterServer(options: {
     const instructions = loadProjectInstructions(options.project);
     return context.json({
       permissionMode: settings.permissionMode,
+      writingMode: settings.writingMode,
       characterEvolutionEnabled: settings.characterEvolutionEnabled,
       scenePipeline: settings.scenePipeline,
       instructionsPath: instructions?.path ?? null,
@@ -670,12 +697,15 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; characterEvolutionEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
+      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
       if (body.characterEvolutionEnabled !== undefined && typeof body.characterEvolutionEnabled !== "boolean") {
         return context.json({ error: "characterEvolutionEnabled 必须是布尔值" }, 400);
+      }
+      if (body.writingMode !== undefined && !isWritingExecutionMode(body.writingMode)) {
+        return context.json({ error: "writingMode 仅支持 delegated、fast" }, 400);
       }
       if (body.scenePipeline !== undefined) {
         const values = [
@@ -716,11 +746,13 @@ export async function startWriterServer(options: {
       }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
+        ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
         ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
+        writingMode: settings.writingMode,
         characterEvolutionEnabled: settings.characterEvolutionEnabled,
         scenePipeline: settings.scenePipeline,
       });

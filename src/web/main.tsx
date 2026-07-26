@@ -26,7 +26,6 @@ import {
   Menu,
   MessageSquare,
   Minus,
-  Moon,
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
@@ -43,11 +42,12 @@ import {
   WandSparkles,
   Wifi,
   X,
+  Zap,
 } from "lucide-react";
 import { Marked, type Token, type Tokens } from "marked";
 import { documentDiff, renderDiffHtml } from "../diff";
 import { characterEditorSaveInput } from "../character_editor_payload";
-import { CharacterEditor } from "./character_editor";
+import { CharacterEditor, type CharacterSummaryKind } from "./character_editor";
 import {
   apiUrl,
   buildEntryUrl,
@@ -57,13 +57,15 @@ import {
   getActiveBase,
   getConnectionInfo,
   initConnection,
+  probeConnectionRoutes,
   setConnectionPreference,
   startConnectionMonitor,
   subscribeConnection,
   type ConnectionInfo,
+  type ConnectionProbeResults,
   type ConnectionPreference,
 } from "./connection";
-import { ModelConfig, type ProviderCatalog, type ScenePipelineSettings } from "./model_config";
+import { ModelConfig, type ProviderCatalog, type ScenePipelineSettings, type SettingsSection, type WritingExecutionMode } from "./model_config";
 import "./style.css";
 
 type Proposal = {
@@ -74,6 +76,14 @@ type Proposal = {
   afterContent: string;
   status: "pending" | "accepted" | "rejected" | "stale";
 };
+
+function mergeProposalEvent(current: Proposal[], incoming: Proposal): Proposal[] {
+  const existing = current.find(item => item.id === incoming.id);
+  // Replayed SSE history may contain the original pending event after a refresh
+  // has already observed the terminal database state. Never downgrade it.
+  if (incoming.status === "pending" && existing && existing.status !== "pending") return current;
+  return [incoming, ...current.filter(item => item.id !== incoming.id)];
+}
 type Message = {
   id: number;
   role: string;
@@ -242,14 +252,15 @@ type TextEntry = Temporal & { id: string; label: string; description: string };
 type Goal = Temporal & { id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown"; priority: number; summary: string; stakes: string; obstacles: string[] };
 type Relationship = Temporal & { id: string; characterId: number; type: string; description: string; attitude: string; status: "active" | "ended" | "strained" | "unknown" };
 type Competency = Temporal & { id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[] };
+type Feature = { id: string; name: string; summary: string; description: string };
 type StoryState = Temporal & { id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string; knowledge: TextEntry[]; beliefs: TextEntry[]; intentions: string[]; temporaryGoals: Goal[]; notes: string };
 type Character = {
   schemaVersion: 3; id: number;
   identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
-  profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
+  profile: { appearance: string; appearanceSummary: string; background: string; backgroundSummary: string; biography: string };
   psychology: { summary: string; traits: TextEntry[]; values: TextEntry[]; fears: TextEntry[]; conflicts: TextEntry[] };
   motivations: Goal[]; voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
-  competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; experiences: TextEntry[]; notes: string; updatedAt: string;
+  features: Feature[]; competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; experiences: TextEntry[]; notes: string; updatedAt: string;
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
 type StepUsage = {
@@ -416,7 +427,7 @@ type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode; characterEvolutionEnabled: boolean; scenePipeline: ScenePipelineSettings };
+  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; scenePipeline: ScenePipelineSettings };
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;
 };
@@ -444,10 +455,10 @@ type TreeNode = {
 
 const EMPTY_CHARACTER: CharacterDraft = {
   schemaVersion: 3, identity: { name: "", aliases: [], tags: [], narrativeRole: "", summary: "" },
-  profile: { appearanceSummary: "", distinguishingFeatures: [], backgroundSummary: "", biography: "" },
+  profile: { appearance: "", appearanceSummary: "", background: "", backgroundSummary: "", biography: "" },
   psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] }, motivations: [],
   voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
-  competencies: [], relationships: [], storyStates: [], experiences: [], notes: "",
+  features: [], competencies: [], relationships: [], storyStates: [], experiences: [], notes: "",
 };
 /** Visual UI themes (workspace chrome). Not writing style templates. */
 type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
@@ -588,27 +599,21 @@ function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggleDocume
   );
 }
 
-function SettingsMenu({ open, theme, connectionAvailable, onClose, onTheme, onModels, onStyle, onConnection, onRefresh }: {
+function SettingsMenu({ open, connectionAvailable, onClose, onSelect }: {
   open: boolean;
-  theme: UiThemeId;
   connectionAvailable: boolean;
   onClose: () => void;
-  onTheme: () => void;
-  onModels: () => void;
-  onStyle: () => void;
-  onConnection: () => void;
-  onRefresh: () => void;
+  onSelect: (section: SettingsSection) => void;
 }) {
   if (!open) return null;
   return (
     <div className="settings-menu-backdrop" role="presentation" onMouseDown={onClose}>
-      <div className="settings-menu" role="menu" aria-label="设置" onMouseDown={(event) => event.stopPropagation()}>
-        <button role="menuitem" onClick={onTheme}>{UI_THEMES.find((item) => item.id === theme)?.dark ? <Moon size={16} /> : <Sun size={16} />}界面主题</button>
-        <button role="menuitem" onClick={onModels}><Settings size={16} />模型与场景链</button>
-        <button role="menuitem" onClick={onStyle}><WandSparkles size={16} />写作风格</button>
-        <button role="menuitem" disabled={!connectionAvailable} onClick={onConnection}><Wifi size={16} />连接设置</button>
-        <span className="settings-menu-separator" />
-        <button role="menuitem" onClick={onRefresh}><RefreshCw size={16} />刷新工作区</button>
+      <div className="settings-menu" role="menu" aria-label="设置快捷入口" onMouseDown={(event) => event.stopPropagation()}>
+        <button role="menuitem" onClick={() => onSelect("models")}><Bot size={16} />模型与分工</button>
+        <button role="menuitem" onClick={() => onSelect("writing")}><Pencil size={16} />写作行为</button>
+        <button role="menuitem" onClick={() => onSelect("style")}><WandSparkles size={16} />写作风格</button>
+        <button role="menuitem" disabled={!connectionAvailable} onClick={() => onSelect("connection")}><Wifi size={16} />连接设置</button>
+        <button role="menuitem" onClick={() => onSelect("appearance")}><Sun size={16} />界面主题</button>
       </div>
     </div>
   );
@@ -1671,7 +1676,6 @@ function WorkspaceTopbar({
   usageCurrency,
   usageUnmetered,
   busy,
-  theme,
   settingsOpen,
   workspaceMode,
   documentsCollapsed,
@@ -1682,9 +1686,7 @@ function WorkspaceTopbar({
   onConnection,
   onToggleSettings,
   onCloseSettings,
-  onTheme,
-  onModels,
-  onStyle,
+  onSelectSettings,
   onRefresh,
   onModeChange,
   onToggleDocuments,
@@ -1697,7 +1699,6 @@ function WorkspaceTopbar({
   usageCurrency: string;
   usageUnmetered: boolean;
   busy: boolean;
-  theme: UiThemeId;
   settingsOpen: boolean;
   workspaceMode: WorkspaceMode;
   documentsCollapsed: boolean;
@@ -1708,9 +1709,7 @@ function WorkspaceTopbar({
   onConnection: () => void;
   onToggleSettings: () => void;
   onCloseSettings: () => void;
-  onTheme: () => void;
-  onModels: () => void;
-  onStyle: () => void;
+  onSelectSettings: (section: SettingsSection) => void;
   onRefresh: () => void;
   onModeChange: (mode: WorkspaceMode) => void;
   onToggleDocuments: () => void;
@@ -1761,16 +1760,12 @@ function WorkspaceTopbar({
           <IconButton label="设置" className={settingsOpen ? "active" : ""} onClick={onToggleSettings}><Settings size={17} /></IconButton>
           <SettingsMenu
             open={settingsOpen}
-            theme={theme}
             connectionAvailable={connection.dualMode}
             onClose={onCloseSettings}
-            onTheme={onTheme}
-            onModels={onModels}
-            onStyle={onStyle}
-            onConnection={onConnection}
-            onRefresh={onRefresh}
+            onSelect={onSelectSettings}
           />
         </div>
+        <IconButton label="刷新工作区" onClick={onRefresh}><RefreshCw size={17} /></IconButton>
       </div>
     </header>
   );
@@ -1831,16 +1826,15 @@ function App() {
   const [reviewOpen, setReviewOpen] = useState(false);
   const prevPendingReviewRef = useRef(0);
   const [theme, setTheme] = useState<UiThemeId>(() => loadUiTheme());
-  const [showThemePicker, setShowThemePicker] = useState(false);
-  const [showStylePicker, setShowStylePicker] = useState(false);
   const [styleBusy, setStyleBusy] = useState(false);
   const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
   const [managementView, setManagementView] = useState<ManagementView | null>(null);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(loadWorkspaceMode);
   const [documentsCollapsed, setDocumentsCollapsed] = useState(() =>
     localStorage.getItem("writer-documents-collapsed") === "true",
   );
-  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [focusedExportBusy, setFocusedExportBusy] = useState(false);
   const [sessionBatchMode, setSessionBatchMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
@@ -1923,7 +1917,7 @@ function App() {
   const [collapsedAssistantIds, setCollapsedAssistantIds] = useState<Set<number>>(() => new Set());
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
   const [connection, setConnection] = useState<ConnectionInfo>(() => getConnectionInfo());
-  const [showConnectionPanel, setShowConnectionPanel] = useState(false);
+  const [connectionProbeResults, setConnectionProbeResults] = useState<ConnectionProbeResults | null>(null);
   const [showUsagePopover, setShowUsagePopover] = useState(false);
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [connectionPanelMsg, setConnectionPanelMsg] = useState("");
@@ -2109,7 +2103,6 @@ function App() {
           : "";
         setNotice(`已激活写作风格：${label || styleId}${samplingHint}`);
       }
-      setShowStylePicker(false);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -2134,7 +2127,6 @@ function App() {
         readOnly: false,
         isNew: true,
       });
-      setShowStylePicker(false);
       return;
     }
     const readOnly = Boolean(template.readOnly || template.builtIn);
@@ -2143,7 +2135,6 @@ function App() {
       readOnly,
       isNew: false,
     });
-    setShowStylePicker(false);
   }, []);
 
   const saveStyleTemplate = useCallback(async () => {
@@ -2169,7 +2160,6 @@ function App() {
       });
       await refresh(state?.sessionId);
       setStyleDraft(null);
-      setShowStylePicker(true);
       setNotice(`${styleDraft.isNew ? "已创建" : "已保存"}写作模板：${result.template.name}`);
     } catch (e) {
       setError(String(e));
@@ -2298,8 +2288,7 @@ function App() {
   }, [outlineCollapsed]);
 
   useEffect(() => {
-    const overlayOpen = showThemePicker || showStylePicker || showConnectionPanel
-      || showUsagePopover || settingsMenuOpen || managementView !== null
+    const overlayOpen = showUsagePopover || settingsMenuOpen || managementView !== null
       || styleDraft !== null || characterDraft !== null || simpleCardDraft !== null
       || roleplaySetup !== null || roleplaySceneDraft !== null || roleplaySceneManagerOpen || roleplayFactDraft !== null
       || branchConfirm !== null || roleplayBranchTimeline !== null;
@@ -2308,7 +2297,6 @@ function App() {
       if (e.key !== "Escape") return;
       if (styleDraft) {
         setStyleDraft(null);
-        setShowStylePicker(true);
         return;
       }
       if (characterDraft) { setCharacterDraft(null); return; }
@@ -2321,22 +2309,14 @@ function App() {
       if (roleplayBranchTimeline) { setRoleplayBranchTimeline(null); return; }
       if (settingsMenuOpen) { setSettingsMenuOpen(false); return; }
       if (showUsagePopover) { setShowUsagePopover(false); return; }
-      if (showThemePicker) { setShowThemePicker(false); return; }
-      if (showStylePicker) { setShowStylePicker(false); return; }
-      if (showConnectionPanel) { setShowConnectionPanel(false); return; }
       if (managementView) { setManagementView(null); return; }
-      setShowThemePicker(false);
-      setShowStylePicker(false);
-      setShowConnectionPanel(false);
       setShowUsagePopover(false);
-      setSettingsMenuOpen(false);
       setManagementView(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
-    showThemePicker, showStylePicker, showConnectionPanel, showUsagePopover, settingsMenuOpen,
-    managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
+    showUsagePopover, settingsMenuOpen, managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
     roleplaySceneDraft, roleplaySceneGenerateBusy, roleplaySceneManagerOpen, roleplaySceneManagerBusy, roleplayFactDraft, branchConfirm, roleplayBranchTimeline,
   ]);
 
@@ -2541,8 +2521,7 @@ function App() {
     if (event.type === "proposal" && event.proposal) {
       setState((prev) => {
         if (!prev) return prev;
-        const rest = prev.proposals.filter((item) => item.id !== event.proposal!.id);
-        return { ...prev, proposals: [event.proposal as Proposal, ...rest] };
+        return { ...prev, proposals: mergeProposalEvent(prev.proposals, event.proposal as Proposal) };
       });
       // Auto mode writes immediately; surface that so it is not mistaken for silent overwrite.
       if (event.proposal.status === "accepted") {
@@ -2567,7 +2546,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "delegated", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -2585,7 +2564,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "delegated", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -2714,6 +2693,48 @@ function App() {
       ...controls,
       contentRating: roleplay?.contentRating ?? "default",
     };
+  }
+
+  async function toggleFastWritingMode() {
+    if (!state || busy || roleplay) return;
+    const current = state.agentSettings?.writingMode ?? "delegated";
+    const writingMode: WritingExecutionMode = current === "fast" ? "delegated" : "fast";
+    setError("");
+    try {
+      const result = await api<{ writingMode: WritingExecutionMode }>("/api/agent-settings", {
+        method: "POST",
+        body: JSON.stringify({ writingMode }),
+      });
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              agentSettings: {
+                ...(prev.agentSettings ?? {
+                  permissionMode: "ask",
+                  writingMode: "delegated",
+                  characterEvolutionEnabled: true,
+                  scenePipeline: {
+                    preferredMinScenes: 3,
+                    preferredMaxScenes: 5,
+                    maxScenes: 5,
+                    notesMaxCharacters: 3000,
+                    isolatedWriterMaxRatio: 2,
+                    isolatedWriter: false,
+                    candidateCount: 1,
+                  },
+                }),
+                writingMode: result.writingMode,
+              },
+            }
+          : prev,
+      );
+      setNotice(result.writingMode === "fast"
+        ? "快速模式已开启：全部写作步骤使用 Agent，不调用正文 Writer"
+        : "快速模式已关闭：恢复 Agent 分工执行");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
   async function sendChat(options?: {
@@ -2988,6 +3009,9 @@ function App() {
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      // The visible card may come from a replayed/stale pending event. Reconcile
+      // even on 409 so an already-processed proposal disappears immediately.
+      await refresh(state?.sessionId).catch(() => undefined);
     }
   }
 
@@ -3147,10 +3171,10 @@ function App() {
     await refresh(state?.sessionId);
   }
 
-  async function summarizeCompetency(competency: Competency): Promise<string> {
-    const result = await api<{ summary: string }>("/api/characters/competencies/summarize", {
+  async function summarizeCharacter(kind: CharacterSummaryKind, source: unknown): Promise<string> {
+    const result = await api<{ summary: string }>("/api/characters/summarize", {
       method: "POST",
-      body: JSON.stringify({ sessionId: state?.sessionId, competency }),
+      body: JSON.stringify({ sessionId: state?.sessionId, kind, source }),
     });
     return result.summary;
   }
@@ -3641,9 +3665,14 @@ function App() {
     }
   }
 
-  function openProviderSettings() {
+  function openSettings(section: SettingsSection = "models") {
     setSettingsMenuOpen(false);
+    setSettingsSection(section);
     setManagementView("models");
+  }
+
+  function openProviderSettings() {
+    openSettings("models");
   }
 
   async function saveRoleplayPerception(message: Message, perception: RoleplayPerceptionProjection): Promise<void> {
@@ -3783,6 +3812,27 @@ function App() {
   const activeStyle = activeStyleId
     ? styleTemplates.find((item) => item.id === activeStyleId)
     : undefined;
+  const connectionProbeLabel = (preference: ConnectionPreference): string | null => {
+    if (!connectionProbeResults) return null;
+    const route = preference === "auto"
+      ? (connection.route === "lan" || connection.route === "public" ? connection.route : null)
+      : preference;
+    if (!route) return "当前为本机";
+    const result = connectionProbeResults[route];
+    const routeName = route === "lan" ? "局域网" : "公网";
+    const value = result.status === "ok"
+      ? `${result.latencyMs} ms`
+      : result.status === "blocked"
+        ? "浏览器受限"
+        : result.status === "unconfigured"
+          ? "未配置"
+          : "不可达";
+    return preference === "auto" ? `${routeName} · ${value}` : value;
+  };
+  // Legacy picker shells remain unreachable while their content is hosted by the unified settings page.
+  const showStylePicker = false;
+  const showConnectionPanel = false;
+  const showThemePicker = false;
 
   return (
     <WorkspaceShell mode={workspaceMode} documentsCollapsed={documentsCollapsed}>
@@ -3805,7 +3855,6 @@ function App() {
         usageCurrency={state.usage.currency}
         usageUnmetered={state.provider.pricing.billingMode === "unmetered"}
         busy={busy}
-        theme={theme}
         settingsOpen={settingsMenuOpen}
         workspaceMode={workspaceMode}
         documentsCollapsed={documentsCollapsed}
@@ -3822,16 +3871,13 @@ function App() {
         }}
         onUsage={() => setShowUsagePopover(true)}
         onConnection={() => {
-          setSettingsMenuOpen(false);
           setConnectionPanelMsg("");
-          setShowConnectionPanel(true);
+          openSettings("connection");
         }}
         onToggleSettings={() => setSettingsMenuOpen((value) => !value)}
         onCloseSettings={() => setSettingsMenuOpen(false)}
-        onTheme={() => { setSettingsMenuOpen(false); setShowThemePicker(true); }}
-        onModels={openProviderSettings}
-        onStyle={() => { setSettingsMenuOpen(false); setShowStylePicker(true); }}
-        onRefresh={() => { setSettingsMenuOpen(false); void refresh(state.sessionId); }}
+        onSelectSettings={openSettings}
+        onRefresh={() => void refresh(state.sessionId)}
         onModeChange={setWorkspaceMode}
         onToggleDocuments={() => setDocumentsCollapsed((value) => !value)}
       />
@@ -4035,7 +4081,7 @@ function App() {
               type="button"
               className={`style-chip${activeStyle ? " active" : ""}`}
               title={activeStyle ? `写作风格：${activeStyle.name}（点击更换）` : "配置写作风格模板"}
-              onClick={() => setShowStylePicker(true)}
+              onClick={() => openSettings("style")}
             >
               {activeStyle ? `风格 · ${activeStyle.name}` : "风格 · 未设置"}
             </button>
@@ -4233,22 +4279,38 @@ function App() {
           </div>
         </div>
         <div className="agent-control-bar">
-          <div className="permission-mode-switch" role="group" aria-label="Permission mode">
-            {PERMISSION_MODES.map((mode) => {
-              const active = (state.agentSettings?.permissionMode ?? "ask") === mode.id;
-              return (
-                <button
-                  key={mode.id}
-                  type="button"
-                  className={`permission-mode-btn${active ? " active" : ""}`}
-                  title={mode.hint}
-                  disabled={busy || Boolean(roleplay)}
-                  onClick={() => void setPermissionMode(mode.id)}
-                >
-                  {mode.label}
-                </button>
-              );
-            })}
+          <div className="agent-mode-controls">
+            <div className="permission-mode-switch" role="group" aria-label="Permission mode">
+              {PERMISSION_MODES.map((mode) => {
+                const active = (state.agentSettings?.permissionMode ?? "ask") === mode.id;
+                return (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    className={`permission-mode-btn${active ? " active" : ""}`}
+                    title={mode.hint}
+                    disabled={busy || Boolean(roleplay)}
+                    onClick={() => void setPermissionMode(mode.id)}
+                  >
+                    {mode.label}
+                  </button>
+                );
+              })}
+              <span className="agent-mode-divider" aria-hidden="true" />
+              <button
+                type="button"
+                className={`permission-mode-btn fast-mode-btn${state.agentSettings?.writingMode === "fast" ? " active" : ""}`}
+                title={state.agentSettings?.writingMode === "fast"
+                  ? "关闭快速模式，恢复 Agent 分工与隔离 Writer"
+                  : "开启传统快速模式；全部写作步骤使用 Agent，不调用正文 Writer"}
+                aria-pressed={state.agentSettings?.writingMode === "fast"}
+                disabled={busy || Boolean(roleplay)}
+                onClick={() => void toggleFastWritingMode()}
+              >
+                <Zap size={11} aria-hidden="true" />
+                Fast
+              </button>
+            </div>
           </div>
           {state.projectInstructions && (
             <span className="agent-control-meta" title="已加载项目指令">
@@ -5108,7 +5170,7 @@ function App() {
       {showStylePicker && (
         <div
           className="theme-picker-backdrop"
-          onMouseDown={() => !styleBusy && setShowStylePicker(false)}
+          onMouseDown={() => !styleBusy && setManagementView(null)}
           role="presentation"
         >
           <div
@@ -5126,7 +5188,7 @@ function App() {
                   激活后会注入对应系统提示与范文示例，并应用建议的 temperature / topP。可随时关闭。
                 </p>
               </div>
-              <IconButton label="关闭" disabled={styleBusy} onClick={() => setShowStylePicker(false)}><X size={17} /></IconButton>
+              <IconButton label="关闭" disabled={styleBusy} onClick={() => setManagementView(null)}><X size={17} /></IconButton>
             </div>
             <div className="style-picker-actions">
               <button type="button" className="primary" disabled={styleBusy} onClick={() => openStyleTemplate()}>
@@ -5263,7 +5325,7 @@ function App() {
               </label>
             </div>
             <div className="modal-actions">
-              <button type="button" disabled={styleBusy} onClick={() => { setStyleDraft(null); setShowStylePicker(true); }}>
+              <button type="button" disabled={styleBusy} onClick={() => setStyleDraft(null)}>
                 {viewing ? "返回" : "取消"}
               </button>
               {viewing ? (
@@ -5295,7 +5357,7 @@ function App() {
       {showConnectionPanel && connection.dualMode && (
         <div
           className="theme-picker-backdrop"
-          onMouseDown={() => setShowConnectionPanel(false)}
+          onMouseDown={() => setManagementView(null)}
           role="presentation"
         >
           <div
@@ -5315,7 +5377,7 @@ function App() {
                   。在家优先局域网，出门自动切公网；也可手动锁定或打开对应链接。
                 </p>
               </div>
-              <IconButton label="关闭" onClick={() => setShowConnectionPanel(false)}><X size={17} /></IconButton>
+              <IconButton label="关闭" onClick={() => setManagementView(null)}><X size={17} /></IconButton>
             </div>
 
             <div className="connection-status-row">
@@ -5529,7 +5591,7 @@ function App() {
       {showThemePicker && (
         <div
           className="theme-picker-backdrop"
-          onMouseDown={() => setShowThemePicker(false)}
+          onMouseDown={() => setManagementView(null)}
           role="presentation"
         >
           <div
@@ -5544,7 +5606,7 @@ function App() {
                 <span className="eyebrow">Appearance</span>
                 <h2>界面主题</h2>
               </div>
-              <IconButton label="关闭" onClick={() => setShowThemePicker(false)}><X size={17} /></IconButton>
+              <IconButton label="关闭" onClick={() => setManagementView(null)}><X size={17} /></IconButton>
             </div>
             <div className="theme-grid">
               {UI_THEMES.map((item) => (
@@ -5554,7 +5616,6 @@ function App() {
                   className={`theme-card${theme === item.id ? " active" : ""}`}
                   onClick={() => {
                     setTheme(item.id);
-                    setShowThemePicker(false);
                   }}
                 >
                   <div
@@ -5802,7 +5863,7 @@ function App() {
           onChange={setCharacterDraft}
           onClose={() => setCharacterDraft(null)}
           onSave={() => void saveCharacter()}
-          onSummarizeCompetency={summarizeCompetency}
+          onSummarizeCharacter={summarizeCharacter}
           onDelete={characterDraft.id ? () => void deleteCharacter(characterDraft as Character) : undefined}
         />
       )}
@@ -5810,7 +5871,125 @@ function App() {
       {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
         scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
+        writingMode={state.agentSettings?.writingMode ?? "delegated"}
         characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
+        section={settingsSection}
+        onSectionChanged={setSettingsSection}
+        connectionAvailable={connection.dualMode}
+        styleContent={<div className="settings-section-body">
+          <div className="style-picker-actions">
+            <button type="button" className="primary" disabled={styleBusy} onClick={() => openStyleTemplate()}>新建模板</button>
+            {activeStyle && <button type="button" disabled={styleBusy} onClick={() => openStyleTemplate(activeStyle)}>
+              {(activeStyle.readOnly || activeStyle.builtIn) ? "浏览当前模板" : "编辑当前模板"}
+            </button>}
+            <button type="button" className={`style-off${activeStyleId ? "" : " active"}`} disabled={styleBusy || !activeStyleId} onClick={() => void applyWritingStyle("")}>不使用模板</button>
+            {activeStyle && <span className="style-active-hint">当前：{activeStyle.name}{(activeStyle.readOnly || activeStyle.builtIn) ? "（内置·只读）" : ""}</span>}
+          </div>
+          <div className="theme-grid style-grid">
+            {styleTemplates.length === 0 ? <div className="management-empty">暂无写作风格模板</div> : styleTemplates.map((item) => {
+              const selected = item.id === activeStyleId;
+              const readOnly = Boolean(item.readOnly || item.builtIn);
+              const preview = (item.exampleContent ?? "").replace(/\s+/g, " ").trim().slice(0, 96);
+              return <div key={item.id} className={`theme-card style-card${selected ? " active" : ""}`}>
+                <button type="button" className="style-card-select" disabled={styleBusy} onClick={() => void applyWritingStyle(item.id, item.name)}>
+                  <div className="theme-card-meta">
+                    <strong>{item.name}{selected && <span className="theme-tag">使用中</span>}{readOnly && <span className="theme-tag">内置</span>}{!readOnly && item.customized && <span className="theme-tag">自定义</span>}</strong>
+                    <small>{item.description}</small>
+                    {preview && <span className="theme-example style-example">{preview}{preview.length >= 96 ? "…" : ""}</span>}
+                    {(item.suggestedTemperature != null || item.suggestedTopP != null) && <span className="style-params">
+                      {item.suggestedTemperature != null && `temp ${item.suggestedTemperature}`}
+                      {item.suggestedTemperature != null && item.suggestedTopP != null && " · "}
+                      {item.suggestedTopP != null && `topP ${item.suggestedTopP}`}
+                    </span>}
+                  </div>
+                </button>
+                <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => openStyleTemplate(item)}>{readOnly ? "浏览" : "编辑"}</button>
+              </div>;
+            })}
+          </div>
+        </div>}
+        connectionContent={connection.dualMode ? <div className="settings-section-body connection-settings">
+          <div className="connection-status-row">
+            <span className={`connection-status-dot route-${connection.route}`} aria-hidden="true" />
+            <div className="connection-status-meta"><strong>{connection.label}</strong><small title={connection.base}>{connection.base}</small></div>
+            <button type="button" className="ghost" disabled={connectionBusy} onClick={() => {
+              setConnectionBusy(true);
+              setConnectionPanelMsg("");
+              void Promise.all([ensureConnection(), probeConnectionRoutes()]).then(([info, probes]) => {
+                setConnection(info);
+                setConnectionProbeResults(probes);
+                setConnectionPanelMsg(`已重新探测：${info.label}`);
+              }).catch((e) => setConnectionPanelMsg(String(e))).finally(() => setConnectionBusy(false));
+            }}>重新探测</button>
+          </div>
+          <div className="connection-section">
+            <h3>通道偏好</h3>
+            <div className="connection-pref-grid">{([
+              { id: "auto" as const, name: "自动", desc: "局域网优先，不可达则公网" },
+              { id: "lan" as const, name: "局域网", desc: "尽量锁定，低延迟" },
+              { id: "public" as const, name: "公网", desc: "Cloudflare 隧道" },
+            ] satisfies Array<{ id: ConnectionPreference; name: string; desc: string }>).map((item) => <button
+              key={item.id}
+              type="button"
+              className={`connection-pref-card${connection.preference === item.id ? " active" : ""}${connection.route === item.id ? " live" : ""}`}
+              disabled={connectionBusy}
+              onClick={() => {
+                setConnectionBusy(true);
+                setConnectionPanelMsg("");
+                void setConnectionPreference(item.id).then((result) => {
+                  setConnection(getConnectionInfo());
+                  if (result.needNavigate || result.error) {
+                    setConnectionPanelMsg(result.error || "请用下方入口链接打开对应通道");
+                    return;
+                  }
+                  setConnectionPanelMsg(item.id === "auto" ? `已设为自动 · 当前 ${result.label}` : `已切换到${item.name}`);
+                }).finally(() => setConnectionBusy(false));
+              }}
+            >
+              <span className="connection-pref-title">
+                <strong>{item.name}</strong>
+                {connectionProbeLabel(item.id) && <em>{connectionProbeLabel(item.id)}</em>}
+              </span>
+              <small>{item.desc}</small>
+            </button>)}</div>
+          </div>
+          <div className="connection-section">
+            <h3>入口链接</h3>
+            <p className="connection-hint">在家 Wi‑Fi 推荐使用局域网入口；公网 HTTPS 页面受浏览器混合内容限制，不能直接探测局域网 HTTP。</p>
+            {connection.lanBlockedByMixedContent && <p className="connection-warn">当前是 HTTPS 公网页，回家后请用下方局域网链接打开工作区。</p>}
+            {([
+              { kind: "lan" as const, name: "局域网", base: connection.lanBase },
+              { kind: "public" as const, name: "公网", base: connection.publicBase },
+            ]).map((item) => {
+              const entry = buildEntryUrl(item.kind);
+              return <div key={item.kind} className="connection-link-row">
+                <div className="connection-link-meta"><strong>{item.name}</strong><small title={item.base || undefined}>{item.base || "未配置"}</small></div>
+                <div className="connection-link-actions">
+                  <button type="button" className="ghost" disabled={!entry} onClick={() => entry && void navigator.clipboard?.writeText(entry).then(() => setConnectionPanelMsg(`已复制${item.name}链接`)).catch(() => setConnectionPanelMsg(entry))}>复制</button>
+                  <button type="button" className="ghost" disabled={!entry} onClick={() => entry && window.open(entry, "_blank", "noopener,noreferrer")}>新标签</button>
+                  <button type="button" className="primary" disabled={!entry} onClick={() => entry && window.location.assign(entry)}>打开</button>
+                </div>
+              </div>;
+            })}
+          </div>
+          {connectionPanelMsg && <p className="connection-panel-msg" role="status">{connectionPanelMsg}</p>}
+        </div> : <div className="management-empty">当前环境只配置了单一连接通道。</div>}
+        appearanceContent={<div className="settings-section-body"><div className="theme-grid">
+          {UI_THEMES.map((item) => <button key={item.id} type="button" className={`theme-card${theme === item.id ? " active" : ""}`} onClick={() => setTheme(item.id)}>
+            <div className="theme-preview" style={{
+              ["--tp-bg"]: item.preview.bg,
+              ["--tp-surface"]: item.preview.surface,
+              ["--tp-surface2"]: item.preview.surface2,
+              ["--tp-border"]: item.preview.border,
+              ["--tp-accent"]: item.preview.accent,
+              ["--tp-text"]: item.preview.text,
+            } as React.CSSProperties} aria-hidden="true">
+              <div className="theme-preview-chrome"><i/><i/><i/></div>
+              <div className="theme-preview-body"><div className="theme-preview-side"/><div className="theme-preview-main"><span/><span/><span/></div><div className="theme-preview-agent"/></div>
+            </div>
+            <div className="theme-card-meta"><strong>{item.name}<span className="theme-tag">{item.tag}</span></strong></div>
+          </button>)}
+        </div></div>}
         request={api}
         onClose={() => setManagementView(null)}
         onChanged={() => { void refresh(state.sessionId); }}
@@ -5818,6 +5997,7 @@ function App() {
           ...previous,
           agentSettings: {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            writingMode: previous.agentSettings?.writingMode ?? "delegated",
             characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
             scenePipeline,
           },
@@ -5826,6 +6006,7 @@ function App() {
           ...previous,
           agentSettings: {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            writingMode: previous.agentSettings?.writingMode ?? "delegated",
             characterEvolutionEnabled,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           },

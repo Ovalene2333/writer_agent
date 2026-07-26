@@ -1978,6 +1978,7 @@ export class WriterStore {
 
   acceptProposal(id: number): Proposal {
     const proposal = this.proposal(id);
+    if (proposal.status === "accepted") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
     const intendedCreate = proposal.baseHash === "__missing__";
     const exists = this.project.documentExists(proposal.path);
@@ -2010,6 +2011,7 @@ export class WriterStore {
 
   rejectProposal(id: number): Proposal {
     const proposal = this.proposal(id);
+    if (proposal.status === "rejected") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
     this.database.prepare("UPDATE proposals SET status='rejected' WHERE id=?").run(id);
     return this.proposal(id);

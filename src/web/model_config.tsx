@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { CheckCircle2, LoaderCircle, Plus, Radar, X, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, LoaderCircle, Palette, Pencil, Plus, Radar, WandSparkles, Wifi, X, XCircle } from "lucide-react";
 
 export type Pricing = {
   billingMode?: "metered" | "unmetered";
@@ -29,6 +29,8 @@ export type ScenePipelineSettings = {
   isolatedWriter: boolean;
   candidateCount: number;
 };
+export type WritingExecutionMode = "delegated" | "fast";
+export type SettingsSection = "models" | "writing" | "style" | "connection" | "appearance";
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
@@ -67,17 +69,39 @@ function TestStatusIcon({ status }: { status: TestStatus }) {
 type ModelConfigProps = {
   initialCatalog: ProviderCatalog;
   scenePipeline: ScenePipelineSettings;
+  writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
+  section: SettingsSection;
+  styleContent: React.ReactNode;
+  connectionContent: React.ReactNode;
+  appearanceContent: React.ReactNode;
+  connectionAvailable: boolean;
   request: Request;
   onClose: () => void;
+  onSectionChanged: (section: SettingsSection) => void;
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
 };
 
-export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionEnabled, request, onClose, onChanged, onScenePipelineChanged, onCharacterEvolutionChanged }: ModelConfigProps) {
+export function ModelConfig({
+  initialCatalog,
+  scenePipeline,
+  writingMode,
+  characterEvolutionEnabled,
+  section,
+  styleContent,
+  connectionContent,
+  appearanceContent,
+  connectionAvailable,
+  request,
+  onClose,
+  onSectionChanged,
+  onChanged,
+  onScenePipelineChanged,
+  onCharacterEvolutionChanged,
+}: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
-  const [tab, setTab] = useState<"models" | "scene-pipeline">("models");
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
@@ -94,6 +118,8 @@ export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionE
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
+  const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
+    || Object.keys(sceneDraft).some(key => sceneDraft[key as keyof ScenePipelineSettings] !== scenePipeline[key as keyof ScenePipelineSettings]);
   const sceneDraftValid = [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
     && sceneDraft.preferredMinScenes <= sceneDraft.preferredMaxScenes
@@ -101,9 +127,25 @@ export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionE
     && Number.isInteger(sceneDraft.notesMaxCharacters)
     && sceneDraft.notesMaxCharacters >= 500
     && sceneDraft.notesMaxCharacters <= 8_000
+    && Number.isInteger(sceneDraft.candidateCount)
+    && sceneDraft.candidateCount >= 1
+    && sceneDraft.candidateCount <= 3
     && Number.isFinite(sceneDraft.isolatedWriterMaxRatio)
     && sceneDraft.isolatedWriterMaxRatio >= 1.2
     && sceneDraft.isolatedWriterMaxRatio <= 3;
+  const sceneCountInvalid = ![sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
+    .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
+    || sceneDraft.preferredMinScenes > sceneDraft.preferredMaxScenes
+    || sceneDraft.preferredMaxScenes > sceneDraft.maxScenes;
+  const notesLimitInvalid = !Number.isInteger(sceneDraft.notesMaxCharacters)
+    || sceneDraft.notesMaxCharacters < 500
+    || sceneDraft.notesMaxCharacters > 8_000;
+  const writerSettingsInvalid = !Number.isInteger(sceneDraft.candidateCount)
+    || sceneDraft.candidateCount < 1
+    || sceneDraft.candidateCount > 3
+    || !Number.isFinite(sceneDraft.isolatedWriterMaxRatio)
+    || sceneDraft.isolatedWriterMaxRatio < 1.2
+    || sceneDraft.isolatedWriterMaxRatio > 3;
   const choices = useMemo(() => catalog.providers.flatMap(provider => provider.models.map(model => ({ value: `${provider.id}:${model.id}`, label: `${provider.name} / ${model.name}` }))), [catalog]);
   const resetScan = () => { setScannedModels([]); setSelectedScannedModels(new Set()); setEditorFeedback(null); };
   const addProfile = () => { resetScan(); setEditing(emptyProfile()); };
@@ -248,7 +290,10 @@ export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionE
     try {
       const result = await request("/api/agent-settings", {
         method: "POST",
-        body: JSON.stringify({ scenePipeline: sceneDraft, characterEvolutionEnabled: characterEvolutionDraft }),
+        body: JSON.stringify({
+          scenePipeline: sceneDraft,
+          characterEvolutionEnabled: characterEvolutionDraft,
+        }),
       }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean };
       setSceneDraft(result.scenePipeline);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
@@ -262,15 +307,74 @@ export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionE
     }
   }
 
+  function resetWritingSettings() {
+    setSceneDraft(scenePipeline);
+    setCharacterEvolutionDraft(characterEvolutionEnabled);
+    setError("");
+    setMessage("");
+  }
+
+  function closeSettings() {
+    if (writingSettingsDirty && !confirm("写作设置尚未保存，确定要放弃这些修改并返回工作区吗？")) return;
+    onClose();
+  }
+
+  function selectSection(nextSection: SettingsSection) {
+    if (section === "writing" && nextSection !== "writing" && writingSettingsDirty
+      && !confirm("写作设置尚未保存，确定要放弃这些修改并切换分类吗？")) return;
+    if (section === "writing" && nextSection !== "writing") resetWritingSettings();
+    onSectionChanged(nextSection);
+    setError("");
+    setMessage("");
+  }
+
+  const sectionMeta: Record<SettingsSection, { eyebrow: string; title: string; description: string }> = {
+    models: { eyebrow: "Model routing", title: "模型与分工", description: "管理模型连接，并为写作流程的不同环节分配模型。" },
+    writing: { eyebrow: "Writing behavior", title: "写作行为", description: "调整角色演进、可选场景链与正文生成策略。" },
+    style: { eyebrow: "Writing style", title: "写作风格", description: "管理写作模板、范文与采样建议。" },
+    connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
+    appearance: { eyebrow: "Appearance", title: "界面主题", description: "选择工作区的明暗与配色方案。" },
+  };
+  const activeMeta = sectionMeta[section];
+
   return <div className="model-config-backdrop management-page">
     <section className="model-config-view">
-      <div className="management-head"><div><span className="eyebrow">Settings</span><h2>模型配置</h2></div><div className="management-actions">{tab === "models" && <button onClick={addProfile}><Plus size={15} />添加供应商</button>}<button className="icon" title="返回工作区" aria-label="返回工作区" onClick={onClose}><X size={17} /></button></div></div>
-      <nav className="settings-tabs" aria-label="设置分类">
-        <button className={tab === "models" ? "active" : ""} onClick={() => { setTab("models"); setError(""); setMessage(""); }}>模型</button>
-        <button className={tab === "scene-pipeline" ? "active" : ""} onClick={() => { setTab("scene-pipeline"); setError(""); setMessage(""); }}>写作</button>
-      </nav>
-      {(error || message) && <div className={error ? "config-feedback error" : "config-feedback"} style={{ whiteSpace: "pre-wrap" }}>{error || message}</div>}
-      {tab === "models" && <div className="model-config-layout">
+      <div className="management-head settings-page-head"><div><span className="eyebrow">Settings</span><h2>设置</h2></div><button className="icon" title="返回工作区" aria-label="返回工作区" onClick={closeSettings}><X size={17} /></button></div>
+      <div className="settings-layout">
+        <nav className="settings-tabs" aria-label="设置分类">
+          <button className={section === "models" ? "active" : ""} aria-current={section === "models" ? "page" : undefined} onClick={() => selectSection("models")}>
+            <Bot size={17}/>
+            <span><strong>模型与分工</strong><small>供应商、模型和流程角色</small></span>
+          </button>
+          <button className={section === "writing" ? "active" : ""} aria-current={section === "writing" ? "page" : undefined} onClick={() => selectSection("writing")}>
+            <Pencil size={17}/>
+            <span><strong>写作行为</strong><small>角色演进与场景生成</small></span>
+            {writingSettingsDirty && <i className="settings-dirty-dot" title="有未保存的修改"/>}
+          </button>
+          <button className={section === "style" ? "active" : ""} aria-current={section === "style" ? "page" : undefined} onClick={() => selectSection("style")}>
+            <WandSparkles size={17}/>
+            <span><strong>写作风格</strong><small>模板、范文与采样建议</small></span>
+          </button>
+          <button className={section === "connection" ? "active" : ""} aria-current={section === "connection" ? "page" : undefined} disabled={!connectionAvailable} onClick={() => selectSection("connection")}>
+            <Wifi size={17}/>
+            <span><strong>连接设置</strong><small>{connectionAvailable ? "局域网与公网通道" : "当前仅有单一通道"}</small></span>
+          </button>
+          <button className={section === "appearance" ? "active" : ""} aria-current={section === "appearance" ? "page" : undefined} onClick={() => selectSection("appearance")}>
+            <Palette size={17}/>
+            <span><strong>界面主题</strong><small>明暗模式与工作区配色</small></span>
+          </button>
+        </nav>
+        <main className="settings-content">
+          <div className="settings-content-head">
+            <div>
+              <span className="eyebrow">{activeMeta.eyebrow}</span>
+              <h3>{activeMeta.title}</h3>
+              <p>{activeMeta.description}</p>
+            </div>
+            {section === "models" && <button onClick={addProfile}><Plus size={15}/>添加供应商</button>}
+          </div>
+          {(error || message) && <div className={error ? "config-feedback error" : "config-feedback"} style={{ whiteSpace: "pre-wrap" }} role={error ? "alert" : "status"}>{error || message}</div>}
+          {section === "models" && <div className="model-config-layout">
         <div className="provider-column">
           <h3>供应商与模型</h3>
           {catalog.providers.map(provider => {
@@ -324,31 +428,53 @@ export function ModelConfig({ initialCatalog, scenePipeline, characterEvolutionE
           })}
         </div>
         <div className="role-column"><h3>写作流程分工</h3><p className="section-note">不同环节可使用不同供应商下的模型。</p>{ROLES.map(role => { const ref = catalog.assignments[role.id]; return <label className="role-card" key={role.id}><span><strong>{role.name}</strong><small>{role.detail}</small></span><select value={`${ref.providerId}:${ref.modelId}`} onChange={event => void assign(role.id, event.target.value)}>{choices.map(choice => <option value={choice.value} key={choice.value}>{choice.label}</option>)}</select></label>; })}</div>
-      </div>}
-      {tab === "scene-pipeline" && <div className="scene-settings">
-        <div className="scene-settings-copy">
-          <span className="eyebrow">Writing behavior</span>
-          <h3>写作行为与可选场景链</h3>
-          <p>Agent 会按任务自主选择直接成稿、局部修改或场景链。以下参数只在它选择场景链时生效；场景越多，模型调用和累计 input 通常越高。</p>
+          </div>}
+          {section === "writing" && <div className="scene-settings">
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>通用行为</h4><p>无论采用哪种正文模式都生效。</p></div></div>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={characterEvolutionDraft} onChange={event => setCharacterEvolutionDraft(event.target.checked)}/>
+            <span><strong>角色演进</strong><small>允许叙事任务自动追加角色经历和故事状态。关闭后仍可显式新建或编辑角色卡。</small></span>
+          </label>
+        </section>
+
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>可选场景链</h4><p>只有模型判断分场确实有助于连续性或长篇修订时才使用。</p></div></div>
+          <div className="scene-settings-grid">
+            <label className={sceneCountInvalid ? "field-invalid" : ""}><span>推荐场数</span><div className="scene-range-inputs"><input aria-label="推荐最少场数" aria-invalid={sceneCountInvalid} type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><i>—</i><input aria-label="推荐最多场数" aria-invalid={sceneCountInvalid} type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/></div><small>建议范围，不为凑数拆场。</small></label>
+            <label className={sceneCountInvalid ? "field-invalid" : ""}><span>场景硬上限</span><input aria-invalid={sceneCountInvalid} type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>最多 8 场，且不能低于推荐值。</small></label>
+            <label className={notesLimitInvalid ? "field-invalid" : ""}><span>每场 notes 上限</span><input aria-invalid={notesLimitInvalid} type="number" min="500" max="8000" step="100" value={sceneDraft.notesMaxCharacters} onChange={event => setSceneDraft(current => ({ ...current, notesMaxCharacters: Number(event.target.value) }))}/><small>500—8000 字，只保留约束本场的材料。</small></label>
+          </div>
+        </section>
+
+        {writingMode === "delegated" ? <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>隔离正文生成</h4><p>控制分工模式下，正文是否由独立纯文本调用生成。</p></div></div>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={sceneDraft.isolatedWriter} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriter: event.target.checked }))}/>
+            <span><strong>启用隔离 Writer</strong><small>短篇可直接隔离成稿；长篇由 Agent 提交场景材料，Writer 写正文，轻量模型提取离场状态。</small></span>
+          </label>
+          <div className="scene-settings-grid compact">
+            <label className={`${!sceneDraft.isolatedWriter ? "setting-disabled " : ""}${writerSettingsInvalid ? "field-invalid" : ""}`}><span>正文硬上限倍率</span><input aria-invalid={writerSettingsInvalid} disabled={!sceneDraft.isolatedWriter} type="number" min="1.2" max="3" step="0.1" value={sceneDraft.isolatedWriterMaxRatio} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriterMaxRatio: Number(event.target.value) }))}/><small>相对目标篇幅；允许 1.2—3.0 倍。</small></label>
+            <label className={writerSettingsInvalid ? "field-invalid" : ""}><span>候选稿数量</span><select aria-invalid={writerSettingsInvalid} value={sceneDraft.candidateCount} onChange={event => setSceneDraft(current => ({ ...current, candidateCount: Number(event.target.value) }))}><option value={1}>1 · 不生成候选</option><option value={2}>2 · 默认择优</option><option value={3}>3 · 更多比较</option></select><small>只在场景质量有提升空间时追加候选。</small></label>
+          </div>
+        </section> : <div className="writing-mode-notice"><strong>快速模式不使用正文 Writer</strong><span>当前沿用传统单 Agent 链路：检索、编排、直接提案和场景链正文全部由 Agent 完成。关闭 Agent 面板中的 Fast 后，隔离设置会重新出现。</span></div>}
+
+        <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid ? "status" : "alert"}>{sceneDraftValid
+          ? writingMode === "fast"
+            ? `当前：快速模式。全部写作步骤使用 Agent，不调用正文 Writer；场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场。`
+            : `当前：分工模式${sceneDraft.isolatedWriter ? " + 隔离 Writer" : ""}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。`
+          : "请检查场景数量、notes 上限、正文倍率与候选稿数量。"}</div>
+        <div className="scene-settings-actions">
+          <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
+          <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>
+          <button className="primary" onClick={() => void saveWritingSettings()} disabled={busy || !sceneDraftValid || !writingSettingsDirty}>{busy ? "保存中…" : "保存修改"}</button>
         </div>
-        <div className="scene-settings-grid">
-          <label><span>推荐最少场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><small>选择场景链后，模型通常在推荐范围内规划。</small></label>
-          <label><span>推荐最多场数</span><input type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/><small>模型默认在推荐区间内规划。</small></label>
-          <label><span>允许最多场数</span><input type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>硬上限为 8；超过时 begin_chapter_draft 会拒绝。</small></label>
-          <label><span>场景 notes 上限</span><input type="number" min="500" max="8000" step="100" value={sceneDraft.notesMaxCharacters} onChange={event => setSceneDraft(current => ({ ...current, notesMaxCharacters: Number(event.target.value) }))}/><small>主 Agent 每场可提交 500—8000 字；默认 3000。</small></label>
-          <label><span>正文硬上限倍率</span><input type="number" min="1.2" max="3" step="0.1" value={sceneDraft.isolatedWriterMaxRatio} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriterMaxRatio: Number(event.target.value) }))}/><small>相对场景目标篇幅；建议区间仍为目标的 85%—120%。</small></label>
-        </div>
-        <label className="scene-experiment-toggle">
-          <input type="checkbox" checked={characterEvolutionDraft} onChange={event => setCharacterEvolutionDraft(event.target.checked)}/>
-          <span><strong>角色演进</strong><small>允许叙事任务自动追加角色经历和故事状态。关闭后仍可显式新建或编辑角色卡。</small></span>
-        </label>
-        <label className="scene-experiment-toggle">
-          <input type="checkbox" checked={sceneDraft.isolatedWriter} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriter: event.target.checked }))}/>
-          <span><strong>隔离正文 Writer（实验）</strong><small>主 Agent 只提交场景短笔记；正文使用独立纯文本调用生成，再由轻量模型提取离场状态。关闭时沿用现有场景写作。</small></span>
-        </label>
-        <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"}>{sceneDraftValid ? `当前策略：推荐 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场；notes 最多 ${sceneDraft.notesMaxCharacters} 字，正文硬上限为目标的 ${sceneDraft.isolatedWriterMaxRatio.toFixed(1)} 倍。` : "请检查场景数量、notes 上限（500—8000）与正文倍率（1.2—3.0）。"}</div>
-        <div className="scene-settings-actions"><button onClick={() => { setSceneDraft(scenePipeline); setCharacterEvolutionDraft(characterEvolutionEnabled); }} disabled={busy}>恢复当前值</button><button className="primary" onClick={() => void saveWritingSettings()} disabled={busy || !sceneDraftValid}>{busy ? "保存中…" : "保存写作设置"}</button></div>
-      </div>}
+          </div>}
+          {section === "style" && styleContent}
+          {section === "connection" && connectionContent}
+          {section === "appearance" && appearanceContent}
+        </main>
+      </div>
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>
       <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" title="关闭" aria-label="关闭" onClick={() => setEditing(null)}><X size={17} /></button></div>

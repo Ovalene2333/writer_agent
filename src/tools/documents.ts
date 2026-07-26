@@ -1,7 +1,7 @@
 import { documentBlocks, documentSections } from "../document_blocks.js";
 import { documentSpanCatalog, documentSpans } from "../document_spans.js";
 import { requestDocumentLocator, type DocumentLocatorCandidate } from "../document_locator.js";
-import { adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
+import { adjudicateLearnedProseGates, adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -67,6 +67,16 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
     },
   );
   const issues = flash.issues;
+  issues.push(...await adjudicateLearnedProseGates(
+    content,
+    context.proseGateRules ?? [],
+    context.proseAdjudicator?.model,
+    {
+      signal: context.proseAdjudicator?.signal,
+      usageReporter: context.modelUsageReporter,
+      callKind: "learned_prose_audit",
+    },
+  ));
   return JSON.stringify({
     path,
     source: activeDraft ? "chapter_draft" : "document",

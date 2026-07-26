@@ -1,6 +1,7 @@
 import type {
   Character,
   CharacterCompetency,
+  CharacterFeature,
   CharacterGoal,
   CharacterRelationship,
   CharacterStoryState,
@@ -15,6 +16,7 @@ export type CharacterSection =
   | "psychology"
   | "motivations"
   | "voice"
+  | "features"
   | "competencies"
   | "relationships"
   | "storyState"
@@ -24,6 +26,7 @@ export type CharacterSection =
 /** Array sections that support upsert / deleteEntryIds / replaceSections. */
 export type CharacterArraySection =
   | "motivations"
+  | "features"
   | "competencies"
   | "relationships"
   | "storyStates"
@@ -35,6 +38,7 @@ export type CharacterArraySection =
 
 export type CharacterReplaceSection =
   | "motivations"
+  | "features"
   | "competencies"
   | "relationships"
   | "storyStates"
@@ -70,7 +74,7 @@ export type SkippedCharacterChange = { op: string; reason: string };
 const VALID_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PSYCH_GROUPS = ["traits", "values", "fears", "conflicts"] as const;
 type PsychGroup = (typeof PSYCH_GROUPS)[number];
-const TOP_ARRAY_SECTIONS = ["motivations", "competencies", "relationships", "storyStates", "experiences"] as const;
+const TOP_ARRAY_SECTIONS = ["motivations", "features", "competencies", "relationships", "storyStates", "experiences"] as const;
 type TopArraySection = (typeof TOP_ARRAY_SECTIONS)[number];
 
 const temporalEmpty = (): CharacterTemporal => ({});
@@ -78,10 +82,11 @@ const temporalEmpty = (): CharacterTemporal => ({});
 export const emptyCharacter = (name = ""): Omit<Character, "id" | "updatedAt"> => ({
   schemaVersion: 3,
   identity: { name, aliases: [], tags: [], narrativeRole: "", summary: "" },
-  profile: { appearanceSummary: "", distinguishingFeatures: [], backgroundSummary: "", biography: "" },
+  profile: { appearance: "", appearanceSummary: "", background: "", backgroundSummary: "", biography: "" },
   psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] },
   motivations: [],
   voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
+  features: [],
   competencies: [],
   relationships: [],
   storyStates: [],
@@ -93,6 +98,7 @@ const obj = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const arr = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 const txt = (v: unknown): string => typeof v === "string" ? v.trim() : "";
+const singleLineTxt = (v: unknown): string => txt(v).replace(/\s+/g, " ");
 const strs = (v: unknown): string[] =>
   arr(v).filter((x): x is string => typeof x === "string").map(x => x.trim()).filter(Boolean);
 
@@ -128,7 +134,7 @@ function competency(v: unknown): CharacterCompetency {
   return {
     id: txt(r.id),
     name: txt(r.name),
-    summary: txt(r.summary),
+    summary: singleLineTxt(r.summary),
     level: txt(r.level),
     unlocked: r.unlocked === true,
     description: txt(r.description),
@@ -136,6 +142,16 @@ function competency(v: unknown): CharacterCompetency {
     limitations: strs(r.limitations),
     costs: strs(r.costs),
     ...temporal(r),
+  };
+}
+
+function feature(v: unknown): CharacterFeature {
+  const r = obj(v);
+  return {
+    id: txt(r.id),
+    name: txt(r.name),
+    summary: singleLineTxt(r.summary),
+    description: txt(r.description),
   };
 }
 
@@ -189,6 +205,25 @@ export function characterPromptCard(character: Character) {
   };
 }
 
+/** First-pass tool view: only the essential portrayal summaries, never full card details. */
+export function characterSummaryCard(character: Character) {
+  return {
+    id: character.id,
+    name: character.identity.name,
+    updatedAt: character.updatedAt,
+    identity: { summary: character.identity.summary },
+    appearance: { summary: character.profile.appearanceSummary },
+    features: character.features.map(item => ({ id: item.id, name: item.name, summary: item.summary })),
+    competencies: character.competencies.map(item => ({
+      id: item.id,
+      name: item.name,
+      summary: item.summary,
+      unlocked: item.unlocked,
+    })),
+    voice: { summary: character.voice.summary },
+  };
+}
+
 function relationship(v: unknown): CharacterRelationship {
   const r = obj(v);
   const statuses = ["active", "ended", "strained", "unknown"];
@@ -228,6 +263,11 @@ export function normalizeV3Character(value: unknown): Character {
   const p = obj(r.profile);
   const y = obj(r.psychology);
   const v = obj(r.voice);
+  const hasNewAppearance = typeof p.appearance === "string";
+  const hasNewBackground = typeof p.background === "string";
+  const legacyAppearance = txt(p.appearanceSummary);
+  const legacyFeatures = strs(p.distinguishingFeatures);
+  const legacyBackground = txt(p.backgroundSummary);
   return {
     schemaVersion: 3,
     id: Number(r.id),
@@ -239,8 +279,11 @@ export function normalizeV3Character(value: unknown): Character {
       summary: txt(i.summary),
     },
     profile: {
-      appearanceSummary: txt(p.appearanceSummary),
-      distinguishingFeatures: strs(p.distinguishingFeatures),
+      appearance: hasNewAppearance ? txt(p.appearance) : legacyAppearance,
+      appearanceSummary: hasNewAppearance
+        ? txt(p.appearanceSummary)
+        : (legacyFeatures.length ? legacyFeatures.join("\n") : legacyAppearance),
+      background: hasNewBackground ? txt(p.background) : legacyBackground,
       backgroundSummary: txt(p.backgroundSummary),
       biography: txt(p.biography),
     },
@@ -260,6 +303,7 @@ export function normalizeV3Character(value: unknown): Character {
       avoidedExpressions: strs(v.avoidedExpressions),
       examples: strs(v.examples),
     },
+    features: arr(r.features).map(feature),
     competencies: arr(r.competencies).map(competency),
     relationships: arr(r.relationships).map(relationship),
     storyStates: arr(r.storyStates).map(state),
@@ -328,8 +372,9 @@ export function migrateV2Character(value: unknown): Character {
       summary: txt(r.identity),
     },
     profile: {
+      appearance: txt(r.appearance),
       appearanceSummary: txt(r.appearance),
-      distinguishingFeatures: [],
+      background: txt(r.background),
       backgroundSummary: txt(r.background),
       biography: "",
     },
@@ -353,6 +398,7 @@ export function migrateV2Character(value: unknown): Character {
       avoidedExpressions: [],
       examples: [],
     },
+    features: [],
     competencies: (txt(r.capabilities) || txt(r.abilities) || txt(r.limitations))
       ? [{
         id: `competency-${id}-legacy`,
@@ -492,6 +538,14 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       replace.has("motivations"),
       goal,
       "goal",
+    ),
+    features: mergeArraySection(
+      base.features,
+      input.features,
+      deleted.features,
+      replace.has("features"),
+      feature,
+      "feature",
     ),
     competencies: mergeArraySection(
       base.competencies,
@@ -836,6 +890,7 @@ function validateOne(
     ["fears", c.psychology.fears],
     ["conflicts", c.psychology.conflicts],
     ["motivations", c.motivations],
+    ["features", c.features],
     ["competencies", c.competencies],
     ["relationships", c.relationships],
     ["storyStates", c.storyStates],
@@ -859,6 +914,9 @@ function validateOne(
   });
   c.competencies.forEach((x, i) => {
     if (!x.name && !x.description) errors.push(`${root}.competencies[${i}]: 记录没有内容`);
+  });
+  c.features.forEach((x, i) => {
+    if (!x.name && !x.description) errors.push(`${root}.features[${i}]: 记录没有内容`);
   });
   const relationTargets = new Set<number>();
   c.relationships.forEach((x, i) => {
@@ -966,6 +1024,7 @@ export function characterPromptViews(character: Character, nodes: OutlineNode[] 
       identity: character.identity,
       profile: character.profile,
       psychology: targetNodeId ? scene.psychology : character.psychology,
+      features: character.features,
       // Prose-bound: no unlocked:false flags (those become「还锁着」inventory diction).
       competencies: competenciesWritingPayload(character.competencies),
       experiences,

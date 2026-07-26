@@ -45,7 +45,7 @@ const CONTINUATION_EVIDENCE_TOOLS = new Set([
 ]);
 
 const DOCUMENT_MUTATION_TOOLS = new Set([
-  "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
+  "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set",
   "revise_document_isolated", "begin_chapter_draft", "write_chapter_scene",
   "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft",
   "propose_chapter_draft",
@@ -87,7 +87,7 @@ export function recordAgentToolResult(
   }
   progress.successfulTools.add(toolName);
   progress.failedTools.delete(toolName);
-  if (["propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set", "revise_document_isolated", "propose_chapter_draft"].includes(toolName)) {
+  if (["propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set", "revise_document_isolated", "propose_chapter_draft"].includes(toolName)) {
     progress.documentArtifactProduced = true;
   }
   if (toolName === "inspect_chapter_draft" && result.proposalSubmitted === true) {

@@ -20,6 +20,9 @@ import {
   buildToolArgumentRepairMessages,
   characterMutationCompletesTask,
   chapterContinuationPrompt,
+  chapterDraftNeedsReview,
+  chapterReviewAllowsTool,
+  chapterReviewRequiredPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
   executionModelForTask,
@@ -56,7 +59,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "92bf474c3fbf6679");
+  assert.equal(agentToolSchemaHash(), "3f01f1e0bcc89c06");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -205,7 +208,7 @@ test("task modes share one frozen universal capability catalog", () => {
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
   assert.deepEqual(writeNames, catalog);
-  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
+  for (const required of ["read_document", "begin_chapter_draft", "write_document_isolated", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
   assert.equal(writeNames.includes("save_character"), true);
@@ -336,7 +339,7 @@ test("scene orchestration always stays on Agent regardless of Writer isolation",
   assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), reviewer);
 });
 
-test("write tasks use Writer only for pending standard scene drafting", () => {
+test("fast writing mode keeps every step on Agent, including pending prose scenes", () => {
   const model = (name: string) => ({ baseUrl: "https://api.example.com/v1", apiKey: "test", model: name });
   const agent = model("agent");
   const writer = model("writer");
@@ -344,11 +347,13 @@ test("write tasks use Writer only for pending standard scene drafting", () => {
   const complete = { scenes: [{ id: "one" }], completed: [{ sceneId: "one" }] } as unknown as Pick<import("./scene_pipeline.js").ChapterSceneDraft, "scenes" | "completed">;
 
   assert.equal(executionModelForStep("write_scene", agent, writer, false), agent);
-  assert.equal(executionModelForStep("write_scene", agent, writer, false, pending), writer);
+  assert.equal(executionModelForStep("write_scene", agent, writer, false, pending), agent);
   assert.equal(executionModelForStep("write_scene", agent, writer, false, complete), agent);
   assert.equal(executionModelForStep("write_scene", agent, writer, true, pending), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, true, complete), agent);
   assert.equal(executionModelForStep("write_scene", agent, writer, true), agent);
-  assert.equal(executionModelForStep("outline", agent, writer, false, pending), agent);
+  assert.equal(executionModelForStep("write_scene", agent, undefined, true), agent);
+  assert.equal(executionModelForStep("outline", agent, writer, true, pending), agent);
 });
 
 test("provider usage parsing and tagged persistence include hidden model calls", () => {
@@ -476,7 +481,13 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /actualState/);
   assert.match(instructions, /大纲不是前置条件/);
+  assert.match(instructions, /问题密集/);
+  assert.match(instructions, /重写受影响场景乃至全文/);
   assert.doesNotMatch(instructions, /不能跳过逐场景|禁止 propose_document\/patch/);
+  const fast = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true);
+  assert.match(fast, /传统单 Agent 链路/);
+  assert.match(fast, /不得调用或等待正文 Writer/);
+  assert.match(fast, /不要为了展示流程而建立场景链/);
 });
 
 test("chapter continuation handoff carries delivery, tail, and final scene state", () => {
@@ -547,6 +558,18 @@ test("scene continuation handoff carries seam tail, states and next card without
   const complete = sceneContinuationPrompt(draft, {});
   assert.match(complete, /当前没有未写 scene guide/);
   assert.match(complete, /inspect_chapter_draft/);
+  const reviewLock = chapterReviewRequiredPrompt(draft);
+  assert.match(reviewLock, /已完成（2\/2）/);
+  assert.match(reviewLock, /唯一下一步：立即调用 inspect_chapter_draft/);
+  assert.match(reviewLock, /不要调用 manage_todos/);
+  assert.match(reviewLock, /禁止重写、续写或重新建立 scene guide/);
+  assert.equal(chapterReviewAllowsTool("inspect_chapter_draft"), true);
+  assert.equal(chapterReviewAllowsTool("manage_todos"), false);
+  assert.equal(chapterReviewAllowsTool("write_chapter_scene"), false);
+  assert.equal(chapterDraftNeedsReview(draft, "scene_written"), true);
+  assert.equal(chapterDraftNeedsReview(draft, "review_blocked"), false);
+  draft.inspectedVersion = draft.version;
+  assert.equal(chapterDraftNeedsReview(draft, "scene_written"), false);
 });
 
 type Msg = {

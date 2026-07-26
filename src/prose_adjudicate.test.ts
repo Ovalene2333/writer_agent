@@ -4,6 +4,7 @@ import {
   applyCachedProseVerdicts,
   applyProseVerdicts,
   materializeProseDiscoveries,
+  parseLearnedProseGateFindings,
   parseProseAdjudication,
   packProseSnippets,
   previewProseStyleGateError,
@@ -14,6 +15,7 @@ import {
   type ProseVerdictCache,
 } from "./prose_adjudicate.js";
 import { analyzeProseStyle, proseStyleIssuesError } from "./prose_quality.js";
+import type { ProseGateRule } from "./prose_gate_rules.js";
 
 test("selectAdjudicationCandidates prefers warnings and skips pure speech info", () => {
   const speech = analyzeProseStyle("「你——你怎么来了？」");
@@ -23,6 +25,36 @@ test("selectAdjudicationCandidates prefers warnings and skips pure speech info",
   const candidates = selectAdjudicationCandidates(mixed);
   assert.ok(candidates.length >= 1);
   assert.ok(candidates.some(item => item.subtype === "cause_or_judgment" || item.subtype === "ambiguous_dash"));
+});
+
+test("learned gate accepts exact evidence for quoted-text count feedback", () => {
+  const text = "她盯着纸上的“永远等你”——这三个字，半晌没动。";
+  const rule: ProseGateRule = {
+    id: "quoted-text-count-consistency",
+    instruction: "描述引号内文字数量时，核对实际字数。",
+    severity: "block",
+    enabled: true,
+    sourceFeedback: "作者要求复审字数描述",
+    createdAt: "2026-07-26T00:00:00.000Z",
+    updatedAt: "2026-07-26T00:00:00.000Z",
+  };
+  const passages = [{ id: "learned:0", start: 0, end: text.length, text, reason: "作者自定义复审" }];
+  const findings = parseLearnedProseGateFindings(JSON.stringify({
+    findings: [{
+      ruleId: rule.id,
+      passageId: "learned:0",
+      evidence: text,
+      reason: "引号内四个字，却写成三个字",
+      suggestion: "改成“这四个字”",
+    }],
+  }), [rule], passages);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].suggestion, "改成“这四个字”");
+
+  const fabricated = parseLearnedProseGateFindings(JSON.stringify({
+    findings: [{ ruleId: rule.id, passageId: "learned:0", evidence: "不存在的原句" }],
+  }), [rule], passages);
+  assert.deepEqual(fabricated, []);
 });
 
 test("packProseSnippets includes neighbor context", () => {

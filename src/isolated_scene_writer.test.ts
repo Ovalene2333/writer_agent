@@ -289,3 +289,66 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("direct isolated document keeps prose generation outside the Agent transcript", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-isolated-document-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "直接隔离正文");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("直接正文");
+    const usageKinds: string[] = [];
+    const prose = [
+      "雨沿着候机楼的玻璃往下淌。林岚把登机牌压在桌沿，等父亲把那杯没有动过的咖啡推回来。",
+      "「到了那边先住学校安排的宿舍。」他说，「月底我把剩下的材料寄过去。」",
+      "她把杯子接住，问的却是下一次复查。两个人对着日历算了几分钟，广播第三次催促登机时，纸上已经多了两个日期。",
+    ].join("\n\n");
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      characterEvolutionEnabled: false,
+      scenePipelineSettings: {
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,
+      },
+      modelUsageReporter: (_model, _usage, meta) => usageKinds.push(meta.callKind),
+      isolatedSceneWriter: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" },
+        stateModel: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "state-test" },
+        run: async (_model, input) => {
+          assert.equal(input.scene.id, "direct-document");
+          assert.equal(input.scene.targetCharacters, 500);
+          assert.match(input.writePack.narrativeBrief, /机场/u);
+          return {
+            content: prose,
+            usage: { promptTokens: 240, completionTokens: 160, cacheHitTokens: 0, cacheMissTokens: 240 },
+            requestCharacters: 1_000,
+          };
+        },
+      },
+    };
+    const result = JSON.parse(await executeTool({
+      id: "direct",
+      name: "write_document_isolated",
+      arguments: JSON.stringify({
+        path: "chapters/序章.md",
+        mode: "create",
+        heading: "序章",
+        goal: "父女完成对未来安排的确认",
+        obstacle: "登机时间逼近，两人都不习惯直接表达关心",
+        turn: "讨论从住宿转到复查与下次见面",
+        outcome: "两人留下明确日期后分别",
+        notes: "机场候机区。父女关系不僵，重点是交换情况并规划未来。",
+        targetCharacters: 500,
+        summary: "新增序章",
+      }),
+    }, project, store, sessionId, () => {}, undefined, context)) as Record<string, unknown>;
+    assert.equal(result.generationMode, "isolated_document");
+    assert.equal(result.generatedCharacters, prose.length);
+    assert.equal("content" in result, false);
+    assert.deepEqual(usageKinds, ["isolated_document_writer"]);
+    assert.equal(store.proposals()[0].afterContent, `# 序章\n\n${prose}`);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

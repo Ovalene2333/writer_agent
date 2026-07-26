@@ -351,6 +351,44 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "write_document_isolated",
+      description: "用隔离 Writer 一次生成并提议短篇单场正文；长篇或多次关键转折改用场景链",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
+          mode: { type: "string", enum: ["create", "replace", "append"] },
+          sourceHash: { type: "string", description: "replace/append 时必传当前文档哈希" },
+          heading: { type: "string", description: "create/replace 时的正文标题（不含 #）" },
+          goal: { type: "string", description: "全文结束后真正改变什么" },
+          entryState: { type: "array", items: { type: "string" }, description: "入场局面" },
+          characterIntent: { type: "array", items: { type: "string" }, description: "人物各自诉求" },
+          obstacle: { type: "string", description: "直接阻力" },
+          turn: { type: "string", description: "预期落空、代价或关系变化" },
+          outcome: { type: "string", description: "正文收束时的直接结果" },
+          notes: { type: "string", description: "故事内材料；长度上限由场景链设置决定" },
+          targetCharacters: { type: "number", description: "目标正文 500—5000 字" },
+          summary: { type: "string", description: "提案摘要" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["path", "mode", "goal", "obstacle", "turn", "outcome", "notes", "targetCharacters", "summary"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "write_chapter_scene",
       description: "写入一场章节草稿；隔离 Writer 模式只提交 notes，标准模式同时提交正文与状态",
       parameters: {
@@ -655,7 +693,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "list_characters",
-      description: "列出可读普通角色卡（含本轮新建；受角色范围限制）",
+      description: "列出可读普通角色卡及分区计数/更新时间（含本轮新建；受角色范围限制）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -663,17 +701,22 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_character",
-      description: "按 ID 读 v3 角色卡；可 sections 分区。locked 能力不可当已用",
+      description: "按 ID 分层读 v3 角色卡：写作先 summary，不足用 sections；编辑直接 edit，可用 sections 限定编辑分区",
       parameters: {
         type: "object",
         properties: {
           id: { type: "number", description: "角色 ID" },
+          view: {
+            type: "string",
+            enum: ["summary", "sections", "edit"],
+            description: "summary=必要摘要；sections=写作安全的指定分区；edit=完整可编辑字段，可配 sections 限定范围。省略时有 sections 则为 sections，否则 summary",
+          },
           sections: {
             type: "array",
-            description: "顶层分区；省略=全卡",
+            description: "view=sections 时必填；view=edit 时可选，指定则只读这些编辑分区",
             items: {
               type: "string",
-              enum: ["identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyState", "experiences", "notes"],
+              enum: ["identity", "profile", "psychology", "motivations", "voice", "features", "competencies", "relationships", "storyState", "experiences", "notes"],
             },
           },
           outlineNodeId: { type: "string", description: "场景态/经历用的大纲节点 ID" },
@@ -692,11 +735,13 @@ export const TOOLS = deepFreeze([
         type: "object",
         properties: {
           id: { type: "number", description: "更新时必填；新建省略" },
+          expectedUpdatedAt: { type: "string", description: "更新已有卡必填；来自最近一次 get_character，防止覆盖并发修改" },
           identity: { type: "object", description: "身份", additionalProperties: true },
-          profile: { type: "object", description: "外貌/背景", additionalProperties: true },
+          profile: { type: "object", description: "外形/背景；appearance/background 为详情，两个 Summary 为逐行要点摘要（每行一项）", additionalProperties: true },
           psychology: { type: "object", description: "心理", additionalProperties: true },
           motivations: { type: "array", description: "目标", items: { type: "object", additionalProperties: true } },
           voice: { type: "object", description: "声线", additionalProperties: true },
+          features: { type: "array", description: "特性（不属于能力的稳定细节）", items: { type: "object", additionalProperties: true } },
           competencies: { type: "array", description: "能力", items: { type: "object", additionalProperties: true } },
           relationships: { type: "array", description: "关系", items: { type: "object", additionalProperties: true } },
           storyStates: { type: "array", description: "剧情状态", items: { type: "object", additionalProperties: true } },
@@ -824,6 +869,26 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "manage_prose_gates",
+      description: "管理项目级语义复审规则；作者明确要求以后持续检查/避免某类问题时 upsert，单次改稿偏好不要沉淀",
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["list", "upsert", "enable", "disable", "remove"] },
+          id: { type: "string", description: "稳定英文短 ID；list 时省略" },
+          instruction: { type: "string", description: "可独立执行的语义核验标准；upsert 必填" },
+          severity: { type: "string", enum: ["block", "warn"], description: "确定错误用 block，偏好风险用 warn" },
+          enabled: { type: "boolean", description: "upsert 后是否启用，默认 true" },
+          sourceFeedback: { type: "string", description: "触发沉淀的作者反馈摘要，不粘贴长对话" },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description: "缺关键事实/目标且无法推断时提问并暂停；可逆创作选择勿滥用。勿与其他工具同轮",
       parameters: {
@@ -885,10 +950,11 @@ export const TOOLS = deepFreeze([
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
 const WRITE_TOOLS = new Set([
-  "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
+  "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set",
   "revise_document_isolated",
   "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
+  "manage_prose_gates",
 ]);
 
 /**

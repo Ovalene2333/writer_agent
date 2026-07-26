@@ -179,6 +179,9 @@ export interface CharacterRelationship extends CharacterTemporal {
 export interface CharacterCompetency extends CharacterTemporal {
   id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[];
 }
+export interface CharacterFeature {
+  id: string; name: string; summary: string; description: string;
+}
 export interface CharacterStoryState extends CharacterTemporal {
   id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string;
   knowledge: CharacterTextEntry[]; beliefs: CharacterTextEntry[]; intentions: string[]; temporaryGoals: CharacterGoal[]; notes: string;
@@ -187,10 +190,12 @@ export interface Character {
   schemaVersion: 3;
   id: number;
   identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
-  profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
+  profile: { appearance: string; appearanceSummary: string; background: string; backgroundSummary: string; biography: string };
   psychology: { summary: string; traits: CharacterTextEntry[]; values: CharacterTextEntry[]; fears: CharacterTextEntry[]; conflicts: CharacterTextEntry[] };
   motivations: CharacterGoal[];
   voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
+  /** Stable details that shape portrayal but are not abilities (habits, physiology, quirks, etc.). */
+  features: CharacterFeature[];
   competencies: CharacterCompetency[];
   relationships: CharacterRelationship[];
   storyStates: CharacterStoryState[];

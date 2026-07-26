@@ -5,6 +5,7 @@ import type { WriterProject } from "./project.js";
 
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
 export type PermissionMode = "ask" | "auto" | "plan";
+export type WritingExecutionMode = "delegated" | "fast";
 
 export const ABSOLUTE_MAX_SCENES = 8;
 export const MIN_SCENE_NOTES_CHARACTERS = 500;
@@ -38,6 +39,8 @@ export interface ScenePipelineSettings {
 
 export interface AgentRuntimeSettings {
   permissionMode: PermissionMode;
+  /** delegated = isolated prose tools; fast = traditional single-Agent writing with no Writer calls. */
+  writingMode: WritingExecutionMode;
   /** Allow narrative tasks to append character experiences and story state. */
   characterEvolutionEnabled: boolean;
   scenePipeline: ScenePipelineSettings;
@@ -96,6 +99,7 @@ const SCENE_PIPELINE_TODO_SIGNATURES = [
 
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
+  writingMode: "delegated",
   characterEvolutionEnabled: true,
   scenePipeline: {
     preferredMinScenes: 3,
@@ -111,9 +115,14 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
 export const MAX_SCENE_CANDIDATES = 3;
 
 const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
+const WRITING_EXECUTION_MODES = new Set<WritingExecutionMode>(["delegated", "fast"]);
 
 export function isPermissionMode(value: string): value is PermissionMode {
   return PERMISSION_MODES.has(value as PermissionMode);
+}
+
+export function isWritingExecutionMode(value: string): value is WritingExecutionMode {
+  return WRITING_EXECUTION_MODES.has(value as WritingExecutionMode);
 }
 
 export function settingsPath(project: WriterProject): string {
@@ -154,6 +163,9 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       : DEFAULT_SETTINGS.permissionMode;
     return {
       permissionMode: mode,
+      writingMode: typeof raw.writingMode === "string" && isWritingExecutionMode(raw.writingMode)
+        ? raw.writingMode
+        : DEFAULT_SETTINGS.writingMode,
       characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
     };
@@ -164,13 +176,21 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
 
 export function saveAgentSettings(
   project: WriterProject,
-  patch: { permissionMode?: PermissionMode; characterEvolutionEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> },
+  patch: {
+    permissionMode?: PermissionMode;
+    writingMode?: WritingExecutionMode;
+    characterEvolutionEnabled?: boolean;
+    scenePipeline?: Partial<ScenePipelineSettings>;
+  },
 ): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
   const next: AgentRuntimeSettings = {
     permissionMode: patch.permissionMode && isPermissionMode(patch.permissionMode)
       ? patch.permissionMode
       : current.permissionMode,
+    writingMode: patch.writingMode && isWritingExecutionMode(patch.writingMode)
+      ? patch.writingMode
+      : current.writingMode,
     characterEvolutionEnabled: typeof patch.characterEvolutionEnabled === "boolean"
       ? patch.characterEvolutionEnabled
       : current.characterEvolutionEnabled,

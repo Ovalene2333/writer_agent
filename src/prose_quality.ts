@@ -4,11 +4,12 @@ export type ProseStyleSubtype =
   | "system_or_metadata" | "parenthetical_explanation" | "appositive_definition"
   | "cause_or_judgment" | "ambiguous_dash"
   | "narrator_redefinition" | "abstract_reframing" | "split_redefinition" | "dialogue_correction" | "factual_exclusion"
-  | "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss";
+  | "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss"
+  | "learned_rule";
 
 export interface ProseStyleIssue {
   id: string;
-  kind: "dash" | "contrast" | "explanation";
+  kind: "dash" | "contrast" | "explanation" | "learned";
   subtype: ProseStyleSubtype;
   severity: ProseStyleSeverity;
   confidence: number;
@@ -79,6 +80,7 @@ export const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
   "intent_translation",
   "thematic_summary",
   "causal_gloss",
+  "learned_rule",
 ]);
 
 export function isHardBlockSubtype(subtype: ProseStyleSubtype): boolean {
@@ -240,7 +242,10 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
     || (issue.subtype === "split_redefinition" && issue.severity === "warning" && issue.confidence >= 0.95),
   );
   if (!errors.length) return undefined;
-  return formatProseStyleBlockError(errors, "本次修改新增过密的高置信度说明式写法");
+  const headline = errors.some(issue => issue.subtype === "learned_rule")
+    ? "本次修改违反作者沉淀的复审规则"
+    : "本次修改新增过密的高置信度说明式写法";
+  return formatProseStyleBlockError(errors, headline);
 }
 
 /** Actionable block message so one local rewrite can pass re-submit. */
@@ -249,8 +254,11 @@ function formatProseStyleBlockError(errors: ProseStyleIssue[], headline: string)
     const tip = issue.suggestions[0] ?? rewriteTipForSubtype(issue.subtype);
     return `第${issue.line}行「${issue.evidence}」→ ${tip}`;
   });
+  const learnedOnly = errors.every(issue => issue.subtype === "learned_rule");
   return `${headline}（${errors.length}处硬拦截）：${located.join("；")}。` +
-    "只改命中句，勿全文重写。保留：对白拖音/中断/迟疑、口语纠正、偶发停顿—揭示与短同位。配方：删「——因为/也就是」类补注；抽象「不是…而是」改成直接事实或人物行动。";
+    (learnedOnly
+      ? "只按规则精确修正命中句，勿全文重写。"
+      : "只改命中句，勿全文重写。保留：对白拖音/中断/迟疑、口语纠正、偶发停顿—揭示与短同位。配方：删「——因为/也就是」类补注；抽象「不是…而是」改成直接事实或人物行动。");
 }
 
 function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
@@ -273,6 +281,8 @@ function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
       return "删去即时总结，让意义由场景后果或后续回收形成";
     case "causal_gloss":
       return "必要因果写成新事实；若只是复述前文则删除";
+    case "learned_rule":
+      return "按作者沉淀的项目复审规则做最小修正";
     default:
       return "改成可观察动作或独立句，去掉说明体";
   }

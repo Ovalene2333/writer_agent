@@ -10,6 +10,7 @@ import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
 import type { DocumentRevisionInput } from "../document_revision.js";
+import type { ProseGateRule } from "../prose_gate_rules.js";
 import type {
   IsolatedSceneWriterInput,
   IsolatedSceneWriterResult,
@@ -91,6 +92,8 @@ export type ToolExecutionContext = {
     model: ModelConfig;
     signal?: AbortSignal;
   };
+  /** Project-persisted semantic review rules learned from explicit author feedback. */
+  proseGateRules?: ProseGateRule[];
   /**
    * Full-chapter structural review runs in an isolated, tool-free call so the
    * assembled prose is not appended to every later Agent step. Production uses
