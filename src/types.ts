@@ -322,6 +322,8 @@ export interface RequestComponentUsage {
   label: string;
   characters: number;
   estimatedTokens: number;
+  /** Short content hash for diagnosing whether a supposedly stable prefix drifted. */
+  fingerprint?: string;
   callKind?: string;
 }
 

@@ -638,6 +638,19 @@ test("dynamic turn messages always expose the same slot count", () => {
   assert.match(empty[6].content ?? "", /工作记忆/);
 });
 
+test("cache waterfall fingerprints stable messages and tools but not dynamic content", () => {
+  const tools = agentToolsForTask("general", "ask");
+  const components = buildRequestComponentUsage([
+    { role: "system", content: "稳定" },
+    { role: "system", content: "动态" },
+    { role: "user", content: "请求" },
+  ], tools, 1, 3);
+  assert.equal(components.find(item => item.kind === "tool_schema")?.fingerprint?.length, 12);
+  assert.equal(components.find(item => item.kind === "stable_system")?.fingerprint?.length, 12);
+  assert.equal(components.find(item => item.kind === "dynamic_system")?.fingerprint, undefined);
+  assert.equal(components.find(item => item.kind === "user")?.fingerprint, undefined);
+});
+
 test("recent roleplay handoff preserves exact turns and director boundaries", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-roleplay-handoff-"));
   try {

@@ -292,6 +292,7 @@ type StepUsage = {
     label: string;
     characters: number;
     estimatedTokens: number;
+    fingerprint?: string;
     callKind?: string;
   }>;
 };
@@ -934,15 +935,31 @@ const markdownParser = new Marked({
 
 let markdownHeadingIndex = 0;
 let markdownHeadingPrefix = "";
+let markdownSourceText = "";
+let markdownSourceCursor = 0;
+let markdownSourceRangesEnabled = false;
+
+function markdownSourceRangeAttributes(raw: string): string {
+  if (!markdownSourceRangesEnabled || !raw) return "";
+  let start = markdownSourceText.indexOf(raw, markdownSourceCursor);
+  if (start < 0) start = markdownSourceText.indexOf(raw);
+  if (start < 0) return "";
+  const end = start + raw.length;
+  markdownSourceCursor = end;
+  return ` data-source-start="${start}" data-source-end="${end}"`;
+}
 
 markdownParser.use({
   renderer: {
-    heading({ tokens, depth }: Tokens.Heading) {
+    heading({ tokens, depth, raw }: Tokens.Heading) {
       const text = this.parser.parseInline(tokens);
       const id = markdownHeadingPrefix
         ? ` id="${markdownHeadingPrefix}-section-${++markdownHeadingIndex}"`
         : "";
-      return `<h${depth}${id}>${text}</h${depth}>\n`;
+      return `<h${depth}${id}${markdownSourceRangeAttributes(raw)}>${text}</h${depth}>\n`;
+    },
+    paragraph({ tokens, raw }: Tokens.Paragraph) {
+      return `<p${markdownSourceRangeAttributes(raw)}>${this.parser.parseInline(tokens)}</p>\n`;
     },
     // Never execute raw HTML from documents / model output.
     html({ text }: Tokens.HTML | Tokens.Tag) {
@@ -1008,6 +1025,9 @@ function renderMarkdownHtml(content: string, headingPrefix?: string): string {
   if (!normalized.trim()) return "";
   markdownHeadingIndex = 0;
   markdownHeadingPrefix = headingPrefix ?? "";
+  markdownSourceText = normalized;
+  markdownSourceCursor = 0;
+  markdownSourceRangesEnabled = headingPrefix === "document";
   try {
     const html = markdownParser.parse(normalized, { async: false });
     return typeof html === "string" ? html : "";
@@ -1015,6 +1035,50 @@ function renderMarkdownHtml(content: string, headingPrefix?: string): string {
     // Fallback: plain escaped text so the reader never goes blank.
     return `<p>${escapeHtml(normalized).replace(/\n/g, "<br/>")}</p>`;
   }
+}
+
+function documentWordCount(content: string): number {
+  return Array.from(content).filter(character => !/\s/u.test(character)).length;
+}
+
+function originalOffsetForNormalized(source: string, normalizedOffset: number): number {
+  let original = source.charCodeAt(0) === 0xFEFF ? 1 : 0;
+  let normalized = 0;
+  while (original < source.length && normalized < normalizedOffset) {
+    if (source[original] === "\r" && source[original + 1] === "\n") original += 2;
+    else original += 1;
+    normalized += 1;
+  }
+  return original;
+}
+
+type DocumentContextSelection = {
+  id: string;
+  path: string;
+  text: string;
+};
+
+type ReaderTextSelection = DocumentContextSelection & {
+  start: number;
+  end: number;
+  blockCount: number;
+  left: number;
+  top: number;
+};
+
+function readingProgressStorageKey(path: string): string {
+  return `writer-reading-progress:v1:${getActiveBase()}:${path}`;
+}
+
+function loadReadingProgress(path: string): number | undefined {
+  if (!path) return undefined;
+  const value = Number(localStorage.getItem(readingProgressStorageKey(path)));
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : undefined;
+}
+
+function saveReadingProgress(path: string, ratio: number): void {
+  if (!path) return;
+  localStorage.setItem(readingProgressStorageKey(path), String(Math.max(0, Math.min(1, ratio))));
 }
 
 function Markdown({ content, className, headingPrefix }: { content: string; className?: string; headingPrefix?: string }) {
@@ -1645,7 +1709,11 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
                   .sort((a, b) => b.estimatedTokens - a.estimatedTokens)
                   .map((component, index) => (
                     <div className="agent-step-context-row" key={`${component.callKind ?? "call"}-${component.kind}-${index}`}>
-                      <span>{component.callKind ? `${component.callKind} · ` : ""}{component.label}</span>
+                      <span>
+                        {component.callKind ? `${component.callKind} · ` : ""}
+                        {component.label}
+                        {component.fingerprint ? ` · #${component.fingerprint}` : ""}
+                      </span>
                       <span>{component.estimatedTokens.toLocaleString()} tok · {component.characters.toLocaleString()} chars</span>
                     </div>
                   ))}
@@ -1884,6 +1952,9 @@ function App() {
   const [readerWidth, setReaderWidth] = useState(() =>
     Number(localStorage.getItem("writer-reader-w")) || 760,
   );
+  const [readingProgress, setReadingProgress] = useState(0);
+  const [readerSelection, setReaderSelection] = useState<ReaderTextSelection | null>(null);
+  const [documentContextSelections, setDocumentContextSelections] = useState<DocumentContextSelection[]>([]);
   const [outlineCollapsed, setOutlineCollapsed] = useState(() =>
     localStorage.getItem("writer-outline-collapsed") === "true",
   );
@@ -1946,8 +2017,10 @@ function App() {
   const createInputRef = useRef<HTMLInputElement>(null);
   const fileSearchRef = useRef<HTMLInputElement>(null);
   const documentReaderRef = useRef<HTMLDivElement>(null);
+  const documentEditorRef = useRef<HTMLTextAreaElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const readingProgressTimerRef = useRef<number | undefined>(undefined);
   const conversationAtBottomRef = useRef(true);
   const composerFocusedAtBottomRef = useRef(false);
   const updateConversationBottom = useCallback((viewport: HTMLDivElement | null = conversationRef.current) => {
@@ -2020,8 +2093,16 @@ function App() {
     setDirectorSuggestions([]);
     setDirectorSuggestionError("");
   }, [state?.sessionId, roleplay?.performer.name, roleplay?.identity.name, roleplay?.scene?.id, roleplay?.scene?.revision]);
+  useEffect(() => {
+    setDocumentContextSelections([]);
+    setReaderSelection(null);
+  }, [state?.sessionId]);
 
   const headings = useMemo(() => markdownHeadings(document.content, "document"), [document.content]);
+  const visibleDocumentWordCount = useMemo(
+    () => documentWordCount(editingDocument ? documentDraft : browsingVersion?.afterContent ?? document.content),
+    [browsingVersion?.afterContent, document.content, documentDraft, editingDocument],
+  );
 
   /**
    * Drop agent step UI. Clears localStorage trail for the current session when
@@ -2355,6 +2436,7 @@ function App() {
     setVersionPanelOpen(false);
     setVersions([]);
     setBrowsingVersion(null);
+    setReaderSelection(null);
     void api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`)
       .then((value) => {
         setDocument(value);
@@ -2363,6 +2445,130 @@ function App() {
       })
       .catch((e) => setError(String(e)));
   }, [activePath]);
+
+  useEffect(() => {
+    if (!activePath || editingDocument || browsingVersion || !document.content) return;
+    const frame = window.requestAnimationFrame(() => {
+      const reader = documentReaderRef.current;
+      if (!reader) return;
+      const saved = loadReadingProgress(activePath) ?? 0;
+      const scrollable = Math.max(0, reader.scrollHeight - reader.clientHeight);
+      reader.scrollTop = scrollable * saved;
+      setReadingProgress(scrollable === 0 ? 1 : saved);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activePath, document.hash, editingDocument, browsingVersion]);
+
+  useEffect(() => () => {
+    if (readingProgressTimerRef.current !== undefined) {
+      window.clearTimeout(readingProgressTimerRef.current);
+    }
+  }, []);
+
+  function handleReaderScroll(event: React.UIEvent<HTMLDivElement>) {
+    const reader = event.currentTarget;
+    const scrollable = Math.max(0, reader.scrollHeight - reader.clientHeight);
+    const ratio = scrollable === 0 ? 1 : reader.scrollTop / scrollable;
+    setReadingProgress(ratio);
+    setReaderSelection(null);
+    if (!activePath || browsingVersion) return;
+    if (readingProgressTimerRef.current !== undefined) {
+      window.clearTimeout(readingProgressTimerRef.current);
+    }
+    readingProgressTimerRef.current = window.setTimeout(() => {
+      saveReadingProgress(activePath, ratio);
+      readingProgressTimerRef.current = undefined;
+    }, 180);
+  }
+
+  function handleReaderTextSelection() {
+    if (!activePath || editingDocument || browsingVersion) return;
+    window.requestAnimationFrame(() => {
+      const reader = documentReaderRef.current;
+      const selection = window.getSelection();
+      if (!reader || !selection || selection.isCollapsed || selection.rangeCount === 0) {
+        setReaderSelection(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      const elementForNode = (node: Node): Element | null =>
+        node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
+      const startBlock = elementForNode(range.startContainer)?.closest<HTMLElement>("[data-source-start][data-source-end]");
+      const endBlock = elementForNode(range.endContainer)?.closest<HTMLElement>("[data-source-start][data-source-end]");
+      if (!startBlock || !endBlock || !reader.contains(startBlock) || !reader.contains(endBlock)) {
+        setReaderSelection(null);
+        return;
+      }
+      let normalizedStart = Number(startBlock.dataset.sourceStart);
+      let normalizedEnd = Number(endBlock.dataset.sourceEnd);
+      if (!Number.isInteger(normalizedStart) || !Number.isInteger(normalizedEnd)) {
+        setReaderSelection(null);
+        return;
+      }
+      if (normalizedEnd < normalizedStart) [normalizedStart, normalizedEnd] = [normalizedEnd, normalizedStart];
+      const normalizedSource = normalizeMarkdownSource(document.content);
+      const selectedText = selection.toString().trim();
+      const envelope = normalizedSource.slice(normalizedStart, normalizedEnd);
+      const exactOffset = selectedText ? envelope.indexOf(selectedText) : -1;
+      if (exactOffset >= 0 && exactOffset === envelope.lastIndexOf(selectedText)) {
+        normalizedStart += exactOffset;
+        normalizedEnd = normalizedStart + selectedText.length;
+      } else {
+        while (normalizedStart < normalizedEnd && /\s/u.test(normalizedSource[normalizedStart] ?? "")) normalizedStart += 1;
+        while (normalizedEnd > normalizedStart && /\s/u.test(normalizedSource[normalizedEnd - 1] ?? "")) normalizedEnd -= 1;
+      }
+      const start = originalOffsetForNormalized(document.content, normalizedStart);
+      const end = originalOffsetForNormalized(document.content, normalizedEnd);
+      const text = document.content.slice(start, end);
+      if (!text.trim()) {
+        setReaderSelection(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      const blockCount = startBlock === endBlock ? 1 : 2;
+      setReaderSelection({
+        id: `${activePath}:${start}:${end}`,
+        path: activePath,
+        text,
+        start,
+        end,
+        blockCount,
+        left: Math.max(12, Math.min(window.innerWidth - 260, rect.left + rect.width / 2 - 120)),
+        top: Math.max(12, rect.top - 48),
+      });
+    });
+  }
+
+  function addReaderSelectionToContext() {
+    if (!readerSelection) return;
+    setDocumentContextSelections(current => {
+      if (current.some(item => item.path === readerSelection.path && item.text === readerSelection.text)) return current;
+      return [...current, {
+        id: readerSelection.id,
+        path: readerSelection.path,
+        text: readerSelection.text,
+      }];
+    });
+    setNotice(`已将 ${readerSelection.path} 的选段加入下一次 Agent 请求`);
+    setReaderSelection(null);
+    window.getSelection()?.removeAllRanges();
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  function editReaderSelectionDirectly() {
+    if (!readerSelection) return;
+    const { start, end } = readerSelection;
+    setDocumentDraft(document.content);
+    setEditingDocument(true);
+    setReaderSelection(null);
+    window.getSelection()?.removeAllRanges();
+    window.requestAnimationFrame(() => {
+      const editor = documentEditorRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.setSelectionRange(start, end);
+    });
+  }
 
   const loadVersions = useCallback(async (path: string) => {
     if (!path) return;
@@ -2752,6 +2958,9 @@ function App() {
     const activeRoleplay = requestedChannel === undefined ? roleplay : requestedChannel === "roleplay" ? roleplay : null;
     const variantGroupId = options?.variantGroupId ?? composerBranch?.variantGroupId;
     const replaceFromId = options?.replaceFromId ?? composerBranch?.fromId;
+    const requestDocumentSelections = !activeRoleplay && options?.text === undefined
+      ? documentContextSelections
+      : [];
     if (!state || busy || !text) return;
     if (requestedChannel === "roleplay" && !activeRoleplay) {
       setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
@@ -2809,6 +3018,14 @@ function App() {
           ...(!activeRoleplay ? {
             ...(characterScope !== undefined ? { characterScope } : {}),
             ...(simpleCharacterScope !== undefined ? { simpleCharacterScope } : {}),
+            ...(requestDocumentSelections.length
+              ? {
+                  documentSelections: requestDocumentSelections.map(selection => ({
+                    path: selection.path,
+                    text: selection.text,
+                  })),
+                }
+              : {}),
           } : {}),
           ...(activeRoleplay
             ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: options?.inputMode ?? roleplayInputMode }
@@ -2818,6 +3035,7 @@ function App() {
       setState(current => current
         ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
         : current);
+      if (requestDocumentSelections.length) setDocumentContextSelections([]);
       setComposerBranch(null);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
@@ -4070,6 +4288,12 @@ function App() {
         <div className="editor-bar">
           <span className="doc-path">
             {activePath || "No document selected"}
+            {activePath && (
+              <span className="document-reading-stats">
+                {visibleDocumentWordCount.toLocaleString("zh-CN")} 字
+                {!browsingVersion && !editingDocument && <> · 阅读 {Math.round(readingProgress * 100)}%</>}
+              </span>
+            )}
             {browsingVersion && (
               <span className="version-badge" title="仅浏览历史版本，不影响 Agent 上下文">
                 历史 · #{browsingVersion.id}
@@ -4138,7 +4362,7 @@ function App() {
           </div>
         </div>
         {editingDocument ? (
-          <textarea value={documentDraft} onChange={(e) => setDocumentDraft(e.target.value)} />
+          <textarea ref={documentEditorRef} value={documentDraft} onChange={(e) => setDocumentDraft(e.target.value)} />
         ) : (
           <div className={`document-reader-shell${versionPanelOpen ? " with-versions" : ""}`}>
             {versionPanelOpen && (
@@ -4187,7 +4411,13 @@ function App() {
                 )}
               </aside>
             )}
-            <div className="document-reader" ref={documentReaderRef}>
+            <div
+              className="document-reader"
+              ref={documentReaderRef}
+              onScroll={handleReaderScroll}
+              onMouseUp={handleReaderTextSelection}
+              onKeyUp={handleReaderTextSelection}
+            >
               {browsingVersion ? (
                 <div className="version-browse-layout">
                   <div className="version-browse-banner">
@@ -4244,6 +4474,23 @@ function App() {
                 </div>
               )}
             </div>
+            {readerSelection && (
+              <div
+                className="reader-selection-toolbar"
+                style={{ left: readerSelection.left, top: readerSelection.top }}
+                role="toolbar"
+                aria-label="选中文字操作"
+                onMouseDown={event => event.preventDefault()}
+              >
+                <span>{readerSelection.blockCount > 1 ? "跨段" : "选段"} · {documentWordCount(readerSelection.text)} 字</span>
+                <button type="button" onClick={addReaderSelectionToContext}>
+                  <MessageSquare size={13} />加入上下文
+                </button>
+                <button type="button" className="primary" onClick={editReaderSelectionDirectly}>
+                  <Pencil size={13} />直接编辑
+                </button>
+              </div>
+            )}
           </div>
         )}
       </main>
@@ -4651,6 +4898,30 @@ function App() {
         )}
         <div className="composer">
           <div className="composer-shell">
+            {!roleplay && documentContextSelections.length > 0 && (
+              <div className="composer-context-selections" aria-label="下一次请求的文档上下文">
+                <div className="composer-context-heading">
+                  <span>文档上下文 · {documentContextSelections.length} 段</span>
+                  <button type="button" disabled={busy} onClick={() => setDocumentContextSelections([])}>清空</button>
+                </div>
+                <div className="composer-context-chips">
+                  {documentContextSelections.map(selection => (
+                    <span className="composer-context-chip" key={selection.id} title={selection.text}>
+                      <FileText size={12} />
+                      <span>{selection.path.split("/").at(-1)} · {documentWordCount(selection.text)} 字</span>
+                      <button
+                        type="button"
+                        aria-label={`移除 ${selection.path} 选段`}
+                        disabled={busy}
+                        onClick={() => setDocumentContextSelections(current => current.filter(item => item.id !== selection.id))}
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
             {roleplay && roleplayInputMode === "director" && (
               <div className="director-mode-guide" role="note">
                 <div className="director-mode-guide-title">

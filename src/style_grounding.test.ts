@@ -49,8 +49,30 @@ describe("built-in style templates", () => {
     assert.ok((template?.exampleContent.length ?? 0) > 300);
   });
 
+  it("offers a legendary commercial mode for speculative adventure", () => {
+    const template = getStyleTemplate("modern-legendary");
+    assert.equal(template?.name, "现代传奇叙事");
+    assert.match(template?.description ?? "", /科幻.*奇幻|奇幻.*科幻/);
+    assert.match(template?.systemPromptAddition ?? "", /主动选择→代价→局势改变/);
+    assert.match(template?.systemPromptAddition ?? "", /眼前异常→可操作规则→更大含义/);
+    assert.match(template?.systemPromptAddition ?? "", /文明|世界秩序/);
+    assert.match(template?.systemPromptAddition ?? "", /不仿写任何具体作家/);
+    assert.ok((template?.exampleContent.length ?? 0) > 700);
+  });
+
+  it("offers an original Marquez template grounded in consequential magical realism", () => {
+    const template = getStyleTemplate("marquez");
+    assert.equal(template?.name, "马尔克斯");
+    assert.match(template?.description ?? "", /家族.*公共历史/);
+    assert.match(template?.systemPromptAddition ?? "", /平静.*不可能之事/);
+    assert.match(template?.systemPromptAddition ?? "", /时间可以循环、折返/);
+    assert.match(template?.systemPromptAddition ?? "", /不搬用黄蝴蝶/);
+    assert.match(template?.systemPromptAddition ?? "", /持续后果/);
+    assert.ok((template?.exampleContent.length ?? 0) > 700);
+  });
+
   it("every built-in template points at anti-mechanical hygiene", () => {
-    for (const template of ["webnovel-power", "literary", "modern-commercial", "light-novel", "mystery", "xianxia"] as const) {
+    for (const template of ["webnovel-power", "literary", "marquez", "modern-commercial", "modern-legendary", "light-novel", "mystery", "xianxia"] as const) {
       const body = getStyleTemplate(template)?.systemPromptAddition ?? "";
       assert.match(body, /全局自然叙事|反机械|堆砌/, `template ${template} should reference anti-mechanical rules`);
     }

@@ -1,0 +1,488 @@
+import { createHash, randomUUID } from "node:crypto";
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+
+const PREFIX_CACHE_LOG_VERSION = 1;
+const DEFAULT_REPLAY_BYTES = 16 * 1024 * 1024;
+
+export type PrefixCacheMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  reasoning_content?: string;
+};
+
+export type PrefixCacheAtomKind =
+  | "tool_schema"
+  | "stable_system"
+  | "dynamic_system"
+  | "user"
+  | "assistant"
+  | "tool_result"
+  | "other";
+
+export type PrefixCacheAtom = {
+  kind: PrefixCacheAtomKind;
+  label: string;
+  hash: string;
+  characters: number;
+  bytes: number;
+  estimatedTokens: number;
+  document?: {
+    path?: string;
+    sourceHash?: string;
+    artifactId?: number;
+    startLine?: number;
+    endLine?: number;
+    bodyCharacters: number;
+  };
+};
+
+export type PrefixCacheRequestInput = {
+  projectRoot: string;
+  endpoint: string;
+  model: string;
+  providerName?: string;
+  userId?: string;
+  sessionId: string;
+  jobId?: string;
+  callKind: string;
+  step?: number;
+  messages: readonly PrefixCacheMessage[];
+  tools?: readonly unknown[];
+  stableMessageCount: number;
+  initialMessageCount: number;
+  requestProfile?: Record<string, unknown>;
+};
+
+export type PrefixCachePrediction = {
+  priorRequests: number;
+  matchedAtoms: number;
+  totalAtoms: number;
+  predictedHitCharacters: number;
+  predictedHitBytes: number;
+  predictedHitTokens: number;
+  fullRequestKnown: boolean;
+  firstDivergence?: {
+    atomIndex: number;
+    kind: PrefixCacheAtomKind;
+    label: string;
+    alternatives: number;
+  };
+};
+
+export type PrefixCacheObservation = {
+  observationId: string;
+  logPath: string;
+  namespaceHash: string;
+  atoms: PrefixCacheAtom[];
+  prediction: PrefixCachePrediction;
+  startedAt: string;
+};
+
+export type PrefixCacheCompletion = {
+  promptTokens?: number;
+  completionTokens?: number;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  estimated?: boolean;
+  finishReason?: string;
+  error?: string;
+};
+
+type PrefixTreeNode = {
+  children: Map<string, PrefixTreeNode>;
+  visits: number;
+  terminals: number;
+};
+
+type PrefixTreeRoot = {
+  node: PrefixTreeNode;
+  requests: number;
+};
+
+type StartLogRecord = {
+  version: number;
+  event: "request_start";
+  at: string;
+  observationId: string;
+  namespaceHash: string;
+  namespace: {
+    endpoint: string;
+    model: string;
+    providerName?: string;
+    userIdHash?: string;
+    requestProfileHash: string;
+  };
+  sessionId: string;
+  jobId?: string;
+  callKind: string;
+  step?: number;
+  prediction: PrefixCachePrediction;
+  totals: {
+    atoms: number;
+    characters: number;
+    bytes: number;
+    estimatedTokens: number;
+    documentReadAtoms: number;
+    documentBodyCharacters: number;
+  };
+  components: Partial<Record<PrefixCacheAtomKind, {
+    atoms: number;
+    characters: number;
+    bytes: number;
+    estimatedTokens: number;
+  }>>;
+  atoms: PrefixCacheAtom[];
+};
+
+type FinishLogRecord = {
+  version: number;
+  event: "request_finish";
+  at: string;
+  observationId: string;
+  namespaceHash: string;
+  durationMs: number;
+  prediction: PrefixCachePrediction;
+  actual: PrefixCacheCompletion;
+  predictionErrorTokens?: number;
+};
+
+function hash(value: string, length = 16): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, length);
+}
+
+function estimatedTokens(bytes: number): number {
+  return Math.max(1, Math.ceil(bytes / 4));
+}
+
+function emptyNode(): PrefixTreeNode {
+  return { children: new Map(), visits: 0, terminals: 0 };
+}
+
+function serializeMessage(message: PrefixCacheMessage): string {
+  return JSON.stringify({
+    role: message.role,
+    content: message.content,
+    ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+    ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
+    ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}),
+  });
+}
+
+function documentMetadata(message: PrefixCacheMessage): PrefixCacheAtom["document"] | undefined {
+  if (message.role !== "tool" || !message.content) return undefined;
+  try {
+    const parsed = JSON.parse(message.content) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const content = typeof parsed.content === "string"
+      ? parsed.content
+      : typeof parsed.markdown === "string" ? parsed.markdown : "";
+    const matchesBody = Array.isArray(parsed.matches)
+      ? parsed.matches.reduce((sum, item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return sum;
+          const context = (item as Record<string, unknown>).context;
+          return sum + (typeof context === "string" ? context.length : 0);
+        }, 0)
+      : 0;
+    const path = typeof parsed.path === "string" ? parsed.path : undefined;
+    const sourceHash = typeof parsed.sourceHash === "string" ? parsed.sourceHash : undefined;
+    const artifactId = typeof parsed.artifactId === "number" ? parsed.artifactId : undefined;
+    const startLine = typeof parsed.contextStartLine === "number" ? parsed.contextStartLine
+      : typeof parsed.startLine === "number" ? parsed.startLine : undefined;
+    const endLine = typeof parsed.contextEndLine === "number" ? parsed.contextEndLine
+      : typeof parsed.endLine === "number" ? parsed.endLine : undefined;
+    if (!path && !sourceHash && artifactId === undefined && !content && !matchesBody) return undefined;
+    return {
+      ...(path ? { path } : {}),
+      ...(sourceHash ? { sourceHash } : {}),
+      ...(artifactId !== undefined ? { artifactId } : {}),
+      ...(startLine !== undefined ? { startLine } : {}),
+      ...(endLine !== undefined ? { endLine } : {}),
+      bodyCharacters: content.length + matchesBody,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function messageKind(
+  message: PrefixCacheMessage,
+  index: number,
+  stableMessageCount: number,
+  initialMessageCount: number,
+): PrefixCacheAtomKind {
+  if (index < stableMessageCount) return "stable_system";
+  if (index < initialMessageCount && message.role === "system") return "dynamic_system";
+  if (message.role === "user") return "user";
+  if (message.role === "assistant") return "assistant";
+  if (message.role === "tool") return "tool_result";
+  return "other";
+}
+
+export function buildPrefixCacheAtoms(input: Pick<
+  PrefixCacheRequestInput,
+  "messages" | "tools" | "stableMessageCount" | "initialMessageCount"
+>): PrefixCacheAtom[] {
+  const atoms: PrefixCacheAtom[] = [];
+  if (input.tools?.length) {
+    const serialized = JSON.stringify(input.tools);
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    atoms.push({
+      kind: "tool_schema",
+      label: `tools(${input.tools.length})`,
+      hash: hash(serialized),
+      characters: serialized.length,
+      bytes,
+      estimatedTokens: estimatedTokens(bytes),
+    });
+  }
+  input.messages.forEach((message, index) => {
+    const serialized = serializeMessage(message);
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    const kind = messageKind(message, index, input.stableMessageCount, input.initialMessageCount);
+    const toolNames = message.tool_calls?.map(call => call.function.name).filter(Boolean);
+    atoms.push({
+      kind,
+      label: kind === "assistant" && toolNames?.length
+        ? `message[${index}]:assistant:${toolNames.join(",")}`
+        : kind === "tool_result"
+          ? `message[${index}]:tool:${message.tool_call_id ?? "-"}`
+          : `message[${index}]:${message.role}`,
+      hash: hash(serialized),
+      characters: serialized.length,
+      bytes,
+      estimatedTokens: estimatedTokens(bytes),
+      ...(documentMetadata(message) ? { document: documentMetadata(message) } : {}),
+    });
+  });
+  return atoms;
+}
+
+function readRecentLog(path: string, maxBytes: number): string {
+  let size: number;
+  try { size = statSync(path).size; }
+  catch { return ""; }
+  if (size <= maxBytes) return readFileSync(path, "utf8");
+  const start = size - maxBytes;
+  const buffer = Buffer.allocUnsafe(maxBytes);
+  const fd = openSync(path, "r");
+  try {
+    const bytesRead = readSync(fd, buffer, 0, maxBytes, start);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    const firstNewline = text.indexOf("\n");
+    return firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function appendJsonLine(path: string, value: StartLogRecord | FinishLogRecord): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(value)}\n`, "utf8");
+  } catch {
+    // Cache observation must never make an Agent request fail.
+  }
+}
+
+function componentSummary(atoms: PrefixCacheAtom[]): StartLogRecord["components"] {
+  const result: StartLogRecord["components"] = {};
+  for (const atom of atoms) {
+    const current = result[atom.kind] ?? { atoms: 0, characters: 0, bytes: 0, estimatedTokens: 0 };
+    current.atoms += 1;
+    current.characters += atom.characters;
+    current.bytes += atom.bytes;
+    current.estimatedTokens += atom.estimatedTokens;
+    result[atom.kind] = current;
+  }
+  return result;
+}
+
+export class RequestPrefixForest {
+  private readonly roots = new Map<string, PrefixTreeRoot>();
+
+  constructor(
+    readonly logPath: string,
+    replayBytes = DEFAULT_REPLAY_BYTES,
+  ) {
+    const text = readRecentLog(logPath, replayBytes);
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as Partial<StartLogRecord>;
+        if (record.version !== PREFIX_CACHE_LOG_VERSION || record.event !== "request_start"
+          || typeof record.namespaceHash !== "string" || !Array.isArray(record.atoms)) continue;
+        const atoms = record.atoms.filter((atom): atom is PrefixCacheAtom =>
+          Boolean(atom && typeof atom.hash === "string"));
+        this.insert(record.namespaceHash, atoms);
+      } catch {
+        // A partial final line or older log version is ignored.
+      }
+    }
+  }
+
+  begin(input: PrefixCacheRequestInput): PrefixCacheObservation {
+    const startedAt = new Date().toISOString();
+    const profile = input.requestProfile ?? {};
+    const namespace = {
+      endpoint: input.endpoint,
+      model: input.model,
+      providerName: input.providerName,
+      userIdHash: input.userId ? hash(input.userId, 12) : undefined,
+      requestProfileHash: hash(JSON.stringify(profile), 12),
+    };
+    const namespaceHash = hash(JSON.stringify(namespace));
+    const atoms = buildPrefixCacheAtoms(input);
+    const prediction = this.query(namespaceHash, atoms);
+    const observation: PrefixCacheObservation = {
+      observationId: randomUUID(),
+      logPath: this.logPath,
+      namespaceHash,
+      atoms,
+      prediction,
+      startedAt,
+    };
+    const documentAtoms = atoms.filter(atom => atom.document);
+    appendJsonLine(this.logPath, {
+      version: PREFIX_CACHE_LOG_VERSION,
+      event: "request_start",
+      at: startedAt,
+      observationId: observation.observationId,
+      namespaceHash,
+      namespace,
+      sessionId: input.sessionId,
+      ...(input.jobId ? { jobId: input.jobId } : {}),
+      callKind: input.callKind,
+      ...(input.step !== undefined ? { step: input.step } : {}),
+      prediction,
+      totals: {
+        atoms: atoms.length,
+        characters: atoms.reduce((sum, atom) => sum + atom.characters, 0),
+        bytes: atoms.reduce((sum, atom) => sum + atom.bytes, 0),
+        estimatedTokens: atoms.reduce((sum, atom) => sum + atom.estimatedTokens, 0),
+        documentReadAtoms: documentAtoms.length,
+        documentBodyCharacters: documentAtoms.reduce((sum, atom) => sum + (atom.document?.bodyCharacters ?? 0), 0),
+      },
+      components: componentSummary(atoms),
+      atoms,
+    });
+    // The request is about to reach the provider. Make it visible to concurrent
+    // observations even if the process exits before a finish record is written.
+    this.insert(namespaceHash, atoms);
+    return observation;
+  }
+
+  finish(observation: PrefixCacheObservation, actual: PrefixCacheCompletion): void {
+    const durationMs = Math.max(0, Date.now() - Date.parse(observation.startedAt));
+    appendJsonLine(this.logPath, {
+      version: PREFIX_CACHE_LOG_VERSION,
+      event: "request_finish",
+      at: new Date().toISOString(),
+      observationId: observation.observationId,
+      namespaceHash: observation.namespaceHash,
+      durationMs,
+      prediction: observation.prediction,
+      actual,
+      ...(actual.cacheHitTokens !== undefined
+        ? { predictionErrorTokens: actual.cacheHitTokens - observation.prediction.predictedHitTokens }
+        : {}),
+    });
+  }
+
+  query(namespaceHash: string, atoms: readonly PrefixCacheAtom[]): PrefixCachePrediction {
+    const root = this.roots.get(namespaceHash);
+    let node = root?.node;
+    let matchedAtoms = 0;
+    let predictedHitCharacters = 0;
+    let predictedHitBytes = 0;
+    let predictedHitTokens = 0;
+    for (const atom of atoms) {
+      const next = node?.children.get(atom.hash);
+      if (!next) break;
+      node = next;
+      matchedAtoms += 1;
+      predictedHitCharacters += atom.characters;
+      predictedHitBytes += atom.bytes;
+      predictedHitTokens += atom.estimatedTokens;
+    }
+    const divergent = atoms[matchedAtoms];
+    return {
+      priorRequests: root?.requests ?? 0,
+      matchedAtoms,
+      totalAtoms: atoms.length,
+      predictedHitCharacters,
+      predictedHitBytes,
+      predictedHitTokens,
+      fullRequestKnown: atoms.length > 0 && matchedAtoms === atoms.length && Boolean(node?.terminals),
+      ...(divergent
+        ? {
+            firstDivergence: {
+              atomIndex: matchedAtoms,
+              kind: divergent.kind,
+              label: divergent.label,
+              alternatives: node?.children.size ?? 0,
+            },
+          }
+        : {}),
+    };
+  }
+
+  private insert(namespaceHash: string, atoms: readonly PrefixCacheAtom[]): void {
+    let root = this.roots.get(namespaceHash);
+    if (!root) {
+      root = { node: emptyNode(), requests: 0 };
+      this.roots.set(namespaceHash, root);
+    }
+    root.requests += 1;
+    let node = root.node;
+    node.visits += 1;
+    for (const atom of atoms) {
+      let next = node.children.get(atom.hash);
+      if (!next) {
+        next = emptyNode();
+        node.children.set(atom.hash, next);
+      }
+      next.visits += 1;
+      node = next;
+    }
+    node.terminals += 1;
+  }
+}
+
+const forests = new Map<string, RequestPrefixForest>();
+
+export function prefixCacheLogPath(projectRoot: string): string {
+  return resolve(projectRoot, ".writer", "logs", "prefix-cache.jsonl");
+}
+
+export function beginPrefixCacheObservation(input: PrefixCacheRequestInput): PrefixCacheObservation {
+  const logPath = prefixCacheLogPath(input.projectRoot);
+  let forest = forests.get(logPath);
+  if (!forest) {
+    forest = new RequestPrefixForest(logPath);
+    forests.set(logPath, forest);
+  }
+  return forest.begin(input);
+}
+
+export function finishPrefixCacheObservation(
+  observation: PrefixCacheObservation | undefined,
+  actual: PrefixCacheCompletion,
+): void {
+  if (!observation) return;
+  forests.get(observation.logPath)?.finish(observation, actual);
+}

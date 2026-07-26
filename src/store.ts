@@ -477,13 +477,20 @@ export class WriterStore {
       .run(sessionId, value.activeDocument ?? null, value.currentIntent, "[]", now);
   }
 
-  /** Drop sticky task residue (todos / intent / active doc / tool memory) when dialogue is rewound or a new non-continuation turn starts. */
-  clearSessionTaskState(sessionId: string): void {
+  /**
+   * Drop sticky task residue when the dialogue is rewound or a new task starts.
+   * Immutable context artifacts are session-level read-through cache entries, not
+   * task workflow state. Preserve them across ordinary task switches; rewinds and
+   * reruns keep the default full clear so removed dialogue cannot leak its reads.
+   */
+  clearSessionTaskState(sessionId: string, options: { preserveContextArtifacts?: boolean } = {}): void {
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,agent_checkpoint_json,updated_at) VALUES(?,?,?,?,?,?)
       ON CONFLICT(session_id) DO UPDATE SET active_document=NULL, current_intent='', todos_json='[]', agent_checkpoint_json='{}', updated_at=excluded.updated_at`)
       .run(sessionId, null, "", "[]", "{}", now);
-    this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
+    if (!options.preserveContextArtifacts) {
+      this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
+    }
   }
 
   sessionTodos(sessionId: string): AgentTodoItem[] {

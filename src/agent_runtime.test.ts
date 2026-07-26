@@ -310,6 +310,34 @@ test("session task state does not sticky-inherit activeDocument across turns", (
   }
 });
 
+test("ordinary task switches preserve immutable context artifacts", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-artifacts-"));
+  try {
+    const project = WriterProject.init(root, "跨任务读取缓存");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("cache");
+    store.saveSessionContext(sessionId, { activeDocument: "lore/world.md", currentIntent: "write_scene/document/document: 写正文" });
+    store.saveSessionTodos(sessionId, [{ id: "t1", content: "写正文", status: "in_progress" }]);
+    store.saveContextArtifact(sessionId, {
+      cacheKey: "read:v2:lore/world.md:h1",
+      kind: "read_document",
+      path: "lore/world.md",
+      sourceHash: "h1",
+      content: "{}",
+      digest: "世界观摘要",
+    });
+
+    store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true });
+
+    assert.equal(store.sessionContext(sessionId).currentIntent, "");
+    assert.equal(store.sessionTodos(sessionId).length, 0);
+    assert.equal(store.recentContextArtifacts(sessionId, 8).length, 1);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rewind clears dialogue-bound task residue", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {

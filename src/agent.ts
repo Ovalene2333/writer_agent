@@ -1,4 +1,5 @@
 import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, RequestComponentUsage, StepUsage } from "./types.js";
+import { createHash } from "node:crypto";
 import { chapterSceneDraftComplete, type ChapterSceneDraft } from "./scene_pipeline.js";
 import { documentSpans } from "./document_spans.js";
 import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
@@ -11,6 +12,7 @@ import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
+import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
 import { isDeepSeekModel, nonThinkingRequestOptions, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import {
   agentCompletionGaps,
@@ -146,6 +148,16 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  */
 
 type ToolAccumulator = ToolCall;
+
+type PrefixCacheRequestContext = {
+  projectRoot: string;
+  sessionId: string;
+  jobId?: string;
+  callKind: string;
+  step?: number;
+  stableMessageCount: number;
+  initialMessageCount: number;
+};
 
 type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "character" | "simple_character" | "general";
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
@@ -519,6 +531,7 @@ async function repairToolArgumentsWithModel(
   call: ToolCall,
   definition: ToolDefinition,
   signal?: AbortSignal,
+  prefixCache?: PrefixCacheRequestContext,
 ): Promise<{
   arguments?: string;
   usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean };
@@ -533,6 +546,7 @@ async function repairToolArgumentsWithModel(
     topP: 1,
     ...(isDeepSeekModel(model) ? { responseFormat: { type: "json_object" as const } } : {}),
     ...thinkingRequestOptions(model),
+    ...(prefixCache ? { prefixCache } : {}),
   });
   const repaired = parseToolArgumentRepair(result.content);
   return {
@@ -666,6 +680,7 @@ async function compileWritingTaskContract(
   characterScope?: number[],
   selectionCharacters = 0,
   onUsage?: (usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean }, retry: boolean) => void,
+  prefixCache?: Omit<PrefixCacheRequestContext, "callKind" | "stableMessageCount" | "initialMessageCount">,
 ): Promise<{ task: WritingTask }> {
   const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
@@ -721,7 +736,17 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
     }),
   }];
   const plannerRequestOptions = plannerCompletionOptions(model);
-  let result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, plannerRequestOptions);
+  let result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, {
+    ...plannerRequestOptions,
+    ...(prefixCache ? {
+      prefixCache: {
+        ...prefixCache,
+        callKind: "planner",
+        stableMessageCount: 1,
+        initialMessageCount: planningMessages.length,
+      },
+    } : {}),
+  });
   if (result.usage) onUsage?.(result.usage, false);
   let parsed = parsePlannerJson(result.content);
   if (!parsed) {
@@ -737,7 +762,17 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
         content: "上一个输出不是可解析的单一 JSON 对象。只修复格式并重新输出完整 JSON；不得解释、不得使用 Markdown。",
       },
     ];
-    const retry = await streamCompletion(model, repairMessages, signal, () => undefined, () => undefined, plannerRequestOptions);
+    const retry = await streamCompletion(model, repairMessages, signal, () => undefined, () => undefined, {
+      ...plannerRequestOptions,
+      ...(prefixCache ? {
+        prefixCache: {
+          ...prefixCache,
+          callKind: "planner_retry",
+          stableMessageCount: 1,
+          initialMessageCount: planningMessages.length,
+        },
+      } : {}),
+    });
     if (retry.usage) onUsage?.(retry.usage, true);
     parsed = parsePlannerJson(retry.content);
     if (!parsed) {
@@ -1478,6 +1513,12 @@ export async function runAgent(options: {
       emit, store, sessionId, plannerModel, usage, 0,
       retry ? "planner_retry" : "planner", options.jobId,
     ),
+    {
+      projectRoot: project.root,
+      sessionId,
+      ...(options.jobId ? { jobId: options.jobId } : {}),
+      step: 0,
+    },
   );
   const task = planned.task;
   // Permission policy is orthogonal to semantic mode and always wins.
@@ -1518,7 +1559,9 @@ export async function runAgent(options: {
     ? task.targetPath ?? previousTaskState.activeDocument ?? store.proposals().find(proposal => proposal.sessionId === sessionId)?.path
     : undefined;
   if (!task.continuation && previousIdentity !== taskIdentity) {
-    store.clearSessionTaskState(sessionId);
+    // A mode/outcome switch invalidates workflow state, not immutable reads.
+    // Exact arguments + sourceHash still guard every artifact cache lookup.
+    store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true });
   }
   // A fresh request in the same mode may keep its todo list, but must never
   // inherit an unfinished server-side draft unless the planner marked it as a continuation.
@@ -1748,6 +1791,18 @@ export async function runAgent(options: {
         emit({ type: "text", text, channel: "output" });
       }, (text) => emit({ type: "text", text, channel: "reasoning" }), {
         tools: executionTools,
+        // DeepSeek isolates KV cache by user_id. A stable opaque session id keeps
+        // multi-turn prefixes together without sharing project context across sessions.
+        ...(isDeepSeekModel(stepModel) ? { userId: sessionId } : {}),
+        prefixCache: {
+          projectRoot: project.root,
+          sessionId,
+          ...(options.jobId ? { jobId: options.jobId } : {}),
+          callKind: "agent_step",
+          step,
+          stableMessageCount: 6,
+          initialMessageCount,
+        },
         ...stepThinkingOptions,
       });
       const ensureThinkingTranscriptCanContinue = () => {
@@ -1837,6 +1892,15 @@ export async function runAgent(options: {
               try {
                 const repaired = await repairToolArgumentsWithModel(
                   plannerModel, effectiveCall, definition, signal,
+                  {
+                    projectRoot: project.root,
+                    sessionId,
+                    ...(options.jobId ? { jobId: options.jobId } : {}),
+                    callKind: "tool_argument_repair",
+                    step,
+                    stableMessageCount: 1,
+                    initialMessageCount: 2,
+                  },
                 );
                 if (repaired.usage) {
                   emitUsageEvent(
@@ -2251,12 +2315,18 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
         artifactIds: savedCheckpoint.artifactIds?.slice(0, 8),
       }
     : undefined;
-  let artifacts = store.recentContextArtifacts(sessionId, 8);
-  // New dialogue turn (not continuation): never inject whole-session residue — only the current target path, if any.
+  let artifacts = store.recentContextArtifacts(sessionId, 12)
+    .filter((artifact) => {
+      if (!artifact.path) return true;
+      if (!project.textFileExists(artifact.path)) return false;
+      return project.hash(project.readTextFile(artifact.path)) === artifact.sourceHash;
+    });
+  // A fresh task may reuse verified read digests from the same session. Keep a
+  // declared target focused; targetless tasks (for example character synthesis)
+  // receive the small validated catalog so they do not blindly reread all lore.
   if (!task.continuation) {
     const focusPath = task.targetPath ?? state.activeDocument;
-    if (!focusPath && !checkpoint) return "";
-    artifacts = artifacts.filter(item => item.path === focusPath);
+    if (focusPath) artifacts = artifacts.filter(item => item.path === focusPath);
     if (!artifacts.length && !checkpoint) return "";
   }
   if (!artifacts.length && !state.activeDocument && !state.currentIntent && !checkpoint) return "";
@@ -2316,7 +2386,7 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
   if (!catalog.length && !restored.length && !checkpoint) return "";
   const scopeNote = task.continuation
     ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
-    : "仅当前目标文档相关索引（非会话级残留）；正文未注入时请按需 read 最小片段，或对相同 path+sourceHash 使用已有工具结果";
+    : "同会话已验证且未变化的读取索引；有目标路径时仅列目标。先按 digest 判断是否足够，正文不足再按需读取；相同 path+参数+sourceHash 会直接复用已有工具结果";
   return `本轮任务工作记忆（${scopeNote}）：\n${JSON.stringify({
     state: { activeDocument: state.activeDocument, currentIntent: state.currentIntent.slice(0, 160) },
     ...(checkpoint ? { checkpoint } : {}),
@@ -2940,6 +3010,10 @@ function approximateRequestTokens(text: string): number {
   return Math.ceil(Buffer.byteLength(text, "utf8") / 4);
 }
 
+function requestComponentFingerprint(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 12);
+}
+
 /** Preflight-only context waterfall; provider usage remains the billing source of truth. */
 export function buildRequestComponentUsage(
   messages: ApiMessage[],
@@ -2948,11 +3022,17 @@ export function buildRequestComponentUsage(
   initialMessageCount: number,
 ): RequestComponentUsage[] {
   const components: RequestComponentUsage[] = [];
-  const append = (kind: RequestComponentUsage["kind"], label: string, text: string) => {
+  const append = (kind: RequestComponentUsage["kind"], label: string, text: string, fingerprint = false) => {
     if (!text) return;
-    components.push({ kind, label, characters: text.length, estimatedTokens: approximateRequestTokens(text) });
+    components.push({
+      kind,
+      label,
+      characters: text.length,
+      estimatedTokens: approximateRequestTokens(text),
+      ...(fingerprint ? { fingerprint: requestComponentFingerprint(text) } : {}),
+    });
   };
-  if (tools.length) append("tool_schema", `工具 schema（${tools.length}）`, JSON.stringify(tools));
+  if (tools.length) append("tool_schema", `工具 schema（${tools.length}）`, JSON.stringify(tools), true);
   messages.forEach((message, index) => {
     const serialized = JSON.stringify({
       role: message.role,
@@ -2961,7 +3041,7 @@ export function buildRequestComponentUsage(
       ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
       ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
     });
-    if (index < stableMessageCount) append("stable_system", `稳定 system ${index + 1}`, serialized);
+    if (index < stableMessageCount) append("stable_system", `稳定 system ${index + 1}`, serialized, true);
     else if (index < initialMessageCount && message.role === "user") append("user", "当前用户请求", serialized);
     else if (index < initialMessageCount) append("dynamic_system", `动态尾部 ${index - stableMessageCount + 1}`, serialized);
     else if (message.role === "tool") append("tool_result", `工具结果 ${message.tool_call_id ?? index}`, serialized);
@@ -2977,20 +3057,25 @@ export function buildRequestComponentUsage(
  * universal catalog for the whole job. Never derive tools from project paths/ids
  * or replace the catalog between steps.
  */
+type CompletionRequestOptions = {
+  tools?: readonly ToolDefinition[];
+  userId?: string;
+  maxCompletionTokens?: number;
+  thinking?: { type: "enabled" | "disabled" };
+  temperature?: number;
+  topP?: number;
+  responseFormat?: { type: "json_object" };
+  /** Observation-only metadata. Never serialized into the provider request. */
+  prefixCache?: PrefixCacheRequestContext;
+};
+
 async function streamCompletion(
   model: ModelConfig,
   messages: ApiMessage[],
   signal: AbortSignal | undefined,
   onText: (text: string) => void,
   onReasoning: (text: string) => void,
-  options: {
-    tools?: readonly ToolDefinition[];
-    maxCompletionTokens?: number;
-    thinking?: { type: "enabled" | "disabled" };
-    temperature?: number;
-    topP?: number;
-    responseFormat?: { type: "json_object" };
-  } = {},
+  options: CompletionRequestOptions = {},
 ): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean } }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({
@@ -2998,6 +3083,7 @@ async function streamCompletion(
     model: model.model,
     messages,
     ...(options.tools?.length ? { tools: options.tools } : {}),
+    ...(options.userId ? { user_id: options.userId } : {}),
     stream: true,
     stream_options: { include_usage: true },
     ...(options.maxCompletionTokens ? { max_tokens: options.maxCompletionTokens } : {}),
@@ -3005,23 +3091,59 @@ async function streamCompletion(
     ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
     ...samplingRequestOptions(model, { temperature: options.temperature, topP: options.topP }),
   });
+  const prefixObservation = options.prefixCache
+    ? beginPrefixCacheObservation({
+        projectRoot: options.prefixCache.projectRoot,
+        endpoint,
+        model: model.model,
+        ...(model.providerName ? { providerName: model.providerName } : {}),
+        ...(options.userId ? { userId: options.userId } : {}),
+        sessionId: options.prefixCache.sessionId,
+        ...(options.prefixCache.jobId ? { jobId: options.prefixCache.jobId } : {}),
+        callKind: options.prefixCache.callKind,
+        ...(options.prefixCache.step !== undefined ? { step: options.prefixCache.step } : {}),
+        messages,
+        tools: options.tools,
+        stableMessageCount: options.prefixCache.stableMessageCount,
+        initialMessageCount: options.prefixCache.initialMessageCount,
+        requestProfile: {
+          thinking: options.thinking?.type,
+          responseFormat: options.responseFormat?.type,
+          sampling: samplingRequestOptions(model, { temperature: options.temperature, topP: options.topP }),
+        },
+      })
+    : undefined;
   logModelRequest(endpoint, requestBody);
-  const response = await modelFetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-    },
-    body: requestBody,
-    signal,
-  }, model.proxyUrl);
+  let response: Response;
+  try {
+    response = await modelFetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
+      },
+      body: requestBody,
+      signal,
+    }, model.proxyUrl);
+  } catch (error) {
+    finishPrefixCacheObservation(prefixObservation, {
+      error: error instanceof Error ? error.message.slice(0, 600) : String(error).slice(0, 600),
+    });
+    throw error;
+  }
   if (!response.ok) {
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     const detail = responseBody.slice(0, 600);
+    // The provider diagnostic may echo prompt text. Keep the dedicated prefix
+    // log content-free; the ordinary model debug channel already has the detail.
+    finishPrefixCacheObservation(prefixObservation, { error: `HTTP ${response.status}` });
     throw new Error(`模型请求失败（${response.status}）：${detail}`);
   }
-  if (!response.body) throw new Error("模型响应没有可读取的数据流");
+  if (!response.body) {
+    finishPrefixCacheObservation(prefixObservation, { error: "模型响应没有可读取的数据流" });
+    throw new Error("模型响应没有可读取的数据流");
+  }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const calls = new Map<number, ToolAccumulator>();
@@ -3110,6 +3232,14 @@ async function streamCompletion(
     usage: resolvedUsage,
   };
   logModelResponse(endpoint, JSON.stringify(completed, null, 2));
+  finishPrefixCacheObservation(prefixObservation, {
+    promptTokens: resolvedUsage.promptTokens,
+    completionTokens: resolvedUsage.completionTokens,
+    cacheHitTokens: resolvedUsage.cacheHitTokens,
+    cacheMissTokens: resolvedUsage.cacheMissTokens,
+    ...("estimated" in resolvedUsage && resolvedUsage.estimated ? { estimated: true } : {}),
+    ...(finishReason ? { finishReason } : {}),
+  });
   return completed;
 }
 

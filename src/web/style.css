@@ -935,6 +935,11 @@ header {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: var(--font-mono); font-size: 12px;
 }
+.document-reading-stats {
+  display: inline-flex; align-items: center; margin-left: 9px; padding-left: 9px;
+  border-left: 1px solid var(--border); color: var(--text-faint);
+  font-family: var(--font-sans); font-size: 11px; font-variant-numeric: tabular-nums;
+}
 .editor-bar .editor-bar-actions {
   display: flex; align-items: center; gap: 6px; flex-shrink: 0;
 }
@@ -985,6 +990,22 @@ header {
   padding: 32px clamp(24px, 8%, 80px);
   background: linear-gradient(180deg, var(--surface) 0%, color-mix(in srgb, var(--surface) 92%, var(--bg)) 100%);
 }
+.reader-selection-toolbar {
+  position: fixed; z-index: 80;
+  display: flex; align-items: center; gap: 5px;
+  min-height: 38px; padding: 5px 6px 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 10px; background: color-mix(in srgb, var(--surface) 94%, var(--accent-light));
+  color: var(--text); box-shadow: var(--shadow-lg); backdrop-filter: blur(12px);
+}
+.reader-selection-toolbar > span {
+  margin-right: 3px; color: var(--text-faint); font-size: 10px; white-space: nowrap;
+}
+.reader-selection-toolbar button {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 5px 8px; border-radius: 7px; font-size: 11px; white-space: nowrap;
+}
+.reader-selection-toolbar button.primary { color: var(--accent-text); }
 
 /* ── Document version history (browse-only) ── */
 .version-panel {
@@ -2348,6 +2369,33 @@ button.agent-orb:focus-visible {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent), 0 8px 28px -16px var(--agent-glow);
 }
+.composer-context-selections {
+  padding: 9px 10px 4px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border-light));
+  background: color-mix(in srgb, var(--accent-light) 36%, var(--surface));
+}
+.composer-context-heading {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-bottom: 6px; color: var(--text-faint); font-size: 10px; font-weight: 700;
+}
+.composer-context-heading button {
+  padding: 1px 5px; border: 0; background: transparent; color: var(--text-faint); font-size: 10px;
+}
+.composer-context-heading button:hover:not(:disabled) { color: var(--warn); }
+.composer-context-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.composer-context-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  padding: 4px 5px 4px 7px; border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
+  border-radius: 999px; background: var(--surface); color: var(--text-dim); font-size: 10px;
+}
+.composer-context-chip > span {
+  overflow: hidden; max-width: 180px; text-overflow: ellipsis; white-space: nowrap;
+}
+.composer-context-chip > button {
+  display: grid; place-items: center; width: 18px; height: 18px; padding: 0;
+  border: 0; border-radius: 999px; background: transparent; color: var(--text-faint);
+}
+.composer-context-chip > button:hover:not(:disabled) { background: var(--warn-light); color: var(--warn); }
 .director-mode-guide {
   margin: 10px 10px 0;
   padding: 10px 12px;
