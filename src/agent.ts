@@ -10,7 +10,7 @@ import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundi
 import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
-import { isDeepSeekModel, nonThinkingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
+import { isDeepSeekModel, nonThinkingRequestOptions, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import {
   agentCompletionGaps,
   completionRecoveryPrompt,
@@ -2883,12 +2883,7 @@ async function streamCompletion(
     ...(options.maxCompletionTokens ? { max_tokens: options.maxCompletionTokens } : {}),
     ...(options.thinking ? { thinking: options.thinking } : {}),
     ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
-    ...(options.temperature !== undefined
-      ? { temperature: options.temperature }
-      : model.temperature !== undefined ? { temperature: model.temperature } : {}),
-    ...(options.topP !== undefined
-      ? { top_p: options.topP }
-      : model.topP !== undefined ? { top_p: model.topP } : {}),
+    ...samplingRequestOptions(model, { temperature: options.temperature, topP: options.topP }),
   });
   logModelRequest(endpoint, requestBody);
   const response = await modelFetch(endpoint, {

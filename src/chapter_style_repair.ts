@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { thinkingRequestOptions } from "./model_compat.js";
+import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -89,7 +89,7 @@ export async function requestChapterStyleRepair(
     model: model.model,
     messages,
     stream: false,
-    temperature: 0.2,
+    ...samplingRequestOptions(model, { temperature: 0.2 }),
     response_format: { type: "json_object" },
     ...thinkingRequestOptions(model),
   });

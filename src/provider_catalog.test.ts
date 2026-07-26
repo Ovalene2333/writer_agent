@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { modelSupportsToolChoice, nonThinkingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
+import { modelSupportsToolChoice, nonThinkingRequestOptions, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { defaultPricing } from "./pricing.js";
 import { parseProviderModelIds, PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
@@ -99,6 +99,37 @@ test("applySamplingDefaults writes temp/topP to all role-assigned models without
       assert.equal(providers.modelConfig("reviewer").temperature, 0.78);
       assert.equal(providers.modelConfig("reviewer").topP, 0.9);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("disableSampling survives save/reload and reaches every role's ModelConfig", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-nosampling-"));
+  try {
+    const project = WriterProject.init(root, "禁用采样");
+    const providers = new ProviderManager(project);
+    const seeded = providers.catalog().providers[0];
+    providers.saveProfile({
+      id: seeded.id,
+      name: seeded.name,
+      provider: seeded.provider,
+      baseUrl: seeded.baseUrl,
+      apiKey: "test-key",
+      models: [{ id: seeded.models[0].id, name: seeded.models[0].name, temperature: 0.8, disableSampling: true }],
+    });
+    const saved = providers.catalog().providers[0].models[0];
+    providers.assign("writer", seeded.id, saved.id);
+    assert.equal(saved.disableSampling, true);
+    assert.equal(providers.modelConfig("writer").disableSampling, true);
+    assert.equal(samplingRequestOptions(providers.modelConfig("writer"), { temperature: 0 }).temperature, undefined);
+
+    // A style template must not silently write sampling params back onto an opted-out model.
+    providers.applySamplingDefaults(0.7, 0.95);
+    assert.equal(providers.catalog().providers[0].models[0].temperature, 0.8, "temperature must be left alone");
+
+    // Reload from disk: the flag is persisted, not just in memory.
+    assert.equal(new ProviderManager(project).modelConfig("writer").disableSampling, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

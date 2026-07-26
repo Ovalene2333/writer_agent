@@ -15,7 +15,7 @@ import type {
 import { characterName, characterPromptCard, characterPromptViews } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelSupportsToolChoice, nonThinkingRequestOptions } from "./model_compat.js";
+import { modelSupportsToolChoice, nonThinkingRequestOptions, samplingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { documentKind, WriterProject } from "./project.js";
@@ -1471,8 +1471,7 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
       model: options.model.model, messages, tools,
       ...(modelSupportsToolChoice(options.model) ? { tool_choice: "auto" } : {}),
       stream: false,
-      temperature: options.model.temperature ?? 0.4,
-      ...(options.model.topP === undefined ? {} : { top_p: options.model.topP }),
+      ...samplingRequestOptions(options.model, { temperature: options.model.temperature ?? 0.4 }),
     });
     logModelRequest(endpoint, requestBody);
     const response = await modelFetch(endpoint, {
@@ -1716,11 +1715,13 @@ async function streamRoleplayText(
     messages,
     stream: true,
     stream_options: { include_usage: true },
-    temperature: sampling.temperature,
-    top_p: sampling.topP,
     // Mild de-echo for long chats; structure still relies on anti-formula slots.
-    frequency_penalty: 0.3,
-    presence_penalty: 0.15,
+    ...samplingRequestOptions(model, {
+      temperature: sampling.temperature,
+      topP: sampling.topP,
+      frequencyPenalty: 0.3,
+      presencePenalty: 0.15,
+    }),
   });
   logModelRequest(endpoint, requestBody);
   const response = await modelFetch(endpoint, {
@@ -1999,7 +2000,7 @@ async function completeJsonText(
     model: model.model,
     messages,
     stream: false,
-    temperature: 0.2,
+    ...samplingRequestOptions(model, { temperature: 0.2 }),
     max_tokens: 1_800,
     ...(options?.strictJson ? { response_format: { type: "json_object" } } : {}),
     ...nonThinkingRequestOptions(model),

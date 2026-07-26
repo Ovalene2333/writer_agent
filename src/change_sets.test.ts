@@ -131,7 +131,7 @@ test("combined validation uses the proposed outline and restores outline metadat
       ...emptyCharacter("Lin"),
       storyStates: [{
         id: "state-scene", outlineNodeId: sceneId, location: "Station", physical: "", emotion: "",
-        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [],
+        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "",
       }],
     });
     const changeSet = activeStore.createChangeSet(sessionId, "remove referenced outline", [

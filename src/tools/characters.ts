@@ -7,7 +7,6 @@ import {
   type CharacterInput,
   type CharacterSection,
 } from "../characters.js";
-import type { CharacterSourceRef } from "../types.js";
 import { OutlineStore } from "../outline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
@@ -124,16 +123,6 @@ export function handleSaveCharacter({ input, store, sessionId, characterScope, c
   });
 }
 
-function parseSourceRef(value: unknown): CharacterSourceRef | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const r = value as Record<string, unknown>;
-  const type = r.type;
-  const ref = typeof r.ref === "string" ? r.ref.trim() : "";
-  if (!(type === "outline" || type === "document" || type === "manual") || !ref) return undefined;
-  const note = typeof r.note === "string" ? r.note.trim() : "";
-  return { type, ref, ...(note ? { note } : {}) };
-}
-
 export function handleApplyCharacterChanges({ input, store, sessionId, characterScope, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "apply_character_changes");
   if (context.characterEvolutionEnabled === false) {
@@ -161,10 +150,8 @@ export function handleApplyCharacterChanges({ input, store, sessionId, character
     }
   }
 
-  const sourceRef = parseSourceRef(input.sourceRef);
   const payload: ApplyCharacterChangesInput = {
     reason,
-    ...(sourceRef ? { sourceRef } : {}),
     changes: changes
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
       .map(item => ({ op: String((item as { op?: unknown }).op ?? ""), ...item })),

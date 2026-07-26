@@ -237,7 +237,7 @@ type DocumentVersionDetail = DocumentVersionMeta & {
   afterContent: string;
 };
 type MarkdownHeading = { id: string; level: number; text: string };
-type Temporal = { sourceRefs: Array<{ type: "outline" | "document" | "manual"; ref: string; note?: string }>; validFrom?: string; validUntil?: string };
+type Temporal = { validFrom?: string; validUntil?: string };
 type TextEntry = Temporal & { id: string; label: string; description: string };
 type Goal = Temporal & { id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown"; priority: number; summary: string; stakes: string; obstacles: string[] };
 type Relationship = Temporal & { id: string; characterId: number; type: string; description: string; attitude: string; status: "active" | "ended" | "strained" | "unknown" };

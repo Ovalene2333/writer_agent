@@ -1656,8 +1656,7 @@ export class WriterStore {
         ...(targetPath ? { targetBaseHash: "__missing__" } : {}),
       };
     });
-    const sourceRef = files[0]?.targetPath ?? files[0]?.path ?? "characters/characters.jsonl";
-    this.evolveCharactersForProposal(sourceRef, summary, characterChanges);
+    this.evolveCharactersForProposal(characterChanges);
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -1725,8 +1724,7 @@ export class WriterStore {
       this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
       throw error;
     }
-    const sourceRef = changeSet.files[0]?.targetPath ?? changeSet.files[0]?.path ?? "characters/characters.jsonl";
-    const evolved = this.evolveCharactersForProposal(sourceRef, changeSet.summary, changeSet.characterChanges);
+    const evolved = this.evolveCharactersForProposal(changeSet.characterChanges);
     const snapshots = this.captureManagedFiles(changeSet.files);
     const originalCharacters = this.characters();
     const originalConfig = this.project.readRaw("writer.yaml");
@@ -1919,7 +1917,7 @@ export class WriterStore {
   createProposal(sessionId: string, path: string, content: string, summary: string, characterChanges: ProposalCharacterChange[] = []): Proposal {
     const exists = this.project.documentExists(path);
     const before = exists ? this.project.read(path) : "";
-    this.evolveCharactersForProposal(path, summary, characterChanges);
+    this.evolveCharactersForProposal(characterChanges);
     const now = new Date().toISOString();
     const result = this.database.prepare(`
       INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,status,created_at)
@@ -1929,8 +1927,6 @@ export class WriterStore {
   }
 
   private evolveCharactersForProposal(
-    path: string,
-    summary: string,
     changes: ProposalCharacterChange[],
   ): { characters: Character[]; revisions: ProposalCharacterRevision[] } {
     let characters = this.characters();
@@ -1940,7 +1936,6 @@ export class WriterStore {
       if (!before) throw new Error(`延迟角色演进失败：角色 ${change.characterId} 不存在`);
       const result = applyCharacterChangesCore(before, {
         reason: change.reason,
-        sourceRef: { type: "document", ref: path, note: summary },
         changes: change.changes,
       });
       if (result.skipped.length) {
@@ -1997,7 +1992,7 @@ export class WriterStore {
       this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
       throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
     }
-    const evolved = this.evolveCharactersForProposal(proposal.path, proposal.summary, proposal.characterChanges);
+    const evolved = this.evolveCharactersForProposal(proposal.characterChanges);
     this.project.writeRaw(proposal.path, proposal.afterContent);
     if (evolved.revisions.length) this.writeCharacters(evolved.characters);
     const now = new Date().toISOString();

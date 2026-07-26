@@ -56,7 +56,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "eb1981f0bfecf5b3");
+  assert.equal(agentToolSchemaHash(), "92bf474c3fbf6679");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {

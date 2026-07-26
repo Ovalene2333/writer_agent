@@ -42,17 +42,17 @@ export class ProviderManager {
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
     const { profile, model } = this.assigned(role); const baseUrl = process.env.WRITER_BASE_URL || profile.baseUrl;
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
+    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP, disableSampling: model.disableSampling };
   }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {
     const { profile, model } = this.active(); const config = this.modelConfig();
     const environmentConfigured = Boolean(process.env.WRITER_API_KEY || process.env.WRITER_BASE_URL || process.env.WRITER_MODEL);
-    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, proxyUrl: config.proxyUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP };
+    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, proxyUrl: config.proxyUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP, disableSampling: config.disableSampling };
   }
   catalog(): ProviderCatalogPublic { return { activeProviderId: this.saved.activeProviderId, activeModelId: this.saved.activeModelId, assignments: this.saved.assignments, providers: this.saved.providers.map(profile => this.publicProfile(profile)) }; }
 
-  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }> }): ProviderCatalogPublic {
+  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; disableSampling?: boolean }> }): ProviderCatalogPublic {
     if (!input.models?.length) throw new Error("每个供应商至少需要一个模型");
     const existing = input.id ? this.saved.providers.find(item => item.id === input.id) : undefined;
     const profile: SavedProfile = { id: existing?.id ?? randomUUID(), name: input.name.trim() || providerLabel(input.provider), provider: validateProvider(input.provider), baseUrl: normalizeBaseUrl(input.baseUrl), proxyUrl: normalizeProxyUrl(input.proxyUrl), apiKey: input.apiKey?.trim() || existing?.apiKey || "", models: [] };
@@ -130,6 +130,8 @@ export class ProviderManager {
     for (const profile of this.saved.providers) {
       for (const model of profile.models) {
         if (!targets.has(`${profile.id}:${model.id}`)) continue;
+        // A model that rejects sampling params must not have a style template write them back in.
+        if (model.disableSampling) continue;
         if (model.temperature === nextTemp && model.topP === nextTopP) continue;
         model.temperature = nextTemp;
         model.topP = nextTopP;
@@ -400,7 +402,7 @@ function defaultCatalog(): SavedCatalog {
   };
 }
 function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "flash", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
-function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }, provider: ProviderId, existing?: SavedModel): SavedModel {
+function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; disableSampling?: boolean }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();
   if (!name) throw new Error("模型名称不能为空");
   const pricing = normalizePricing(provider, name, input.pricing, existing?.pricing);
@@ -410,6 +412,7 @@ function normalizeModel(input: { id?: string; name: string; pricing?: Partial<To
     pricing,
     temperature: optional(input.temperature, 0, 2),
     topP: optional(input.topP, 0, 1),
+    ...(input.disableSampling ? { disableSampling: true } : {}),
   };
 }
 function validateProvider(value: ProviderId) { if (value !== "deepseek" && value !== "openai-compatible") throw new Error("不支持的模型供应商"); return value; }

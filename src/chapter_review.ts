@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { thinkingRequestOptions } from "./model_compat.js";
+import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -147,7 +147,7 @@ export async function reviewChapterDraft(
     model: model.model,
     messages: buildChapterReviewMessages(input),
     stream: false,
-    temperature: 0,
+    ...samplingRequestOptions(model, { temperature: 0 }),
     response_format: { type: "json_object" },
     ...thinkingRequestOptions(model),
   });

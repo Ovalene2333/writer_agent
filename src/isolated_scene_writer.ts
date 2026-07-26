@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { nonThinkingRequestOptions } from "./model_compat.js";
+import { nonThinkingRequestOptions, samplingRequestOptions, type SamplingRequestBody } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
@@ -254,12 +254,9 @@ export async function requestIsolatedScene(
 }
 
 export function isolatedSceneWriterSamplingOptions(
-  model: Pick<ModelConfig, "temperature" | "topP">,
-): { temperature?: number; top_p?: number } {
-  return {
-    ...(model.temperature === undefined ? {} : { temperature: model.temperature }),
-    ...(model.topP === undefined ? {} : { top_p: model.topP }),
-  };
+  model: Pick<ModelConfig, "temperature" | "topP" | "disableSampling">,
+): SamplingRequestBody {
+  return samplingRequestOptions(model);
 }
 
 export function isolatedSceneWriterMaxTokens(input: IsolatedSceneWriterInput): number {
@@ -282,7 +279,7 @@ export async function requestSceneStateExtraction(
     model: model.model,
     messages,
     stream: false,
-    temperature: 0,
+    ...samplingRequestOptions(model, { temperature: 0 }),
     max_tokens: input.retryJsonOnly ? 2_400 : 1_800,
     response_format: { type: "json_object" },
     ...nonThinkingRequestOptions(model),

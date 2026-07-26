@@ -22,8 +22,7 @@
   "$defs": {
     "strings": { "type": "array", "items": { "type": "string" } },
     "entryId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
-    "sourceRefs": { "type": "array", "items": { "type": "object", "required": ["type", "ref"], "properties": { "type": { "enum": ["outline", "document", "manual"] }, "ref": { "type": "string", "minLength": 1 }, "note": { "type": "string" } }, "additionalProperties": false } },
-    "temporal": { "type": "object", "required": ["sourceRefs"], "properties": { "sourceRefs": { "$ref": "#/$defs/sourceRefs" }, "validFrom": { "type": "string" }, "validUntil": { "type": "string" } } },
+    "temporal": { "type": "object", "properties": { "validFrom": { "type": "string" }, "validUntil": { "type": "string" } } },
     "textEntry": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "label", "description"], "properties": { "id": { "$ref": "#/$defs/entryId" }, "label": { "type": "string" }, "description": { "type": "string" } } }] },
     "textEntries": { "type": "array", "items": { "$ref": "#/$defs/textEntry" } },
     "goal": { "allOf": [{ "$ref": "#/$defs/temporal" }, { "type": "object", "required": ["id", "category", "status", "priority", "summary", "stakes", "obstacles"], "properties": { "id": { "$ref": "#/$defs/entryId" }, "category": { "enum": ["longTerm", "current"] }, "status": { "enum": ["active", "achieved", "abandoned", "blocked", "unknown"] }, "priority": { "type": "number", "minimum": 0, "maximum": 100 }, "summary": { "type": "string", "minLength": 1 }, "stakes": { "type": "string" }, "obstacles": { "$ref": "#/$defs/strings" } } }] },

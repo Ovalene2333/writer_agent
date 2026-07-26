@@ -226,6 +226,12 @@ style: ""   # 可设为风格模板 id，如 light-novel
 | `WRITER_DEBUG_STEPS` | 设为 `1` / `true` 时**仅**打印 Agent step（reasoning / tools / output），不含模型 HTTP 原文 |
 | `WRITER_TUNNEL_PROTOCOL` | cloudflared 传输协议，默认 `http2` |
 
+#### 禁用采样参数
+
+部分较新的模型（GPT-5、o 系列及其兼容实现）不再忽略 `temperature`，而是直接拒绝整个请求，并且同时拒绝 `top_p` 与惩罚项。在**模型配置 → 编辑供应商 → 对应模型**中勾选「采样参数：禁用」后，Writer 对该模型的所有调用（正文、状态提取、终审、候选重写与评选、角色扮演、局部改写等）都不再发送这组参数，改由供应商使用自身默认值；风格模板的建议 temperature / topP 也不会再写回该模型。
+
+漏发采样参数不会导致请求失败，多发一个被弃用的参数会——所以该开关一次性抑制整组，不需要逐项判断供应商弃用了哪些。
+
 供应商与计费配置集中在 **单独文件** `.writer/providers.json`（含 API Key、模型单价、峰谷计费、角色分工）。复制该文件即可迁移到另一项目；旧版 `.writer/provider.json` 会在首次启动时自动迁移。
 
 #### Step 调试输出格式（`--debug-steps`）

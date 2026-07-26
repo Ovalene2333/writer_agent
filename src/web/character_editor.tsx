@@ -1,7 +1,6 @@
 import React, { useMemo, useRef, useState } from "react";
 
 type Temporal = {
-  sourceRefs: Array<{ type: "outline" | "document" | "manual"; ref: string; note?: string }>;
   validFrom?: string;
   validUntil?: string;
 };
@@ -583,7 +582,7 @@ export function CharacterEditor(props: {
                           onClick={() => patchPsychology({
                             [group.key]: [
                               ...draft.psychology[group.key],
-                              { id: entryId(group.key), label: "", description: "", sourceRefs: [] },
+                              { id: entryId(group.key), label: "", description: "" },
                             ],
                           })}
                         >
@@ -653,7 +652,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       motivations: [...draft.motivations, {
                         id: entryId("goal"), category: "current", status: "active", priority: 50,
-                        summary: "", stakes: "", obstacles: [], sourceRefs: [],
+                        summary: "", stakes: "", obstacles: [],
                       }],
                     })}>+ 添加目标</button>
                   )}
@@ -730,7 +729,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       competencies: [...draft.competencies, {
                         id: entryId("skill"), name: "", summary: "", level: "", unlocked: false, description: "",
-                        resources: [], limitations: [], costs: [], sourceRefs: [],
+                        resources: [], limitations: [], costs: [],
                       }],
                     })}>+ 添加能力</button>
                   )}
@@ -825,7 +824,7 @@ export function CharacterEditor(props: {
                   action={(
                     <button type="button" onClick={() => onChange({
                       ...draft,
-                      experiences: [...draft.experiences, { id: entryId("exp"), label: "", description: "", sourceRefs: [] }],
+                      experiences: [...draft.experiences, { id: entryId("exp"), label: "", description: "" }],
                     })}>+ 添加经历</button>
                   )}
                 />
@@ -910,7 +909,6 @@ export function CharacterEditor(props: {
                                 description: "",
                                 attitude: "",
                                 status: "active",
-                                sourceRefs: [],
                               }],
                           })}
                         >
@@ -970,7 +968,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       storyStates: [...draft.storyStates, {
                         id: entryId("state"), unanchored: true, location: "", physical: "", emotion: "",
-                        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [],
+                        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "",
                       }],
                     })}>+ 添加状态</button>
                   )}
@@ -1047,7 +1045,6 @@ export function CharacterEditor(props: {
                                     id: `${story.id}-knowledge-${i + 1}`,
                                     label: "",
                                     description,
-                                    sourceRefs: [],
                                   })),
                                 }
                                 : x),

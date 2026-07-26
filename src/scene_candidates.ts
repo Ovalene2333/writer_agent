@@ -1,5 +1,6 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
+import { samplingRequestOptions } from "./model_compat.js";
 import { sceneProseScore, type SceneScoreBreakdown } from "./prose_metrics.js";
 import type { ModelConfig } from "./types.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
@@ -127,7 +128,7 @@ export async function judgeSceneCandidates(request: SceneJudgeRequest): Promise<
     model: model.model,
     messages: buildSceneJudgeMessages(request),
     stream: false,
-    temperature: 0,
+    ...samplingRequestOptions(model, { temperature: 0 }),
     response_format: { type: "json_object" },
   });
   logModelRequest(endpoint, body);
@@ -194,10 +195,11 @@ export async function rewriteSceneCandidate(request: SceneRewriteRequest): Promi
     messages: buildSceneRewriteMessages(request),
     stream: false,
     // Prose-only call: warmer sampling + mild de-echo are safe here (no tool JSON).
-    temperature: Math.min(1.2, (model.temperature ?? 0.9) + 0.1),
-    ...(model.topP === undefined ? {} : { top_p: model.topP }),
-    frequency_penalty: 0.2,
-    presence_penalty: 0.2,
+    ...samplingRequestOptions(model, {
+      temperature: Math.min(1.2, (model.temperature ?? 0.9) + 0.1),
+      frequencyPenalty: 0.2,
+      presencePenalty: 0.2,
+    }),
   });
   logModelRequest(endpoint, body);
   const timeout = AbortSignal.timeout(request.timeoutMs ?? REWRITE_TIMEOUT_MS);

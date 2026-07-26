@@ -15,6 +15,16 @@ export interface ModelConfig {
   pricing?: TokenPricing;
   temperature?: number;
   topP?: number;
+  /**
+   * Suppress every sampling / penalty parameter for this model.
+   *
+   * Newer model families (GPT-5, o-series and their compatible clones) reject
+   * `temperature` outright rather than ignoring it, and reject `top_p` and the
+   * penalty fields alongside it. Omitting a parameter is never an error — sending
+   * a rejected one fails the whole request — so this switch drops the entire group
+   * and lets the provider apply its own defaults.
+   */
+  disableSampling?: boolean;
 }
 
 /** 峰谷/分时计费：高峰时段使用 peak 单价，平时使用基础单价。 */
@@ -91,6 +101,7 @@ export interface ProviderPublicConfig {
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
+  disableSampling?: boolean;
 }
 
 export interface ProviderModelPublic {
@@ -99,6 +110,8 @@ export interface ProviderModelPublic {
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
+  /** See ModelConfig.disableSampling — set per model, since this is a model capability. */
+  disableSampling?: boolean;
 }
 
 export interface ProviderProfilePublic {
@@ -153,8 +166,7 @@ export interface Message {
   variantCount?: number;
 }
 
-export interface CharacterSourceRef { type: "outline" | "document" | "manual"; ref: string; note?: string }
-export interface CharacterTemporal { sourceRefs: CharacterSourceRef[]; validFrom?: string; validUntil?: string }
+export interface CharacterTemporal { validFrom?: string; validUntil?: string }
 export interface CharacterTextEntry extends CharacterTemporal { id: string; label: string; description: string }
 export interface CharacterGoal extends CharacterTemporal {
   id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown";

@@ -11,7 +11,7 @@ import {
 } from "./prose_quality.js";
 import { adjudicateProseStyleForAudit } from "./prose_adjudicate.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
-import { modelSupportsToolChoice } from "./model_compat.js";
+import { modelSupportsToolChoice, samplingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
@@ -202,7 +202,7 @@ export async function generateCharacter(input: {
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
-    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/experiences/notes；结构化条目必须有稳定 ASCII id，演进记录包含 status/sourceRefs/validFrom/validUntil。competencies 每项必须填写 name、summary 和 unlocked；summary 是无论是否解锁都会展示的简短能力概述，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 sourceRefs/validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
+    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/competencies/storyStates/experiences/notes；结构化条目必须有稳定 ASCII id，演进记录可包含 status/validFrom/validUntil。competencies 每项必须填写 name、summary 和 unlocked；summary 是无论是否解锁都会展示的简短能力概述，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
   const usesToolLoop = Boolean(input.project && input.allowedDocumentPaths?.length);
@@ -374,8 +374,7 @@ ${writePackDraftContractPrompt()}
       model: options.draftModel.model, messages, tools,
       ...(modelSupportsToolChoice(options.draftModel) ? { tool_choice: "auto" } : {}),
       stream: false,
-      ...(options.draftModel.temperature === undefined ? {} : { temperature: options.draftModel.temperature }),
-      ...(options.draftModel.topP === undefined ? {} : { top_p: options.draftModel.topP }),
+      ...samplingRequestOptions(options.draftModel),
     });
     logModelRequest(endpoint, requestBody);
     const response = await modelFetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody }, options.draftModel.proxyUrl);
@@ -792,8 +791,7 @@ async function runReadOnlyToolLoop(
     const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
     const requestBody = JSON.stringify({ model: model.model, messages, tools,
       ...(modelSupportsToolChoice(model) ? { tool_choice: "auto" } : {}), stream: false,
-      ...(model.temperature === undefined ? {} : { temperature: model.temperature }),
-      ...(model.topP === undefined ? {} : { top_p: model.topP }) });
+      ...samplingRequestOptions(model) });
     logModelRequest(endpoint, requestBody);
     const response = await modelFetch(endpoint, {
       method: "POST", signal,
@@ -840,7 +838,7 @@ async function completeText(model: ModelConfig, messages: ChatMessage[], signal?
 async function streamText(model: ModelConfig, messages: ChatMessage[], signal: AbortSignal | undefined, onText: (text: string) => void | Promise<void>) {
   if (!model.apiKey) throw new Error("请先配置模型 API Key");
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const requestBody = JSON.stringify({ model: model.model, messages, stream: true, stream_options: { include_usage: true }, ...(model.temperature === undefined ? {} : { temperature: model.temperature }), ...(model.topP === undefined ? {} : { top_p: model.topP }) });
+  const requestBody = JSON.stringify({ model: model.model, messages, stream: true, stream_options: { include_usage: true }, ...samplingRequestOptions(model) });
   logModelRequest(endpoint, requestBody);
   const response = await modelFetch(endpoint, {
     method: "POST", signal,

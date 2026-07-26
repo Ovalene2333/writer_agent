@@ -727,11 +727,6 @@ export const TOOLS = deepFreeze([
         properties: {
           id: { type: "number", description: "角色 ID" },
           reason: { type: "string", description: "已确认事实摘要" },
-          sourceRef: {
-            type: "object",
-            description: "来源 type+ref",
-            additionalProperties: true,
-          },
           changes: {
             type: "array",
             description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,location|physical|emotion|notes|knowledge|beliefs|intentions|temporaryGoals}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",

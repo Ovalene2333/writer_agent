@@ -3,7 +3,6 @@ import type {
   CharacterCompetency,
   CharacterGoal,
   CharacterRelationship,
-  CharacterSourceRef,
   CharacterStoryState,
   CharacterTemporal,
   CharacterTextEntry,
@@ -62,7 +61,6 @@ export type CharacterChangeOp = {
 
 export type ApplyCharacterChangesInput = {
   reason: string;
-  sourceRef?: CharacterSourceRef;
   changes: CharacterChangeOp[];
 };
 
@@ -75,7 +73,7 @@ type PsychGroup = (typeof PSYCH_GROUPS)[number];
 const TOP_ARRAY_SECTIONS = ["motivations", "competencies", "relationships", "storyStates", "experiences"] as const;
 type TopArraySection = (typeof TOP_ARRAY_SECTIONS)[number];
 
-const temporalEmpty = (): CharacterTemporal => ({ sourceRefs: [] });
+const temporalEmpty = (): CharacterTemporal => ({});
 
 export const emptyCharacter = (name = ""): Omit<Character, "id" | "updatedAt"> => ({
   schemaVersion: 3,
@@ -98,19 +96,8 @@ const txt = (v: unknown): string => typeof v === "string" ? v.trim() : "";
 const strs = (v: unknown): string[] =>
   arr(v).filter((x): x is string => typeof x === "string").map(x => x.trim()).filter(Boolean);
 
-function sourceRef(v: unknown): CharacterSourceRef[] {
-  const r = obj(v);
-  if (!(["outline", "document", "manual"] as unknown[]).includes(r.type) || !txt(r.ref)) return [];
-  return [{ type: r.type as CharacterSourceRef["type"], ref: txt(r.ref), ...(txt(r.note) ? { note: txt(r.note) } : {}) }];
-}
-
-function parseSourceRef(v: unknown): CharacterSourceRef | undefined {
-  return sourceRef(v)[0];
-}
-
 function temporal(r: Record<string, unknown>): CharacterTemporal {
   return {
-    sourceRefs: arr(r.sourceRefs).flatMap(sourceRef),
     ...(txt(r.validFrom) ? { validFrom: txt(r.validFrom) } : {}),
     ...(txt(r.validUntil) ? { validUntil: txt(r.validUntil) } : {}),
   };
@@ -543,16 +530,6 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
   });
 }
 
-function withOptionalSourceRef<T extends CharacterTemporal>(
-  item: T,
-  ref: CharacterSourceRef | undefined,
-): T {
-  if (!ref) return item;
-  const exists = item.sourceRefs.some(x => x.type === ref.type && x.ref === ref.ref);
-  if (exists) return item;
-  return { ...item, sourceRefs: [...item.sourceRefs, ref] };
-}
-
 let generatedEntrySequence = 0;
 
 function generatedEntryId(prefix: string): string {
@@ -633,7 +610,6 @@ export function applyCharacterChanges(
   const changes = Array.isArray(input.changes) ? input.changes : [];
   if (!changes.length) throw new Error("apply_character_changes 需要至少一条 changes");
 
-  const defaultRef = parseSourceRef(input.sourceRef);
   let current = normalizeV3Character(base);
   const applied: AppliedCharacterChange[] = [];
   const skipped: SkippedCharacterChange[] = [];
@@ -665,7 +641,7 @@ export function applyCharacterChanges(
             break;
           }
           const next = [...current.competencies];
-          next[index] = withOptionalSourceRef({ ...next[index], unlocked }, defaultRef);
+          next[index] = { ...next[index], unlocked };
           current = { ...current, competencies: next };
           applied.push({ op, detail: `${competencyId} → unlocked=${unlocked}` });
           break;
@@ -673,7 +649,7 @@ export function applyCharacterChanges(
         case "upsert_competency": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "competency");
-          const item = withOptionalSourceRef(competency({ ...entryRaw, id }), defaultRef);
+          const item = competency({ ...entryRaw, id });
           if (!item.name && !item.description) {
             skip(op, "能力缺少 name/description");
             break;
@@ -699,7 +675,7 @@ export function applyCharacterChanges(
           }
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, group);
-          const item = withOptionalSourceRef(entry({ ...entryRaw, id }), defaultRef);
+          const item = entry({ ...entryRaw, id });
           if (!item.label && !item.description) {
             skip(op, "心理条目缺少 label/description");
             break;
@@ -735,7 +711,7 @@ export function applyCharacterChanges(
         case "upsert_experience": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "exp");
-          const item = withOptionalSourceRef(entry({ ...entryRaw, id }), defaultRef);
+          const item = entry({ ...entryRaw, id });
           if (!item.label && !item.description) {
             skip(op, "经历缺少 label/description");
             break;
@@ -757,7 +733,7 @@ export function applyCharacterChanges(
         case "upsert_motivation": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "goal");
-          const item = withOptionalSourceRef(goal({ ...entryRaw, id }), defaultRef);
+          const item = goal({ ...entryRaw, id });
           if (!item.summary) {
             skip(op, "目标缺少 summary");
             break;
@@ -769,7 +745,7 @@ export function applyCharacterChanges(
         case "upsert_relationship": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "rel");
-          const item = withOptionalSourceRef(relationship({ ...entryRaw, id }), defaultRef);
+          const item = relationship({ ...entryRaw, id });
           if (!Number.isInteger(item.characterId) || item.characterId <= 0) {
             skip(op, "关系缺少有效 characterId");
             break;
@@ -781,7 +757,7 @@ export function applyCharacterChanges(
         case "upsert_story_state": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "state");
-          const item = withOptionalSourceRef(state({ ...entryRaw, id }), defaultRef);
+          const item = state({ ...entryRaw, id });
           if (!item.outlineNodeId && !item.unanchored) {
             skip(op, "storyState 需要 outlineNodeId 或 unanchored=true");
             break;

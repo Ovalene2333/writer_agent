@@ -21,6 +21,49 @@ export function thinkingRequestOptions(
   return isDeepSeekModel(model) ? { thinking: { type: "enabled" } } : {};
 }
 
+export type SamplingRequest = {
+  temperature?: number;
+  topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+};
+
+export type SamplingRequestBody = {
+  temperature?: number;
+  top_p?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+};
+
+/**
+ * Single choke point for every sampling / penalty field we put on the wire.
+ *
+ * Call sites must not spell `temperature:` into a request body directly. Most of
+ * them used to hardcode a literal (`temperature: 0` for extraction and judging,
+ * `?? 0.9` for prose), which meant clearing temperature in provider settings
+ * changed almost nothing: the model config was consulted in 3 places out of 13,
+ * and every other call still sent a value the provider had deprecated.
+ *
+ * Passing `disableSampling` drops the whole group rather than just temperature.
+ * Models that reject `temperature` reject `top_p` and the penalties too, and an
+ * omitted parameter simply falls back to the provider default — omitting can
+ * never fail a request, so the safe superset costs nothing.
+ */
+export function samplingRequestOptions(
+  model: Pick<ModelConfig, "temperature" | "topP" | "disableSampling">,
+  requested: SamplingRequest = {},
+): SamplingRequestBody {
+  if (model.disableSampling) return {};
+  const temperature = requested.temperature ?? model.temperature;
+  const topP = requested.topP ?? model.topP;
+  return {
+    ...(temperature === undefined ? {} : { temperature }),
+    ...(topP === undefined ? {} : { top_p: topP }),
+    ...(requested.frequencyPenalty === undefined ? {} : { frequency_penalty: requested.frequencyPenalty }),
+    ...(requested.presencePenalty === undefined ? {} : { presence_penalty: requested.presencePenalty }),
+  };
+}
+
 /** Keep deterministic extraction calls from spending their output budget on reasoning. */
 export function nonThinkingRequestOptions(
   model: Pick<ModelConfig, "provider" | "baseUrl">,

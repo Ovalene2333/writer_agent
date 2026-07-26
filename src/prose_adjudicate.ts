@@ -10,6 +10,7 @@ import {
 } from "./prose_quality.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
+import { samplingRequestOptions } from "./model_compat.js";
 
 export type ProseVerdict = "allow" | "warn" | "block";
 
@@ -494,8 +495,7 @@ async function completeJsonChat(
     model: model.model,
     messages,
     stream: false,
-    temperature: 0,
-    ...(model.topP === undefined ? {} : { top_p: model.topP }),
+    ...samplingRequestOptions(model, { temperature: 0 }),
   });
   logModelRequest(endpoint, body);
 

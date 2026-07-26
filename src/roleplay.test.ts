@@ -83,7 +83,7 @@ function sampleCharacter(): Character {
     competencies: [{
       id: "locked-skill", name: "终焉协议", summary: "尚未掌握的禁忌能力",
       level: "绝密", unlocked: false, description: "未解锁能力的秘密说明",
-      resources: ["秘密资源"], limitations: ["秘密限制"], costs: ["秘密代价"], sourceRefs: [],
+      resources: ["秘密资源"], limitations: ["秘密限制"], costs: ["秘密代价"],
     }],
   };
 }
@@ -567,16 +567,16 @@ describe("roleplay prompts", () => {
       identity: { ...sampleCharacter().identity, name: "苏远", summary: "泛亚基地教官" },
       relationships: [{
         id: "rel-1", characterId: 1, type: "搭档", attitude: "信任但担忧",
-        status: "active", description: "带过林千夏的实战训练", sourceRefs: [],
+        status: "active", description: "带过林千夏的实战训练",
       }],
       storyStates: [{
         id: "st-1", location: "训练结束后的医务室", physical: "疲惫", emotion: "克制的关切",
-        knowledge: [{ id: "k1", label: "训练安排", description: "知道今天的训练强度超标", sourceRefs: [] }],
-        beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [],
+        knowledge: [{ id: "k1", label: "训练安排", description: "知道今天的训练强度超标" }],
+        beliefs: [], intentions: [], temporaryGoals: [], notes: "",
       }],
       motivations: [{
         id: "m1", category: "current", status: "active", priority: 1,
-        summary: "确认林千夏的身体状态", stakes: "", obstacles: [], sourceRefs: [],
+        summary: "确认林千夏的身体状态", stakes: "", obstacles: [],
       }],
     };
     const derived = deriveInterlocutorFromCharacter(identity, performer);
