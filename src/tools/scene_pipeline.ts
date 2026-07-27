@@ -65,7 +65,13 @@ import {
   DEFAULT_ISOLATED_WRITER_MAX_RATIO,
   DEFAULT_SCENE_NOTES_CHARACTERS,
 } from "../agent_runtime.js";
-import { assertWritableMode, rejectCompressedPlaceholder, requireString } from "./helpers.js";
+import {
+  assertWritableMode,
+  rejectCompressedPlaceholder,
+  requireString,
+  resolveDocumentWriteTarget,
+  type DocumentWriteMode,
+} from "./helpers.js";
 import {
   proseStyleGateIssues,
   submitFullDocumentProposal,
@@ -103,12 +109,11 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
   const path = requireString(input.path, "path");
   if (!isScenePipelineDocument(path)) throw new Error("逐场景正文草稿只能写入 chapters/ 或 side/");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const mode = requireString(input.mode, "mode") as ChapterDraftMode;
-  if (!(["create", "replace", "append"] as string[]).includes(mode)) throw new Error("mode 只能是 create/replace/append");
-  const exists = project.documentExists(path);
-  if (mode === "create" && exists) throw new Error("create 模式目标已存在；全文重写用 replace，续写用 append");
-  if (mode !== "create" && !exists) throw new Error(`${mode} 模式目标文档不存在`);
-  const baseContent = exists ? project.read(path) : "";
+  const requestedMode = requireString(input.mode, "mode") as ChapterDraftMode;
+  if (!(["create", "replace", "append"] as string[]).includes(requestedMode)) throw new Error("mode 只能是 create/replace/append");
+  const target = resolveDocumentWriteTarget(project, path, requestedMode as DocumentWriteMode);
+  const mode = target.mode as ChapterDraftMode;
+  const baseContent = target.beforeContent;
   const scenes = Array.isArray(input.scenes) ? input.scenes : [];
   const draft = beginChapterSceneDraft({
     path,
@@ -116,7 +121,7 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
     heading: typeof input.heading === "string" ? input.heading : undefined,
     chapterGoal: requireString(input.chapterGoal, "chapterGoal"),
     baseContent,
-    baseHash: project.hash(baseContent),
+    baseHash: target.baseHash,
     scenes,
     maxScenes: context.scenePipelineSettings?.maxScenes,
   });
@@ -143,6 +148,8 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
     status: "started",
     path,
     mode,
+    requestedMode,
+    submissionKind: target.versionSubmission ? "new_version" : "new_document",
     chapterGoal: draft.chapterGoal,
     sceneCount: draft.scenes.length,
     scenePolicy: context.scenePipelineSettings,
@@ -151,6 +158,7 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
     message: (context.scenePipelineSettings?.isolatedWriter
       ? "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene_notes 只提交故事内 notes，正文与状态由隔离调用生成。"
       : "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 提交故事内 notes、正文和状态。")
+      + (target.versionSubmission ? " 目标路径已存在，完成后会作为该文档的新版本提交。" : "")
       + (stylePriorNotes.length ? " stylePriorNotes 是从既有正文统计出的高频表达负面清单，写每一场时遵守。" : ""),
   });
 }

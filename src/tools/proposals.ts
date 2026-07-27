@@ -21,7 +21,15 @@ import {
 } from "../agent_runtime.js";
 import type { WriterStore } from "../store.js";
 import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
-import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
+import {
+  assertCreativeOutlineDesigned,
+  assertWritableMode,
+  countOccurrences,
+  rejectCompressedPlaceholder,
+  requireString,
+  resolveDocumentWriteTarget,
+  type DocumentWriteMode,
+} from "./helpers.js";
 
 /** Auto-fix referential meta leaks; block if residual high-confidence leaks remain. */
 function gateProseMetaLeaks(content: string, path: string): { content: string; stripped: string[] } {
@@ -308,16 +316,15 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
   const path = requireString(input.path, "path");
   if (!isScenePipelineDocument(path)) throw new Error("直接隔离正文只能写入 chapters/ 或 side/");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const mode = requireString(input.mode, "mode");
-  if (!(["create", "replace", "append"] as string[]).includes(mode)) {
+  const requestedMode = requireString(input.mode, "mode");
+  if (!(["create", "replace", "append"] as string[]).includes(requestedMode)) {
     throw new Error("mode 只能是 create/replace/append");
   }
-  const exists = project.documentExists(path);
-  if (mode === "create" && exists) throw new Error("create 模式目标已存在；全文重写用 replace，续写用 append");
-  if (mode !== "create" && !exists) throw new Error(`${mode} 模式目标文档不存在`);
-  const beforeContent = exists ? project.read(path) : "";
-  if (mode !== "create") {
-    const sourceHash = project.hash(beforeContent);
+  const target = resolveDocumentWriteTarget(project, path, requestedMode as DocumentWriteMode);
+  const mode = target.mode;
+  const beforeContent = target.beforeContent;
+  if (requestedMode !== "create") {
+    const sourceHash = target.baseHash;
     if (typeof input.sourceHash !== "string" || input.sourceHash !== sourceHash) {
       throw new Error("replace/append 必须携带 inspect_document 返回的当前 sourceHash");
     }
@@ -423,10 +430,10 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
   }
   rejectCompressedPlaceholder(generated.content, "隔离 Writer 正文");
   const generatedBody = generated.content.trim();
-  if (mode === "create") {
+  if (!target.existed) {
     if (project.documentExists(path)) throw new Error("Writer 生成期间目标文档已被创建；请重新判断 create/replace");
   } else if (!project.documentExists(path)
-    || project.hash(project.read(path)) !== input.sourceHash) {
+    || project.hash(project.read(path)) !== target.baseHash) {
     throw new Error("Writer 生成期间目标文档已变化；未创建提案，请重新读取后再试");
   }
   const proposedContent = mode === "append"
@@ -443,6 +450,9 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
   return JSON.stringify({
     ...parsed,
     generationMode: "isolated_document",
+    requestedMode: target.requestedMode,
+    effectiveMode: target.mode,
+    submissionKind: target.versionSubmission ? "new_version" : "new_document",
     generatedCharacters: generatedBody.length,
     targetCharacters,
   });
@@ -459,7 +469,8 @@ export async function submitFullDocumentProposal(
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
-  const beforeContent = project.documentExists(path) ? project.read(path) : "";
+  const existed = project.documentExists(path);
+  const beforeContent = existed ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
   if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
   const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
@@ -473,6 +484,8 @@ export async function submitFullDocumentProposal(
   emit({ type: "proposal", proposal });
   return JSON.stringify({
     ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
+    submissionKind: existed ? "new_version" : "new_document",
+    ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
   });

@@ -1094,6 +1094,7 @@ export function taskInstructions(
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；需要人物约束时读取相关角色分区。
 - ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
+- 目标路径已经存在时保持原路径提交，系统会把整篇成稿记录为该文档的新版本；不要为避开同名另起副本或改写章节路径。局部修改仍用 patch，只有承接现有结尾才用 append。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
     ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
     : `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。`}依据真实成稿决定继续、调整未写引导或收束。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}

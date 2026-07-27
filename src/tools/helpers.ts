@@ -1,5 +1,33 @@
 import { documentKind, type WriterProject } from "../project.js";
 
+export type DocumentWriteMode = "create" | "replace" | "append";
+
+/** Existing targets are revisions, not filename collisions. */
+export function resolveDocumentWriteTarget(
+  project: WriterProject,
+  path: string,
+  requestedMode: DocumentWriteMode,
+): {
+  requestedMode: DocumentWriteMode;
+  mode: DocumentWriteMode;
+  existed: boolean;
+  beforeContent: string;
+  baseHash: string;
+  versionSubmission: boolean;
+} {
+  const existed = project.documentExists(path);
+  if (requestedMode !== "create" && !existed) throw new Error(`${requestedMode} 模式目标文档不存在`);
+  const beforeContent = existed ? project.read(path) : "";
+  return {
+    requestedMode,
+    mode: requestedMode === "create" && existed ? "replace" : requestedMode,
+    existed,
+    beforeContent,
+    baseHash: project.hash(beforeContent),
+    versionSubmission: existed,
+  };
+}
+
 export function requireString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`缺少有效参数：${name}`);
   return value;
