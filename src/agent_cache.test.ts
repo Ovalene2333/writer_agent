@@ -25,6 +25,7 @@ import {
   chapterReviewRequiredPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
+  documentDeliveryRemaining,
   executionModelForTask,
   executionModelForStep,
   initialTodos,
@@ -34,6 +35,7 @@ import {
   parsePlannerJson,
   parseToolArgumentRepair,
   plannerCompletionOptions,
+  priorTurnContentForContext,
   rehydrateRecentToolMessages,
   recentRoleplayHandoffContext,
   requestNeedsProjectFactSearch,
@@ -319,6 +321,32 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   });
 });
 
+test("immediately previous reply preserves named options for follow-up references", () => {
+  const prior = [
+    "前置分析。",
+    "**A. 第一次杀人**",
+    "A线的具体内容。",
+    "**B. 方晓的极限**",
+    "B线的具体内容。",
+    "**C. 父亲的另一面**",
+    "C线的具体内容。",
+  ].join("\n\n");
+  const admitted = priorTurnContentForContext(prior);
+  assert.equal(admitted, prior);
+  assert.match(admitted, /A\. 第一次杀人/);
+  assert.match(admitted, /C\. 父亲的另一面/);
+});
+
+test("exceptionally long previous replies mark middle omission instead of posing as complete", () => {
+  const prior = `HEAD-${"甲".repeat(15_000)}-${"乙".repeat(15_000)}-TAIL`;
+  const admitted = priorTurnContentForContext(prior);
+  assert.match(admitted, /^HEAD-/);
+  assert.match(admitted, /上一条消息中段已省略/);
+  assert.match(admitted, /原文 30011 字/);
+  assert.match(admitted, /-TAIL$/);
+  assert.ok(admitted.length < prior.length);
+});
+
 test("scene orchestration always stays on Agent regardless of Writer isolation", () => {
   const model = (name: string) => ({
     provider: "openai-compatible" as const,
@@ -488,6 +516,10 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(fast, /传统单 Agent 链路/);
   assert.match(fast, /不得调用或等待正文 Writer/);
   assert.match(fast, /不要为了展示流程而建立场景链/);
+  const withoutScenePipeline = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true, false);
+  assert.match(withoutScenePipeline, /场景链已关闭/);
+  assert.match(withoutScenePipeline, /禁止调用章节场景链工具/);
+  assert.doesNotMatch(withoutScenePipeline, /write_chapter_scene 提交/);
 });
 
 test("chapter continuation handoff carries delivery, tail, and final scene state", () => {
@@ -566,10 +598,23 @@ test("scene continuation handoff carries seam tail, states and next card without
   assert.equal(chapterReviewAllowsTool("inspect_chapter_draft"), true);
   assert.equal(chapterReviewAllowsTool("manage_todos"), false);
   assert.equal(chapterReviewAllowsTool("write_chapter_scene"), false);
+  const reviewRetry = chapterReviewRequiredPrompt(draft, {
+    rejectedTools: ["write_chapter_scene", "manage_todos", "write_chapter_scene"],
+    attempt: 2,
+  });
+  assert.match(reviewRetry, /第 2 次/);
+  assert.match(reviewRetry, /write_chapter_scene、manage_todos/);
+  assert.match(reviewRetry, /这些调用未执行，草稿没有变化/);
   assert.equal(chapterDraftNeedsReview(draft, "scene_written"), true);
   assert.equal(chapterDraftNeedsReview(draft, "review_blocked"), false);
   draft.inspectedVersion = draft.version;
   assert.equal(chapterDraftNeedsReview(draft, "scene_written"), false);
+});
+
+test("document delivery continuation uses contract outputs instead of todo wording", () => {
+  assert.equal(documentDeliveryRemaining(["第二章"], 1), false);
+  assert.equal(documentDeliveryRemaining(["第二章", "第三章"], 1), true);
+  assert.equal(documentDeliveryRemaining([], 0), false);
 });
 
 type Msg = {

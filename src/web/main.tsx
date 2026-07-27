@@ -23,6 +23,7 @@ import {
   IdCard,
   Library,
   ListOrdered,
+  LockKeyhole,
   Menu,
   MessageSquare,
   Minus,
@@ -34,6 +35,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Share2,
   Save,
   Settings,
   ShieldCheck,
@@ -50,6 +52,7 @@ import { characterEditorSaveInput } from "../character_editor_payload";
 import { CharacterEditor, type CharacterSummaryKind } from "./character_editor";
 import {
   apiUrl,
+  buildReadonlyEntryUrl,
   buildEntryUrl,
   ensureConnection,
   failoverFrom,
@@ -405,6 +408,7 @@ type StyleTemplateInfo = {
 };
 type StyleTemplateDraft = StyleTemplateInfo & { isNew: boolean };
 type State = {
+  accessMode?: "owner" | "readonly";
   config: { title: string; style?: string };
   documents: string[];
   documentFolders: string[];
@@ -620,12 +624,13 @@ function SettingsMenu({ open, connectionAvailable, onClose, onSelect }: {
   );
 }
 
-function WorkspaceShell({ mode, documentsCollapsed, children }: {
+function WorkspaceShell({ mode, documentsCollapsed, readOnly = false, children }: {
   mode: WorkspaceMode;
   documentsCollapsed: boolean;
+  readOnly?: boolean;
   children: React.ReactNode;
 }) {
-  return <div className={`app workspace-${mode}${documentsCollapsed ? " documents-collapsed" : ""}`}>{children}</div>;
+  return <div className={`app workspace-${mode}${documentsCollapsed ? " documents-collapsed" : ""}${readOnly ? " readonly" : ""}`}>{children}</div>;
 }
 
 const token = initConnection();
@@ -1744,6 +1749,7 @@ function WorkspaceTopbar({
   usageCurrency,
   usageUnmetered,
   busy,
+  readOnly,
   settingsOpen,
   workspaceMode,
   documentsCollapsed,
@@ -1751,6 +1757,7 @@ function WorkspaceTopbar({
   onRoleplay,
   onSessions,
   onUsage,
+  onShare,
   onConnection,
   onToggleSettings,
   onCloseSettings,
@@ -1767,6 +1774,7 @@ function WorkspaceTopbar({
   usageCurrency: string;
   usageUnmetered: boolean;
   busy: boolean;
+  readOnly: boolean;
   settingsOpen: boolean;
   workspaceMode: WorkspaceMode;
   documentsCollapsed: boolean;
@@ -1774,6 +1782,7 @@ function WorkspaceTopbar({
   onRoleplay: () => void;
   onSessions: () => void;
   onUsage: () => void;
+  onShare: () => void;
   onConnection: () => void;
   onToggleSettings: () => void;
   onCloseSettings: () => void;
@@ -1802,6 +1811,7 @@ function WorkspaceTopbar({
             <span className="connection-pill-label">{connection.label}</span>
           </button>
         )}
+        {readOnly && <span className="readonly-pill"><LockKeyhole size={12} />只读分享</span>}
       </div>
       <div className="header-right">
         <LayoutControls
@@ -1812,7 +1822,7 @@ function WorkspaceTopbar({
         />
         <nav className="nav-cluster" aria-label="工作区入口">
           <button type="button" className="ghost nav-action" aria-label="角色" title="角色" onClick={onCharacters}><IdCard size={17} aria-hidden="true" /><span>角色</span></button>
-          <button type="button" className="ghost nav-action" aria-label="扮演" title="扮演" disabled={busy} onClick={onRoleplay}><Drama size={17} aria-hidden="true" /><span>扮演</span></button>
+          <button type="button" className="ghost nav-action" aria-label="扮演" title="扮演" disabled={busy || readOnly} onClick={onRoleplay}><Drama size={17} aria-hidden="true" /><span>扮演</span></button>
           <button type="button" className="ghost nav-action" aria-label="会话" title="会话" onClick={onSessions}><MessageSquare size={16} aria-hidden="true" /><span>会话</span></button>
         </nav>
         <button className="usage-strip" onClick={onUsage} title="当前会话用量与计费明细">
@@ -1824,7 +1834,8 @@ function WorkspaceTopbar({
           <span className="usage-cost">{usageUnmetered ? "非按量计费" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(4)}`}</span>
           <ChevronDown size={13} aria-hidden="true" />
         </button>
-        <div className="settings-anchor">
+        {!readOnly && <button type="button" className="ghost nav-action" onClick={onShare} title="生成新的只读分享链接"><Share2 size={16} /><span>分享</span></button>}
+        {!readOnly && <div className="settings-anchor">
           <IconButton label="设置" className={settingsOpen ? "active" : ""} onClick={onToggleSettings}><Settings size={17} /></IconButton>
           <SettingsMenu
             open={settingsOpen}
@@ -1832,7 +1843,7 @@ function WorkspaceTopbar({
             onClose={onCloseSettings}
             onSelect={onSelectSettings}
           />
-        </div>
+        </div>}
         <IconButton label="刷新工作区" onClick={onRefresh}><RefreshCw size={17} /></IconButton>
       </div>
     </header>
@@ -2556,7 +2567,7 @@ function App() {
   }
 
   function editReaderSelectionDirectly() {
-    if (!readerSelection) return;
+    if (!readerSelection || state?.accessMode === "readonly") return;
     const { start, end } = readerSelection;
     setDocumentDraft(document.content);
     setEditingDocument(true);
@@ -2752,7 +2763,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "delegated", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "fast", characterEvolutionEnabled: true, scenePipeline: { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -2770,7 +2781,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "delegated", characterEvolutionEnabled: true, scenePipeline: { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "fast", characterEvolutionEnabled: true, scenePipeline: { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -2903,7 +2914,7 @@ function App() {
 
   async function toggleFastWritingMode() {
     if (!state || busy || roleplay) return;
-    const current = state.agentSettings?.writingMode ?? "delegated";
+    const current = state.agentSettings?.writingMode ?? "fast";
     const writingMode: WritingExecutionMode = current === "fast" ? "delegated" : "fast";
     setError("");
     try {
@@ -2918,9 +2929,10 @@ function App() {
               agentSettings: {
                 ...(prev.agentSettings ?? {
                   permissionMode: "ask",
-                  writingMode: "delegated",
+                  writingMode: "fast",
                   characterEvolutionEnabled: true,
                   scenePipeline: {
+                    enabled: false,
                     preferredMinScenes: 3,
                     preferredMaxScenes: 5,
                     maxScenes: 5,
@@ -2938,6 +2950,56 @@ function App() {
       setNotice(result.writingMode === "fast"
         ? "快速模式已开启：全部写作步骤使用 Agent，不调用正文 Writer"
         : "快速模式已关闭：恢复 Agent 分工执行");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function toggleScenePipeline() {
+    if (!state || busy || roleplay) return;
+    const enabled = !(state.agentSettings?.scenePipeline.enabled ?? false);
+    setError("");
+    try {
+      const result = await api<{ scenePipeline: ScenePipelineSettings }>("/api/agent-settings", {
+        method: "POST",
+        body: JSON.stringify({ scenePipeline: { enabled } }),
+      });
+      setState(prev => prev ? {
+        ...prev,
+        agentSettings: {
+          ...(prev.agentSettings ?? {
+            permissionMode: "ask",
+            writingMode: "fast",
+            characterEvolutionEnabled: true,
+            scenePipeline: result.scenePipeline,
+          }),
+          scenePipeline: result.scenePipeline,
+        },
+      } : prev);
+      setNotice(result.scenePipeline.enabled
+        ? "场景链已开启：Agent 可在长篇连续状态确有收益时选择分场"
+        : "场景链已关闭：正文将直接成稿");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function createReadonlyShareLink() {
+    if (!state || state.accessMode === "readonly") return;
+    setError("");
+    try {
+      const result = await api<{ token: string; accessMode: "readonly" }>("/api/share/readonly", {
+        method: "POST",
+      });
+      const url = buildReadonlyEntryUrl(result.token);
+      if (!url) throw new Error("当前连接没有可分享的访问地址");
+      try {
+        await navigator.clipboard.writeText(url);
+        setNotice("新的只读分享链接已复制；此前生成的只读链接已失效");
+      } catch {
+        window.prompt("复制只读分享链接", url);
+        setNotice("已生成只读分享链接；此前生成的只读链接已失效");
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -4020,6 +4082,7 @@ function App() {
   }
 
   const pendingProposals = state.proposals.filter((p) => p.status === "pending");
+  const readOnly = state.accessMode === "readonly";
   const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
   const visibleMessages = state.messages.filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.content.trim());
   const usagePct = state.provider.pricing.contextWindow
@@ -4053,7 +4116,7 @@ function App() {
   const showThemePicker = false;
 
   return (
-    <WorkspaceShell mode={workspaceMode} documentsCollapsed={documentsCollapsed}>
+    <WorkspaceShell mode={workspaceMode} documentsCollapsed={documentsCollapsed} readOnly={readOnly}>
       {!documentsCollapsed && workspaceMode !== "agent-focus" && <div
         className={`resize-handle${resizing === "sidebar" ? " active" : ""}`}
         style={{ left: `calc(var(--sidebar-w, 248px) - 2.5px)` }}
@@ -4073,6 +4136,7 @@ function App() {
         usageCurrency={state.usage.currency}
         usageUnmetered={state.provider.pricing.billingMode === "unmetered"}
         busy={busy}
+        readOnly={readOnly}
         settingsOpen={settingsMenuOpen}
         workspaceMode={workspaceMode}
         documentsCollapsed={documentsCollapsed}
@@ -4088,6 +4152,7 @@ function App() {
           setManagementView("sessions");
         }}
         onUsage={() => setShowUsagePopover(true)}
+        onShare={() => void createReadonlyShareLink()}
         onConnection={() => {
           setConnectionPanelMsg("");
           openSettings("connection");
@@ -4099,6 +4164,12 @@ function App() {
         onModeChange={setWorkspaceMode}
         onToggleDocuments={() => setDocumentsCollapsed((value) => !value)}
       />
+      {readOnly && (
+        <div className="readonly-banner" role="status">
+          <LockKeyhole size={14} />
+          只读模式：可以浏览和导出内容，不能聊天、编辑、审批或修改项目设置。
+        </div>
+      )}
 
       <nav className="mobile-tabs" aria-label="主区域">
         <button
@@ -4169,7 +4240,7 @@ function App() {
             </button>
           </div>
         </div>
-        <div className="file-manager-actions">
+        {!readOnly && <div className="file-manager-actions">
           <button
             type="button"
             className="fm-btn"
@@ -4192,7 +4263,7 @@ function App() {
             <FolderPlus size={15} aria-hidden="true" />
             新建文件夹
           </button>
-        </div>
+        </div>}
 
         {renaming && (
           <div className="inline-edit">
@@ -4353,7 +4424,7 @@ function App() {
                   >
                     <History size={14} />版本
                   </button>
-                  <button disabled={!activePath} onClick={() => setEditingDocument(true)}>
+                  <button disabled={!activePath || readOnly} onClick={() => setEditingDocument(true)}>
                     <Pencil size={14} />编辑
                   </button>
                 </>
@@ -4536,7 +4607,7 @@ function App() {
                     type="button"
                     className={`permission-mode-btn${active ? " active" : ""}`}
                     title={mode.hint}
-                    disabled={busy || Boolean(roleplay)}
+                    disabled={busy || Boolean(roleplay) || readOnly}
                     onClick={() => void setPermissionMode(mode.id)}
                   >
                     {mode.label}
@@ -4551,11 +4622,24 @@ function App() {
                   ? "关闭快速模式，恢复 Agent 分工与隔离 Writer"
                   : "开启传统快速模式；全部写作步骤使用 Agent，不调用正文 Writer"}
                 aria-pressed={state.agentSettings?.writingMode === "fast"}
-                disabled={busy || Boolean(roleplay)}
+                disabled={busy || Boolean(roleplay) || readOnly}
                 onClick={() => void toggleFastWritingMode()}
               >
                 <Zap size={11} aria-hidden="true" />
                 Fast
+              </button>
+              <button
+                type="button"
+                className={`permission-mode-btn fast-mode-btn${state.agentSettings?.scenePipeline.enabled ? " active" : ""}`}
+                title={state.agentSettings?.scenePipeline.enabled
+                  ? "关闭场景链；正文直接成稿"
+                  : "开启可选场景链；仅在长篇连续状态确有收益时使用"}
+                aria-pressed={state.agentSettings?.scenePipeline.enabled ?? false}
+                disabled={busy || Boolean(roleplay) || readOnly}
+                onClick={() => void toggleScenePipeline()}
+              >
+                <ListOrdered size={11} aria-hidden="true" />
+                场景链
               </button>
             </div>
           </div>
@@ -4969,12 +5053,14 @@ function App() {
                   stop();
                 }
               }}
-              placeholder={roleplay
-                ? roleplayInputMode === "director"
-                  ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
-                  : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
-                : "Describe your writing task… (Ctrl+Enter to send)"}
-              disabled={busy || Boolean(roleplayAutoReplyBusy)}
+              placeholder={readOnly
+                ? "只读分享模式不能发送消息"
+                : roleplay
+                  ? roleplayInputMode === "director"
+                    ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
+                    : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
+                  : "Describe your writing task… (Ctrl+Enter to send)"}
+              disabled={readOnly || busy || Boolean(roleplayAutoReplyBusy)}
             />
             <div className="composer-actions">
               <span className="composer-hint">
@@ -4983,7 +5069,7 @@ function App() {
               <button
                 className={`composer-send ${busy ? "stop" : "primary"}`}
                 onClick={busy ? stop : () => void sendChat()}
-                disabled={Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim())}
+                disabled={readOnly || Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim())}
               >
                 {busy ? "Stop" : "Send"}
               </button>
@@ -6141,8 +6227,8 @@ function App() {
 
       {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
-        scenePipeline={state.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
-        writingMode={state.agentSettings?.writingMode ?? "delegated"}
+        scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
+        writingMode={state.agentSettings?.writingMode ?? "fast"}
         characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
         section={settingsSection}
         onSectionChanged={setSettingsSection}
@@ -6268,7 +6354,7 @@ function App() {
           ...previous,
           agentSettings: {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "delegated",
+            writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
             scenePipeline,
           },
@@ -6277,9 +6363,9 @@ function App() {
           ...previous,
           agentSettings: {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "delegated",
+            writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled,
-            scenePipeline: previous.agentSettings?.scenePipeline ?? { preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           },
         } : previous)}
       />}

@@ -21,6 +21,7 @@ export type ProviderProfile = { id: string; name: string; provider: "deepseek" |
 export type ModelRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
 export type ScenePipelineSettings = {
+  enabled: boolean;
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
@@ -439,7 +440,11 @@ export function ModelConfig({
         </section>
 
         <section className="writing-settings-section">
-          <div className="writing-settings-section-head"><div><h4>可选场景链</h4><p>只有模型判断分场确实有助于连续性或长篇修订时才使用。</p></div></div>
+          <div className="writing-settings-section-head"><div><h4>可选场景链</h4><p>默认关闭；开启后，模型只在分场确实有助于连续性或长篇修订时使用。</p></div></div>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={sceneDraft.enabled} onChange={event => setSceneDraft(current => ({ ...current, enabled: event.target.checked }))}/>
+            <span><strong>启用场景链</strong><small>关闭时正文直接成稿，不调用章节场景链工具。</small></span>
+          </label>
           <div className="scene-settings-grid">
             <label className={sceneCountInvalid ? "field-invalid" : ""}><span>推荐场数</span><div className="scene-range-inputs"><input aria-label="推荐最少场数" aria-invalid={sceneCountInvalid} type="number" min="1" max="8" value={sceneDraft.preferredMinScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMinScenes: Number(event.target.value) }))}/><i>—</i><input aria-label="推荐最多场数" aria-invalid={sceneCountInvalid} type="number" min="1" max="8" value={sceneDraft.preferredMaxScenes} onChange={event => setSceneDraft(current => ({ ...current, preferredMaxScenes: Number(event.target.value) }))}/></div><small>建议范围，不为凑数拆场。</small></label>
             <label className={sceneCountInvalid ? "field-invalid" : ""}><span>场景硬上限</span><input aria-invalid={sceneCountInvalid} type="number" min="1" max="8" value={sceneDraft.maxScenes} onChange={event => setSceneDraft(current => ({ ...current, maxScenes: Number(event.target.value) }))}/><small>最多 8 场，且不能低于推荐值。</small></label>
@@ -460,7 +465,9 @@ export function ModelConfig({
         </section> : <div className="writing-mode-notice"><strong>快速模式不使用正文 Writer</strong><span>当前沿用传统单 Agent 链路：检索、编排、直接提案和场景链正文全部由 Agent 完成。关闭 Agent 面板中的 Fast 后，隔离设置会重新出现。</span></div>}
 
         <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid ? "status" : "alert"}>{sceneDraftValid
-          ? writingMode === "fast"
+          ? !sceneDraft.enabled
+            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式开启" : "分工模式开启"}，正文直接成稿。`
+            : writingMode === "fast"
             ? `当前：快速模式。全部写作步骤使用 Agent，不调用正文 Writer；场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场。`
             : `当前：分工模式${sceneDraft.isolatedWriter ? " + 隔离 Writer" : ""}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。`
           : "请检查场景数量、notes 上限、正文倍率与候选稿数量。"}</div>

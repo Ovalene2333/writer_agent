@@ -201,6 +201,7 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     const context: ToolExecutionContext = {
       permissionMode: "ask",
       scenePipelineSettings: {
+        enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,
       },
@@ -307,6 +308,7 @@ test("direct isolated document keeps prose generation outside the Agent transcri
       permissionMode: "ask",
       characterEvolutionEnabled: false,
       scenePipelineSettings: {
+        enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,
       },

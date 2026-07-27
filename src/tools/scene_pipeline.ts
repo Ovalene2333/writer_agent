@@ -45,12 +45,19 @@ import {
   sceneProseScoreBreakdown,
 } from "../prose_metrics.js";
 import { analyzeProseVividness, formatVividnessSummary, sceneVividnessFeedback } from "../prose_vividness.js";
-import { proseStyleIssuesError, sceneMannerismGateError, type ProseStyleIssue } from "../prose_quality.js";
+import {
+  analyzeProseStyle,
+  isHardBlockSubtype,
+  proseStyleIssuesError,
+  sceneMannerismGateError,
+  type ProseStyleIssue,
+} from "../prose_quality.js";
 import { ChapterReviewRequestError, reviewChapterDraft, type ChapterReviewResult } from "../chapter_review.js";
 import {
   CHAPTER_STYLE_REPAIR_BATCH_SIZE,
   ChapterStyleRepairRequestError,
   requestChapterStyleRepair,
+  type ChapterStyleEdit,
   type ChapterStyleRepairIssue,
 } from "../chapter_style_repair.js";
 import type { ToolExecutionContext } from "./types.js";
@@ -89,6 +96,9 @@ function saveDraftCheckpoint(
 
 export function handleBeginChapterDraft({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "begin_chapter_draft");
+  if (context.scenePipelineSettings?.enabled === false) {
+    throw new Error("场景链当前已关闭；请直接使用 propose_document、propose_document_patch 或可用的隔离正文工具完成文档");
+  }
   if (context.chapterSceneDraft) throw new Error("已有章节场景草稿正在进行；请完成提案后再开始下一章");
   const path = requireString(input.path, "path");
   if (!isScenePipelineDocument(path)) throw new Error("逐场景正文草稿只能写入 chapters/ 或 side/");
@@ -327,18 +337,6 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
     throw new Error(`隔离正文 Writer 连续两次超出本场上限 ${maximumCharacters} 字；请收紧 notes 中的事件范围后重试`);
   }
   rejectCompressedPlaceholder(generated.content, "隔离正文 Writer content");
-  const generationStyleError = sceneMannerismGateError(generated.content);
-  if (generationStyleError) {
-    context.isolatedPendingScene = undefined;
-    return JSON.stringify({
-      status: "style_revision_required",
-      code: "SCENE_STYLE_DENSE",
-      error: generationStyleError,
-      sceneId,
-      complete: false,
-      message: "本场未写入草稿。保持原场景事实与目标，用同一 sceneId 重新生成；直接陈述成立事实，不再使用命中的否定—改判或说明式句法。",
-    });
-  }
   context.isolatedPendingScene = {
     forPath: draft.path,
     sceneId,
@@ -423,7 +421,7 @@ async function acceptChapterScene(args: {
   // AA-repeat generation bug ("S。S。") — objective defect with a mechanical fix:
   // dedupe in-tool instead of spending a full round-trip on regeneration.
   const dedup = removeAdjacentDuplicateSentences(args.submitted);
-  const content = dedup.text;
+  let content = dedup.text;
   const residualDuplicates = findAdjacentDuplicateSentences(content);
   if (residualDuplicates.length) {
     // Duplicates spanning a line boundary that the remover can't safely fix — rare fallback bounce.
@@ -436,6 +434,14 @@ async function acceptChapterScene(args: {
       message: "本场未入库；保留 notes，用同一 sceneId 重新调用 write_chapter_scene。",
     });
   }
+  const sceneStyleRepair = await autoRepairSparseSceneStyle({
+    project,
+    store,
+    context,
+    draft,
+    content,
+  });
+  content = sceneStyleRepair.content;
   const styleError = sceneMannerismGateError(content);
   if (styleError) {
     return JSON.stringify({
@@ -444,7 +450,12 @@ async function acceptChapterScene(args: {
       error: styleError,
       sceneId,
       complete: false,
-      message: "本场未写入草稿。只改门禁命中的句子后，用同一 sceneId 重新提交；保留场景事实、因果和人物选择。",
+      styleIssueCount: sceneStyleRepair.initialBlockers,
+      localRepairAttempts: sceneStyleRepair.attempts,
+      ...(sceneStyleRepair.errors.length ? { localRepairErrors: sceneStyleRepair.errors } : {}),
+      message: sceneStyleRepair.dense
+        ? `本场有 ${sceneStyleRepair.initialBlockers} 个硬门禁句，超过局部修订单批上限，未写入草稿。尽量只重写这些句子；若无法保持上下文连贯，再用同一 sceneId 重写本场，保留场景事实、因果和人物选择。`
+        : "本场的逐句修订未能通过复检，尚未写入草稿。先只改仍命中的句子；确实无法局部消除时，才用同一 sceneId 重写本场，保留场景事实、因果和人物选择。",
     });
   }
   // Experimental best-of-N prose sampling: the submitted scene is candidate 0;
@@ -493,7 +504,19 @@ async function acceptChapterScene(args: {
     sceneVividness: formatVividnessSummary(sceneVividness),
     ...(styleFeedback.length ? { styleFeedback } : {}),
     ...(candidateReport ? { candidateSampling: candidateReport } : {}),
-    ...(dedup.removed.length ? { autoFixes: { duplicateSentencesRemoved: dedup.removed.slice(0, 5) } } : {}),
+    ...(dedup.removed.length || sceneStyleRepair.edits.length
+      ? {
+        autoFixes: {
+          ...(dedup.removed.length ? { duplicateSentencesRemoved: dedup.removed.slice(0, 5) } : {}),
+          ...(sceneStyleRepair.edits.length
+            ? {
+              sceneStyleEdits: sceneStyleRepair.edits,
+              sceneStyleRepairAttempts: sceneStyleRepair.attempts,
+            }
+            : {}),
+        },
+      }
+      : {}),
     // When a rewrite wins, the model's own submission is NOT what entered the
     // draft — return the stored text so later inspect/revise work on real bytes.
     ...(args.exposeCandidateContent && candidateReport?.chosen === "rewrite" ? { content: selectedContent } : {}),
@@ -504,6 +527,9 @@ async function acceptChapterScene(args: {
         : "当前没有未写 scene guide；章节目标已抵达则 inspect_chapter_draft，否则先补充下一场引导。",
       dedup.removed.length
         ? "autoFixes 中的相邻复读句已在入稿时各删至一句；本场后续精确替换以入稿文本为准。"
+        : "",
+      sceneStyleRepair.edits.length
+        ? "autoFixes 中的门禁句已逐句替换并通过复检；本场事实与状态保留，后续精确替换以列出的 replace 文本为准。"
         : "",
       candidateReport?.chosen === "rewrite"
         ? "候选采样选中了重写稿并已写入草稿（见 content 字段）；本场后续审阅与精确替换一律以该文本为准，不要引用你提交的原稿字句。"
@@ -721,6 +747,151 @@ function styleRepairIssues(content: string, blockers: ProseStyleIssue[]): Chapte
     after: content.slice(issue.end, Math.min(content.length, issue.end + 100)).trim(),
     instruction: [issue.reason, ...issue.suggestions.slice(0, 2)].filter(Boolean).join("；"),
   }));
+}
+
+const SPARSE_SCENE_STYLE_REPAIR_LIMIT = CHAPTER_STYLE_REPAIR_BATCH_SIZE;
+const SPARSE_SCENE_STYLE_REPAIR_MAX_REQUESTS = 2;
+
+function sceneStyleBlockers(content: string): ProseStyleIssue[] {
+  return analyzeProseStyle(content).filter(issue =>
+    issue.severity === "error" && isHardBlockSubtype(issue.subtype),
+  );
+}
+
+function applyExactSceneStyleEdits(
+  content: string,
+  blockers: ProseStyleIssue[],
+  edits: ChapterStyleEdit[],
+): { content: string; edits: ChapterStyleEdit[] } {
+  const allowed = new Set(blockers.map(issue => issue.sentence));
+  const replacements: Array<ChapterStyleEdit & { start: number; end: number }> = [];
+  const seen = new Set<string>();
+  for (const edit of edits.slice(0, SPARSE_SCENE_STYLE_REPAIR_LIMIT)) {
+    const search = edit.search.trim();
+    const replace = edit.replace.trim();
+    if (!allowed.has(search) || seen.has(search) || !replace || replace === search) continue;
+    if (replace.length > Math.max(500, search.length * 3) || /^#{1,6}\s/mu.test(replace)) continue;
+    const start = content.indexOf(search);
+    if (start < 0 || content.indexOf(search, start + search.length) >= 0) continue;
+    seen.add(search);
+    replacements.push({ search, replace, start, end: start + search.length });
+  }
+  replacements.sort((a, b) => b.start - a.start);
+  let revised = content;
+  let previousStart = content.length;
+  const applied: ChapterStyleEdit[] = [];
+  for (const edit of replacements) {
+    if (edit.end > previousStart) continue;
+    revised = `${revised.slice(0, edit.start)}${edit.replace}${revised.slice(edit.end)}`;
+    previousStart = edit.start;
+    applied.push({ search: edit.search, replace: edit.replace });
+  }
+  return { content: revised, edits: applied.reverse() };
+}
+
+async function autoRepairSparseSceneStyle(args: {
+  project: WriterProject;
+  store: WriterStore;
+  context: ToolExecutionContext;
+  draft: ChapterSceneDraft;
+  content: string;
+}): Promise<{
+  content: string;
+  initialBlockers: number;
+  attempts: number;
+  edits: ChapterStyleEdit[];
+  errors: string[];
+  dense: boolean;
+}> {
+  let content = args.content;
+  let blockers = sceneStyleBlockers(content);
+  const initialBlockers = blockers.length;
+  const repairer = args.context.chapterStyleRepairer;
+  if (!blockers.length || !repairer) {
+    return {
+      content,
+      initialBlockers,
+      attempts: 0,
+      edits: [],
+      errors: [],
+      dense: blockers.length > SPARSE_SCENE_STYLE_REPAIR_LIMIT,
+    };
+  }
+  if (blockers.length > SPARSE_SCENE_STYLE_REPAIR_LIMIT) {
+    return {
+      content,
+      initialBlockers,
+      attempts: 0,
+      edits: [],
+      errors: [],
+      dense: true,
+    };
+  }
+
+  const runRepair = repairer.run ?? requestChapterStyleRepair;
+  const models = [repairer.model, repairer.fallbackModel]
+    .filter((model): model is NonNullable<typeof model> => Boolean(model))
+    .filter((model, index, all) => all.findIndex(candidate =>
+      candidate.baseUrl === model.baseUrl && candidate.model === model.model
+    ) === index);
+  const styleEvidence = chapterStyleEvidence(args, args.draft);
+  const appliedEdits: ChapterStyleEdit[] = [];
+  const errors: string[] = [];
+  let attempts = 0;
+  while (
+    blockers.length
+    && blockers.length <= SPARSE_SCENE_STYLE_REPAIR_LIMIT
+    && attempts < SPARSE_SCENE_STYLE_REPAIR_MAX_REQUESTS
+    && models.length
+  ) {
+    const model = models[Math.min(attempts, models.length - 1)];
+    attempts += 1;
+    try {
+      const repaired = await runRepair(model, {
+        issues: styleRepairIssues(content, blockers),
+        chapterGoal: args.draft.chapterGoal,
+        styleEvidence,
+      }, repairer.signal);
+      if (repaired.usage) {
+        args.context.modelUsageReporter?.(model, repaired.usage, {
+          callKind: "scene_style_repair",
+          requestComponents: isolatedRequestComponent(
+            "隔离单场逐句修订请求",
+            repaired.requestCharacters,
+            "scene_style_repair",
+          ),
+        });
+      }
+      const applied = applyExactSceneStyleEdits(content, blockers, repaired.edits);
+      if (!applied.edits.length) {
+        errors.push("局部风格修订没有提供可安全应用的唯一精确替换");
+        continue;
+      }
+      content = applied.content;
+      appliedEdits.push(...applied.edits);
+      blockers = sceneStyleBlockers(content);
+    } catch (error) {
+      if (error instanceof ChapterStyleRepairRequestError && error.usage) {
+        args.context.modelUsageReporter?.(model, error.usage, {
+          callKind: "scene_style_repair_failed",
+          requestComponents: isolatedRequestComponent(
+            "失败的隔离单场逐句修订请求",
+            error.requestCharacters,
+            "scene_style_repair_failed",
+          ),
+        });
+      }
+      errors.push(error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240));
+    }
+  }
+  return {
+    content,
+    initialBlockers,
+    attempts,
+    edits: appliedEdits,
+    errors,
+    dense: blockers.length > SPARSE_SCENE_STYLE_REPAIR_LIMIT,
+  };
 }
 
 function isolatedRequestComponent(label: string, characters: number, callKind: string) {

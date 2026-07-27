@@ -171,6 +171,39 @@ test("--no-token server mode disables public API authentication only when explic
       });
       const disconnectedPayload = await disconnectedHealth.json() as { publicOrigin: string | null };
       assert.equal(disconnectedPayload.publicOrigin, null);
+      const shareResponse = await fetch(`http://127.0.0.1:${protectedPort}/api/share/readonly`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${protectedServer.token}` },
+      });
+      assert.equal(shareResponse.status, 200);
+      const share = await shareResponse.json() as { token: string; accessMode: string };
+      assert.ok(share.token.length >= 24);
+      assert.equal(share.accessMode, "readonly");
+      const readonlyState = await fetch(`http://127.0.0.1:${protectedPort}/api/state`, {
+        headers: { authorization: `Bearer ${share.token}` },
+      });
+      assert.equal(readonlyState.status, 200);
+      assert.equal((await readonlyState.json() as { accessMode: string }).accessMode, "readonly");
+      const readonlyWrite = await fetch(`http://127.0.0.1:${protectedPort}/api/agent-settings`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${share.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ permissionMode: "auto" }),
+      });
+      assert.equal(readonlyWrite.status, 403);
+      assert.match(await readonlyWrite.text(), /只读模式/);
+      const rotatedResponse = await fetch(`http://127.0.0.1:${protectedPort}/api/share/readonly`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${protectedServer.token}` },
+      });
+      const rotated = await rotatedResponse.json() as { token: string };
+      assert.notEqual(rotated.token, share.token);
+      const expiredReadonly = await fetch(`http://127.0.0.1:${protectedPort}/api/health`, {
+        headers: { authorization: `Bearer ${share.token}` },
+      });
+      assert.equal(expiredReadonly.status, 401);
       assert.ok(protectedServer.token.length >= 24);
     } finally {
       await protectedServer.close();
@@ -182,6 +215,8 @@ test("--no-token server mode disables public API authentication only when explic
       assert.equal(openServer.token, "");
       const allowed = await fetch(`http://127.0.0.1:${openPort}/api/health`);
       assert.equal(allowed.status, 200);
+      const unsafeShare = await fetch(`http://127.0.0.1:${openPort}/api/share/readonly`, { method: "POST" });
+      assert.equal(unsafeShare.status, 400);
     } finally {
       await openServer.close();
     }

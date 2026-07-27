@@ -133,6 +133,17 @@ test("advanceTodosAfterProposal closes single-scene soft checklist and stops", (
   assert.equal(todos.every(item => item.status === "completed"), true);
 });
 
+test("advanceTodosAfterProposal does not treat same-document scene todos as new deliverables", () => {
+  const { todos, shouldContinue } = advanceTodosAfterProposal([
+    { id: "t2", content: "规划第二章场景顺序", status: "in_progress" },
+    { id: "t3", content: "撰写千夏苏醒与适应", status: "pending" },
+    { id: "t4", content: "撰写与父亲的长谈", status: "pending" },
+    { id: "t5", content: "终审氛围与风格", status: "pending" },
+  ], false);
+  assert.equal(shouldContinue, false);
+  assert.equal(todos.every(item => item.status === "completed"), true);
+});
+
 test("persistCompletedCharacterTaskTodos closes todos after a character save", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
@@ -199,9 +210,10 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     const project = WriterProject.init(root, "测试");
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "ask",
-      writingMode: "delegated",
+      writingMode: "fast",
       characterEvolutionEnabled: true,
       scenePipeline: {
+        enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
       },
@@ -211,6 +223,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       writingMode: "fast",
       characterEvolutionEnabled: false,
       scenePipeline: {
+        enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4,
       },
@@ -220,6 +233,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       writingMode: "fast",
       characterEvolutionEnabled: false,
       scenePipeline: {
+        enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 2,
       },

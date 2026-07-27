@@ -16,6 +16,8 @@ export const MAX_ISOLATED_WRITER_MAX_RATIO = 3;
 export const DEFAULT_ISOLATED_WRITER_MAX_RATIO = 2;
 
 export interface ScenePipelineSettings {
+  /** Whether the optional multi-scene chapter draft pipeline may be used. */
+  enabled: boolean;
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
@@ -99,9 +101,10 @@ const SCENE_PIPELINE_TODO_SIGNATURES = [
 
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
-  writingMode: "delegated",
+  writingMode: "fast",
   characterEvolutionEnabled: true,
   scenePipeline: {
+    enabled: false,
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
     maxScenes: 5,
@@ -130,6 +133,7 @@ export function settingsPath(project: WriterProject): string {
 }
 
 export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSettings>): ScenePipelineSettings {
+  const enabled = value?.enabled === true;
   const integer = (candidate: unknown, fallback: number) => Number.isInteger(candidate)
     ? Math.min(ABSOLUTE_MAX_SCENES, Math.max(1, Number(candidate)))
     : fallback;
@@ -148,6 +152,7 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
     ? Math.round(Math.min(MAX_ISOLATED_WRITER_MAX_RATIO, Math.max(MIN_ISOLATED_WRITER_MAX_RATIO, rawWriterRatio)) * 10) / 10
     : DEFAULT_SETTINGS.scenePipeline.isolatedWriterMaxRatio;
   return {
+    enabled,
     preferredMinScenes, preferredMaxScenes, maxScenes,
     notesMaxCharacters, isolatedWriterMaxRatio, isolatedWriter, candidateCount,
   };
@@ -477,7 +482,10 @@ export function isFurtherWritingTodo(content: string): boolean {
  * "submit proposal" checkboxes. If further writing steps remain, promote the next
  * one and signal the agent loop to continue instead of finalizing the whole plan.
  */
-export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
+export function advanceTodosAfterProposal(
+  todos: AgentTodoItem[],
+  allowFurtherDocumentDelivery = true,
+): {
   todos: AgentTodoItem[];
   changed: boolean;
   shouldContinue: boolean;
@@ -498,7 +506,9 @@ export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
       changed = true;
     }
   }
-  const furtherPending = next.filter(item => item.status === "pending" && isFurtherWritingTodo(item.content));
+  const furtherPending = allowFurtherDocumentDelivery
+    ? next.filter(item => item.status === "pending" && isFurtherWritingTodo(item.content))
+    : [];
   if (furtherPending.length) {
     // Only one in_progress at a time.
     for (const item of next) {
@@ -571,10 +581,14 @@ export function persistAdvancedTodosAfterProposal(
   },
   sessionId: string,
   emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
+  allowFurtherDocumentDelivery = true,
 ): { todos: AgentTodoItem[]; shouldContinue: boolean } {
   const current = store.sessionTodos(sessionId);
   if (!current.length) return { todos: current, shouldContinue: false };
-  const { todos, changed, shouldContinue } = advanceTodosAfterProposal(current);
+  const { todos, changed, shouldContinue } = advanceTodosAfterProposal(
+    current,
+    allowFurtherDocumentDelivery,
+  );
   if (changed) {
     store.saveSessionTodos(sessionId, todos);
     emit?.({ type: "todos", todos });

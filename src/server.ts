@@ -228,6 +228,7 @@ export async function startWriterServer(options: {
   const requireToken = options.requireToken !== false;
   const token = requireToken ? randomBytes(24).toString("base64url") : "";
   const localBypassToken = randomBytes(24).toString("base64url");
+  let readonlyToken = "";
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs();
   let publicOrigin: string | null | undefined;
@@ -253,11 +254,21 @@ export async function startWriterServer(options: {
     }
     const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
     const localBypass = context.req.header("x-writer-local-access") ?? "";
-    if (!tokensEqual(provided, token) && !tokensEqual(localBypass, localBypassToken)) {
+    const ownerAccess = tokensEqual(provided, token) || tokensEqual(localBypass, localBypassToken);
+    const readonlyAccess = Boolean(readonlyToken) && tokensEqual(provided, readonlyToken);
+    if (!ownerAccess && !readonlyAccess) {
       return context.json({ error: "访问令牌无效或已失效" }, 401);
+    }
+    if (readonlyAccess && context.req.method !== "GET") {
+      return context.json({ error: "此分享链接为只读模式，不能执行写入操作" }, 403);
     }
     await next();
   });
+
+  const requestAccessMode = (authorization: string | undefined): "owner" | "readonly" => {
+    const provided = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+    return readonlyToken && tokensEqual(provided, readonlyToken) ? "readonly" : "owner";
+  };
 
   app.get("/api/health", (context) => context.json({
     ok: true,
@@ -265,12 +276,28 @@ export async function startWriterServer(options: {
     ...(publicOrigin !== undefined ? { publicOrigin } : {}),
   }));
 
+  app.post("/api/share/readonly", (context) => {
+    if (!requireToken) {
+      return context.json({ error: "当前服务未启用访问令牌，无法创建安全的只读分享链接" }, 400);
+    }
+    // Rotation is intentional: at most one read-only bearer link is valid.
+    readonlyToken = randomBytes(24).toString("base64url");
+    return context.json({ token: readonlyToken, accessMode: "readonly" as const });
+  });
+
+  app.delete("/api/share/readonly", (context) => {
+    readonlyToken = "";
+    return context.json({ ok: true });
+  });
+
   app.get("/api/state", (context) => {
+    const accessMode = requestAccessMode(context.req.header("authorization"));
     const requested = context.req.query("session");
     const sessionId = requested && options.store.sessionExists(requested)
       ? requested
       : options.store.latestSession() ?? options.store.createSession();
     return context.json({
+      accessMode,
       config: options.project.config(),
       documents: options.project.listDocuments(),
       documentFolders: options.project.listDocumentFolders(),
@@ -708,6 +735,9 @@ export async function startWriterServer(options: {
         return context.json({ error: "writingMode 仅支持 delegated、fast" }, 400);
       }
       if (body.scenePipeline !== undefined) {
+        if (body.scenePipeline.enabled !== undefined && typeof body.scenePipeline.enabled !== "boolean") {
+          return context.json({ error: "scenePipeline.enabled 必须是布尔值" }, 400);
+        }
         const values = [
           body.scenePipeline.preferredMinScenes,
           body.scenePipeline.preferredMaxScenes,

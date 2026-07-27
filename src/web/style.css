@@ -5182,6 +5182,38 @@ a:focus-visible {
 .workspace-topbar .header-right { min-width: 0; }
 .workspace-topbar .header-left { flex: 1 1 auto; }
 .workspace-topbar .header-right { flex: 0 1 auto; }
+.readonly-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 999px;
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+.readonly-banner {
+  position: absolute;
+  z-index: 44;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: calc(100vw - 32px);
+  padding: 7px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 94%, var(--accent));
+  color: var(--text-dim);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  pointer-events: none;
+}
 .workspace-topbar .logo { flex: 0 0 auto; }
 .workspace-topbar .logo-mark {
   width: 30px;

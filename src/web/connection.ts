@@ -358,6 +358,19 @@ export function buildEntryUrl(kind: "lan" | "public"): string | null {
   return `${publicBase}/#${params.toString()}`;
 }
 
+/** Build a bearer link that authenticates with the server's read-only token. */
+export function buildReadonlyEntryUrl(readonlyToken: string): string | null {
+  const safeToken = readonlyToken.trim();
+  if (!safeToken) return null;
+  const base = publicBase || activeBase || lanBase
+    || (typeof location !== "undefined" ? normalizeBase(location.origin) : "");
+  if (!base || !isHttpUrl(base)) return null;
+  const params = new URLSearchParams({ token: safeToken, readonly: "1" });
+  if (publicBase && base === publicBase && lanBase) params.set("lan", lanBase);
+  if (lanBase && base === lanBase && publicBase) params.set("public", publicBase);
+  return `${normalizeBase(base)}/#${params.toString()}`;
+}
+
 /**
  * 用户手动指定通道偏好。
  * - auto：局域网优先，失败走公网
