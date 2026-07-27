@@ -418,6 +418,30 @@ type ProseGateRule = {
 };
 type ProseGateRuleDraft = Pick<ProseGateRule, "id" | "instruction" | "severity" | "enabled" | "sourceFeedback">
   & { isNew: boolean };
+type ContinuityFact = {
+  id: number;
+  statement: string;
+  kind: "milieu" | "character" | "location" | "event" | "object" | "relationship" | "organization" | "other";
+  scopeKind: "global" | "era" | "arc" | "chapter" | "location" | "character";
+  scopeValue: string;
+  validFrom: string;
+  validUntil: string;
+  epistemic: "objective" | "character_knowledge" | "rumor";
+  knownBy: string[];
+  importance: number;
+  status: "active" | "conflict" | "pending" | "stale" | "retracted";
+  sourcePath: string;
+  sourceHash: string;
+  sourceEvidence: string;
+  sourceAnchorId: string;
+  sourceProposalId?: number;
+  conflictsWith: number[];
+  supersedes: number[];
+  createdAt: string;
+  updatedAt: string;
+};
+type ContinuityFactDraft = Omit<ContinuityFact, "id" | "sourceHash" | "sourceAnchorId" | "sourceProposalId" | "createdAt" | "updatedAt">
+  & { id?: number };
 type State = {
   accessMode?: "owner" | "readonly";
   config: { title: string; style?: string };
@@ -445,6 +469,7 @@ type State = {
   todos?: AgentTodoItem[];
   agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; scenePipeline: ScenePipelineSettings };
   proseGateRules?: ProseGateRule[];
+  continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;
 };
@@ -480,7 +505,7 @@ const EMPTY_CHARACTER: CharacterDraft = {
 /** Visual UI themes (workspace chrome). Not writing style templates. */
 type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
 type WorkspaceMode = "split" | "editor-focus" | "agent-focus";
-type ManagementView = "characters" | "sessions" | "models" | "prose-gates";
+type ManagementView = "characters" | "sessions" | "models" | "prose-gates" | "continuity-facts";
 
 type UiTheme = {
   id: UiThemeId;
@@ -616,12 +641,13 @@ function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggleDocume
   );
 }
 
-function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRules }: {
+function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRules, onContinuityFacts }: {
   open: boolean;
   connectionAvailable: boolean;
   onClose: () => void;
   onSelect: (section: SettingsSection) => void;
   onReviewRules: () => void;
+  onContinuityFacts: () => void;
 }) {
   if (!open) return null;
   return (
@@ -631,6 +657,7 @@ function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRu
         <button role="menuitem" onClick={() => onSelect("writing")}><Pencil size={16} />写作行为</button>
         <button role="menuitem" onClick={() => onSelect("style")}><WandSparkles size={16} />写作风格</button>
         <button role="menuitem" onClick={onReviewRules}><ShieldCheck size={16} />作者复审规则</button>
+        <button role="menuitem" onClick={onContinuityFacts}><Library size={16} />连续性事实</button>
         <button role="menuitem" disabled={!connectionAvailable} onClick={() => onSelect("connection")}><Wifi size={16} />连接设置</button>
         <button role="menuitem" onClick={() => onSelect("appearance")}><Sun size={16} />界面主题</button>
       </div>
@@ -1777,6 +1804,7 @@ function WorkspaceTopbar({
   onCloseSettings,
   onSelectSettings,
   onReviewRules,
+  onContinuityFacts,
   onRefresh,
   onModeChange,
   onToggleDocuments,
@@ -1803,6 +1831,7 @@ function WorkspaceTopbar({
   onCloseSettings: () => void;
   onSelectSettings: (section: SettingsSection) => void;
   onReviewRules: () => void;
+  onContinuityFacts: () => void;
   onRefresh: () => void;
   onModeChange: (mode: WorkspaceMode) => void;
   onToggleDocuments: () => void;
@@ -1859,6 +1888,7 @@ function WorkspaceTopbar({
             onClose={onCloseSettings}
             onSelect={onSelectSettings}
             onReviewRules={onReviewRules}
+            onContinuityFacts={onContinuityFacts}
           />
         </div>}
         <IconButton label="刷新工作区" onClick={onRefresh}><RefreshCw size={17} /></IconButton>
@@ -1926,6 +1956,8 @@ function App() {
   const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
   const [proseGateDraft, setProseGateDraft] = useState<ProseGateRuleDraft | null>(null);
   const [proseGateBusy, setProseGateBusy] = useState(false);
+  const [continuityFactDraft, setContinuityFactDraft] = useState<ContinuityFactDraft | null>(null);
+  const [continuityFactBusy, setContinuityFactBusy] = useState(false);
   const [managementView, setManagementView] = useState<ManagementView | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
@@ -3980,6 +4012,12 @@ function App() {
     setManagementView("prose-gates");
   }
 
+  function openContinuityFacts() {
+    setSettingsMenuOpen(false);
+    setContinuityFactDraft(null);
+    setManagementView("continuity-facts");
+  }
+
   async function saveProseGateRule() {
     if (!proseGateDraft) return;
     setProseGateBusy(true);
@@ -4035,6 +4073,43 @@ function App() {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setProseGateBusy(false);
+    }
+  }
+
+  async function saveContinuityFact() {
+    if (!continuityFactDraft) return;
+    setContinuityFactBusy(true);
+    setError("");
+    try {
+      const result = await api<{ facts: ContinuityFact[] }>("/api/continuity-facts", {
+        method: "POST",
+        body: JSON.stringify(continuityFactDraft),
+      });
+      setState(current => current ? { ...current, continuityFacts: result.facts } : current);
+      setContinuityFactDraft(null);
+      setNotice("连续性事实已保存，将从下一次任务开始进入相关事实包。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setContinuityFactBusy(false);
+    }
+  }
+
+  async function retractContinuityFact(fact: ContinuityFact) {
+    if (!confirm(`撤回事实“${fact.statement}”？原始记录仍会保留以便追溯。`)) return;
+    setContinuityFactBusy(true);
+    setError("");
+    try {
+      const result = await api<{ facts: ContinuityFact[] }>(
+        `/api/continuity-facts/${fact.id}`,
+        { method: "DELETE" },
+      );
+      setState(current => current ? { ...current, continuityFacts: result.facts } : current);
+      if (continuityFactDraft?.id === fact.id) setContinuityFactDraft(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setContinuityFactBusy(false);
     }
   }
 
@@ -4244,6 +4319,7 @@ function App() {
         onCloseSettings={() => setSettingsMenuOpen(false)}
         onSelectSettings={openSettings}
         onReviewRules={openProseGateRules}
+        onContinuityFacts={openContinuityFacts}
         onRefresh={() => void refresh(state.sessionId)}
         onModeChange={setWorkspaceMode}
         onToggleDocuments={() => setDocumentsCollapsed((value) => !value)}
@@ -6105,7 +6181,9 @@ function App() {
                   ? "角色卡"
                   : managementView === "sessions"
                     ? "会话"
-                    : "作者复审规则"}</h2>
+                    : managementView === "prose-gates"
+                      ? "作者复审规则"
+                      : "连续性事实"}</h2>
               </div>
               <div className="management-actions">
                 {managementView === "characters" ? (
@@ -6135,7 +6213,7 @@ function App() {
                       }} title="新建会话并清除当前 step 渲染"><Plus size={15} />新建会话</button>
                     )}
                   </>
-                ) : (
+                ) : managementView === "prose-gates" ? (
                   <button
                     className="primary"
                     disabled={proseGateBusy || readOnly || Boolean(proseGateDraft)}
@@ -6148,6 +6226,27 @@ function App() {
                       isNew: true,
                     })}
                   ><Plus size={15} />新增规则</button>
+                ) : (
+                  <button
+                    className="primary"
+                    disabled={continuityFactBusy || readOnly || Boolean(continuityFactDraft)}
+                    onClick={() => setContinuityFactDraft({
+                      statement: "",
+                      kind: "milieu",
+                      scopeKind: "global",
+                      scopeValue: "",
+                      validFrom: "",
+                      validUntil: "",
+                      epistemic: "objective",
+                      knownBy: [],
+                      importance: 50,
+                      status: "active",
+                      sourcePath: "",
+                      sourceEvidence: "",
+                      conflictsWith: [],
+                      supersedes: [],
+                    })}
+                  ><Plus size={15} />新增事实</button>
                 )}
                 <button
                   className="icon"
@@ -6155,6 +6254,7 @@ function App() {
                   onClick={() => {
                     setManagementView(null);
                     setProseGateDraft(null);
+                    setContinuityFactDraft(null);
                     setSessionBatchMode(false);
                     setSelectedSessionIds(new Set());
                   }}
@@ -6309,7 +6409,7 @@ function App() {
                   {state.sessions.length === 0 && <div className="management-empty">暂无会话</div>}
                 </div>
               </div>
-            ) : (
+            ) : managementView === "prose-gates" ? (
               <div className="prose-gate-manager">
                 <p className="prose-gate-intro">
                   项目级语义复审会在正文出口运行。确定错误可设为阻断；偏好、倾向和可能误报的规则建议使用提醒。
@@ -6436,6 +6536,201 @@ function App() {
                   ))}
                   {(state.proseGateRules ?? []).length === 0 && (
                     <div className="management-empty">暂无作者复审规则，可以从右上角新增。</div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="continuity-fact-manager">
+                <p className="prose-gate-intro">
+                  这是原文的可追溯连续性索引，不替代正文和设定。环境事实记录长期生活常识；离散事实记录局部人物、事件与物品状态。冲突项不会自动覆盖旧事实。
+                </p>
+                {continuityFactDraft && (
+                  <div className="continuity-fact-editor">
+                    <label className="continuity-fact-statement">
+                      <span>事实陈述</span>
+                      <textarea
+                        rows={3}
+                        maxLength={280}
+                        value={continuityFactDraft.statement}
+                        disabled={continuityFactBusy}
+                        placeholder="写成脱离上下文仍然成立的一条事实。"
+                        onChange={(event) => setContinuityFactDraft(current => current
+                          ? { ...current, statement: event.target.value }
+                          : current)}
+                      />
+                    </label>
+                    <div className="continuity-fact-editor-grid">
+                      <label>
+                        <span>类型</span>
+                        <select value={continuityFactDraft.kind} disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, kind: event.target.value as ContinuityFact["kind"] }
+                            : current)}>
+                          <option value="milieu">环境常识</option>
+                          <option value="character">角色</option>
+                          <option value="location">地点</option>
+                          <option value="event">事件</option>
+                          <option value="object">物品</option>
+                          <option value="relationship">关系</option>
+                          <option value="organization">组织</option>
+                          <option value="other">其他</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>作用域</span>
+                        <select value={continuityFactDraft.scopeKind} disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, scopeKind: event.target.value as ContinuityFact["scopeKind"] }
+                            : current)}>
+                          <option value="global">全局</option>
+                          <option value="era">年代</option>
+                          <option value="arc">剧情线</option>
+                          <option value="chapter">章节</option>
+                          <option value="location">地点</option>
+                          <option value="character">角色</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>事实性质</span>
+                        <select value={continuityFactDraft.epistemic} disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, epistemic: event.target.value as ContinuityFact["epistemic"] }
+                            : current)}>
+                          <option value="objective">客观事实</option>
+                          <option value="character_knowledge">人物认知</option>
+                          <option value="rumor">传闻／不确定</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>状态</span>
+                        <select value={continuityFactDraft.status} disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, status: event.target.value as ContinuityFact["status"] }
+                            : current)}>
+                          <option value="active">有效</option>
+                          <option value="pending">待确认</option>
+                          <option value="conflict">冲突</option>
+                          <option value="stale">来源过期</option>
+                          <option value="retracted">已撤回</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>作用域值</span>
+                        <input value={continuityFactDraft.scopeValue} disabled={continuityFactBusy}
+                          placeholder="如 北港、第五章、角色 ID"
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, scopeValue: event.target.value }
+                            : current)} />
+                      </label>
+                      <label>
+                        <span>重要度</span>
+                        <input type="number" min={0} max={100} value={continuityFactDraft.importance}
+                          disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, importance: Math.max(0, Math.min(100, Number(event.target.value) || 0)) }
+                            : current)} />
+                      </label>
+                      <label>
+                        <span>从何时有效</span>
+                        <input value={continuityFactDraft.validFrom} disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, validFrom: event.target.value }
+                            : current)} />
+                      </label>
+                      <label>
+                        <span>到何时失效</span>
+                        <input value={continuityFactDraft.validUntil} disabled={continuityFactBusy}
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, validUntil: event.target.value }
+                            : current)} />
+                      </label>
+                    </div>
+                    <label>
+                      <span>知情角色</span>
+                      <input value={continuityFactDraft.knownBy.join("、")} disabled={continuityFactBusy}
+                        placeholder="用顿号或逗号分隔；公共客观事实可留空"
+                        onChange={(event) => setContinuityFactDraft(current => current
+                          ? { ...current, knownBy: event.target.value.split(/[、,，]/u).map(item => item.trim()).filter(Boolean) }
+                          : current)} />
+                    </label>
+                    <div className="continuity-fact-editor-grid source">
+                      <label>
+                        <span>来源文档</span>
+                        <input value={continuityFactDraft.sourcePath} disabled={continuityFactBusy}
+                          placeholder="可留空；自动提取时会记录"
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, sourcePath: event.target.value }
+                            : current)} />
+                      </label>
+                      <label>
+                        <span>连续原文证据</span>
+                        <input value={continuityFactDraft.sourceEvidence} disabled={continuityFactBusy}
+                          placeholder="填写来源时，证据必须存在于当前文档"
+                          onChange={(event) => setContinuityFactDraft(current => current
+                            ? { ...current, sourceEvidence: event.target.value }
+                            : current)} />
+                      </label>
+                    </div>
+                    <div className="prose-gate-editor-actions">
+                      <button className="primary" disabled={continuityFactBusy || !continuityFactDraft.statement.trim()}
+                        onClick={() => void saveContinuityFact()}><Save size={15} />保存</button>
+                      <button disabled={continuityFactBusy} onClick={() => setContinuityFactDraft(null)}>取消</button>
+                    </div>
+                  </div>
+                )}
+                <div className="continuity-fact-list">
+                  {(state.continuityFacts ?? []).map(fact => (
+                    <article className={`continuity-fact-card status-${fact.status}`} key={fact.id}>
+                      <div className="continuity-fact-card-head">
+                        <div>
+                          <span className={`continuity-fact-kind kind-${fact.kind}`}>
+                            {fact.kind === "milieu" ? "环境" : fact.kind}
+                          </span>
+                          <span className={`continuity-fact-status status-${fact.status}`}>{fact.status}</span>
+                          <small>#{fact.id} · 重要度 {fact.importance}</small>
+                        </div>
+                        <span>{fact.scopeKind}{fact.scopeValue ? ` · ${fact.scopeValue}` : ""}</span>
+                      </div>
+                      <p>{fact.statement}</p>
+                      <div className="continuity-fact-meta">
+                        <span>{fact.epistemic === "objective" ? "客观事实" : fact.epistemic === "rumor" ? "传闻" : "人物认知"}</span>
+                        {fact.knownBy.length > 0 && <span>知情：{fact.knownBy.join("、")}</span>}
+                        {fact.sourcePath && <span title={fact.sourceEvidence}>{fact.sourcePath}</span>}
+                        {(fact.conflictsWith.length > 0 || fact.supersedes.length > 0) && (
+                          <span>关联：{[...fact.conflictsWith, ...fact.supersedes].map(id => `#${id}`).join("、")}</span>
+                        )}
+                      </div>
+                      <div className="prose-gate-card-foot">
+                        <time dateTime={fact.updatedAt}>更新于 {new Date(fact.updatedAt).toLocaleString()}</time>
+                        <div>
+                          <button className="ghost" disabled={continuityFactBusy || readOnly || Boolean(continuityFactDraft)}
+                            onClick={() => setContinuityFactDraft({
+                              id: fact.id,
+                              statement: fact.statement,
+                              kind: fact.kind,
+                              scopeKind: fact.scopeKind,
+                              scopeValue: fact.scopeValue,
+                              validFrom: fact.validFrom,
+                              validUntil: fact.validUntil,
+                              epistemic: fact.epistemic,
+                              knownBy: fact.knownBy,
+                              importance: fact.importance,
+                              status: fact.status,
+                              sourcePath: fact.sourcePath,
+                              sourceEvidence: fact.sourceEvidence,
+                              conflictsWith: fact.conflictsWith,
+                              supersedes: fact.supersedes,
+                            })}><Pencil size={14} />编辑</button>
+                          {fact.status !== "retracted" && (
+                            <button className="ghost danger" disabled={continuityFactBusy || readOnly}
+                              onClick={() => void retractContinuityFact(fact)}><Trash2 size={14} />撤回</button>
+                          )}
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                  {(state.continuityFacts ?? []).length === 0 && (
+                    <div className="management-empty">暂无连续性事实。接受新的设定或正文后会增量提取，也可以手动添加。</div>
                   )}
                 </div>
               </div>

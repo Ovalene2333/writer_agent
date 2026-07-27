@@ -8,6 +8,7 @@ import type {
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
+import { documentSpans } from "./document_spans.js";
 import {
   applyCharacterChanges as applyCharacterChangesCore,
   applyCharacterInput,
@@ -24,6 +25,17 @@ import {
 import { OutlineStore } from "./outline.js";
 import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
+import {
+  CONTINUITY_FACT_EPISTEMIC_KINDS,
+  CONTINUITY_FACT_KINDS,
+  CONTINUITY_FACT_SCOPE_KINDS,
+  type ContinuityFact,
+  type ContinuityFactCandidate,
+  type ContinuityFactEpistemicKind,
+  type ContinuityFactKind,
+  type ContinuityFactScopeKind,
+  type ContinuityFactStatus,
+} from "./continuity_facts.js";
 
 type Row = Record<string, unknown>;
 type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
@@ -304,6 +316,34 @@ export class WriterStore {
         last_used_at TEXT NOT NULL,
         UNIQUE(session_id, cache_key)
       );
+      CREATE TABLE IF NOT EXISTS continuity_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        statement TEXT NOT NULL,
+        normalized_statement TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        scope_kind TEXT NOT NULL,
+        scope_value TEXT NOT NULL DEFAULT '',
+        valid_from TEXT NOT NULL DEFAULT '',
+        valid_until TEXT NOT NULL DEFAULT '',
+        epistemic TEXT NOT NULL DEFAULT 'objective',
+        known_by_json TEXT NOT NULL DEFAULT '[]',
+        importance INTEGER NOT NULL DEFAULT 50,
+        status TEXT NOT NULL DEFAULT 'active',
+        resume_status TEXT NOT NULL DEFAULT 'active',
+        source_path TEXT NOT NULL DEFAULT '',
+        source_hash TEXT NOT NULL DEFAULT '',
+        source_evidence TEXT NOT NULL DEFAULT '',
+        source_anchor_id TEXT NOT NULL DEFAULT '',
+        source_proposal_id INTEGER,
+        conflicts_with_json TEXT NOT NULL DEFAULT '[]',
+        supersedes_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS continuity_facts_status_scope
+        ON continuity_facts(status,scope_kind,scope_value,importance);
+      CREATE INDEX IF NOT EXISTS continuity_facts_source
+        ON continuity_facts(source_path,source_hash,status);
       CREATE TABLE IF NOT EXISTS session_context (
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
         active_document TEXT,
@@ -349,6 +389,13 @@ export class WriterStore {
       CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(path UNINDEXED, content);
     `);
     const revisionColumns = this.database.prepare("PRAGMA table_info(revisions)").all() as Row[];
+    const continuityFactColumns = this.database.prepare("PRAGMA table_info(continuity_facts)").all() as Row[];
+    if (!continuityFactColumns.some(column => column.name === "resume_status")) {
+      this.database.exec("ALTER TABLE continuity_facts ADD COLUMN resume_status TEXT NOT NULL DEFAULT 'active'");
+    }
+    if (!continuityFactColumns.some(column => column.name === "source_anchor_id")) {
+      this.database.exec("ALTER TABLE continuity_facts ADD COLUMN source_anchor_id TEXT NOT NULL DEFAULT ''");
+    }
     if (!revisionColumns.some(column => column.name === "created_file")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN created_file INTEGER NOT NULL DEFAULT 0");
     }
@@ -456,6 +503,216 @@ export class WriterStore {
         return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), digest: String(row.digest),
           ...(typeof row.path === "string" ? { path: row.path } : {}) };
       });
+  }
+
+  continuityFacts(options: {
+    statuses?: ContinuityFactStatus[];
+    sourcePath?: string;
+    limit?: number;
+  } = {}): ContinuityFact[] {
+    const statuses = options.statuses?.filter(status =>
+      ["active", "conflict", "pending", "stale", "retracted"].includes(status));
+    const where: string[] = [];
+    const values: Array<string | number> = [];
+    if (statuses?.length) {
+      where.push(`status IN (${statuses.map(() => "?").join(",")})`);
+      values.push(...statuses);
+    }
+    if (options.sourcePath) {
+      where.push("source_path=?");
+      values.push(options.sourcePath);
+    }
+    const limit = Math.max(1, Math.min(1_000, Math.round(options.limit ?? 300)));
+    values.push(limit);
+    return (this.database.prepare(`SELECT * FROM continuity_facts
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY CASE status WHEN 'conflict' THEN 0 WHEN 'pending' THEN 1 WHEN 'active' THEN 2 ELSE 3 END,
+        importance DESC,updated_at DESC,id DESC LIMIT ?`).all(...values) as Row[])
+      .map(row => continuityFactFromRow(row));
+  }
+
+  saveContinuityFact(input: Partial<ContinuityFact> & { statement: string }): ContinuityFact {
+    const statement = input.statement.trim().replace(/\s+/gu, " ").slice(0, 280);
+    if (!statement) throw new Error("事实陈述不能为空");
+    const kind = continuityEnum(input.kind, CONTINUITY_FACT_KINDS, "other");
+    const scopeKind = continuityEnum(input.scopeKind, CONTINUITY_FACT_SCOPE_KINDS, "global");
+    const epistemic = continuityEnum(input.epistemic, CONTINUITY_FACT_EPISTEMIC_KINDS, "objective");
+    const status = continuityStatus(input.status);
+    const now = new Date().toISOString();
+    const knownBy = continuityStrings(input.knownBy, 20);
+    const conflictsWith = continuityIds(input.conflictsWith);
+    const supersedes = continuityIds(input.supersedes);
+    const sourcePath = typeof input.sourcePath === "string" ? input.sourcePath.trim().slice(0, 500) : "";
+    const sourceEvidence = typeof input.sourceEvidence === "string" ? input.sourceEvidence.trim().slice(0, 500) : "";
+    const sourceContent = sourcePath && this.project.textFileExists(sourcePath)
+      ? this.project.readTextFile(sourcePath)
+      : "";
+    const sourceHash = sourceContent
+      ? this.project.hash(sourceContent)
+      : typeof input.sourceHash === "string" ? input.sourceHash : "";
+    if (sourcePath && sourceEvidence && sourceContent && !sourceContent.includes(sourceEvidence)) {
+      throw new Error("来源证据不在当前文档中");
+    }
+    const sourceAnchorId = sourceContent && sourceEvidence
+      ? continuityEvidenceAnchor(sourceContent, sourceHash, sourceEvidence)
+      : typeof input.sourceAnchorId === "string" ? input.sourceAnchorId : "";
+    let id = Number(input.id);
+    const values = [
+      statement,
+      normalizeContinuityStatement(statement),
+      kind,
+      scopeKind,
+      typeof input.scopeValue === "string" ? input.scopeValue.trim().slice(0, 160) : "",
+      typeof input.validFrom === "string" ? input.validFrom.trim().slice(0, 120) : "",
+      typeof input.validUntil === "string" ? input.validUntil.trim().slice(0, 120) : "",
+      epistemic,
+      JSON.stringify(knownBy),
+      Math.max(0, Math.min(100, Math.round(Number(input.importance ?? 50)) || 0)),
+      status,
+      status === "active" || status === "conflict" || status === "pending" ? status : "active",
+      sourcePath,
+      sourceHash,
+      sourceEvidence,
+      sourceAnchorId,
+      Number.isInteger(input.sourceProposalId) && Number(input.sourceProposalId) > 0 ? Number(input.sourceProposalId) : null,
+      JSON.stringify(conflictsWith),
+      JSON.stringify(supersedes),
+    ] as const;
+    if (Number.isInteger(id) && id > 0) {
+      const result = this.database.prepare(`UPDATE continuity_facts SET
+        statement=?,normalized_statement=?,kind=?,scope_kind=?,scope_value=?,valid_from=?,valid_until=?,
+        epistemic=?,known_by_json=?,importance=?,status=?,resume_status=?,source_path=?,source_hash=?,source_evidence=?,source_anchor_id=?,
+        source_proposal_id=?,conflicts_with_json=?,supersedes_json=?,updated_at=? WHERE id=?`)
+        .run(...values, now, id);
+      if (!result.changes) throw new Error("连续性事实不存在");
+    } else {
+      id = Number(this.database.prepare(`INSERT INTO continuity_facts(
+        statement,normalized_statement,kind,scope_kind,scope_value,valid_from,valid_until,epistemic,
+        known_by_json,importance,status,resume_status,source_path,source_hash,source_evidence,source_anchor_id,source_proposal_id,
+        conflicts_with_json,supersedes_json,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(...values, now, now).lastInsertRowid);
+    }
+    const row = this.database.prepare("SELECT * FROM continuity_facts WHERE id=?").get(id) as Row | undefined;
+    if (!row) throw new Error("连续性事实保存失败");
+    return continuityFactFromRow(row);
+  }
+
+  retractContinuityFact(id: number): ContinuityFact {
+    if (!Number.isInteger(id) || id <= 0) throw new Error("连续性事实 ID 无效");
+    const now = new Date().toISOString();
+    if (!this.database.prepare("UPDATE continuity_facts SET status='retracted',updated_at=? WHERE id=?").run(now, id).changes) {
+      throw new Error("连续性事实不存在");
+    }
+    return continuityFactFromRow(this.database.prepare("SELECT * FROM continuity_facts WHERE id=?").get(id) as Row);
+  }
+
+  /**
+   * Revalidate provenance after a document revision. Evidence that survived stays
+   * usable under the new hash; missing evidence becomes stale, never silently deleted.
+   */
+  refreshContinuityFactsForDocument(path: string, content: string): void {
+    const hash = this.project.hash(content);
+    const rows = this.database.prepare(`SELECT id,source_evidence,status,resume_status FROM continuity_facts
+      WHERE source_path=? AND status!='retracted'`).all(path) as Row[];
+    const now = new Date().toISOString();
+    const update = this.database.prepare(`UPDATE continuity_facts
+      SET source_hash=?,source_anchor_id=?,status=?,resume_status=?,updated_at=? WHERE id=?`);
+    for (const row of rows) {
+      const evidence = String(row.source_evidence ?? "");
+      const survives = Boolean(evidence && content.includes(evidence));
+      const oldStatus = String(row.status);
+      const oldResumeStatus = continuityStatus(row.resume_status);
+      const status = survives
+        ? oldStatus === "stale" ? oldResumeStatus : oldStatus
+        : "stale";
+      const resumeStatus = !survives && oldStatus !== "stale"
+        && (oldStatus === "active" || oldStatus === "conflict" || oldStatus === "pending")
+        ? oldStatus
+        : oldResumeStatus;
+      update.run(hash, survives ? continuityEvidenceAnchor(content, hash, evidence) : "", status, resumeStatus, now, Number(row.id));
+    }
+  }
+
+  moveContinuityFactsSource(fromPath: string, toPath: string, content: string): void {
+    const now = new Date().toISOString();
+    const hash = this.project.hash(content);
+    const rows = this.database.prepare(`SELECT id,source_evidence FROM continuity_facts
+      WHERE source_path=? AND status!='retracted'`).all(fromPath) as Row[];
+    const update = this.database.prepare(`UPDATE continuity_facts
+      SET source_path=?,source_hash=?,source_anchor_id=?,updated_at=? WHERE id=?`);
+    for (const row of rows) {
+      update.run(toPath, hash, continuityEvidenceAnchor(content, hash, String(row.source_evidence ?? "")), now, Number(row.id));
+    }
+  }
+
+  saveExtractedContinuityFacts(
+    path: string,
+    content: string,
+    proposalId: number,
+    candidates: ContinuityFactCandidate[],
+  ): ContinuityFact[] {
+    const saved: ContinuityFact[] = [];
+    const hash = this.project.hash(content);
+    for (const candidate of candidates.slice(0, 24)) {
+      if (!candidate.sourceEvidence || !content.includes(candidate.sourceEvidence)) continue;
+      const normalized = normalizeContinuityStatement(candidate.statement);
+      const existing = this.database.prepare(`SELECT * FROM continuity_facts
+        WHERE normalized_statement=? AND scope_kind=? AND scope_value=? AND epistemic=?
+          AND status!='retracted' ORDER BY id DESC LIMIT 1`)
+        .get(normalized, candidate.scopeKind, candidate.scopeValue, candidate.epistemic) as Row | undefined;
+      const status: ContinuityFactStatus = candidate.conflictsWith.length || candidate.supersedes.length
+        ? "conflict"
+        : "active";
+      saved.push(this.saveContinuityFact({
+        ...(existing ? { id: Number(existing.id) } : {}),
+        ...candidate,
+        status,
+        sourcePath: path,
+        sourceHash: hash,
+        sourceProposalId: proposalId,
+      }));
+    }
+    return saved;
+  }
+
+  continuityFactPacket(options: {
+    targetPath?: string;
+    characterIds?: number[];
+    limit?: number;
+  } = {}): ContinuityFact[] {
+    const facts = this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 });
+    const characterKeys = new Set((options.characterIds ?? []).map(String));
+    const targetPath = options.targetPath ?? "";
+    return facts.map(fact => {
+      let score = fact.importance;
+      if (fact.scopeKind === "global") score += 45;
+      if (fact.kind === "milieu") score += 25;
+      if (targetPath && (fact.sourcePath === targetPath || fact.scopeValue === targetPath)) score += 80;
+      if (fact.scopeKind === "character" && characterKeys.has(fact.scopeValue)) score += 80;
+      if (fact.status === "conflict") score += 100;
+      return { fact, score };
+    }).sort((a, b) => b.score - a.score || b.fact.id - a.fact.id)
+      .slice(0, Math.max(1, Math.min(40, options.limit ?? 24)))
+      .map(item => item.fact);
+  }
+
+  searchContinuityFacts(query: string, limit = 8): ContinuityFact[] {
+    const normalized = query.trim().toLocaleLowerCase("zh-CN");
+    if (!normalized) return [];
+    const terms = normalized.match(/[a-z0-9_]{2,}|[\p{Script=Han}]{2,}/gu)?.slice(0, 8) ?? [];
+    if (!terms.length) return [];
+    return this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 })
+      .map(fact => {
+        const haystack = `${fact.statement} ${fact.scopeValue} ${fact.knownBy.join(" ")} ${fact.sourcePath}`
+          .toLocaleLowerCase("zh-CN");
+        const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? Math.max(2, term.length) : 0), 0)
+          + (haystack.includes(normalized) ? 20 : 0);
+        return { fact, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score || b.fact.importance - a.fact.importance)
+      .slice(0, Math.max(1, Math.min(20, limit)))
+      .map(item => item.fact);
   }
 
   sessionContext(sessionId: string): { activeDocument?: string; currentIntent: string } {
@@ -1743,6 +2000,7 @@ export class WriterStore {
       if (evolved.revisions.length) this.writeCharacters(evolved.characters);
       this.database.prepare("UPDATE change_sets SET status='accepted',undone=0,character_revisions_json=?,after_config=? WHERE id=?")
         .run(JSON.stringify(evolved.revisions), this.project.readRaw("writer.yaml"), id);
+      this.refreshContinuityFactsForChangeSet(changeSet.files, true);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -1774,6 +2032,7 @@ export class WriterStore {
       validateCharacters(restoredCharacters, this.outlineNodeIds());
       if (characterRevisions.length) this.writeCharacters(restoredCharacters);
       this.database.prepare("UPDATE change_sets SET undone=1 WHERE id=?").run(id);
+      this.refreshContinuityFactsForChangeSet(changeSet.files, false);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -1805,6 +2064,7 @@ export class WriterStore {
       validateCharacters(restoredCharacters, this.outlineNodeIds());
       if (characterRevisions.length) this.writeCharacters(restoredCharacters);
       this.database.prepare("UPDATE change_sets SET undone=0 WHERE id=?").run(id);
+      this.refreshContinuityFactsForChangeSet(changeSet.files, true);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -1896,6 +2156,20 @@ export class WriterStore {
         this.removeManagedTextFile(file.path);
         this.writeManagedTextFile(file.targetPath, file.afterContent);
       } else this.writeManagedTextFile(file.path, file.afterContent);
+    }
+  }
+
+  private refreshContinuityFactsForChangeSet(files: ChangeSetFileChange[], applied: boolean): void {
+    for (const file of files) {
+      if (file.operation === "move" && file.targetPath) {
+        if (applied) this.moveContinuityFactsSource(file.path, file.targetPath, file.afterContent);
+        else this.moveContinuityFactsSource(file.targetPath, file.path, file.beforeContent);
+        continue;
+      }
+      this.refreshContinuityFactsForDocument(
+        file.path,
+        applied ? file.operation === "delete" ? "" : file.afterContent : file.beforeContent,
+      );
     }
   }
 
@@ -2012,6 +2286,7 @@ export class WriterStore {
       JSON.stringify(evolved.revisions), now,
     );
     this.database.prepare("UPDATE proposals SET status='accepted' WHERE id=?").run(id);
+    this.refreshContinuityFactsForDocument(proposal.path, proposal.afterContent);
     this.reindex();
     return this.proposal(id);
   }
@@ -2046,6 +2321,7 @@ export class WriterStore {
     else this.project.writeRaw(path, row.before_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(row.id as number);
+    this.refreshContinuityFactsForDocument(path, row.created_file === 1 ? "" : String(row.before_content));
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已撤销文档修改：${path}`);
     return path;
@@ -2075,6 +2351,7 @@ export class WriterStore {
     this.project.writeRaw(path, row.after_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=0 WHERE id=?").run(row.id as number);
+    this.refreshContinuityFactsForDocument(path, String(row.after_content));
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已重做文档修改：${path}`);
     return path;
@@ -2092,6 +2369,7 @@ export class WriterStore {
     else this.project.writeRaw(path, String(row.before_content));
     if (revisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(Number(row.id));
+    this.refreshContinuityFactsForDocument(path, Number(row.created_file) === 1 ? "" : String(row.before_content));
     return {
       path,
       characterNames: revisions.map(revision => this.normalizeCharacter(revision.after).identity.name),
@@ -2530,6 +2808,7 @@ export class WriterStore {
     this.project.renameDocument(fromPath, toPath);
     this.database.prepare("UPDATE proposals SET path=? WHERE path=?").run(toPath, fromPath);
     this.database.prepare("UPDATE revisions SET path=? WHERE path=?").run(toPath, fromPath);
+    this.moveContinuityFactsSource(fromPath, toPath, this.project.read(toPath));
     this.reindex();
   }
 
@@ -2544,11 +2823,22 @@ export class WriterStore {
     const updateRevision = this.database.prepare("UPDATE revisions SET path=? WHERE id=?");
     for (const row of proposalRows) updateProposal.run(rewrite(row.path), row.id);
     for (const row of revisionRows) updateRevision.run(rewrite(row.path), row.id);
+    const factRows = this.database.prepare("SELECT DISTINCT source_path FROM continuity_facts WHERE source_path LIKE ?")
+      .all(`${fromPrefix}%`) as Row[];
+    for (const row of factRows) {
+      const from = String(row.source_path);
+      const to = rewrite(from);
+      if (this.project.textFileExists(to)) this.moveContinuityFactsSource(from, to, this.project.readTextFile(to));
+    }
     this.reindex();
   }
 
   removeFolder(path: string): void {
+    const prefix = `${path.replace(/\/+$/u, "")}/`;
     this.project.removeFolder(path);
+    const rows = this.database.prepare("SELECT DISTINCT source_path FROM continuity_facts WHERE source_path LIKE ?")
+      .all(`${prefix}%`) as Row[];
+    for (const row of rows) this.refreshContinuityFactsForDocument(String(row.source_path), "");
     this.reindex();
   }
 
@@ -2651,6 +2941,74 @@ function headingAtLine(lines: string[], line: number): string | undefined {
 
 function canonicalTextPath(path: string): string {
   return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "").replace(/^resource(?:\/|$)/, "");
+}
+
+function normalizeContinuityStatement(value: string): string {
+  return value.trim().replace(/\s+/gu, " ").toLocaleLowerCase("zh-CN");
+}
+
+function continuityEvidenceAnchor(content: string, sourceHash: string, evidence: string): string {
+  const offset = evidence ? content.indexOf(evidence) : -1;
+  if (offset < 0) return "";
+  return documentSpans(content, sourceHash)
+    .find(span => span.startOffset <= offset && span.endOffset > offset)?.anchorId ?? "";
+}
+
+function continuityEnum<T extends readonly string[]>(value: unknown, allowed: T, fallback: T[number]): T[number] {
+  return typeof value === "string" && allowed.includes(value) ? value as T[number] : fallback;
+}
+
+function continuityStatus(value: unknown): ContinuityFactStatus {
+  return typeof value === "string" && ["active", "conflict", "pending", "stale", "retracted"].includes(value)
+    ? value as ContinuityFactStatus
+    : "active";
+}
+
+function continuityStrings(value: unknown, limit: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === "string")
+    .map(item => item.trim()).filter(Boolean))].slice(0, limit);
+}
+
+function continuityIds(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(Number).filter(id => Number.isInteger(id) && id > 0))].slice(0, 12);
+}
+
+function continuityFactFromRow(row: Row): ContinuityFact {
+  const parseArray = <T>(value: unknown): T[] => {
+    if (typeof value !== "string") return [];
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return Array.isArray(parsed) ? parsed as T[] : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: Number(row.id),
+    statement: String(row.statement),
+    kind: continuityEnum(row.kind, CONTINUITY_FACT_KINDS, "other") as ContinuityFactKind,
+    scopeKind: continuityEnum(row.scope_kind, CONTINUITY_FACT_SCOPE_KINDS, "global") as ContinuityFactScopeKind,
+    scopeValue: String(row.scope_value ?? ""),
+    validFrom: String(row.valid_from ?? ""),
+    validUntil: String(row.valid_until ?? ""),
+    epistemic: continuityEnum(row.epistemic, CONTINUITY_FACT_EPISTEMIC_KINDS, "objective") as ContinuityFactEpistemicKind,
+    knownBy: parseArray<string>(row.known_by_json),
+    importance: Number(row.importance),
+    status: continuityStatus(row.status),
+    sourcePath: String(row.source_path ?? ""),
+    sourceHash: String(row.source_hash ?? ""),
+    sourceEvidence: String(row.source_evidence ?? ""),
+    sourceAnchorId: String(row.source_anchor_id ?? ""),
+    ...(Number.isInteger(Number(row.source_proposal_id)) && Number(row.source_proposal_id) > 0
+      ? { sourceProposalId: Number(row.source_proposal_id) }
+      : {}),
+    conflictsWith: parseArray<number>(row.conflicts_with_json).map(Number).filter(id => Number.isInteger(id) && id > 0),
+    supersedes: parseArray<number>(row.supersedes_json).map(Number).filter(id => Number.isInteger(id) && id > 0),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
 }
 
 function textOccurrences(content: string, search: string): number {

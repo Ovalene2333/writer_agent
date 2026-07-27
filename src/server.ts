@@ -51,7 +51,7 @@ import {
 } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
-import { WriterProject } from "./project.js";
+import { documentKind, WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
@@ -64,6 +64,7 @@ import {
   upsertProseGateRule,
   type ProseGateRule,
 } from "./prose_gate_rules.js";
+import { extractContinuityFacts, type ContinuityFact } from "./continuity_facts.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -340,6 +341,7 @@ export async function startWriterServer(options: {
       todos: options.store.sessionTodos(sessionId),
       agentSettings: loadAgentSettings(options.project),
       proseGateRules: loadProseGateRules(options.project),
+      continuityFacts: options.store.continuityFacts({ limit: 500 }),
       projectInstructions: loadProjectInstructions(options.project)?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description,
@@ -632,6 +634,31 @@ export async function startWriterServer(options: {
       const id = context.req.param("id");
       const removed = removeProseGateRule(options.project, id);
       return context.json({ removed, id, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.get("/api/continuity-facts", (context) => {
+    try {
+      return context.json({ facts: options.store.continuityFacts({ limit: 1_000 }) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/continuity-facts", async (context) => {
+    try {
+      const body = await context.req.json<Partial<ContinuityFact>>();
+      const fact = options.store.saveContinuityFact({
+        ...body,
+        statement: typeof body.statement === "string" ? body.statement : "",
+      });
+      return context.json({ fact, facts: options.store.continuityFacts({ limit: 1_000 }) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.delete("/api/continuity-facts/:id", (context) => {
+    try {
+      const id = Number(context.req.param("id"));
+      const fact = options.store.retractContinuityFact(id);
+      return context.json({ fact, facts: options.store.continuityFacts({ limit: 1_000 }) });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -1249,19 +1276,32 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
-  app.post("/api/proposals/:id/:action", (context) => {
+  app.post("/api/proposals/:id/:action", async (context) => {
     try {
       const id = Number(context.req.param("id"));
       const action = context.req.param("action");
       if (!Number.isInteger(id) || !["accept", "reject"].includes(action)) throw new Error("审批参数无效");
       const proposal = action === "accept" ? options.store.acceptProposal(id) : options.store.rejectProposal(id);
-      return context.json({ proposal });
+      const continuity = action === "accept"
+        ? await indexAcceptedContinuityFacts({
+            project: options.project,
+            store: options.store,
+            providers: options.providers,
+            path: proposal.path,
+            beforeContent: proposal.beforeContent,
+            afterContent: proposal.afterContent,
+            sourceId: proposal.id,
+            sessionId: proposal.sessionId,
+            signal: context.req.raw.signal,
+          })
+        : { continuityFacts: 0 };
+      return context.json({ proposal, ...continuity });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
   });
 
-  app.post("/api/change-sets/:id/:action", (context) => {
+  app.post("/api/change-sets/:id/:action", async (context) => {
     try {
       const id = Number(context.req.param("id"));
       const action = context.req.param("action");
@@ -1270,7 +1310,27 @@ export async function startWriterServer(options: {
         : action === "reject" ? options.store.rejectChangeSet(id)
           : action === "undo" ? options.store.undoChangeSet(id)
             : options.store.redoChangeSet(id);
-      return context.json({ changeSet });
+      const indexed: Array<{ continuityFacts: number; continuityFactWarning?: string }> = [];
+      if (action === "accept") {
+        for (const file of changeSet.files) {
+          if (file.operation === "delete" || file.operation === "move") continue;
+          indexed.push(await indexAcceptedContinuityFacts({
+              project: options.project,
+              store: options.store,
+              providers: options.providers,
+              path: file.path,
+              beforeContent: file.beforeContent,
+              afterContent: file.afterContent,
+              sessionId: changeSet.sessionId,
+              signal: context.req.raw.signal,
+            }));
+        }
+      }
+      return context.json({
+        changeSet,
+        continuityFacts: indexed.reduce((sum, item) => sum + item.continuityFacts, 0),
+        continuityFactWarnings: indexed.flatMap(item => item.continuityFactWarning ? [item.continuityFactWarning] : []),
+      });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -1544,4 +1604,41 @@ function usageReporterForSession(store: WriterStore, sessionId?: string): ModelU
   return (model, usage, meta) => {
     buildRecordedUsageEvent(store, sessionId, model, usage, meta);
   };
+}
+
+async function indexAcceptedContinuityFacts(options: {
+  project: WriterProject;
+  store: WriterStore;
+  providers: ProviderManager;
+  path: string;
+  beforeContent: string;
+  afterContent: string;
+  sourceId?: number;
+  sessionId?: string;
+  signal?: AbortSignal;
+}): Promise<{ continuityFacts: number; continuityFactWarning?: string }> {
+  if (!["lore", "chapter", "side"].includes(documentKind(options.path))) return { continuityFacts: 0 };
+  try {
+    const candidates = await extractContinuityFacts({
+      model: options.providers.summaryModelConfig(),
+      path: options.path,
+      beforeContent: options.beforeContent,
+      afterContent: options.afterContent,
+      existingFacts: options.store.continuityFacts({ statuses: ["active", "conflict", "pending"], limit: 300 }),
+      signal: options.signal,
+      usageReporter: usageReporterForSession(options.store, options.sessionId),
+    });
+    const saved = options.store.saveExtractedContinuityFacts(
+      options.path,
+      options.afterContent,
+      options.sourceId ?? 0,
+      candidates,
+    );
+    return { continuityFacts: saved.length };
+  } catch (error) {
+    return {
+      continuityFacts: 0,
+      continuityFactWarning: `内容已接受，但事实索引更新失败：${errorMessage(error)}`,
+    };
+  }
 }

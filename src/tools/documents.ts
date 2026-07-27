@@ -444,6 +444,16 @@ export function handleSearchProject({ input, project, store, context }: ToolHand
     ? Math.max(0, Math.min(12, Math.round(input.contextLines))) : 2;
   const pathPrefix = typeof input.pathPrefix === "string" ? input.pathPrefix : undefined;
   const query = requireString(input.query, "query");
+  const facts = store.searchContinuityFacts(query, Math.min(8, limit)).map(fact => ({
+    id: fact.id,
+    statement: fact.statement,
+    kind: fact.kind,
+    scope: [fact.scopeKind, fact.scopeValue].filter(Boolean).join(":"),
+    epistemic: fact.epistemic,
+    knownBy: fact.knownBy,
+    status: fact.status,
+    sourcePath: fact.sourcePath,
+  }));
   const found = store.search(query, limit, { scope, mode, contextLines, pathPrefix })
     .filter(item => !project.isDocumentHidden(item.path));
   // Search is a locator, not a bulk reader. Keep the complete result atom under
@@ -456,5 +466,12 @@ export function handleSearchProject({ input, project, store, context }: ToolHand
     matches.push({ ...item, excerpt });
     excerptBudget -= excerpt.length;
   }
-  return JSON.stringify({ query, scope, mode, matches, truncated: matches.length < found.length || matches.some((item, index) => item.excerpt.length < found[index].excerpt.length) });
+  return JSON.stringify({
+    query,
+    scope,
+    mode,
+    facts,
+    matches,
+    truncated: matches.length < found.length || matches.some((item, index) => item.excerpt.length < found[index].excerpt.length),
+  });
 }

@@ -2,7 +2,7 @@ import { documentBlocks } from "../document_blocks.js";
 import { documentKind } from "../project.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
-import { gateProseStyle, prepareDeferredCharacterChanges } from "./proposals.js";
+import { captureAcceptedContinuityFacts, gateProseStyle, prepareDeferredCharacterChanges } from "./proposals.js";
 import type { ToolHandlerArgs } from "./types.js";
 
 const READ_BLOCK_TARGET_CHARACTERS = 3_000;
@@ -165,7 +165,19 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
   try {
     const accepted = store.acceptChangeSet(changeSet.id);
     emit({ type: "change_set", changeSet: accepted });
+    const indexed: Array<{ continuityFacts: number; continuityFactWarning?: string }> = [];
+    for (const file of accepted.files) {
+      if (file.operation === "delete" || file.operation === "move") continue;
+      indexed.push(await captureAcceptedContinuityFacts(store, {
+        id: 0,
+        path: file.path,
+        beforeContent: file.beforeContent,
+        afterContent: file.afterContent,
+      }, context));
+    }
     return JSON.stringify({ changeSetId: accepted.id, status: accepted.status, files: accepted.files.length, autoAccepted: true,
+      continuityFacts: indexed.reduce((sum, item) => sum + item.continuityFacts, 0),
+      continuityFactWarnings: indexed.flatMap(item => item.continuityFactWarning ? [item.continuityFactWarning] : []),
       ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}) });
   } catch (error) {
     return JSON.stringify({ changeSetId: changeSet.id, status: "pending",

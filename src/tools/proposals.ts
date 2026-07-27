@@ -14,7 +14,7 @@ import { documentBlocks } from "../document_blocks.js";
 import { requestDocumentRevision } from "../document_revision.js";
 import { IsolatedSceneRequestError, requestIsolatedScene } from "../isolated_scene_writer.js";
 import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
-import { isScenePipelineDocument } from "../project.js";
+import { documentKind, isScenePipelineDocument } from "../project.js";
 import {
   DEFAULT_ISOLATED_WRITER_MAX_RATIO,
   DEFAULT_SCENE_NOTES_CHARACTERS,
@@ -165,12 +165,47 @@ function normalizeProposalCharacterChange(
   return { ...change, entry: { ...source, notes } };
 }
 
-export function maybeAutoAcceptProposal(
+export async function captureAcceptedContinuityFacts(
+  store: WriterStore,
+  proposal: Pick<Proposal, "id" | "path" | "beforeContent" | "afterContent">,
+  context: ToolExecutionContext,
+): Promise<{ continuityFacts: number; continuityFactWarning?: string }> {
+  const kind = documentKind(proposal.path);
+  if (!context.continuityExtractor || !["lore", "chapter", "side"].includes(kind)) {
+    return { continuityFacts: 0 };
+  }
+  try {
+    const existingFacts = store.continuityFacts({ statuses: ["active", "conflict", "pending"], limit: 300 });
+    const candidates = context.continuityExtractor.run
+      ? await context.continuityExtractor.run({
+          path: proposal.path,
+          beforeContent: proposal.beforeContent,
+          afterContent: proposal.afterContent,
+          existingFacts,
+        })
+      : [];
+    const saved = store.saveExtractedContinuityFacts(
+      proposal.path,
+      proposal.afterContent,
+      proposal.id,
+      candidates,
+    );
+    return { continuityFacts: saved.length };
+  } catch (error) {
+    return {
+      continuityFacts: 0,
+      continuityFactWarning: `正文已接受，但事实索引更新失败：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+export async function maybeAutoAcceptProposal(
   store: WriterStore,
   proposal: { id: number; status: string },
   permissionMode: PermissionMode,
   emit: (event: AgentEvent) => void,
-): { proposalId: number; status: string; message: string; autoAccepted?: boolean } {
+  context: ToolExecutionContext,
+): Promise<{ proposalId: number; status: string; message: string; autoAccepted?: boolean; continuityFacts?: number; continuityFactWarning?: string }> {
   if (permissionMode !== "auto" || proposal.status !== "pending") {
     return {
       proposalId: proposal.id,
@@ -181,11 +216,13 @@ export function maybeAutoAcceptProposal(
   try {
     const accepted = store.acceptProposal(proposal.id);
     emit({ type: "proposal", proposal: accepted });
+    const continuity = await captureAcceptedContinuityFacts(store, accepted, context);
     return {
       proposalId: accepted.id,
       status: accepted.status,
       autoAccepted: true,
       message: "auto 模式：提案已自动写入文件",
+      ...continuity,
     };
   } catch (error) {
     return {
@@ -435,7 +472,7 @@ export async function submitFullDocumentProposal(
   );
   emit({ type: "proposal", proposal });
   return JSON.stringify({
-    ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
   });
@@ -540,7 +577,7 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   const uniqueStripped = [...new Set(strippedMeta)];
   return JSON.stringify({
     edits: edits.length,
-    ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(uniqueStripped.length ? { metaSanitized: uniqueStripped } : {}),
   });

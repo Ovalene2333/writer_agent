@@ -44,7 +44,7 @@ export function handleCompareOutlineWithDraft({ input, project }: ToolHandlerArg
   return JSON.stringify(new OutlineStore(project).compareWithDraft(requireString(input.id, "id")));
 }
 
-export function handleProposeOutlinePatch({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): string {
+export async function handleProposeOutlinePatch({ input, project, store, sessionId, emit, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_outline_patch");
   const outline = new OutlineStore(project);
   const id = requireString(input.id, "id");
@@ -59,5 +59,5 @@ export function handleProposeOutlinePatch({ input, project, store, sessionId, em
   if (occurrences !== 1) throw new Error(`search 在大纲中出现 ${occurrences} 次，必须唯一`);
   const proposal = store.createProposal(sessionId, outline.sourcePath, content.replace(search, replace), requireString(input.summary, "summary"));
   emit({ type: "proposal", proposal });
-  return JSON.stringify({ nodeId: id, ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit) });
+  return JSON.stringify({ nodeId: id, ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context) });
 }

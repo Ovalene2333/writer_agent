@@ -12,6 +12,7 @@ import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
+import { extractContinuityFacts } from "./continuity_facts.js";
 import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
 import { isDeepSeekModel, nonThinkingRequestOptions, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import {
@@ -1695,18 +1696,19 @@ export async function runAgent(options: {
     ? selectedBlockEditLock(project, options.selectedDocumentBlocks)
     : undefined;
   let currentUsageStep: number | undefined;
+  const reportToolUsage: NonNullable<ToolExecutionContext["modelUsageReporter"]> = (callModel, callUsage, meta) => {
+    emit(buildRecordedUsageEvent(store, sessionId, callModel, callUsage, {
+      ...meta,
+      ...(meta.step === undefined && currentUsageStep !== undefined ? { step: currentUsageStep } : {}),
+      ...(meta.jobId || !options.jobId ? {} : { jobId: options.jobId }),
+    }));
+  };
   const toolContext: ToolExecutionContext = {
     permissionMode,
     sourceMessageId,
     editScope: task.editScope,
     ...(selectedEditLock ? { editTargetLocked: selectedEditLock } : {}),
-    modelUsageReporter: (callModel, callUsage, meta) => {
-      emit(buildRecordedUsageEvent(store, sessionId, callModel, callUsage, {
-        ...meta,
-        ...(meta.step === undefined && currentUsageStep !== undefined ? { step: currentUsageStep } : {}),
-        ...(meta.jobId || !options.jobId ? {} : { jobId: options.jobId }),
-      }));
-    },
+    modelUsageReporter: reportToolUsage,
     readSnapshots: new Map(),
     readCharactersUsed: 0,
     simpleCharacterScope,
@@ -1717,6 +1719,16 @@ export async function runAgent(options: {
     proseAdjudicator: {
       model: adjudicatorModel,
       signal,
+    },
+    continuityExtractor: {
+      model: options.models?.summarizer ?? options.models?.inline ?? adjudicatorModel,
+      signal,
+      run: async (input) => extractContinuityFacts({
+        model: options.models?.summarizer ?? options.models?.inline ?? adjudicatorModel,
+        ...input,
+        signal,
+        usageReporter: reportToolUsage,
+      }),
     },
     proseGateRules: loadProseGateRules(project),
     chapterStyleRepairer: {
@@ -2408,6 +2420,22 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
         artifactIds: savedCheckpoint.artifactIds?.slice(0, 8),
       }
     : undefined;
+  const continuityFacts = store.continuityFactPacket({
+    targetPath: task.targetPath ?? state.activeDocument,
+    characterIds: task.characterIds,
+    limit: 20,
+  }).map(fact => ({
+    id: fact.id,
+    fact: fact.statement,
+    kind: fact.kind,
+    scope: [fact.scopeKind, fact.scopeValue].filter(Boolean).join(":"),
+    epistemic: fact.epistemic,
+    ...(fact.knownBy.length ? { knownBy: fact.knownBy } : {}),
+    ...(fact.validFrom ? { validFrom: fact.validFrom } : {}),
+    ...(fact.validUntil ? { validUntil: fact.validUntil } : {}),
+    status: fact.status,
+    source: fact.sourcePath,
+  }));
   let artifacts = store.recentContextArtifacts(sessionId, 12)
     .filter((artifact) => {
       if (!artifact.path) return true;
@@ -2420,9 +2448,9 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
   if (!task.continuation) {
     const focusPath = task.targetPath ?? state.activeDocument;
     if (focusPath) artifacts = artifacts.filter(item => item.path === focusPath);
-    if (!artifacts.length && !checkpoint) return "";
+    if (!artifacts.length && !checkpoint && !continuityFacts.length) return "";
   }
-  if (!artifacts.length && !state.activeDocument && !state.currentIntent && !checkpoint) return "";
+  if (!artifacts.length && !state.activeDocument && !state.currentIntent && !checkpoint && !continuityFacts.length) return "";
   const activePath = task.continuation ? state.activeDocument : (task.targetPath ?? state.activeDocument);
   const activeHash = activePath && project.textFileExists(activePath)
     ? project.hash(project.readTextFile(activePath))
@@ -2476,13 +2504,14 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
       id, kind, path, sourceHash,
       digest: digest.replace(/\s+/g, " ").slice(0, 240),
     }));
-  if (!catalog.length && !restored.length && !checkpoint) return "";
+  if (!catalog.length && !restored.length && !checkpoint && !continuityFacts.length) return "";
   const scopeNote = task.continuation
     ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
     : "同会话已验证且未变化的读取索引；有目标路径时仅列目标。先按 digest 判断是否足够，正文不足再按需读取；相同 path+参数+sourceHash 会直接复用已有工具结果";
-  return `本轮任务工作记忆（${scopeNote}）：\n${JSON.stringify({
+  return `本轮任务工作记忆（${scopeNote}）。continuityFacts 是带来源的项目连续性索引：active 可直接约束写作；conflict 只提示矛盾，禁止自行选边；事实缺失、冲突或需要原文措辞时才回读最小证据片段：\n${JSON.stringify({
     state: { activeDocument: state.activeDocument, currentIntent: state.currentIntent.slice(0, 160) },
     ...(checkpoint ? { checkpoint } : {}),
+    continuityFacts,
     artifacts: catalog,
     restoredReads: restored,
   })}`;
@@ -2745,6 +2774,13 @@ async function executeToolCached(
   const sourcePath = path ?? (outlinePath && project.documentExists(outlinePath) ? outlinePath : undefined);
   const sourceHash = sourcePath && project.textFileExists(sourcePath)
     ? project.hash(project.readTextFile(sourcePath))
+    : call.name === "search_project"
+      ? project.hash(JSON.stringify({
+          documents: project.listDocuments().map(documentPath =>
+            [documentPath, project.hash(project.read(documentPath))]),
+          facts: store.continuityFacts({ limit: 1_000 }).map(fact =>
+            [fact.id, fact.status, fact.updatedAt]),
+        }))
     : call.name.endsWith("_files")
       ? project.hash(JSON.stringify(project.listTextFiles().map(file => [file, project.hash(project.readTextFile(file))])))
       : project.hash(JSON.stringify(project.listDocuments()));

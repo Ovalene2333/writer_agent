@@ -11,6 +11,7 @@ import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
 import type { DocumentRevisionInput } from "../document_revision.js";
 import type { ProseGateRule } from "../prose_gate_rules.js";
+import type { ContinuityFact, ContinuityFactCandidate } from "../continuity_facts.js";
 import type {
   IsolatedSceneWriterInput,
   IsolatedSceneWriterResult,
@@ -91,6 +92,17 @@ export type ToolExecutionContext = {
   proseAdjudicator?: {
     model: ModelConfig;
     signal?: AbortSignal;
+  };
+  /** Best-effort delta extractor run only after a lore/chapter proposal is accepted. */
+  continuityExtractor?: {
+    model: ModelConfig;
+    signal?: AbortSignal;
+    run?: (input: {
+      path: string;
+      beforeContent: string;
+      afterContent: string;
+      existingFacts: ContinuityFact[];
+    }) => Promise<ContinuityFactCandidate[]>;
   };
   /** Project-persisted semantic review rules learned from explicit author feedback. */
   proseGateRules?: ProseGateRule[];
