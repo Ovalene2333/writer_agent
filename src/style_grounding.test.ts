@@ -75,6 +75,7 @@ describe("built-in style templates", () => {
     for (const template of ["webnovel-power", "literary", "marquez", "modern-commercial", "modern-legendary", "light-novel", "mystery", "xianxia"] as const) {
       const body = getStyleTemplate(template)?.systemPromptAddition ?? "";
       assert.match(body, /全局自然叙事|反机械|堆砌/, `template ${template} should reference anti-mechanical rules`);
+      assert.doesNotMatch(body, /破折号/, `template ${template} should not carry global punctuation gates`);
     }
   });
 

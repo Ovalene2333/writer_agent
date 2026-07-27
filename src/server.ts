@@ -57,6 +57,13 @@ import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
 import type { AgentEvent, Message, PermissionMode, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
+import {
+  loadProseGateRules,
+  removeProseGateRule,
+  setProseGateRuleEnabled,
+  upsertProseGateRule,
+  type ProseGateRule,
+} from "./prose_gate_rules.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -332,6 +339,7 @@ export async function startWriterServer(options: {
       usage: options.store.usage(sessionId),
       todos: options.store.sessionTodos(sessionId),
       agentSettings: loadAgentSettings(options.project),
+      proseGateRules: loadProseGateRules(options.project),
       projectInstructions: loadProjectInstructions(options.project)?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description,
@@ -588,6 +596,43 @@ export async function startWriterServer(options: {
     const activeStyleId = options.project.config().style || "";
     const activeTemplate = activeStyleId ? options.project.styleTemplate(activeStyleId) : undefined;
     return context.json({ templates: styleTemplatesForClient(options.project), active: activeTemplate ?? null });
+  });
+
+  app.get("/api/prose-gates", (context) => {
+    try {
+      return context.json({ rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/prose-gates", async (context) => {
+    try {
+      const body = await context.req.json<Partial<ProseGateRule>>();
+      const rule = upsertProseGateRule(options.project, {
+        id: typeof body.id === "string" ? body.id : "",
+        instruction: typeof body.instruction === "string" ? body.instruction : "",
+        severity: body.severity === "warn" ? "warn" : "block",
+        enabled: body.enabled !== false,
+        sourceFeedback: typeof body.sourceFeedback === "string" ? body.sourceFeedback : "",
+      });
+      return context.json({ rule, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.put("/api/prose-gates/:id/enabled", async (context) => {
+    try {
+      const body = await context.req.json<{ enabled?: boolean }>();
+      if (typeof body.enabled !== "boolean") throw new Error("enabled 必须是布尔值");
+      const rule = setProseGateRuleEnabled(options.project, context.req.param("id"), body.enabled);
+      return context.json({ rule, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.delete("/api/prose-gates/:id", (context) => {
+    try {
+      const id = context.req.param("id");
+      const removed = removeProseGateRule(options.project, id);
+      return context.json({ removed, id, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
   app.post("/api/style/templates", async (context) => {

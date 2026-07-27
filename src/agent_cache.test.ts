@@ -22,6 +22,7 @@ import {
   chapterContinuationPrompt,
   chapterDraftNeedsReview,
   chapterReviewAllowsTool,
+  chapterReviewCompleted,
   chapterReviewRequiredPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
@@ -61,7 +62,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "3f01f1e0bcc89c06");
+  assert.equal(agentToolSchemaHash(), "4eae4ced9f2e47fe");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -210,7 +211,7 @@ test("task modes share one frozen universal capability catalog", () => {
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
   assert.deepEqual(writeNames, catalog);
-  for (const required of ["read_document", "begin_chapter_draft", "write_document_isolated", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
+  for (const required of ["read_document", "begin_chapter_draft", "write_document_isolated", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
   assert.equal(writeNames.includes("save_character"), true);
@@ -219,6 +220,7 @@ test("task modes share one frozen universal capability catalog", () => {
 
   const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
   assert.equal(planNames.includes("write_chapter_scene"), false);
+  assert.equal(planNames.includes("write_chapter_scene_notes"), false);
   assert.equal(planNames.includes("propose_chapter_draft"), false);
   assert.ok(planNames.includes("read_document"));
 });
@@ -504,6 +506,7 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(instructions, /只有长篇连续状态/);
   assert.match(instructions, /不要为了展示流程/);
   const isolated = taskInstructions("write_scene", "deliver", "ask", true, true);
+  assert.match(isolated, /write_chapter_scene_notes/);
   assert.match(isolated, /由隔离 Writer 生成正文和状态/);
   assert.match(taskInstructions("write_scene", "deliver", "ask", true, true, 4_200), /4200 字/);
   assert.match(instructions, /inspect_chapter_draft/);
@@ -580,7 +583,7 @@ test("scene continuation handoff carries seam tail, states and next card without
   const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
   assert.ok(tailBlock.length > 0 && tailBlock.length < 1_000, `tail block out of bounds: ${tailBlock.length}`);
   const isolatedPrompt = sceneContinuationPrompt(draft, { isolatedWriter: true });
-  assert.match(isolatedPrompt, /调用 write_chapter_scene/);
+  assert.match(isolatedPrompt, /调用 write_chapter_scene_notes/);
   assert.match(isolatedPrompt, /只提交要点式 notes/);
   assert.doesNotMatch(isolatedPrompt, /提交要点式 notes、正文与 actualState/);
 
@@ -609,6 +612,19 @@ test("scene continuation handoff carries seam tail, states and next card without
   assert.equal(chapterDraftNeedsReview(draft, "review_blocked"), false);
   draft.inspectedVersion = draft.version;
   assert.equal(chapterDraftNeedsReview(draft, "scene_written"), false);
+});
+
+test("actionable chapter review results release the inspect-only terminal lock", () => {
+  assert.equal(chapterReviewCompleted({
+    status: "style_revision_required",
+    error: "六个句子需要精确替换",
+  }), true);
+  assert.equal(chapterReviewCompleted({ status: "structural_revision_required" }), true);
+  assert.equal(chapterReviewCompleted({ status: "inspection_required" }), true);
+  assert.equal(chapterReviewCompleted({ status: "proposal_failed", error: "提案暂时失败" }), true);
+  assert.equal(chapterReviewCompleted({ status: "proposal_submitted" }), true);
+  assert.equal(chapterReviewCompleted({ error: "缺少有效参数：summary" }), false);
+  assert.equal(chapterReviewCompleted({ status: "error", error: "工具执行失败" }), false);
 });
 
 test("document delivery continuation uses contract outputs instead of todo wording", () => {

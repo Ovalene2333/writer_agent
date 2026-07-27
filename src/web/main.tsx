@@ -407,6 +407,17 @@ type StyleTemplateInfo = {
   readOnly?: boolean;
 };
 type StyleTemplateDraft = StyleTemplateInfo & { isNew: boolean };
+type ProseGateRule = {
+  id: string;
+  instruction: string;
+  severity: "block" | "warn";
+  enabled: boolean;
+  sourceFeedback: string;
+  createdAt: string;
+  updatedAt: string;
+};
+type ProseGateRuleDraft = Pick<ProseGateRule, "id" | "instruction" | "severity" | "enabled" | "sourceFeedback">
+  & { isNew: boolean };
 type State = {
   accessMode?: "owner" | "readonly";
   config: { title: string; style?: string };
@@ -433,6 +444,7 @@ type State = {
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
   agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; scenePipeline: ScenePipelineSettings };
+  proseGateRules?: ProseGateRule[];
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;
 };
@@ -468,7 +480,7 @@ const EMPTY_CHARACTER: CharacterDraft = {
 /** Visual UI themes (workspace chrome). Not writing style templates. */
 type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
 type WorkspaceMode = "split" | "editor-focus" | "agent-focus";
-type ManagementView = "characters" | "sessions" | "models";
+type ManagementView = "characters" | "sessions" | "models" | "prose-gates";
 
 type UiTheme = {
   id: UiThemeId;
@@ -604,11 +616,12 @@ function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggleDocume
   );
 }
 
-function SettingsMenu({ open, connectionAvailable, onClose, onSelect }: {
+function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRules }: {
   open: boolean;
   connectionAvailable: boolean;
   onClose: () => void;
   onSelect: (section: SettingsSection) => void;
+  onReviewRules: () => void;
 }) {
   if (!open) return null;
   return (
@@ -617,6 +630,7 @@ function SettingsMenu({ open, connectionAvailable, onClose, onSelect }: {
         <button role="menuitem" onClick={() => onSelect("models")}><Bot size={16} />模型与分工</button>
         <button role="menuitem" onClick={() => onSelect("writing")}><Pencil size={16} />写作行为</button>
         <button role="menuitem" onClick={() => onSelect("style")}><WandSparkles size={16} />写作风格</button>
+        <button role="menuitem" onClick={onReviewRules}><ShieldCheck size={16} />作者复审规则</button>
         <button role="menuitem" disabled={!connectionAvailable} onClick={() => onSelect("connection")}><Wifi size={16} />连接设置</button>
         <button role="menuitem" onClick={() => onSelect("appearance")}><Sun size={16} />界面主题</button>
       </div>
@@ -1762,6 +1776,7 @@ function WorkspaceTopbar({
   onToggleSettings,
   onCloseSettings,
   onSelectSettings,
+  onReviewRules,
   onRefresh,
   onModeChange,
   onToggleDocuments,
@@ -1787,6 +1802,7 @@ function WorkspaceTopbar({
   onToggleSettings: () => void;
   onCloseSettings: () => void;
   onSelectSettings: (section: SettingsSection) => void;
+  onReviewRules: () => void;
   onRefresh: () => void;
   onModeChange: (mode: WorkspaceMode) => void;
   onToggleDocuments: () => void;
@@ -1842,6 +1858,7 @@ function WorkspaceTopbar({
             connectionAvailable={connection.dualMode}
             onClose={onCloseSettings}
             onSelect={onSelectSettings}
+            onReviewRules={onReviewRules}
           />
         </div>}
         <IconButton label="刷新工作区" onClick={onRefresh}><RefreshCw size={17} /></IconButton>
@@ -1907,6 +1924,8 @@ function App() {
   const [theme, setTheme] = useState<UiThemeId>(() => loadUiTheme());
   const [styleBusy, setStyleBusy] = useState(false);
   const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
+  const [proseGateDraft, setProseGateDraft] = useState<ProseGateRuleDraft | null>(null);
+  const [proseGateBusy, setProseGateBusy] = useState(false);
   const [managementView, setManagementView] = useState<ManagementView | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
@@ -3955,6 +3974,70 @@ function App() {
     openSettings("models");
   }
 
+  function openProseGateRules() {
+    setSettingsMenuOpen(false);
+    setProseGateDraft(null);
+    setManagementView("prose-gates");
+  }
+
+  async function saveProseGateRule() {
+    if (!proseGateDraft) return;
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ rules: ProseGateRule[] }>("/api/prose-gates", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(proseGateDraft),
+      });
+      setState(current => current ? { ...current, proseGateRules: result.rules } : current);
+      setProseGateDraft(null);
+      setNotice("作者复审规则已保存，将从下一次正文复审开始生效。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function setProseGateRuleEnabled(rule: ProseGateRule, enabled: boolean) {
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ rules: ProseGateRule[] }>(
+        `/api/prose-gates/${encodeURIComponent(rule.id)}/enabled`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        },
+      );
+      setState(current => current ? { ...current, proseGateRules: result.rules } : current);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function deleteProseGateRule(rule: ProseGateRule) {
+    if (!confirm(`删除作者复审规则“${rule.id}”？`)) return;
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ rules: ProseGateRule[] }>(
+        `/api/prose-gates/${encodeURIComponent(rule.id)}`,
+        { method: "DELETE" },
+      );
+      setState(current => current ? { ...current, proseGateRules: result.rules } : current);
+      if (proseGateDraft?.id === rule.id) setProseGateDraft(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
   async function saveRoleplayPerception(message: Message, perception: RoleplayPerceptionProjection): Promise<void> {
     if (!state) return;
     const result = await api<{ perception: RoleplayPerceptionProjection; display: string }>(
@@ -4160,6 +4243,7 @@ function App() {
         onToggleSettings={() => setSettingsMenuOpen((value) => !value)}
         onCloseSettings={() => setSettingsMenuOpen(false)}
         onSelectSettings={openSettings}
+        onReviewRules={openProseGateRules}
         onRefresh={() => void refresh(state.sessionId)}
         onModeChange={setWorkspaceMode}
         onToggleDocuments={() => setDocumentsCollapsed((value) => !value)}
@@ -6017,7 +6101,11 @@ function App() {
             <div className="management-head">
               <div>
                 <span className="eyebrow">Workspace</span>
-                <h2>{managementView === "characters" ? "角色卡" : "会话"}</h2>
+                <h2>{managementView === "characters"
+                  ? "角色卡"
+                  : managementView === "sessions"
+                    ? "会话"
+                    : "作者复审规则"}</h2>
               </div>
               <div className="management-actions">
                 {managementView === "characters" ? (
@@ -6025,7 +6113,7 @@ function App() {
                     <button className="ghost" onClick={() => setSimpleCardDraft({ name: "", identity: "", relationship: "", knowledge: "", scene: "", goal: "" })}><Plus size={15} />简易角色</button>
                     <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}><Plus size={15} />普通角色</button>
                   </>
-                ) : (
+                ) : managementView === "sessions" ? (
                   <>
                     <button
                       className={sessionBatchMode ? "primary" : "ghost"}
@@ -6047,12 +6135,26 @@ function App() {
                       }} title="新建会话并清除当前 step 渲染"><Plus size={15} />新建会话</button>
                     )}
                   </>
+                ) : (
+                  <button
+                    className="primary"
+                    disabled={proseGateBusy || readOnly || Boolean(proseGateDraft)}
+                    onClick={() => setProseGateDraft({
+                      id: "",
+                      instruction: "",
+                      severity: "warn",
+                      enabled: true,
+                      sourceFeedback: "",
+                      isNew: true,
+                    })}
+                  ><Plus size={15} />新增规则</button>
                 )}
                 <button
                   className="icon"
                   aria-label="Close"
                   onClick={() => {
                     setManagementView(null);
+                    setProseGateDraft(null);
                     setSessionBatchMode(false);
                     setSelectedSessionIds(new Set());
                   }}
@@ -6127,7 +6229,7 @@ function App() {
                 ))}
                 {state.characters.length === 0 && state.roleplayInterlocutors.length === 0 && <div className="management-empty">还没有角色卡，点右上角新建。</div>}
               </div>
-            ) : (
+            ) : managementView === "sessions" ? (
               <div className="session-manager">
                 {sessionBatchMode && (
                   <div className="session-batch-bar">
@@ -6205,6 +6307,136 @@ function App() {
                     );
                   })}
                   {state.sessions.length === 0 && <div className="management-empty">暂无会话</div>}
+                </div>
+              </div>
+            ) : (
+              <div className="prose-gate-manager">
+                <p className="prose-gate-intro">
+                  项目级语义复审会在正文出口运行。确定错误可设为阻断；偏好、倾向和可能误报的规则建议使用提醒。
+                </p>
+                {proseGateDraft && (
+                  <div className="prose-gate-editor">
+                    <div className="prose-gate-editor-grid">
+                      <label>
+                        <span>稳定 ID</span>
+                        <input
+                          value={proseGateDraft.id}
+                          disabled={!proseGateDraft.isNew || proseGateBusy}
+                          placeholder="例如 dialogue-register"
+                          onChange={(event) => setProseGateDraft(current => current
+                            ? { ...current, id: event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, "") }
+                            : current)}
+                        />
+                      </label>
+                      <label>
+                        <span>级别</span>
+                        <select
+                          value={proseGateDraft.severity}
+                          disabled={proseGateBusy}
+                          onChange={(event) => setProseGateDraft(current => current
+                            ? { ...current, severity: event.target.value === "block" ? "block" : "warn" }
+                            : current)}
+                        >
+                          <option value="warn">提醒</option>
+                          <option value="block">阻断</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label>
+                      <span>核验标准</span>
+                      <textarea
+                        value={proseGateDraft.instruction}
+                        disabled={proseGateBusy}
+                        maxLength={500}
+                        rows={4}
+                        placeholder="写成可以独立执行的检查标准；说明何时适用、什么算违规。"
+                        onChange={(event) => setProseGateDraft(current => current
+                          ? { ...current, instruction: event.target.value }
+                          : current)}
+                      />
+                    </label>
+                    <label>
+                      <span>作者反馈来源</span>
+                      <textarea
+                        value={proseGateDraft.sourceFeedback}
+                        disabled={proseGateBusy}
+                        maxLength={500}
+                        rows={2}
+                        placeholder="简要记录为什么增加这条规则，不粘贴长对话。"
+                        onChange={(event) => setProseGateDraft(current => current
+                          ? { ...current, sourceFeedback: event.target.value }
+                          : current)}
+                      />
+                    </label>
+                    <label className="prose-gate-enabled">
+                      <input
+                        type="checkbox"
+                        checked={proseGateDraft.enabled}
+                        disabled={proseGateBusy}
+                        onChange={(event) => setProseGateDraft(current => current
+                          ? { ...current, enabled: event.target.checked }
+                          : current)}
+                      />
+                      保存后立即启用
+                    </label>
+                    <div className="prose-gate-editor-actions">
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={proseGateBusy || !proseGateDraft.id.trim() || !proseGateDraft.instruction.trim()}
+                        onClick={() => void saveProseGateRule()}
+                      ><Save size={15} />保存</button>
+                      <button type="button" disabled={proseGateBusy} onClick={() => setProseGateDraft(null)}>取消</button>
+                    </div>
+                  </div>
+                )}
+                <div className="prose-gate-list">
+                  {(state.proseGateRules ?? []).map(rule => (
+                    <article className={`prose-gate-card${rule.enabled ? "" : " disabled"}`} key={rule.id}>
+                      <div className="prose-gate-card-head">
+                        <div>
+                          <strong>{rule.id}</strong>
+                          <span className={`prose-gate-severity ${rule.severity}`}>{rule.severity === "block" ? "阻断" : "提醒"}</span>
+                        </div>
+                        <label className="prose-gate-switch">
+                          <input
+                            type="checkbox"
+                            checked={rule.enabled}
+                            disabled={proseGateBusy || readOnly}
+                            onChange={(event) => void setProseGateRuleEnabled(rule, event.target.checked)}
+                          />
+                          {rule.enabled ? "启用" : "停用"}
+                        </label>
+                      </div>
+                      <p>{rule.instruction}</p>
+                      {rule.sourceFeedback && <small>{rule.sourceFeedback}</small>}
+                      <div className="prose-gate-card-foot">
+                        <time dateTime={rule.updatedAt}>更新于 {new Date(rule.updatedAt).toLocaleString()}</time>
+                        <div>
+                          <button
+                            className="ghost"
+                            disabled={proseGateBusy || readOnly || Boolean(proseGateDraft)}
+                            onClick={() => setProseGateDraft({
+                              id: rule.id,
+                              instruction: rule.instruction,
+                              severity: rule.severity,
+                              enabled: rule.enabled,
+                              sourceFeedback: rule.sourceFeedback,
+                              isNew: false,
+                            })}
+                          ><Pencil size={14} />编辑</button>
+                          <button
+                            className="ghost danger"
+                            disabled={proseGateBusy || readOnly}
+                            onClick={() => void deleteProseGateRule(rule)}
+                          ><Trash2 size={14} />删除</button>
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                  {(state.proseGateRules ?? []).length === 0 && (
+                    <div className="management-empty">暂无作者复审规则，可以从右上角新增。</div>
+                  )}
                 </div>
               </div>
             )}

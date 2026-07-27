@@ -215,6 +215,37 @@ test("--no-token server mode disables public API authentication only when explic
       assert.equal(openServer.token, "");
       const allowed = await fetch(`http://127.0.0.1:${openPort}/api/health`);
       assert.equal(allowed.status, 200);
+      const createdRuleResponse = await fetch(`http://127.0.0.1:${openPort}/api/prose-gates`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id: "dialogue-register",
+          instruction: "人物对白必须符合各自身份和语域。",
+          severity: "warn",
+          enabled: true,
+          sourceFeedback: "作者要求长期检查人物声口。",
+        }),
+      });
+      assert.equal(createdRuleResponse.status, 200);
+      const createdRules = await createdRuleResponse.json() as { rules: Array<{ id: string; severity: string }> };
+      assert.equal(createdRules.rules.find(rule => rule.id === "dialogue-register")?.severity, "warn");
+      const disabledRuleResponse = await fetch(
+        `http://127.0.0.1:${openPort}/api/prose-gates/dialogue-register/enabled`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: false }),
+        },
+      );
+      assert.equal(disabledRuleResponse.status, 200);
+      const disabledRules = await disabledRuleResponse.json() as { rules: Array<{ id: string; enabled: boolean }> };
+      assert.equal(disabledRules.rules.find(rule => rule.id === "dialogue-register")?.enabled, false);
+      const removedRuleResponse = await fetch(
+        `http://127.0.0.1:${openPort}/api/prose-gates/dialogue-register`,
+        { method: "DELETE" },
+      );
+      assert.equal(removedRuleResponse.status, 200);
+      assert.equal((await removedRuleResponse.json() as { removed: boolean }).removed, true);
       const unsafeShare = await fetch(`http://127.0.0.1:${openPort}/api/share/readonly`, { method: "POST" });
       assert.equal(unsafeShare.status, 400);
     } finally {

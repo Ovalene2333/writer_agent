@@ -3466,6 +3466,53 @@ button.agent-orb:focus-visible {
   color: var(--text-faint);
 }
 .management-empty { grid-column: 1 / -1; padding: 80px 20px; text-align: center; color: var(--text-faint); }
+.prose-gate-manager { display: flex; flex-direction: column; gap: 16px; }
+.prose-gate-intro {
+  margin: -10px 0 0; padding: 12px 14px; border: 1px solid var(--border-light);
+  border-radius: 12px; background: color-mix(in srgb, var(--accent-light) 45%, var(--surface));
+  color: var(--text-dim); font-size: 12px; line-height: 1.65;
+}
+.prose-gate-editor {
+  display: flex; flex-direction: column; gap: 13px; padding: 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
+  border-radius: 14px; background: var(--surface); box-shadow: var(--shadow-sm);
+}
+.prose-gate-editor-grid { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 12px; }
+.prose-gate-editor label { display: flex; flex-direction: column; gap: 6px; color: var(--text-dim); font-size: 11px; font-weight: 700; }
+.prose-gate-editor input,
+.prose-gate-editor select,
+.prose-gate-editor textarea {
+  width: 100%; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface2); color: var(--text); padding: 9px 10px; font: inherit;
+}
+.prose-gate-editor textarea { resize: vertical; line-height: 1.55; }
+.prose-gate-editor input:focus,
+.prose-gate-editor select:focus,
+.prose-gate-editor textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 26%, transparent); border-color: var(--accent); }
+.prose-gate-editor .prose-gate-enabled { display: inline-flex; flex-direction: row; align-items: center; gap: 8px; width: fit-content; }
+.prose-gate-enabled input,
+.prose-gate-switch input { width: auto; accent-color: var(--accent); }
+.prose-gate-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.prose-gate-list { display: flex; flex-direction: column; gap: 10px; }
+.prose-gate-card {
+  display: flex; flex-direction: column; gap: 10px; padding: 15px 16px;
+  border: 1px solid var(--border-light); border-radius: 12px; background: var(--surface);
+}
+.prose-gate-card.disabled { opacity: .62; }
+.prose-gate-card-head,
+.prose-gate-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.prose-gate-card-head > div,
+.prose-gate-card-foot > div { display: flex; align-items: center; gap: 8px; }
+.prose-gate-card-head strong { font: 700 13px var(--font-mono); overflow-wrap: anywhere; }
+.prose-gate-severity { padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 800; }
+.prose-gate-severity.block { color: var(--danger); background: color-mix(in srgb, var(--danger) 11%, transparent); }
+.prose-gate-severity.warn { color: var(--accent); background: var(--accent-light); }
+.prose-gate-switch { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 11px; }
+.prose-gate-card p { margin: 0; color: var(--text); font-size: 13px; line-height: 1.65; white-space: pre-wrap; }
+.prose-gate-card > small { color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+.prose-gate-card-foot { padding-top: 3px; border-top: 1px solid var(--border-light); }
+.prose-gate-card-foot time { color: var(--text-faint); font-size: 10px; }
+.prose-gate-card-foot button { display: inline-flex; align-items: center; gap: 5px; }
 .session-manager { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
 .session-batch-bar {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -4659,6 +4706,10 @@ header { padding-inline: 18px; }
   .management-head { align-items: flex-start; margin-bottom: 20px; }
   .management-head h2 { font-size: 22px; }
   .management-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .prose-gate-editor-grid { grid-template-columns: 1fr; }
+  .prose-gate-card-head,
+  .prose-gate-card-foot { align-items: flex-start; flex-direction: column; }
+  .prose-gate-card-foot > div { align-self: flex-end; }
   .modal { padding: 22px 18px; border-radius: 16px; }
   .model-config-backdrop { inset: 54px 0 calc(64px + env(safe-area-inset-bottom)); padding: 0; }
   .model-config-view { padding: 20px 14px 36px; border: 0; border-radius: 0; }

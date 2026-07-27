@@ -112,7 +112,7 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *       truncate back to the initial stable+dynamic prefix and append one compact
  *       handoff (chapterContinuationPrompt), so the next chapter stops paying the
  *       previous chapter's scene transcript every step.
- *    b) Scene boundary: after each successful write_chapter_scene, truncate back
+ *    b) Scene boundary: after each successful scene-write tool, truncate back
  *       to the post-begin context base (prep reads + initial scene guide survive) and
  *       append one compact handoff (sceneContinuationPrompt), so later scenes stop
  *       paying earlier scenes' full prose; inspect_chapter_draft reviews the
@@ -445,7 +445,7 @@ ${taskInstructions(
 写入：${documentInstruction}
 修改范围：${editScopeInstruction[task.editScope]}
 写作模式：${writingMode === "fast" ? "快速模式；沿用传统单 Agent 链路，由当前 Agent 完成检索、编排与直接提案，不调用正文 Writer。" : "分工模式；Agent 负责检索与编排，实际正文可交给隔离 Writer。"}
-场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场。链内正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer" : "主 Agent"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、revise_chapter_scene_guide、inspect_chapter_draft 或 propose_chapter_draft，直接使用普通文档交付路径。"}
+场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场。链内正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer" : "主 Agent"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、write_chapter_scene_notes、revise_chapter_scene_guide、inspect_chapter_draft 或 propose_chapter_draft，直接使用普通文档交付路径。"}
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
@@ -613,7 +613,7 @@ export function executionModelForStep(
 }
 
 function isChapterSceneWriteTool(name: string): boolean {
-  return name === "write_chapter_scene";
+  return name === "write_chapter_scene" || name === "write_chapter_scene_notes";
 }
 
 function characterMutationDiagnostic(result: Record<string, unknown>): string {
@@ -1094,7 +1094,7 @@ export function taskInstructions(
 - ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
-    ? `write_chapter_scene 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
+    ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
     : `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。`}依据真实成稿决定继续、调整未写引导或收束。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称；仅正文兑现且有依据的变化才进入 characterChanges。提交前：${proseMannerismPreflightLine()}
 - 单次任务只交付用户指定的正文，不规划或创建其他章节。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;
@@ -1419,7 +1419,7 @@ export function chapterContinuationPrompt(parts: {
 }
 
 /**
- * Scene-boundary handoff (contract §4b). After each successful write_chapter_scene
+ * Scene-boundary handoff (contract §4b). After each successful scene-write call
  * the loop truncates back to the post-begin context base and appends this single
  * message, so later scenes stop paying earlier scenes' full prose on every step.
  * It must therefore carry everything the next scene needs: the seam tail, each
@@ -1453,13 +1453,14 @@ export function sceneContinuationPrompt(
     lines.push(`styleFeedback（对已写正文的机器统计，写下一场必须遵守）：${extras.styleFeedback.join("；")}`);
   }
   if (next) {
+    const sceneWriteTool = extras.isolatedWriter ? "write_chapter_scene_notes" : "write_chapter_scene";
     const submission = extras.isolatedWriter
       ? "在同一调用中只提交要点式 notes；隔离 Writer 会生成正文并独立提取 actualState"
       : "在同一调用中提交要点式 notes、正文与 actualState";
     lines.push(
       `当前 scene guide 的下一场：${JSON.stringify(next)}`,
       ...(remaining.length ? [`当前其后引导：${JSON.stringify(remaining)}`] : []),
-      `先以真实结尾和 actualState 判断 guide 是否仍成立：成立则调用 write_chapter_scene（sceneId=${next.id}），${submission}；不成立则调用 revise_chapter_scene_guide 替换全部未写引导；章节目标已经抵达则清空 remainingScenes 后终审。不要输出计划说明或更新任务清单。`,
+      `先以真实结尾和 actualState 判断 guide 是否仍成立：成立则调用 ${sceneWriteTool}（sceneId=${next.id}），${submission}；不成立则调用 revise_chapter_scene_guide 替换全部未写引导；章节目标已经抵达则清空 remainingScenes 后终审。不要输出计划说明或更新任务清单。`,
     );
   } else {
     lines.push("当前没有未写 scene guide。若章节目标已由实际正文完成，调用 inspect_chapter_draft 并同时提供提案 summary 与已确认的 characterChanges；若仍缺少必要变化，先 revise_chapter_scene_guide 增加下一场引导。");
@@ -1492,6 +1493,24 @@ export function chapterReviewRequiredPrompt(
 
 export function chapterReviewAllowsTool(toolName: string): boolean {
   return toolName === "inspect_chapter_draft";
+}
+
+const COMPLETED_CHAPTER_REVIEW_STATUSES = new Set([
+  "proposal_submitted",
+  "proposal_failed",
+  "style_revision_required",
+  "structural_revision_required",
+  "inspection_required",
+]);
+
+/**
+ * An inspect call may validly return an actionable `error` field (for example,
+ * exact style blockers). Classify by the handler's closed status contract rather
+ * than by the presence of `error`; malformed arguments and execution failures do
+ * not carry one of these statuses and therefore keep the terminal review lock.
+ */
+export function chapterReviewCompleted(result: Record<string, unknown>): boolean {
+  return typeof result.status === "string" && COMPLETED_CHAPTER_REVIEW_STATUSES.has(result.status);
 }
 
 export function chapterDraftNeedsReview(
@@ -2042,13 +2061,11 @@ export async function runAgent(options: {
               ? (parsed.styleFeedback as unknown[]).filter((item): item is string => typeof item === "string")
               : [];
           }
-          if (!("error" in parsed) && call.name === "inspect_chapter_draft" && parsed.proposalSubmitted === true) {
-            documentProposalSubmitted = true;
-            chapterReviewRequired = false;
-          } else if (!("error" in parsed) && call.name === "inspect_chapter_draft"
-            && parsed.status === "style_revision_required") {
-            // Review ran and produced actionable repair targets. Release the
-            // terminal lock so the Agent can use the normal precise-repair path.
+          if (call.name === "inspect_chapter_draft" && chapterReviewCompleted(parsed)) {
+            // Every declared inspect outcome means the terminal action ran. Keep
+            // its tool result in the transcript and release the inspect-only lock
+            // so the Agent can submit, precisely repair, or use fallback review.
+            documentProposalSubmitted = parsed.proposalSubmitted === true;
             chapterReviewRequired = false;
           }
         } catch { /* 非 JSON 工具结果不参与结构化里程碑推进。 */ }

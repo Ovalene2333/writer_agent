@@ -425,6 +425,10 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(begun.status, "started");
     assert.equal(begun.sceneCount, 1);
     assert.equal("scenes" in begun, false, "begin result must not echo the full scene chain");
+    const wrongMode = JSON.parse(await call("write_chapter_scene_notes", {
+      sceneId: "arrival", notes: "只提交笔记。",
+    })) as Record<string, unknown>;
+    assert.match(String(wrongMode.error), /标准\/Fast 模式请调用 write_chapter_scene/u);
     // Planning-only steps mid-draft get steered back to write_chapter_scene.
     const todosNudge = JSON.parse(await call("manage_todos", {
       todos: [{ id: "t1", content: "自定义步骤", status: "in_progress" }],

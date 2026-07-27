@@ -77,7 +77,7 @@ test("analyzeChapterProseMetrics blocks adjacent duplicates and heavy recycling"
   assert.match(blocked, /复读|重合/);
 });
 
-test("analyzeChapterProseMetrics warns on dash and contrast density, dialogue included", () => {
+test("analyzeChapterProseMetrics blocks dash overload and warns on contrast density", () => {
   const text = [
     "她看着屏幕——数据在跳——然后停住——像被掐断。",
     "不是伏击。是撤退。",
@@ -89,8 +89,12 @@ test("analyzeChapterProseMetrics warns on dash and contrast density, dialogue in
   assert.ok(codes.includes("dash_density"));
   assert.ok(codes.includes("contrast_density"));
   assert.ok(metrics.stats.contrastCount >= 2, `dialogue contrast frame must count too, got ${metrics.stats.contrastCount}`);
-  // Density warnings never block on their own.
-  assert.equal(chapterMetricsBlockError(metrics), undefined);
+  const dash = metrics.issues.find(issue => issue.code === "dash_density");
+  const contrast = metrics.issues.find(issue => issue.code === "contrast_density");
+  assert.equal(dash?.severity, "error");
+  assert.ok(dash?.examples.some(example => example.includes("——")));
+  assert.equal(contrast?.severity, "warning");
+  assert.match(chapterMetricsBlockError(metrics) ?? "", /破折号/);
 });
 
 test("analyzeChapterProseMetrics warns on flat staccato rhythm at chapter scale", () => {

@@ -149,7 +149,7 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
     nextScene: sceneCardForTool(nextChapterScene(draft)),
     ...(stylePriorNotes.length ? { stylePriorNotes } : {}),
     message: (context.scenePipelineSettings?.isolatedWriter
-      ? "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 只提交故事内 notes，正文与状态由隔离调用生成。"
+      ? "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene_notes 只提交故事内 notes，正文与状态由隔离调用生成。"
       : "初始 scene guide 与内存草稿已建立。每场后可按 actualState 调整剩余引导；write_chapter_scene 提交故事内 notes、正文和状态。")
       + (stylePriorNotes.length ? " stylePriorNotes 是从既有正文统计出的高频表达负面清单，写每一场时遵守。" : ""),
   });
@@ -184,7 +184,9 @@ function priorProseText(project: WriterProject, draft: ChapterSceneDraft, contex
 export async function handleWriteChapterScene({ input, project, store, sessionId, context }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "write_chapter_scene");
   if (context.scenePipelineSettings?.isolatedWriter) {
-    return handleWriteChapterSceneIsolated({ input, project, store, sessionId, context, emit: () => undefined });
+    // Keep both schemas in the universal tool catalog for prefix-cache stability,
+    // but never reinterpret one tool's payload as the other mode at runtime.
+    throw new Error("隔离 Writer 模式请调用 write_chapter_scene_notes；write_chapter_scene 仅用于标准/Fast 模式");
   }
   const draft = context.chapterSceneDraft;
   if (!draft) throw new Error("尚未开始章节场景草稿；先调用 begin_chapter_draft");
@@ -205,6 +207,19 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
     toolName: "write_chapter_scene",
     exposeCandidateContent: true,
   });
+}
+
+/**
+ * Notes-only entry point for the isolated Writer path. This is intentionally a
+ * separate public tool so its schema can require exactly what that path accepts;
+ * both tools remain permanently registered instead of changing the catalog by mode.
+ */
+export async function handleWriteChapterSceneNotes(args: ToolHandlerArgs): Promise<string> {
+  assertWritableMode(args.context.permissionMode, "write_chapter_scene_notes");
+  if (!args.context.scenePipelineSettings?.isolatedWriter) {
+    throw new Error("标准/Fast 模式请调用 write_chapter_scene，并提交 content 与 actualState");
+  }
+  return handleWriteChapterSceneIsolated(args);
 }
 
 export function handleReviseChapterSceneGuide({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
@@ -392,7 +407,7 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
     submitted: generated.content,
     actualState: extracted.actualState,
     writePackCharacters: formatted.length,
-    toolName: "write_chapter_scene",
+    toolName: "write_chapter_scene_notes",
     generation: {
       mode: "isolated",
       writerInputCharacters: generated.requestCharacters,
@@ -413,7 +428,7 @@ async function acceptChapterScene(args: {
   submitted: string;
   actualState: unknown;
   writePackCharacters: number;
-  toolName: "write_chapter_scene";
+  toolName: "write_chapter_scene" | "write_chapter_scene_notes";
   exposeCandidateContent?: boolean;
   generation?: { mode: "isolated"; writerInputCharacters: number; stateInputCharacters: number };
 }): Promise<string> {
@@ -431,7 +446,7 @@ async function acceptChapterScene(args: {
       error: `本场存在相邻逐字复读句：${residualDuplicates.slice(0, 3).map(item => `「${item}」`).join("、")}`,
       sceneId,
       complete: false,
-      message: "本场未入库；保留 notes，用同一 sceneId 重新调用 write_chapter_scene。",
+      message: `本场未入库；保留 notes，用同一 sceneId 重新调用 ${args.toolName}。`,
     });
   }
   const sceneStyleRepair = await autoRepairSparseSceneStyle({
@@ -1106,6 +1121,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       status: "style_revision_required",
       code: "CHAPTER_METRICS_BLOCKED",
       error: metricsError,
+      metricIssues: metrics.issues.filter(issue => issue.severity === "error"),
       path: draft.path,
       complete: true,
       invalidatedSceneIds: [],

@@ -131,9 +131,14 @@ export function analyzeChapterProseMetrics(
   if (dashPer10k > DASH_PER_10K_LIMIT) {
     issues.push({
       code: "dash_density",
-      severity: "warning",
-      message: `破折号 ${dashPer10k}/万字（上限 ${DASH_PER_10K_LIMIT}）；它正在替代逗号、冒号和因果从句，把补注改写为完整句或直接删除。`,
-      examples: [],
+      severity: "error",
+      message: `破折号 ${dashPer10k}/万字（硬上限 ${DASH_PER_10K_LIMIT}）；保留确有必要的对白拖音、中断或偶发揭示，其余补注改写为完整句、逗号或冒号，或直接删除。`,
+      examples: splitSentences(body)
+        .filter(sentence => {
+          DASH_UNIT.lastIndex = 0;
+          return DASH_UNIT.test(sentence);
+        })
+        .slice(0, 8),
     });
   }
 
@@ -212,7 +217,7 @@ export function analyzeChapterProseMetrics(
   };
 }
 
-/** Blocking message for metric errors only (warnings ship separately as checklist). */
+/** Blocking message for metric errors only (including chapter-wide dash overload). */
 export function chapterMetricsBlockError(metrics: ChapterProseMetrics): string | undefined {
   const errors = metrics.issues.filter(issue => issue.severity === "error");
   if (!errors.length) return undefined;

@@ -386,11 +386,14 @@ export const TOOLS = deepFreeze([
       },
     },
   },
+  // Scene writing has two payload contracts. Keep both tools in this fixed
+  // catalog: switching schemas by runtime mode would destroy provider prefix
+  // cache reuse, while a shared weak schema lets standard calls omit required data.
   {
     type: "function",
     function: {
       name: "write_chapter_scene",
-      description: "写入一场章节草稿；隔离 Writer 模式只提交 notes，标准模式同时提交正文与状态",
+      description: "标准/Fast 场景写入：提交故事内 notes、本场正文和实际离场状态",
       parameters: {
         type: "object",
         properties: {
@@ -413,6 +416,25 @@ export const TOOLS = deepFreeze([
               usedMotifs: { type: "array", items: { type: "string" } },
             },
             additionalProperties: false,
+          },
+        },
+        required: ["sceneId", "notes", "content", "actualState"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_chapter_scene_notes",
+      description: "隔离 Writer 场景写入：只提交故事内 notes，由工具生成正文并提取实际离场状态",
+      parameters: {
+        type: "object",
+        properties: {
+          sceneId: { type: "string" },
+          notes: {
+            type: "string",
+            description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
         },
         required: ["sceneId", "notes"],
@@ -952,7 +974,7 @@ export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name))
 const WRITE_TOOLS = new Set([
   "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set",
   "revise_document_isolated",
-  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
+  "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
   "manage_prose_gates",
 ]);

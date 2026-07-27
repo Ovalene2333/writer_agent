@@ -12,7 +12,7 @@ export function handleCompileWritePack({ input, context }: ToolHandlerArgs): str
   const targetPath = typeof input.targetPath === "string" ? input.targetPath.trim() : undefined;
   const instruction = typeof input.instruction === "string" ? input.instruction.trim() : undefined;
   if (context.chapterSceneDraft) {
-    throw new Error("章节场景无需单独 compile_write_pack；请在 write_chapter_scene 的 notes 中提供故事内笔记，工具会在同一步完成编译");
+    throw new Error("章节场景无需单独 compile_write_pack；请在当前模式对应的场景写入工具 notes 中提供故事内笔记，工具会在同一步完成编译");
   }
   const pack = compileWritePack(notes, { targetPath, instruction });
   const writePack = formatWritePackForWriter(pack);

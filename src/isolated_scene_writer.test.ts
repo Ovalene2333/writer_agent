@@ -262,11 +262,20 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     await call("begin_chapter_draft", {
       path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "改变战术", scenes: [scene],
     });
-    const failed = JSON.parse(await call("write_chapter_scene", {
+    const wrongMode = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "armor",
+      notes: "## 场景目标\n改变战术",
+      content: "这段正文不应被隔离模式接收。",
+      actualState: state("不应写入"),
+    })) as Record<string, unknown>;
+    assert.match(String(wrongMode.error), /隔离 Writer 模式请调用 write_chapter_scene_notes/u);
+    const failed = JSON.parse(await call("write_chapter_scene_notes", {
+      sceneId: "armor",
       notes: "## 已知事实\n双方都读过委托书上的装甲参数\n## 须自然落地\n装甲实际厚度比旧参数高三成",
     })) as Record<string, unknown>;
     assert.match(String(failed.error), /正文已暂存/u);
-    const result = JSON.parse(await call("write_chapter_scene", {
+    const result = JSON.parse(await call("write_chapter_scene_notes", {
+      sceneId: "armor",
       notes: "状态提取重试；正文已经生成，不要重新生成。",
     })) as Record<string, unknown>;
     assert.deepEqual(calls, ["writer", "writer", "state", "state", "state"]);
