@@ -34,6 +34,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Share2,
   Save,
@@ -248,6 +249,14 @@ type DocumentVersionMeta = {
 type DocumentVersionDetail = DocumentVersionMeta & {
   beforeContent: string;
   afterContent: string;
+};
+type ChapterSummary = {
+  path: string;
+  title: string;
+  volume: string;
+  wordCount: number;
+  versionCount: number;
+  updatedAt: string;
 };
 type MarkdownHeading = { id: string; level: number; text: string };
 type Temporal = { validFrom?: string; validUntil?: string };
@@ -505,6 +514,7 @@ const EMPTY_CHARACTER: CharacterDraft = {
 /** Visual UI themes (workspace chrome). Not writing style templates. */
 type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
 type WorkspaceMode = "split" | "editor-focus" | "agent-focus";
+type DocumentSidebarMode = "chapters" | "files";
 type ManagementView = "characters" | "sessions" | "models" | "prose-gates" | "continuity-facts";
 
 type UiTheme = {
@@ -1428,6 +1438,144 @@ function countFiles(node: TreeNode): number {
   return node.kind === "file" ? 1 : node.children.reduce((total, child) => total + countFiles(child), 0);
 }
 
+type ChapterGroup = { id: string; label: string; folderPath: string; chapters: ChapterSummary[] };
+
+function buildChapterGroups(chapters: ChapterSummary[], folders: string[]): ChapterGroup[] {
+  const volumes = new Set<string>([""]);
+  for (const folder of folders) {
+    if (folder.startsWith("chapters/")) volumes.add(folder.slice("chapters/".length));
+  }
+  for (const chapter of chapters) volumes.add(chapter.volume);
+  return [...volumes]
+    .sort((a, b) => {
+      if (!a) return -1;
+      if (!b) return 1;
+      return a.localeCompare(b, "zh-CN", { numeric: true });
+    })
+    .map(volume => ({
+      id: volume || "__ungrouped__",
+      label: volume || "未分卷",
+      folderPath: volume ? `chapters/${volume}` : "chapters",
+      chapters: chapters.filter(chapter => chapter.volume === volume),
+    }));
+}
+
+function ChapterManager({
+  groups,
+  query,
+  activePath,
+  readOnly,
+  collapsed,
+  onToggleGroup,
+  onSelect,
+  onVersions,
+  onRename,
+  onDelete,
+  onDuplicate,
+  onMove,
+  onNewChapter,
+}: {
+  groups: ChapterGroup[];
+  query: string;
+  activePath: string;
+  readOnly: boolean;
+  collapsed: Set<string>;
+  onToggleGroup: (id: string) => void;
+  onSelect: (path: string) => void;
+  onVersions: (path: string) => void;
+  onRename: (path: string, kind: "file" | "folder") => void;
+  onDelete: (path: string, kind: "file" | "folder") => void;
+  onDuplicate: (path: string) => void;
+  onMove: (path: string, kind: "file" | "folder", target: string) => void;
+  onNewChapter: (folderPath: string) => void;
+}) {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visible = groups.flatMap(group => {
+    const chapters = normalizedQuery
+      ? group.chapters.filter(chapter => `${chapter.title} ${chapter.path}`.toLocaleLowerCase().includes(normalizedQuery))
+      : group.chapters;
+    return chapters.length || !normalizedQuery ? [{ ...group, chapters }] : [];
+  });
+  if (!visible.some(group => group.chapters.length)) {
+    return (
+      <div className="sidebar-empty compact">
+        <BookOpenText size={24} aria-hidden="true" />
+        <strong>{normalizedQuery ? "没有匹配的章节" : "还没有章节"}</strong>
+        <span>{normalizedQuery ? "可按章节标题或路径搜索" : "从上方新建章节开始写作"}</span>
+      </div>
+    );
+  }
+  return (
+    <div className="chapter-manager">
+      {visible.map(group => {
+        const isCollapsed = collapsed.has(group.id) && !normalizedQuery;
+        const words = group.chapters.reduce((total, chapter) => total + chapter.wordCount, 0);
+        return (
+          <section
+            className="chapter-group"
+            key={group.id}
+            onDragOver={event => event.preventDefault()}
+            onDrop={event => {
+              event.preventDefault();
+              const raw = event.dataTransfer.getData("application/x-writer-node");
+              if (!raw) return;
+              const payload = JSON.parse(raw) as { path: string; kind: "file" | "folder" };
+              if (payload.kind === "file") onMove(payload.path, payload.kind, group.folderPath);
+            }}
+          >
+            <div className="chapter-group-head">
+              <button type="button" className="chapter-group-toggle" onClick={() => onToggleGroup(group.id)}>
+                <ChevronRight size={14} className={isCollapsed ? "" : "expanded"} />
+                <span>{group.label}</span>
+              </button>
+              <span className="chapter-group-stats">{group.chapters.length} 章 · {words.toLocaleString("zh-CN")} 字</span>
+              {!readOnly && (
+                <div className="chapter-group-actions">
+                  <IconButton label={`在${group.label}中新建章节`} onClick={() => onNewChapter(group.folderPath)}><Plus size={13} /></IconButton>
+                  {group.id !== "__ungrouped__" && <IconButton label="重命名卷" onClick={() => onRename(group.folderPath, "folder")}><Pencil size={13} /></IconButton>}
+                </div>
+              )}
+            </div>
+            {!isCollapsed && (
+              <div className="chapter-list">
+                {group.chapters.length === 0 ? (
+                  <button type="button" className="chapter-group-empty" onClick={() => onNewChapter(group.folderPath)}>在本卷新建第一章</button>
+                ) : group.chapters.map(chapter => (
+                  <div
+                    key={chapter.path}
+                    className={`chapter-row${activePath === chapter.path ? " active" : ""}`}
+                    draggable={!readOnly}
+                    onDragStart={event => {
+                      event.dataTransfer.setData("application/x-writer-node", JSON.stringify({ path: chapter.path, kind: "file" }));
+                      event.dataTransfer.effectAllowed = "move";
+                    }}
+                  >
+                    <button type="button" className="chapter-open" onClick={() => onSelect(chapter.path)} title={chapter.path}>
+                      <span className="chapter-title">{chapter.title}</span>
+                      <span className="chapter-meta">
+                        {chapter.wordCount.toLocaleString("zh-CN")} 字
+                        {chapter.versionCount > 0 && <> · {chapter.versionCount} 个版本</>}
+                      </span>
+                    </button>
+                    <div className="chapter-row-actions">
+                      <IconButton label="版本历史" onClick={() => onVersions(chapter.path)}><History size={13} /></IconButton>
+                      {!readOnly && <>
+                        <IconButton label="创建副本" onClick={() => onDuplicate(chapter.path)}><Copy size={13} /></IconButton>
+                        <IconButton label="重命名章节" onClick={() => onRename(chapter.path, "file")}><Pencil size={13} /></IconButton>
+                        <IconButton label="删除章节" className="danger" onClick={() => onDelete(chapter.path, "file")}><Trash2 size={13} /></IconButton>
+                      </>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 function FileTreeItem({
   node,
   depth,
@@ -1993,6 +2141,18 @@ function App() {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
     try {
       return new Set(JSON.parse(localStorage.getItem("writer-expanded-folders") || "[]") as string[]);
+    } catch {
+      return new Set();
+    }
+  });
+  const [documentSidebarMode, setDocumentSidebarMode] = useState<DocumentSidebarMode>(() =>
+    localStorage.getItem("writer-document-sidebar-mode") === "files" ? "files" : "chapters",
+  );
+  const [chapters, setChapters] = useState<ChapterSummary[]>([]);
+  const [chaptersLoading, setChaptersLoading] = useState(false);
+  const [collapsedChapterVolumes, setCollapsedChapterVolumes] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("writer-collapsed-chapter-volumes") || "[]") as string[]);
     } catch {
       return new Set();
     }
@@ -2647,6 +2807,18 @@ function App() {
     }
   }, []);
 
+  const loadChapters = useCallback(async () => {
+    setChaptersLoading(true);
+    try {
+      const result = await api<{ chapters: ChapterSummary[] }>("/api/chapters");
+      setChapters(result.chapters);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChaptersLoading(false);
+    }
+  }, []);
+
   async function toggleVersionPanel() {
     if (!activePath || editingDocument) return;
     if (versionPanelOpen) {
@@ -2678,6 +2850,39 @@ function App() {
     setBrowsingVersion(null);
   }
 
+  async function openChapterVersions(path: string) {
+    setActivePath(path);
+    setBrowsingVersion(null);
+    setEditingDocument(false);
+    setVersionPanelOpen(true);
+    setMobileTab("editor");
+    await loadVersions(path);
+  }
+
+  async function restoreBrowsingVersion() {
+    if (!activePath || !browsingVersion || state?.accessMode === "readonly") return;
+    if (!confirm(`将历史版本 #${browsingVersion.id} 恢复为当前内容？当前内容会保留在版本历史中。`)) return;
+    setVersionBusy(true);
+    setError("");
+    try {
+      const live = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
+      await api("/api/document/version/restore", {
+        method: "POST",
+        body: JSON.stringify({ path: activePath, id: browsingVersion.id, baseHash: live.hash }),
+      });
+      const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
+      setDocument(next);
+      setDocumentDraft(next.content);
+      setBrowsingVersion(null);
+      await Promise.all([loadVersions(activePath), loadChapters(), refresh(state?.sessionId)]);
+      setNotice(`已将版本 #${browsingVersion.id} 恢复为新版本`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setVersionBusy(false);
+    }
+  }
+
   useEffect(() => {
     if (renaming && renameInputRef.current) renameInputRef.current.focus();
   }, [renaming]);
@@ -2689,6 +2894,19 @@ function App() {
   useEffect(() => {
     localStorage.setItem("writer-expanded-folders", JSON.stringify([...expandedFolders]));
   }, [expandedFolders]);
+
+  useEffect(() => {
+    localStorage.setItem("writer-document-sidebar-mode", documentSidebarMode);
+  }, [documentSidebarMode]);
+
+  useEffect(() => {
+    localStorage.setItem("writer-collapsed-chapter-volumes", JSON.stringify([...collapsedChapterVolumes]));
+  }, [collapsedChapterVolumes]);
+
+  useEffect(() => {
+    if (!state) return;
+    void loadChapters();
+  }, [loadChapters, state?.documents]);
 
   useEffect(() => {
     if (!activePath.includes("/")) return;
@@ -3459,6 +3677,21 @@ function App() {
     setCreateValue(kind === "file" ? "新文档" : "新文件夹");
   }
 
+  function handleNewChapter(parent = "chapters") {
+    const maxNumber = chapters.reduce((max, chapter) => {
+      const match = chapter.path.split("/").pop()?.match(/^chapter-(\d+)\.md$/iu);
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0);
+    setCreating({ parent, kind: "file" });
+    setCreateValue(`chapter-${String(maxNumber + 1).padStart(3, "0")}`);
+  }
+
+  function handleNewVolume() {
+    const volumeCount = new Set(chapters.map(chapter => chapter.volume).filter(Boolean)).size;
+    setCreating({ parent: "chapters", kind: "folder" });
+    setCreateValue(`第${volumeCount + 1}卷`);
+  }
+
   async function submitCreate() {
     if (!creating || !createValue.trim()) {
       setCreating(null);
@@ -3470,9 +3703,12 @@ function App() {
       : `${name}${creating.kind === "file" && !name.endsWith(".md") ? ".md" : ""}`;
     try {
       if (creating.kind === "file") {
+        const stem = name.replace(/\.md$/iu, "");
+        const numberedChapter = fullPath.startsWith("chapters/") ? stem.match(/^chapter-(\d+)$/iu) : null;
+        const heading = numberedChapter ? `第${Number(numberedChapter[1])}章` : stem;
         await api("/api/document", {
           method: "POST",
-          body: JSON.stringify({ path: fullPath, content: "# New Document\n\n" }),
+          body: JSON.stringify({ path: fullPath, content: `# ${heading || "新文档"}\n\n` }),
         });
       } else {
         await api("/api/folder", {
@@ -3486,6 +3722,8 @@ function App() {
         return next;
       });
       await refresh(state?.sessionId);
+      if (fullPath.startsWith("chapters/")) await loadChapters();
+      if (creating.kind === "file") setActivePath(fullPath);
     } catch (e) {
       setError(String(e));
     }
@@ -4230,6 +4468,8 @@ function App() {
   const visibleExpandedFolders = useMemo(() => fileQuery.trim()
     ? new Set([...expandedFolders, ...collectFolderPaths(visibleTree)])
     : expandedFolders, [expandedFolders, fileQuery, visibleTree]);
+  const chapterGroups = useMemo(() => buildChapterGroups(chapters, state?.documentFolders ?? []), [chapters, state?.documentFolders]);
+  const totalChapterWords = useMemo(() => chapters.reduce((total, chapter) => total + chapter.wordCount, 0), [chapters]);
 
   if (!state) {
     return (
@@ -4368,11 +4608,22 @@ function App() {
         <div className="file-manager-head">
           <div>
             <span className="file-manager-kicker">Workspace</span>
-            <h2>项目文件</h2>
+            <h2>{documentSidebarMode === "chapters" ? "章节管理" : "项目文件"}</h2>
           </div>
           <span className="file-manager-count">
-            {fileQuery.trim() ? `${state.documents.length - visibleTree.reduce((sum, node) => sum + countFiles(node), 0)} 条已筛除` : `${state.documents.length} 篇`}
+            {documentSidebarMode === "chapters"
+              ? `${chapters.length} 章 · ${totalChapterWords.toLocaleString("zh-CN")} 字`
+              : fileQuery.trim() ? `${state.documents.length - visibleTree.reduce((sum, node) => sum + countFiles(node), 0)} 条已筛除` : `${state.documents.length} 篇`}
           </span>
+        </div>
+
+        <div className="document-mode-switch" role="tablist" aria-label="文档视图">
+          <button type="button" role="tab" aria-selected={documentSidebarMode === "chapters"} className={documentSidebarMode === "chapters" ? "active" : ""} onClick={() => setDocumentSidebarMode("chapters")}>
+            <BookOpenText size={14} />章节
+          </button>
+          <button type="button" role="tab" aria-selected={documentSidebarMode === "files"} className={documentSidebarMode === "files" ? "active" : ""} onClick={() => setDocumentSidebarMode("files")}>
+            <Folder size={14} />全部文件
+          </button>
         </div>
 
         <div className="file-manager-tools">
@@ -4382,47 +4633,42 @@ function App() {
               ref={fileSearchRef}
               value={fileQuery}
               onChange={(event) => setFileQuery(event.target.value)}
-              placeholder="搜索文件或路径…"
+              placeholder={documentSidebarMode === "chapters" ? "搜索章节标题或路径…" : "搜索文件或路径…"}
               aria-label="搜索项目文件"
               aria-keyshortcuts="/"
             />
             {fileQuery && <button type="button" title="清除搜索" onClick={() => setFileQuery("")}><X size={13} /></button>}
           </label>
           <div className="file-view-actions">
-            <button type="button" title="展开全部" onClick={() => setExpandedFolders(new Set(collectFolderPaths(tree)))}>
-              <ChevronDown size={14} />
-            </button>
-            <button type="button" title="收起全部" onClick={() => setExpandedFolders(new Set())}>
-              <Minus size={14} />
-            </button>
-            <button type="button" title="刷新文件列表" onClick={() => void refresh(state.sessionId)}>
+            {documentSidebarMode === "files" && <>
+              <button type="button" title="展开全部" onClick={() => setExpandedFolders(new Set(collectFolderPaths(tree)))}>
+                <ChevronDown size={14} />
+              </button>
+              <button type="button" title="收起全部" onClick={() => setExpandedFolders(new Set())}>
+                <Minus size={14} />
+              </button>
+            </>}
+            <button type="button" title="刷新" onClick={() => void Promise.all([refresh(state.sessionId), loadChapters()])}>
               <RefreshCw size={14} />
             </button>
           </div>
         </div>
         {!readOnly && <div className="file-manager-actions">
-          <button
-            type="button"
-            className="fm-btn"
-            onClick={() => {
-              setCreating({ parent: "", kind: "file" });
-              setCreateValue("新文档");
-            }}
-          >
-            <FilePlus2 size={15} aria-hidden="true" />
-            新建文档
-          </button>
-          <button
-            type="button"
-            className="fm-btn"
-            onClick={() => {
-              setCreating({ parent: "", kind: "folder" });
-              setCreateValue("新文件夹");
-            }}
-          >
-            <FolderPlus size={15} aria-hidden="true" />
-            新建文件夹
-          </button>
+          {documentSidebarMode === "chapters" ? <>
+            <button type="button" className="fm-btn" onClick={() => handleNewChapter()}>
+              <FilePlus2 size={15} aria-hidden="true" />新建章节
+            </button>
+            <button type="button" className="fm-btn" onClick={handleNewVolume}>
+              <FolderPlus size={15} aria-hidden="true" />新建卷
+            </button>
+          </> : <>
+            <button type="button" className="fm-btn" onClick={() => { setCreating({ parent: "", kind: "file" }); setCreateValue("新文档"); }}>
+              <FilePlus2 size={15} aria-hidden="true" />新建文档
+            </button>
+            <button type="button" className="fm-btn" onClick={() => { setCreating({ parent: "", kind: "folder" }); setCreateValue("新文件夹"); }}>
+              <FolderPlus size={15} aria-hidden="true" />新建文件夹
+            </button>
+          </>}
         </div>}
 
         {renaming && (
@@ -4458,7 +4704,29 @@ function App() {
         )}
 
         <div className="sidebar-section docs">
-          {tree.length === 0 ? (
+          {documentSidebarMode === "chapters" ? (
+            chaptersLoading && chapters.length === 0
+              ? <div className="sidebar-empty compact"><RefreshCw size={22} /><span>正在整理章节…</span></div>
+              : <ChapterManager
+                  groups={chapterGroups}
+                  query={fileQuery}
+                  activePath={activePath}
+                  readOnly={readOnly}
+                  collapsed={collapsedChapterVolumes}
+                  onToggleGroup={(id) => setCollapsedChapterVolumes(current => {
+                    const next = new Set(current);
+                    if (next.has(id)) next.delete(id); else next.add(id);
+                    return next;
+                  })}
+                  onSelect={(path) => { setActivePath(path); setMobileTab("editor"); }}
+                  onVersions={(path) => void openChapterVersions(path)}
+                  onRename={handleRename}
+                  onDelete={handleDelete}
+                  onDuplicate={handleDuplicate}
+                  onMove={handleMoveNode}
+                  onNewChapter={handleNewChapter}
+                />
+          ) : tree.length === 0 ? (
             <div className="sidebar-empty">
               <div className="sidebar-empty-icon" aria-hidden="true">
                 <FolderPlus size={32} />
@@ -4563,9 +4831,16 @@ function App() {
                 </button>
               )}
               {browsingVersion ? (
-                <button className="primary" onClick={exitVersionBrowse} title="回到磁盘上的当前版本">
-                  返回当前
-                </button>
+                <>
+                  {!readOnly && !browsingVersion.isCurrent && (
+                    <button disabled={versionBusy} onClick={() => void restoreBrowsingVersion()} title="把这个历史快照恢复为新的当前版本">
+                      <RotateCcw size={14} />恢复此版本
+                    </button>
+                  )}
+                  <button className="primary" onClick={exitVersionBrowse} title="回到磁盘上的当前版本">
+                    返回当前
+                  </button>
+                </>
               ) : editingDocument ? (
                 <>
                   <button onClick={cancelEdit}><X size={14} />取消</button>

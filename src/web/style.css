@@ -717,10 +717,26 @@ header {
   letter-spacing: .01em; text-transform: none;
 }
 .file-manager-count {
-  flex-shrink: 0; padding: 3px 8px;
+  flex-shrink: 1; min-width: 0; max-width: 54%; padding: 3px 8px;
   border-radius: 999px; border: 1px solid var(--border-light);
   background: color-mix(in srgb, var(--surface) 70%, transparent);
   color: var(--text-faint); font-size: 10px; font-weight: 650;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.document-mode-switch {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2px;
+  margin: 0 12px 10px; padding: 2px; flex-shrink: 0;
+  border: 1px solid var(--border-light); border-radius: 8px;
+  background: color-mix(in srgb, var(--surface3) 74%, transparent);
+}
+.document-mode-switch button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-width: 0; min-height: 28px; padding: 4px 7px;
+  border: 0; border-radius: 6px; background: transparent;
+  color: var(--text-dim); font-size: 11px; font-weight: 650; cursor: pointer;
+}
+.document-mode-switch button.active {
+  background: var(--surface); color: var(--accent); box-shadow: var(--shadow-sm);
 }
 .file-manager-actions {
   display: flex; gap: 8px; padding: 0 12px 12px;
@@ -790,6 +806,54 @@ header {
 .document-tree {
   overflow-y: auto; flex: 1 1 auto; padding: 4px 8px 16px;
 }
+
+/* Chapter-first workspace. Volumes are real folders under chapters/. */
+.chapter-manager {
+  overflow-y: auto; flex: 1 1 auto; min-height: 0; padding: 2px 8px 18px;
+}
+.chapter-group { margin-bottom: 7px; }
+.chapter-group-head {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 5px;
+  min-height: 34px; padding: 2px 3px 2px 5px;
+  border-bottom: 1px solid var(--border-light);
+}
+.chapter-group-toggle {
+  min-width: 0; display: flex; align-items: center; gap: 5px; padding: 5px 2px;
+  border: 0; background: transparent; color: var(--text); cursor: pointer;
+  font-size: 12px; font-weight: 700; text-align: left;
+}
+.chapter-group-toggle svg { flex: 0 0 auto; color: var(--text-faint); transition: transform .15s ease; }
+.chapter-group-toggle svg.expanded { transform: rotate(90deg); }
+.chapter-group-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chapter-group-stats { color: var(--text-faint); font-size: 9px; white-space: nowrap; }
+.chapter-group-actions { display: flex; gap: 1px; opacity: 0; transition: opacity .12s ease; }
+.chapter-group-head:hover .chapter-group-actions, .chapter-group-head:focus-within .chapter-group-actions { opacity: 1; }
+.chapter-group-actions .icon, .chapter-row-actions .icon {
+  width: 25px; height: 25px; padding: 0; border: 0; border-radius: 6px;
+  color: var(--text-faint); background: transparent;
+}
+.chapter-row-actions .icon.danger:hover { color: var(--warn); background: var(--warn-light); }
+.chapter-list { padding: 3px 0 2px; }
+.chapter-row {
+  display: flex; align-items: center; min-height: 48px; margin: 2px 0;
+  border: 1px solid transparent; border-radius: 8px;
+  transition: background .12s ease, border-color .12s ease;
+}
+.chapter-row:hover { background: color-mix(in srgb, var(--accent-light) 62%, var(--surface)); border-color: var(--border-light); }
+.chapter-row.active { background: var(--accent-light); border-color: color-mix(in srgb, var(--accent) 28%, var(--border)); box-shadow: inset 3px 0 var(--accent); }
+.chapter-open {
+  min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+  padding: 7px 4px 7px 11px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer;
+}
+.chapter-title { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 650; }
+.chapter-meta { color: var(--text-faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+.chapter-row-actions { display: flex; flex: 0 0 auto; padding-right: 4px; opacity: 0; transition: opacity .12s ease; }
+.chapter-row:hover .chapter-row-actions, .chapter-row:focus-within .chapter-row-actions, .chapter-row.active .chapter-row-actions { opacity: 1; }
+.chapter-group-empty {
+  width: 100%; padding: 10px; border: 1px dashed var(--border); border-radius: 7px;
+  background: transparent; color: var(--text-faint); font-size: 11px; cursor: pointer;
+}
+.chapter-group-empty:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
 .tree-node {
   min-width: 0;
 }

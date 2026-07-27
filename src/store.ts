@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
   RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
@@ -176,6 +176,7 @@ export class WriterStore {
         created_file INTEGER NOT NULL DEFAULT 0,
         character_revisions_json TEXT NOT NULL DEFAULT '[]',
         undone INTEGER NOT NULL DEFAULT 0,
+        label TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS change_sets (
@@ -401,6 +402,9 @@ export class WriterStore {
     }
     if (!revisionColumns.some(column => column.name === "character_revisions_json")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN character_revisions_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!revisionColumns.some(column => column.name === "label")) {
+      this.database.exec("ALTER TABLE revisions ADD COLUMN label TEXT NOT NULL DEFAULT ''");
     }
     const changeSetColumns = this.database.prepare("PRAGMA table_info(change_sets)").all() as Row[];
     if (!changeSetColumns.some(column => column.name === "before_config")) {
@@ -2732,10 +2736,40 @@ export class WriterStore {
     if (this.project.hash(current) !== baseHash) throw new Error("文档已在其他位置修改，请刷新后重试");
     this.project.writeRaw(path, content);
     this.database.prepare(`
-      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_at)
-      VALUES(NULL,?,?,?,?,?)
-    `).run(path, current, content, this.project.hash(content), new Date().toISOString());
+      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,label,created_at)
+      VALUES(NULL,?,?,?,?,?,?)
+    `).run(path, current, content, this.project.hash(content), "手动编辑", new Date().toISOString());
     this.reindex();
+  }
+
+  chapterSummaries(): ChapterSummary[] {
+    const revisionRows = this.database.prepare(`
+      SELECT path, COUNT(*) AS version_count, MAX(created_at) AS updated_at
+      FROM revisions WHERE path LIKE 'chapters/%' GROUP BY path
+    `).all() as Row[];
+    const revisions = new Map(revisionRows.map(row => [String(row.path), {
+      count: Number(row.version_count),
+      updatedAt: String(row.updated_at ?? ""),
+    }]));
+    return this.project.listDocuments()
+      .filter(path => path.startsWith("chapters/"))
+      .map((path) => {
+        const content = this.project.read(path);
+        const title = content.match(/^\s*#\s+(.+)$/mu)?.[1]?.trim()
+          || path.split("/").pop()!.replace(/\.md$/iu, "");
+        const relative = path.slice("chapters/".length);
+        const slash = relative.lastIndexOf("/");
+        const revision = revisions.get(path);
+        return {
+          path,
+          title,
+          volume: slash >= 0 ? relative.slice(0, slash) : "",
+          wordCount: content.replace(/\s+/gu, "").length,
+          versionCount: revision?.count ?? 0,
+          updatedAt: revision?.updatedAt ?? "",
+        };
+      })
+      .sort((a, b) => a.path.localeCompare(b.path, "zh-CN", { numeric: true }));
   }
 
   /**
@@ -2748,7 +2782,7 @@ export class WriterStore {
     const live = this.project.documentExists(path) ? this.project.read(path) : "";
     const liveHash = live ? this.project.hash(live) : "";
     const rows = this.database.prepare(`
-      SELECT r.id, r.path, r.after_hash, r.created_file, r.created_at, r.undone,
+      SELECT r.id, r.path, r.after_hash, r.created_file, r.created_at, r.undone, r.label,
              p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
@@ -2758,7 +2792,9 @@ export class WriterStore {
     `).all(path) as Row[];
     return rows.map((row) => {
       const undone = Number(row.undone) === 1;
-      const baseSummary = typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+      const baseSummary = typeof row.label === "string" && row.label.trim()
+        ? String(row.label)
+        : typeof row.proposal_summary === "string" && row.proposal_summary.trim()
         ? String(row.proposal_summary)
         : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
       return {
@@ -2779,7 +2815,7 @@ export class WriterStore {
     if (!Number.isInteger(revisionId) || revisionId <= 0) throw new Error("版本编号无效");
     const row = this.database.prepare(`
       SELECT r.id, r.path, r.before_content, r.after_content, r.after_hash,
-             r.created_file, r.created_at, r.undone, p.summary AS proposal_summary
+             r.created_file, r.created_at, r.undone, r.label, p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
       WHERE r.id = ? AND r.path = ?
@@ -2788,7 +2824,9 @@ export class WriterStore {
     const live = this.project.documentExists(path) ? this.project.read(path) : "";
     const liveHash = live ? this.project.hash(live) : "";
     const undone = Number(row.undone) === 1;
-    const baseSummary = typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+    const baseSummary = typeof row.label === "string" && row.label.trim()
+      ? String(row.label)
+      : typeof row.proposal_summary === "string" && row.proposal_summary.trim()
       ? String(row.proposal_summary)
       : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
     return {
@@ -2802,6 +2840,23 @@ export class WriterStore {
       beforeContent: String(row.before_content ?? ""),
       afterContent: String(row.after_content ?? ""),
     };
+  }
+
+  restoreDocumentVersion(path: string, revisionId: number, baseHash: string): DocumentVersionMeta {
+    if (!this.project.documentExists(path)) throw new Error("当前文档不存在，无法恢复历史版本");
+    const current = this.project.read(path);
+    if (this.project.hash(current) !== baseHash) throw new Error("文档已在其他位置修改，请刷新后重试");
+    const target = this.documentVersion(path, revisionId);
+    if (current === target.afterContent) throw new Error("当前内容已经是该版本");
+    const now = new Date().toISOString();
+    this.project.writeRaw(path, target.afterContent);
+    const result = this.database.prepare(`
+      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,label,created_at)
+      VALUES(NULL,?,?,?,?,?,?)
+    `).run(path, current, target.afterContent, this.project.hash(target.afterContent), `恢复版本 #${revisionId}`, now);
+    this.refreshContinuityFactsForDocument(path, target.afterContent);
+    this.reindex();
+    return this.documentVersions(path).find(version => version.id === Number(result.lastInsertRowid))!;
   }
 
   renameDocument(fromPath: string, toPath: string): void {

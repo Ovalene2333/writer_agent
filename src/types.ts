@@ -316,6 +316,16 @@ export interface DocumentVersionDetail extends DocumentVersionMeta {
   afterContent: string;
 }
 
+/** Compact metadata used by the chapter workspace without loading every body in the browser. */
+export interface ChapterSummary {
+  path: string;
+  title: string;
+  volume: string;
+  wordCount: number;
+  versionCount: number;
+  updatedAt: string;
+}
+
 /** Per-model-call token stats (one agent step / draft call). */
 export interface RequestComponentUsage {
   kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";

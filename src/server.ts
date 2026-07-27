@@ -372,6 +372,14 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.get("/api/chapters", (context) => {
+    try {
+      return context.json({ chapters: options.store.chapterSummaries() });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.get("/api/document/version", (context) => {
     try {
       const path = context.req.query("path") ?? "";
@@ -380,6 +388,16 @@ export async function startWriterServer(options: {
       return context.json({ version: options.store.documentVersion(path, id) });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.post("/api/document/version/restore", async (context) => {
+    try {
+      const body = await context.req.json<{ path: string; id: number; baseHash: string }>();
+      const version = options.store.restoreDocumentVersion(body.path ?? "", Number(body.id), body.baseHash ?? "");
+      return context.json({ version, hash: options.project.hash(options.project.read(body.path)) });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 409);
     }
   });
 
