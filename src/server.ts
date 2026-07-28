@@ -630,6 +630,7 @@ export async function startWriterServer(options: {
       const rule = upsertProseGateRule(options.project, {
         id: typeof body.id === "string" ? body.id : "",
         instruction: typeof body.instruction === "string" ? body.instruction : "",
+        kind: body.kind === "style_preference" ? "style_preference" : body.kind === "hard_gate" ? "hard_gate" : undefined,
         severity: body.severity === "warn" ? "warn" : "block",
         enabled: body.enabled !== false,
         sourceFeedback: typeof body.sourceFeedback === "string" ? body.sourceFeedback : "",
@@ -1064,7 +1065,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }>; resumeInterrupted?: boolean }>();
     if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
@@ -1159,6 +1160,7 @@ export async function startWriterServer(options: {
             prompt: body.prompt,
             variantGroupId,
             selectedDocumentBlocks: body.documentSelections,
+            resumeInterrupted: body.resumeInterrupted === true,
             characterScope,
             simpleCharacterScope,
             permissionMode,
@@ -1308,8 +1310,8 @@ export async function startWriterServer(options: {
       const shouldIndexContinuity = action === "accept"
         && loadAgentSettings(options.project).continuityFactsEnabled
         && ["lore", "chapter", "side"].includes(documentKind(proposal.path));
-      const continuity = shouldIndexContinuity
-        ? await indexAcceptedContinuityFacts({
+      if (shouldIndexContinuity) {
+        scheduleAcceptedContinuityIndexing(() => indexAcceptedContinuityFacts({
             project: options.project,
             store: options.store,
             providers: options.providers,
@@ -1318,9 +1320,9 @@ export async function startWriterServer(options: {
             afterContent: proposal.afterContent,
             sourceId: proposal.id,
             sessionId: proposal.sessionId,
-          })
-        : { continuityFacts: 0 };
-      return context.json({ proposal, ...continuity, continuityFactsPending: false });
+        }));
+      }
+      return context.json({ proposal, continuityFacts: 0, continuityFactsPending: shouldIndexContinuity });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -1339,9 +1341,8 @@ export async function startWriterServer(options: {
         ? changeSet.files.filter(file => file.operation !== "delete" && file.operation !== "move"
           && ["lore", "chapter", "side"].includes(documentKind(file.path)))
         : [];
-      const continuityResults: Array<{ continuityFacts: number; continuityFactWarning?: string }> = [];
       for (const file of continuityFiles) {
-        continuityResults.push(await indexAcceptedContinuityFacts({
+        scheduleAcceptedContinuityIndexing(() => indexAcceptedContinuityFacts({
           project: options.project,
           store: options.store,
           providers: options.providers,
@@ -1353,9 +1354,9 @@ export async function startWriterServer(options: {
       }
       return context.json({
         changeSet,
-        continuityFacts: continuityResults.reduce((sum, result) => sum + result.continuityFacts, 0),
-        continuityFactWarnings: continuityResults.flatMap(result => result.continuityFactWarning ? [result.continuityFactWarning] : []),
-        continuityFactsPending: false,
+        continuityFacts: 0,
+        continuityFactWarnings: [],
+        continuityFactsPending: continuityFiles.length > 0,
       });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
@@ -1407,6 +1408,16 @@ export async function startWriterServer(options: {
       return context.json(options.store.prepareMessageRerun(sessionId, targetId, {
         keepChanges: Boolean(body.keepChanges),
       }));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/messages/:id/resume", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string }>();
+      const sessionId = body.sessionId ?? "";
+      const targetId = Number(context.req.param("id"));
+      if (!sessionId || !Number.isInteger(targetId) || targetId < 1) throw new Error("参数无效");
+      return context.json(options.store.interruptedAgentResumePrompt(sessionId, targetId));
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 

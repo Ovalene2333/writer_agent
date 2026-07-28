@@ -3,10 +3,12 @@ import { resolve } from "node:path";
 import type { WriterProject } from "./project.js";
 
 export type ProseGateRuleSeverity = "block" | "warn";
+export type ProseGateRuleKind = "hard_gate" | "style_preference";
 
 export interface ProseGateRule {
   id: string;
   instruction: string;
+  kind: ProseGateRuleKind;
   severity: ProseGateRuleSeverity;
   enabled: boolean;
   sourceFeedback: string;
@@ -17,6 +19,7 @@ export interface ProseGateRule {
 const DEFAULT_RULES: readonly ProseGateRule[] = [{
   id: "quoted-text-count-consistency",
   instruction: "正文用“这几个字/这N个字/几个字”等方式描述引号内文字数量时，必须按实际书写单位核对数量；数量与引号内文字不一致即违规。不要把标点计入字数。",
+  kind: "hard_gate",
   severity: "block",
   enabled: true,
   sourceFeedback: "作者反馈：类似“xxxx”——这三个字的数量描述容易写错，必须复审。",
@@ -45,10 +48,17 @@ function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRul
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("规则必须是对象");
   const item = value as Record<string, unknown>;
   const now = new Date().toISOString();
+  const severity: ProseGateRuleSeverity = item.severity === "warn" ? "warn" : "block";
+  const kind: ProseGateRuleKind = item.kind === "style_preference"
+    ? "style_preference"
+    : item.kind === "hard_gate"
+      ? "hard_gate"
+      : severity === "warn" ? "style_preference" : "hard_gate";
   return {
     id: normalizeId(item.id),
     instruction: boundedText(item.instruction, "instruction", 500),
-    severity: item.severity === "warn" ? "warn" : "block",
+    kind,
+    severity,
     enabled: item.enabled !== false,
     sourceFeedback: typeof item.sourceFeedback === "string" ? item.sourceFeedback.trim().slice(0, 500) : "",
     createdAt: typeof item.createdAt === "string" && item.createdAt ? item.createdAt : fallbackCreatedAt ?? now,
@@ -81,7 +91,7 @@ function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): voi
 
 export function upsertProseGateRule(
   project: WriterProject,
-  input: Pick<ProseGateRule, "id" | "instruction"> & Partial<Pick<ProseGateRule, "severity" | "enabled" | "sourceFeedback">>,
+  input: Pick<ProseGateRule, "id" | "instruction"> & Partial<Pick<ProseGateRule, "kind" | "severity" | "enabled" | "sourceFeedback">>,
 ): ProseGateRule {
   const rules = loadProseGateRules(project);
   const id = normalizeId(input.id);

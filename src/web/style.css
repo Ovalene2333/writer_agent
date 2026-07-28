@@ -1616,8 +1616,9 @@ button.agent-orb:focus-visible {
 .conversation-region {
   position: relative;
   display: flex;
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
+  overflow: hidden;
 }
 .conversation {
   flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
@@ -2419,6 +2420,7 @@ button.agent-orb:focus-visible {
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--surface2) 70%, transparent), var(--surface2));
   position: relative;
+  z-index: 2;
 }
 .composer::before {
   content: ""; position: absolute; left: 16px; right: 16px; top: 0; height: 1px;

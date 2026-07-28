@@ -449,7 +449,7 @@ evidence 必须逐字复制自对应 passage，尽量是一句完整原文；rea
       {
         role: "user",
         content: JSON.stringify({
-          rules: activeRules.map(rule => ({ id: rule.id, instruction: rule.instruction, severity: rule.severity })),
+          rules: activeRules.map(rule => ({ id: rule.id, instruction: rule.instruction, kind: rule.kind, severity: rule.severity })),
           passages: passages.map(passage => ({ id: passage.id, text: passage.text })),
         }),
       },

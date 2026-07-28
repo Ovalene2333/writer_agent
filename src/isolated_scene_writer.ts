@@ -2,6 +2,12 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { nonThinkingRequestOptions, samplingRequestOptions, type SamplingRequestBody } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
+import {
+  proseCharacterCount,
+  proseLengthAdjustmentInstruction,
+  proseTargetBounds,
+  type ProseLengthAssessment,
+} from "./prose_length.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import type { WritePack } from "./write_pack.js";
@@ -22,21 +28,10 @@ export type IsolatedSceneWriterInput = {
   maximumCharacters?: number;
   strictMinimumCharacters?: number;
   strictMaximumCharacters?: number;
+  lengthAdjustment?: ProseLengthAssessment;
 };
 
-export const PROSE_TARGET_MIN_RATIO = 0.85;
-export const PROSE_TARGET_MAX_RATIO = 1.2;
-
-export function proseTargetBounds(targetCharacters: number): { minimum: number; maximum: number } {
-  return {
-    minimum: Math.ceil(targetCharacters * PROSE_TARGET_MIN_RATIO),
-    maximum: Math.floor(targetCharacters * PROSE_TARGET_MAX_RATIO),
-  };
-}
-
-export function proseCharacterCount(content: string): number {
-  return content.replace(/\s+/gu, "").length;
-}
+export { proseCharacterCount, proseTargetBounds };
 
 export type SceneStateExtractionInput = {
   previousState?: SceneActualState;
@@ -172,13 +167,16 @@ export function buildIsolatedSceneWriterMessages(
     ?? input.maximumCharacters
     ?? (target ? Math.floor(target * 2) : undefined);
   sections.push(target
-    ? `目标篇幅是 ${target} 字，可接受范围 ${targetBounds!.minimum}—${targetBounds!.maximum} 字${maximumCharacters ? `，硬上限 ${maximumCharacters} 字` : ""}。字数是交付约束：先让关键动作、阻力、转折和余波获得足够展开，再压缩不改变选择的说明与重复过程；不得用总结、回顾或同义反复凑字。`
+    ? `目标篇幅是 ${target} 字，可接受范围 ${targetBounds!.minimum}—${targetBounds!.maximum} 字${maximumCharacters ? `，硬上限 ${maximumCharacters} 字` : ""}。字数是交付约束，但不是精确凑数：关键动作、阻力、转折和余波要完整，过门、解释和重复过程应压缩；不得用总结、回顾或同义反复凑字。`
     : "变化完成、余波抵达时就结束，不用解释或回顾来填满篇幅。");
+  if (input.lengthAdjustment && input.lengthAdjustment.status !== "ok") {
+    sections.push(proseLengthAdjustmentInstruction(input.lengthAdjustment));
+  }
   if (input.strictMinimumCharacters) {
-    sections.push(`上一次正文篇幅不足。这一次正文不得少于 ${input.strictMinimumCharacters} 字；扩展人物为达成目标采取的行动、阻力造成的具体后果、转折前后的反应与收束余波，不新增无依据支线，不用解释和复述填充。`);
+    sections.push(`这一次正文不得少于 ${input.strictMinimumCharacters} 字。`);
   }
   if (input.strictMaximumCharacters) {
-    sections.push(`上一次写得太长。这一次把枝节留在场外，正文不得超过 ${input.strictMaximumCharacters} 字；先压缩原理说明、重复读数和不改变选择的过程，但要给结尾留下完整余波。`);
+    sections.push(`这一次正文不得超过 ${input.strictMaximumCharacters} 字。`);
   }
 
   const styleDirectives = input.styleDirectives?.trim();

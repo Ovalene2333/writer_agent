@@ -539,6 +539,8 @@ export type AgentEvent =
       mutation: "none" | "document" | "character" | "mixed";
       planning: "direct" | "adaptive";
       capabilities: string[];
+      workflow?: "free" | "scene_graph" | "chapter_delivery";
+      qualityProfile?: "fast" | "standard" | "strict";
     } }
   | { type: "text"; text: string; channel?: "output" | "reasoning" }
   | { type: "tool"; name: string }

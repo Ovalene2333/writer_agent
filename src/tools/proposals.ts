@@ -19,6 +19,7 @@ import {
   requestIsolatedScene,
 } from "../isolated_scene_writer.js";
 import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
+import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
 import {
   DEFAULT_ISOLATED_WRITER_MAX_RATIO,
@@ -407,16 +408,18 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     styleDirectives: isolatedWriterStyleDirectives(project),
     maximumCharacters,
   };
-  const runWriter = async (lengthRetry = false) => {
+  const runWriter = async (lengthAdjustment?: ProseLengthAssessment, forceBounds = false) => {
+    const lengthRetry = Boolean(lengthAdjustment) || forceBounds;
     const callKind = lengthRetry
       ? "isolated_document_writer_length_retry"
       : "isolated_document_writer";
     try {
       const generated = await runner(writer.model, {
         ...writerInput,
-        ...(lengthRetry ? {
+        ...(lengthAdjustment || forceBounds ? {
           strictMinimumCharacters: targetBounds.minimum,
           strictMaximumCharacters: targetBounds.maximum,
+          ...(lengthAdjustment ? { lengthAdjustment } : {}),
         } : {}),
       }, writer.signal);
       if (generated.usage) {
@@ -449,14 +452,15 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     if (!(error instanceof IsolatedSceneRequestError)
       || error.stage !== "writer"
       || error.failureKind !== "truncated") throw error;
-    generated = await runWriter(true);
+    generated = await runWriter(undefined, true);
   }
-  const initialCharacters = proseCharacterCount(generated.content);
-  if (initialCharacters < targetBounds.minimum || initialCharacters > targetBounds.maximum) {
-    generated = await runWriter(true);
+  const initialAssessment = assessProseLength(targetCharacters, generated.content);
+  if (initialAssessment.status !== "ok") {
+    generated = await runWriter(initialAssessment);
   }
-  const finalCharacters = proseCharacterCount(generated.content);
-  if (finalCharacters < targetBounds.minimum || finalCharacters > targetBounds.maximum) {
+  const finalAssessment = assessProseLength(targetCharacters, generated.content);
+  const finalCharacters = finalAssessment.actual;
+  if (finalAssessment.status !== "ok") {
     throw new Error(`隔离 Writer 重试后正文仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整事件密度或改用场景链`);
   }
   rejectCompressedPlaceholder(generated.content, "隔离 Writer 正文");

@@ -2549,8 +2549,29 @@ export class WriterStore {
       ...(inputMode ? { inputMode } : {}),
       ...(channel === "roleplay" && prompt === "<续演>"
         ? { modelInitiatedRoleplay: "continuation" as const }
-        : {}),
+      : {}),
     };
+  }
+
+  interruptedAgentResumePrompt(sessionId: string, targetId: number): { prompt: string; fromId: number } {
+    if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
+    const target = this.database.prepare(`SELECT id,role,content,channel FROM messages WHERE id=? AND session_id=?`)
+      .get(targetId, sessionId) as Row | undefined;
+    if (!target) throw new Error("消息不存在");
+    if (target.channel !== "agent") throw new Error("只能续跑 Agent 消息");
+    if (target.role === "user") {
+      const prompt = String(target.content).trim();
+      if (!prompt) throw new Error("原始用户指令为空，无法续跑");
+      return { fromId: Number(target.id), prompt };
+    }
+    if (target.role !== "assistant" || !String(target.content).includes("[生成已中断]")) {
+      throw new Error("只能续跑已中断的 Agent 回复或对应用户指令");
+    }
+    const user = this.database.prepare(`SELECT id,content FROM messages
+      WHERE session_id=? AND role='user' AND channel='agent' AND id<? ORDER BY id DESC LIMIT 1`)
+      .get(sessionId, targetId) as Row | undefined;
+    if (!user || !String(user.content).trim()) throw new Error("未找到可续跑的原始用户指令");
+    return { fromId: Number(user.id), prompt: String(user.content) };
   }
 
   archiveRoleplayBranch(sessionId: string, fromMessageId: number, groupId: string): RoleplayBranchSummary | undefined {

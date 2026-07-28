@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Bot, CheckCircle2, LoaderCircle, Palette, Pencil, Plus, Radar, WandSparkles, Wifi, X, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, Library, LoaderCircle, Palette, Pencil, Plus, Radar, ShieldCheck, WandSparkles, Wifi, X, XCircle } from "lucide-react";
 
 export type Pricing = {
   billingMode?: "metered" | "unmetered";
@@ -31,7 +31,7 @@ export type ScenePipelineSettings = {
   candidateCount: number;
 };
 export type WritingExecutionMode = "delegated" | "fast";
-export type SettingsSection = "models" | "writing" | "style" | "connection" | "appearance";
+export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "continuity-facts" | "connection" | "appearance";
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
@@ -75,6 +75,8 @@ type ModelConfigProps = {
   continuityFactsEnabled: boolean;
   section: SettingsSection;
   styleContent: React.ReactNode;
+  proseGatesContent: React.ReactNode;
+  continuityFactsContent: React.ReactNode;
   connectionContent: React.ReactNode;
   appearanceContent: React.ReactNode;
   connectionAvailable: boolean;
@@ -95,6 +97,8 @@ export function ModelConfig({
   continuityFactsEnabled,
   section,
   styleContent,
+  proseGatesContent,
+  continuityFactsContent,
   connectionContent,
   appearanceContent,
   connectionAvailable,
@@ -344,6 +348,8 @@ export function ModelConfig({
     models: { eyebrow: "Model routing", title: "模型与分工", description: "管理模型连接，并为写作流程的不同环节分配模型。" },
     writing: { eyebrow: "Writing behavior", title: "写作行为", description: "调整角色演进、可选场景链与正文生成策略。" },
     style: { eyebrow: "Writing style", title: "写作风格", description: "管理写作模板、范文与采样建议。" },
+    "prose-gates": { eyebrow: "Review rules", title: "作者复审规则", description: "管理项目级语义复审规则。" },
+    "continuity-facts": { eyebrow: "Continuity", title: "连续性事实", description: "维护可追溯的长期事实索引。" },
     connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
     appearance: { eyebrow: "Appearance", title: "界面主题", description: "选择工作区的明暗与配色方案。" },
   };
@@ -366,6 +372,14 @@ export function ModelConfig({
           <button className={section === "style" ? "active" : ""} aria-current={section === "style" ? "page" : undefined} onClick={() => selectSection("style")}>
             <WandSparkles size={17}/>
             <span><strong>写作风格</strong><small>模板、范文与采样建议</small></span>
+          </button>
+          <button className={section === "prose-gates" ? "active" : ""} aria-current={section === "prose-gates" ? "page" : undefined} onClick={() => selectSection("prose-gates")}>
+            <ShieldCheck size={17}/>
+            <span><strong>作者复审规则</strong><small>语义门禁与长期偏好</small></span>
+          </button>
+          <button className={section === "continuity-facts" ? "active" : ""} aria-current={section === "continuity-facts" ? "page" : undefined} onClick={() => selectSection("continuity-facts")}>
+            <Library size={17}/>
+            <span><strong>连续性事实</strong><small>事实索引与来源证据</small></span>
           </button>
           <button className={section === "connection" ? "active" : ""} aria-current={section === "connection" ? "page" : undefined} disabled={!connectionAvailable} onClick={() => selectSection("connection")}>
             <Wifi size={17}/>
@@ -493,6 +507,8 @@ export function ModelConfig({
         </div>
           </div>}
           {section === "style" && styleContent}
+          {section === "prose-gates" && proseGatesContent}
+          {section === "continuity-facts" && continuityFactsContent}
           {section === "connection" && connectionContent}
           {section === "appearance" && appearanceContent}
         </main>

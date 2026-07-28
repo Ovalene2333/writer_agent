@@ -62,6 +62,30 @@ test("accepted continuity indexing starts after the approval response turn", asy
   assert.equal(started, true);
 });
 
+test("interrupted agent resume can use either assistant marker or step anchor user", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-resume-"));
+  try {
+    const project = WriterProject.init(root, "resume");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("resume");
+    const userId = store.addMessage(sessionId, "user", "写第一章", "agent");
+    const assistantId = store.addMessage(sessionId, "assistant", "已经完成几步\n\n[生成已中断]", "agent");
+    assert.deepEqual(store.interruptedAgentResumePrompt(sessionId, userId), {
+      fromId: userId,
+      prompt: "写第一章",
+    });
+    assert.deepEqual(store.interruptedAgentResumePrompt(sessionId, assistantId), {
+      fromId: userId,
+      prompt: "写第一章",
+    });
+    const doneId = store.addMessage(sessionId, "assistant", "已完成", "agent");
+    assert.throws(() => store.interruptedAgentResumePrompt(sessionId, doneId), /只能续跑/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("web roleplay messages expose the parsed perception without internal turn hints", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-web-perception-"));
   try {

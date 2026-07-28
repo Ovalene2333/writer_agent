@@ -71,7 +71,7 @@ test("isolated scene writer receives only the current prose packet", () => {
   assert.match(messages[1].content, /不是台词任务/u);
   assert.match(messages[1].content, /可以合并、改序或舍弃/u);
   assert.match(messages[1].content, /对白简短，动作留白/u);
-  assert.match(messages[1].content, /绝不要超过 800 字/u);
+  assert.match(messages[1].content, /硬上限 800 字/u);
   assert.doesNotMatch(messages[1].content, /［|^\s*[-•]\s/mu);
   assert.doesNotMatch(messages[1].content, /chapters\//u);
   assert.doesNotMatch(messages[1].content, /write_chapter_scene|actualState|styleFeedback|todo/iu);
@@ -224,7 +224,8 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
             );
           }
           assert.equal(input.maximumCharacters, 800);
-          assert.equal(input.strictMaximumCharacters, 800);
+          assert.equal(input.strictMinimumCharacters, 300);
+          assert.equal(input.strictMaximumCharacters, 540);
           return {
             content,
             usage: { promptTokens: 300, completionTokens: 200, cacheHitTokens: 0, cacheMissTokens: 300 },
@@ -312,6 +313,9 @@ test("direct isolated document keeps prose generation outside the Agent transcri
       "雨沿着候机楼的玻璃往下淌。林岚把登机牌压在桌沿，等父亲把那杯没有动过的咖啡推回来。",
       "「到了那边先住学校安排的宿舍。」他说，「月底我把剩下的材料寄过去。」",
       "她把杯子接住，问的却是下一次复查。两个人对着日历算了几分钟，广播第三次催促登机时，纸上已经多了两个日期。",
+      "父亲把那张写满时间的便签折了两折，塞进她护照夹最外层，又像怕动作太郑重似的补了一句只是顺手。林岚没有拆穿他，只把咖啡重新推回去，说飞机落地后会先发消息。",
+      "检票口前的队伍慢慢缩短。她拖着箱子往前走了几步，听见父亲在身后叫她名字。那一声并不响，却让她回头看见他举起手机，屏幕上已经存好下一次复查和视频通话的提醒。",
+      "她隔着人群点头。广播盖过了后半句话，但父亲的口型很清楚，是让她别省药，也别省电话。林岚把登机牌夹进书里，第一次没有急着说自己都知道。",
     ].join("\n\n");
     const context: ToolExecutionContext = {
       permissionMode: "ask",

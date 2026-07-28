@@ -47,6 +47,7 @@ import {
   sceneProseScoreBreakdown,
 } from "../prose_metrics.js";
 import { analyzeProseVividness, formatVividnessSummary, sceneVividnessFeedback } from "../prose_vividness.js";
+import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
 import {
   analyzeProseStyle,
   isHardBlockSubtype,
@@ -216,11 +217,10 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   rejectCompressedPlaceholder(submitted, "content");
   const targetCharacters = draft.scenes.find(scene => scene.id === sceneId)?.targetCharacters;
   if (targetCharacters) {
-    const bounds = proseTargetBounds(targetCharacters);
-    const actualCharacters = proseCharacterCount(submitted);
-    if (actualCharacters < bounds.minimum || actualCharacters > bounds.maximum) {
+    const assessment = assessProseLength(targetCharacters, submitted);
+    if (assessment.status !== "ok") {
       throw new Error(
-        `本场正文 ${actualCharacters} 字，目标 ${targetCharacters} 字，可接受范围 ${bounds.minimum}—${bounds.maximum} 字。保持本场目标、事实和 actualState 一致，调整正文篇幅后重新提交；不得用总结、重复或元说明凑字。`,
+        `本场正文 ${assessment.actual} 字，目标 ${targetCharacters} 字，可接受范围 ${assessment.minimum}—${assessment.maximum} 字。保持本场目标、事实和 actualState 一致，按差量${assessment.status === "too_short" ? `补足约 ${assessment.delta} 字` : `删减约 ${assessment.delta} 字`}后重新提交；不得用总结、重复或元说明凑字。`,
       );
     }
   }
@@ -330,14 +330,16 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
     ...(avoidNotes.length ? { avoidNotes } : {}),
     maximumCharacters,
   };
-  const runWriter = async (lengthRetry = false) => {
+  const runWriter = async (lengthAdjustment?: ProseLengthAssessment, forceBounds = false) => {
+    const lengthRetry = Boolean(lengthAdjustment) || forceBounds;
     const callKind = lengthRetry ? "isolated_scene_writer_length_retry" : "isolated_scene_writer";
     try {
       const generated = await runner(context.isolatedSceneWriter!.model, {
         ...writerInput,
-        ...(lengthRetry && targetBounds ? {
+        ...(targetBounds && (lengthAdjustment || forceBounds) ? {
           strictMinimumCharacters: targetBounds.minimum,
           strictMaximumCharacters: targetBounds.maximum,
+          ...(lengthAdjustment ? { lengthAdjustment } : {}),
         } : {}),
       }, context.isolatedSceneWriter!.signal);
       if (generated.usage) {
@@ -369,17 +371,18 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
         || error.stage !== "writer"
         || error.failureKind !== "truncated"
         || !maximumCharacters) throw error;
-      generated = await runWriter(true);
+      generated = await runWriter(undefined, true);
       retriedForLength = true;
     }
   }
   const initialCharacters = proseCharacterCount(generated.content);
   if (!retriedForLength && targetBounds
     && (initialCharacters < targetBounds.minimum || initialCharacters > targetBounds.maximum)) {
-    generated = await runWriter(true);
+    generated = await runWriter(assessProseLength(targetCharacters!, generated.content));
   }
-  const finalCharacters = proseCharacterCount(generated.content);
-  if (targetBounds && (finalCharacters < targetBounds.minimum || finalCharacters > targetBounds.maximum)) {
+  const finalAssessment = targetCharacters ? assessProseLength(targetCharacters, generated.content) : undefined;
+  const finalCharacters = finalAssessment?.actual ?? proseCharacterCount(generated.content);
+  if (targetBounds && finalAssessment?.status !== "ok") {
     throw new Error(`隔离正文 Writer 重试后本场仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整本场事件密度后重试`);
   }
   if (!targetBounds && maximumCharacters && finalCharacters > maximumCharacters) {

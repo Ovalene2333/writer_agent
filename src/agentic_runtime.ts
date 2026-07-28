@@ -1,4 +1,13 @@
 import type { AgentTodoItem, PermissionMode } from "./types.js";
+import {
+  inferWritingQualityProfile,
+  inferWritingWorkflowKind,
+  writingWorkflowCompletionGaps,
+  writingWorkflowStagesForTool,
+  type WritingQualityProfile,
+  type WritingWorkflowKind,
+  type WritingWorkflowStage,
+} from "./writing_workflow.js";
 
 export type AgentTaskOutcome = "answer" | "document" | "character" | "review" | "multiple";
 export type AgentEvidenceRequirement = "none" | "project" | "target" | "continuation";
@@ -18,6 +27,11 @@ export interface AgentTaskContract {
   mutation: AgentMutationRequirement;
   planning: AgentPlanningStrategy;
   capabilities: AgentCapability[];
+  documentProposalRequired?: boolean;
+  /** Runtime writing graph hint; it guides execution without freezing a path. */
+  workflow?: WritingWorkflowKind;
+  /** Quality gate intensity selected from task shape and runtime settings. */
+  qualityProfile?: WritingQualityProfile;
   /** A semantic planner decision that must be persisted before the turn can finish. */
   proseGateRequired?: boolean;
 }
@@ -29,6 +43,7 @@ export interface AgentExecutionProgress {
   documentArtifactProduced: boolean;
   characterArtifactProduced: boolean;
   proseGateRuleSaved: boolean;
+  workflowStages: Set<WritingWorkflowStage>;
 }
 
 const PROJECT_EVIDENCE_TOOLS = new Set([
@@ -66,8 +81,11 @@ export function createAgentExecutionProgress(reusableEvidence = false): AgentExe
     documentArtifactProduced: false,
     characterArtifactProduced: false,
     proseGateRuleSaved: false,
+    workflowStages: new Set(),
   };
 }
+
+export { inferWritingQualityProfile, inferWritingWorkflowKind };
 
 export function resolveAgentPlanningStrategy(
   mutation: AgentMutationRequirement,
@@ -104,6 +122,9 @@ export function recordAgentToolResult(
   if (toolName === "manage_prose_gates" && result.status === "saved") {
     progress.proseGateRuleSaved = true;
   }
+  for (const stage of writingWorkflowStagesForTool(toolName, result)) {
+    progress.workflowStages.add(stage);
+  }
 }
 
 function hasEvidence(contract: AgentTaskContract, progress: AgentExecutionProgress): boolean {
@@ -138,6 +159,7 @@ export function agentCompletionGaps(
   if (contract.proseGateRequired && !progress.proseGateRuleSaved) {
     gaps.push("尚未把 planning 识别出的可复用作者反馈保存为复审规则");
   }
+  gaps.push(...writingWorkflowCompletionGaps(contract, progress.workflowStages));
   if (contract.planning === "adaptive" && todos.length
     && todos.some(todo => todo.status === "pending" || todo.status === "in_progress")) {
     gaps.push("动态任务清单仍有未完成步骤");

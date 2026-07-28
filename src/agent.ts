@@ -20,6 +20,8 @@ import {
   completionRecoveryPrompt,
   contractAllowsTool,
   createAgentExecutionProgress,
+  inferWritingQualityProfile,
+  inferWritingWorkflowKind,
   recordAgentToolResult,
   resolveAgentPlanningStrategy,
   type AgentCapability,
@@ -29,6 +31,7 @@ import {
   type AgentTaskContract,
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
+import { writingWorkflowPrompt } from "./writing_workflow.js";
 import {
   DEFAULT_SCENE_NOTES_CHARACTERS,
   formatTodosForPrompt,
@@ -394,6 +397,7 @@ function dynamicContextPrompt(
   characterScope?: number[],
   continuationPath?: string,
   simpleCharacterScope?: number[],
+  resumeInterrupted?: boolean,
 ): string {
   const explicitReferences = explicitReferencePaths(project, request);
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
@@ -442,9 +446,14 @@ function dynamicContextPrompt(
     continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/提案确定路径。"}记忆有末尾且未变则续写；否则 inspect 一次 + read(lastSection=true)。`,
   };
   const reviewBlock = task.mode === "audit" ? `\n\n${REVIEW_PROMPT}` : "";
+  const resumeLine = resumeInterrupted
+    ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
+    : "";
   return `当前任务：${task.label}
-任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities })}
+任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile })}
 mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后用 manage_todos 修订剩余计划。
+${writingWorkflowPrompt(task.workflow ?? "free", task.qualityProfile ?? "fast")}
+${resumeLine}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
 作者复审：${proseGateInstruction}
 
@@ -970,6 +979,24 @@ proseGateCandidate 格式：{"id":"稳定英文短ID","instruction":"可独立�
       documentDeliverables: documentProposalRequired
         ? (documentDeliverables.length ? documentDeliverables : ["当前文档"])
         : [],
+      workflow: inferWritingWorkflowKind({
+        mode,
+        outcome,
+        mutation,
+        planning,
+        capabilities,
+        documentProposalRequired,
+        editScope,
+      }),
+      qualityProfile: inferWritingQualityProfile({
+        mode,
+        outcome,
+        mutation,
+        planning,
+        capabilities,
+        documentProposalRequired,
+        editScope,
+      }),
       proseGateRequired: Boolean(proseGateCandidate),
       ...(proseGateCandidate ? { proseGateCandidate } : {}),
       ...(typeof parsed.targetPath === "string" && validDocumentPaths.has(parsed.targetPath) ? { targetPath: parsed.targetPath } : {}),
@@ -1640,6 +1667,7 @@ export async function runAgent(options: {
   characterScope?: number[];
   simpleCharacterScope?: number[];
   selectedDocumentBlocks?: Array<{ path: string; text?: string }>;
+  resumeInterrupted?: boolean;
   model?: ModelConfig;
   models?: AgentRoleModels;
   maxTurns?: number;
@@ -1698,11 +1726,14 @@ export async function runAgent(options: {
     },
   );
   const task = planned.task;
+  if (options.resumeInterrupted) task.continuation = true;
   // Permission policy is orthogonal to semantic mode and always wins.
   if (permissionMode === "plan") {
     task.documentProposalRequired = false;
     task.mutation = "none";
     task.proseGateRequired = false;
+    task.workflow = "free";
+    task.qualityProfile = "fast";
   }
   emit({
     type: "task_contract",
@@ -1713,6 +1744,8 @@ export async function runAgent(options: {
       mutation: task.mutation,
       planning: task.planning,
       capabilities: task.capabilities,
+      workflow: task.workflow,
+      qualityProfile: task.qualityProfile,
     },
   });
   const executionModel = executionModelForTask(
@@ -1909,6 +1942,7 @@ export async function runAgent(options: {
         characterScope,
         continuationPath,
         simpleCharacterScope,
+        options.resumeInterrupted === true,
       ),
       dynamicStyleContext: dynamicStyleContext || undefined,
       bootstrapContext: bootstrapContext || undefined,

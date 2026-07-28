@@ -107,6 +107,29 @@ test("self-contained document creation only requires a delivered artifact", () =
   assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
 });
 
+test("chapter workflow stage gaps require review after a scene chain starts", () => {
+  const progress = createAgentExecutionProgress(true);
+  const contract: AgentTaskContract = {
+    mode: "write_scene",
+    outcome: "document",
+    evidence: "none",
+    mutation: "document",
+    planning: "adaptive",
+    capabilities: ["documents", "scenes", "review"],
+    documentProposalRequired: true,
+    workflow: "chapter_delivery",
+    qualityProfile: "standard",
+  };
+  recordAgentToolResult(progress, "begin_chapter_draft", { status: "started" });
+  recordAgentToolResult(progress, "write_chapter_scene", { status: "written", complete: true });
+  recordAgentToolResult(progress, "propose_document", { status: "pending" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "章节场景链已启动但尚未完成整章终审",
+  ]);
+  recordAgentToolResult(progress, "inspect_chapter_draft", { status: "review_passed", proposalSubmitted: true });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
 test("mixed contracts require and authorize both artifact families", () => {
   const contract: AgentTaskContract = {
     ...documentContract,

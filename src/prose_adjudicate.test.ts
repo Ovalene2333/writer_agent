@@ -32,6 +32,7 @@ test("learned gate accepts exact evidence for quoted-text count feedback", () =>
   const rule: ProseGateRule = {
     id: "quoted-text-count-consistency",
     instruction: "描述引号内文字数量时，核对实际字数。",
+    kind: "hard_gate",
     severity: "block",
     enabled: true,
     sourceFeedback: "作者要求复审字数描述",

@@ -261,7 +261,7 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.match(normal, /检查同名卡/);
   assert.match(normal, /角色保存成功即完成本任务/);
   assert.match(normal, /禁止再提交文档提案或 change set/);
-  assert.match(normal, /必须 get_character/);
+  assert.match(normal, /直接 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
   assert.match(normal, /结构化错误/);
 });
