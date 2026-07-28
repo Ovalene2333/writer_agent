@@ -15,6 +15,12 @@ export interface ModelConfig {
   pricing?: TokenPricing;
   temperature?: number;
   topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  /** OpenAI-compatible reasoning depth. Omitted to use the provider default. */
+  reasoningEffort?: ReasoningEffort;
+  /** OpenAI-compatible response detail. Omitted to use the provider default. */
+  verbosity?: ResponseVerbosity;
   /**
    * Suppress every sampling / penalty parameter for this model.
    *
@@ -87,6 +93,8 @@ export interface ModelTokenUsage {
 }
 
 export type ProviderId = "deepseek" | "openai-compatible";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ResponseVerbosity = "low" | "medium" | "high";
 
 export interface ProviderPublicConfig {
   profileId?: string;
@@ -101,6 +109,10 @@ export interface ProviderPublicConfig {
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  reasoningEffort?: ReasoningEffort;
+  verbosity?: ResponseVerbosity;
   disableSampling?: boolean;
 }
 
@@ -110,6 +122,10 @@ export interface ProviderModelPublic {
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  reasoningEffort?: ReasoningEffort;
+  verbosity?: ResponseVerbosity;
   /** See ModelConfig.disableSampling — set per model, since this is a model capability. */
   disableSampling?: boolean;
 }
@@ -141,8 +157,6 @@ export interface StyleTemplate {
   name: string;
   description: string;
   systemPromptAddition: string;
-  suggestedTemperature: number;
-  suggestedTopP: number;
   exampleContent: string;
   exampleNotes: string;
 }

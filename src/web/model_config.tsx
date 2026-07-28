@@ -16,8 +16,10 @@ export type Pricing = {
     output: number;
   };
 };
-export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number; disableSampling?: boolean };
-export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ResponseVerbosity = "low" | "medium" | "high";
+export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean };
+export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; proxyUrl?: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
 export type ModelRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
 export type ScenePipelineSettings = {
@@ -50,7 +52,8 @@ const ROLES: Array<{ id: Exclude<ModelRole, "drafter">; name: string; detail: st
 
 const EMPTY_PRICING: Pricing = { cacheHit: 0, cacheMiss: 0, output: 0, currency: "CNY", contextWindow: 128000 };
 const newModel = (): ModelDraft => ({ name: "", pricing: { ...EMPTY_PRICING } });
-const emptyProfile = (): ProfileDraft => ({ name: "", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "", models: [newModel()] });
+const emptyProfile = (): ProfileDraft => ({ name: "", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", proxyUrl: "", apiKey: "", models: [newModel()] });
+const optionalNumber = (value: string): number | undefined => value.trim() === "" ? undefined : Number(value);
 
 type TestStatus = "idle" | "testing" | "ok" | "fail";
 
@@ -163,9 +166,9 @@ export function ModelConfig({
   const addProfile = () => { resetScan(); setEditing(emptyProfile()); };
   const editProfile = (profile: ProviderProfile) => {
     resetScan();
-    setEditing({ id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, apiKey: "", models: profile.models.map(model => ({ ...model, pricing: { ...model.pricing } })) });
+    setEditing({ id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, proxyUrl: profile.proxyUrl ?? "", apiKey: "", models: profile.models.map(model => ({ ...model, pricing: { ...model.pricing } })) });
   };
-  const updateConnection = (change: Partial<Pick<ProfileDraft, "provider" | "baseUrl" | "apiKey">>) => {
+  const updateConnection = (change: Partial<Pick<ProfileDraft, "provider" | "baseUrl" | "proxyUrl" | "apiKey">>) => {
     resetScan();
     setEditing(current => current ? { ...current, ...change } : current);
   };
@@ -199,6 +202,7 @@ export function ModelConfig({
           profileId: editing.id,
           provider: editing.provider,
           baseUrl: editing.baseUrl,
+          proxyUrl: editing.proxyUrl || undefined,
           apiKey: editing.apiKey || undefined,
         }),
       }) as { models: ScannedModel[] };
@@ -516,7 +520,7 @@ export function ModelConfig({
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>
       <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" title="关闭" aria-label="关闭" onClick={() => setEditing(null)}><X size={17} /></button></div>
-      <div className="character-form-grid"><label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label><span>协议类型</span><select value={editing.provider} onChange={e => updateConnection({ provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容</option><option value="deepseek">DeepSeek</option></select></label><label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => updateConnection({ baseUrl: e.target.value })}/></label><label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => updateConnection({ apiKey: e.target.value })}/></label></div>
+      <div className="character-form-grid"><label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label><span>协议类型</span><select value={editing.provider} onChange={e => updateConnection({ provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容</option><option value="deepseek">DeepSeek</option></select></label><label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => updateConnection({ baseUrl: e.target.value })}/></label><label className="wide"><span>代理 URL（可选）</span><input placeholder="http://127.0.0.1:7890" value={editing.proxyUrl ?? ""} onChange={e => updateConnection({ proxyUrl: e.target.value })}/></label><label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => updateConnection({ apiKey: e.target.value })}/></label></div>
       <div className="model-list-head"><h3>模型</h3><div className="model-list-actions"><button className="ghost" disabled={!canScanModels || scanning || busy} title={canScanModels ? "从供应商读取模型列表" : "请先填写 API Base URL 和 API Key"} onClick={() => void scanProviderModels()}>{scanning ? <LoaderCircle className="test-icon-spin" size={15} /> : <Radar size={15} />}{scanning ? "扫描中…" : "扫描模型"}</button><button disabled={busy || scanning} onClick={() => setEditing({ ...editing, models: [...editing.models, newModel()] })}><Plus size={15} />添加模型</button></div></div>
       {editorFeedback && <div className={editorFeedback.error ? "editor-feedback error" : "editor-feedback"}>{editorFeedback.text}</div>}
       {scannedModels.length > 0 && <section className="model-scan-results">
@@ -546,10 +550,18 @@ export function ModelConfig({
               <label><span>{ratePrefix}输出</span><input type="number" min="0" step="0.001" value={model.pricing.output} onChange={e => updateModel(index, { pricing: { ...model.pricing, output: Number(e.target.value) } })}/><em className="field-unit">元 / 百万 token</em></label>
               <label><span>货币</span><select value={model.pricing.currency} onChange={e => updateModel(index, { pricing: { ...model.pricing, currency: e.target.value as Pricing["currency"] } })}><option value="CNY">CNY 人民币</option><option value="USD">USD 美元</option></select></label>
             </>}
+            <label><span>Temperature（0–2）</span><input type="number" min="0" max="2" step="0.05" placeholder="供应商默认" value={model.temperature ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { temperature: optionalNumber(e.target.value) })}/></label>
+            <label><span>Top P（0–1）</span><input type="number" min="0" max="1" step="0.01" placeholder="供应商默认" value={model.topP ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { topP: optionalNumber(e.target.value) })}/></label>
+            <label><span>Frequency penalty（-2–2）</span><input type="number" min="-2" max="2" step="0.1" placeholder="供应商默认" value={model.frequencyPenalty ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { frequencyPenalty: optionalNumber(e.target.value) })}/></label>
+            <label><span>Presence penalty（-2–2）</span><input type="number" min="-2" max="2" step="0.1" placeholder="供应商默认" value={model.presencePenalty ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { presencePenalty: optionalNumber(e.target.value) })}/></label>
+            {editing.provider === "openai-compatible" && <>
+              <label><span>Reasoning effort</span><select value={model.reasoningEffort ?? ""} onChange={e => updateModel(index, { reasoningEffort: (e.target.value || undefined) as ReasoningEffort | undefined })}><option value="">供应商默认</option><option value="none">none</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></label>
+              <label><span>Verbosity</span><select value={model.verbosity ?? ""} onChange={e => updateModel(index, { verbosity: (e.target.value || undefined) as ResponseVerbosity | undefined })}><option value="">供应商默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
+            </>}
             <div className="sampling-setting">
               <div className="sampling-setting-copy">
                 <strong>采样参数</strong>
-                <small>请求中是否携带 temperature、top_p 与惩罚项</small>
+                <small>控制 temperature、top_p 与惩罚项；reasoning_effort 和 verbosity 不受影响</small>
               </div>
               <div className="sampling-setting-control" role="group" aria-label="采样参数">
                 <button type="button" className={!model.disableSampling ? "active" : ""} aria-pressed={!model.disableSampling} onClick={() => updateModel(index, { disableSampling: false })}>发送</button>

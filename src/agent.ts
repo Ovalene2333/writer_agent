@@ -1165,7 +1165,7 @@ export function taskInstructions(
 - 落盘字段仅使用：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。`;
   if (mode === "write_scene") return `正文创作原则（内部执行，不输出分析过程）：
 - 主 Agent 对成品负责，自主决定先读什么、是否构思、是否分场、何时修订；不要为了展示流程而调用工具或创建清单。
-- 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；需要人物约束时读取相关角色分区。
+- 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
 - ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
 - 正文开始前先确定目标字数。用户给出数字时以该数字为全文目标，不擅自缩减；未给数字时根据事件密度确定一个明确目标。直接 propose_document 必须传 targetCharacters；场景链必须给每场 targetCharacters，且各场之和对齐全文目标。工具按目标的 85%—120% 验收；篇幅不足要扩展行动、阻力、后果、反应和余波，篇幅过长先删不改变选择的说明与重复过程，禁止用总结、同义复述、额外支线或元说明凑字。
@@ -1850,6 +1850,7 @@ export async function runAgent(options: {
     readSnapshots: new Map(),
     readCharactersUsed: 0,
     simpleCharacterScope,
+    reviewCharacterIds: [...new Set([...task.characterIds, ...(characterScope ?? [])])],
     characterEvolutionEnabled: runtimeSettings.characterEvolutionEnabled,
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
     ...(restoredChapterDraft ? { chapterSceneDraft: restoredChapterDraft } : {}),
@@ -2823,18 +2824,27 @@ function writingBootstrapContext(
       ? [previousPath(chapterDocs, targetCandidates[0])].filter((path): path is string => Boolean(path))
       : [];
 
+  const targetIndex = targetCandidates[0] ? chapterDocs.indexOf(targetCandidates[0]) : -1;
+  const nextCandidates = chapterNum !== undefined
+    ? chapterDocs.filter(path =>
+      chapterTitleMatches(path, chapterNum + 1) || chapterTitleMatches(safeReadHeading(project, path), chapterNum + 1)).slice(0, 2)
+    : targetIndex >= 0 && targetIndex + 1 < chapterDocs.length
+      ? [chapterDocs[targetIndex + 1]]
+      : [];
+
   const characterIndex = store.characters()
     .filter(item => task.characterIds.includes(item.id) || outlineCharacterIds.includes(item.id))
     .slice(0, 8)
     .map(item => ({ id: item.id, name: item.identity.name, narrativeRole: item.identity.narrativeRole }));
 
-  if (!outlineNodes?.length && !targetCandidates.length && !prevCandidates.length && !characterIndex.length) {
+  if (!outlineNodes?.length && !targetCandidates.length && !prevCandidates.length && !nextCandidates.length && !characterIndex.length) {
     return "";
   }
 
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
 - outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接写作，禁止为了写正文创建大纲。
 - 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
+- 目标之后已有成稿时：对 nextChapterCandidates 中的路径 read_document(startLine=1,endLine=40) 一次，只把其开场事实当作本章离场边界，不把后章事件提前写入本章。
 - 需要人设：先对 characterIndex 中的 id 调用 get_character 获取必要字段摘要；摘要不足时再带 sections 选读，场景状态需传 outlineNodeId。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
 - 交付路径由 Agent 根据作品需要决定：可直接 propose_document、局部 patch、先 compile_write_pack，${scenePipeline.isolatedWriter ? "短篇单场可用 write_document_isolated，" : ""}${scenePipeline.enabled ? `或在长篇连续状态确有收益时使用${scenePipeline.isolatedWriter ? "隔离 Writer 的" : ""}场景草稿链` : "场景链当前关闭"}。
@@ -2847,6 +2857,7 @@ ${JSON.stringify({
     outlineNodes,
     targetDocumentCandidates: targetCandidates,
     previousChapterCandidates: prevCandidates,
+    nextChapterCandidates: nextCandidates,
     characterIndex,
   })}`;
 }

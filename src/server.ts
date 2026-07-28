@@ -685,18 +685,12 @@ export async function startWriterServer(options: {
     try {
       const body = await context.req.json<Partial<StyleTemplate>>();
       const template = options.project.saveStyleTemplate(body);
-      let sampling: ReturnType<ProviderManager["applySamplingDefaults"]> | null = null;
       if (options.project.config().style === template.id) {
         options.store.seedStyleExample(template);
-        sampling = options.providers.applySamplingDefaults(
-          template.suggestedTemperature,
-          template.suggestedTopP,
-        );
       }
       return context.json({
         template,
         templates: styleTemplatesForClient(options.project),
-        sampling,
         provider: options.providers.publicConfig(),
         catalog: options.providers.catalog(),
       });
@@ -712,20 +706,14 @@ export async function startWriterServer(options: {
         if (!template) throw new Error(`未知的风格模板：${styleId}`);
         options.project.setStyle(styleId);
         options.store.seedStyleExample(template);
-        // Always write suggested sampling onto role-assigned models (no API key required).
-        const sampling = options.providers.applySamplingDefaults(
-          template.suggestedTemperature,
-          template.suggestedTopP,
-        );
         return context.json({
           active: template,
-          sampling,
-          provider: sampling.provider,
-          catalog: sampling.catalog,
+          provider: options.providers.publicConfig(),
+          catalog: options.providers.catalog(),
         });
       } else {
         options.project.setStyle("");
-        return context.json({ active: null, sampling: null });
+        return context.json({ active: null });
       }
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });

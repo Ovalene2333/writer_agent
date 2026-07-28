@@ -82,6 +82,8 @@ test("isolated chapter review carries the full draft once and returns bounded st
   });
   assert.deepEqual(messages.map(message => message.role), ["system", "system", "user"]);
   assert.equal(messages[1].content, "稳定项目约束");
+  assert.match(messages[0].content, /客观事实不自动等于角色知识/u);
+  assert.match(messages[0].content, /亲历\/目击、被可信来源告知/u);
   assert.match(messages[2].content, /门禁灯由绿变红/u);
   assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 
@@ -90,12 +92,12 @@ test("isolated chapter review carries the full draft once and returns bounded st
     chapterChange: "主角从服从转为违规",
     reviewNotes: "结果与计划一致，但接缝需要补强。",
     issues: [{
-      severity: "blocker", kind: "telemetry_pileup", sceneId: "arrival",
-      evidence: ["门禁灯由绿变红。"], problem: "读数堆砌遮蔽人物选择", action: "只保留改变行动的读数",
+      severity: "blocker", kind: "knowledge_leak", sceneId: "arrival",
+      evidence: ["门禁灯由绿变红。"], problem: "角色没有获知门禁规则的路径，却据此判断违规", action: "补入可见线索或删除判断",
     }],
   }), new Set(["arrival"]), content);
   assert.equal(review.verdict, "revise");
-  assert.equal(review.issues[0].kind, "telemetry_pileup");
+  assert.equal(review.issues[0].kind, "knowledge_leak");
   assert.deepEqual(review.issues[0].evidence, ["门禁灯由绿变红。"]);
   assert.throws(() => parseChapterReview(JSON.stringify({
     verdict: "revise",

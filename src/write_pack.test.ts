@@ -23,6 +23,7 @@ import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { executeTool } from "./tools/execute.js";
+import { submitFullDocumentProposal } from "./tools/proposals.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { sceneProseScoreBreakdown } from "./prose_metrics.js";
 import { shouldSkipSceneCandidates } from "./scene_candidates.js";
@@ -247,6 +248,76 @@ test("side prose treats scene count and target length as guidance", async () => 
       summary: "直接交付支线片段",
     })) as Record<string, unknown>;
     assert.equal(direct.status, "pending");
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("direct chapter proposal blocks factual knowledge leaks before creating a proposal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-direct-review-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "事实终审");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("直接整章");
+    store.saveContinuityFact({
+      statement: "密钥藏在北塔钟摆内",
+      epistemic: "character_knowledge",
+      knownBy: ["守塔人"],
+      status: "active",
+      sourcePath: "",
+      sourceEvidence: "",
+    });
+    let shouldBlock = true;
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      readSnapshots: new Map(),
+      chapterReviewer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "reviewer-test" },
+        context: "项目终审约束",
+        run: async (_model, input) => {
+          assert.match(input.context ?? "", /character_knowledge/u);
+          assert.match(input.context ?? "", /守塔人/u);
+          return {
+            review: shouldBlock ? {
+              verdict: "revise" as const,
+              chapterChange: "来客试图进入北塔",
+              reviewNotes: "来客越过了认知边界",
+              issues: [{
+                severity: "blocker" as const,
+                kind: "knowledge_leak" as const,
+                sceneId: "document",
+                evidence: ["来客径直说密钥藏在钟摆里。"],
+                problem: "该事实仅守塔人知晓，正文没有来客获知它的路径",
+                action: "补入获知路径或删除准确断言",
+              }],
+            } : {
+              verdict: "pass" as const,
+              chapterChange: "来客从试探转为撤退",
+              reviewNotes: "事实与认知路径一致",
+              issues: [],
+            },
+          };
+        },
+      },
+    };
+    const args = {
+      input: {}, project, store, sessionId, emit: (_event: AgentEvent) => {}, context,
+    };
+    const content = "# 第一章\n\n来客径直说密钥藏在钟摆里。";
+    const blocked = JSON.parse(await submitFullDocumentProposal(
+      args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+    )) as Record<string, unknown>;
+    assert.equal(blocked.code, "DIRECT_CHAPTER_REVIEW_BLOCKED");
+    assert.equal(store.proposals().length, 0);
+
+    shouldBlock = false;
+    const passed = JSON.parse(await submitFullDocumentProposal(
+      args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+    )) as Record<string, unknown>;
+    assert.equal(passed.status, "pending");
+    assert.equal(store.proposals().length, 1);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });
@@ -542,7 +613,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
     assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
     assert.equal((inspected.characterChangeWarnings as string[]).length, 1);
-    assert.deepEqual(chapterReviewUsage, [], "single-scene chapters skip the cross-scene model review");
+    assert.deepEqual(chapterReviewUsage.map(item => item.callKind), ["chapter_review_failed", "chapter_review"]);
     const proposed = inspected.proposal as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
     const storedProposal = activeStore.proposal(Number(proposed.proposalId));

@@ -410,8 +410,6 @@ type StyleTemplateInfo = {
   systemPromptAddition: string;
   exampleContent: string;
   exampleNotes: string;
-  suggestedTemperature: number;
-  suggestedTopP: number;
   builtIn?: boolean;
   customized?: boolean;
   /** Built-in templates cannot be edited or overridden. */
@@ -2398,10 +2396,7 @@ function App() {
     setStyleBusy(true);
     setError("");
     try {
-      const result = await api<{
-        active?: StyleTemplateInfo | null;
-        sampling?: { temperature: number; topP: number; updatedModels: number } | null;
-      }>("/api/style", {
+      await api("/api/style", {
         method: "PUT",
         body: JSON.stringify({ styleId }),
       });
@@ -2409,11 +2404,7 @@ function App() {
       if (!styleId) {
         setNotice("已关闭写作风格模板");
       } else {
-        const sampling = result.sampling;
-        const samplingHint = sampling
-          ? ` · 已写入 sampling temp ${sampling.temperature} / topP ${sampling.topP}${sampling.updatedModels ? `（${sampling.updatedModels} 个模型）` : ""}`
-          : "";
-        setNotice(`已激活写作风格：${label || styleId}${samplingHint}`);
+        setNotice(`已激活写作风格：${label || styleId}`);
       }
     } catch (e) {
       setError(String(e));
@@ -2432,8 +2423,6 @@ function App() {
         systemPromptAddition: "写作风格指令：\n- ",
         exampleContent: "",
         exampleNotes: "",
-        suggestedTemperature: 0.8,
-        suggestedTopP: 0.92,
         builtIn: false,
         customized: true,
         readOnly: false,
@@ -6400,7 +6389,7 @@ function App() {
                 <span className="eyebrow">Writing style</span>
                 <h2>写作风格模板</h2>
                 <p>
-                  激活后会注入对应系统提示与范文示例，并应用建议的 temperature / topP。可随时关闭。
+                  激活后会注入对应系统提示与范文示例。模型请求参数在供应商配置中独立管理。
                 </p>
               </div>
               <IconButton label="关闭" disabled={styleBusy} onClick={() => setManagementView(null)}><X size={17} /></IconButton>
@@ -6426,8 +6415,6 @@ function App() {
                 <span className="style-active-hint">
                   当前：{activeStyle.name}
                   {(activeStyle.readOnly || activeStyle.builtIn) ? "（内置·只读）" : ""}
-                  {activeStyle.suggestedTemperature != null && ` · temp ${activeStyle.suggestedTemperature}`}
-                  {activeStyle.suggestedTopP != null && ` · topP ${activeStyle.suggestedTopP}`}
                 </span>
               )}
             </div>
@@ -6460,13 +6447,6 @@ function App() {
                         <small>{item.description}</small>
                         {preview && (
                           <span className="theme-example style-example">{preview}{preview.length >= 96 ? "…" : ""}</span>
-                        )}
-                        {(item.suggestedTemperature != null || item.suggestedTopP != null) && (
-                          <span className="style-params">
-                            {item.suggestedTemperature != null && `temp ${item.suggestedTemperature}`}
-                            {item.suggestedTemperature != null && item.suggestedTopP != null && " · "}
-                            {item.suggestedTopP != null && `topP ${item.suggestedTopP}`}
-                          </span>
                         )}
                         </div>
                       </button>
@@ -6502,7 +6482,7 @@ function App() {
             </h2>
             <p>
               {viewing
-                ? "内置模板只读。可查看完整写作指令与范文；激活后会把建议 temperature / topP 写入当前各角色模型。"
+                ? "内置模板只读。可查看完整写作指令与范文；模型请求参数由供应商配置独立管理。"
                 : "自定义模板保存在当前项目的 .writer 目录中。内置模板不可编辑或覆盖，请使用新的模板 ID。"}
             </p>
             <div className="style-template-form">
@@ -6529,14 +6509,6 @@ function App() {
               <label className="wide">
                 <span>范文备注</span>
                 <textarea rows={3} value={styleDraft.exampleNotes} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, exampleNotes: event.target.value })} />
-              </label>
-              <label>
-                <span>Temperature（0–2）</span>
-                <input type="number" min="0" max="2" step="0.05" value={styleDraft.suggestedTemperature} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTemperature: Number(event.target.value) })} />
-              </label>
-              <label>
-                <span>Top P（0–1）</span>
-                <input type="number" min="0.05" max="1" step="0.01" value={styleDraft.suggestedTopP} disabled={viewing} onChange={(event) => setStyleDraft({ ...styleDraft, suggestedTopP: Number(event.target.value) })} />
               </label>
             </div>
             <div className="modal-actions">
@@ -7485,11 +7457,6 @@ function App() {
                     <strong>{item.name}{selected && <span className="theme-tag">使用中</span>}{readOnly && <span className="theme-tag">内置</span>}{!readOnly && item.customized && <span className="theme-tag">自定义</span>}</strong>
                     <small>{item.description}</small>
                     {preview && <span className="theme-example style-example">{preview}{preview.length >= 96 ? "…" : ""}</span>}
-                    {(item.suggestedTemperature != null || item.suggestedTopP != null) && <span className="style-params">
-                      {item.suggestedTemperature != null && `temp ${item.suggestedTemperature}`}
-                      {item.suggestedTemperature != null && item.suggestedTopP != null && " · "}
-                      {item.suggestedTopP != null && `topP ${item.suggestedTopP}`}
-                    </span>}
                   </div>
                 </button>
                 <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => openStyleTemplate(item)}>{readOnly ? "浏览" : "编辑"}</button>

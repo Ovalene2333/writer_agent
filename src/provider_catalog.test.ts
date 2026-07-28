@@ -72,38 +72,6 @@ test("scanModels uses a saved key, returns default pricing, and does not mutate 
   }
 });
 
-test("applySamplingDefaults writes temp/topP to all role-assigned models without api key", () => {
-  const root = mkdtempSync(join(tmpdir(), "writer-provider-sampling-"));
-  try {
-    const project = WriterProject.init(root, "采样覆盖");
-    const providers = new ProviderManager(project);
-    // Default catalog has empty api keys — sampling must still work.
-    const before = providers.catalog();
-    assert.equal(before.providers[0].apiKeyConfigured, false);
-
-    const agentModel = before.providers[0].models[0];
-    providers.assign("writer", before.providers[0].id, agentModel.id);
-    if (before.providers[1]?.models[0]) {
-      providers.assign("reviewer", before.providers[1].id, before.providers[1].models[0].id);
-    }
-
-    const result = providers.applySamplingDefaults(0.78, 0.9);
-    assert.equal(result.temperature, 0.78);
-    assert.equal(result.topP, 0.9);
-    assert.ok(result.updatedModels >= 1);
-    assert.equal(providers.publicConfig().temperature, 0.78);
-    assert.equal(providers.publicConfig().topP, 0.9);
-    assert.equal(providers.modelConfig("writer").temperature, 0.78);
-    assert.equal(providers.modelConfig("writer").topP, 0.9);
-    if (before.providers[1]?.models[0]) {
-      assert.equal(providers.modelConfig("reviewer").temperature, 0.78);
-      assert.equal(providers.modelConfig("reviewer").topP, 0.9);
-    }
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test("disableSampling survives save/reload and reaches every role's ModelConfig", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-provider-nosampling-"));
   try {
@@ -124,12 +92,41 @@ test("disableSampling survives save/reload and reaches every role's ModelConfig"
     assert.equal(providers.modelConfig("writer").disableSampling, true);
     assert.equal(samplingRequestOptions(providers.modelConfig("writer"), { temperature: 0 }).temperature, undefined);
 
-    // A style template must not silently write sampling params back onto an opted-out model.
-    providers.applySamplingDefaults(0.7, 0.95);
-    assert.equal(providers.catalog().providers[0].models[0].temperature, 0.8, "temperature must be left alone");
-
     // Reload from disk: the flag is persisted, not just in memory.
     assert.equal(new ProviderManager(project).modelConfig("writer").disableSampling, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("OpenAI advanced request parameters survive save/reload and reach ModelConfig", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-advanced-"));
+  try {
+    const project = WriterProject.init(root, "高级参数");
+    const providers = new ProviderManager(project);
+    const seeded = providers.catalog().providers[0];
+    providers.saveProfile({
+      id: seeded.id,
+      name: seeded.name,
+      provider: "openai-compatible",
+      baseUrl: seeded.baseUrl,
+      apiKey: "test-key",
+      models: [{
+        id: seeded.models[0].id,
+        name: seeded.models[0].name,
+        temperature: 0.7,
+        topP: 0.9,
+        frequencyPenalty: 0.4,
+        presencePenalty: -0.2,
+        reasoningEffort: "high",
+        verbosity: "low",
+      }],
+    });
+    const reloaded = new ProviderManager(project).modelConfig("agent");
+    assert.equal(reloaded.frequencyPenalty, 0.4);
+    assert.equal(reloaded.presencePenalty, -0.2);
+    assert.equal(reloaded.reasoningEffort, "high");
+    assert.equal(reloaded.verbosity, "low");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -56,6 +56,8 @@ export type ToolExecutionContext = {
   readCharactersUsed?: number;
   /** Optional UI-selected scope for compact/simple character cards. */
   simpleCharacterScope?: number[];
+  /** Planner/UI-selected characters whose factual state should be supplied to final review. */
+  reviewCharacterIds?: number[];
   /**
    * When true (outline mode), propose_document / propose_document_patch targeting
    * outline paths require a successful design_creative_outline earlier in this run.

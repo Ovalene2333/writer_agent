@@ -56,6 +56,7 @@ import {
   type ProseStyleIssue,
 } from "../prose_quality.js";
 import { ChapterReviewRequestError, reviewChapterDraft, type ChapterReviewResult } from "../chapter_review.js";
+import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
   CHAPTER_STYLE_REPAIR_BATCH_SIZE,
   ChapterStyleRepairRequestError,
@@ -1181,25 +1182,6 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     examples: issue.examples.slice(0, 5),
   }));
   const ledger = chapterSceneLedger(draft);
-  if (draft.completed.length === 1 && !styleWarnings.length && !vividnessWarnings.length) {
-    const scene = draft.scenes[0];
-    return submitPassedChapterReview(args, {
-      draft,
-      proposalSummary,
-      contentCharacters: content.length,
-      metrics,
-      styleWarnings,
-      vividness,
-      vividnessWarnings,
-      ledger,
-      chapterReview: {
-        verdict: "pass",
-        chapterChange: `本章完成“${draft.chapterGoal}”：${scene.outcome}`,
-        reviewNotes: "单场景章节无跨场景接缝或功能重复；句式门禁、复用计量与场景结果检查均已通过。",
-        issues: [],
-      },
-    });
-  }
   let reviewFailure: { attempts: number; errors: string[] } | undefined;
   if (context.chapterReviewer) {
     const reviewer = context.chapterReviewer;
@@ -1210,15 +1192,23 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
         candidate.baseUrl === model.baseUrl && candidate.model === model.model
       ) === index);
     const reviewErrors: string[] = [];
+    const reviewContext = buildFactualChapterReviewContext({
+      project,
+      store: args.store,
+      context,
+      path: draft.path,
+      characterScope: args.characterScope,
+      baseContext: reviewer.context,
+    });
     const reviewRequestCharacters = content.length + JSON.stringify(ledger).length
-      + draft.chapterGoal.length + (reviewer.context?.length ?? 0) + 1_200;
+      + draft.chapterGoal.length + reviewContext.length + 1_200;
     for (const reviewModel of reviewModels) {
       try {
         const reviewed = await runReview(reviewModel, {
           chapterGoal: draft.chapterGoal,
           content,
           scenes: ledger,
-          context: reviewer.context,
+          context: reviewContext,
           proseSignals: {
             stats: metrics.stats,
             warnings: styleWarnings,
@@ -1307,9 +1297,20 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     proseVividness: formatVividnessSummary(vividness.stats),
     ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
     ledger,
+    ...(reviewFailure ? { factReviewContext: buildFactualChapterReviewContext({
+      project,
+      store: args.store,
+      context,
+      path: draft.path,
+      characterScope: args.characterScope,
+      baseContext: context.chapterReviewer?.context,
+    }) } : {}),
     // Only the compatibility fallback appends the full chapter to the Agent loop.
     content,
     reviewChecklist: [
+      "逐个角色核对其对白、内心与行动依据：该信息是否来自亲历、被告知、可见线索推断或公共知识；客观真相不自动等于角色所知",
+      "传闻、误解与 beliefs 是否被误写成确认事实；关键解题信息是否无来源突然出现",
+      "时间、地点、伤势、物品、身份、关系、经历、能力解锁和世界规则是否与事实证据冲突",
       "相邻场景是否因果承接，而非只按时间并列",
       "各场转折与结果是否承担不同功能",
       "人物关系、信息、目标或处境是否逐场发生变化",
@@ -1356,6 +1357,7 @@ async function submitChapterDraftProposal(
     assembleChapterSceneDraft(draft),
     values.summary,
     values.characterChanges,
+    true,
     true,
   );
   try {

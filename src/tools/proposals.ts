@@ -21,6 +21,8 @@ import {
 import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
 import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
+import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
+import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
   DEFAULT_ISOLATED_WRITER_MAX_RATIO,
   DEFAULT_SCENE_NOTES_CHARACTERS,
@@ -494,13 +496,15 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
 }
 
 export async function submitFullDocumentProposal(
-  { project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs,
+  args: ToolHandlerArgs,
   path: string,
   proposedContent: string,
   summary: string,
   characterChanges: unknown,
   proseStyleApproved = false,
+  semanticReviewApproved = false,
 ): Promise<string> {
+  const { project, store, sessionId, emit, context, characterScope } = args;
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
@@ -508,6 +512,10 @@ export async function submitFullDocumentProposal(
   const beforeContent = existed ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
   if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
+  if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
+    const blocked = await reviewDirectNarrativeProposal(args, path, meta.content, summary);
+    if (blocked) return blocked;
+  }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId,
@@ -523,6 +531,85 @@ export async function submitFullDocumentProposal(
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
+  });
+}
+
+async function reviewDirectNarrativeProposal(
+  args: ToolHandlerArgs,
+  path: string,
+  content: string,
+  summary: string,
+): Promise<string | undefined> {
+  const reviewer = args.context.chapterReviewer!;
+  const runReview = reviewer.run ?? reviewChapterDraft;
+  const models = [reviewer.model, reviewer.fallbackModel]
+    .filter((model): model is NonNullable<typeof model> => Boolean(model))
+    .filter((model, index, all) => all.findIndex(candidate =>
+      candidate.baseUrl === model.baseUrl && candidate.model === model.model) === index);
+  const reviewContext = buildFactualChapterReviewContext({
+    project: args.project,
+    store: args.store,
+    context: args.context,
+    path,
+    characterScope: args.characterScope,
+    baseContext: reviewer.context,
+  });
+  const requestCharacters = content.length + reviewContext.length + summary.length + 1_200;
+  const errors: string[] = [];
+  for (const model of models) {
+    try {
+      const reviewed = await runReview(model, {
+        chapterGoal: summary,
+        content,
+        context: reviewContext,
+        scenes: [{
+          sceneId: "document",
+          title: path,
+          plannedTurn: summary,
+          plannedOutcome: summary,
+          actualState: null,
+        }],
+      }, reviewer.signal);
+      if (reviewed.usage) args.context.modelUsageReporter?.(model, reviewed.usage, {
+        callKind: "direct_chapter_review",
+        requestComponents: [{
+          kind: "other",
+          label: "直接整章终审请求",
+          characters: requestCharacters,
+          estimatedTokens: Math.ceil(requestCharacters * 0.75),
+          callKind: "direct_chapter_review",
+        }],
+      });
+      if (reviewed.review.verdict === "pass") return undefined;
+      return JSON.stringify({
+        status: "final_review_revision_required",
+        code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+        path,
+        chapterReview: reviewed.review,
+        message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
+      });
+    } catch (error) {
+      if (error instanceof ChapterReviewRequestError && error.usage) {
+        args.context.modelUsageReporter?.(model, error.usage, {
+          callKind: "direct_chapter_review_failed",
+          requestComponents: [{
+            kind: "other",
+            label: "失败的直接整章终审请求",
+            characters: requestCharacters,
+            estimatedTokens: Math.ceil(requestCharacters * 0.75),
+            callKind: "direct_chapter_review_failed",
+          }],
+        });
+      }
+      errors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+    }
+  }
+  return JSON.stringify({
+    status: "final_review_unavailable",
+    code: "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    path,
+    errors,
+    message: "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
   });
 }
 

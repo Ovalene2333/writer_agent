@@ -25,9 +25,14 @@ describe("naturalProseCraftPrompt", () => {
   it("turns naturalness into positive, scene-level writing decisions", () => {
     const prompt = naturalProseCraftPrompt();
     assert.match(prompt, /注意顺序/);
-    assert.match(prompt, /场景推进/);
+    assert.match(prompt, /场景发动/);
+    assert.match(prompt, /张力累积/);
+    assert.match(prompt, /转折余波/);
     assert.match(prompt, /对白意图/);
     assert.match(prompt, /具体性检查/);
+    assert.match(prompt, /篇章完整与衔接/);
+    assert.match(prompt, /阶段性结果/);
+    assert.match(prompt, /已有下一章/);
     assert.match(prompt, /节奏与质感/);
     assert.match(prompt, /单句成段是重音/);
     assert.match(prompt, /绵延的长句/);
@@ -89,8 +94,6 @@ describe("built-in style templates", () => {
         name: "克制喜剧",
         description: "用关系错位和具体反应制造趣味",
         systemPromptAddition: "写作风格指令：笑点必须改变人物关系，不使用段子拼贴。",
-        suggestedTemperature: 0.78,
-        suggestedTopP: 0.9,
         exampleContent: "他把辞职信推过去。老板看完，问他打印机墨盒在哪里买。",
         exampleNotes: "严肃场面中的现实错位。",
       });
@@ -120,8 +123,6 @@ describe("built-in style templates", () => {
         name: "克制喜剧",
         description: "用关系错位和具体反应制造趣味",
         systemPromptAddition: "写作风格指令：笑点必须改变人物关系，不使用段子拼贴。",
-        suggestedTemperature: 0.78,
-        suggestedTopP: 0.9,
         exampleContent: "他把辞职信推过去。",
         exampleNotes: "",
       }], null, 2)}\n`, "utf8");

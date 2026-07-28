@@ -28,6 +28,42 @@ test("penalties only ride along when explicitly requested", () => {
   );
 });
 
+test("configured OpenAI request parameters share the request choke point", () => {
+  assert.deepEqual(
+    samplingRequestOptions({
+      provider: "openai-compatible",
+      baseUrl: "https://api.openai.com/v1",
+      frequencyPenalty: 0.4,
+      presencePenalty: -0.2,
+      reasoningEffort: "high",
+      verbosity: "low",
+    }),
+    { frequency_penalty: 0.4, presence_penalty: -0.2, reasoning_effort: "high", verbosity: "low" },
+  );
+  assert.deepEqual(
+    samplingRequestOptions({
+      provider: "openai-compatible",
+      reasoningEffort: "medium",
+      verbosity: "high",
+      temperature: 0.7,
+      disableSampling: true,
+    }),
+    { reasoning_effort: "medium", verbosity: "high" },
+  );
+});
+
+test("DeepSeek never receives OpenAI-only request parameters", () => {
+  assert.deepEqual(
+    samplingRequestOptions({
+      provider: "deepseek",
+      baseUrl: "https://api.deepseek.com",
+      reasoningEffort: "high",
+      verbosity: "low",
+    }),
+    {},
+  );
+});
+
 /**
  * The bug behind disableSampling was never a missing flag — it was 13 request
  * bodies each spelling `temperature:` inline, so a provider-level setting could
@@ -36,7 +72,7 @@ test("penalties only ride along when explicitly requested", () => {
  * inputs are untouched because it only reads inside JSON.stringify bodies.
  */
 test("no request body spells a sampling parameter directly", () => {
-  const wireKey = /(?:^|[^_\w.])(?:temperature|top_p|frequency_penalty|presence_penalty)\s*:/;
+  const wireKey = /(?:^|[^_\w.])(?:temperature|top_p|frequency_penalty|presence_penalty|reasoning_effort|verbosity)\s*:/;
   const offenders: string[] = [];
   for (const path of sourceFiles("src")) {
     if (path.endsWith("model_compat.ts")) continue;

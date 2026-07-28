@@ -17,8 +17,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 描写：环境服务氛围，战斗/冲突用短句；系统面板可出现，但同一场景内面板/数值刷屏不超过必要的一行两次。
 - 类型特忌：大段世界观说明、冗长心理、文绉绉书面语；升级写成“任务清单勾选”或连续“提示音→数值→下一提示音”。
 - 与全局自然叙事原则一致：反机械短段、反解释回声、反堆砌同义感官。`,
-    suggestedTemperature: 0.9,
-    suggestedTopP: 0.95,
     exampleContent: `林玄睁开眼，发现自己躺在一间破旧的木屋里。
 【叮——万界最强系统已激活】
 【新手任务：三日之内突破炼气一层。奖励：洗髓丹×1】
@@ -42,8 +40,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 对白：符合身份与时代，带潜台词；人物不必句句深刻。
 - 类型特忌：空洞华丽、情绪标签堆叠、快餐爆点；也忌把章节写成意象陈列清单。
 - 与全局自然叙事原则一致：反机械、反堆砌、反贴金句收尾。`,
-    suggestedTemperature: 0.7,
-    suggestedTopP: 0.9,
     exampleContent: `陈秋禾站在窗前，看着院子里的梧桐。起风了。黄叶从枝头脱落的时候，好像犹豫了一下，在空中顿了顿，才不情不愿地往下坠。
 厨房里传来母亲切菜的声响，规律而沉闷。父亲走后，母亲很少说话，只是不停地扫地、洗衣、做饭。
 陈秋禾没有回头。窗玻璃上映出她的脸，和父亲年轻时真像。她抬手摸了摸那张脸，指腹只触到冰凉。
@@ -69,8 +65,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 收束：章节落在一个物件、习惯、传闻或决定的新变化上，使读者感到结局早已埋在生活里，却仍由人物一步步造成。宿命感来自重复选择与集体遗忘，不来自作者宣判。
 - 风格边界：不搬用黄蝴蝶、失眠瘟疫、升天、冰块、重复姓名等知名作品标志；不复刻原作人物、地名、情节或句子。避免把拉丁美洲写成异域符号展览，也避免随机塞入无后果的怪事。
 - 与全局自然叙事原则一致：反机械、反同义意象堆砌、反解释回声；在丰饶叙述中仍保持因果、人物选择和场景变化。`,
-    suggestedTemperature: 0.9,
-    suggestedTopP: 0.95,
     exampleContent: `罗萨尔家的饭桌第一次多出一把椅子，是在军队带走米格尔舅舅后的星期二。
 
 那把椅子和其余六把一样，用后院那棵早已被雷劈死的雪松制成，扶手上甚至有米格尔九岁时拿餐刀刻下的歪月亮。塞拉芬娜祖母看了一眼，叫小女儿添一副碗勺，仿佛舅舅只是下地干活晚了，而不是被一辆没有牌照的卡车带往北方。
@@ -114,8 +108,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
   4) 收束落在后果或未决问题，不贴“迈出第一步”式金句。
 - 语言：准确、具体、有动作感；趣味来自关系错位与现场反应，不用热梗拼盘。
 - 与全局自然叙事原则一致：反机械短段、反无聊堆砌、反贴金句收尾。`,
-    suggestedTemperature: 0.78,
-    suggestedTopP: 0.9,
     exampleContent: `周一早上九点零七分，许知遥在公司前台看见了自己的工牌。
 
 它挂在一个陌生男人胸前。照片是她，名字是她，职位却从“产品总监”变成了“项目顾问”。前台空调开得很足，塑封边缘那道旧裂口在灯下发白——去年出差摔的。
@@ -156,8 +148,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 技法来源：综合古典冒险的连续危机、神话史诗的历史纵深、社会科幻的制度推演与政治奇幻的多方利益冲突；只吸收结构方法，不仿写任何具体作家的标志性句法或措辞。
 - 类型特忌：日常流程长期不受异常打断；训练、测试、会议、赶路写成步骤清单；专名与设定一次倾倒；战力只升数字不改策略；靠巧合、预言或新能力免除既定代价；所有人只为主角递信息或喝彩。
 - 与全局自然叙事原则一致：反机械短段、反说明书、反同义奇观堆砌、反贴金句收尾。`,
-    suggestedTemperature: 0.86,
-    suggestedTopP: 0.94,
     exampleContent: `帝国处决沈砾那天，失踪三百年的远征舰队从太阳里发来了回信。
 
 她跪在白塔广场中央，双手锁在审判柱上。头顶的遮光阵列缓慢合拢，把正午切成一圈越来越窄的亮边。执刑官刚念到“伪造星外讯号”，整座城的玻璃同时震了一下。
@@ -222,8 +212,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 节奏：开篇有吸引力（反常对话/场景/悬念）；节尾留钩子要具体。
 - 类型特忌：严肃文学腔、大段心理分析；也忌“吐槽模板”三连和全员抖机灵。
 - 与全局自然叙事原则一致：反机械短段、反堆砌、反空洞金句。`,
-    suggestedTemperature: 0.85,
-    suggestedTopP: 0.95,
     exampleContent: `"所以说，你其实是异世界的勇者？"
 我盯着面前这个自称转学生的银发少女，筷子停在半空。
 "正是。"她双手抱胸，理所当然，"而你，就是我命中注定的同伴。"
@@ -249,8 +237,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 对白：可含误导与假线索；推理逐步展开，每步有依据，禁止侦探长篇演讲一次讲清。
 - 类型特忌：碰巧捡关键线索、靠读者不知的信息强行反转、把线索写成说明串。
 - 与全局自然叙事原则一致：反机械、反堆砌、反贴金句收尾。`,
-    suggestedTemperature: 0.75,
-    suggestedTopP: 0.9,
     exampleContent: `沈酌接到消息的时候，正好站在周老师家门口。
 "周老师……昨天夜里过世了。"
 手机里的声音还在说什么，他已经听不进去。视线落在门缝里：一张对折的纸条，纸张还新。
@@ -275,8 +261,6 @@ export const BUILTIN_STYLE_TEMPLATES: StyleTemplate[] = [
 - 语言：可半文半白；战斗对白短；少用现代网络词。
 - 类型特忌：境界忽高忽低、宝物无铺垫空降、境界说明会式对白。
 - 与全局自然叙事原则一致：反机械短段、反指标刷屏、反堆砌。`,
-    suggestedTemperature: 0.85,
-    suggestedTopP: 0.95,
     exampleContent: `青云宗，外门演武场。
 数百名弟子围着擂台。台上身形单薄的少年握紧了拳——陆沉，炼气三层，外门倒数。
 对面是炼气七层的赵恒，把玩着长剑，语气漫不经心：“现在跪下，我只打断一条腿。”
@@ -320,16 +304,8 @@ export function normalizeStyleTemplate(
   if (systemPromptAddition.length > 20_000) throw new Error("模板写作指令不能超过 20000 个字符");
   if (exampleContent.length > 50_000) throw new Error("模板范文不能超过 50000 个字符");
   if (exampleNotes.length > 5_000) throw new Error("范文备注不能超过 5000 个字符");
-  const suggestedTemperature = Number(input.suggestedTemperature);
-  const suggestedTopP = Number(input.suggestedTopP);
-  if (!Number.isFinite(suggestedTemperature) || suggestedTemperature < 0 || suggestedTemperature > 2) {
-    throw new Error("temperature 必须在 0 到 2 之间");
-  }
-  if (!Number.isFinite(suggestedTopP) || suggestedTopP <= 0 || suggestedTopP > 1) {
-    throw new Error("topP 必须大于 0 且不超过 1");
-  }
   return {
     id, name, description, systemPromptAddition,
-    suggestedTemperature, suggestedTopP, exampleContent, exampleNotes,
+    exampleContent, exampleNotes,
   };
 }
