@@ -125,6 +125,12 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    against an identical warmed prefix; the same bytes as trailing-user hit
  *    the full prefix. A system handoff therefore pays a full-context cache
  *    miss at every scene boundary.
+ *    Rechecked 2026-07-27 (v4-flash, full 44-tool schema): append + trailing-user
+ *    hit 11,520/11,643 prompt tokens; trailing-system hit 0/11,642. Truncating to
+ *    the cached scene base + trailing-user still hit 11,520/11,549, so keep the
+ *    current user-role handoffs and boundary truncation. A 123-token new tail did
+ *    not extend the reported hit on exact replay; do not assume tiny suffixes are
+ *    immediately cacheable without accounting for provider cache-block granularity.
  *
  * 5) TOOLS SCHEMA
  *    src/tools/schema.ts TOOLS is the stable universal capability catalog. Keep
@@ -166,6 +172,13 @@ type CreativeDepth = "explore" | "shape" | "deliver";
 export type EditScope = "point" | "section" | "document";
 type AgentRoleModels = Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
 
+export interface PlannedProseGateCandidate {
+  id: string;
+  instruction: string;
+  severity: "block" | "warn";
+  sourceFeedback: string;
+}
+
 interface WritingTask extends AgentTaskContract {
   mode: WritingTaskMode;
   label: string;
@@ -180,6 +193,7 @@ interface WritingTask extends AgentTaskContract {
   todoPlan: string[];
   /** Independent document outputs requested by the user; scenes/checks inside one document are not deliverables. */
   documentDeliverables: string[];
+  proseGateCandidate?: PlannedProseGateCandidate;
   targetPath?: string;
 }
 
@@ -402,6 +416,11 @@ function dynamicContextPrompt(
   const documentInstruction = task.documentProposalRequired
     ? `必须成功提交文档提案或 change set 后结束，禁止用最终回复代替文件交付。根据作品与修改范围自主选择完整文档、局部 patch、隔离通篇修订${scenePipeline.enabled ? "或场景草稿链" : ""}；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接继续。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
     : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
+  const proseGateInstruction = task.proseGateCandidate
+    ? permissionMode === "plan"
+      ? `planning 已识别出可复用的作者复审候选；plan 只读模式不得保存。向作者说明拟沉淀规则，不要声称已经生效。候选：${JSON.stringify(task.proseGateCandidate)}`
+      : `planning 已确认当前反馈是可复用的作者正文约束。结束前必须调用 manage_prose_gates(operation=upsert) 保存下列候选；当前文档的修改不能替代规则沉淀：${JSON.stringify(task.proseGateCandidate)}`
+    : "planning 未识别到需要沉淀的作者复审候选；不要把一次性改稿偏好自动保存。";
   const editScopeInstruction: Record<EditScope, string> = {
     point: "局部修改：有原句/选区就优先 locate/read 锚点；根据修改所需事实按需补读上下文，并用 sourceHash+anchorId+spanHash 提交 patch。",
     section: "分节修改：按标题或语义 locate，读取目标锚点范围与必要接缝；只 patch 命中范围，不读取无关章节。",
@@ -427,6 +446,7 @@ function dynamicContextPrompt(
 任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities })}
 mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后用 manage_todos 修订剩余计划。
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
+作者复审：${proseGateInstruction}
 
 ${taskInstructions(
     task.mode,
@@ -566,14 +586,36 @@ function isCharacterMutationTool(name: string): boolean {
 }
 
 export function executionModelForTask(
-  task: Pick<WritingTask, "mode" | "documentProposalRequired">,
-  models: AgentRoleModels,
+  _task: Pick<WritingTask, "mode" | "documentProposalRequired">,
+  _models: AgentRoleModels,
   fallback: ModelConfig,
 ): ModelConfig {
-  if (task.mode === "audit") return models.reviewer ?? fallback;
-  if (task.mode === "rewrite") return models.inline ?? fallback;
-  // Scene isolation changes how prose is produced, never which model orchestrates tools.
+  // Keep the tool-orchestrating Agent on one model across task modes. Auxiliary
+  // planner/writer/reviewer calls still use their assigned role models.
   return fallback;
+}
+
+export function normalizePlannedProseGateCandidate(value: unknown): PlannedProseGateCandidate | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  const id = typeof item.id === "string" ? item.id.trim().toLowerCase() : "";
+  const instruction = typeof item.instruction === "string" ? item.instruction.trim().slice(0, 500) : "";
+  const sourceFeedback = typeof item.sourceFeedback === "string" ? item.sourceFeedback.trim().slice(0, 500) : "";
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(id) || !instruction || !sourceFeedback) return undefined;
+  return {
+    id,
+    instruction,
+    severity: item.severity === "block" ? "block" : "warn",
+    sourceFeedback,
+  };
+}
+
+export function projectCacheUserId(projectRoot: string): string {
+  const digest = createHash("sha256")
+    .update(`writer-project-cache-v1\0${projectRoot}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `writer-project-${digest}`;
 }
 
 /**
@@ -721,8 +763,8 @@ async function compileWritingTaskContract(
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
-JSON 总长度不超过 1200 字符；字符串保持简短，todoPlan 每项不超过 40 字。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])。
+JSON 总长度不超过 1600 字符；字符串保持简短，todoPlan 每项不超过 40 字。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出对象，否则省略)。
 契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
 正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
@@ -740,6 +782,8 @@ documentContext 判定（关键，勿默认 none）：
 editScope 仅描述既有文档修改范围：明确原句/网页选区/一小处→point；一个小节或若干相邻段→section；明确通篇/全文/整体统一调整且每部分都需处理→document。不要把“深度修改某一处”误判为document。
 只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
 documentDeliverables 只列最终会分别形成文档提案的独立产物：写一章时即使含多个场景、人物段落、检查步骤也只能列1项；明确一次写三章才列3项。讨论、角色卡或无文档写入时填[]。不得把 todoPlan 的内部步骤复制成多个交付项。
+作者复审候选按语义判断，不依赖“以后/始终/每次”等字面词。当前 user 若概括了一类可在后续正文重复出现的问题，并给出可复用的避免标准或典型例子，就输出 proseGateCandidate；即使同一请求还要求修改当前文档也要输出。只针对当前一句/当前段/本章的一次性取舍、单纯说“不好/重写”、没有可执行标准的含糊抱怨，不输出。
+proseGateCandidate 格式：{"id":"稳定英文短ID","instruction":"可独立执行的语义核验标准，写清合理例外，不能只靠关键词判断","severity":"block|warn","sourceFeedback":"当前作者反馈的简短摘要"}。可确定的事实矛盾或作者明确绝对禁止才用 block；频率、密度、风格倾向及可能误报用 warn。比如“不要频繁细写技术参数，比如元件温度升降多少度”属于可复用候选，应输出 warn；规则应允许直接影响人物判断、风险或行动的关键参数。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
   }, {
     role: "user",
@@ -865,6 +909,7 @@ documentDeliverables 只列最终会分别形成文档提案的独立产物：�
       .filter((item, index, all) => all.indexOf(item) === index)
       .slice(0, 5)
     : [];
+  const proseGateCandidate = normalizePlannedProseGateCandidate(parsed.proseGateCandidate);
   const evidenceValues: AgentEvidenceRequirement[] = ["none", "project", "target", "continuation"];
   let evidence = evidenceValues.includes(parsed.evidence as AgentEvidenceRequirement)
     ? parsed.evidence as AgentEvidenceRequirement
@@ -925,6 +970,8 @@ documentDeliverables 只列最终会分别形成文档提案的独立产物：�
       documentDeliverables: documentProposalRequired
         ? (documentDeliverables.length ? documentDeliverables : ["当前文档"])
         : [],
+      proseGateRequired: Boolean(proseGateCandidate),
+      ...(proseGateCandidate ? { proseGateCandidate } : {}),
       ...(typeof parsed.targetPath === "string" && validDocumentPaths.has(parsed.targetPath) ? { targetPath: parsed.targetPath } : {}),
     },
   };
@@ -1094,6 +1141,7 @@ export function taskInstructions(
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；需要人物约束时读取相关角色分区。
 - ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
+- 正文开始前先确定目标字数。用户给出数字时以该数字为全文目标，不擅自缩减；未给数字时根据事件密度确定一个明确目标。直接 propose_document 必须传 targetCharacters；场景链必须给每场 targetCharacters，且各场之和对齐全文目标。工具按目标的 85%—120% 验收；篇幅不足要扩展行动、阻力、后果、反应和余波，篇幅过长先删不改变选择的说明与重复过程，禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径提交，系统会把整篇成稿记录为该文档的新版本；不要为避开同名另起副本或改写章节路径。局部修改仍用 patch，只有承接现有结尾才用 append。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
     ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
@@ -1515,6 +1563,60 @@ export function chapterReviewCompleted(result: Record<string, unknown>): boolean
   return typeof result.status === "string" && COMPLETED_CHAPTER_REVIEW_STATUSES.has(result.status);
 }
 
+export type ChapterReviewRepairLock =
+  | { mode: "style" }
+  | { mode: "structural"; targetSceneIds: string[] };
+
+const CHAPTER_DRAFT_MUTATION_TOOLS = new Set([
+  "begin_chapter_draft",
+  "write_chapter_scene",
+  "write_chapter_scene_notes",
+  "revise_chapter_scene_guide",
+  "revise_chapter_draft_style",
+  "inspect_chapter_draft",
+  "propose_chapter_draft",
+  "propose_document",
+  "propose_document_patch",
+  "revise_document_isolated",
+  "write_document_isolated",
+]);
+
+export function chapterReviewRepairLock(result: Record<string, unknown>): ChapterReviewRepairLock | undefined {
+  if (result.status === "style_revision_required") return { mode: "style" };
+  if (result.status !== "structural_revision_required" || !Array.isArray(result.targetScenes)) return undefined;
+  const targetSceneIds = result.targetScenes.flatMap(scene => {
+    if (!scene || typeof scene !== "object" || Array.isArray(scene)) return [];
+    const sceneId = (scene as Record<string, unknown>).sceneId;
+    return typeof sceneId === "string" && sceneId.trim() ? [sceneId.trim()] : [];
+  });
+  return targetSceneIds.length ? { mode: "structural", targetSceneIds: [...new Set(targetSceneIds)] } : undefined;
+}
+
+export function chapterReviewRepairAllowsTool(
+  lock: ChapterReviewRepairLock,
+  toolName: string,
+  argumentsText = "{}",
+): boolean {
+  if (!CHAPTER_DRAFT_MUTATION_TOOLS.has(toolName)) return true;
+  if (lock.mode === "style") return toolName === "revise_chapter_draft_style";
+  if (toolName !== "write_chapter_scene" && toolName !== "write_chapter_scene_notes") return false;
+  try {
+    const input = JSON.parse(argumentsText) as Record<string, unknown>;
+    return typeof input.sceneId === "string" && lock.targetSceneIds.includes(input.sceneId.trim());
+  } catch {
+    return false;
+  }
+}
+
+export function automaticChapterReviewEnabled(characterEvolutionEnabled: boolean | undefined): boolean {
+  // Otherwise the terminal Agent turn is still needed to author grounded characterChanges.
+  return characterEvolutionEnabled === false;
+}
+
+function automaticChapterReviewSummary(draft: ChapterSceneDraft): string {
+  return `完成“${draft.chapterGoal}”的整章写作与终审`;
+}
+
 export function chapterDraftNeedsReview(
   draft: ChapterSceneDraft | undefined,
   checkpointStage?: string,
@@ -1600,6 +1702,7 @@ export async function runAgent(options: {
   if (permissionMode === "plan") {
     task.documentProposalRequired = false;
     task.mutation = "none";
+    task.proseGateRequired = false;
   }
   emit({
     type: "task_contract",
@@ -1660,7 +1763,7 @@ export async function runAgent(options: {
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
   const artifactContext = [
-    recentArtifactsContext(store, sessionId, project, task),
+    recentArtifactsContext(store, sessionId, project, task, runtimeSettings.continuityFactsEnabled),
     roleplayHandoffContext,
   ].filter(Boolean).join("\n\n");
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
@@ -1721,7 +1824,7 @@ export async function runAgent(options: {
       model: adjudicatorModel,
       signal,
     },
-    continuityExtractor: {
+    ...(runtimeSettings.continuityFactsEnabled ? { continuityExtractor: {
       model: options.models?.summarizer ?? options.models?.inline ?? adjudicatorModel,
       signal,
       run: async (input) => extractContinuityFacts({
@@ -1730,7 +1833,7 @@ export async function runAgent(options: {
         signal,
         usageReporter: reportToolUsage,
       }),
-    },
+    } } : {}),
     proseGateRules: loadProseGateRules(project),
     chapterStyleRepairer: {
       model: options.models?.inline ?? executionModel,
@@ -1823,6 +1926,12 @@ export async function runAgent(options: {
   const restoredCheckpoint = restoredChapterDraft ? store.agentCheckpoint(sessionId) : undefined;
   let chapterReviewRequired = chapterDraftNeedsReview(restoredChapterDraft, restoredCheckpoint?.stage);
   let chapterReviewRejectedAttempts = 0;
+  const restoredRepair = restoredCheckpoint?.reviewRepair;
+  let chapterReviewRepair: ChapterReviewRepairLock | undefined = restoredRepair?.mode === "style"
+    ? { mode: "style" }
+    : restoredRepair?.mode === "structural" && restoredRepair.targetSceneIds?.length
+      ? { mode: "structural", targetSceneIds: [...new Set(restoredRepair.targetSceneIds)] }
+      : undefined;
   if (chapterReviewRequired && restoredChapterDraft) {
     messages.push({ role: "user", content: chapterReviewRequiredPrompt(restoredChapterDraft) });
   }
@@ -1881,9 +1990,9 @@ export async function runAgent(options: {
         emit({ type: "text", text, channel: "output" });
       }, (text) => emit({ type: "text", text, channel: "reasoning" }), {
         tools: executionTools,
-        // DeepSeek isolates KV cache by user_id. A stable opaque session id keeps
-        // multi-turn prefixes together without sharing project context across sessions.
-        ...(isDeepSeekModel(stepModel) ? { userId: sessionId } : {}),
+        // DeepSeek isolates KV cache by user_id. Use an opaque project identity so
+        // stable prefixes survive new sessions without crossing project boundaries.
+        ...(isDeepSeekModel(stepModel) ? { userId: projectCacheUserId(project.root) } : {}),
         prefixCache: {
           projectRoot: project.root,
           sessionId,
@@ -2022,6 +2131,21 @@ export async function runAgent(options: {
             code: "CHAPTER_REVIEW_REQUIRED",
             nextAllowedActions: ["inspect_chapter_draft"],
           });
+        } else if (chapterReviewRepair && !chapterReviewRepairAllowsTool(chapterReviewRepair, call.name, effectiveCall.arguments)) {
+          toolResult = JSON.stringify({
+            error: chapterReviewRepair.mode === "style"
+              ? "终审只要求精确句式修订，禁止重写场景或重建 scene guide。"
+              : "终审只允许重写 blocker 明确定位的 targetScenes。",
+            code: chapterReviewRepair.mode === "style"
+              ? "CHAPTER_STYLE_REPAIR_ONLY"
+              : "CHAPTER_STRUCTURAL_TARGET_ONLY",
+            nextAllowedActions: chapterReviewRepair.mode === "style"
+              ? ["revise_chapter_draft_style"]
+              : ["write_chapter_scene", "write_chapter_scene_notes"],
+            ...(chapterReviewRepair.mode === "structural"
+              ? { targetSceneIds: chapterReviewRepair.targetSceneIds }
+              : {}),
+          });
         } else if (!executionToolNames.has(call.name)) {
           toolResult = JSON.stringify({ error: `工具 ${call.name} 不在当前权限模式的稳定能力集中` });
         } else if (!contractAllowsTool(task, permissionMode, call.name)) {
@@ -2070,9 +2194,15 @@ export async function runAgent(options: {
           }
           if (!("error" in parsed) && isChapterSceneWriteTool(call.name)
             && (parsed.status === "written" || parsed.status === "revised")) {
+            if (chapterReviewRepair?.mode === "structural") chapterReviewRepair = undefined;
             sceneWrittenFeedback = Array.isArray(parsed.styleFeedback)
               ? (parsed.styleFeedback as unknown[]).filter((item): item is string => typeof item === "string")
               : [];
+          }
+          if (!("error" in parsed) && call.name === "revise_chapter_draft_style"
+            && parsed.status === "style_revised" && parsed.styleRecheck === "passed") {
+            chapterReviewRepair = undefined;
+            chapterReviewRequired = true;
           }
           if (call.name === "inspect_chapter_draft" && chapterReviewCompleted(parsed)) {
             // Every declared inspect outcome means the terminal action ran. Keep
@@ -2080,6 +2210,7 @@ export async function runAgent(options: {
             // so the Agent can submit, precisely repair, or use fallback review.
             documentProposalSubmitted = parsed.proposalSubmitted === true;
             chapterReviewRequired = false;
+            chapterReviewRepair = chapterReviewRepairLock(parsed);
           }
         } catch { /* 非 JSON 工具结果不参与结构化里程碑推进。 */ }
         if (call.name === "inspect_chapter_draft" || call.name === "revise_chapter_draft_style" || call.name === "propose_chapter_draft") {
@@ -2101,7 +2232,49 @@ export async function runAgent(options: {
         }
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
+      let automaticReviewHandoff: string | undefined;
+      if (chapterReviewRequired && toolContext.chapterSceneDraft
+        && automaticChapterReviewEnabled(toolContext.characterEvolutionEnabled)
+        && !documentProposalSubmitted && !waitingForUser) {
+        const automaticReviewCall: ToolAccumulator = {
+          id: `runtime_chapter_review_${step}_${toolContext.chapterSceneDraft.version}`,
+          name: "inspect_chapter_draft",
+          arguments: JSON.stringify({ summary: automaticChapterReviewSummary(toolContext.chapterSceneDraft) }),
+        };
+        emit({ type: "tool", name: automaticReviewCall.name });
+        let automaticReviewResult = await executeToolCached(
+          automaticReviewCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext,
+        );
+        automaticReviewResult = boundToolResultForModel(
+          automaticReviewCall, automaticReviewResult, project, store, sessionId,
+        );
+        let parsedAutomaticReview: Record<string, unknown> | undefined;
+        try {
+          const parsed = JSON.parse(automaticReviewResult) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            parsedAutomaticReview = parsed as Record<string, unknown>;
+          }
+        } catch { /* malformed automatic review keeps the ordinary terminal lock */ }
+        recordAgentToolResult(executionProgress, automaticReviewCall.name, parsedAutomaticReview);
+        if (parsedAutomaticReview && chapterReviewCompleted(parsedAutomaticReview)) {
+          documentProposalSubmitted = parsedAutomaticReview.proposalSubmitted === true;
+          chapterReviewRequired = false;
+          chapterReviewRepair = chapterReviewRepairLock(parsedAutomaticReview);
+          chapterReviewInStep = true;
+          if (!documentProposalSubmitted) automaticReviewHandoff = automaticReviewResult;
+        }
+      }
       emit({ type: "step_done", step });
+      if (automaticReviewHandoff) {
+        messages.length = contextBase;
+        messages.push({
+          role: "user",
+          content: `运行时自动终审已完成。严格按结构化结果执行修复或兼容性提交，不要复述报告，也不要扩大修改范围。\n${automaticReviewHandoff}`,
+        });
+        turnStart = messages.length;
+        ensureThinkingTranscriptCanContinue();
+        continue;
+      }
       if (characterMutationSubmitted && task.mutation === "character") {
         persistCompletedCharacterTaskTodos(store, sessionId, emit);
         const gaps = agentCompletionGaps(task, executionProgress, store.sessionTodos(sessionId));
@@ -2402,7 +2575,13 @@ function selectedBlockEditLock(
  * Dynamic-tail work memory. CACHE: miss-priced — default to catalog + digests;
  * restore at most one body on continuation. Do not re-inject multi-chapter prose here.
  */
-function recentArtifactsContext(store: WriterStore, sessionId: string, project: WriterProject, task: WritingTask): string {
+function recentArtifactsContext(
+  store: WriterStore,
+  sessionId: string,
+  project: WriterProject,
+  task: WritingTask,
+  continuityFactsEnabled = false,
+): string {
   const state = store.sessionContext(sessionId);
   const restorableDraft = task.continuation
     ? restoreChapterDraftCheckpoint(store, sessionId, project, task.targetPath ?? state.activeDocument)
@@ -2418,10 +2597,11 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
         completedScenes: savedCheckpoint.completedScenes,
         totalScenes: savedCheckpoint.totalScenes,
         unresolved: savedCheckpoint.unresolved?.slice(0, 12),
+        reviewRepair: savedCheckpoint.reviewRepair,
         artifactIds: savedCheckpoint.artifactIds?.slice(0, 8),
       }
     : undefined;
-  const continuityFacts = store.continuityFactPacket({
+  const continuityFacts = continuityFactsEnabled ? store.continuityFactPacket({
     targetPath: task.targetPath ?? state.activeDocument,
     characterIds: task.characterIds,
     limit: 20,
@@ -2436,7 +2616,7 @@ function recentArtifactsContext(store: WriterStore, sessionId: string, project: 
     ...(fact.validUntil ? { validUntil: fact.validUntil } : {}),
     status: fact.status,
     source: fact.sourcePath,
-  }));
+  })) : [];
   let artifacts = store.recentContextArtifacts(sessionId, 12)
     .filter((artifact) => {
       if (!artifact.path) return true;

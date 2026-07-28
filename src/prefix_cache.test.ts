@@ -45,7 +45,7 @@ test("request prefix forest finds the exact atom prefix without logging prompt b
 
     const second = forest.begin(request(root, "different-private-request"));
     assert.equal(second.prediction.priorRequests, 1);
-    assert.equal(second.prediction.matchedAtoms, 2, "tool schema and stable system should match");
+    assert.equal(second.prediction.matchedAtoms, 1, "only the stable system prefix should match");
     assert.equal(second.prediction.firstDivergence?.kind, "user");
     forest.finish(second, {
       promptTokens: 120,
@@ -90,4 +90,23 @@ test("prefix atoms expose document cache metadata but omit document text", () =>
   assert.equal(atoms[0].document?.sourceHash, "source-hash");
   assert.equal(atoms[0].document?.bodyCharacters, body.length);
   assert.doesNotMatch(JSON.stringify(atoms), new RegExp(body));
+});
+
+test("prefix atoms place tools after initial messages and before appended turns", () => {
+  const atoms = buildPrefixCacheAtoms({
+    stableMessageCount: 1,
+    initialMessageCount: 2,
+    messages: [
+      { role: "system", content: "stable" },
+      { role: "user", content: "request" },
+      { role: "assistant", content: "working" },
+    ],
+    tools: [{ type: "function", function: { name: "read_document" } }],
+  });
+  assert.deepEqual(atoms.map(atom => atom.kind), [
+    "stable_system",
+    "user",
+    "tool_schema",
+    "assistant",
+  ]);
 });

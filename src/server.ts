@@ -814,12 +814,15 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
+      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
       if (body.characterEvolutionEnabled !== undefined && typeof body.characterEvolutionEnabled !== "boolean") {
         return context.json({ error: "characterEvolutionEnabled 必须是布尔值" }, 400);
+      }
+      if (body.continuityFactsEnabled !== undefined && typeof body.continuityFactsEnabled !== "boolean") {
+        return context.json({ error: "continuityFactsEnabled 必须是布尔值" }, 400);
       }
       if (body.writingMode !== undefined && !isWritingExecutionMode(body.writingMode)) {
         return context.json({ error: "writingMode 仅支持 delegated、fast" }, 400);
@@ -868,12 +871,14 @@ export async function startWriterServer(options: {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
         ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
         ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
+        ...(typeof body.continuityFactsEnabled === "boolean" ? { continuityFactsEnabled: body.continuityFactsEnabled } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
         writingMode: settings.writingMode,
         characterEvolutionEnabled: settings.characterEvolutionEnabled,
+        continuityFactsEnabled: settings.continuityFactsEnabled,
         scenePipeline: settings.scenePipeline,
       });
     } catch (error) {
@@ -1300,7 +1305,10 @@ export async function startWriterServer(options: {
       const action = context.req.param("action");
       if (!Number.isInteger(id) || !["accept", "reject"].includes(action)) throw new Error("审批参数无效");
       const proposal = action === "accept" ? options.store.acceptProposal(id) : options.store.rejectProposal(id);
-      const continuity = action === "accept"
+      const shouldIndexContinuity = action === "accept"
+        && loadAgentSettings(options.project).continuityFactsEnabled
+        && ["lore", "chapter", "side"].includes(documentKind(proposal.path));
+      const continuity = shouldIndexContinuity
         ? await indexAcceptedContinuityFacts({
             project: options.project,
             store: options.store,
@@ -1310,10 +1318,9 @@ export async function startWriterServer(options: {
             afterContent: proposal.afterContent,
             sourceId: proposal.id,
             sessionId: proposal.sessionId,
-            signal: context.req.raw.signal,
           })
         : { continuityFacts: 0 };
-      return context.json({ proposal, ...continuity });
+      return context.json({ proposal, ...continuity, continuityFactsPending: false });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -1328,26 +1335,27 @@ export async function startWriterServer(options: {
         : action === "reject" ? options.store.rejectChangeSet(id)
           : action === "undo" ? options.store.undoChangeSet(id)
             : options.store.redoChangeSet(id);
-      const indexed: Array<{ continuityFacts: number; continuityFactWarning?: string }> = [];
-      if (action === "accept") {
-        for (const file of changeSet.files) {
-          if (file.operation === "delete" || file.operation === "move") continue;
-          indexed.push(await indexAcceptedContinuityFacts({
-              project: options.project,
-              store: options.store,
-              providers: options.providers,
-              path: file.path,
-              beforeContent: file.beforeContent,
-              afterContent: file.afterContent,
-              sessionId: changeSet.sessionId,
-              signal: context.req.raw.signal,
-            }));
-        }
+      const continuityFiles = action === "accept" && loadAgentSettings(options.project).continuityFactsEnabled
+        ? changeSet.files.filter(file => file.operation !== "delete" && file.operation !== "move"
+          && ["lore", "chapter", "side"].includes(documentKind(file.path)))
+        : [];
+      const continuityResults: Array<{ continuityFacts: number; continuityFactWarning?: string }> = [];
+      for (const file of continuityFiles) {
+        continuityResults.push(await indexAcceptedContinuityFacts({
+          project: options.project,
+          store: options.store,
+          providers: options.providers,
+          path: file.path,
+          beforeContent: file.beforeContent,
+          afterContent: file.afterContent,
+          sessionId: changeSet.sessionId,
+        }));
       }
       return context.json({
         changeSet,
-        continuityFacts: indexed.reduce((sum, item) => sum + item.continuityFacts, 0),
-        continuityFactWarnings: indexed.flatMap(item => item.continuityFactWarning ? [item.continuityFactWarning] : []),
+        continuityFacts: continuityResults.reduce((sum, result) => sum + result.continuityFacts, 0),
+        continuityFactWarnings: continuityResults.flatMap(result => result.continuityFactWarning ? [result.continuityFactWarning] : []),
+        continuityFactsPending: false,
       });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
@@ -1624,6 +1632,13 @@ function usageReporterForSession(store: WriterStore, sessionId?: string): ModelU
   };
 }
 
+/** Keep manual approval latency independent from the best-effort model indexer. */
+export function scheduleAcceptedContinuityIndexing(run: () => Promise<unknown>): void {
+  setImmediate(() => {
+    void run().catch(() => undefined);
+  });
+}
+
 async function indexAcceptedContinuityFacts(options: {
   project: WriterProject;
   store: WriterStore;
@@ -1646,6 +1661,10 @@ async function indexAcceptedContinuityFacts(options: {
       signal: options.signal,
       usageReporter: usageReporterForSession(options.store, options.sessionId),
     });
+    if (!options.project.documentExists(options.path)
+      || options.project.hash(options.project.read(options.path)) !== options.project.hash(options.afterContent)) {
+      return { continuityFacts: 0 };
+    }
     const saved = options.store.saveExtractedContinuityFacts(
       options.path,
       options.afterContent,

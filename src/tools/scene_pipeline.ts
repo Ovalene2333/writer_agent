@@ -24,6 +24,8 @@ import {
 } from "../scene_candidates.js";
 import {
   IsolatedSceneRequestError,
+  proseCharacterCount,
+  proseTargetBounds,
   requestIsolatedScene,
   requestSceneStateExtraction,
 } from "../isolated_scene_writer.js";
@@ -83,7 +85,11 @@ function saveDraftCheckpoint(
   args: Pick<ToolHandlerArgs, "store" | "sessionId">,
   stage: import("../types.js").AgentCheckpoint["stage"],
   draft: ChapterSceneDraft,
-  extra: { unresolved?: string[]; proposalId?: number } = {},
+  extra: {
+    unresolved?: string[];
+    proposalId?: number;
+    reviewRepair?: import("../types.js").AgentCheckpoint["reviewRepair"];
+  } = {},
 ): void {
   args.store.saveAgentCheckpoint(args.sessionId, {
     version: 1,
@@ -208,6 +214,16 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const submitted = requireString(input.content, "content");
   rejectCompressedPlaceholder(submitted, "content");
+  const targetCharacters = draft.scenes.find(scene => scene.id === sceneId)?.targetCharacters;
+  if (targetCharacters) {
+    const bounds = proseTargetBounds(targetCharacters);
+    const actualCharacters = proseCharacterCount(submitted);
+    if (actualCharacters < bounds.minimum || actualCharacters > bounds.maximum) {
+      throw new Error(
+        `本场正文 ${actualCharacters} 字，目标 ${targetCharacters} 字，可接受范围 ${bounds.minimum}—${bounds.maximum} 字。保持本场目标、事实和 actualState 一致，调整正文篇幅后重新提交；不得用总结、重复或元说明凑字。`,
+      );
+    }
+  }
   return acceptChapterScene({
     project, store, sessionId, context, draft, sceneId, submitted,
     actualState: input.actualState,
@@ -286,6 +302,7 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
   const previous = sceneIndex > 0 ? draft.completed[sceneIndex - 1] : undefined;
   const runner = context.isolatedSceneWriter.run ?? requestIsolatedScene;
   const targetCharacters = draft.scenes[sceneIndex].targetCharacters;
+  const targetBounds = targetCharacters ? proseTargetBounds(targetCharacters) : undefined;
   const writerMaxRatio = context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO;
   const maximumCharacters = targetCharacters ? Math.floor(targetCharacters * writerMaxRatio) : undefined;
   const voiceEvidence = chapterIsolatedVoiceEvidence({ project, store, context }, draft);
@@ -313,12 +330,15 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
     ...(avoidNotes.length ? { avoidNotes } : {}),
     maximumCharacters,
   };
-  const runWriter = async (strictMaximumCharacters?: number) => {
-    const callKind = strictMaximumCharacters ? "isolated_scene_writer_length_retry" : "isolated_scene_writer";
+  const runWriter = async (lengthRetry = false) => {
+    const callKind = lengthRetry ? "isolated_scene_writer_length_retry" : "isolated_scene_writer";
     try {
       const generated = await runner(context.isolatedSceneWriter!.model, {
         ...writerInput,
-        ...(strictMaximumCharacters ? { strictMaximumCharacters } : {}),
+        ...(lengthRetry && targetBounds ? {
+          strictMinimumCharacters: targetBounds.minimum,
+          strictMaximumCharacters: targetBounds.maximum,
+        } : {}),
       }, context.isolatedSceneWriter!.signal);
       if (generated.usage) {
         context.modelUsageReporter?.(context.isolatedSceneWriter!.model, generated.usage, { callKind });
@@ -349,15 +369,21 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
         || error.stage !== "writer"
         || error.failureKind !== "truncated"
         || !maximumCharacters) throw error;
-      generated = await runWriter(maximumCharacters);
+      generated = await runWriter(true);
       retriedForLength = true;
     }
   }
-  if (!retriedForLength && maximumCharacters && generated.content.trim().length > maximumCharacters) {
-    generated = await runWriter(maximumCharacters);
+  const initialCharacters = proseCharacterCount(generated.content);
+  if (!retriedForLength && targetBounds
+    && (initialCharacters < targetBounds.minimum || initialCharacters > targetBounds.maximum)) {
+    generated = await runWriter(true);
   }
-  if (maximumCharacters && generated.content.trim().length > maximumCharacters) {
-    throw new Error(`隔离正文 Writer 连续两次超出本场上限 ${maximumCharacters} 字；请收紧 notes 中的事件范围后重试`);
+  const finalCharacters = proseCharacterCount(generated.content);
+  if (targetBounds && (finalCharacters < targetBounds.minimum || finalCharacters > targetBounds.maximum)) {
+    throw new Error(`隔离正文 Writer 重试后本场仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整本场事件密度后重试`);
+  }
+  if (!targetBounds && maximumCharacters && finalCharacters > maximumCharacters) {
+    throw new Error(`隔离正文 Writer 超出本场上限 ${maximumCharacters} 字；请收紧 notes 中的事件范围后重试`);
   }
   rejectCompressedPlaceholder(generated.content, "隔离正文 Writer content");
   context.isolatedPendingScene = {
@@ -1101,6 +1127,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
   if (!styleRepair.passed) {
     saveDraftCheckpoint(args, "review_blocked", draft, {
       unresolved: styleRepair.blockers.map(issue => `${issue.subtype}:${issue.sentence}`).slice(0, 20),
+      reviewRepair: { mode: "style" },
     });
     return JSON.stringify({
       status: "style_revision_required",
@@ -1124,6 +1151,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
   if (metricsError) {
     saveDraftCheckpoint(args, "review_blocked", draft, {
       unresolved: metrics.issues.filter(issue => issue.severity === "error").flatMap(issue => issue.examples).slice(0, 20),
+      reviewRepair: { mode: "style" },
     });
     return JSON.stringify({
       status: "style_revision_required",
@@ -1202,12 +1230,13 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           });
         }
         if (reviewed.review.verdict === "revise") {
-          saveDraftCheckpoint(args, "review_blocked", draft, {
-            unresolved: reviewed.review.issues.filter(issue => issue.severity === "blocker").map(issue => issue.problem),
-          });
           const targetIds = new Set(reviewed.review.issues
             .filter(issue => issue.severity === "blocker" && issue.sceneId)
             .map(issue => issue.sceneId!));
+          saveDraftCheckpoint(args, "review_blocked", draft, {
+            unresolved: reviewed.review.issues.filter(issue => issue.severity === "blocker").map(issue => issue.problem),
+            reviewRepair: { mode: "structural", targetSceneIds: [...targetIds] },
+          });
           const targetScenes = draft.completed.flatMap((completed, index) => {
             if (!targetIds.has(completed.sceneId)) return [];
             return [{

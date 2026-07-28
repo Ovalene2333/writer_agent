@@ -72,6 +72,7 @@ type ModelConfigProps = {
   scenePipeline: ScenePipelineSettings;
   writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
+  continuityFactsEnabled: boolean;
   section: SettingsSection;
   styleContent: React.ReactNode;
   connectionContent: React.ReactNode;
@@ -83,6 +84,7 @@ type ModelConfigProps = {
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
+  onContinuityFactsChanged: (enabled: boolean) => void;
 };
 
 export function ModelConfig({
@@ -90,6 +92,7 @@ export function ModelConfig({
   scenePipeline,
   writingMode,
   characterEvolutionEnabled,
+  continuityFactsEnabled,
   section,
   styleContent,
   connectionContent,
@@ -101,10 +104,12 @@ export function ModelConfig({
   onChanged,
   onScenePipelineChanged,
   onCharacterEvolutionChanged,
+  onContinuityFactsChanged,
 }: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
+  const [continuityFactsDraft, setContinuityFactsDraft] = useState(continuityFactsEnabled);
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -117,9 +122,11 @@ export function ModelConfig({
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
+  useEffect(() => setContinuityFactsDraft(continuityFactsEnabled), [continuityFactsEnabled]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
+    || continuityFactsDraft !== continuityFactsEnabled
     || Object.keys(sceneDraft).some(key => sceneDraft[key as keyof ScenePipelineSettings] !== scenePipeline[key as keyof ScenePipelineSettings]);
   const sceneDraftValid = [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
@@ -294,12 +301,15 @@ export function ModelConfig({
         body: JSON.stringify({
           scenePipeline: sceneDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
+          continuityFactsEnabled: continuityFactsDraft,
         }),
-      }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean };
+      }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean; continuityFactsEnabled: boolean };
       setSceneDraft(result.scenePipeline);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
+      setContinuityFactsDraft(result.continuityFactsEnabled);
       onScenePipelineChanged(result.scenePipeline);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
+      onContinuityFactsChanged(result.continuityFactsEnabled);
       setMessage("写作设置已保存，将从下一次 Agent 任务开始生效");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -311,6 +321,7 @@ export function ModelConfig({
   function resetWritingSettings() {
     setSceneDraft(scenePipeline);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
+    setContinuityFactsDraft(continuityFactsEnabled);
     setError("");
     setMessage("");
   }
@@ -436,6 +447,10 @@ export function ModelConfig({
           <label className="writing-setting-row">
             <input type="checkbox" checked={characterEvolutionDraft} onChange={event => setCharacterEvolutionDraft(event.target.checked)}/>
             <span><strong>角色演进</strong><small>允许叙事任务自动追加角色经历和故事状态。关闭后仍可显式新建或编辑角色卡。</small></span>
+          </label>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={continuityFactsDraft} onChange={event => setContinuityFactsDraft(event.target.checked)}/>
+            <span><strong>连续性事实</strong><small>接受正文或设定后调用摘要模型提取事实，并在后续相关任务中注入。关闭时不增加审批等待、模型调用或写作上下文。</small></span>
           </label>
         </section>
 

@@ -70,6 +70,26 @@ test("reusable grounded context satisfies an evidence obligation", () => {
   assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
 });
 
+test("planned author review rules must be persisted before completion", () => {
+  const progress = createAgentExecutionProgress();
+  const contract: AgentTaskContract = {
+    mode: "general",
+    outcome: "answer",
+    evidence: "none",
+    mutation: "none",
+    planning: "direct",
+    capabilities: ["review"],
+    proseGateRequired: true,
+  };
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "尚未把 planning 识别出的可复用作者反馈保存为复审规则",
+  ]);
+  recordAgentToolResult(progress, "manage_prose_gates", { rules: [] });
+  assert.equal(progress.proseGateRuleSaved, false);
+  recordAgentToolResult(progress, "manage_prose_gates", { status: "saved" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
 test("self-contained document creation only requires a delivered artifact", () => {
   const progress = createAgentExecutionProgress();
   const contract: AgentTaskContract = {

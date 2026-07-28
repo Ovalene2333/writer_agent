@@ -13,6 +13,7 @@ import {
   agentToolSchemaHash,
   agentToolsForTask,
   admitReadAtom,
+  automaticChapterReviewEnabled,
   boundToolResultForModel,
   buildRequestComponentUsage,
   buildDynamicTurnMessages,
@@ -23,15 +24,19 @@ import {
   chapterDraftNeedsReview,
   chapterReviewAllowsTool,
   chapterReviewCompleted,
+  chapterReviewRepairAllowsTool,
+  chapterReviewRepairLock,
   chapterReviewRequiredPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
   documentDeliveryRemaining,
   executionModelForTask,
   executionModelForStep,
+  projectCacheUserId,
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
+  normalizePlannedProseGateCandidate,
   normalizeRewriteEditScope,
   parsePlannerJson,
   parseToolArgumentRepair,
@@ -62,7 +67,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "4eae4ced9f2e47fe");
+  assert.equal(agentToolSchemaHash(), "e4cfb41bb0f63db3");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -323,6 +328,30 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   });
 });
 
+test("planner prose gate candidates require an independently executable semantic rule", () => {
+  assert.deepEqual(normalizePlannedProseGateCandidate({
+    id: "technical-telemetry-density",
+    instruction: "正文不要连续堆叠精确技术参数；只有数值直接影响人物判断、风险或行动时才保留。",
+    severity: "warn",
+    sourceFeedback: "作者要求避免频繁细写元件温度升降数值。",
+  }), {
+    id: "technical-telemetry-density",
+    instruction: "正文不要连续堆叠精确技术参数；只有数值直接影响人物判断、风险或行动时才保留。",
+    severity: "warn",
+    sourceFeedback: "作者要求避免频繁细写元件温度升降数值。",
+  });
+  assert.equal(normalizePlannedProseGateCandidate({
+    id: "中文-id",
+    instruction: "少写一点。",
+    sourceFeedback: "不喜欢。",
+  }), undefined);
+  assert.equal(normalizePlannedProseGateCandidate({
+    id: "vague-feedback",
+    instruction: "",
+    sourceFeedback: "不喜欢。",
+  }), undefined);
+});
+
 test("immediately previous reply preserves named options for follow-up references", () => {
   const prior = [
     "前置分析。",
@@ -349,7 +378,7 @@ test("exceptionally long previous replies mark middle omission instead of posing
   assert.ok(admitted.length < prior.length);
 });
 
-test("scene orchestration always stays on Agent regardless of Writer isolation", () => {
+test("main orchestration always stays on Agent across task modes", () => {
   const model = (name: string) => ({
     provider: "openai-compatible" as const,
     baseUrl: "https://api.example.com/v1",
@@ -365,8 +394,16 @@ test("scene orchestration always stays on Agent regardless of Writer isolation",
 
   assert.equal(executionModelForTask(writing, models, agent), agent);
   assert.equal(executionModelForTask({ mode: "outline", documentProposalRequired: true }, models, agent), agent);
-  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent), inline);
-  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), reviewer);
+  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent), agent);
+  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), agent);
+});
+
+test("project cache user id is opaque and stable within a project", () => {
+  const first = projectCacheUserId("/projects/novel-a");
+  assert.equal(first, projectCacheUserId("/projects/novel-a"));
+  assert.notEqual(first, projectCacheUserId("/projects/novel-b"));
+  assert.match(first, /^writer-project-[a-f0-9]{32}$/);
+  assert.doesNotMatch(first, /novel-a/);
 });
 
 test("fast writing mode keeps every step on Agent, including pending prose scenes", () => {
@@ -625,6 +662,30 @@ test("actionable chapter review results release the inspect-only terminal lock",
   assert.equal(chapterReviewCompleted({ status: "proposal_submitted" }), true);
   assert.equal(chapterReviewCompleted({ error: "缺少有效参数：summary" }), false);
   assert.equal(chapterReviewCompleted({ status: "error", error: "工具执行失败" }), false);
+});
+
+test("automatic chapter review preserves character evolution and scopes rejected repairs", () => {
+  assert.equal(automaticChapterReviewEnabled(false), true);
+  assert.equal(automaticChapterReviewEnabled(true), false);
+  assert.equal(automaticChapterReviewEnabled(undefined), false);
+
+  const style = chapterReviewRepairLock({ status: "style_revision_required" });
+  assert.deepEqual(style, { mode: "style" });
+  assert.equal(chapterReviewRepairAllowsTool(style!, "revise_chapter_draft_style"), true);
+  assert.equal(chapterReviewRepairAllowsTool(style!, "write_chapter_scene", JSON.stringify({ sceneId: "s1" })), false);
+  assert.equal(chapterReviewRepairAllowsTool(style!, "propose_chapter_draft"), false);
+  assert.equal(chapterReviewRepairAllowsTool(style!, "read_document", JSON.stringify({ path: "chapters/one.md" })), true);
+
+  const structural = chapterReviewRepairLock({
+    status: "structural_revision_required",
+    targetScenes: [{ sceneId: "s2" }, { sceneId: "s2" }, { sceneId: "s4" }],
+  });
+  assert.deepEqual(structural, { mode: "structural", targetSceneIds: ["s2", "s4"] });
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s2" })), true);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene_notes", JSON.stringify({ sceneId: "s4" })), true);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s3" })), false);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "revise_chapter_scene_guide"), false);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", "{"), false);
 });
 
 test("document delivery continuation uses contract outputs instead of todo wording", () => {

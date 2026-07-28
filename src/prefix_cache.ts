@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-const PREFIX_CACHE_LOG_VERSION = 1;
+const PREFIX_CACHE_LOG_VERSION = 2;
 const DEFAULT_REPLAY_BYTES = 16 * 1024 * 1024;
 
 export type PrefixCacheMessage = {
@@ -238,19 +238,7 @@ export function buildPrefixCacheAtoms(input: Pick<
   "messages" | "tools" | "stableMessageCount" | "initialMessageCount"
 >): PrefixCacheAtom[] {
   const atoms: PrefixCacheAtom[] = [];
-  if (input.tools?.length) {
-    const serialized = JSON.stringify(input.tools);
-    const bytes = Buffer.byteLength(serialized, "utf8");
-    atoms.push({
-      kind: "tool_schema",
-      label: `tools(${input.tools.length})`,
-      hash: hash(serialized),
-      characters: serialized.length,
-      bytes,
-      estimatedTokens: estimatedTokens(bytes),
-    });
-  }
-  input.messages.forEach((message, index) => {
+  const appendMessage = (message: PrefixCacheMessage, index: number): void => {
     const serialized = serializeMessage(message);
     const bytes = Buffer.byteLength(serialized, "utf8");
     const kind = messageKind(message, index, input.stableMessageCount, input.initialMessageCount);
@@ -268,6 +256,23 @@ export function buildPrefixCacheAtoms(input: Pick<
       estimatedTokens: estimatedTokens(bytes),
       ...(documentMetadata(message) ? { document: documentMetadata(message) } : {}),
     });
+  };
+  const initialMessageCount = Math.min(input.initialMessageCount, input.messages.length);
+  input.messages.slice(0, initialMessageCount).forEach(appendMessage);
+  if (input.tools?.length) {
+    const serialized = JSON.stringify(input.tools);
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    atoms.push({
+      kind: "tool_schema",
+      label: `tools(${input.tools.length})`,
+      hash: hash(serialized),
+      characters: serialized.length,
+      bytes,
+      estimatedTokens: estimatedTokens(bytes),
+    });
+  }
+  input.messages.slice(initialMessageCount).forEach((message, offset) => {
+    appendMessage(message, initialMessageCount + offset);
   });
   return atoms;
 }

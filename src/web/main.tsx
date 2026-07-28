@@ -17,6 +17,7 @@ import {
   FilePlus2,
   FileText,
   Folder,
+  FolderInput,
   FolderOpen,
   FolderPlus,
   History,
@@ -476,7 +477,7 @@ type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; scenePipeline: ScenePipelineSettings };
+  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; continuityFactsEnabled?: boolean; scenePipeline: ScenePipelineSettings };
   proseGateRules?: ProseGateRule[];
   continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;
@@ -1473,6 +1474,7 @@ function ChapterManager({
   onDelete,
   onDuplicate,
   onMove,
+  onRequestMove,
   onNewChapter,
 }: {
   groups: ChapterGroup[];
@@ -1487,6 +1489,7 @@ function ChapterManager({
   onDelete: (path: string, kind: "file" | "folder") => void;
   onDuplicate: (path: string) => void;
   onMove: (path: string, kind: "file" | "folder", target: string) => void;
+  onRequestMove: (chapter: ChapterSummary) => void;
   onNewChapter: (folderPath: string) => void;
 }) {
   const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -1533,6 +1536,7 @@ function ChapterManager({
                 <div className="chapter-group-actions">
                   <IconButton label={`在${group.label}中新建章节`} onClick={() => onNewChapter(group.folderPath)}><Plus size={13} /></IconButton>
                   {group.id !== "__ungrouped__" && <IconButton label="重命名卷" onClick={() => onRename(group.folderPath, "folder")}><Pencil size={13} /></IconButton>}
+                  {group.id !== "__ungrouped__" && <IconButton label="删除卷" className="danger" onClick={() => onDelete(group.folderPath, "folder")}><Trash2 size={13} /></IconButton>}
                 </div>
               )}
             </div>
@@ -1560,6 +1564,7 @@ function ChapterManager({
                     <div className="chapter-row-actions">
                       <IconButton label="版本历史" onClick={() => onVersions(chapter.path)}><History size={13} /></IconButton>
                       {!readOnly && <>
+                        <IconButton label="移动章节" onClick={() => onRequestMove(chapter)}><FolderInput size={13} /></IconButton>
                         <IconButton label="创建副本" onClick={() => onDuplicate(chapter.path)}><Copy size={13} /></IconButton>
                         <IconButton label="重命名章节" onClick={() => onRename(chapter.path, "file")}><Pencil size={13} /></IconButton>
                         <IconButton label="删除章节" className="danger" onClick={() => onDelete(chapter.path, "file")}><Trash2 size={13} /></IconButton>
@@ -2150,6 +2155,8 @@ function App() {
   );
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [chaptersLoading, setChaptersLoading] = useState(false);
+  const [movingChapter, setMovingChapter] = useState<ChapterSummary | null>(null);
+  const [moveChapterTarget, setMoveChapterTarget] = useState("");
   const [collapsedChapterVolumes, setCollapsedChapterVolumes] = useState<Set<string>>(() => {
     try {
       return new Set(JSON.parse(localStorage.getItem("writer-collapsed-chapter-volumes") || "[]") as string[]);
@@ -3547,8 +3554,13 @@ function App() {
 
   async function decide(proposal: Proposal, action: "accept" | "reject") {
     try {
-      await api(`/api/proposals/${proposal.id}/${action}`, { method: "POST" });
+      const result = await api<{ continuityFacts?: number; continuityFactWarning?: string }>(
+        `/api/proposals/${proposal.id}/${action}`,
+        { method: "POST" },
+      );
       await refresh(state?.sessionId);
+      if (result.continuityFactWarning) setNotice(result.continuityFactWarning);
+      else if (action === "accept" && result.continuityFacts) setNotice(`已更新 ${result.continuityFacts} 条连续性事实`);
       if (action === "accept" && proposal.path === activePath) {
         const next = await api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`);
         setDocument(next);
@@ -3591,6 +3603,7 @@ function App() {
         setActivePath(`${newPath}${activePath.slice(oldPath.length)}`);
       }
       await refresh(state?.sessionId);
+      if (oldPath.startsWith("chapters/")) await loadChapters();
     } catch (e) {
       setError(String(e));
     }
@@ -3598,13 +3611,22 @@ function App() {
   }
 
   async function handleDelete(path: string, kind: "file" | "folder") {
-    const label = kind === "file" ? "document" : "folder";
-    if (!confirm(`Delete ${label} "${path}"? This cannot be undone.`)) return;
+    if (kind === "folder") {
+      const volume = chapterGroups.find(group => group.folderPath === path);
+      const containedChapters = chapters.filter(chapter => chapter.path.startsWith(`${path}/`)).length;
+      if (volume && containedChapters > 0) {
+        setNotice(`“${volume.label}”及其子卷中还有 ${containedChapters} 个章节，请先移动或删除这些章节`);
+        return;
+      }
+    }
+    const label = kind === "file" ? "文档" : "卷";
+    if (!confirm(`确定删除${label}“${path}”吗？此操作不可撤销。`)) return;
     try {
       const endpoint = kind === "file" ? "/api/document" : "/api/folder";
       await api(`${endpoint}?path=${encodeURIComponent(path)}`, { method: "DELETE" });
       if (activePath === path || activePath.startsWith(`${path}/`)) setActivePath("");
       await refresh(state?.sessionId);
+      if (path.startsWith("chapters/")) await loadChapters();
     } catch (e) {
       setError(String(e));
     }
@@ -3623,15 +3645,15 @@ function App() {
     }
   }
 
-  async function handleMoveNode(path: string, kind: "file" | "folder", targetFolder: string) {
+  async function handleMoveNode(path: string, kind: "file" | "folder", targetFolder: string): Promise<boolean> {
     if (kind === "folder" && (targetFolder === path || targetFolder.startsWith(`${path}/`))) {
       setNotice("不能把文件夹移动到自身内部");
-      return;
+      return false;
     }
     const parts = path.split("/");
     const name = parts.pop()!;
     const newPath = targetFolder ? `${targetFolder}/${name}` : name;
-    if (newPath === path) return;
+    if (newPath === path) return false;
     try {
       await api(kind === "file" ? "/api/document/rename" : "/api/folder/rename", {
         method: "PUT",
@@ -3642,9 +3664,33 @@ function App() {
       }
       if (targetFolder) setExpandedFolders((prev) => new Set(prev).add(targetFolder));
       await refresh(state?.sessionId);
+      if (path.startsWith("chapters/") || newPath.startsWith("chapters/")) await loadChapters();
+      return true;
     } catch (e) {
       setError(String(e));
+      return false;
     }
+  }
+
+  function requestMoveChapter(chapter: ChapterSummary) {
+    const currentFolder = chapter.path.slice(0, chapter.path.lastIndexOf("/"));
+    const firstTarget = chapterGroups.find(group => group.folderPath !== currentFolder)?.folderPath ?? "";
+    if (!firstTarget) {
+      setNotice("请先新建另一个卷，再移动章节");
+      return;
+    }
+    setMovingChapter(chapter);
+    setMoveChapterTarget(firstTarget);
+  }
+
+  async function submitMoveChapter() {
+    if (!movingChapter || !moveChapterTarget) return;
+    const moved = await handleMoveNode(movingChapter.path, "file", moveChapterTarget);
+    if (!moved) return;
+    const targetLabel = chapterGroups.find(group => group.folderPath === moveChapterTarget)?.label ?? moveChapterTarget;
+    setNotice(`已将“${movingChapter.title}”移动到“${targetLabel}”`);
+    setMovingChapter(null);
+    setMoveChapterTarget("");
   }
 
   async function handleDuplicate(path: string) {
@@ -3918,8 +3964,13 @@ function App() {
 
   async function decideChangeSet(changeSet: ChangeSet, action: "accept" | "reject" | "undo" | "redo") {
     try {
-      await api(`/api/change-sets/${changeSet.id}/${action}`, { method: "POST" });
+      const result = await api<{ continuityFacts?: number; continuityFactWarnings?: string[] }>(
+        `/api/change-sets/${changeSet.id}/${action}`,
+        { method: "POST" },
+      );
       await refresh(state?.sessionId);
+      if (result.continuityFactWarnings?.length) setNotice(result.continuityFactWarnings.join("；"));
+      else if (action === "accept" && result.continuityFacts) setNotice(`已更新 ${result.continuityFacts} 条连续性事实`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -4724,6 +4775,7 @@ function App() {
                   onDelete={handleDelete}
                   onDuplicate={handleDuplicate}
                   onMove={handleMoveNode}
+                  onRequestMove={requestMoveChapter}
                   onNewChapter={handleNewChapter}
                 />
           ) : tree.length === 0 ? (
@@ -4826,8 +4878,14 @@ function App() {
             )}
             <div className="editor-bar-actions">
               {!editingDocument && (
-                <button disabled={!activePath || focusedExportBusy} onClick={() => void exportFocusedDocument()} title="下载当前正在浏览的 Markdown 文件">
-                  <Download size={14} />下载
+                <button
+                  className="mobile-reader-action"
+                  disabled={!activePath || focusedExportBusy}
+                  onClick={() => void exportFocusedDocument()}
+                  title="下载当前正在浏览的 Markdown 文件"
+                  aria-label="下载当前文档"
+                >
+                  <Download size={14} /><span className="mobile-reader-action-label">下载</span>
                 </button>
               )}
               {browsingVersion ? (
@@ -4852,15 +4910,22 @@ function App() {
                 <>
                   <button
                     type="button"
-                    className={versionPanelOpen ? "active" : ""}
+                    className={`mobile-reader-action${versionPanelOpen ? " active" : ""}`}
                     disabled={!activePath}
                     onClick={() => void toggleVersionPanel()}
                     title="浏览文档历史版本（只读，Agent 仅见当前版）"
+                    aria-label="浏览文档版本历史"
                   >
-                    <History size={14} />版本
+                    <History size={14} /><span className="mobile-reader-action-label">版本</span>
                   </button>
-                  <button disabled={!activePath || readOnly} onClick={() => setEditingDocument(true)}>
-                    <Pencil size={14} />编辑
+                  <button
+                    className="mobile-reader-action"
+                    disabled={!activePath || readOnly}
+                    onClick={() => setEditingDocument(true)}
+                    title="编辑当前文档"
+                    aria-label="编辑当前文档"
+                  >
+                    <Pencil size={14} /><span className="mobile-reader-action-label">编辑</span>
                   </button>
                 </>
               )}
@@ -5512,6 +5577,39 @@ function App() {
           </div>
         </div>
       </section>
+
+      {movingChapter && (() => {
+        const currentFolder = movingChapter.path.slice(0, movingChapter.path.lastIndexOf("/"));
+        const targets = chapterGroups.filter(group => group.folderPath !== currentFolder);
+        return (
+          <div className="modal-backdrop" role="presentation" onMouseDown={() => setMovingChapter(null)}>
+            <div
+              className="modal chapter-move-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="chapter-move-title"
+              onMouseDown={event => event.stopPropagation()}
+            >
+              <h2 id="chapter-move-title">移动章节</h2>
+              <p>将“{movingChapter.title}”移动到其他卷。文件名和版本历史保持不变。</p>
+              <label>
+                <span>目标卷</span>
+                <select value={moveChapterTarget} onChange={event => setMoveChapterTarget(event.target.value)} autoFocus>
+                  {targets.map(group => (
+                    <option key={group.id} value={group.folderPath}>{group.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="modal-actions">
+                <button type="button" onClick={() => setMovingChapter(null)}>取消</button>
+                <button type="button" className="primary" disabled={!moveChapterTarget} onClick={() => void submitMoveChapter()}>
+                  <FolderInput size={14} />移动
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {branchConfirm && (
         <div
@@ -7032,6 +7130,7 @@ function App() {
         scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
         writingMode={state.agentSettings?.writingMode ?? "fast"}
         characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
+        continuityFactsEnabled={state.agentSettings?.continuityFactsEnabled ?? false}
         section={settingsSection}
         onSectionChanged={setSettingsSection}
         connectionAvailable={connection.dualMode}
@@ -7158,6 +7257,7 @@ function App() {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
             writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
             scenePipeline,
           },
         } : previous)}
@@ -7167,6 +7267,17 @@ function App() {
             permissionMode: previous.agentSettings?.permissionMode ?? "ask",
             writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled,
+            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          },
+        } : previous)}
+        onContinuityFactsChanged={continuityFactsEnabled => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            writingMode: previous.agentSettings?.writingMode ?? "fast",
+            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+            continuityFactsEnabled,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           },
         } : previous)}

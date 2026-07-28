@@ -45,6 +45,8 @@ export interface AgentRuntimeSettings {
   writingMode: WritingExecutionMode;
   /** Allow narrative tasks to append character experiences and story state. */
   characterEvolutionEnabled: boolean;
+  /** Extract accepted prose/lore facts and inject relevant facts into later Agent tasks. */
+  continuityFactsEnabled: boolean;
   scenePipeline: ScenePipelineSettings;
 }
 
@@ -103,6 +105,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
   writingMode: "fast",
   characterEvolutionEnabled: true,
+  continuityFactsEnabled: false,
   scenePipeline: {
     enabled: false,
     preferredMinScenes: 3,
@@ -172,6 +175,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
         ? raw.writingMode
         : DEFAULT_SETTINGS.writingMode,
       characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
+      continuityFactsEnabled: raw.continuityFactsEnabled === true,
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
     };
   } catch {
@@ -185,6 +189,7 @@ export function saveAgentSettings(
     permissionMode?: PermissionMode;
     writingMode?: WritingExecutionMode;
     characterEvolutionEnabled?: boolean;
+    continuityFactsEnabled?: boolean;
     scenePipeline?: Partial<ScenePipelineSettings>;
   },
 ): AgentRuntimeSettings {
@@ -199,6 +204,9 @@ export function saveAgentSettings(
     characterEvolutionEnabled: typeof patch.characterEvolutionEnabled === "boolean"
       ? patch.characterEvolutionEnabled
       : current.characterEvolutionEnabled,
+    continuityFactsEnabled: typeof patch.continuityFactsEnabled === "boolean"
+      ? patch.continuityFactsEnabled
+      : current.continuityFactsEnabled,
     scenePipeline: patch.scenePipeline
       ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
       : current.scenePipeline,

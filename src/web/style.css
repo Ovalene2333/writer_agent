@@ -832,6 +832,7 @@ header {
   width: 25px; height: 25px; padding: 0; border: 0; border-radius: 6px;
   color: var(--text-faint); background: transparent;
 }
+.chapter-group-actions .icon.danger:hover { color: var(--warn); background: var(--warn-light); }
 .chapter-row-actions .icon.danger:hover { color: var(--warn); background: var(--warn-light); }
 .chapter-list { padding: 3px 0 2px; }
 .chapter-row {
@@ -854,6 +855,9 @@ header {
   background: transparent; color: var(--text-faint); font-size: 11px; cursor: pointer;
 }
 .chapter-group-empty:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
+@media (max-width: 900px) {
+  .chapter-group-actions, .chapter-row-actions { opacity: 1; }
+}
 .tree-node {
   min-width: 0;
 }
@@ -2755,6 +2759,9 @@ button.agent-orb:focus-visible {
 .modal label > span { display: block; margin-bottom: 5px; color: var(--text-dim); font-size: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
 .modal-actions .danger { margin-right: auto; }
+.chapter-move-modal { width: min(420px, 100%); }
+.chapter-move-modal h2 { margin-bottom: 10px; }
+.chapter-move-modal > p { margin: 0 0 16px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
 .branch-confirm-modal p {
   margin: -6px 0 4px;
   color: var(--text-dim);
@@ -4730,6 +4737,10 @@ header { padding-inline: 18px; }
   .editor-bar { height: 50px; padding: 0 12px; }
   .editor-bar .doc-path { font-size: 11px; }
   .editor-bar .editor-bar-actions button { min-height: 36px; padding-inline: 14px; }
+  .editor-bar .editor-bar-actions button.mobile-reader-action {
+    width: 36px; min-width: 36px; padding: 0; justify-content: center;
+  }
+  .mobile-reader-action-label { display: none; }
   .document-reader { padding: 0; background: var(--surface); }
   .document-reader-layout { display: block; }
   .document-reader-layout.outline-collapsed { display: block; }

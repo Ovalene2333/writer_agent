@@ -369,6 +369,7 @@ export interface AgentCheckpoint {
   completedScenes?: number;
   totalScenes?: number;
   unresolved?: string[];
+  reviewRepair?: { mode: "style" | "structural"; targetSceneIds?: string[] };
   artifactIds?: number[];
   proposalId?: number;
   draft?: unknown;

@@ -18,6 +18,8 @@ export interface AgentTaskContract {
   mutation: AgentMutationRequirement;
   planning: AgentPlanningStrategy;
   capabilities: AgentCapability[];
+  /** A semantic planner decision that must be persisted before the turn can finish. */
+  proseGateRequired?: boolean;
 }
 
 export interface AgentExecutionProgress {
@@ -26,6 +28,7 @@ export interface AgentExecutionProgress {
   reusableEvidence: boolean;
   documentArtifactProduced: boolean;
   characterArtifactProduced: boolean;
+  proseGateRuleSaved: boolean;
 }
 
 const PROJECT_EVIDENCE_TOOLS = new Set([
@@ -62,6 +65,7 @@ export function createAgentExecutionProgress(reusableEvidence = false): AgentExe
     reusableEvidence,
     documentArtifactProduced: false,
     characterArtifactProduced: false,
+    proseGateRuleSaved: false,
   };
 }
 
@@ -97,6 +101,9 @@ export function recordAgentToolResult(
     || (toolName === "apply_character_changes" && Array.isArray(result.applied) && result.applied.length > 0)) {
     progress.characterArtifactProduced = true;
   }
+  if (toolName === "manage_prose_gates" && result.status === "saved") {
+    progress.proseGateRuleSaved = true;
+  }
 }
 
 function hasEvidence(contract: AgentTaskContract, progress: AgentExecutionProgress): boolean {
@@ -127,6 +134,9 @@ export function agentCompletionGaps(
   }
   if ((contract.mutation === "character" || contract.mutation === "mixed") && !progress.characterArtifactProduced) {
     gaps.push("尚未成功保存或更新角色卡");
+  }
+  if (contract.proseGateRequired && !progress.proseGateRuleSaved) {
+    gaps.push("尚未把 planning 识别出的可复用作者反馈保存为复审规则");
   }
   if (contract.planning === "adaptive" && todos.length
     && todos.some(todo => todo.status === "pending" || todo.status === "in_progress")) {

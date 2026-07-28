@@ -12,7 +12,12 @@ import { compileWritePack, findProseMetaLeaks, sanitizeProseMetaLeaks } from "..
 import { documentSpans } from "../document_spans.js";
 import { documentBlocks } from "../document_blocks.js";
 import { requestDocumentRevision } from "../document_revision.js";
-import { IsolatedSceneRequestError, requestIsolatedScene } from "../isolated_scene_writer.js";
+import {
+  IsolatedSceneRequestError,
+  proseCharacterCount,
+  proseTargetBounds,
+  requestIsolatedScene,
+} from "../isolated_scene_writer.js";
 import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
 import {
@@ -291,10 +296,30 @@ export async function proseStyleGateIssues(
 export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
+  const content = requireString(input.content, "content");
+  const rawTargetCharacters = input.targetCharacters;
+  if (isScenePipelineDocument(path) && rawTargetCharacters === undefined) {
+    throw new Error("章节/支线完整正文必须传 targetCharacters；先确定全文目标字数再提交");
+  }
+  if (rawTargetCharacters !== undefined) {
+    const targetCharacters = Number(rawTargetCharacters);
+    if (!Number.isInteger(targetCharacters) || targetCharacters < 500 || targetCharacters > 50_000) {
+      throw new Error("targetCharacters 须为 500—50000 的整数");
+    }
+    const lines = content.trim().split(/\r?\n/u);
+    const body = lines[0]?.startsWith("# ") ? lines.slice(1).join("\n").trim() : content.trim();
+    const bounds = proseTargetBounds(targetCharacters);
+    const actualCharacters = proseCharacterCount(body);
+    if (actualCharacters < bounds.minimum || actualCharacters > bounds.maximum) {
+      throw new Error(
+        `正文篇幅 ${actualCharacters} 字，目标 ${targetCharacters} 字，可接受范围 ${bounds.minimum}—${bounds.maximum} 字。请保持既定事实、因果和结局，针对不足或冗余重写后重新提交；不得靠总结、重复或元说明凑字。`,
+      );
+    }
+  }
   return submitFullDocumentProposal(
     { input, project, store, sessionId, emit, context, characterScope },
     path,
-    requireString(input.content, "content"),
+    content,
     requireString(input.summary, "summary"),
     input.characterChanges,
   );
@@ -372,6 +397,7 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
   const maximumCharacters = Math.floor(targetCharacters * (
     context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO
   ));
+  const targetBounds = proseTargetBounds(targetCharacters);
   const writerInput = {
     scene,
     writePack,
@@ -381,14 +407,17 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     styleDirectives: isolatedWriterStyleDirectives(project),
     maximumCharacters,
   };
-  const runWriter = async (strictMaximumCharacters?: number) => {
-    const callKind = strictMaximumCharacters
+  const runWriter = async (lengthRetry = false) => {
+    const callKind = lengthRetry
       ? "isolated_document_writer_length_retry"
       : "isolated_document_writer";
     try {
       const generated = await runner(writer.model, {
         ...writerInput,
-        ...(strictMaximumCharacters ? { strictMaximumCharacters } : {}),
+        ...(lengthRetry ? {
+          strictMinimumCharacters: targetBounds.minimum,
+          strictMaximumCharacters: targetBounds.maximum,
+        } : {}),
       }, writer.signal);
       if (generated.usage) {
         context.modelUsageReporter?.(writer.model, generated.usage, {
@@ -420,13 +449,15 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     if (!(error instanceof IsolatedSceneRequestError)
       || error.stage !== "writer"
       || error.failureKind !== "truncated") throw error;
-    generated = await runWriter(maximumCharacters);
+    generated = await runWriter(true);
   }
-  if (generated.content.trim().length > maximumCharacters) {
-    generated = await runWriter(maximumCharacters);
+  const initialCharacters = proseCharacterCount(generated.content);
+  if (initialCharacters < targetBounds.minimum || initialCharacters > targetBounds.maximum) {
+    generated = await runWriter(true);
   }
-  if (generated.content.trim().length > maximumCharacters) {
-    throw new Error(`隔离 Writer 连续两次超出正文上限 ${maximumCharacters} 字；请缩小本次事件范围或改用场景链`);
+  const finalCharacters = proseCharacterCount(generated.content);
+  if (finalCharacters < targetBounds.minimum || finalCharacters > targetBounds.maximum) {
+    throw new Error(`隔离 Writer 重试后正文仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整事件密度或改用场景链`);
   }
   rejectCompressedPlaceholder(generated.content, "隔离 Writer 正文");
   const generatedBody = generated.content.trim();
@@ -453,7 +484,7 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     requestedMode: target.requestedMode,
     effectiveMode: target.mode,
     submissionKind: target.versionSubmission ? "new_version" : "new_document",
-    generatedCharacters: generatedBody.length,
+    generatedCharacters: proseCharacterCount(generatedBody),
     targetCharacters,
   });
 }

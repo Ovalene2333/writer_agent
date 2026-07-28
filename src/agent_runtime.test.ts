@@ -212,6 +212,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "ask",
       writingMode: "fast",
       characterEvolutionEnabled: true,
+      continuityFactsEnabled: false,
       scenePipeline: {
         enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
@@ -222,6 +223,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "plan",
       writingMode: "fast",
       characterEvolutionEnabled: false,
+      continuityFactsEnabled: true,
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
@@ -232,6 +234,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "plan",
       writingMode: "fast",
       characterEvolutionEnabled: false,
+      continuityFactsEnabled: true,
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
@@ -250,6 +253,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriter, true);
     assert.equal(loadAgentSettings(project).writingMode, "fast", "scene patch must preserve writing mode");
     assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
+    assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "scene patch must preserve continuity toggle");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

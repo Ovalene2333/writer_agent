@@ -7,7 +7,13 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
-import { BackgroundAgentJobs, conversationMessageForWeb, resolveWebRoot, startWriterServer } from "./server.js";
+import {
+  BackgroundAgentJobs,
+  conversationMessageForWeb,
+  resolveWebRoot,
+  scheduleAcceptedContinuityIndexing,
+  startWriterServer,
+} from "./server.js";
 import { WriterStore } from "./store.js";
 
 test("web assets always resolve to Vite's build output", () => {
@@ -46,6 +52,14 @@ test("agent event snapshot keeps events emitted during replay", async () => {
     [1, "text"],
     [2, "done"],
   ]);
+});
+
+test("accepted continuity indexing starts after the approval response turn", async () => {
+  let started = false;
+  scheduleAcceptedContinuityIndexing(async () => { started = true; });
+  assert.equal(started, false);
+  await waitForImmediate();
+  assert.equal(started, true);
 });
 
 test("web roleplay messages expose the parsed perception without internal turn hints", () => {
