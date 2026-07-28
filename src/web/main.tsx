@@ -542,17 +542,6 @@ type MessageStepTrail = {
   }>;
   updatedAt: string;
 };
-type State = {
-  accessMode?: "owner" | "readonly";
-  config: { title: string; style?: string };
-  documents: string[];
-  documentFolders: string[];
-  hiddenDocuments: string[];
-  hiddenFolders: string[];
-  sessionId: string;
-  messages: Message[];
-  messagesHasMore: boolean;
-
 type ContextGraphNode = {
   id: string;
   sessionId: string;
@@ -582,6 +571,16 @@ type ContextGraphView = {
   recentSlices: ContextGraphNode[];
   stats: { activeNodes: number; archivedNodes: number; edgeCount: number; handoffCount: number };
 };
+type State = {
+  accessMode?: "owner" | "readonly";
+  config: { title: string; style?: string };
+  documents: string[];
+  documentFolders: string[];
+  hiddenDocuments: string[];
+  hiddenFolders: string[];
+  sessionId: string;
+  messages: Message[];
+  messagesHasMore: boolean;
   /** Server-persisted step trails for messages on the current page. */
   stepTrails?: MessageStepTrail[];
   proposals: Proposal[];
@@ -5966,10 +5965,15 @@ function App() {
             </h2>
           </div>
           <div className="agent-head-actions">
-            <IconButton
-              label="上下文图"
+            <button
+              type="button"
+              className="ghost context-graph-open-btn"
+              title="查看可管理上下文图（任务 / 交接 / 装配）"
               onClick={() => void openContextGraph()}
-            ><GitBranch size={16} /></IconButton>
+            >
+              <GitBranch size={15} aria-hidden="true" />
+              <span>上下文图</span>
+            </button>
             {!busy && (
               <IconButton
                 label="新建会话"

@@ -6028,3 +6028,24 @@ a:focus-visible {
 .context-graph-layout {
   margin-top: 4px;
 }
+
+.context-graph-open-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.context-graph-open-btn:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+@media (max-width: 720px) {
+  .context-graph-open-btn span { display: none; }
+  .context-graph-open-btn { width: 30px; padding: 0; justify-content: center; }
+}
