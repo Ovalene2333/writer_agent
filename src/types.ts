@@ -532,6 +532,7 @@ export type PermissionMode = "ask" | "auto" | "plan";
 
 export type AgentEvent =
   | { type: "step_start"; step: number }
+  | { type: "source_message"; messageId: number; channel?: MessageChannel }
   | { type: "task_contract"; contract: {
       mode: string;
       outcome: "answer" | "document" | "character" | "review" | "multiple";

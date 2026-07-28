@@ -517,10 +517,10 @@ export async function startWriterServer(options: {
       const rawLimit = Number(context.req.query("limit") || 50);
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 50;
       const messages = options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, beforeId, limit)
-        .filter(message => message.content.trim())
+        .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
         .map(message => ({
           ...conversationMessageForWeb(options.store, message),
-          content: stripDsmlText(message.content, "[tool call hidden]"),
+          content: stripDsmlText(message.content, "[工具调用已隐藏]"),
         })));
       const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
       const hasMore = Boolean(messages.length && firstArchiveId !== undefined && messages[0].id > firstArchiveId);

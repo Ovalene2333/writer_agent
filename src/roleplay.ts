@@ -1204,6 +1204,7 @@ export async function runRoleplayChat(options: {
         directorInput ? "director" : "dialogue",
       )
     : undefined;
+  if (currentUserMessageId) emit({ type: "source_message", messageId: currentUserMessageId, channel: "roleplay" });
   emit({ type: "step_start", step: 1 });
 
   const identitySource = options.identity?.kind === "normal" && options.identity.id

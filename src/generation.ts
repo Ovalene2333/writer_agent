@@ -121,7 +121,8 @@ export async function generateWriting(options: GenerateWritingOptions): Promise<
     ? effective.project.read(effective.path)
     : "";
   const characters = selectedCharacters(effective.store, effective.characterIds);
-  options.store.addMessage(options.sessionId, "user", options.instruction.trim());
+  const sourceMessageId = options.store.addMessage(options.sessionId, "user", options.instruction.trim());
+  await emit({ type: "source_message", messageId: sourceMessageId, channel: "agent" });
   try {
     if (!pending || !isDraftConfirmation(options.instruction)) {
       await emit({ type: "step_start", step: 1 });
@@ -345,6 +346,7 @@ export async function updateCharacterFromConversation(input: {
     : input.store.characters().find(item => item.id === input.characterId);
   if (input.characterId !== undefined && !existing) throw new Error("目标角色卡不存在");
   const userMessageId = input.store.addMessage(input.sessionId, "user", input.instruction.trim());
+  await emit({ type: "source_message", messageId: userMessageId, channel: "agent" });
   await emit({ type: "step_start", step: 1 });
   try {
     const draft = await generateCharacter({

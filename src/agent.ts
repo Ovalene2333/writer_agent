@@ -1792,6 +1792,7 @@ export async function runAgent(options: {
   // roleplay block is still the newest conversation segment.
   const roleplayHandoffContext = recentRoleplayHandoffContext(store, sessionId);
   const sourceMessageId = store.addMessage(sessionId, "user", prompt, "agent", options.variantGroupId);
+  emit({ type: "source_message", messageId: sourceMessageId, channel: "agent" });
   const archiveContext = `会话归档元数据（注入历史仅为预览；完整史用 inspect/read_conversation）：${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);

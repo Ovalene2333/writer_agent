@@ -340,6 +340,7 @@ type AgentTodoItem = {
 type AgentStreamEvent = {
   type: string;
   step?: number;
+  messageId?: number;
   text?: string;
   channel?: "output" | "reasoning";
   name?: string;
@@ -2522,6 +2523,10 @@ function App() {
   useEffect(() => {
     if (!state?.sessionId) return;
     setRoleplay(state.activeRoleplay);
+  }, [state?.sessionId, state?.activeRoleplay]);
+
+  useEffect(() => {
+    if (!state?.sessionId) return;
     setRoleplaySetup(null);
   }, [state?.sessionId]);
 
@@ -2944,6 +2949,9 @@ function App() {
   }, [workspaceMode]);
 
   function handleAgentEvent(event: AgentStreamEvent) {
+    if (event.type === "source_message" && typeof event.messageId === "number" && Number.isFinite(event.messageId)) {
+      updateStreamStepsAnchorId(event.messageId);
+    }
     if (event.type === "step_start") {
       updateStreamSteps((current) => {
         const id = event.step ?? current.length + 1;
@@ -3108,10 +3116,7 @@ function App() {
         // Intentionally keep streamSteps so the tool trail stays visible after completion.
         // Re-anchor to the persisted user message id (temp negative ids are replaced by refresh).
         const next = await refresh(sessionId);
-        const lastUser = [...next.messages]
-          .reverse()
-          .find((msg) => msg.role === "user" && msg.content.trim());
-        const anchorId = lastUser?.id ?? streamStepsAnchorIdRef.current;
+        const anchorId = streamStepsAnchorIdRef.current;
         updateStreamStepsAnchorId(anchorId);
         if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
           saveStepTrail(sessionId, anchorId, streamStepsRef.current);
@@ -3383,6 +3388,11 @@ function App() {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
       clearAgentStream();
+      await refresh(state.sessionId).catch(() => {
+        setState(current => current
+          ? { ...current, messages: current.messages.filter(message => message.id !== tempMessageId) }
+          : current);
+      });
     }
   }
 

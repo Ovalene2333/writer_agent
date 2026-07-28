@@ -5734,3 +5734,172 @@ a:focus-visible {
   }
 }
 .empty-state .empty-hint { font-size: 12px; }
+
+/* ── Product chat surface ───────────────── */
+.agent-panel { background: var(--surface2); }
+.agent-panel .conversation-region {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface) 70%, transparent), transparent 120px),
+    var(--surface2);
+}
+.agent-panel .conversation {
+  align-items: stretch;
+  gap: 14px;
+  padding: 18px clamp(12px, 3cqw, 22px) 22px;
+  background: transparent;
+}
+.conversation article.user,
+.conversation article.assistant,
+.conversation .agent-step,
+.agent-step-trail-total,
+.conversation .notice,
+.conversation .error,
+.conversation .empty-state {
+  width: min(100%, 820px);
+  box-sizing: border-box;
+}
+.conversation article.assistant {
+  align-self: flex-start;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  column-gap: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.conversation article.assistant::before {
+  content: "A";
+  grid-column: 1;
+  grid-row: 1 / span 3;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 8px;
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+}
+.conversation article.assistant.roleplay-msg::before { content: "R"; }
+.conversation article.assistant > * {
+  grid-column: 2;
+  min-width: 0;
+}
+.conversation article.user {
+  align-self: flex-end;
+  max-width: min(78%, 680px);
+  margin-left: auto;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 14px 14px 4px 14px;
+  background: color-mix(in srgb, var(--accent-light) 82%, var(--surface));
+  box-shadow: none;
+}
+.conversation article.user.roleplay-msg {
+  background: color-mix(in srgb, #4f8cff 9%, var(--surface));
+  border-color: color-mix(in srgb, #4f8cff 22%, var(--border));
+}
+.conversation .assistant .msg-label,
+.conversation .user .msg-label {
+  min-height: 24px;
+  margin: 0 0 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.conversation .assistant .msg-label::before { display: none; }
+.conversation .assistant .msg-label-toggle {
+  justify-content: flex-start;
+  width: max-content;
+  max-width: 100%;
+  padding: 0;
+}
+.conversation .assistant .msg-label-toggle:hover {
+  background: transparent;
+  color: var(--accent);
+}
+.conversation .assistant .markdown,
+.conversation .assistant .msg-preview {
+  padding: 12px 14px;
+  border: 1px solid var(--border-light);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+.conversation .assistant.collapsed .msg-preview { opacity: .82; }
+.conversation article.user > div:not(.msg-label):not(.message-actions),
+.conversation article.user .markdown {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.message-actions {
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity .14s ease, transform .14s ease;
+}
+.conversation article:hover .message-actions,
+.conversation article:focus-within .message-actions {
+  opacity: 1;
+  transform: none;
+}
+.message-actions button,
+.message-version-nav button { border-radius: 7px; }
+.conversation .agent-step,
+.agent-step-trail-total {
+  align-self: center;
+  margin-left: 0;
+}
+.conversation .agent-step {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 94%, var(--accent-light));
+}
+.agent-step-summary { min-height: 42px; }
+.agent-step-content { max-height: min(420px, 48vh); }
+.composer {
+  padding: 12px clamp(10px, 3cqw, 18px) 16px;
+  background:
+    linear-gradient(180deg, transparent, color-mix(in srgb, var(--surface) 80%, transparent) 18px),
+    var(--surface);
+}
+.composer-shell {
+  width: min(100%, 820px);
+  margin: 0 auto;
+  border-radius: 16px;
+  border-color: color-mix(in srgb, var(--border) 86%, var(--accent));
+  background: var(--surface);
+  box-shadow: 0 8px 28px -18px var(--agent-glow), var(--shadow-sm);
+}
+.composer-shell textarea,
+.composer textarea {
+  min-height: 74px;
+  height: 84px;
+  padding: 12px 13px 4px;
+  line-height: 1.5;
+}
+.composer-actions { padding: 7px 9px 9px; }
+.composer-actions .composer-send { border-radius: 9px; }
+
+@media (max-width: 900px) {
+  .conversation article.user { max-width: min(88%, 680px); }
+  .message-actions {
+    opacity: 1;
+    transform: none;
+  }
+  .composer-shell textarea,
+  .composer textarea {
+    min-height: 58px;
+    height: 64px;
+  }
+}
