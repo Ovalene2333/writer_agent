@@ -5926,3 +5926,105 @@ a:focus-visible {
   font-size: 13px;
   color: var(--text-muted, #889);
 }
+
+/* Context graph SVG canvas */
+.context-graph-canvas {
+  border: 1px solid var(--border, #3334);
+  border-radius: 12px;
+  overflow: auto;
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--text-muted, #889) 22%, transparent) 1px, transparent 0) 0 0 / 18px 18px;
+  min-height: 300px;
+}
+.context-graph-canvas.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted, #889);
+  font-size: 13px;
+  background: color-mix(in srgb, var(--panel, #111) 90%, transparent);
+}
+.context-graph-column-label {
+  fill: var(--text-muted, #889);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.context-graph-edge-line {
+  fill: none;
+  stroke: color-mix(in srgb, var(--text-muted, #889) 55%, transparent);
+  stroke-width: 1.5;
+}
+.context-graph-edge-line.active {
+  stroke: var(--accent, #6c8cff);
+  stroke-width: 2.2;
+}
+.context-graph-arrow {
+  fill: color-mix(in srgb, var(--text-muted, #889) 70%, transparent);
+}
+.context-graph-arrow.active {
+  fill: var(--accent, #6c8cff);
+}
+.context-graph-edge-label {
+  fill: var(--text-muted, #889);
+  font-size: 10px;
+  pointer-events: none;
+}
+.context-graph-edge-g.dim {
+  opacity: 0.18;
+}
+.context-graph-edge-g.active .context-graph-edge-label {
+  fill: var(--accent, #6c8cff);
+  font-weight: 600;
+}
+.context-graph-svg-card {
+  fill: color-mix(in srgb, var(--panel, #16181f) 92%, #fff 4%);
+  stroke: color-mix(in srgb, var(--border, #3334) 90%, transparent);
+  stroke-width: 1.2;
+}
+.context-graph-svg-node.selected .context-graph-svg-card {
+  stroke: var(--accent, #6c8cff);
+  stroke-width: 2.2;
+  fill: color-mix(in srgb, var(--accent, #6c8cff) 16%, var(--panel, #16181f));
+}
+.context-graph-svg-node.related .context-graph-svg-card {
+  stroke: color-mix(in srgb, var(--accent, #6c8cff) 70%, transparent);
+}
+.context-graph-svg-node.dim {
+  opacity: 0.28;
+}
+.context-graph-svg-node.status-archived .context-graph-svg-card {
+  stroke-dasharray: 4 3;
+  opacity: 0.85;
+}
+.context-graph-svg-node.kind-handoff .context-graph-svg-card {
+  fill: color-mix(in srgb, #3ecf8e 12%, var(--panel, #16181f));
+}
+.context-graph-svg-node.kind-epoch .context-graph-svg-card {
+  fill: color-mix(in srgb, #6c8cff 12%, var(--panel, #16181f));
+}
+.context-graph-svg-node.kind-message .context-graph-svg-card {
+  fill: color-mix(in srgb, #f0b429 10%, var(--panel, #16181f));
+}
+.context-graph-svg-node.kind-assemble_slice .context-graph-svg-card {
+  fill: color-mix(in srgb, #c084fc 10%, var(--panel, #16181f));
+}
+.context-graph-svg-kind {
+  fill: var(--text-muted, #889);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.context-graph-svg-label {
+  fill: var(--text, #e8e8ef);
+  font-size: 12px;
+  font-weight: 600;
+}
+.context-graph-svg-meta {
+  fill: var(--text-muted, #889);
+  font-size: 10px;
+}
+.context-graph-layout {
+  margin-top: 4px;
+}
