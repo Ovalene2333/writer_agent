@@ -793,6 +793,7 @@ export async function startWriterServer(options: {
       permissionMode: settings.permissionMode,
       writingMode: settings.writingMode,
       characterEvolutionEnabled: settings.characterEvolutionEnabled,
+      reviewFollowsProseModel: settings.reviewFollowsProseModel,
       scenePipeline: settings.scenePipeline,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
@@ -803,7 +804,7 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
+      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
@@ -812,6 +813,9 @@ export async function startWriterServer(options: {
       }
       if (body.continuityFactsEnabled !== undefined && typeof body.continuityFactsEnabled !== "boolean") {
         return context.json({ error: "continuityFactsEnabled 必须是布尔值" }, 400);
+      }
+      if (body.reviewFollowsProseModel !== undefined && typeof body.reviewFollowsProseModel !== "boolean") {
+        return context.json({ error: "reviewFollowsProseModel 必须是布尔值" }, 400);
       }
       if (body.writingMode !== undefined && !isWritingExecutionMode(body.writingMode)) {
         return context.json({ error: "writingMode 仅支持 delegated、fast" }, 400);
@@ -861,6 +865,7 @@ export async function startWriterServer(options: {
         ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
         ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
         ...(typeof body.continuityFactsEnabled === "boolean" ? { continuityFactsEnabled: body.continuityFactsEnabled } : {}),
+        ...(typeof body.reviewFollowsProseModel === "boolean" ? { reviewFollowsProseModel: body.reviewFollowsProseModel } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
       });
       return context.json({
@@ -868,6 +873,7 @@ export async function startWriterServer(options: {
         writingMode: settings.writingMode,
         characterEvolutionEnabled: settings.characterEvolutionEnabled,
         continuityFactsEnabled: settings.continuityFactsEnabled,
+        reviewFollowsProseModel: settings.reviewFollowsProseModel,
         scenePipeline: settings.scenePipeline,
       });
     } catch (error) {

@@ -47,6 +47,14 @@ export interface AgentRuntimeSettings {
   characterEvolutionEnabled: boolean;
   /** Extract accepted prose/lore facts and inject relevant facts into later Agent tasks. */
   continuityFactsEnabled: boolean;
+  /**
+   * 终审与候选评判跟随正文模型（默认开）。
+   *
+   * 判「这章像不像人写的」用的是语感，不是清单：一个比正文便宜的模型评自己写不出来的
+   * 文字，只会把标准降到它自己的水平，新增的 voice_homogenization / theme_stated /
+   * resolution_too_smooth 尤其吃这一点。关闭后回到「审阅校对」角色配置的模型。
+   */
+  reviewFollowsProseModel: boolean;
   scenePipeline: ScenePipelineSettings;
 }
 
@@ -106,6 +114,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   writingMode: "fast",
   characterEvolutionEnabled: true,
   continuityFactsEnabled: false,
+  reviewFollowsProseModel: true,
   scenePipeline: {
     enabled: false,
     preferredMinScenes: 3,
@@ -176,6 +185,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
         : DEFAULT_SETTINGS.writingMode,
       characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
       continuityFactsEnabled: raw.continuityFactsEnabled === true,
+      reviewFollowsProseModel: raw.reviewFollowsProseModel !== false,
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
     };
   } catch {
@@ -190,6 +200,7 @@ export function saveAgentSettings(
     writingMode?: WritingExecutionMode;
     characterEvolutionEnabled?: boolean;
     continuityFactsEnabled?: boolean;
+    reviewFollowsProseModel?: boolean;
     scenePipeline?: Partial<ScenePipelineSettings>;
   },
 ): AgentRuntimeSettings {
@@ -207,6 +218,9 @@ export function saveAgentSettings(
     continuityFactsEnabled: typeof patch.continuityFactsEnabled === "boolean"
       ? patch.continuityFactsEnabled
       : current.continuityFactsEnabled,
+    reviewFollowsProseModel: typeof patch.reviewFollowsProseModel === "boolean"
+      ? patch.reviewFollowsProseModel
+      : current.reviewFollowsProseModel,
     scenePipeline: patch.scenePipeline
       ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
       : current.scenePipeline,

@@ -47,6 +47,7 @@ import {
   sceneProseScoreBreakdown,
 } from "../prose_metrics.js";
 import { analyzeProseVividness, formatVividnessSummary, sceneVividnessFeedback } from "../prose_vividness.js";
+import { analyzeAiTells, formatAiTellSummary, sceneAiTellFeedback } from "../ai_tells.js";
 import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
 import {
   analyzeProseStyle,
@@ -317,6 +318,7 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
           priorChapterText: priorProseText(project, draft, context) || undefined,
         }),
         ...sceneVividnessFeedback(chapterSoFar),
+        ...sceneAiTellFeedback(chapterSoFar),
       ]
       : []),
   ];
@@ -541,6 +543,7 @@ async function acceptChapterScene(args: {
         priorChapterText: priorProseText(project, result.draft, context) || undefined,
       }),
       ...sceneVividnessFeedback(chapterSoFar),
+      ...sceneAiTellFeedback(chapterSoFar),
     ]
     : [];
   const sceneVividness = analyzeProseVividness(selectedContent).stats;
@@ -1038,6 +1041,8 @@ async function submitPassedChapterReview(
     styleWarnings: Array<{ code: string; message: string; examples: string[] }>;
     vividness: ReturnType<typeof analyzeProseVividness>;
     vividnessWarnings: Array<{ code: string; message: string; examples: string[] }>;
+    aiTells: ReturnType<typeof analyzeAiTells>;
+    aiTellWarnings: Array<{ code: string; message: string; examples: string[] }>;
     ledger: ReturnType<typeof chapterSceneLedger>;
     chapterReview: ChapterReviewResult;
   },
@@ -1045,7 +1050,7 @@ async function submitPassedChapterReview(
   const { input } = args;
   const {
     draft, proposalSummary, contentCharacters, metrics, styleWarnings,
-    vividness, vividnessWarnings, ledger, chapterReview,
+    vividness, vividnessWarnings, aiTells, aiTellWarnings, ledger, chapterReview,
   } = values;
   draft.inspectedVersion = draft.version;
   saveDraftCheckpoint(args, "review_passed", draft);
@@ -1096,6 +1101,8 @@ async function submitPassedChapterReview(
     ...(styleWarnings.length ? { styleWarnings } : {}),
     proseVividness: { summary: formatVividnessSummary(vividness.stats), stats: vividness.stats },
     ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
+    proseAiTells: { summary: formatAiTellSummary(aiTells.stats), stats: aiTells.stats },
+    ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
     ledger,
     chapterReview,
     ...(preparedCharacterChanges.warnings.length
@@ -1181,6 +1188,15 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     message: issue.message,
     examples: issue.examples.slice(0, 5),
   }));
+  // Same contract as vividness: measured, reported, never blocking. The only way
+  // an AI-tell turns into a revise loop is the reviewer model judging it a blocker
+  // (voice_homogenization / theme_stated / resolution_too_smooth).
+  const aiTells = analyzeAiTells(scenesText);
+  const aiTellWarnings = aiTells.issues.map(issue => ({
+    code: issue.code,
+    message: issue.message,
+    examples: issue.examples.slice(0, 5),
+  }));
   const ledger = chapterSceneLedger(draft);
   let reviewFailure: { attempts: number; errors: string[] } | undefined;
   if (context.chapterReviewer) {
@@ -1214,6 +1230,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             warnings: styleWarnings,
             vividness: vividness.stats,
             vividnessWarnings,
+            aiTells: aiTells.stats,
+            aiTellWarnings,
           },
         }, reviewer.signal);
         if (reviewed.usage) {
@@ -1252,6 +1270,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             ...(styleWarnings.length ? { styleWarnings } : {}),
             proseVividness: formatVividnessSummary(vividness.stats),
             ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
+            proseAiTells: formatAiTellSummary(aiTells.stats),
+            ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
             ledger,
             chapterReview: reviewed.review,
             targetScenes,
@@ -1266,6 +1286,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           styleWarnings,
           vividness,
           vividnessWarnings,
+          aiTells,
+          aiTellWarnings,
           ledger,
           chapterReview: reviewed.review,
         });
@@ -1296,6 +1318,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     ...(styleWarnings.length ? { styleWarnings } : {}),
     proseVividness: formatVividnessSummary(vividness.stats),
     ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
+    proseAiTells: formatAiTellSummary(aiTells.stats),
+    ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
     ledger,
     ...(reviewFailure ? { factReviewContext: buildFactualChapterReviewContext({
       project,
@@ -1317,6 +1341,9 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
       "有没有换掉人名地点仍能套进多数故事的句子；现场是否只被叙述者报告、没有被人物看见听见摸到",
+      "遮住说话人后台词能否互换：每个人物是否有各自的句长、书面程度、回避方式与说话目的",
+      "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
+      "冲突是否靠互相理解化解、代价被抹平、阻力恰好让路；有没有人付出了不可撤销的代价",
     ],
     message: "隔离终审不可用，已回退到主 Agent 通读：content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
       + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",

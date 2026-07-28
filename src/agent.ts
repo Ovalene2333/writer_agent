@@ -1823,6 +1823,13 @@ export async function runAgent(options: {
     ?? options.models?.summarizer
     ?? options.models?.reviewer
     ?? model;
+  // 终审与候选评判默认跟正文走同一个模型：判「这章像不像人写的」靠的是语感，
+  // 一个比正文便宜的模型评自己写不出来的文字，只会把标准降到它自己的水平。
+  // 「审阅校对」角色仍在，作为显式覆盖 —— 关掉 reviewFollowsProseModel 即回到它。
+  const proseModel = options.models?.writer ?? executionModel;
+  const reviewModel = runtimeSettings.reviewFollowsProseModel
+    ? proseModel
+    : options.models?.reviewer ?? executionModel;
   const chapterReviewContext = [
     projectInstructionsPrompt(project),
     structuredCreativeContext(store, task, characterScope, simpleCharacterScope),
@@ -1888,13 +1895,9 @@ export async function runAgent(options: {
         : {}),
       signal,
     },
-    // Prefer the configured cheap reviewer for the isolated full-chapter read;
-    // retain the writing model as a quality/compatibility fallback.
     chapterReviewer: {
-      model: options.models?.reviewer ?? executionModel,
-      ...(options.models?.reviewer && options.models.reviewer !== executionModel
-        ? { fallbackModel: executionModel }
-        : {}),
+      model: reviewModel,
+      ...(reviewModel !== executionModel ? { fallbackModel: executionModel } : {}),
       signal,
       context: chapterReviewContext,
     },
@@ -1918,7 +1921,7 @@ export async function runAgent(options: {
       ? {
           sceneCandidates: {
             model,
-            judgeModel: options.models?.reviewer ?? options.models?.inline ?? model,
+            judgeModel: reviewModel,
             signal,
           },
         }

@@ -213,6 +213,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       writingMode: "fast",
       characterEvolutionEnabled: true,
       continuityFactsEnabled: false,
+      reviewFollowsProseModel: true,
       scenePipeline: {
         enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
@@ -235,12 +236,21 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       writingMode: "fast",
       characterEvolutionEnabled: false,
       continuityFactsEnabled: true,
+      reviewFollowsProseModel: true,
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 2,
       },
     });
+    // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
+    saveAgentSettings(project, { reviewFollowsProseModel: false });
+    assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false);
+    assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "review toggle must preserve continuity toggle");
+    saveAgentSettings(project, { scenePipeline: { enabled: false } });
+    assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false, "scene patch must preserve review toggle");
+    saveAgentSettings(project, { reviewFollowsProseModel: true });
+    assert.equal(loadAgentSettings(project).reviewFollowsProseModel, true);
     // Best-of-N switch: persisted, clamped to 1—3 (2 by default).
     saveAgentSettings(project, { scenePipeline: { candidateCount: 9 } });
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 3);

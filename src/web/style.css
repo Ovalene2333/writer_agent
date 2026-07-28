@@ -2617,6 +2617,45 @@ button.agent-orb:focus-visible {
   margin: 0 0 10px; font-size: var(--fs-meta); color: var(--text-dim); line-height: 1.5;
 }
 .review-drawer .proposal-actions { display: flex; gap: 6px; justify-content: flex-end; }
+/* Advisory quality report — accent for good, warn only when the rule layer is uneasy. */
+.proposal-quality {
+  margin: 0 0 10px; padding: 7px 8px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--surface2);
+  border-left: 2px solid var(--accent);
+}
+.proposal-quality.grade-fair { border-left-color: color-mix(in srgb, var(--warn) 50%, var(--accent)); }
+.proposal-quality.grade-weak { border-left-color: var(--warn); }
+.proposal-quality-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  font: 11px var(--font-mono); color: var(--text-dim);
+}
+.proposal-quality-grade {
+  padding: 1px 6px; border-radius: 999px; font-weight: 700;
+  background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+}
+.proposal-quality.grade-weak .proposal-quality-grade {
+  background: var(--warn-light); color: var(--warn);
+}
+.proposal-quality-chars { margin-left: auto; color: var(--text-faint); }
+.proposal-quality-toggle {
+  margin-top: 6px; padding: 0; border: 0; background: none; cursor: pointer;
+  font: 11px var(--font-mono); color: var(--text-faint);
+}
+.proposal-quality-toggle:hover { color: var(--accent); }
+.proposal-quality-warnings {
+  margin: 6px 0 0; padding: 0; list-style: none;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.proposal-quality-warnings li {
+  display: flex; flex-direction: column; gap: 2px;
+  font-size: var(--fs-meta); color: var(--text-dim); line-height: 1.45;
+}
+.proposal-quality-source {
+  align-self: flex-start; padding: 0 5px; border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent); font: 10px var(--font-mono);
+}
+.proposal-quality-examples { color: var(--text-faint); font: 11px var(--font-mono); overflow-wrap: anywhere; }
 .change-set-status {
   display: inline-block; margin-bottom: 8px; color: var(--text-faint); font: 11px var(--font-mono);
 }

@@ -278,6 +278,28 @@ export interface Proposal {
   createdAt: string;
   /** Applied only when the linked document proposal is accepted. */
   characterChanges: ProposalCharacterChange[];
+  /** Rule-layer writing-quality picture, attached to narrative proposals only. */
+  qualityReport?: ProseQualityReport;
+}
+
+/**
+ * Final writing-quality picture shown to the author before Accept.
+ * Built by `buildProseQualityReport` (src/final_quality.ts) from the three
+ * deterministic layers; advisory only — it never blocks a proposal.
+ */
+export interface ProseQualityReport {
+  characters: number;
+  /** 0–100, higher is better (现场感). */
+  vividness: { score: number; summary: string };
+  /** 0–100, higher is WORSE (AI 味). */
+  aiTells: { score: number; summary: string };
+  grade: "good" | "fair" | "weak";
+  warnings: Array<{
+    source: "metrics" | "vividness" | "ai_tells";
+    code: string;
+    message: string;
+    examples: string[];
+  }>;
 }
 
 export interface ProposalCharacterChange {

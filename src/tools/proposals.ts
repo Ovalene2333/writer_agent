@@ -21,6 +21,7 @@ import {
 import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
 import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
+import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
 import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
@@ -517,17 +518,23 @@ export async function submitFullDocumentProposal(
     if (blocked) return blocked;
   }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
+  // Single funnel for every narrative proposal (场景管线与直接文档两条路都走这里), so the
+  // author sees the same quality picture in the review dock no matter how it was written.
+  // Advisory: the report never blocks — everything that blocks已在上面 gate 掉了。
+  const qualityReport = isScenePipelineDocument(path) ? buildProseQualityReport(meta.content) : undefined;
   const proposal = store.createProposal(
     sessionId,
     path,
     meta.content,
     summary,
     preparedCharacterChanges.changes,
+    qualityReport,
   );
   emit({ type: "proposal", proposal });
   return JSON.stringify({
     ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
     submissionKind: existed ? "new_version" : "new_document",
+    ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),

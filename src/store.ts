@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange, ProseQualityReport,
   RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
 } from "./types.js";
@@ -80,6 +80,30 @@ function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[
     ));
   } catch {
     return [];
+  }
+}
+
+/**
+ * Advisory data only — a proposal written before the column existed, or one whose
+ * report shape has since changed, simply shows no quality card in the review dock.
+ * Never throw here: a bad blob must not make the proposal unreadable.
+ */
+function parseProposalQualityReport(value: unknown): ProseQualityReport | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const report = parsed as Partial<ProseQualityReport>;
+    if (typeof report.grade !== "string" || !report.vividness || !report.aiTells) return undefined;
+    return {
+      characters: Number(report.characters) || 0,
+      vividness: report.vividness,
+      aiTells: report.aiTells,
+      grade: report.grade as ProseQualityReport["grade"],
+      warnings: Array.isArray(report.warnings) ? report.warnings : [],
+    };
+  } catch {
+    return undefined;
   }
 }
 
@@ -163,6 +187,7 @@ export class WriterStore {
         after_content TEXT NOT NULL,
         base_hash TEXT NOT NULL,
         character_changes_json TEXT NOT NULL DEFAULT '[]',
+        quality_report_json TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'pending',
         created_at TEXT NOT NULL
       );
@@ -416,6 +441,9 @@ export class WriterStore {
     const proposalColumns = this.database.prepare("PRAGMA table_info(proposals)").all() as Row[];
     if (!proposalColumns.some(column => column.name === "character_changes_json")) {
       this.database.exec("ALTER TABLE proposals ADD COLUMN character_changes_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!proposalColumns.some(column => column.name === "quality_report_json")) {
+      this.database.exec("ALTER TABLE proposals ADD COLUMN quality_report_json TEXT NOT NULL DEFAULT ''");
     }
     const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as Row[];
     if (!sessionColumns.some(column => column.name === "auto_title_done")) {
@@ -2199,15 +2227,22 @@ export class WriterStore {
     else this.project.removeTextFile(path);
   }
 
-  createProposal(sessionId: string, path: string, content: string, summary: string, characterChanges: ProposalCharacterChange[] = []): Proposal {
+  createProposal(
+    sessionId: string,
+    path: string,
+    content: string,
+    summary: string,
+    characterChanges: ProposalCharacterChange[] = [],
+    qualityReport?: ProseQualityReport,
+  ): Proposal {
     const exists = this.project.documentExists(path);
     const before = exists ? this.project.read(path) : "";
     this.evolveCharactersForProposal(characterChanges);
     const now = new Date().toISOString();
     const result = this.database.prepare(`
-      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,status,created_at)
-      VALUES(?,?,?,?,?,?,?,'pending',?)
-    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), now);
+      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
+      VALUES(?,?,?,?,?,?,?,?,'pending',?)
+    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
     return this.proposal(Number(result.lastInsertRowid));
   }
 
@@ -2247,6 +2282,7 @@ export class WriterStore {
   }
 
   private proposalFromRow(row: Row): Proposal {
+    const qualityReport = parseProposalQualityReport(row.quality_report_json);
     return {
       id: row.id as number,
       sessionId: row.session_id as string,
@@ -2258,6 +2294,7 @@ export class WriterStore {
       status: row.status as Proposal["status"],
       createdAt: row.created_at as string,
       characterChanges: parseProposalCharacterChanges(row.character_changes_json),
+      ...(qualityReport ? { qualityReport } : {}),
     };
   }
 

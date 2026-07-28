@@ -76,7 +76,13 @@ test("isolated chapter review carries the full draft once and returns bounded st
     sceneId: "arrival", title: "进入", plannedTurn: "门禁变红", plannedOutcome: "主角违规进入",
     actualState: { situation: ["主角违规进入"] },
   }];
-  const proseSignals = { stats: { numericTokenDensityPer10k: 112 }, warnings: [] };
+  const proseSignals = {
+    stats: { numericTokenDensityPer10k: 112 },
+    warnings: [],
+    // 规则层测得的 AI 味，只作参考不作判据；它进 user 消息，不进缓存前缀。
+    aiTells: { score: 62.5, thematicUpliftCount: 2, idiomPer10k: 44 },
+    aiTellWarnings: [{ code: "thematic_uplift", message: "收尾自己点破主题", examples: ["从此以后"] }],
+  };
   const messages = buildChapterReviewMessages({
     chapterGoal: "关系改变", content, scenes, context: "稳定项目约束", proseSignals,
   });
@@ -84,6 +90,9 @@ test("isolated chapter review carries the full draft once and returns bounded st
   assert.equal(messages[1].content, "稳定项目约束");
   assert.match(messages[0].content, /客观事实不自动等于角色知识/u);
   assert.match(messages[0].content, /亲历\/目击、被可信来源告知/u);
+  assert.match(messages[0].content, /voice_homogenization/u);
+  assert.match(messages[0].content, /theme_stated/u);
+  assert.match(messages[0].content, /resolution_too_smooth/u);
   assert.match(messages[2].content, /门禁灯由绿变红/u);
   assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 

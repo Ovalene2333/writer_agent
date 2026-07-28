@@ -46,7 +46,7 @@ const ROLES: Array<{ id: Exclude<ModelRole, "drafter">; name: string; detail: st
   { id: "roleplay", name: "角色扮演", detail: "角色试演、对话者设定与沉浸式对白" },
   { id: "inline", name: "行内生成", detail: "短文本补全与局部快速修改" },
   { id: "writer", name: "正文写作", detail: "续写、重写与长篇内容生成" },
-  { id: "reviewer", name: "审阅校对", detail: "质量检查、润色与修改建议" },
+  { id: "reviewer", name: "审阅校对", detail: "质量检查、润色与修改建议；关闭「终审跟随正文模型」后才用于整章终审" },
   { id: "summarizer", name: "上下文摘要", detail: "压缩历史内容以控制上下文长度" },
 ];
 
@@ -76,6 +76,7 @@ type ModelConfigProps = {
   writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
   continuityFactsEnabled: boolean;
+  reviewFollowsProseModel: boolean;
   section: SettingsSection;
   styleContent: React.ReactNode;
   proseGatesContent: React.ReactNode;
@@ -90,6 +91,7 @@ type ModelConfigProps = {
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
   onContinuityFactsChanged: (enabled: boolean) => void;
+  onReviewFollowsProseModelChanged: (enabled: boolean) => void;
 };
 
 export function ModelConfig({
@@ -98,6 +100,7 @@ export function ModelConfig({
   writingMode,
   characterEvolutionEnabled,
   continuityFactsEnabled,
+  reviewFollowsProseModel,
   section,
   styleContent,
   proseGatesContent,
@@ -112,11 +115,13 @@ export function ModelConfig({
   onScenePipelineChanged,
   onCharacterEvolutionChanged,
   onContinuityFactsChanged,
+  onReviewFollowsProseModelChanged,
 }: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [continuityFactsDraft, setContinuityFactsDraft] = useState(continuityFactsEnabled);
+  const [reviewFollowsProseDraft, setReviewFollowsProseDraft] = useState(reviewFollowsProseModel);
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -130,10 +135,12 @@ export function ModelConfig({
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
   useEffect(() => setContinuityFactsDraft(continuityFactsEnabled), [continuityFactsEnabled]);
+  useEffect(() => setReviewFollowsProseDraft(reviewFollowsProseModel), [reviewFollowsProseModel]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
     || continuityFactsDraft !== continuityFactsEnabled
+    || reviewFollowsProseDraft !== reviewFollowsProseModel
     || Object.keys(sceneDraft).some(key => sceneDraft[key as keyof ScenePipelineSettings] !== scenePipeline[key as keyof ScenePipelineSettings]);
   const sceneDraftValid = [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
@@ -310,14 +317,17 @@ export function ModelConfig({
           scenePipeline: sceneDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
           continuityFactsEnabled: continuityFactsDraft,
+          reviewFollowsProseModel: reviewFollowsProseDraft,
         }),
-      }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean; continuityFactsEnabled: boolean };
+      }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean; continuityFactsEnabled: boolean; reviewFollowsProseModel: boolean };
       setSceneDraft(result.scenePipeline);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
       setContinuityFactsDraft(result.continuityFactsEnabled);
+      setReviewFollowsProseDraft(result.reviewFollowsProseModel);
       onScenePipelineChanged(result.scenePipeline);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
       onContinuityFactsChanged(result.continuityFactsEnabled);
+      onReviewFollowsProseModelChanged(result.reviewFollowsProseModel);
       setMessage("写作设置已保存，将从下一次 Agent 任务开始生效");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -330,6 +340,7 @@ export function ModelConfig({
     setSceneDraft(scenePipeline);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
     setContinuityFactsDraft(continuityFactsEnabled);
+    setReviewFollowsProseDraft(reviewFollowsProseModel);
     setError("");
     setMessage("");
   }
@@ -469,6 +480,10 @@ export function ModelConfig({
           <label className="writing-setting-row">
             <input type="checkbox" checked={continuityFactsDraft} onChange={event => setContinuityFactsDraft(event.target.checked)}/>
             <span><strong>连续性事实</strong><small>接受正文或设定后调用摘要模型提取事实，并在后续相关任务中注入。关闭时不增加审批等待、模型调用或写作上下文。</small></span>
+          </label>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={reviewFollowsProseDraft} onChange={event => setReviewFollowsProseDraft(event.target.checked)}/>
+            <span><strong>终审跟随正文模型</strong><small>整章终审与候选评判使用「正文写作」的模型。判「像不像人写的」靠语感，用更便宜的模型评它自己写不出来的文字，只会把标准降到它的水平。关闭后改用「审阅校对」角色的模型。</small></span>
           </label>
         </section>
 

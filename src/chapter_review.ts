@@ -16,7 +16,8 @@ export type ChapterReviewIssue = {
   severity: "blocker" | "warning";
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
     | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "identity_relationship"
-    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo" | "generic_prose";
+    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo" | "generic_prose"
+    | "voice_homogenization" | "theme_stated" | "resolution_too_smooth";
   sceneId?: string;
   evidence: string[];
   problem: string;
@@ -69,8 +70,15 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。事实正确性与人
 - expository_mechanics：动作已经成立后，叙述又展开原理、计算或教程式过程，挤压人物反应与环境后果；
 - semantic_echo：相邻句段换一种说法重复同一动作、判断或结论，没有新增事实。
 - generic_prose：句子换掉人名、地点后仍能原样放进多数别的故事——用「气氛/仿佛/某种/一切」这类泛化标签代替此时此地才成立的物件、动作或后果；现场只被叙述者报告，没有被人物看见、听见、摸到。这是唯一一类"写得没错但没有画面"的问题，其余检查都发现不了它，请主动找。
+
+最后检查三类"生成腔"。它们不违反任何事实、结构或句式规则，前面的检查全都发现不了，必须单独找：
+- voice_homogenization：把说话人的名字和提示语遮住后，台词还能在人物之间互换——所有人用同样的句长、同样的书面程度、同样的方式起头和收束，没有各自的回避方式、口头禅或说话目的。只要有两个人物在同一场里说话且无法区分，就至少记 warning。
+- theme_stated：叙述者或人物把本章的主题、教训或人物成长直接说出口，替读者完成判断。章尾与场尾尤其要查：「他终于明白……」「从此以后……」「一切都不一样了」「这一刻他懂得了……」，以及人物在对白里总结自己的转变。让意义由后果承担，而不是由句子宣告。
+- resolution_too_smooth：冲突靠互相理解或坦白化解，代价被抹平；阻力恰好在需要时让路；反对者在没有新证据或新压力的情况下改变立场；每个细节都恰好服务主线，没有任何东西是白费的。判定看的是"有没有人付出了不可撤销的代价"，不是"结局是否圆满"——刻意的圆满结局本身不判错。
+
+以上三类的判定尺度与前面一致：零星命中列 warning；只有当整章都成立（例如全章对白无一处可区分、章尾整段都在宣告主题、核心冲突完全无代价地消解）才判 blocker。proseSignals.aiTells 是规则层测得的参考数字（AI 味分越高越可疑），只用来提示往哪里看，不能作为判据；判 blocker 仍须逐字引用正文证据。
 单个准确数字、确实触发选择的测量、角色偶尔使用技术语言均可保留，不得仅因出现术语或数字判错。只有同类堆砌在一个场景内反复出现并明显遮蔽行动、关系或留白时，才把对应场景判 blocker；轻微问题列 warning。generic_prose 仅在整场都停留在泛化叙述、读者无法看见任何具体现场时才判 blocker；零星抽象句列 warning。句式符号已由独立门禁处理，不做全文润色。evidence 必须逐字引用短句。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
+字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|theme_stated|resolution_too_smooth、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -120,6 +128,7 @@ export function parseChapterReview(
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
     "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship",
     "telemetry_pileup", "expository_mechanics", "semantic_echo", "generic_prose",
+    "voice_homogenization", "theme_stated", "resolution_too_smooth",
   ]);
   const rows = Array.isArray(value.issues) ? value.issues.slice(0, 8) : [];
   const issues: ChapterReviewIssue[] = [];

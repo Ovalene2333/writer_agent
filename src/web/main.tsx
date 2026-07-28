@@ -73,6 +73,17 @@ import {
 import { ModelConfig, type ProviderCatalog, type ScenePipelineSettings, type SettingsSection, type WritingExecutionMode } from "./model_config";
 import "./style.css";
 
+/** Rule-layer writing-quality picture. Absent on非正文提案与旧提案 —— 渲染时必须容忍。 */
+type ProseQualityReport = {
+  characters: number;
+  /** 越高越好。 */
+  vividness: { score: number; summary: string };
+  /** 越高越可疑（AI 味）。 */
+  aiTells: { score: number; summary: string };
+  grade: "good" | "fair" | "weak";
+  warnings: Array<{ source: "metrics" | "vividness" | "ai_tells"; code: string; message: string; examples: string[] }>;
+};
+
 type Proposal = {
   id: number;
   path: string;
@@ -80,7 +91,62 @@ type Proposal = {
   beforeContent: string;
   afterContent: string;
   status: "pending" | "accepted" | "rejected" | "stale";
+  qualityReport?: ProseQualityReport;
 };
+
+const QUALITY_GRADE_LABEL: Record<ProseQualityReport["grade"], string> = {
+  good: "良好",
+  fair: "尚可",
+  weak: "偏弱",
+};
+
+const QUALITY_SOURCE_LABEL: Record<ProseQualityReport["warnings"][number]["source"], string> = {
+  metrics: "节奏",
+  vividness: "现场感",
+  ai_tells: "AI 味",
+};
+
+/**
+ * Advisory card: everything blocking已在提案创建前拦掉，这里只是让作者在按 Accept
+ * 之前看到这一章的质量画像。默认折叠明细，避免把审阅 dock 撑开。
+ */
+function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={`proposal-quality grade-${report.grade}`}>
+      <div className="proposal-quality-head">
+        <span className="proposal-quality-grade">{QUALITY_GRADE_LABEL[report.grade]}</span>
+        <span className="proposal-quality-metric" title={report.vividness.summary}>
+          现场感 {report.vividness.score}
+        </span>
+        <span className="proposal-quality-metric" title={report.aiTells.summary}>
+          AI 味 {report.aiTells.score}
+        </span>
+        <span className="proposal-quality-chars">{report.characters} 字</span>
+      </div>
+      {report.warnings.length > 0 && (
+        <>
+          <button type="button" className="proposal-quality-toggle" onClick={() => setOpen(value => !value)} aria-expanded={open}>
+            {open ? "收起" : `${report.warnings.length} 条提示`}
+          </button>
+          {open && (
+            <ul className="proposal-quality-warnings">
+              {report.warnings.map((warning, index) => (
+                <li key={`${warning.source}-${warning.code}-${index}`}>
+                  <span className="proposal-quality-source">{QUALITY_SOURCE_LABEL[warning.source] ?? warning.source}</span>
+                  <span className="proposal-quality-message">{warning.message}</span>
+                  {warning.examples.length > 0 && (
+                    <span className="proposal-quality-examples">{warning.examples.join(" / ")}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
 
 function mergeProposalEvent(current: Proposal[], incoming: Proposal): Proposal[] {
   const existing = current.find(item => item.id === incoming.id);
@@ -477,7 +543,7 @@ type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; continuityFactsEnabled?: boolean; scenePipeline: ScenePipelineSettings };
+  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline: ScenePipelineSettings };
   proseGateRules?: ProseGateRule[];
   continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;
@@ -1327,6 +1393,7 @@ function ReviewDock({
                 <div className="proposal-card" key={p.id}>
                   <h3>{p.path}</h3>
                   <p>{p.summary}</p>
+                  {p.qualityReport && <ProposalQualityCard report={p.qualityReport} />}
                   <div className="proposal-actions">
                     <button onClick={() => onProposalDecide(p, "reject")}>Reject</button>
                     <button className="primary" onClick={() => onProposalDecide(p, "accept")}>Accept</button>
@@ -2226,17 +2293,31 @@ function App() {
   const streamOutputRef = useRef("");
   const streamStepsRef = useRef<StreamStep[]>([]);
   const streamStepsAnchorIdRef = useRef<number | null>(null);
+  const streamStepsRafRef = useRef<number | null>(null);
+  const refreshSeqRef = useRef(0);
   const sessionIdRef = useRef<string | undefined>(undefined);
   const todosCompletionRef = useRef({ sessionId: "", complete: false });
   const activePathRef = useRef(activePath);
   const editingDocumentRef = useRef(editingDocument);
   activePathRef.current = activePath;
   editingDocumentRef.current = editingDocument;
+  /** Apply step updates immediately to the ref; coalesce React renders to one per frame. */
   const updateStreamSteps = useCallback((update: React.SetStateAction<StreamStep[]>) => {
     const current = streamStepsRef.current;
     const next = typeof update === "function" ? update(current) : update;
     streamStepsRef.current = next;
-    setStreamSteps(next);
+    if (streamStepsRafRef.current != null) return;
+    streamStepsRafRef.current = window.requestAnimationFrame(() => {
+      streamStepsRafRef.current = null;
+      setStreamSteps(streamStepsRef.current);
+    });
+  }, []);
+  const flushStreamStepsNow = useCallback(() => {
+    if (streamStepsRafRef.current != null) {
+      window.cancelAnimationFrame(streamStepsRafRef.current);
+      streamStepsRafRef.current = null;
+    }
+    setStreamSteps(streamStepsRef.current);
   }, []);
   const updateStreamStepsAnchorId = useCallback((messageId: number | null) => {
     streamStepsAnchorIdRef.current = messageId;
@@ -2347,21 +2428,109 @@ function App() {
     if (options?.clearStorage) {
       clearStepTrail(options.sessionId ?? sessionIdRef.current ?? "");
     }
-    updateStreamSteps([]);
+    if (streamStepsRafRef.current != null) {
+      window.cancelAnimationFrame(streamStepsRafRef.current);
+      streamStepsRafRef.current = null;
+    }
+    streamStepsRef.current = [];
+    setStreamSteps([]);
     updateStreamStepsAnchorId(null);
     streamOutputRef.current = "";
+  }, [updateStreamStepsAnchorId]);
+
+  /**
+   * Merge a server conversation page with local UI state.
+   * - Keep paginated older messages that the latest page no longer includes.
+   * - Keep optimistic (negative-id) bubbles while a job is live so a mid-run
+   *   workspace refresh cannot blank the chat after re-run/edit rewind.
+   * - Prefer server rows for positive ids (variant metadata, perception, etc.).
+   */
+  const mergeConversationMessages = useCallback((local: Message[], remote: Message[], liveJob: boolean): Message[] => {
+    const optimistic = local.filter((message) => message.id < 0);
+    if (remote.length === 0) {
+      // Re-run/edit deletes the turn before the new user row is written; a refresh
+      // in that window must not wipe the optimistic bubble (and leave the pane empty).
+      if (liveJob && local.length > 0) return local;
+      // Intentional empty server page (e.g. edit-rewind of the first turn).
+      return optimistic.length && liveJob ? optimistic : remote;
+    }
+    const remoteById = new Map(remote.map((message) => [message.id, message]));
+    const remoteMinPositive = remote.reduce((min, message) => (
+      message.id > 0 && message.id < min ? message.id : min
+    ), Number.POSITIVE_INFINITY);
+    const olderLocal = local.filter((message) => (
+      message.id > 0
+      && !remoteById.has(message.id)
+      && message.id < remoteMinPositive
+    ));
+    // Drop local positive ids that are missing from the remote page but are not
+    // older-than-page history — they were deleted by rewind/re-run.
+    const merged = [...olderLocal, ...remote];
+    if (!liveJob || !optimistic.length) return merged;
+    const remoteHasSameTurn = (candidate: Message) => remote.some((message) => (
+      message.role === candidate.role
+      && message.channel === candidate.channel
+      && message.content === candidate.content
+    ));
+    for (const message of optimistic) {
+      if (!remoteHasSameTurn(message)) merged.push(message);
+    }
+    return merged;
   }, []);
+
+  const reconcileStreamStepsAnchor = useCallback((messages: Message[]) => {
+    if (!streamStepsRef.current.length) return;
+    const anchor = streamStepsAnchorIdRef.current;
+    if (anchor != null && anchor > 0 && messages.some((message) => message.id === anchor)) return;
+    const lastUser = [...messages].reverse().find((message) => (
+      message.role === "user" && message.id > 0 && message.content.trim()
+    ));
+    if (lastUser) updateStreamStepsAnchorId(lastUser.id);
+  }, [updateStreamStepsAnchorId]);
 
   const refresh = useCallback(
     async (targetSession?: string) => {
+      const seq = ++refreshSeqRef.current;
+      const requestedSession = targetSession ?? sessionIdRef.current;
       const next = await api<State>(
         `/api/state${targetSession ? `?session=${encodeURIComponent(targetSession)}` : ""}`,
       );
-      setState(next);
-      if (!activePath && next.documents[0]) setActivePath(next.documents[0]);
+      // Drop stale responses so an older in-flight refresh (e.g. snapshot taken in the
+      // re-run rewind gap) cannot overwrite a newer complete conversation.
+      if (seq !== refreshSeqRef.current) return next;
+      if (requestedSession && next.sessionId !== requestedSession && sessionIdRef.current === requestedSession) {
+        return next;
+      }
+      let appliedMessages = next.messages;
+      setState((current) => {
+        if (seq !== refreshSeqRef.current) return current ?? next;
+        if (!current || current.sessionId !== next.sessionId) {
+          appliedMessages = next.messages;
+          return next;
+        }
+        const liveJob = Boolean(currentJobRef.current)
+          || Boolean(next.activeJobs?.some((job) => job.sessionId === next.sessionId));
+        const messages = mergeConversationMessages(current.messages, next.messages, liveJob);
+        appliedMessages = messages;
+        // If we already paged in older history, keep hasMore consistent with the merge.
+        const messagesHasMore = next.messagesHasMore
+          || messages.some((message) => message.id > 0 && !next.messages.some((remote) => remote.id === message.id));
+        const fromServer = next.activeJobs ?? [];
+        const activeJobs = liveJob && currentJobRef.current && !fromServer.some((job) => job.id === currentJobRef.current)
+          ? (() => {
+              const localJob = (current.activeJobs ?? []).find((job) => job.id === currentJobRef.current);
+              return localJob
+                ? [...fromServer.filter((job) => job.sessionId !== localJob.sessionId), localJob]
+                : fromServer;
+            })()
+          : next.activeJobs;
+        return { ...next, messages, messagesHasMore, activeJobs };
+      });
+      if (seq === refreshSeqRef.current) reconcileStreamStepsAnchor(appliedMessages);
+      if (!activePathRef.current && next.documents[0]) setActivePath(next.documents[0]);
       return next;
     },
-    [activePath],
+    [mergeConversationMessages, reconcileStreamStepsAnchor],
   );
 
   const loadOlderMessages = useCallback(async () => {
@@ -2494,12 +2663,19 @@ function App() {
       setBusy(false);
       streamOutputRef.current = "";
       setCollapsedAssistantIds(new Set());
+      if (streamStepsRafRef.current != null) {
+        window.cancelAnimationFrame(streamStepsRafRef.current);
+        streamStepsRafRef.current = null;
+      }
       const trail = loadStepTrail(nextId);
       if (trail) {
-        updateStreamSteps(restoreTrailSteps(trail));
+        const restored = restoreTrailSteps(trail);
+        streamStepsRef.current = restored;
+        setStreamSteps(restored);
         updateStreamStepsAnchorId(trail.messageId);
       } else {
-        updateStreamSteps([]);
+        streamStepsRef.current = [];
+        setStreamSteps([]);
         updateStreamStepsAnchorId(null);
       }
       setNotice("");
@@ -2507,7 +2683,7 @@ function App() {
       setComposerBranch(null);
       setMessageVersionViews({});
     }
-  }, [state?.sessionId]);
+  }, [state?.sessionId, updateStreamStepsAnchorId]);
 
   useEffect(() => {
     if (!state?.sessionId) return;
@@ -3098,14 +3274,27 @@ function App() {
             terminalType = event.type;
           }
         }
+        // Push coalesced step UI after each SSE chunk so the trail does not lag a full frame behind.
+        if (streamStepsRafRef.current != null) flushStreamStepsNow();
         if (done) break;
       }
       if (terminal) {
         if (sessionIdRef.current !== sessionId) return;
+        flushStreamStepsNow();
         // Intentionally keep streamSteps so the tool trail stays visible after completion.
         // Re-anchor to the persisted user message id (temp negative ids are replaced by refresh).
         const next = await refresh(sessionId);
-        const anchorId = streamStepsAnchorIdRef.current;
+        const messages = next.messages;
+        let anchorId = streamStepsAnchorIdRef.current;
+        if (
+          streamStepsRef.current.length
+          && (anchorId == null || anchorId <= 0 || !messages.some((message) => message.id === anchorId))
+        ) {
+          const lastUser = [...messages].reverse().find((message) => (
+            message.role === "user" && message.id > 0 && message.content.trim()
+          ));
+          if (lastUser) anchorId = lastUser.id;
+        }
         updateStreamStepsAnchorId(anchorId);
         if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
           saveStepTrail(sessionId, anchorId, streamStepsRef.current);
@@ -3152,28 +3341,55 @@ function App() {
     }
   }
 
+  const activeJobId = state?.activeJobs?.find((job) => job.sessionId === state.sessionId)?.id;
   useEffect(() => {
     const currentSessionId = state?.sessionId;
-    const job = state?.activeJobs?.find(item => item.sessionId === currentSessionId);
-    if (!job || currentJobRef.current === job.id) return;
-    updateStreamSteps([]);
-    streamOutputRef.current = "";
-    const lastUser = [...(state?.messages ?? [])]
-      .reverse()
-      .find((msg) => msg.role === "user" && msg.content.trim());
-    updateStreamStepsAnchorId(lastUser?.id ?? null);
-    void subscribeAgentJob(job.id, job.sessionId);
-  }, [state?.sessionId, state?.activeJobs]);
+    if (!currentSessionId || !activeJobId) return;
+    if (currentJobRef.current === activeJobId) return;
+    const switchingJob = Boolean(currentJobRef.current && currentJobRef.current !== activeJobId);
+    // Only clear the trail when attaching to a different job. Re-subscribe after a
+    // workspace refresh must keep in-memory steps so the pane does not flash empty.
+    if (switchingJob) {
+      if (streamStepsRafRef.current != null) {
+        window.cancelAnimationFrame(streamStepsRafRef.current);
+        streamStepsRafRef.current = null;
+      }
+      streamStepsRef.current = [];
+      setStreamSteps([]);
+      streamOutputRef.current = "";
+      const lastUser = [...(state?.messages ?? [])]
+        .reverse()
+        .find((msg) => msg.role === "user" && msg.content.trim());
+      updateStreamStepsAnchorId(lastUser?.id ?? null);
+    } else if (streamStepsAnchorIdRef.current == null) {
+      const lastUser = [...(state?.messages ?? [])]
+        .reverse()
+        .find((msg) => msg.role === "user" && msg.content.trim());
+      updateStreamStepsAnchorId(lastUser?.id ?? null);
+    }
+    void subscribeAgentJob(activeJobId, currentSessionId);
+  }, [state?.sessionId, activeJobId]);
 
   useEffect(() => {
-    if (!state?.activeJobs?.length) return;
+    if (!activeJobId) return;
     const timer = window.setInterval(() => {
       void api<{ activeJobs: AgentJob[] }>("/api/chat/jobs")
-        .then(result => setState(current => current ? { ...current, activeJobs: result.activeJobs } : current))
+        .then((result) => setState((current) => {
+          if (!current) return current;
+          const nextJobs = result.activeJobs;
+          const prev = current.activeJobs ?? [];
+          if (
+            prev.length === nextJobs.length
+            && prev.every((job, index) => job.id === nextJobs[index]?.id && job.status === nextJobs[index]?.status)
+          ) {
+            return current;
+          }
+          return { ...current, activeJobs: nextJobs };
+        }))
         .catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(timer);
-  }, [Boolean(state?.activeJobs?.length)]);
+  }, [activeJobId]);
 
   function roleplayRequestControls(controls?: RoleplayRerunControls): RoleplayRerunControls {
     return {
@@ -3306,7 +3522,12 @@ function App() {
     setNotice("");
     // New turn replaces the previous trail for this session.
     clearStepTrail(state.sessionId);
-    updateStreamSteps([]);
+    if (streamStepsRafRef.current != null) {
+      window.cancelAnimationFrame(streamStepsRafRef.current);
+      streamStepsRafRef.current = null;
+    }
+    streamStepsRef.current = [];
+    setStreamSteps([]);
     updateStreamStepsAnchorId(tempMessageId);
     streamOutputRef.current = "";
     setState((value) =>
@@ -4180,7 +4401,12 @@ function App() {
     setError("");
     setNotice("");
     clearStepTrail(state.sessionId);
-    updateStreamSteps([]);
+    if (streamStepsRafRef.current != null) {
+      window.cancelAnimationFrame(streamStepsRafRef.current);
+      streamStepsRafRef.current = null;
+    }
+    streamStepsRef.current = [];
+    setStreamSteps([]);
     // No user bubble for an opening; anchor the live stream to a temp id so it renders via the orphan path.
     updateStreamStepsAnchorId(-Date.now());
     streamOutputRef.current = "";
@@ -4230,7 +4456,12 @@ function App() {
     setError("");
     setNotice("");
     clearStepTrail(state.sessionId);
-    updateStreamSteps([]);
+    if (streamStepsRafRef.current != null) {
+      window.cancelAnimationFrame(streamStepsRafRef.current);
+      streamStepsRafRef.current = null;
+    }
+    streamStepsRef.current = [];
+    setStreamSteps([]);
     updateStreamStepsAnchorId(tempMessageId);
     streamOutputRef.current = "";
     setState(current => current ? {
@@ -7434,6 +7665,7 @@ function App() {
         writingMode={state.agentSettings?.writingMode ?? "fast"}
         characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
         continuityFactsEnabled={state.agentSettings?.continuityFactsEnabled ?? false}
+        reviewFollowsProseModel={state.agentSettings?.reviewFollowsProseModel ?? true}
         section={settingsSection}
         onSectionChanged={setSettingsSection}
         connectionAvailable={connection.dualMode}
@@ -7558,6 +7790,7 @@ function App() {
             writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
             continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
             scenePipeline,
           },
         } : previous)}
@@ -7568,6 +7801,7 @@ function App() {
             writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled,
             continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           },
         } : previous)}
@@ -7578,6 +7812,18 @@ function App() {
             writingMode: previous.agentSettings?.writingMode ?? "fast",
             characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
             continuityFactsEnabled,
+            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          },
+        } : previous)}
+        onReviewFollowsProseModelChanged={reviewFollowsProseModel => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            writingMode: previous.agentSettings?.writingMode ?? "fast",
+            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+            reviewFollowsProseModel,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           },
         } : previous)}
