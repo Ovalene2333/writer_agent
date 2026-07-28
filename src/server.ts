@@ -55,7 +55,7 @@ import { documentKind, WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import type { AgentEvent, Message, PermissionMode, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
+import type { AgentEvent, Message, MessageStepTrail, PermissionMode, PersistedStreamStep, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StepUsage, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 import {
   loadProseGateRules,
@@ -117,8 +117,55 @@ type AgentJob = {
   listeners: Set<(event: StoredAgentEvent) => void>;
 };
 
+const STEP_TRAIL_TEXT_MAX = 12_000;
+const STEP_TRAIL_FLUSH_MS = 1_500;
+
+function compactStepTrailText(value: string): string {
+  if (value.length <= STEP_TRAIL_TEXT_MAX) return value;
+  const tailLength = 2_000;
+  const headLength = STEP_TRAIL_TEXT_MAX - tailLength;
+  return `${value.slice(0, headLength)}\n\n[内容过长，已截断]\n\n${value.slice(-tailLength)}`;
+}
+
+function mergePersistedStepUsage(current: StepUsage | undefined, next: StepUsage): StepUsage {
+  if (!current) return next;
+  const models = [...new Set([current.model, next.model].filter((value): value is string => Boolean(value)))];
+  const hits = (current.cacheHitTokens ?? 0) + (next.cacheHitTokens ?? 0);
+  const misses = (current.cacheMissTokens ?? 0) + (next.cacheMissTokens ?? 0);
+  return {
+    ...(models.length ? { model: models.length === 1 ? models[0] : "多个模型" } : {}),
+    ...(current.providerName || next.providerName
+      ? { providerName: current.providerName === next.providerName
+          ? current.providerName
+          : [current.providerName, next.providerName].filter(Boolean).join(",") }
+      : {}),
+    promptTokens: (current.promptTokens ?? 0) + (next.promptTokens ?? 0),
+    completionTokens: (current.completionTokens ?? 0) + (next.completionTokens ?? 0),
+    cacheHitTokens: hits,
+    cacheMissTokens: misses,
+    totalTokens: (current.totalTokens ?? 0) + (next.totalTokens ?? 0),
+    cost: (current.cost ?? 0) + (next.cost ?? 0),
+    currency: current.cost > 0 ? current.currency : next.currency || current.currency,
+    estimated: Boolean(current.estimated || next.estimated),
+    ...(hits + misses > 0 && !current.estimated && !next.estimated
+      ? { cacheHitRate: hits / (hits + misses) }
+      : {}),
+    requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
+  };
+}
+
+type JobTrailState = {
+  sourceMessageId?: number;
+  steps: PersistedStreamStep[];
+  lastFlushAt: number;
+  dirty: boolean;
+};
+
 export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
+  private trails = new Map<string, JobTrailState>();
+
+  constructor(private store?: WriterStore) {}
 
   start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
     if (this.activeJob(sessionId)) throw new Error("SESSION_JOB_ALREADY_RUNNING");
@@ -133,6 +180,7 @@ export class BackgroundAgentJobs {
       listeners: new Set(),
     };
     this.jobs.set(job.id, job);
+    this.trails.set(job.id, { steps: [], lastFlushAt: 0, dirty: false });
     const emit = (event: AgentEvent) => this.emit(job.id, event);
     // Defer so callers can finish `const job = start(...)` before the runner touches `job`.
     queueMicrotask(() => {
@@ -196,6 +244,7 @@ export class BackgroundAgentJobs {
     const stored = { ...event, index: job.events.length } as StoredAgentEvent;
     job.events.push(stored);
     job.updatedAt = new Date().toISOString();
+    this.applyTrailEvent(job, event);
     if (event.type === "done") this.finish(job, "completed");
     if (event.type === "cancelled") this.finish(job, "cancelled");
     if (event.type === "waiting_for_input") this.finish(job, "completed");
@@ -203,10 +252,125 @@ export class BackgroundAgentJobs {
     for (const listener of job.listeners) listener(stored);
   }
 
+  private applyTrailEvent(job: AgentJob, event: AgentEvent): void {
+    const trail = this.trails.get(job.id);
+    if (!trail) return;
+    let forceFlush = false;
+    if (event.type === "source_message" && typeof event.messageId === "number" && Number.isFinite(event.messageId)) {
+      trail.sourceMessageId = event.messageId;
+      trail.dirty = true;
+      forceFlush = true;
+    } else if (event.type === "step_start") {
+      const id = event.step ?? trail.steps.length + 1;
+      if (!trail.steps.some(step => step.id === id)) {
+        trail.steps.push({ id, output: "", reasoning: "", tools: [], status: "running" });
+        trail.dirty = true;
+        forceFlush = true;
+      }
+    } else if (event.type === "text" && event.text) {
+      const idx = activeTrailStepIndex(trail.steps);
+      if (idx >= 0) {
+        const key = event.channel === "reasoning" ? "reasoning" : "output";
+        trail.steps[idx] = {
+          ...trail.steps[idx],
+          [key]: compactStepTrailText(trail.steps[idx][key] + event.text),
+        };
+        trail.dirty = true;
+      }
+    } else if (event.type === "tool" && event.name) {
+      const idx = activeTrailStepIndex(trail.steps);
+      if (idx >= 0) {
+        trail.steps[idx] = {
+          ...trail.steps[idx],
+          tools: [...trail.steps[idx].tools, event.name],
+        };
+        trail.dirty = true;
+      }
+    } else if (event.type === "usage" && event.call) {
+      const targetId = event.step;
+      let idx = targetId != null
+        ? trail.steps.findIndex(step => step.id === targetId)
+        : activeTrailStepIndex(trail.steps);
+      if (idx < 0 && targetId != null) {
+        trail.steps.push({
+          id: targetId,
+          output: "",
+          reasoning: "",
+          tools: [],
+          status: "completed",
+          usage: event.call,
+        });
+        trail.steps.sort((left, right) => left.id - right.id);
+        trail.dirty = true;
+      } else if (idx >= 0) {
+        trail.steps[idx] = {
+          ...trail.steps[idx],
+          usage: mergePersistedStepUsage(trail.steps[idx].usage, event.call),
+        };
+        trail.dirty = true;
+      }
+    } else if (event.type === "step_done") {
+      trail.steps = trail.steps.map(step => (
+        step.id === event.step
+          ? { ...step, status: "completed", output: compactStepTrailText(step.output), reasoning: compactStepTrailText(step.reasoning) }
+          : step
+      ));
+      trail.dirty = true;
+      forceFlush = true;
+    } else if (event.type === "error") {
+      trail.steps = trail.steps.map(step => (
+        step.status === "running" ? { ...step, status: "failed" } : step
+      ));
+      trail.dirty = true;
+      forceFlush = true;
+    } else if (
+      event.type === "done"
+      || event.type === "cancelled"
+      || event.type === "waiting_for_input"
+    ) {
+      trail.steps = trail.steps.map(step => (
+        step.status === "running"
+          ? { ...step, status: event.type === "cancelled" ? "failed" : "completed" }
+          : step
+      ));
+      trail.dirty = true;
+      forceFlush = true;
+    }
+    if (trail.dirty) this.flushTrail(job, forceFlush);
+  }
+
+  private flushTrail(job: AgentJob, force: boolean): void {
+    const trail = this.trails.get(job.id);
+    if (!trail?.dirty || !trail.sourceMessageId || !trail.steps.length || !this.store) return;
+    const now = Date.now();
+    if (!force && now - trail.lastFlushAt < STEP_TRAIL_FLUSH_MS) return;
+    const steps = trail.steps.map(step => ({
+      ...step,
+      output: compactStepTrailText(step.output),
+      reasoning: compactStepTrailText(step.reasoning),
+    }));
+    try {
+      this.store.upsertMessageStepTrail(job.sessionId, trail.sourceMessageId, steps, { jobId: job.id });
+      trail.lastFlushAt = now;
+      trail.dirty = false;
+    } catch {
+      // Persistence is best-effort; live SSE remains authoritative while the job runs.
+    }
+  }
+
   private finish(job: AgentJob, status: Exclude<AgentJobStatus, "running">): void {
     job.status = status;
     job.updatedAt = new Date().toISOString();
+    this.flushTrail(job, true);
+    this.trails.delete(job.id);
   }
+}
+
+function activeTrailStepIndex(steps: PersistedStreamStep[]): number {
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    if (steps[i].status === "running") return i;
+  }
+  return -1;
 }
 
 function jobInfo({ id, sessionId, status, createdAt, updatedAt }: AgentJob): AgentJobInfo {
@@ -238,7 +402,7 @@ export async function startWriterServer(options: {
   const localBypassToken = randomBytes(24).toString("base64url");
   let readonlyToken = "";
   const app = new Hono();
-  const agentJobs = new BackgroundAgentJobs();
+  const agentJobs = new BackgroundAgentJobs(options.store);
   let publicOrigin: string | null | undefined;
 
   // CORS：手机页在局域网 HTTP 打开时，离开家后 API 会跨域打到 Cloudflare HTTPS。
@@ -325,6 +489,12 @@ export async function startWriterServer(options: {
         const firstId = visible[0]?.id;
         const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
         return firstId !== undefined && firstArchiveId !== undefined && firstId > firstArchiveId;
+      })(),
+      stepTrails: (() => {
+        const visible = options.store.conversationMessagesBefore(sessionId, undefined, 50)
+          .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim());
+        const messageIds = visible.map(message => message.id);
+        return options.store.messageStepTrails(sessionId, messageIds);
       })(),
       proposals: options.store.proposals(),
       changeSets: options.store.changeSets(),

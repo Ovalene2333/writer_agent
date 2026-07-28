@@ -518,6 +518,19 @@ type ContinuityFact = {
 };
 type ContinuityFactDraft = Omit<ContinuityFact, "id" | "sourceHash" | "sourceAnchorId" | "sourceProposalId" | "createdAt" | "updatedAt">
   & { id?: number };
+type MessageStepTrail = {
+  sourceMessageId: number;
+  jobId?: string;
+  steps: Array<{
+    id: number;
+    output: string;
+    reasoning: string;
+    tools: string[];
+    status: "running" | "completed" | "failed";
+    usage?: StepUsage;
+  }>;
+  updatedAt: string;
+};
 type State = {
   accessMode?: "owner" | "readonly";
   config: { title: string; style?: string };
@@ -528,6 +541,8 @@ type State = {
   sessionId: string;
   messages: Message[];
   messagesHasMore: boolean;
+  /** Server-persisted step trails for messages on the current page. */
+  stepTrails?: MessageStepTrail[];
   proposals: Proposal[];
   changeSets: ChangeSet[];
   sessions: Array<{ id: string; title: string; updatedAt: string; autoTitleDone?: boolean }>;
@@ -1006,6 +1021,33 @@ function realCacheHitRate(usage: Pick<Usage, "cacheHitRate" | "cacheHitTokens" |
   const hit = Number.isFinite(usage.cacheHitTokens) ? Math.max(0, usage.cacheHitTokens) : 0;
   const miss = Number.isFinite(usage.cacheMissTokens) ? Math.max(0, usage.cacheMissTokens) : 0;
   return hit + miss > 0 ? hit / (hit + miss) : 0;
+}
+
+
+function stepsFromServerTrail(trail: MessageStepTrail): StreamStep[] {
+  return trail.steps.map((step) => ({
+    id: step.id,
+    output: step.output ?? "",
+    reasoning: step.reasoning ?? "",
+    tools: Array.isArray(step.tools) ? step.tools : [],
+    status: step.status === "running" || step.status === "failed" || step.status === "completed"
+      ? step.status
+      : "completed",
+    expanded: false,
+    ...(step.usage ? { usage: step.usage } : {}),
+  }));
+}
+
+function pickServerStepTrail(
+  trails: MessageStepTrail[] | undefined,
+  preferredMessageId?: number | null,
+): MessageStepTrail | null {
+  if (!trails?.length) return null;
+  if (preferredMessageId != null && preferredMessageId > 0) {
+    const match = trails.find((trail) => trail.sourceMessageId === preferredMessageId);
+    if (match) return match;
+  }
+  return trails.slice().sort((a, b) => b.sourceMessageId - a.sourceMessageId)[0] ?? null;
 }
 
 function restoreTrailSteps(trail: StoredStepTrail): StreamStep[] {
@@ -2526,11 +2568,29 @@ function App() {
           : next.activeJobs;
         return { ...next, messages, messagesHasMore, activeJobs };
       });
-      if (seq === refreshSeqRef.current) reconcileStreamStepsAnchor(appliedMessages);
+      if (seq === refreshSeqRef.current) {
+        reconcileStreamStepsAnchor(appliedMessages);
+        // Architecture: steps are server-truth. Refresh must rehydrate from stepTrails
+        // unless a live job is still streaming into streamSteps.
+        if (!currentJobRef.current) {
+          const trail = pickServerStepTrail(next.stepTrails, streamStepsAnchorIdRef.current);
+          if (trail) {
+            const restored = stepsFromServerTrail(trail);
+            if (streamStepsRafRef.current != null) {
+              window.cancelAnimationFrame(streamStepsRafRef.current);
+              streamStepsRafRef.current = null;
+            }
+            streamStepsRef.current = restored;
+            setStreamSteps(restored);
+            updateStreamStepsAnchorId(trail.sourceMessageId);
+            saveStepTrail(next.sessionId, trail.sourceMessageId, restored);
+          }
+        }
+      }
       if (!activePathRef.current && next.documents[0]) setActivePath(next.documents[0]);
       return next;
     },
-    [mergeConversationMessages, reconcileStreamStepsAnchor],
+    [mergeConversationMessages, reconcileStreamStepsAnchor, updateStreamStepsAnchorId],
   );
 
   const loadOlderMessages = useCallback(async () => {
@@ -2710,10 +2770,16 @@ function App() {
     todosCompletionRef.current = { sessionId, complete };
   }, [state?.sessionId, state?.todos]);
 
-  // Initial load: restore collapsed step trail for the active session.
+  // Restore step trail: server stepTrails first, localStorage only as legacy fallback.
   useEffect(() => {
     if (!state?.sessionId || busy || currentJobRef.current) return;
     if (streamSteps.length > 0) return;
+    const serverTrail = pickServerStepTrail(state.stepTrails, streamStepsAnchorIdRef.current);
+    if (serverTrail) {
+      updateStreamSteps(stepsFromServerTrail(serverTrail));
+      updateStreamStepsAnchorId(serverTrail.sourceMessageId);
+      return;
+    }
     const trail = loadStepTrail(state.sessionId);
     if (!trail) return;
     const messageStillExists = trail.messageId < 0 || state.messages.some((msg) => msg.id === trail.messageId);
@@ -2725,7 +2791,7 @@ function App() {
     }
     updateStreamSteps(restoreTrailSteps(trail));
     updateStreamStepsAnchorId(trail.messageId);
-  }, [state?.sessionId, state?.messages, state?.messagesHasMore, busy, streamSteps.length, updateStreamSteps]);
+  }, [state?.sessionId, state?.messages, state?.messagesHasMore, state?.stepTrails, busy, streamSteps.length, updateStreamSteps, updateStreamStepsAnchorId]);
 
   // Persist live/completed steps locally (collapsed) for the current user message.
   useEffect(() => {
@@ -3294,6 +3360,24 @@ function App() {
             message.role === "user" && message.id > 0 && message.content.trim()
           ));
           if (lastUser) anchorId = lastUser.id;
+        }
+        // Prefer server trail when present (source of truth); keep richer live steps as fallback.
+        const serverTrail = pickServerStepTrail(next.stepTrails, anchorId);
+        if (serverTrail) {
+          const restored = stepsFromServerTrail(serverTrail);
+          const liveLen = streamStepsRef.current.reduce((sum, step) => sum + step.output.length + step.reasoning.length, 0);
+          const serverLen = restored.reduce((sum, step) => sum + step.output.length + step.reasoning.length, 0);
+          if (!streamStepsRef.current.length || serverLen >= liveLen * 0.8 || restored.length >= streamStepsRef.current.length) {
+            if (streamStepsRafRef.current != null) {
+              window.cancelAnimationFrame(streamStepsRafRef.current);
+              streamStepsRafRef.current = null;
+            }
+            streamStepsRef.current = restored;
+            setStreamSteps(restored);
+            anchorId = serverTrail.sourceMessageId;
+          } else {
+            anchorId = serverTrail.sourceMessageId;
+          }
         }
         updateStreamStepsAnchorId(anchorId);
         if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
@@ -5843,7 +5927,10 @@ function App() {
               const interruptedAgentMessage = msg.role === "assistant" && msg.channel !== "roleplay"
                 && displayContent.includes("[生成已中断]");
               const resumableAgentStepAnchor = msg.role === "user" && msg.channel !== "roleplay"
-                && streamStepsAnchorId === msg.id && streamSteps.length > 0;
+                && (
+                  (streamStepsAnchorId === msg.id && streamSteps.length > 0)
+                  || Boolean(state.stepTrails?.some((trail) => trail.sourceMessageId === msg.id && trail.steps.length > 0))
+                );
               return (
             <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}${directorMessage ? " roleplay-director-msg" : ""}${continuationMessage ? " roleplay-continuation-msg" : ""}${assistantCollapsed ? " collapsed" : ""}`}>
               {msg.role === "assistant" ? (
@@ -5948,22 +6035,47 @@ function App() {
             </article>
               );
             })()}
-            {streamStepsAnchorId === msg.id && (
+            {(() => {
+              const liveHere = streamStepsAnchorId === msg.id && streamSteps.length > 0;
+              const serverTrail = !liveHere
+                ? state.stepTrails?.find((trail) => trail.sourceMessageId === msg.id)
+                : undefined;
+              const stepsHere = liveHere
+                ? streamSteps
+                : serverTrail
+                  ? stepsFromServerTrail(serverTrail)
+                  : [];
+              if (!stepsHere.length) return null;
+              return (
               <>
-                {streamSteps.map((step) => (
+                {stepsHere.map((step) => (
                   <AgentStepCard
-                    key={step.id}
+                    key={`${msg.id}-${step.id}`}
                     step={step}
-                    onToggle={() =>
-                      updateStreamSteps((current) =>
-                        current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
-                      )
-                    }
+                    onToggle={() => {
+                      if (liveHere || streamStepsAnchorId === msg.id) {
+                        updateStreamSteps((current) =>
+                          current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
+                        );
+                        return;
+                      }
+                      // Promote server trail into live UI state so expand works after refresh.
+                      const promoted = stepsHere.map((s) => (
+                        s.id === step.id ? { ...s, expanded: !s.expanded } : s
+                      ));
+                      if (streamStepsRafRef.current != null) {
+                        window.cancelAnimationFrame(streamStepsRafRef.current);
+                        streamStepsRafRef.current = null;
+                      }
+                      streamStepsRef.current = promoted;
+                      setStreamSteps(promoted);
+                      updateStreamStepsAnchorId(msg.id);
+                    }}
                   />
                 ))}
                 {(() => {
-                  const total = sumStepUsage(streamSteps);
-                  if (!total || streamSteps.length < 1) return null;
+                  const total = sumStepUsage(stepsHere);
+                  if (!total || stepsHere.length < 1) return null;
                   return (
                     <div className="agent-step-trail-total" title={stepUsageTitle(total)}>
                       <span>本轮合计{total.estimated ? "（含估算）" : ""}</span>
@@ -5972,7 +6084,8 @@ function App() {
                   );
                 })()}
               </>
-            )}
+              );
+            })()}
             </React.Fragment>
           ))}
           {/* Steps for a turn whose user bubble is not in the filtered list yet. */}
@@ -5992,7 +6105,7 @@ function App() {
               ))}
             </>
           )}
-          {state.messages.length === 0 && streamSteps.length === 0 && (
+          {state.messages.length === 0 && streamSteps.length === 0 && !(state.stepTrails?.length) && (
             <div className="empty-state">
               <div className="empty-orb" aria-hidden="true" />
               <p>Agent is ready</p>
