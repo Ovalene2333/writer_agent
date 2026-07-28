@@ -2113,18 +2113,25 @@ const CONTEXT_GRAPH_EDGE_LABEL: Record<string, string> = {
 
 type ContextGraphLayoutNode = ContextGraphNode & { x: number; y: number; w: number; h: number };
 
+function truncateGraphLabel(value: string, max = 14): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
+}
+
 function layoutContextGraphNodes(nodes: ContextGraphNode[]): {
   placed: ContextGraphLayoutNode[];
   width: number;
   height: number;
-  columns: Array<{ index: number; label: string }>;
+  columns: Array<{ index: number; label: string; x: number; width: number }>;
 } {
-  const colWidth = 188;
-  const rowGap = 16;
-  const nodeH = 58;
-  const nodeW = 168;
-  const padX = 36;
-  const padY = 48;
+  const colWidth = 210;
+  const rowGap = 22;
+  const nodeH = 72;
+  const nodeW = 176;
+  const padX = 28;
+  const padY = 56;
+  const laneGap = 12;
   const byCol = new Map<number, ContextGraphNode[]>();
   for (const node of nodes) {
     const col = CONTEXT_GRAPH_KIND_COLUMN[node.kind] ?? 4;
@@ -2135,26 +2142,69 @@ function layoutContextGraphNodes(nodes: ContextGraphNode[]): {
   const colIndexes = [...byCol.keys()].sort((a, b) => a - b);
   const placed: ContextGraphLayoutNode[] = [];
   let maxY = padY;
-  for (const col of colIndexes) {
+  colIndexes.forEach((col, order) => {
     const list = (byCol.get(col) ?? []).slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     list.forEach((node, index) => {
-      const x = padX + colIndexes.indexOf(col) * colWidth;
+      const x = padX + order * colWidth + (colWidth - nodeW) / 2;
       const y = padY + index * (nodeH + rowGap);
       maxY = Math.max(maxY, y + nodeH);
       placed.push({ ...node, x, y, w: nodeW, h: nodeH });
     });
-  }
-  const columns = colIndexes.map((index) => {
+  });
+  const columns = colIndexes.map((index, order) => {
     const sample = (byCol.get(index) ?? [])[0];
     const kind = sample?.kind ?? "project_note";
-    return { index, label: CONTEXT_GRAPH_KIND_LABEL[kind] ?? kind };
+    return {
+      index,
+      label: CONTEXT_GRAPH_KIND_LABEL[kind] ?? kind,
+      x: padX + order * colWidth - laneGap / 2,
+      width: colWidth,
+    };
   });
   return {
     placed,
-    width: Math.max(640, padX * 2 + Math.max(colIndexes.length, 1) * colWidth),
-    height: Math.max(280, maxY + padY),
+    width: Math.max(720, padX * 2 + Math.max(colIndexes.length, 1) * colWidth),
+    height: Math.max(320, maxY + padY),
     columns,
   };
+}
+
+function nodeAnchor(
+  from: ContextGraphLayoutNode,
+  to: ContextGraphLayoutNode,
+  end: "start" | "finish",
+): { x: number; y: number } {
+  const fromCx = from.x + from.w / 2;
+  const fromCy = from.y + from.h / 2;
+  const toCx = to.x + to.w / 2;
+  const toCy = to.y + to.h / 2;
+  const dx = toCx - fromCx;
+  const dy = toCy - fromCy;
+  const node = end === "start" ? from : to;
+  const cx = node.x + node.w / 2;
+  const cy = node.y + node.h / 2;
+  // Prefer horizontal ports for left/right layout; fall back to vertical for same-column links.
+  if (Math.abs(dx) >= Math.abs(dy) * 0.55) {
+    const right = end === "start" ? dx > 0 : dx < 0;
+    return { x: right ? node.x + node.w : node.x, y: cy };
+  }
+  const down = end === "start" ? dy > 0 : dy < 0;
+  return { x: cx, y: down ? node.y + node.h : node.y };
+}
+
+function edgePath(from: ContextGraphLayoutNode, to: ContextGraphLayoutNode): string {
+  const a = nodeAnchor(from, to, "start");
+  const b = nodeAnchor(from, to, "finish");
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    const bend = Math.max(36, Math.abs(dx) * 0.42);
+    const s = dx >= 0 ? 1 : -1;
+    return `M ${a.x} ${a.y} C ${a.x + bend * s} ${a.y}, ${b.x - bend * s} ${b.y}, ${b.x} ${b.y}`;
+  }
+  const bend = Math.max(28, Math.abs(dy) * 0.4);
+  const s = dy >= 0 ? 1 : -1;
+  return `M ${a.x} ${a.y} C ${a.x} ${a.y + bend * s}, ${b.x} ${b.y - bend * s}, ${b.x} ${b.y}`;
 }
 
 function ContextGraphCanvas({
@@ -2190,49 +2240,80 @@ function ContextGraphCanvas({
   }, [selectedId, visibleEdges]);
 
   if (!nodes.length) {
-    return <div className="context-graph-canvas empty">暂无节点可绘制</div>;
+    return (
+      <div className="context-graph-canvas empty">
+        <div className="context-graph-empty-card">
+          <GitBranch size={22} aria-hidden="true" />
+          <strong>暂无上下文节点</strong>
+          <span>跑一轮 Agent 写作任务后，这里会显示任务、交接与装配关系。</span>
+        </div>
+      </div>
+    );
   }
+
+  const svgHeight = Math.min(560, Math.max(340, layout.height));
 
   return (
     <div className="context-graph-canvas" role="img" aria-label="上下文关系图">
+      <div className="context-graph-legend" aria-hidden="true">
+        {(["message", "epoch", "handoff", "assemble_slice"] as const).map((kind) => (
+          <span key={kind} className={`context-graph-legend-item kind-${kind}`}>
+            <i />
+            {CONTEXT_GRAPH_KIND_LABEL[kind]}
+          </span>
+        ))}
+      </div>
       <svg
         viewBox={`0 0 ${layout.width} ${layout.height}`}
         width="100%"
-        height={Math.min(520, Math.max(300, layout.height))}
+        height={svgHeight}
         preserveAspectRatio="xMidYMin meet"
       >
         <defs>
-          <marker id="ctx-arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-            <path d="M0,0 L7,3 L0,6 Z" className="context-graph-arrow" />
+          <filter id="ctx-node-shadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="0" dy="2" stdDeviation="3" floodOpacity="0.18" />
+          </filter>
+          <marker id="ctx-arrow" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L8,3.5 L0,7 Z" className="context-graph-arrow" />
           </marker>
-          <marker id="ctx-arrow-active" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-            <path d="M0,0 L7,3 L0,6 Z" className="context-graph-arrow active" />
+          <marker id="ctx-arrow-active" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L8,3.5 L0,7 Z" className="context-graph-arrow active" />
           </marker>
         </defs>
-        {layout.columns.map((column, order) => (
-          <text
-            key={`col-${column.index}`}
-            x={36 + order * 188 + 84}
-            y={28}
-            textAnchor="middle"
-            className="context-graph-column-label"
-          >
-            {column.label}
-          </text>
+
+        {layout.columns.map((column) => (
+          <g key={`lane-${column.index}`} className="context-graph-lane">
+            <rect
+              x={column.x}
+              y={18}
+              width={column.width - 12}
+              height={Math.max(120, layout.height - 36)}
+              rx={16}
+              className="context-graph-lane-bg"
+            />
+            <text
+              x={column.x + (column.width - 12) / 2}
+              y={40}
+              textAnchor="middle"
+              className="context-graph-column-label"
+            >
+              {column.label}
+            </text>
+          </g>
         ))}
+
         {visibleEdges.map((edge) => {
           const from = pos.get(edge.fromId);
           const to = pos.get(edge.toId);
           if (!from || !to) return null;
-          const x1 = from.x + from.w;
-          const y1 = from.y + from.h / 2;
-          const x2 = to.x;
-          const y2 = to.y + to.h / 2;
-          const dx = Math.max(40, (x2 - x1) * 0.45);
-          const path = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+          const path = edgePath(from, to);
           const active = Boolean(selectedId && (edge.fromId === selectedId || edge.toId === selectedId));
-          const midX = (x1 + x2) / 2;
-          const midY = (y1 + y2) / 2 - 6;
+          const a = nodeAnchor(from, to, "start");
+          const b = nodeAnchor(from, to, "finish");
+          const midX = (a.x + b.x) / 2;
+          const midY = (a.y + b.y) / 2;
+          const label = CONTEXT_GRAPH_EDGE_LABEL[edge.kind] ?? edge.kind;
+          const labelW = Math.max(28, label.length * 11);
           return (
             <g key={edge.id} className={`context-graph-edge-g${active ? " active" : selectedId ? " dim" : ""}`}>
               <path
@@ -2240,16 +2321,30 @@ function ContextGraphCanvas({
                 className={`context-graph-edge-line${active ? " active" : ""}`}
                 markerEnd={active ? "url(#ctx-arrow-active)" : "url(#ctx-arrow)"}
               />
-              <text x={midX} y={midY} textAnchor="middle" className="context-graph-edge-label">
-                {CONTEXT_GRAPH_EDGE_LABEL[edge.kind] ?? edge.kind}
+              <rect
+                x={midX - labelW / 2}
+                y={midY - 9}
+                width={labelW}
+                height={16}
+                rx={8}
+                className={`context-graph-edge-chip${active ? " active" : ""}`}
+              />
+              <text x={midX} y={midY + 3} textAnchor="middle" className={`context-graph-edge-label${active ? " active" : ""}`}>
+                {label}
               </text>
             </g>
           );
         })}
+
         {layout.placed.map((node) => {
           const selected = node.id === selectedId;
           const related = relatedIds.has(node.id);
           const dim = Boolean(selectedId && !related);
+          const kindLabel = CONTEXT_GRAPH_KIND_LABEL[node.kind] ?? node.kind;
+          const title = truncateGraphLabel(node.label.replace(/^(用户|任务|章交接|装配)[ ·]+/, ""), 15);
+          const meta = node.sourceMessageId != null
+            ? `msg #${node.sourceMessageId}`
+            : new Date(node.createdAt).toLocaleString(undefined, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
           return (
             <g
               key={node.id}
@@ -2258,18 +2353,18 @@ function ContextGraphCanvas({
               onClick={() => onSelect(node.id)}
               style={{ cursor: "pointer" }}
             >
-              <title>{`${node.kind}: ${node.label}`}</title>
-              <rect width={node.w} height={node.h} rx={10} ry={10} className="context-graph-svg-card" />
-              <text x={12} y={18} className="context-graph-svg-kind">
-                {CONTEXT_GRAPH_KIND_LABEL[node.kind] ?? node.kind}
-                {node.status === "archived" ? " · 归档" : ""}
-              </text>
-              <text x={12} y={36} className="context-graph-svg-label">
-                {(node.label.length > 16 ? `${node.label.slice(0, 16)}…` : node.label)}
-              </text>
-              <text x={12} y={50} className="context-graph-svg-meta">
-                {node.sourceMessageId != null ? `msg #${node.sourceMessageId}` : node.id.slice(0, 10)}
-              </text>
+              <title>{`${kindLabel}: ${node.label}`}</title>
+              <rect width={node.w} height={node.h} rx={14} ry={14} className="context-graph-svg-card" filter="url(#ctx-node-shadow)" />
+              <rect x={0} y={0} width={5} height={node.h} rx={2.5} className="context-graph-svg-accent" />
+              <text x={16} y={22} className="context-graph-svg-kind">{kindLabel}</text>
+              {node.status === "archived" ? (
+                <g transform={`translate(${node.w - 42}, 10)`}>
+                  <rect width={32} height={14} rx={7} className="context-graph-status-pill" />
+                  <text x={16} y={10.5} textAnchor="middle" className="context-graph-status-pill-text">归档</text>
+                </g>
+              ) : null}
+              <text x={16} y={42} className="context-graph-svg-label">{title}</text>
+              <text x={16} y={58} className="context-graph-svg-meta">{meta}</text>
             </g>
           );
         })}
