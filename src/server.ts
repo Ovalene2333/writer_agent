@@ -1640,7 +1640,15 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
-  app.get("/api/messages/:id/versions", (context) => {
+  app.get("/api/session/:id/context-graph", (context) => {
+    try {
+      const sessionId = context.req.param("id");
+      if (!sessionId || !options.store.sessionExists(sessionId)) throw new Error("会话不存在");
+      return context.json(options.store.contextGraph(sessionId));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+    app.get("/api/messages/:id/versions", (context) => {
     try {
       const sessionId = context.req.query("session") ?? "";
       const messageId = Number(context.req.param("id"));

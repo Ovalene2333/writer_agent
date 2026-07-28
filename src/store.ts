@@ -37,6 +37,12 @@ import {
   type ContinuityFactScopeKind,
   type ContinuityFactStatus,
 } from "./continuity_facts.js";
+import type {
+  ContextEdge, ContextEdgeKind, ContextNode, ContextNodeKind, ContextNodeStatus,
+} from "./context_graph.js";
+import {
+  buildContextGraphView, newContextEdgeId, newContextNodeId, type ContextGraphView,
+} from "./context_graph.js";
 
 type Row = Record<string, unknown>;
 type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
@@ -428,6 +434,32 @@ export class WriterStore {
       );
       CREATE INDEX IF NOT EXISTS message_step_trails_session
         ON message_step_trails(session_id, source_message_id);
+      CREATE TABLE IF NOT EXISTS context_nodes (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        label TEXT NOT NULL DEFAULT '',
+        source_message_id INTEGER,
+        job_id TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS context_nodes_session
+        ON context_nodes(session_id, status, kind, created_at);
+      CREATE INDEX IF NOT EXISTS context_nodes_message
+        ON context_nodes(session_id, source_message_id);
+      CREATE TABLE IF NOT EXISTS context_edges (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS context_edges_session
+        ON context_edges(session_id, kind);
       CREATE TABLE IF NOT EXISTS character_revisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -907,6 +939,149 @@ export class WriterStore {
     this.database.prepare(
       "DELETE FROM message_step_trails WHERE session_id=? AND source_message_id>=?",
     ).run(sessionId, fromMessageId);
+  }
+
+  createContextNode(input: {
+    sessionId: string;
+    kind: ContextNodeKind;
+    label: string;
+    status?: ContextNodeStatus;
+    sourceMessageId?: number;
+    jobId?: string;
+    payload?: Record<string, unknown>;
+    id?: string;
+  }): ContextNode {
+    const now = new Date().toISOString();
+    const node: ContextNode = {
+      id: input.id ?? newContextNodeId(input.kind === "epoch" ? "epoch" : input.kind === "handoff" ? "hand" : "ctx"),
+      sessionId: input.sessionId,
+      kind: input.kind,
+      status: input.status ?? "active",
+      label: input.label,
+      ...(input.sourceMessageId != null ? { sourceMessageId: input.sourceMessageId } : {}),
+      ...(input.jobId ? { jobId: input.jobId } : {}),
+      payload: input.payload ?? {},
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.database.prepare(`INSERT INTO context_nodes(
+      id,session_id,kind,status,label,source_message_id,job_id,payload_json,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      node.id, node.sessionId, node.kind, node.status, node.label,
+      node.sourceMessageId ?? null, node.jobId ?? null, JSON.stringify(node.payload),
+      node.createdAt, node.updatedAt,
+    );
+    return node;
+  }
+
+  addContextEdge(input: {
+    sessionId: string;
+    fromId: string;
+    toId: string;
+    kind: ContextEdgeKind;
+  }): ContextEdge {
+    const edge: ContextEdge = {
+      id: newContextEdgeId(),
+      sessionId: input.sessionId,
+      fromId: input.fromId,
+      toId: input.toId,
+      kind: input.kind,
+      createdAt: new Date().toISOString(),
+    };
+    this.database.prepare(
+      "INSERT INTO context_edges(id,session_id,from_id,to_id,kind,created_at) VALUES(?,?,?,?,?,?)",
+    ).run(edge.id, edge.sessionId, edge.fromId, edge.toId, edge.kind, edge.createdAt);
+    return edge;
+  }
+
+  updateContextNode(sessionId: string, id: string, patch: {
+    status?: ContextNodeStatus;
+    label?: string;
+    payload?: Record<string, unknown>;
+  }): void {
+    const row = this.database.prepare("SELECT * FROM context_nodes WHERE session_id=? AND id=?")
+      .get(sessionId, id) as Row | undefined;
+    if (!row) return;
+    const status = patch.status ?? String(row.status);
+    const label = patch.label ?? String(row.label ?? "");
+    const payload = patch.payload ?? JSON.parse(String(row.payload_json || "{}"));
+    const updatedAt = new Date().toISOString();
+    this.database.prepare(
+      "UPDATE context_nodes SET status=?, label=?, payload_json=?, updated_at=? WHERE session_id=? AND id=?",
+    ).run(status, label, JSON.stringify(payload), updatedAt, sessionId, id);
+  }
+
+  contextNodes(sessionId: string, options?: { status?: ContextNodeStatus; kind?: ContextNodeKind }): ContextNode[] {
+    if (!this.sessionExists(sessionId)) return [];
+    let sql = "SELECT * FROM context_nodes WHERE session_id=?";
+    const args: Array<string | number | null> = [sessionId];
+    if (options?.status) {
+      sql += " AND status=?";
+      args.push(options.status);
+    }
+    if (options?.kind) {
+      sql += " AND kind=?";
+      args.push(options.kind);
+    }
+    sql += " ORDER BY created_at ASC";
+    return (this.database.prepare(sql).all(...args) as Row[]).map(row => this.contextNodeFromRow(row));
+  }
+
+  contextEdges(sessionId: string): ContextEdge[] {
+    if (!this.sessionExists(sessionId)) return [];
+    return (this.database.prepare(
+      "SELECT * FROM context_edges WHERE session_id=? ORDER BY created_at ASC",
+    ).all(sessionId) as Row[]).map(row => ({
+      id: String(row.id),
+      sessionId: String(row.session_id),
+      fromId: String(row.from_id),
+      toId: String(row.to_id),
+      kind: row.kind as ContextEdgeKind,
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  contextGraph(sessionId: string): ContextGraphView {
+    return buildContextGraphView(sessionId, this.contextNodes(sessionId), this.contextEdges(sessionId));
+  }
+
+  activeContextHandoffs(sessionId: string): ContextNode[] {
+    return this.contextNodes(sessionId, { status: "active", kind: "handoff" });
+  }
+
+  /**
+   * Archive graph nodes tied to rewound messages (edit / re-run).
+   * Keeps history for debugging but removes them from active assemble.
+   */
+  archiveContextGraphFrom(sessionId: string, fromMessageId: number): void {
+    if (!this.sessionExists(sessionId)) return;
+    if (!Number.isInteger(fromMessageId) || fromMessageId < 1) return;
+    const now = new Date().toISOString();
+    this.database.prepare(`UPDATE context_nodes SET status='archived', updated_at=?
+      WHERE session_id=? AND source_message_id IS NOT NULL AND source_message_id>=? AND status='active'`)
+      .run(now, sessionId, fromMessageId);
+    // Also archive epochs/handoffs that only hang off archived messages via job id later if needed.
+  }
+
+  private contextNodeFromRow(row: Row): ContextNode {
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(String(row.payload_json || "{}")) as Record<string, unknown>;
+    } catch {
+      payload = {};
+    }
+    return {
+      id: String(row.id),
+      sessionId: String(row.session_id),
+      kind: row.kind as ContextNodeKind,
+      status: row.status === "archived" ? "archived" : "active",
+      label: String(row.label ?? ""),
+      ...(row.source_message_id != null ? { sourceMessageId: Number(row.source_message_id) } : {}),
+      ...(typeof row.job_id === "string" && row.job_id ? { jobId: String(row.job_id) } : {}),
+      payload,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
   }
 
   sessionTodos(sessionId: string): AgentTodoItem[] {
@@ -2660,6 +2835,7 @@ export class WriterStore {
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
     this.deleteMessageStepTrailsFrom(sessionId, fromId);
+    this.archiveContextGraphFrom(sessionId, fromId);
     // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
     if (userRow.channel === "roleplay") this.restoreRoleplayMemoryBefore(sessionId, fromId);
@@ -2715,6 +2891,7 @@ export class WriterStore {
         this.clearSessionTaskState(sessionId);
         this.restoreRoleplayMemoryBefore(sessionId, fromId);
         this.deleteMessageStepTrailsFrom(sessionId, fromId);
+        this.archiveContextGraphFrom(sessionId, fromId);
         this.addSystemMessage(sessionId, `已撤销角色主动开场 #${fromId} 及其后续对话，准备重新演出。`);
         this.reindex();
         return {

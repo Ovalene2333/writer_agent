@@ -35,6 +35,12 @@ import {
 import { writingWorkflowPrompt } from "./writing_workflow.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
+  chapterHandoffLabel,
+  formatActiveHandoffsForPrompt,
+  type AssembleSlicePayload,
+  type ChapterHandoffPayload,
+} from "./context_graph.js";
+import {
   DEFAULT_SCENE_NOTES_CHARACTERS,
   formatTodosForPrompt,
   loadAgentSettings,
@@ -1848,6 +1854,36 @@ export async function runAgent(options: {
   const roleplayHandoffContext = recentRoleplayHandoffContext(store, sessionId);
   const sourceMessageId = store.addMessage(sessionId, "user", prompt, "agent", options.variantGroupId);
   emit({ type: "source_message", messageId: sourceMessageId, channel: "agent" });
+  // Context graph: message + epoch. Process (L3) lives only inside this epoch;
+  // active handoffs (L2) are linked as uses for assemble/debug.
+  let contextEpochId: string | undefined;
+  try {
+    const messageNode = store.createContextNode({
+      sessionId,
+      kind: "message",
+      label: `用户 · ${prompt.replace(/\s+/g, " ").slice(0, 72)}`,
+      sourceMessageId,
+      payload: { role: "user", preview: prompt.slice(0, 240) },
+    });
+    const epochNode = store.createContextNode({
+      sessionId,
+      kind: "epoch",
+      label: `任务 · ${task.label.replace(/\s+/g, " ").slice(0, 80)}`,
+      sourceMessageId,
+      jobId: options.jobId,
+      payload: {
+        mode: task.mode,
+        outcome: task.outcome,
+        workflow: task.workflow,
+        promptPreview: prompt.slice(0, 240),
+      },
+    });
+    contextEpochId = epochNode.id;
+    store.addContextEdge({ sessionId, fromId: epochNode.id, toId: messageNode.id, kind: "caused_by" });
+    for (const handoff of store.activeContextHandoffs(sessionId)) {
+      store.addContextEdge({ sessionId, fromId: epochNode.id, toId: handoff.id, kind: "uses" });
+    }
+  } catch { /* graph is diagnostic; never fail the writing job */ }
   const archiveContext = `会话归档元数据（注入历史仅为预览；完整史用 inspect/read_conversation）：${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
@@ -1997,8 +2033,9 @@ export async function runAgent(options: {
     budgetTokens: replayBudgetTokens,
     compact: compactRuntimeMessages,
   });
+  const managedHandoffContext = formatActiveHandoffsForPrompt(store.activeContextHandoffs(sessionId));
   const turnContextParts = {
-    taskContext: dynamicContextPrompt(
+    taskContext: `${dynamicContextPrompt(
       project,
       store,
       prompt,
@@ -2012,7 +2049,9 @@ export async function runAgent(options: {
       simpleCharacterScope,
       options.resumeInterrupted === true,
       turnProseLength,
-    ),
+    )}
+
+${managedHandoffContext}`,
     dynamicStyleContext: dynamicStyleContext || undefined,
     bootstrapContext: bootstrapContext || undefined,
     todosPrompt,
@@ -2035,6 +2074,39 @@ export async function runAgent(options: {
   const replayedMessageCount = stableSystemPrefix.length + replay.messages.length;
   // Multi-chapter boundary resets truncate back to exactly this prefix (see contract §4).
   const initialMessageCount = messages.length;
+  try {
+    const activeHandoffs = store.activeContextHandoffs(sessionId);
+    const slicePayload: AssembleSlicePayload = {
+      step: 0,
+      layers: [
+        { id: "L0", layer: "L0", label: "稳定前缀 + 工具 schema", estimatedTokens: approximateMessageTokens(stableSystemPrefix) },
+        { id: "L1", layer: "L1", label: "跨 turn 冻块 replay", estimatedTokens: approximateMessageTokens(replay.messages) },
+        {
+          id: "L2",
+          layer: "L2",
+          label: "焦点任务 + 活跃章交接",
+          nodeIds: activeHandoffs.map(node => node.id),
+          estimatedTokens: Math.ceil(Buffer.byteLength(managedHandoffContext, "utf8") / 4),
+        },
+        { id: "L3", layer: "L3", label: "本 epoch 工具过程（append-only，边界后截断）" },
+      ],
+      note: "initial assemble for this user turn",
+    };
+    const slice = store.createContextNode({
+      sessionId,
+      kind: "assemble_slice",
+      label: "装配 · 开轮",
+      sourceMessageId,
+      jobId: options.jobId,
+      payload: slicePayload as unknown as Record<string, unknown>,
+    });
+    if (contextEpochId) {
+      store.addContextEdge({ sessionId, fromId: slice.id, toId: contextEpochId, kind: "includes" });
+      for (const handoff of activeHandoffs) {
+        store.addContextEdge({ sessionId, fromId: slice.id, toId: handoff.id, kind: "uses" });
+      }
+    }
+  } catch { /* ignore graph errors */ }
   // Scene-boundary resets truncate back here (§4b): advanced past prep reads when
   // begin_chapter_draft succeeds, so chapter facts survive while scene prose does not.
   let contextBase = initialMessageCount;
@@ -2082,6 +2154,18 @@ export async function runAgent(options: {
         messages: block,
         estimatedTokens: approximateMessageTokens(block),
       });
+      if (contextEpochId) {
+        store.updateContextNode(sessionId, contextEpochId, {
+          payload: {
+            mode: task.mode,
+            outcome: task.outcome,
+            workflow: task.workflow,
+            promptPreview: prompt.slice(0, 240),
+            frozen: true,
+            frozenTokens: approximateMessageTokens(block),
+          },
+        });
+      }
     } catch { /* 缓存优化失败不影响本轮结果。 */ }
   };
 
@@ -2521,6 +2605,48 @@ export async function runAgent(options: {
               ...(handoff ? { handoff } : {}),
             }),
           });
+          try {
+            const handoffPayload: ChapterHandoffPayload = {
+              kind: "chapter",
+              ...(latestProposal ? {
+                path: latestProposal.path,
+                summary: latestProposal.summary,
+                tail: latestProposal.afterContent.trimEnd().slice(-800),
+              } : {}),
+              ...(handoff?.finalActualState != null ? { finalActualState: handoff.finalActualState } : {}),
+            };
+            const handoffNode = store.createContextNode({
+              sessionId,
+              kind: "handoff",
+              label: chapterHandoffLabel({
+                path: latestProposal?.path,
+                summary: latestProposal?.summary,
+                index: completedDocumentDeliverables,
+              }),
+              sourceMessageId,
+              jobId: options.jobId,
+              payload: handoffPayload as unknown as Record<string, unknown>,
+            });
+            if (contextEpochId) {
+              store.addContextEdge({ sessionId, fromId: contextEpochId, toId: handoffNode.id, kind: "produces" });
+            }
+            store.createContextNode({
+              sessionId,
+              kind: "assemble_slice",
+              label: `装配 · 章边界 · ${latestProposal?.path ?? completedDocumentDeliverables}`,
+              sourceMessageId,
+              jobId: options.jobId,
+              payload: {
+                step,
+                layers: [
+                  { id: "L0", layer: "L0", label: "稳定前缀保留（截断回 initial）" },
+                  { id: "L2", layer: "L2", label: "写入章交接", nodeIds: [handoffNode.id] },
+                  { id: "L3", layer: "L3", label: "丢弃上一章工具过程" },
+                ],
+                note: "chapter boundary: messages truncated to initialMessageCount",
+              } as unknown as Record<string, unknown>,
+            });
+          } catch { /* ignore graph errors */ }
           turnStart = messages.length;
           // Next chapter's scene resets truncate to here until its begin succeeds.
           contextBase = messages.length;

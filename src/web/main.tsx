@@ -20,6 +20,7 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  GitBranch,
   History,
   IdCard,
   Library,
@@ -551,6 +552,36 @@ type State = {
   sessionId: string;
   messages: Message[];
   messagesHasMore: boolean;
+
+type ContextGraphNode = {
+  id: string;
+  sessionId: string;
+  kind: string;
+  status: "active" | "archived";
+  label: string;
+  sourceMessageId?: number;
+  jobId?: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
+type ContextGraphEdge = {
+  id: string;
+  sessionId: string;
+  fromId: string;
+  toId: string;
+  kind: string;
+  createdAt: string;
+};
+type ContextGraphView = {
+  sessionId: string;
+  nodes: ContextGraphNode[];
+  edges: ContextGraphEdge[];
+  activeHandoffs: ContextGraphNode[];
+  activeEpochs: ContextGraphNode[];
+  recentSlices: ContextGraphNode[];
+  stats: { activeNodes: number; archivedNodes: number; edgeCount: number; handoffCount: number };
+};
   /** Server-persisted step trails for messages on the current page. */
   stepTrails?: MessageStepTrail[];
   proposals: Proposal[];
@@ -607,7 +638,7 @@ const EMPTY_CHARACTER: CharacterDraft = {
 type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
 type WorkspaceMode = "split" | "editor-focus" | "agent-focus";
 type DocumentSidebarMode = "chapters" | "files";
-type ManagementView = "characters" | "sessions" | "models" | "prose-gates" | "continuity-facts";
+type ManagementView = "characters" | "sessions" | "models" | "prose-gates" | "continuity-facts" | "context-graph";
 
 type UiTheme = {
   id: UiThemeId;
@@ -2231,6 +2262,10 @@ function App() {
   const [continuityFactDraft, setContinuityFactDraft] = useState<ContinuityFactDraft | null>(null);
   const [continuityFactBusy, setContinuityFactBusy] = useState(false);
   const [managementView, setManagementView] = useState<ManagementView | null>(null);
+  const [contextGraph, setContextGraph] = useState<ContextGraphView | null>(null);
+  const [contextGraphLoading, setContextGraphLoading] = useState(false);
+  const [contextGraphSelectedId, setContextGraphSelectedId] = useState<string | null>(null);
+  const [contextGraphFilter, setContextGraphFilter] = useState<"all" | "active" | "handoff" | "epoch" | "slice">("all");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(loadWorkspaceMode);
@@ -3073,7 +3108,31 @@ function App() {
     }
   }, []);
 
-  async function toggleVersionPanel() {
+  async function loadContextGraph(sessionId?: string) {
+    const id = sessionId ?? state?.sessionId;
+    if (!id) return;
+    setContextGraphLoading(true);
+    setError("");
+    try {
+      const graph = await api<ContextGraphView>(`/api/session/${encodeURIComponent(id)}/context-graph`);
+      setContextGraph(graph);
+      if (graph.nodes.length && !graph.nodes.some(node => node.id === contextGraphSelectedId)) {
+        setContextGraphSelectedId(graph.recentSlices[0]?.id ?? graph.nodes[graph.nodes.length - 1]?.id ?? null);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setContextGraphLoading(false);
+    }
+  }
+
+  async function openContextGraph() {
+    setManagementView("context-graph");
+    setContextGraphFilter("all");
+    await loadContextGraph();
+  }
+
+    async function toggleVersionPanel() {
     if (!activePath || editingDocument) return;
     if (versionPanelOpen) {
       setVersionPanelOpen(false);
@@ -5712,6 +5771,10 @@ function App() {
             </h2>
           </div>
           <div className="agent-head-actions">
+            <IconButton
+              label="上下文图"
+              onClick={() => void openContextGraph()}
+            ><GitBranch size={16} /></IconButton>
             {!busy && (
               <IconButton
                 label="新建会话"
@@ -7207,10 +7270,16 @@ function App() {
                     ? "会话"
                     : managementView === "prose-gates"
                       ? "作者复审规则"
+                      : managementView === "context-graph"
+                        ? "上下文图"
                       : "连续性事实"}</h2>
               </div>
               <div className="management-actions">
-                {managementView === "characters" ? (
+                {managementView === "context-graph" ? (
+                  <button className="ghost" disabled={contextGraphLoading} onClick={() => void loadContextGraph()}>
+                    <RefreshCw size={15} />{contextGraphLoading ? "加载中…" : "刷新"}
+                  </button>
+                ) : managementView === "characters" ? (
                   <>
                     <button className="ghost" onClick={() => setSimpleCardDraft({ name: "", identity: "", relationship: "", knowledge: "", scene: "", goal: "" })}><Plus size={15} />简易角色</button>
                     <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}><Plus size={15} />普通角色</button>
@@ -7287,7 +7356,119 @@ function App() {
               </div>
             </div>
 
-            {managementView === "characters" ? (
+            {managementView === "context-graph" ? (
+              <div className="context-graph-panel">
+                <div className="context-graph-stats">
+                  <span>活跃 {contextGraph?.stats.activeNodes ?? 0}</span>
+                  <span>归档 {contextGraph?.stats.archivedNodes ?? 0}</span>
+                  <span>交接 {contextGraph?.stats.handoffCount ?? 0}</span>
+                  <span>边 {contextGraph?.stats.edgeCount ?? 0}</span>
+                </div>
+                <p className="context-graph-hint">
+                  过程（工具链）只活在任务 epoch 内；章完成后写入交接节点。编辑/重跑会归档旧枝。点节点查看装配与依赖。
+                </p>
+                <div className="context-graph-filters" role="tablist" aria-label="节点筛选">
+                  {([
+                    ["all", "全部"],
+                    ["active", "活跃"],
+                    ["epoch", "任务"],
+                    ["handoff", "交接"],
+                    ["slice", "装配"],
+                  ] as const).map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      role="tab"
+                      className={contextGraphFilter === id ? "active" : ""}
+                      aria-selected={contextGraphFilter === id}
+                      onClick={() => setContextGraphFilter(id)}
+                    >{label}</button>
+                  ))}
+                </div>
+                <div className="context-graph-layout">
+                  <ul className="context-graph-list">
+                    {(contextGraph?.nodes ?? [])
+                      .filter((node) => {
+                        if (contextGraphFilter === "all") return true;
+                        if (contextGraphFilter === "active") return node.status === "active";
+                        if (contextGraphFilter === "epoch") return node.kind === "epoch";
+                        if (contextGraphFilter === "handoff") return node.kind === "handoff";
+                        if (contextGraphFilter === "slice") return node.kind === "assemble_slice";
+                        return true;
+                      })
+                      .slice()
+                      .reverse()
+                      .map((node) => (
+                        <li key={node.id}>
+                          <button
+                            type="button"
+                            className={`context-graph-node ${contextGraphSelectedId === node.id ? "selected" : ""} status-${node.status}`}
+                            onClick={() => setContextGraphSelectedId(node.id)}
+                          >
+                            <span className="context-graph-kind">{node.kind}</span>
+                            <strong>{node.label}</strong>
+                            <small>
+                              {node.status}
+                              {node.sourceMessageId != null ? ` · msg #${node.sourceMessageId}` : ""}
+                              {" · "}
+                              {new Date(node.createdAt).toLocaleString()}
+                            </small>
+                          </button>
+                        </li>
+                      ))}
+                    {!contextGraphLoading && !(contextGraph?.nodes.length) && (
+                      <li className="context-graph-empty">暂无节点。跑一轮 Agent 写作任务后，这里会出现任务、交接与装配切片。</li>
+                    )}
+                    {contextGraphLoading && <li className="context-graph-empty">加载上下文图…</li>}
+                  </ul>
+                  <div className="context-graph-detail">
+                    {(() => {
+                      const node = contextGraph?.nodes.find((item) => item.id === contextGraphSelectedId);
+                      if (!node) return <p className="context-graph-empty">选择左侧节点查看详情。</p>;
+                      const related = (contextGraph?.edges ?? []).filter(
+                        (edge) => edge.fromId === node.id || edge.toId === node.id,
+                      );
+                      return (
+                        <>
+                          <header>
+                            <span className="eyebrow">{node.kind} · {node.status}</span>
+                            <h3>{node.label}</h3>
+                            <p>
+                              id <code>{node.id}</code>
+                              {node.jobId ? <> · job <code>{node.jobId}</code></> : null}
+                              {node.sourceMessageId != null ? <> · message #{node.sourceMessageId}</> : null}
+                            </p>
+                          </header>
+                          {related.length > 0 && (
+                            <div className="context-graph-edges">
+                              <h4>关系</h4>
+                              <ul>
+                                {related.map((edge) => {
+                                  const otherId = edge.fromId === node.id ? edge.toId : edge.fromId;
+                                  const other = contextGraph?.nodes.find((item) => item.id === otherId);
+                                  const direction = edge.fromId === node.id ? "→" : "←";
+                                  return (
+                                    <li key={edge.id}>
+                                      <button type="button" className="ghost" onClick={() => setContextGraphSelectedId(otherId)}>
+                                        <code>{edge.kind}</code> {direction} {other?.label ?? otherId}
+                                      </button>
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            </div>
+                          )}
+                          <div className="context-graph-payload">
+                            <h4>载荷</h4>
+                            <pre>{JSON.stringify(node.payload, null, 2)}</pre>
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            ) : managementView === "characters" ? (
               <div className="character-grid">
                 {state.characters.length > 0 && (
                   <div className="character-section-heading">
