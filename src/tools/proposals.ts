@@ -19,7 +19,8 @@ import {
   requestIsolatedScene,
 } from "../isolated_scene_writer.js";
 import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
-import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
+import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } from "../prose_length.js";
+import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "../agent_runtime.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
 import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
 import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
@@ -301,24 +302,28 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
   const content = requireString(input.content, "content");
-  const rawTargetCharacters = input.targetCharacters;
+  // 调用方没给数字时用本轮篇幅目标兜底，而不是把交付卡在「必须先报个数」上。
+  const rawTargetCharacters = input.targetCharacters
+    ?? (isScenePipelineDocument(path) ? context.proseLength?.targetCharacters : undefined);
   if (isScenePipelineDocument(path) && rawTargetCharacters === undefined) {
     throw new Error("章节/支线完整正文必须传 targetCharacters；先确定全文目标字数再提交");
   }
+  let lengthNotice: string | undefined;
   if (rawTargetCharacters !== undefined) {
     const targetCharacters = Number(rawTargetCharacters);
-    if (!Number.isInteger(targetCharacters) || targetCharacters < 500 || targetCharacters > 50_000) {
-      throw new Error("targetCharacters 须为 500—50000 的整数");
+    if (!Number.isInteger(targetCharacters)
+      || targetCharacters < MIN_CHAPTER_TARGET_CHARACTERS
+      || targetCharacters > MAX_CHAPTER_TARGET_CHARACTERS) {
+      throw new Error(`targetCharacters 须为 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS} 的整数`);
     }
     const lines = content.trim().split(/\r?\n/u);
     const body = lines[0]?.startsWith("# ") ? lines.slice(1).join("\n").trim() : content.trim();
-    const bounds = proseTargetBounds(targetCharacters);
-    const actualCharacters = proseCharacterCount(body);
-    if (actualCharacters < bounds.minimum || actualCharacters > bounds.maximum) {
-      throw new Error(
-        `正文篇幅 ${actualCharacters} 字，目标 ${targetCharacters} 字，可接受范围 ${bounds.minimum}—${bounds.maximum} 字。请保持既定事实、因果和结局，针对不足或冗余重写后重新提交；不得靠总结、重复或元说明凑字。`,
-      );
-    }
+    const outcome = proseLengthOutcome(
+      assessProseLength(targetCharacters, body),
+      context.proseLength?.enforceMinimum === true,
+    );
+    if (outcome.blocked) throw new Error(outcome.message);
+    lengthNotice = outcome.notice;
   }
   return submitFullDocumentProposal(
     { input, project, store, sessionId, emit, context, characterScope },
@@ -326,6 +331,9 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
     content,
     requireString(input.summary, "summary"),
     input.characterChanges,
+    false,
+    false,
+    lengthNotice,
   );
 }
 
@@ -463,7 +471,9 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
   }
   const finalAssessment = assessProseLength(targetCharacters, generated.content);
   const finalCharacters = finalAssessment.actual;
-  if (finalAssessment.status !== "ok") {
+  // 一次按差量重试之后就不再纠缠：偏长仍然拒收，偏短默认接受并提示。
+  const finalOutcome = proseLengthOutcome(finalAssessment, context.proseLength?.enforceMinimum === true);
+  if (finalOutcome.blocked) {
     throw new Error(`隔离 Writer 重试后正文仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整事件密度或改用场景链`);
   }
   rejectCompressedPlaceholder(generated.content, "隔离 Writer 正文");
@@ -483,6 +493,9 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     proposedContent,
     requireString(input.summary, "summary"),
     input.characterChanges,
+    false,
+    false,
+    finalOutcome.notice,
   );
   const parsed = JSON.parse(submitted) as Record<string, unknown>;
   return JSON.stringify({
@@ -504,6 +517,8 @@ export async function submitFullDocumentProposal(
   characterChanges: unknown,
   proseStyleApproved = false,
   semanticReviewApproved = false,
+  /** 偏短但不阻断时给作者/Agent 看的一句话；随提案结果一起回给 Agent。 */
+  lengthNotice?: string,
 ): Promise<string> {
   const { project, store, sessionId, emit, context, characterScope } = args;
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
@@ -521,7 +536,11 @@ export async function submitFullDocumentProposal(
   // Single funnel for every narrative proposal (场景管线与直接文档两条路都走这里), so the
   // author sees the same quality picture in the review dock no matter how it was written.
   // Advisory: the report never blocks — everything that blocks已在上面 gate 掉了。
-  const qualityReport = isScenePipelineDocument(path) ? buildProseQualityReport(meta.content) : undefined;
+  const qualityReport = isScenePipelineDocument(path)
+    ? buildProseQualityReport(meta.content, context.proseLength
+      ? { lengthTarget: context.proseLength.targetCharacters }
+      : undefined)
+    : undefined;
   const proposal = store.createProposal(
     sessionId,
     path,
@@ -534,6 +553,7 @@ export async function submitFullDocumentProposal(
   return JSON.stringify({
     ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
     submissionKind: existed ? "new_version" : "new_document",
+    ...(lengthNotice ? { lengthNotice } : {}),
     ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),

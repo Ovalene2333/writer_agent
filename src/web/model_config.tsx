@@ -32,6 +32,10 @@ export type ScenePipelineSettings = {
   isolatedWriter: boolean;
   candidateCount: number;
 };
+export type ProseLengthSettings = {
+  chapterTargetCharacters: number;
+  enforceMinimum: boolean;
+};
 export type WritingExecutionMode = "delegated" | "fast";
 export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "continuity-facts" | "connection" | "appearance";
 
@@ -73,6 +77,7 @@ function TestStatusIcon({ status }: { status: TestStatus }) {
 type ModelConfigProps = {
   initialCatalog: ProviderCatalog;
   scenePipeline: ScenePipelineSettings;
+  proseLength: ProseLengthSettings;
   writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
   continuityFactsEnabled: boolean;
@@ -89,6 +94,7 @@ type ModelConfigProps = {
   onSectionChanged: (section: SettingsSection) => void;
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
+  onProseLengthChanged: (settings: ProseLengthSettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
   onContinuityFactsChanged: (enabled: boolean) => void;
   onReviewFollowsProseModelChanged: (enabled: boolean) => void;
@@ -97,6 +103,7 @@ type ModelConfigProps = {
 export function ModelConfig({
   initialCatalog,
   scenePipeline,
+  proseLength,
   writingMode,
   characterEvolutionEnabled,
   continuityFactsEnabled,
@@ -113,12 +120,14 @@ export function ModelConfig({
   onSectionChanged,
   onChanged,
   onScenePipelineChanged,
+  onProseLengthChanged,
   onCharacterEvolutionChanged,
   onContinuityFactsChanged,
   onReviewFollowsProseModelChanged,
 }: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
+  const [lengthDraft, setLengthDraft] = useState(proseLength);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [continuityFactsDraft, setContinuityFactsDraft] = useState(continuityFactsEnabled);
   const [reviewFollowsProseDraft, setReviewFollowsProseDraft] = useState(reviewFollowsProseModel);
@@ -133,16 +142,22 @@ export function ModelConfig({
   const [error, setError] = useState("");
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
+  useEffect(() => setLengthDraft(proseLength), [proseLength]);
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
   useEffect(() => setContinuityFactsDraft(continuityFactsEnabled), [continuityFactsEnabled]);
   useEffect(() => setReviewFollowsProseDraft(reviewFollowsProseModel), [reviewFollowsProseModel]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
+  const lengthDraftInvalid = !Number.isInteger(lengthDraft.chapterTargetCharacters)
+    || lengthDraft.chapterTargetCharacters < 500
+    || lengthDraft.chapterTargetCharacters > 50_000;
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
+    || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
+    || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
     || continuityFactsDraft !== continuityFactsEnabled
     || reviewFollowsProseDraft !== reviewFollowsProseModel
     || Object.keys(sceneDraft).some(key => sceneDraft[key as keyof ScenePipelineSettings] !== scenePipeline[key as keyof ScenePipelineSettings]);
-  const sceneDraftValid = [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
+  const sceneDraftValid = !lengthDraftInvalid && [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
     && sceneDraft.preferredMinScenes <= sceneDraft.preferredMaxScenes
     && sceneDraft.preferredMaxScenes <= sceneDraft.maxScenes
@@ -315,16 +330,19 @@ export function ModelConfig({
         method: "POST",
         body: JSON.stringify({
           scenePipeline: sceneDraft,
+          proseLength: lengthDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
           continuityFactsEnabled: continuityFactsDraft,
           reviewFollowsProseModel: reviewFollowsProseDraft,
         }),
-      }) as { scenePipeline: ScenePipelineSettings; characterEvolutionEnabled: boolean; continuityFactsEnabled: boolean; reviewFollowsProseModel: boolean };
+      }) as { scenePipeline: ScenePipelineSettings; proseLength: ProseLengthSettings; characterEvolutionEnabled: boolean; continuityFactsEnabled: boolean; reviewFollowsProseModel: boolean };
       setSceneDraft(result.scenePipeline);
+      setLengthDraft(result.proseLength);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
       setContinuityFactsDraft(result.continuityFactsEnabled);
       setReviewFollowsProseDraft(result.reviewFollowsProseModel);
       onScenePipelineChanged(result.scenePipeline);
+      onProseLengthChanged(result.proseLength);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
       onContinuityFactsChanged(result.continuityFactsEnabled);
       onReviewFollowsProseModelChanged(result.reviewFollowsProseModel);
@@ -338,6 +356,7 @@ export function ModelConfig({
 
   function resetWritingSettings() {
     setSceneDraft(scenePipeline);
+    setLengthDraft(proseLength);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
     setContinuityFactsDraft(continuityFactsEnabled);
     setReviewFollowsProseDraft(reviewFollowsProseModel);
@@ -488,6 +507,17 @@ export function ModelConfig({
         </section>
 
         <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>章节篇幅</h4><p>不在对话里说字数时，这里就是每章的目标长度；说了「写 6000 字」或「这章长一点」时以对话为准。</p></div></div>
+          <div className="scene-settings-grid compact">
+            <label className={lengthDraftInvalid ? "field-invalid" : ""}><span>默认章节字数</span><input aria-invalid={lengthDraftInvalid} type="number" min="500" max="50000" step="100" value={lengthDraft.chapterTargetCharacters} onChange={event => setLengthDraft(current => ({ ...current, chapterTargetCharacters: Number(event.target.value) }))}/><small>500—50000 字，不计空白。</small></label>
+          </div>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={lengthDraft.enforceMinimum} onChange={event => setLengthDraft(current => ({ ...current, enforceMinimum: event.target.checked }))}/>
+            <span><strong>字数不足时拦截交付</strong><small>默认关闭：偏短只在质量卡上提示，正文照常提交，需要更长直接说一句就行。打开后不达下限会要求重写。超出上限任何时候都会被拦。</small></span>
+          </label>
+        </section>
+
+        <section className="writing-settings-section">
           <div className="writing-settings-section-head"><div><h4>可选场景链</h4><p>默认关闭；开启后，模型只在分场确实有助于连续性或长篇修订时使用。</p></div></div>
           <label className="writing-setting-row">
             <input type="checkbox" checked={sceneDraft.enabled} onChange={event => setSceneDraft(current => ({ ...current, enabled: event.target.checked }))}/>
@@ -518,7 +548,7 @@ export function ModelConfig({
             : writingMode === "fast"
             ? `当前：快速模式。全部写作步骤使用 Agent，不调用正文 Writer；场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场。`
             : `当前：分工模式${sceneDraft.isolatedWriter ? " + 隔离 Writer" : ""}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。`
-          : "请检查场景数量、notes 上限、正文倍率与候选稿数量。"}</div>
+          : "请检查默认章节字数、场景数量、notes 上限、正文倍率与候选稿数量。"}</div>
         <div className="scene-settings-actions">
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
           <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>

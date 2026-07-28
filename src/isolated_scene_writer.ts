@@ -162,12 +162,13 @@ export function buildIsolatedSceneWriterMessages(
   }
 
   const target = input.scene.targetCharacters;
-  const targetBounds = target ? proseTargetBounds(target) : undefined;
   const maximumCharacters = input.strictMaximumCharacters
     ?? input.maximumCharacters
     ?? (target ? Math.floor(target * 2) : undefined);
+  // 只给目标和硬上限，绝不报下限：模型会把它看到的最小合法值当成目标，
+  // 一路写到那里就收尾，于是下限反而成了实际篇幅（还常常压不住地掉到线下）。
   sections.push(target
-    ? `目标篇幅是 ${target} 字，可接受范围 ${targetBounds!.minimum}—${targetBounds!.maximum} 字${maximumCharacters ? `，硬上限 ${maximumCharacters} 字` : ""}。字数是交付约束，但不是精确凑数：关键动作、阻力、转折和余波要完整，过门、解释和重复过程应压缩；不得用总结、回顾或同义反复凑字。`
+    ? `目标篇幅是 ${target} 字${maximumCharacters ? `，硬上限 ${maximumCharacters} 字` : ""}。写足这次变化需要的动作、阻力、后果与余波，宁可略超目标也不要提前收尾；过门、解释和重复过程应压缩，不得用总结、回顾或同义反复凑字。`
     : "变化完成、余波抵达时就结束，不用解释或回顾来填满篇幅。");
   if (input.lengthAdjustment && input.lengthAdjustment.status !== "ok") {
     sections.push(proseLengthAdjustmentInstruction(input.lengthAdjustment));

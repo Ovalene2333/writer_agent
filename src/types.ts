@@ -294,6 +294,11 @@ export interface ProseQualityReport {
   /** 0–100, higher is WORSE (AI 味). */
   aiTells: { score: number; summary: string };
   grade: "good" | "fair" | "weak";
+  /**
+   * 本轮篇幅目标与实际值。偏短不再阻断交付，作者据这一行决定要不要让它再长一点。
+   * 没有目标（例如非章节文档）时缺省。
+   */
+  length?: { target: number; actual: number; status: "ok" | "too_short" | "too_long" };
   warnings: Array<{
     source: "metrics" | "vividness" | "ai_tells";
     code: string;

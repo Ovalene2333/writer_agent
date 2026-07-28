@@ -284,6 +284,35 @@ test("--no-token server mode disables public API authentication only when explic
       );
       assert.equal(removedRuleResponse.status, 200);
       assert.equal((await removedRuleResponse.json() as { removed: boolean }).removed, true);
+      // 篇幅设置是作者调的旋钮，越界值必须在服务端就挡住，别等到写作时才发现目标不合理。
+      const badLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { chapterTargetCharacters: 120 } }),
+      });
+      assert.equal(badLength.status, 400);
+      assert.match(await badLength.text(), /chapterTargetCharacters/);
+      const badEnforce = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { enforceMinimum: "yes" } }),
+      });
+      assert.equal(badEnforce.status, 400);
+      const savedLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { chapterTargetCharacters: 4_200, enforceMinimum: true } }),
+      });
+      assert.equal(savedLength.status, 200);
+      assert.deepEqual(
+        (await savedLength.json() as { proseLength: unknown }).proseLength,
+        { chapterTargetCharacters: 4_200, enforceMinimum: true },
+      );
+      const reloadedLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`);
+      assert.deepEqual(
+        (await reloadedLength.json() as { proseLength: unknown }).proseLength,
+        { chapterTargetCharacters: 4_200, enforceMinimum: true },
+      );
       const unsafeShare = await fetch(`http://127.0.0.1:${openPort}/api/share/readonly`, { method: "POST" });
       assert.equal(unsafeShare.status, 400);
     } finally {

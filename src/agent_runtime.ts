@@ -14,6 +14,22 @@ export const DEFAULT_SCENE_NOTES_CHARACTERS = 3_000;
 export const MIN_ISOLATED_WRITER_MAX_RATIO = 1.2;
 export const MAX_ISOLATED_WRITER_MAX_RATIO = 3;
 export const DEFAULT_ISOLATED_WRITER_MAX_RATIO = 2;
+export const MIN_CHAPTER_TARGET_CHARACTERS = 500;
+export const MAX_CHAPTER_TARGET_CHARACTERS = 50_000;
+export const DEFAULT_CHAPTER_TARGET_CHARACTERS = 3_000;
+
+export interface ProseLengthSettings {
+  /**
+   * 对话没有指定字数时的默认整章目标。作者在这里定一次「这个项目一章多长」，
+   * 之后不必每轮复述数字，也不再由模型按事件密度自行拍板。
+   */
+  chapterTargetCharacters: number;
+  /**
+   * 下限是否硬性拦截。默认关：偏短只提示并记进质量报告，交付照常继续。
+   * 打开后恢复旧行为 —— 不达下限就报错要求重写。上限任何时候都硬拦。
+   */
+  enforceMinimum: boolean;
+}
 
 export interface ScenePipelineSettings {
   /** Whether the optional multi-scene chapter draft pipeline may be used. */
@@ -56,6 +72,8 @@ export interface AgentRuntimeSettings {
    */
   reviewFollowsProseModel: boolean;
   scenePipeline: ScenePipelineSettings;
+  /** 作者的篇幅偏好：默认目标字数与下限执行强度。 */
+  proseLength: ProseLengthSettings;
 }
 
 export interface AgentTodoItem {
@@ -125,6 +143,10 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     isolatedWriter: false,
     candidateCount: 2,
   },
+  proseLength: {
+    chapterTargetCharacters: DEFAULT_CHAPTER_TARGET_CHARACTERS,
+    enforceMinimum: false,
+  },
 };
 
 export const MAX_SCENE_CANDIDATES = 3;
@@ -170,6 +192,16 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
   };
 }
 
+export function normalizeProseLengthSettings(value?: Partial<ProseLengthSettings>): ProseLengthSettings {
+  const raw = Number(value?.chapterTargetCharacters);
+  return {
+    chapterTargetCharacters: Number.isFinite(raw) && raw > 0
+      ? Math.round(Math.min(MAX_CHAPTER_TARGET_CHARACTERS, Math.max(MIN_CHAPTER_TARGET_CHARACTERS, raw)))
+      : DEFAULT_SETTINGS.proseLength.chapterTargetCharacters,
+    enforceMinimum: value?.enforceMinimum === true,
+  };
+}
+
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {
   const path = settingsPath(project);
   if (!existsSync(path)) return { ...DEFAULT_SETTINGS };
@@ -187,6 +219,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       continuityFactsEnabled: raw.continuityFactsEnabled === true,
       reviewFollowsProseModel: raw.reviewFollowsProseModel !== false,
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
+      proseLength: normalizeProseLengthSettings(raw.proseLength),
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -202,6 +235,7 @@ export function saveAgentSettings(
     continuityFactsEnabled?: boolean;
     reviewFollowsProseModel?: boolean;
     scenePipeline?: Partial<ScenePipelineSettings>;
+    proseLength?: Partial<ProseLengthSettings>;
   },
 ): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
@@ -224,6 +258,9 @@ export function saveAgentSettings(
     scenePipeline: patch.scenePipeline
       ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
       : current.scenePipeline,
+    proseLength: patch.proseLength
+      ? normalizeProseLengthSettings({ ...current.proseLength, ...patch.proseLength })
+      : current.proseLength,
   };
   mkdirSync(project.privateDir, { recursive: true });
   writeFileSync(settingsPath(project), `${JSON.stringify(next, null, 2)}\n`, "utf8");

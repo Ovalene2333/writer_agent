@@ -219,6 +219,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
       },
+      proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
@@ -242,6 +243,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 2,
       },
+      proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
     });
     // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
     saveAgentSettings(project, { reviewFollowsProseModel: false });
@@ -251,6 +253,13 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false, "scene patch must preserve review toggle");
     saveAgentSettings(project, { reviewFollowsProseModel: true });
     assert.equal(loadAgentSettings(project).reviewFollowsProseModel, true);
+    // 篇幅档：可单独打补丁，越界值 clamp 而不是抛错，且不碰同组的其他开关。
+    saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 6_000, enforceMinimum: true } });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 6_000, enforceMinimum: true });
+    saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 90_000 } });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 50_000, enforceMinimum: true });
+    saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 100 } });
+    assert.equal(loadAgentSettings(project).proseLength.chapterTargetCharacters, 500);
     // Best-of-N switch: persisted, clamped to 1—3 (2 by default).
     saveAgentSettings(project, { scenePipeline: { candidateCount: 9 } });
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 3);

@@ -48,7 +48,7 @@ import {
 } from "../prose_metrics.js";
 import { analyzeProseVividness, formatVividnessSummary, sceneVividnessFeedback } from "../prose_vividness.js";
 import { analyzeAiTells, formatAiTellSummary, sceneAiTellFeedback } from "../ai_tells.js";
-import { assessProseLength, type ProseLengthAssessment } from "../prose_length.js";
+import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } from "../prose_length.js";
 import {
   analyzeProseStyle,
   isHardBlockSubtype,
@@ -220,7 +220,8 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   const targetCharacters = draft.scenes.find(scene => scene.id === sceneId)?.targetCharacters;
   if (targetCharacters) {
     const assessment = assessProseLength(targetCharacters, submitted);
-    if (assessment.status !== "ok") {
+    // 偏长挤掉后文预算，硬拦；偏短默认放行 —— 这一场本来就可能没那么多事发生。
+    if (proseLengthOutcome(assessment, context.proseLength?.enforceMinimum === true).blocked) {
       throw new Error(
         `本场正文 ${assessment.actual} 字，目标 ${targetCharacters} 字，可接受范围 ${assessment.minimum}—${assessment.maximum} 字。保持本场目标、事实和 actualState 一致，按差量${assessment.status === "too_short" ? `补足约 ${assessment.delta} 字` : `删减约 ${assessment.delta} 字`}后重新提交；不得用总结、重复或元说明凑字。`,
       );
@@ -385,7 +386,9 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
   }
   const finalAssessment = targetCharacters ? assessProseLength(targetCharacters, generated.content) : undefined;
   const finalCharacters = finalAssessment?.actual ?? proseCharacterCount(generated.content);
-  if (targetBounds && finalAssessment?.status !== "ok") {
+  // 同样的非对称：一次差量重试之后偏长仍拒收，偏短默认接受。
+  if (targetBounds && finalAssessment
+    && proseLengthOutcome(finalAssessment, context.proseLength?.enforceMinimum === true).blocked) {
     throw new Error(`隔离正文 Writer 重试后本场仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整本场事件密度后重试`);
   }
   if (!targetBounds && maximumCharacters && finalCharacters > maximumCharacters) {

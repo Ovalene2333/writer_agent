@@ -15,6 +15,7 @@
 import { analyzeAiTells, formatAiTellSummary } from "./ai_tells.js";
 import { analyzeChapterProseMetrics } from "./prose_metrics.js";
 import { analyzeProseVividness, formatVividnessSummary } from "./prose_vividness.js";
+import { assessProseLength } from "./prose_length.js";
 import type { ProseQualityReport } from "./types.js";
 
 /** 生动度低于此分记一次扣分（现场感不足）。 */
@@ -24,7 +25,7 @@ export const AI_TELL_ALERT_SCORE = 40;
 
 export function buildProseQualityReport(
   text: string,
-  options?: { priorText?: string },
+  options?: { priorText?: string; lengthTarget?: number },
 ): ProseQualityReport {
   const metrics = analyzeChapterProseMetrics(text, options?.priorText ? { priorText: options.priorText } : undefined);
   const vividness = analyzeProseVividness(text);
@@ -56,6 +57,7 @@ export function buildProseQualityReport(
     vividness: { score: vividness.stats.score, summary: formatVividnessSummary(vividness.stats) },
     aiTells: { score: aiTells.stats.score, summary: formatAiTellSummary(aiTells.stats) },
     grade: gradeOf(vividness.stats.score, aiTells.stats.score, warnings.length),
+    ...(options?.lengthTarget ? { length: lengthOf(options.lengthTarget, text) } : {}),
     warnings,
   };
 }
@@ -75,9 +77,20 @@ function gradeOf(vividness: number, aiTells: number, warningCount: number): Pros
 }
 
 /** Text rendering for tool results and the agent-facing fallback path. */
+/** 篇幅是报告项，不是判决项：只描述目标与实际的关系，交付与否已在工具端定了。 */
+function lengthOf(target: number, text: string): NonNullable<ProseQualityReport["length"]> {
+  const assessment = assessProseLength(target, text);
+  return { target, actual: assessment.actual, status: assessment.status };
+}
+
 export function formatQualityReportLines(report: ProseQualityReport): string[] {
   return [
     `最终写作质量：${gradeLabel(report.grade)}（${report.characters} 字）`,
+    ...(report.length
+      ? [`篇幅 ${report.length.actual} / 目标 ${report.length.target} 字${
+        report.length.status === "too_short" ? "（偏短）" : report.length.status === "too_long" ? "（偏长）" : ""
+      }`]
+      : []),
     report.vividness.summary,
     report.aiTells.summary,
     ...report.warnings.map(warning => `[${warning.source}/${warning.code}] ${warning.message}`),

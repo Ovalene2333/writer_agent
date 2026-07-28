@@ -18,6 +18,7 @@ import {
   buildRequestComponentUsage,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
+  dynamicContextPrompt,
   buildToolArgumentRepairMessages,
   characterMutationCompletesTask,
   chapterContinuationPrompt,
@@ -69,7 +70,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "e4cfb41bb0f63db3");
+  assert.equal(agentToolSchemaHash(), "5fa7836838927d43");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -741,6 +742,60 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.match(a[4].content ?? "", /风格锚定/);
     assert.match(a[5].content ?? "", /当前任务/);
     assert.doesNotMatch(a[5].content ?? "", /终审专则/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the turn's prose-length target lives in the dynamic tail, never in the stable prefix", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-length-"));
+  try {
+    const project = WriterProject.init(root, "篇幅");
+    const store = new WriterStore(project);
+    const task = {
+      mode: "write_scene" as const,
+      label: "写一章",
+      searchQuery: "",
+      characterIds: [],
+      exampleIds: [],
+      documentContext: "target" as const,
+      creativeDepth: "deliver" as const,
+      editScope: "document" as const,
+      documentProposalRequired: true,
+      continuation: false,
+      todoPlan: [],
+      documentDeliverables: ["chapters/01.md"],
+      outcome: "document" as const,
+      evidence: "none" as const,
+      mutation: "document" as const,
+      planning: "adaptive" as const,
+      capabilities: ["documents" as const],
+      workflow: "chapter_delivery" as const,
+      qualityProfile: "standard" as const,
+    };
+    const scenePipeline = {
+      enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
+      notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+    };
+    const withTarget = dynamicContextPrompt(
+      project, store, "写一章", task, "ask", scenePipeline, "fast", false,
+      undefined, undefined, undefined, false,
+      { targetCharacters: 4_200, source: "prompt_relative" },
+    );
+    assert.match(withTarget, /本轮篇幅目标：整章约 4200 字/u);
+    assert.match(withTarget, /用户本轮要求相对项目默认调整/u);
+
+    // 这个数字每轮都可能变，只能待在 miss-priced 的动态块里。
+    const stable = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "write_scene");
+    assert.equal(stable.length, 6);
+    assert.ok(stable.every(message => !/本轮篇幅目标/u.test(message.content ?? "")));
+
+    // 没有解析出目标时不占位，免得给动态块加一行常量字节。
+    const withoutTarget = dynamicContextPrompt(
+      project, store, "写一章", task, "ask", scenePipeline, "fast", false,
+    );
+    assert.doesNotMatch(withoutTarget, /本轮篇幅目标：/u);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

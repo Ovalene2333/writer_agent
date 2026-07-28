@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  MAX_CHAPTER_TARGET_CHARACTERS,
+  MIN_CHAPTER_TARGET_CHARACTERS,
+} from "../agent_runtime.js";
+import { PROSE_TARGET_BAND_TEXT } from "../prose_length.js";
 import type { ToolDefinition } from "./types.js";
 
 /**
@@ -336,7 +341,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "本场直接结果" },
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "本场目标正文 200—8000 字；工具按 85%—120% 验收" },
+                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -367,7 +372,7 @@ export const TOOLS = deepFreeze([
           turn: { type: "string", description: "预期落空、代价或关系变化" },
           outcome: { type: "string", description: "正文收束时的直接结果" },
           notes: { type: "string", description: "故事内材料；长度上限由场景链设置决定" },
-          targetCharacters: { type: "number", description: "目标正文 500—5000 字；工具按 85%—120% 验收并在偏差时重试" },
+          targetCharacters: { type: "number", description: `目标正文 500—5000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收并在偏差时重试` },
           summary: { type: "string", description: "提案摘要" },
           characterChanges: {
             type: "array", maxItems: 8,
@@ -402,7 +407,7 @@ export const TOOLS = deepFreeze([
             type: "string",
             description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
-          content: { type: "string", description: "仅本场正文，不含任何 markdown 标题；guide 有 targetCharacters 时按 85%—120% 验收" },
+          content: { type: "string", description: `仅本场正文，不含任何 markdown 标题；guide 有 targetCharacters 时按 ${PROSE_TARGET_BAND_TEXT} 验收` },
           actualState: {
             type: "object",
             description: "从实际正文归纳的离场状态；不可照抄计划",
@@ -466,7 +471,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "预期结果；实际正文可以合理偏离" },
                 handoff: { type: "string", description: "可能如何交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "本场目标正文 200—8000 字；工具按 85%—120% 验收" },
+                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -570,7 +575,7 @@ export const TOOLS = deepFreeze([
         properties: {
           path: { type: "string", description: "文档路径" },
           content: { type: "string", description: "完整 Markdown" },
-          targetCharacters: { type: "number", description: "正文目标字数 500—50000；章节/支线正文须传，按 85%—120% 验收（不计首行标题）" },
+          targetCharacters: { type: "number", description: `正文目标字数 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS}；章节/支线正文须传，用本轮篇幅目标，按 ${PROSE_TARGET_BAND_TEXT} 验收（不计首行标题）：超上限拒收，不足下限只提示` },
           summary: { type: "string", description: "修改摘要" },
           characterChanges: {
             type: "array", maxItems: 8,

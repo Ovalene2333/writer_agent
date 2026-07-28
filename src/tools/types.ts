@@ -74,6 +74,11 @@ export type ToolExecutionContext = {
   writePackSceneId?: string;
   /** Current project scene-chain guidance and enforced per-document limit. */
   scenePipelineSettings?: ScenePipelineSettings;
+  /**
+   * 本轮整章篇幅目标与下限执行强度。工具在调用方没给 targetCharacters 时用它兜底，
+   * 并据 enforceMinimum 决定偏短是拦截还是只提示。
+   */
+  proseLength?: { targetCharacters: number; enforceMinimum: boolean };
   /** In-run narrative draft; never writes a partial document to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**

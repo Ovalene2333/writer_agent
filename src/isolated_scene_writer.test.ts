@@ -367,3 +367,22 @@ test("direct isolated document keeps prose generation outside the Agent transcri
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the first writer pass sees the target and the ceiling but never a floor number", () => {
+  // 模型会把它看到的最小合法值当成目标；报下限等于把下限变成实际篇幅。
+  const messages = buildIsolatedSceneWriterMessages({ scene, writePack: pack });
+  assert.match(messages[1].content, /目标篇幅是 400 字/u);
+  assert.match(messages[1].content, /硬上限 800 字/u);
+  assert.doesNotMatch(messages[1].content, /可接受范围/u);
+  assert.doesNotMatch(messages[1].content, /不得少于/u);
+  assert.doesNotMatch(messages[1].content, /300 字/u);
+});
+
+test("the retry pass is the only place a hard floor appears", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    strictMinimumCharacters: 360,
+  });
+  assert.match(messages[1].content, /不得少于 360 字/u);
+});

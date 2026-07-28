@@ -70,7 +70,10 @@ import {
   type ConnectionProbeResults,
   type ConnectionPreference,
 } from "./connection";
-import { ModelConfig, type ProviderCatalog, type ScenePipelineSettings, type SettingsSection, type WritingExecutionMode } from "./model_config";
+import { ModelConfig, type ProseLengthSettings, type ProviderCatalog, type ScenePipelineSettings, type SettingsSection, type WritingExecutionMode } from "./model_config";
+
+/** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
+const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, enforceMinimum: false };
 import "./style.css";
 
 /** Rule-layer writing-quality picture. Absent on非正文提案与旧提案 —— 渲染时必须容忍。 */
@@ -81,6 +84,8 @@ type ProseQualityReport = {
   /** 越高越可疑（AI 味）。 */
   aiTells: { score: number; summary: string };
   grade: "good" | "fair" | "weak";
+  /** 本轮篇幅目标与实际；偏短不阻断交付，只在这里露出来。 */
+  length?: { target: number; actual: number; status: "ok" | "too_short" | "too_long" };
   warnings: Array<{ source: "metrics" | "vividness" | "ai_tells"; code: string; message: string; examples: string[] }>;
 };
 
@@ -122,7 +127,12 @@ function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
         <span className="proposal-quality-metric" title={report.aiTells.summary}>
           AI 味 {report.aiTells.score}
         </span>
-        <span className="proposal-quality-chars">{report.characters} 字</span>
+        {report.length
+          ? <span
+              className={`proposal-quality-chars length-${report.length.status}`}
+              title={`目标 ${report.length.target} 字${report.length.status === "too_short" ? "；偏短，想更长直接说一句" : report.length.status === "too_long" ? "；偏长" : ""}`}
+            >{report.length.actual} / {report.length.target} 字</span>
+          : <span className="proposal-quality-chars">{report.characters} 字</span>}
       </div>
       {report.warnings.length > 0 && (
         <>
@@ -558,7 +568,7 @@ type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline: ScenePipelineSettings };
+  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline: ScenePipelineSettings; proseLength?: ProseLengthSettings };
   proseGateRules?: ProseGateRule[];
   continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;
@@ -7775,6 +7785,7 @@ function App() {
       {managementView === "models" && <ModelConfig
         initialCatalog={state.providerCatalog}
         scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
+        proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
         writingMode={state.agentSettings?.writingMode ?? "fast"}
         characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
         continuityFactsEnabled={state.agentSettings?.continuityFactsEnabled ?? false}
@@ -7905,6 +7916,19 @@ function App() {
             continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
             reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
             scenePipeline,
+            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          },
+        } : previous)}
+        onProseLengthChanged={proseLength => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+            writingMode: previous.agentSettings?.writingMode ?? "fast",
+            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+            proseLength,
           },
         } : previous)}
         onCharacterEvolutionChanged={characterEvolutionEnabled => setState(previous => previous ? {
@@ -7916,6 +7940,7 @@ function App() {
             continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
             reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
         } : previous)}
         onContinuityFactsChanged={continuityFactsEnabled => setState(previous => previous ? {
@@ -7927,6 +7952,7 @@ function App() {
             continuityFactsEnabled,
             reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
         } : previous)}
         onReviewFollowsProseModelChanged={reviewFollowsProseModel => setState(previous => previous ? {
@@ -7938,6 +7964,7 @@ function App() {
             continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
             reviewFollowsProseModel,
             scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
         } : previous)}
       />}

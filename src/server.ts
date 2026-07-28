@@ -11,9 +11,11 @@ import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
 import {
   ABSOLUTE_MAX_SCENES,
+  MAX_CHAPTER_TARGET_CHARACTERS,
   MAX_ISOLATED_WRITER_MAX_RATIO,
   MAX_SCENE_NOTES_CHARACTERS,
   MAX_SCENE_CANDIDATES,
+  MIN_CHAPTER_TARGET_CHARACTERS,
   MIN_ISOLATED_WRITER_MAX_RATIO,
   MIN_SCENE_NOTES_CHARACTERS,
   isPermissionMode,
@@ -22,6 +24,7 @@ import {
   loadProjectInstructions,
   saveAgentSettings,
   isWritingExecutionMode,
+  type ProseLengthSettings,
   type ScenePipelineSettings,
   type WritingExecutionMode,
 } from "./agent_runtime.js";
@@ -965,6 +968,7 @@ export async function startWriterServer(options: {
       characterEvolutionEnabled: settings.characterEvolutionEnabled,
       reviewFollowsProseModel: settings.reviewFollowsProseModel,
       scenePipeline: settings.scenePipeline,
+      proseLength: settings.proseLength,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description, path: skill.path,
@@ -974,7 +978,7 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline?: Partial<ScenePipelineSettings> }>();
+      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline?: Partial<ScenePipelineSettings>; proseLength?: Partial<ProseLengthSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
@@ -1030,6 +1034,21 @@ export async function startWriterServer(options: {
           }, 400);
         }
       }
+      if (body.proseLength !== undefined) {
+        const target = body.proseLength.chapterTargetCharacters;
+        if (target !== undefined && (
+          !Number.isInteger(target)
+          || Number(target) < MIN_CHAPTER_TARGET_CHARACTERS
+          || Number(target) > MAX_CHAPTER_TARGET_CHARACTERS
+        )) {
+          return context.json({
+            error: `chapterTargetCharacters 须为 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS} 的整数`,
+          }, 400);
+        }
+        if (body.proseLength.enforceMinimum !== undefined && typeof body.proseLength.enforceMinimum !== "boolean") {
+          return context.json({ error: "enforceMinimum 必须是布尔值" }, 400);
+        }
+      }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
         ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
@@ -1037,6 +1056,7 @@ export async function startWriterServer(options: {
         ...(typeof body.continuityFactsEnabled === "boolean" ? { continuityFactsEnabled: body.continuityFactsEnabled } : {}),
         ...(typeof body.reviewFollowsProseModel === "boolean" ? { reviewFollowsProseModel: body.reviewFollowsProseModel } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
+        ...(body.proseLength ? { proseLength: body.proseLength } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
@@ -1045,6 +1065,7 @@ export async function startWriterServer(options: {
         continuityFactsEnabled: settings.continuityFactsEnabled,
         reviewFollowsProseModel: settings.reviewFollowsProseModel,
         scenePipeline: settings.scenePipeline,
+        proseLength: settings.proseLength,
       });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);

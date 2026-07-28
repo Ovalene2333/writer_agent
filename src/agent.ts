@@ -7,6 +7,7 @@ import { WriterStore } from "./store.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { proseMannerismPreflightLine } from "./prose_quality.js";
+import { PROSE_TARGET_BAND_TEXT, resolveTurnProseLength, type TurnProseLength } from "./prose_length.js";
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
@@ -424,7 +425,7 @@ ${modeRule}
  * CACHE: OK to be turn-specific; keep structuredCreativeContext slim (ids/fingerprints,
  * not full example bodies — those belong in dynamicStyleGroundingPrompt when intensive).
  */
-function dynamicContextPrompt(
+export function dynamicContextPrompt(
   project: WriterProject,
   store: WriterStore,
   request: string,
@@ -437,6 +438,7 @@ function dynamicContextPrompt(
   continuationPath?: string,
   simpleCharacterScope?: number[],
   resumeInterrupted?: boolean,
+  proseLength?: TurnProseLength,
 ): string {
   const explicitReferences = explicitReferencePaths(project, request);
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
@@ -485,6 +487,17 @@ function dynamicContextPrompt(
     continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/提案确定路径。"}记忆有末尾且未变则续写；否则 inspect 一次 + read(lastSection=true)。`,
   };
   const reviewBlock = task.mode === "audit" ? `\n\n${REVIEW_PROMPT}` : "";
+  // 作者定的篇幅，不是模型按事件密度自己拍的。来源写出来，作者一看就知道这个数字
+  // 是他这句话带来的还是项目默认档。
+  const proseLengthLine = proseLength && (task.documentProposalRequired || task.mode === "write_scene" || task.mode === "rewrite")
+    ? `\n本轮篇幅目标：整章约 ${proseLength.targetCharacters} 字（${
+      proseLength.source === "prompt_exact"
+        ? "用户本轮指定"
+        : proseLength.source === "prompt_relative"
+          ? "用户本轮要求相对项目默认调整"
+          : "项目默认篇幅档"
+    }）。propose_document 用这个数字作 targetCharacters；场景链各场之和对齐它。用户本轮另给数字时以用户为准。`
+    : "";
   const resumeLine = resumeInterrupted
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
     : "";
@@ -513,7 +526,7 @@ ${taskInstructions(
 简易卡范围：${simpleCharacterScopeInstruction}
 角色演进：${characterEvolutionInstruction}
 写入：${documentInstruction}
-修改范围：${editScopeInstruction[task.editScope]}
+修改范围：${editScopeInstruction[task.editScope]}${proseLengthLine}
 写作模式：${writingMode === "fast" ? "快速模式；沿用传统单 Agent 链路，由当前 Agent 完成检索、编排与直接提案，不调用正文 Writer。" : "分工模式；Agent 负责检索与编排，实际正文可交给隔离 Writer。"}
 场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场。链内正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer" : "主 Agent"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、write_chapter_scene_notes、revise_chapter_scene_guide、inspect_chapter_draft 或 propose_chapter_draft，直接使用普通文档交付路径。"}
 
@@ -1208,7 +1221,7 @@ export function taskInstructions(
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
 - ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
-- 正文开始前先确定目标字数。用户给出数字时以该数字为全文目标，不擅自缩减；未给数字时根据事件密度确定一个明确目标。直接 propose_document 必须传 targetCharacters；场景链必须给每场 targetCharacters，且各场之和对齐全文目标。工具按目标的 85%—120% 验收；篇幅不足要扩展行动、阻力、后果、反应和余波，篇幅过长先删不改变选择的说明与重复过程，禁止用总结、同义复述、额外支线或元说明凑字。
+- 全文目标字数以「本轮篇幅目标」为准，不擅自缩减，也不另按事件密度改判。直接 propose_document 必须传 targetCharacters（等于该目标）；场景链必须给每场 targetCharacters，且各场之和对齐该目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径提交，系统会把整篇成稿记录为该文档的新版本；不要为避开同名另起副本或改写章节路径。局部修改仍用 patch，只有承接现有结尾才用 append。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
     ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
@@ -1738,6 +1751,8 @@ export async function runAgent(options: {
   const scenePipelineSettings: ScenePipelineSettings = fastWritingMode
     ? { ...configuredScenePipelineSettings, isolatedWriter: false, candidateCount: 1 }
     : configuredScenePipelineSettings;
+  // 本轮篇幅目标：项目默认档 + 用户这句话的覆盖。纯字符串解析，不额外调模型。
+  const turnProseLength = resolveTurnProseLength(prompt, runtimeSettings.proseLength);
   emit({ type: "mode", mode: permissionMode });
 
   // 写作 Agent 可读全部通道；扮演试演会标注 channel=roleplay，供人设/对白参考。
@@ -1902,6 +1917,10 @@ export async function runAgent(options: {
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
     ...(restoredChapterDraft ? { chapterSceneDraft: restoredChapterDraft } : {}),
     scenePipelineSettings,
+    proseLength: {
+      targetCharacters: turnProseLength.targetCharacters,
+      enforceMinimum: runtimeSettings.proseLength.enforceMinimum,
+    },
     proseAdjudicator: {
       model: adjudicatorModel,
       signal,
@@ -1992,6 +2011,7 @@ export async function runAgent(options: {
       continuationPath,
       simpleCharacterScope,
       options.resumeInterrupted === true,
+      turnProseLength,
     ),
     dynamicStyleContext: dynamicStyleContext || undefined,
     bootstrapContext: bootstrapContext || undefined,

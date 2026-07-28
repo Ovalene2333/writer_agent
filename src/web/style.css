@@ -2637,6 +2637,9 @@ button.agent-orb:focus-visible {
   background: var(--warn-light); color: var(--warn);
 }
 .proposal-quality-chars { margin-left: auto; color: var(--text-faint); }
+/* 篇幅只是提示：偏离目标时提一级对比度，但不用报警色 —— 交付并没有被拦下。 */
+.proposal-quality-chars.length-too_short,
+.proposal-quality-chars.length-too_long { color: var(--text-muted); }
 .proposal-quality-toggle {
   margin-top: 6px; padding: 0; border: 0; background: none; cursor: pointer;
   font: 11px var(--font-mono); color: var(--text-faint);
