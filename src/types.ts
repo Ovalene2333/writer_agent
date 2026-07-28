@@ -364,7 +364,7 @@ export interface ChapterSummary {
 
 /** Per-model-call token stats (one agent step / draft call). */
 export interface RequestComponentUsage {
-  kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
+  kind: "stable_system" | "replayed_turn" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
   label: string;
   characters: number;
   estimatedTokens: number;
@@ -391,6 +391,45 @@ export interface StepUsage {
   cacheHitRate?: number;
   /** Pre-request estimate by message/schema component; provider usage remains authoritative. */
   requestComponents?: RequestComponentUsage[];
+}
+
+/** Compact Agent step card persisted for workspace refresh / session reload. */
+export interface PersistedStreamStep {
+  id: number;
+  output: string;
+  reasoning: string;
+  tools: string[];
+  status: "running" | "completed" | "failed";
+  usage?: StepUsage;
+}
+
+/** Server-side step trail keyed by the user (source) message of a turn. */
+export interface MessageStepTrail {
+  sourceMessageId: number;
+  jobId?: string;
+  steps: PersistedStreamStep[];
+  updatedAt: string;
+}
+
+/**
+ * One frozen conversation turn (dynamic context block + its tool transcript),
+ * replayed byte-verbatim on later turns of the same session so the provider
+ * prefix cache keeps hitting. `messages` is the exact wire shape that was sent;
+ * never lean-ify it in place — a rewritten body costs one extra full miss.
+ */
+export interface AgentTurnBlock {
+  turnIndex: number;
+  messages: AgentTurnMessage[];
+  estimatedTokens: number;
+  createdAt: string;
+}
+
+export interface AgentTurnMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
+  reasoning_content?: string;
 }
 
 export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";

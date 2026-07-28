@@ -32,6 +32,7 @@ import {
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
+import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
   DEFAULT_SCENE_NOTES_CHARACTERS,
   formatTodosForPrompt,
@@ -84,12 +85,21 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  * a byte-stable longest common prefix on the request. Follow these rules whenever
  * you add or rewrite prompts, system slots, tools, or message assembly:
  *
- * 1) MESSAGE ORDER — stable first, dynamic last
+ * 1) MESSAGE ORDER — stable first, replayed history next, this turn's bytes last
+ *    [tools schema]
  *    [buildStableSystemPrefix: 6 fixed system slots]
- *    [buildDynamicTurnMessages: 8 fixed system slots + 1 user]
+ *    [frozen turns 1..N-1, replayed byte-verbatim from agent_turn_blocks]
+ *    [this turn's dynamic block]
+ *      turn 1 : buildDynamicTurnMessages — 8 fixed system slots + 1 user
+ *      turn 2+: mergedTurnContext — ONE user message (see rule 4b)
  *    [assistant / tool turns appended during the job]
  *    Never insert optional system messages *between* stable slots; use the
  *    existing placeholder text when a block is empty so slot indices never shift.
+ *    Each finished turn is frozen (freezeTurnBlock) and replayed on the next turn,
+ *    so the only new bytes in turn N are turn N's own block. Replay is VERBATIM —
+ *    never lean-ify a block on the way out, or the common prefix ends right there.
+ *    Boundaries reported to the observers: stableMessageCount(6) ≤
+ *    replayedMessageCount ≤ initialMessageCount.
  *
  * 2) STABLE PREFIX (cross-turn cache)
  *    writingSystemPrompt, executionRulesPrompt, project instructions, skills
@@ -100,16 +110,27 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    and sample bodies in the dynamic tail. Frequent copy edits to stable text
  *    invalidate everyone's cache — batch them.
  *
- * 3) DYNAMIC TAIL (always miss-priced — keep short)
- *    history preview, archive stats, task/dynamicContext (+ audit REVIEW when needed),
- *    dynamic style evidence (范文/章节样本), bootstrap index, todos, work-memory
- *    catalog, user selection, current user. Prefer digests / ids / paths; full
- *    prose belongs in tool results or read_conversation paging, not auto-injection.
+ * 3) THIS TURN'S DYNAMIC BLOCK (the only miss-priced bytes — keep short)
+ *    task/dynamicContext (+ audit REVIEW when needed), dynamic style evidence
+ *    (范文/章节样本), bootstrap index, todos, work-memory catalog, user selection,
+ *    current user request. Prefer digests / ids / paths; full prose belongs in
+ *    tool results or read_conversation paging, not auto-injection.
+ *    From turn 2 the history preview and conversationStats (total / characters /
+ *    lastMessageId) are deliberately DROPPED: the real transcript is now in the
+ *    request, and those counters change every single turn — sitting at the front
+ *    of the tail they pinned the divergence point at slot 0 and made every stable
+ *    slot behind them unreachable. Do not reintroduce a per-turn counter here.
+ *    dynamicContextPrompt states that earlier「当前任务」blocks are historical, so
+ *    replayed instructions cannot be mistaken for live ones.
  *
  * 4) APPEND-ONLY WITHIN ONE runAgent JOB
  *    After the first streamCompletion, do not mutate earlier messages (no mid-job
  *    compactRuntimeMessages / rehydrate / stripStaleReasoning / compactCompletedToolCalls).
  *    Compactors are only for rebuilding a transcript outside an active job.
+ *    Cross-turn this extends to the frozen chain: loadReplayMessages may compact
+ *    or drop whole turns, but only *before* the job's first request, and it writes
+ *    the shrunk form back so the shrink is paid for exactly once and then becomes
+ *    the new cacheable prefix. Never rewrite replayed bytes on the fly.
  *    Sole exceptions — boundary truncations (never rewrites, so the surviving
  *    prefix still cache-hits):
  *    a) Chapter boundary: after a successful proposal with further writing steps,
@@ -135,18 +156,35 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    not extend the reported hit on exact replay; do not assume tiny suffixes are
  *    immediately cacheable without accounting for provider cache-block granularity.
  *
- * 5) TOOLS SCHEMA
+ * 5) NO `system` MESSAGE MAY FOLLOW ASSISTANT/TOOL HISTORY — EVER
+ *    The measurements in rule 4 are not a scene-boundary detail; they constrain
+ *    the whole layout. Consequences, all of them hard requirements:
+ *    a) From turn 2 the dynamic block MUST be a single role "user" message
+ *       (mergedTurnContext), because frozen turns now precede it. The eight
+ *       system slots keep their exact text and order — only the container
+ *       changes. Turn 1 keeps today's 8-system + 1-user shape verbatim, since
+ *       nothing precedes it. agent_cache.test.ts locks both shapes.
+ *    b) freezeTurnBlock drops any system message that appears after the
+ *       transcript starts, and drops dangling tool_calls / orphan tool results
+ *       (a provider 400 otherwise). On a healthy turn both are no-ops, which is
+ *       what keeps replay byte-verbatim.
+ *    c) reasoning_content is KEPT in frozen blocks: the live loop already
+ *       replays it between steps, so it is part of the prefix the provider has
+ *       cached — stripping it would move the divergence to the first assistant
+ *       turn.
+ *
+ * 6) TOOLS SCHEMA
  *    src/tools/schema.ts TOOLS is the stable universal capability catalog. Keep
  *    it byte-identical throughout a job and across task modes. The semantic task
  *    contract authorizes side effects at execution time; a fallible mode label
  *    must never make recovery/read capabilities disappear.
  *
- * 6) TASK CONTRACT COMPILER
+ * 7) TASK CONTRACT COMPILER
  *    compileWritingTaskContract is a small, tool-free Flash call. It declares the
  *    outcome, evidence and mutation obligations but does not prescribe a frozen
  *    execution path. The main Agent owns and revises the live plan from tool facts.
  *
- * 7) DEDUPE
+ * 8) DEDUPE
  *    Prefer one compact rule + cross-reference over pasting the same mannerism /
  *    craft checklist into system + style + task workflow + review.
  *
@@ -167,6 +205,7 @@ type PrefixCacheRequestContext = {
   step?: number;
   stableMessageCount: number;
   initialMessageCount: number;
+  replayedMessageCount?: number;
 };
 
 type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "character" | "simple_character" | "general";
@@ -455,6 +494,7 @@ mode 只决定表达与领域工作流，不限制可见工具。根据工具事
 ${writingWorkflowPrompt(task.workflow ?? "free", task.qualityProfile ?? "fast")}
 ${resumeLine}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
+上文中出现过的历次「当前任务」区块均为历史记录，其指令、清单与终审要求都已失效；只有本区块之后的要求现在生效。
 作者复审：${proseGateInstruction}
 
 ${taskInstructions(
@@ -1928,35 +1968,51 @@ export async function runAgent(options: {
       : {}),
   };
   // Assemble per PROMPT / PREFIX-CACHE CONTRACT (top of this file):
-  // stable 6 + dynamic 9, then append-only tool loop. See buildStableSystemPrefix /
-  // buildDynamicTurnMessages for slot maps when adding new prompt material.
+  // stable 6 + replayed frozen turns + this turn's context block, then append-only
+  // tool loop. See buildStableSystemPrefix / buildDynamicTurnMessages / mergedTurnContext
+  // for slot maps when adding new prompt material.
+  const replayBudgetTokens = Math.max(8_000, Math.floor((executionModel.pricing?.contextWindow ?? 128_000) / 2));
+  const replay = loadReplayMessages({
+    store,
+    sessionId,
+    budgetTokens: replayBudgetTokens,
+    compact: compactRuntimeMessages,
+  });
+  const turnContextParts = {
+    taskContext: dynamicContextPrompt(
+      project,
+      store,
+      prompt,
+      task,
+      permissionMode,
+      scenePipelineSettings,
+      runtimeSettings.writingMode,
+      runtimeSettings.characterEvolutionEnabled,
+      characterScope,
+      continuationPath,
+      simpleCharacterScope,
+      options.resumeInterrupted === true,
+    ),
+    dynamicStyleContext: dynamicStyleContext || undefined,
+    bootstrapContext: bootstrapContext || undefined,
+    todosPrompt,
+    artifactContext: artifactContext || undefined,
+    selectedContext: selectedContext || undefined,
+    prompt,
+  };
   const messages: ApiMessage[] = [
     ...stableSystemPrefix,
-    ...buildDynamicTurnMessages({
-      historyText,
-      archiveContext,
-      taskContext: dynamicContextPrompt(
-        project,
-        store,
-        prompt,
-        task,
-        permissionMode,
-        scenePipelineSettings,
-        runtimeSettings.writingMode,
-        runtimeSettings.characterEvolutionEnabled,
-        characterScope,
-        continuationPath,
-        simpleCharacterScope,
-        options.resumeInterrupted === true,
-      ),
-      dynamicStyleContext: dynamicStyleContext || undefined,
-      bootstrapContext: bootstrapContext || undefined,
-      todosPrompt,
-      artifactContext: artifactContext || undefined,
-      selectedContext: selectedContext || undefined,
-      prompt,
-    }),
+    ...replay.messages,
+    // First turn of a session keeps today's exact 8-system + 1-user shape (nothing
+    // precedes it, so system slots are still legal). From turn 2 the same bodies in
+    // the same order must fold into one `user` message — see mergedTurnContext.
+    ...(replay.messages.length
+      ? [mergedTurnContext(turnContextParts)]
+      : buildDynamicTurnMessages({ historyText, archiveContext, ...turnContextParts })),
   ];
+  // Everything before this turn's own context block: frozen bytes the provider has
+  // already seen. Observation classifies these separately from the live dynamic tail.
+  const replayedMessageCount = stableSystemPrefix.length + replay.messages.length;
   // Multi-chapter boundary resets truncate back to exactly this prefix (see contract §4).
   const initialMessageCount = messages.length;
   // Scene-boundary resets truncate back here (§4b): advanced past prep reads when
@@ -1991,6 +2047,23 @@ export async function runAgent(options: {
   ));
   const replannedFailures = new Set<string>();
   let thinkingContinuationDisabled = false;
+  /**
+   * Freeze this turn (its context block + tool transcript) so the next turn in the
+   * same session replays it instead of rebuilding from zero. Called on the normal
+   * and cancelled exits only — an exception leaves a half-written tail that must
+   * not become someone's cached prefix. Never called mid-job: contract §4.
+   */
+  const freezeCurrentTurn = () => {
+    try {
+      const block = freezeTurnBlock(messages, replayedMessageCount);
+      if (!block.length) return;
+      store.appendAgentTurnBlock(sessionId, {
+        turnIndex: store.nextAgentTurnIndex(sessionId),
+        messages: block,
+        estimatedTokens: approximateMessageTokens(block),
+      });
+    } catch { /* 缓存优化失败不影响本轮结果。 */ }
+  };
 
   try {
     // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
@@ -2023,7 +2096,7 @@ export async function runAgent(options: {
         : thinkingContinuationDisabled
         ? nonThinkingRequestOptions(stepModel)
         : thinkingRequestOptions(stepModel);
-      const requestComponents = buildRequestComponentUsage(messages, executionTools, 6, initialMessageCount);
+      const requestComponents = buildRequestComponentUsage(messages, executionTools, 6, initialMessageCount, replayedMessageCount);
       const result = await streamCompletion(stepModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
@@ -2040,6 +2113,7 @@ export async function runAgent(options: {
           step,
           stableMessageCount: 6,
           initialMessageCount,
+          replayedMessageCount,
         },
         ...stepThinkingOptions,
       });
@@ -2091,6 +2165,11 @@ export async function runAgent(options: {
         }
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
         store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+        // This step's reply was never pushed into `messages` (the loop returns here),
+        // so close the transcript before freezing — otherwise the next turn replays a
+        // tool result with no answer after it.
+        messages.push({ role: "assistant", content: answer });
+        freezeCurrentTurn();
         emit({ type: "done", sessionId });
         return;
       }
@@ -2488,6 +2567,9 @@ export async function runAgent(options: {
         if (assistantParts.length) store.addMessage(sessionId, "assistant", assistantParts.join("\n\n"), "agent", options.variantGroupId);
       } catch { /* 消息保存失败不影响流程 */ }
       if (waitingEvent) emit({ type: "waiting_for_input", sessionId, ...waitingEvent });
+      // The answer arrives as the next turn — replaying this one is exactly what
+      // makes「接着刚才那个问题」cheap instead of a full rebuild.
+      freezeCurrentTurn();
       return;
     }
     if (documentProposalSubmitted) {
@@ -2500,6 +2582,7 @@ export async function runAgent(options: {
         }
       } catch { /* 消息保存失败不影响流程 */ }
       // Last proposal with no further writing steps — checklist already advanced.
+      freezeCurrentTurn();
       emit({ type: "done", sessionId });
       return;
     }
@@ -2514,6 +2597,9 @@ export async function runAgent(options: {
   } catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
       if (transcript.trim()) store.addMessage(sessionId, "assistant", `${transcript.trim()}\n\n[生成已中断]`, "agent", options.variantGroupId);
+      // Resuming after a cancel should not re-pay the work already done; freezeTurnBlock
+      // drops the dangling tool_calls the abort left behind.
+      freezeCurrentTurn();
       emit({ type: "cancelled", sessionId });
       return;
     }
@@ -3379,6 +3465,8 @@ export function buildRequestComponentUsage(
   tools: readonly ToolDefinition[],
   stableMessageCount: number,
   initialMessageCount: number,
+  /** End of the replayed frozen turns; defaults to "no replay" for isolated calls. */
+  replayedMessageCount = stableMessageCount,
 ): RequestComponentUsage[] {
   const components: RequestComponentUsage[] = [];
   const append = (kind: RequestComponentUsage["kind"], label: string, text: string, fingerprint = false) => {
@@ -3401,8 +3489,9 @@ export function buildRequestComponentUsage(
       ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
     });
     if (index < stableMessageCount) append("stable_system", `稳定 system ${index + 1}`, serialized, true);
+    else if (index < replayedMessageCount) append("replayed_turn", `复放历史 ${index - stableMessageCount + 1}`, serialized);
     else if (index < initialMessageCount && message.role === "user") append("user", "当前用户请求", serialized);
-    else if (index < initialMessageCount) append("dynamic_system", `动态尾部 ${index - stableMessageCount + 1}`, serialized);
+    else if (index < initialMessageCount) append("dynamic_system", `动态尾部 ${index - replayedMessageCount + 1}`, serialized);
     else if (message.role === "tool") append("tool_result", `工具结果 ${message.tool_call_id ?? index}`, serialized);
     else if (message.role === "assistant") append("assistant", `Agent 历史 ${index - initialMessageCount + 1}`, serialized);
     else if (message.role === "user") append("user", `用户/阶段交接 ${index - initialMessageCount + 1}`, serialized);
@@ -3465,6 +3554,9 @@ async function streamCompletion(
         tools: options.tools,
         stableMessageCount: options.prefixCache.stableMessageCount,
         initialMessageCount: options.prefixCache.initialMessageCount,
+        ...(options.prefixCache.replayedMessageCount !== undefined
+          ? { replayedMessageCount: options.prefixCache.replayedMessageCount }
+          : {}),
         requestProfile: {
           thinking: options.thinking?.type,
           responseFormat: options.responseFormat?.type,

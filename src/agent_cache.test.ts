@@ -52,6 +52,8 @@ import {
   stripStaleReasoningContent,
   taskInstructions,
 } from "./agent.js";
+import { freezeTurnBlock, mergedTurnContext } from "./turn_replay.js";
+import type { AgentTurnMessage } from "./types.js";
 import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -926,4 +928,80 @@ test("compactCompletedToolCalls keeps only the latest propose payload", () => {
   const second = JSON.parse(messages[1].tool_calls![0].function.arguments) as { content: string };
   assert.match(first.content, /已压缩/);
   assert.equal(second.content, "新正文");
+});
+
+test("turn one keeps today's 9-slot shape; later turns fold into a single user block", () => {
+  const turnParts = {
+    taskContext: "当前任务：改稿",
+    dynamicStyleContext: "声线",
+    bootstrapContext: "线索",
+    todosPrompt: "清单",
+    artifactContext: "记忆",
+    selectedContext: "选区",
+    prompt: "把这段改短",
+  };
+  const stable = [1, 2, 3, 4, 5, 6].map(index => ({ role: "system" as const, content: `稳定 ${index}` }));
+
+  // Turn 1: no replay, so the 8 system slots are still legal (nothing precedes them).
+  const first = [...stable, ...buildDynamicTurnMessages({ historyText: "历史", archiveContext: "归档", ...turnParts })];
+  assert.equal(first.length, 15);
+  assert.equal(first.filter(message => message.role === "system").length, 14);
+
+  // Turn 2: the same bodies, one user message, appended after the frozen transcript.
+  const frozen = freezeTurnBlock([...first, { role: "assistant", content: "已改" }], stable.length);
+  const second = [...stable, ...frozen, mergedTurnContext(turnParts)];
+  assert.equal(second.at(-1)?.role, "user");
+  for (const body of ["当前任务：改稿", "声线", "线索", "清单", "记忆", "选区", "把这段改短"]) {
+    assert.match(second.at(-1)?.content ?? "", new RegExp(body));
+  }
+});
+
+test("no system message ever follows an assistant or tool turn across three turns", () => {
+  const stable = [1, 2, 3, 4, 5, 6].map(index => ({ role: "system" as const, content: `稳定 ${index}` }));
+  const parts = (turn: number) => ({ taskContext: `任务 ${turn}`, prompt: `请求 ${turn}` });
+
+  let chain: AgentTurnMessage[] = [];
+  let request: AgentTurnMessage[] = [];
+  for (const turn of [1, 2, 3]) {
+    request = [
+      ...stable,
+      ...chain,
+      ...(chain.length
+        ? [mergedTurnContext(parts(turn))]
+        : buildDynamicTurnMessages({ historyText: "历史", archiveContext: "归档", ...parts(turn) })),
+    ];
+    const live = [
+      ...request,
+      { role: "assistant" as const, content: "读", tool_calls: [{ id: `t${turn}`, type: "function" as const, function: { name: "read_document", arguments: "{}" } }] },
+      { role: "tool" as const, content: "{}", tool_call_id: `t${turn}` },
+      { role: "assistant" as const, content: `完成 ${turn}` },
+    ];
+    chain = freezeTurnBlock(live, stable.length);
+  }
+
+  // DeepSeek re-renders the whole request under a different template when a system
+  // message trails assistant/tool history — measured twice (contract §4).
+  let transcriptStarted = false;
+  request.forEach((message, index) => {
+    if (message.role === "assistant" || message.role === "tool") transcriptStarted = true;
+    assert.ok(!(transcriptStarted && message.role === "system"), `system message at index ${index} follows the transcript`);
+  });
+  // Replay must be a real prefix of what was sent, not a rebuilt approximation.
+  assert.deepEqual(request.slice(0, 6), stable);
+  assert.equal(request.at(-1)?.role, "user");
+  assert.match(request.at(-1)?.content ?? "", /任务 3/);
+});
+
+test("cache waterfall reports replayed turns separately from the live dynamic tail", () => {
+  const tools = agentToolsForTask("general", "ask");
+  const components = buildRequestComponentUsage([
+    { role: "system", content: "稳定" },
+    { role: "user", content: "上一轮请求" },
+    { role: "assistant", content: "上一轮回答" },
+    { role: "user", content: "本轮请求" },
+  ], tools, 1, 4, 3);
+  assert.equal(components.filter(item => item.kind === "replayed_turn").length, 2);
+  assert.equal(components.filter(item => item.kind === "user").length, 1);
+  assert.equal(components.find(item => item.kind === "user")?.label, "当前用户请求");
+  assert.equal(components.find(item => item.kind === "dynamic_system"), undefined);
 });

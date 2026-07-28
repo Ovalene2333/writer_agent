@@ -28,6 +28,8 @@ export type PrefixCacheMessage = {
 export type PrefixCacheAtomKind =
   | "tool_schema"
   | "stable_system"
+  /** Verbatim replay of an earlier turn in this session (see src/turn_replay.ts). */
+  | "replayed_turn"
   | "dynamic_system"
   | "user"
   | "assistant"
@@ -65,6 +67,8 @@ export type PrefixCacheRequestInput = {
   tools?: readonly unknown[];
   stableMessageCount: number;
   initialMessageCount: number;
+  /** End of the replayed frozen turns; defaults to stableMessageCount (no replay). */
+  replayedMessageCount?: number;
   requestProfile?: Record<string, unknown>;
 };
 
@@ -224,8 +228,12 @@ function messageKind(
   index: number,
   stableMessageCount: number,
   initialMessageCount: number,
+  replayedMessageCount: number,
 ): PrefixCacheAtomKind {
   if (index < stableMessageCount) return "stable_system";
+  // Frozen earlier turns: bytes the provider has already seen. Classifying them as
+  // "dynamic_system" would report a warm prefix as fresh miss-priced context.
+  if (index < replayedMessageCount) return "replayed_turn";
   if (index < initialMessageCount && message.role === "system") return "dynamic_system";
   if (message.role === "user") return "user";
   if (message.role === "assistant") return "assistant";
@@ -235,13 +243,14 @@ function messageKind(
 
 export function buildPrefixCacheAtoms(input: Pick<
   PrefixCacheRequestInput,
-  "messages" | "tools" | "stableMessageCount" | "initialMessageCount"
+  "messages" | "tools" | "stableMessageCount" | "initialMessageCount" | "replayedMessageCount"
 >): PrefixCacheAtom[] {
   const atoms: PrefixCacheAtom[] = [];
+  const replayedMessageCount = Math.max(input.stableMessageCount, input.replayedMessageCount ?? input.stableMessageCount);
   const appendMessage = (message: PrefixCacheMessage, index: number): void => {
     const serialized = serializeMessage(message);
     const bytes = Buffer.byteLength(serialized, "utf8");
-    const kind = messageKind(message, index, input.stableMessageCount, input.initialMessageCount);
+    const kind = messageKind(message, index, input.stableMessageCount, input.initialMessageCount, replayedMessageCount);
     const toolNames = message.tool_calls?.map(call => call.function.name).filter(Boolean);
     atoms.push({
       kind,
@@ -490,4 +499,158 @@ export function finishPrefixCacheObservation(
 ): void {
   if (!observation) return;
   forests.get(observation.logPath)?.finish(observation, actual);
+}
+
+export type PrefixCacheDivergence = {
+  label: string;
+  kind: PrefixCacheAtomKind;
+  requests: number;
+  /** Miss-priced tokens sitting at or after this divergence point, summed. */
+  missedTokens: number;
+};
+
+export type PrefixCacheCallKindSummary = {
+  callKind: string;
+  requests: number;
+  /** Requests that also produced a finish record with provider usage. */
+  measuredRequests: number;
+  promptTokens: number;
+  cacheHitTokens: number;
+  /** cacheHitTokens / promptTokens over measured requests; undefined when nothing measured. */
+  actualHitRate?: number;
+  predictedHitTokens: number;
+  predictedRequestTokens: number;
+  predictedHitRate?: number;
+  /** Mean signed (actual − predicted); positive means we under-predicted the hit. */
+  predictionErrorTokens?: number;
+  componentTokens: Partial<Record<PrefixCacheAtomKind, number>>;
+  topDivergences: PrefixCacheDivergence[];
+};
+
+export type PrefixCacheLogSummary = {
+  logPath: string;
+  totalRequests: number;
+  callKinds: PrefixCacheCallKindSummary[];
+};
+
+/**
+ * Aggregate `.writer/logs/prefix-cache.jsonl` into a per-callKind report.
+ *
+ * The forest predicts hits; only the provider knows what actually cached. Joining
+ * the two on observationId is the one thing that says whether a prompt-layout
+ * change paid off — and the divergence histogram says which slot is leaking.
+ */
+export function summarizePrefixCacheLog(
+  logPath: string,
+  options: { callKind?: string; topDivergences?: number; maxBytes?: number } = {},
+): PrefixCacheLogSummary {
+  const text = readRecentLog(logPath, options.maxBytes ?? DEFAULT_REPLAY_BYTES);
+  const topCount = options.topDivergences ?? 5;
+  type Accumulator = {
+    requests: number;
+    measuredRequests: number;
+    promptTokens: number;
+    cacheHitTokens: number;
+    predictedHitTokens: number;
+    predictedRequestTokens: number;
+    predictionErrorTokens: number;
+    predictionErrorSamples: number;
+    componentTokens: Partial<Record<PrefixCacheAtomKind, number>>;
+    divergences: Map<string, PrefixCacheDivergence>;
+  };
+  const byKind = new Map<string, Accumulator>();
+  // observationId → callKind, so finish records can be attributed without a second pass.
+  const starts = new Map<string, string>();
+  let totalRequests = 0;
+
+  const accumulator = (callKind: string): Accumulator => {
+    let entry = byKind.get(callKind);
+    if (!entry) {
+      entry = {
+        requests: 0, measuredRequests: 0, promptTokens: 0, cacheHitTokens: 0,
+        predictedHitTokens: 0, predictedRequestTokens: 0,
+        predictionErrorTokens: 0, predictionErrorSamples: 0,
+        componentTokens: {}, divergences: new Map(),
+      };
+      byKind.set(callKind, entry);
+    }
+    return entry;
+  };
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    // Intersecting the two record types collapses `event` to never; read them loosely.
+    let record: Omit<Partial<StartLogRecord>, "event"> & Omit<Partial<FinishLogRecord>, "event"> & { event?: string };
+    try { record = JSON.parse(line) as typeof record; }
+    catch { continue; } // A truncated final line or an older log version is ignored.
+    if (record.version !== PREFIX_CACHE_LOG_VERSION) continue;
+
+    if (record.event === "request_start") {
+      const callKind = typeof record.callKind === "string" ? record.callKind : "unspecified";
+      if (options.callKind && callKind !== options.callKind) continue;
+      if (typeof record.observationId === "string") starts.set(record.observationId, callKind);
+      const entry = accumulator(callKind);
+      entry.requests += 1;
+      totalRequests += 1;
+      const predictedHit = record.prediction?.predictedHitTokens ?? 0;
+      entry.predictedHitTokens += predictedHit;
+      entry.predictedRequestTokens += record.totals?.estimatedTokens ?? 0;
+      for (const [kind, component] of Object.entries(record.components ?? {})) {
+        const key = kind as PrefixCacheAtomKind;
+        entry.componentTokens[key] = (entry.componentTokens[key] ?? 0) + (component?.estimatedTokens ?? 0);
+      }
+      const divergence = record.prediction?.firstDivergence;
+      if (divergence) {
+        // Strip the volatile message index so the same slot aggregates across turns.
+        const label = divergence.label.replace(/^message\[\d+]:/, "");
+        const existing = entry.divergences.get(label)
+          ?? { label, kind: divergence.kind, requests: 0, missedTokens: 0 };
+        existing.requests += 1;
+        existing.missedTokens += Math.max(0, (record.totals?.estimatedTokens ?? 0) - predictedHit);
+        entry.divergences.set(label, existing);
+      }
+      continue;
+    }
+
+    if (record.event === "request_finish") {
+      const callKind = typeof record.observationId === "string" ? starts.get(record.observationId) : undefined;
+      // A finish whose start scrolled out of the log tail has no components to attribute.
+      if (!callKind) continue;
+      const entry = accumulator(callKind);
+      const actual = record.actual;
+      if (!actual || actual.promptTokens === undefined) continue;
+      entry.measuredRequests += 1;
+      entry.promptTokens += actual.promptTokens;
+      entry.cacheHitTokens += actual.cacheHitTokens ?? 0;
+      if (record.predictionErrorTokens !== undefined) {
+        entry.predictionErrorTokens += record.predictionErrorTokens;
+        entry.predictionErrorSamples += 1;
+      }
+    }
+  }
+
+  const callKinds = [...byKind.entries()]
+    .map(([callKind, entry]): PrefixCacheCallKindSummary => ({
+      callKind,
+      requests: entry.requests,
+      measuredRequests: entry.measuredRequests,
+      promptTokens: entry.promptTokens,
+      cacheHitTokens: entry.cacheHitTokens,
+      ...(entry.promptTokens > 0 ? { actualHitRate: entry.cacheHitTokens / entry.promptTokens } : {}),
+      predictedHitTokens: entry.predictedHitTokens,
+      predictedRequestTokens: entry.predictedRequestTokens,
+      ...(entry.predictedRequestTokens > 0
+        ? { predictedHitRate: entry.predictedHitTokens / entry.predictedRequestTokens }
+        : {}),
+      ...(entry.predictionErrorSamples > 0
+        ? { predictionErrorTokens: entry.predictionErrorTokens / entry.predictionErrorSamples }
+        : {}),
+      componentTokens: entry.componentTokens,
+      topDivergences: [...entry.divergences.values()]
+        .sort((a, b) => b.missedTokens - a.missedTokens || b.requests - a.requests)
+        .slice(0, topCount),
+    }))
+    .sort((a, b) => b.requests - a.requests || a.callKind.localeCompare(b.callKind));
+
+  return { logPath, totalRequests, callKinds };
 }

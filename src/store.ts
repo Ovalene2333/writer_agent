@@ -3,9 +3,10 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange, ProseQualityReport,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange, ProseQualityReport,
   RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
+  MessageStepTrail, PersistedStreamStep,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
 import { documentSpans } from "./document_spans.js";
@@ -88,6 +89,36 @@ function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[
  * report shape has since changed, simply shows no quality card in the review dock.
  * Never throw here: a bad blob must not make the proposal unreadable.
  */
+/**
+ * Cache optimisation only — a block written by an older build, or one whose blob
+ * got truncated, simply drops out of the replay chain and that turn is paid for
+ * again. Never throw: a bad blob must not make the session unrunnable.
+ */
+function parseAgentTurnMessages(value: unknown): AgentTurnMessage[] | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed) || !parsed.length) return undefined;
+    const messages: AgentTurnMessage[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") return undefined;
+      const message = item as Partial<AgentTurnMessage>;
+      if (message.role !== "system" && message.role !== "user" && message.role !== "assistant" && message.role !== "tool") return undefined;
+      if (typeof message.content !== "string" && message.content !== null) return undefined;
+      messages.push({
+        role: message.role,
+        content: message.content,
+        ...(typeof message.tool_call_id === "string" ? { tool_call_id: message.tool_call_id } : {}),
+        ...(Array.isArray(message.tool_calls) ? { tool_calls: message.tool_calls } : {}),
+        ...(typeof message.reasoning_content === "string" ? { reasoning_content: message.reasoning_content } : {}),
+      });
+    }
+    return messages;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseProposalQualityReport(value: unknown): ProseQualityReport | undefined {
   if (typeof value !== "string" || !value.trim()) return undefined;
   try {
@@ -377,6 +408,26 @@ export class WriterStore {
         agent_checkpoint_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS agent_turn_blocks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_index INTEGER NOT NULL,
+        messages_json TEXT NOT NULL,
+        estimated_tokens INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(session_id, turn_index)
+      );
+      CREATE INDEX IF NOT EXISTS agent_turn_blocks_session ON agent_turn_blocks(session_id, turn_index);
+      CREATE TABLE IF NOT EXISTS message_step_trails (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_message_id INTEGER NOT NULL,
+        job_id TEXT,
+        steps_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_message_id)
+      );
+      CREATE INDEX IF NOT EXISTS message_step_trails_session
+        ON message_step_trails(session_id, source_message_id);
       CREATE TABLE IF NOT EXISTS character_revisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -782,6 +833,82 @@ export class WriterStore {
     }
   }
 
+  upsertMessageStepTrail(
+    sessionId: string,
+    sourceMessageId: number,
+    steps: PersistedStreamStep[],
+    options?: { jobId?: string },
+  ): void {
+    if (!this.sessionExists(sessionId)) return;
+    if (!Number.isInteger(sourceMessageId) || sourceMessageId < 1) return;
+    if (!Array.isArray(steps) || !steps.length) return;
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO message_step_trails(session_id,source_message_id,job_id,steps_json,updated_at)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(session_id,source_message_id) DO UPDATE SET
+        job_id=excluded.job_id,
+        steps_json=excluded.steps_json,
+        updated_at=excluded.updated_at`)
+      .run(sessionId, sourceMessageId, options?.jobId ?? null, JSON.stringify(steps), now);
+  }
+
+  messageStepTrails(sessionId: string, sourceMessageIds?: number[]): MessageStepTrail[] {
+    if (!this.sessionExists(sessionId)) return [];
+    const rows = sourceMessageIds?.length
+      ? (() => {
+          const ids = [...new Set(sourceMessageIds.filter(id => Number.isInteger(id) && id > 0))];
+          if (!ids.length) return [] as Row[];
+          const placeholders = ids.map(() => "?").join(",");
+          return this.database.prepare(
+            `SELECT source_message_id,job_id,steps_json,updated_at FROM message_step_trails
+              WHERE session_id=? AND source_message_id IN (${placeholders})
+              ORDER BY source_message_id ASC`,
+          ).all(sessionId, ...ids) as Row[];
+        })()
+      : this.database.prepare(
+          `SELECT source_message_id,job_id,steps_json,updated_at FROM message_step_trails
+            WHERE session_id=? ORDER BY source_message_id DESC LIMIT 50`,
+        ).all(sessionId) as Row[];
+    return rows.flatMap(row => {
+      try {
+        const steps = JSON.parse(String(row.steps_json ?? "[]")) as unknown;
+        if (!Array.isArray(steps) || !steps.length) return [];
+        const normalized = steps.flatMap((item): PersistedStreamStep[] => {
+          if (!item || typeof item !== "object") return [];
+          const step = item as Record<string, unknown>;
+          const id = Number(step.id);
+          if (!Number.isFinite(id)) return [];
+          const status = step.status === "running" || step.status === "failed" ? step.status : "completed";
+          return [{
+            id,
+            output: typeof step.output === "string" ? step.output : "",
+            reasoning: typeof step.reasoning === "string" ? step.reasoning : "",
+            tools: Array.isArray(step.tools) ? step.tools.filter((name): name is string => typeof name === "string") : [],
+            status,
+            ...(step.usage && typeof step.usage === "object" ? { usage: step.usage as PersistedStreamStep["usage"] } : {}),
+          }];
+        });
+        if (!normalized.length) return [];
+        return [{
+          sourceMessageId: Number(row.source_message_id),
+          ...(typeof row.job_id === "string" && row.job_id ? { jobId: row.job_id } : {}),
+          steps: normalized,
+          updatedAt: String(row.updated_at ?? ""),
+        }];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  deleteMessageStepTrailsFrom(sessionId: string, fromMessageId: number): void {
+    if (!this.sessionExists(sessionId)) return;
+    if (!Number.isInteger(fromMessageId) || fromMessageId < 1) return;
+    this.database.prepare(
+      "DELETE FROM message_step_trails WHERE session_id=? AND source_message_id>=?",
+    ).run(sessionId, fromMessageId);
+  }
+
   sessionTodos(sessionId: string): AgentTodoItem[] {
     const row = this.database.prepare("SELECT todos_json FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
     if (!row || typeof row.todos_json !== "string" || !row.todos_json.trim()) return [];
@@ -959,6 +1086,57 @@ export class WriterStore {
   clearAgentCheckpoint(sessionId: string): void {
     this.database.prepare("UPDATE session_context SET agent_checkpoint_json='{}',updated_at=? WHERE session_id=?")
       .run(new Date().toISOString(), sessionId);
+  }
+
+  /**
+   * The session's frozen turn chain, oldest first. A block that fails to parse is
+   * dropped along with everything after it: replay must be a contiguous prefix of
+   * what was actually sent, otherwise tool_call/tool_result pairs can straddle the gap.
+   */
+  agentTurnBlocks(sessionId: string): AgentTurnBlock[] {
+    const rows = this.database
+      .prepare("SELECT turn_index,messages_json,estimated_tokens,created_at FROM agent_turn_blocks WHERE session_id=? ORDER BY turn_index")
+      .all(sessionId) as Row[];
+    const blocks: AgentTurnBlock[] = [];
+    for (const row of rows) {
+      const messages = parseAgentTurnMessages(row.messages_json);
+      if (!messages) break;
+      blocks.push({
+        turnIndex: Number(row.turn_index) || 0,
+        messages,
+        estimatedTokens: Number(row.estimated_tokens) || 0,
+        createdAt: String(row.created_at ?? ""),
+      });
+    }
+    return blocks;
+  }
+
+  appendAgentTurnBlock(sessionId: string, block: { turnIndex: number; messages: AgentTurnMessage[]; estimatedTokens: number }): void {
+    if (!block.messages.length) return;
+    this.database.prepare(`INSERT INTO agent_turn_blocks(session_id,turn_index,messages_json,estimated_tokens,created_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(session_id,turn_index) DO UPDATE SET
+        messages_json=excluded.messages_json,estimated_tokens=excluded.estimated_tokens,created_at=excluded.created_at`)
+      .run(sessionId, block.turnIndex, JSON.stringify(block.messages), block.estimatedTokens, new Date().toISOString());
+  }
+
+  /** Rewrite the whole chain (boundary compaction). Turn indexes are renumbered from 0. */
+  replaceAgentTurnBlocks(sessionId: string, blocks: { messages: AgentTurnMessage[]; estimatedTokens: number }[]): void {
+    this.clearAgentTurnBlocks(sessionId);
+    blocks.forEach((block, index) => {
+      this.appendAgentTurnBlock(sessionId, { turnIndex: index, messages: block.messages, estimatedTokens: block.estimatedTokens });
+    });
+  }
+
+  clearAgentTurnBlocks(sessionId: string): void {
+    this.database.prepare("DELETE FROM agent_turn_blocks WHERE session_id=?").run(sessionId);
+  }
+
+  nextAgentTurnIndex(sessionId: string): number {
+    const row = this.database.prepare("SELECT MAX(turn_index) AS max_index FROM agent_turn_blocks WHERE session_id=?").get(sessionId) as Row | undefined;
+    // MAX over no rows is NULL, and Number(null) is 0 — an empty chain must start at 0, not 1.
+    if (row?.max_index === null || row?.max_index === undefined) return 0;
+    const max = Number(row.max_index);
+    return Number.isFinite(max) ? max + 1 : 0;
   }
 
   saveRoleplayInterlocutor(input: RoleplayInterlocutor & { id?: number; targetCharacterId?: number }): SavedRoleplayInterlocutor {
@@ -2481,6 +2659,7 @@ export class WriterStore {
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
+    this.deleteMessageStepTrailsFrom(sessionId, fromId);
     // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
     if (userRow.channel === "roleplay") this.restoreRoleplayMemoryBefore(sessionId, fromId);
@@ -2535,6 +2714,7 @@ export class WriterStore {
         this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
         this.clearSessionTaskState(sessionId);
         this.restoreRoleplayMemoryBefore(sessionId, fromId);
+        this.deleteMessageStepTrailsFrom(sessionId, fromId);
         this.addSystemMessage(sessionId, `已撤销角色主动开场 #${fromId} 及其后续对话，准备重新演出。`);
         this.reindex();
         return {
@@ -2707,6 +2887,7 @@ export class WriterStore {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>?").run(sessionId, baseMessageId);
+      this.database.prepare("DELETE FROM message_step_trails WHERE session_id=? AND source_message_id>?").run(sessionId, baseMessageId);
       this.database.prepare("DELETE FROM roleplay_memory_snapshots WHERE session_id=? AND through_message_id>?")
         .run(sessionId, baseMessageId);
       this.database.prepare("DELETE FROM roleplay_memory_facts WHERE session_id=? AND source_message_id>? AND pinned=0")

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildPrefixCacheAtoms,
   RequestPrefixForest,
+  summarizePrefixCacheLog,
   type PrefixCacheRequestInput,
 } from "./prefix_cache.js";
 
@@ -109,4 +110,89 @@ test("prefix atoms place tools after initial messages and before appended turns"
     "tool_schema",
     "assistant",
   ]);
+});
+
+test("replayed turns are classified apart from this turn's dynamic tail", () => {
+  const atoms = buildPrefixCacheAtoms({
+    stableMessageCount: 1,
+    replayedMessageCount: 4,
+    initialMessageCount: 5,
+    messages: [
+      { role: "system", content: "stable" },
+      // Frozen turn 1: bytes the provider has already seen.
+      { role: "user", content: "第一轮" },
+      { role: "assistant", content: "读", tool_calls: [{ id: "c1", type: "function", function: { name: "read_document", arguments: "{}" } }] },
+      { role: "tool", content: "{}", tool_call_id: "c1" },
+      // This turn's own context block — the only new bytes.
+      { role: "user", content: "第二轮" },
+      { role: "assistant", content: "working" },
+    ],
+  });
+  assert.deepEqual(atoms.map(atom => atom.kind), [
+    "stable_system",
+    "replayed_turn",
+    "replayed_turn",
+    "replayed_turn",
+    "user",
+    "assistant",
+  ]);
+});
+
+test("omitting replayedMessageCount keeps the pre-replay classification", () => {
+  const atoms = buildPrefixCacheAtoms({
+    stableMessageCount: 1,
+    initialMessageCount: 3,
+    messages: [
+      { role: "system", content: "stable" },
+      { role: "system", content: "dynamic" },
+      { role: "user", content: "request" },
+    ],
+  });
+  assert.deepEqual(atoms.map(atom => atom.kind), ["stable_system", "dynamic_system", "user"]);
+});
+
+test("cache log summary joins prediction with provider usage and ranks divergences", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-cache-summary-"));
+  const logPath = join(root, "prefix-cache.jsonl");
+  try {
+    const forest = new RequestPrefixForest(logPath);
+    for (const [index, content] of ["请求一", "请求二", "请求三"].entries()) {
+      const observation = forest.begin(request(root, content));
+      forest.finish(observation, {
+        promptTokens: 1_000,
+        completionTokens: 50,
+        cacheHitTokens: index === 0 ? 0 : 900,
+        cacheMissTokens: index === 0 ? 1_000 : 100,
+      });
+    }
+    // A different call kind must not be folded into agent_step's numbers.
+    const other = forest.begin({ ...request(root, "编译"), callKind: "task_contract" });
+    forest.finish(other, { promptTokens: 100, completionTokens: 10, cacheHitTokens: 0, cacheMissTokens: 100 });
+
+    const summary = summarizePrefixCacheLog(logPath);
+    assert.equal(summary.totalRequests, 4);
+    assert.deepEqual(summary.callKinds.map(kind => kind.callKind), ["agent_step", "task_contract"]);
+
+    const step = summary.callKinds[0];
+    assert.equal(step.requests, 3);
+    assert.equal(step.measuredRequests, 3);
+    assert.equal(step.promptTokens, 3_000);
+    assert.equal(step.cacheHitTokens, 1_800);
+    assert.equal(step.actualHitRate, 0.6);
+    assert.ok((step.predictedHitRate ?? 0) > 0, "the stable system prefix should predict some hit");
+    // The cold first request diverges at the stable prefix itself; the two warm
+    // ones diverge at the user message — which is exactly the slot we want named.
+    const cold = step.topDivergences.find(item => item.kind === "stable_system");
+    const warm = step.topDivergences.find(item => item.kind === "user");
+    assert.equal(cold?.requests, 1);
+    assert.equal(warm?.requests, 2);
+    assert.ok((warm?.missedTokens ?? 0) > 0);
+    assert.ok((step.componentTokens.stable_system ?? 0) > 0);
+
+    const filtered = summarizePrefixCacheLog(logPath, { callKind: "task_contract" });
+    assert.equal(filtered.totalRequests, 1);
+    assert.deepEqual(filtered.callKinds.map(kind => kind.callKind), ["task_contract"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
