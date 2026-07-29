@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,7 +33,10 @@ import {
   documentDeliveryRemaining,
   executionModelForTask,
   executionModelForStep,
+  formatJobMaterialsShelfPrompt,
+  hydrateSessionMaterialsShelf,
   projectCacheUserId,
+  registerMaterialsShelfEntry,
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
@@ -889,6 +892,79 @@ test("read atoms lock one source snapshot, reuse exact coverage and allow wider 
   assert.match(String(changed.error), /锁定快照|禁止混读/);
 });
 
+test("materials shelf freezes digests and format stays path-stable", () => {
+  const context: ToolExecutionContext = {
+    permissionMode: "ask",
+    materialsShelf: new Map(),
+  };
+  registerMaterialsShelfEntry(context, {
+    path: "lore/b.md",
+    sourceHash: "hb",
+    kind: "read_document",
+    digest: "设定乙",
+    bodyChars: 100,
+    fullBodyServed: true,
+  });
+  registerMaterialsShelfEntry(context, {
+    path: "lore/a.md",
+    sourceHash: "ha",
+    kind: "read_document",
+    digest: "设定甲",
+    bodyChars: 200,
+    fullBodyServed: true,
+  });
+  // Second register upgrades digest but keeps fullBodyServed.
+  registerMaterialsShelfEntry(context, {
+    path: "lore/a.md",
+    sourceHash: "ha",
+    kind: "read_document",
+    digest: "设定甲更新摘要",
+    bodyChars: 50,
+    fullBodyServed: false,
+  });
+  assert.equal(context.materialsShelf?.get("lore/a.md")?.fullBodyServed, true);
+  const prompt = formatJobMaterialsShelfPrompt(context);
+  assert.match(prompt, /材料架/);
+  assert.match(prompt, /会话材料架|跨任务/);
+  assert.match(prompt, /lore\/a\.md/);
+  assert.match(prompt, /lore\/b\.md/);
+  // Sorted by path: a before b.
+  assert.ok(prompt.indexOf("lore/a.md") < prompt.indexOf("lore/b.md"));
+});
+
+test("session materials shelf persists and drops stale sourceHash", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-shelf-"));
+  try {
+    const project = WriterProject.init(root, "材料架会话");
+    const rel = "lore/world.md";
+    writeFileSync(join(project.resourceDir, "lore", "world.md"), "设定甲 v1", "utf8");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("shelf-session");
+    const hash1 = project.hash(project.read(rel));
+    store.saveSessionMaterialsShelf(sessionId, [{
+      key: rel,
+      path: rel,
+      sourceHash: hash1,
+      kind: "read_document",
+      digest: "设定甲摘要",
+      bodyChars: 10,
+      fullBodyServed: true,
+    }]);
+    const loaded = hydrateSessionMaterialsShelf(store, sessionId, project);
+    assert.equal(loaded.size, 1);
+    assert.equal(loaded.get(rel)?.digest, "设定甲摘要");
+
+    // Mutate file → hydrate drops stale entry
+    writeFileSync(join(project.resourceDir, "lore", "world.md"), "设定甲 v2 变更", "utf8");
+    const after = hydrateSessionMaterialsShelf(store, sessionId, project);
+    assert.equal(after.size, 0);
+    assert.equal(store.sessionMaterialsShelf(sessionId).length, 0);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("compactRuntimeMessages digests older heavy tool bodies and keeps recent full", () => {
   const heavy = JSON.stringify({
     path: "chapters/第1章.md",
@@ -913,6 +989,30 @@ test("compactRuntimeMessages digests older heavy tool bodies and keeps recent fu
   // keepRecent=2 remain full (not compacted status)
   assert.equal(JSON.parse(last).status, undefined);
   assert.equal(JSON.parse(secondLast).status, undefined);
+});
+
+test("compactRuntimeMessages with keepRecent 0 digests every heavy body and keeps pairing", () => {
+  const heavy = JSON.stringify({ path: "chapters/第1章.md", content: "甲".repeat(2_000), artifactId: 1 });
+  const messages: Msg[] = [
+    { role: "user", content: "写" },
+    { role: "assistant", content: null, tool_calls: [
+      { id: "t1", type: "function", function: { name: "read_document", arguments: "{}" } },
+      { id: "t2", type: "function", function: { name: "read_document", arguments: "{}" } },
+    ] } as Msg,
+    { role: "tool", content: heavy, tool_call_id: "t1" },
+    { role: "tool", content: heavy, tool_call_id: "t2" },
+  ];
+  // `force` because two tool bodies sit under the default "is this even worth it"
+  // threshold; a cold replay block is compacted regardless of how heavy it is.
+  compactRuntimeMessages(messages as never, { keepRecent: 0, force: true });
+  const toolBodies = messages.filter(m => m.role === "tool").map(m => m.content ?? "");
+  assert.equal(toolBodies.length, 2);
+  // slice(0, -0) would have been an empty list — keepRecent 0 must mean "all of them".
+  for (const body of toolBodies) assert.match(body, /artifact_compacted/);
+  const calls = new Set(messages.flatMap(m => (m as { tool_calls?: Array<{ id: string }> }).tool_calls?.map(call => call.id) ?? []));
+  for (const message of messages) {
+    if (message.role === "tool") assert.ok(calls.has(message.tool_call_id!), `orphan tool result ${message.tool_call_id}`);
+  }
 });
 
 test("rehydrateRecentToolMessages only restores the last N digests", () => {

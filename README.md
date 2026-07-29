@@ -85,6 +85,7 @@ writer run "续写并自动落盘" --mode auto -c   # -c 继续最近会话
 | `writer init [目录] [--title 名称]` | 初始化写作项目 |
 | `writer web` / `writer serve` | 启动 Web 写作工作台 |
 | `writer run <指令>` | 执行一次写作生成后退出 |
+| `writer grok-proxy` | 将 Grok Build 订阅接口反代为 OpenAI Chat Completions |
 | `writer export` | 按章节顺序导出作品 |
 | `writer session list` | 列出会话 |
 
@@ -117,6 +118,28 @@ writer run "检查人设一致性" --json    # 逐行输出 JSON 事件
 writer run "..." --debug
 writer run "..." --debug-steps      # 仅 step 调试输出
 ```
+
+### Grok Build 本地反代
+
+`writer grok-proxy` 参考 Sub2API 的 Grok OAuth 与 Responses 桥接方式，把 xAI 订阅侧的
+`grok-build-0.1` 转换为 Writer 可直接使用的 OpenAI Chat Completions 接口：
+
+```bash
+writer grok-proxy -p ./my-novel
+```
+
+首次运行会打开 xAI OAuth 授权页；若页面显示一次性代码，将其粘贴回终端并按回车。
+授权后，终端会打印本地 Base URL、模型名和 API Key；
+工具会自动在当前项目的 `providers.json` 中新增或更新“Grok Build 本地反代”供应商，
+但不会改动现有模型分工。xAI 凭据仅保存在 `.writer/grok-proxy.json`。需要换号时运行：
+
+```bash
+writer grok-proxy -p ./my-novel --login
+```
+
+默认只监听 `127.0.0.1:4101`。上游需要网络代理时可传
+`--proxy-url http://127.0.0.1:7890`；未传时会依次读取 `HTTPS_PROXY` 和 `HTTP_PROXY`
+环境变量。除非明确需要局域网接入，不要修改监听地址。
 
 ### 权限模式与项目指令
 

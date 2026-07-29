@@ -26,6 +26,22 @@ export type CompletedChapterHandoff = {
   finalActualState?: SceneActualState;
 };
 
+/**
+ * One setting/character body already paid for in this job.
+ * After `fullBodyServed`, identical hash reads return a short shelf hit instead of
+ * re-injecting the full tool payload (avoids post-boundary cold starts).
+ */
+export type MaterialsShelfEntry = {
+  key: string;
+  path?: string;
+  characterId?: number;
+  sourceHash: string;
+  kind: string;
+  digest: string;
+  bodyChars: number;
+  fullBodyServed: boolean;
+};
+
 export type ToolCall = {
   id: string;
   name: string;
@@ -54,6 +70,12 @@ export type ToolExecutionContext = {
   }>;
   /** Total body characters admitted from document/file read tools this job. */
   readCharactersUsed?: number;
+  /**
+   * Job-level materials shelf: setting/character reads that survive chapter
+   * boundaries so multi-chapter jobs do not cold-start re-read the same lore.
+   * Key is a normalized path or `character:<id>`.
+   */
+  materialsShelf?: Map<string, MaterialsShelfEntry>;
   /** Optional UI-selected scope for compact/simple character cards. */
   simpleCharacterScope?: number[];
   /** Planner/UI-selected characters whose factual state should be supplied to final review. */

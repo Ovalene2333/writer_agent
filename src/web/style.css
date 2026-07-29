@@ -56,6 +56,27 @@
   --fs-h1: 16px;
   /* Focus ring (shared) */
   --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+  /*
+   * Context-graph palette (structural — inherited by all themes).
+   *
+   * Each hue is mixed with the theme's own --text, so a light theme darkens it
+   * and a dark theme lifts it without any [data-theme] override. --ctx-epoch is
+   * the accent itself: the task node is the graph's subject and should carry the
+   * theme's identity colour.
+   */
+  --ctx-message: color-mix(in srgb, #d99a3f 72%, var(--text) 28%);
+  --ctx-epoch: var(--accent);
+  --ctx-handoff: color-mix(in srgb, #2f9d6a 72%, var(--text) 28%);
+  --ctx-slice: color-mix(in srgb, #7f63d8 72%, var(--text) 28%);
+  --ctx-note: color-mix(in srgb, #5b8def 72%, var(--text) 28%);
+  /* Assemble layers, ordered cool → warm by how volatile the bytes are. */
+  --ctx-l0: color-mix(in srgb, #2f9d6a 70%, var(--text) 30%);
+  --ctx-l1: color-mix(in srgb, #3f8fc4 70%, var(--text) 30%);
+  --ctx-l2: color-mix(in srgb, #7f63d8 70%, var(--text) 30%);
+  --ctx-l3: color-mix(in srgb, #d99a3f 70%, var(--text) 30%);
+  /* One dim level for the whole canvas, so focus reads consistently. */
+  --ctx-dim-node: .34;
+  --ctx-dim-edge: .18;
   --text-muted: var(--text-dim);
   --danger: var(--warn);
   --shadow-hover: 0 10px 24px -12px var(--agent-glow), var(--shadow-md);
@@ -2139,6 +2160,76 @@ button.agent-orb:focus-visible {
 .conversation .agent-step.failed {
   border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
 }
+.conversation .agent-step.after-context-reset {
+  border-color: color-mix(in srgb, #2f9d6a 40%, var(--border));
+}
+
+/* Mid-job chapter/scene cut between consecutive steps (e.g. 53k → 16k). */
+.agent-step-context-reset {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 2px 6px 6px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px dashed color-mix(in srgb, #2f9d6a 45%, var(--border));
+  background: color-mix(in srgb, #2f9d6a 10%, var(--surface));
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.agent-step-context-reset-badge {
+  font-weight: 750;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: #1f7a52;
+  background: color-mix(in srgb, #2f9d6a 18%, var(--surface));
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.agent-step-context-reset-flow {
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.agent-step-context-reset-tokens {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  color: var(--text);
+}
+.agent-step-context-reset-tokens em {
+  margin-left: 6px;
+  font-style: normal;
+  color: #1f7a52;
+  font-weight: 700;
+}
+.agent-step-context-reset-hint {
+  flex: 1 1 180px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.agent-step-context-reset-detail {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, #2f9d6a 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, #2f9d6a 22%, var(--border));
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.agent-step-context-reset-detail strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 12px;
+}
+.agent-step-context-reset-detail ul {
+  margin: 0;
+  padding-left: 1.15em;
+}
+.agent-step-context-reset-detail li { margin: 3px 0; }
 
 .agent-step-summary {
   display: flex; align-items: center; gap: 10px; width: 100%;
@@ -5490,6 +5581,89 @@ body::before {
   pointer-events: none;
 }
 
+/* Settings gear dropdown (must be absolute/fixed — without these rules items spill into the topbar) */
+.settings-anchor {
+  position: relative;
+  flex: 0 0 auto;
+}
+.settings-menu-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  background: transparent;
+}
+.settings-menu {
+  position: fixed;
+  z-index: 81;
+  top: calc(56px + env(safe-area-inset-top, 0px));
+  right: max(10px, env(safe-area-inset-right, 0px));
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: min(248px, calc(100vw - 20px));
+  max-height: min(70dvh, 420px);
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  animation: settings-menu-in .14s var(--ease-out);
+}
+@keyframes settings-menu-in {
+  from { opacity: 0; transform: translateY(-6px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.settings-menu button {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 550;
+  text-align: left;
+  white-space: nowrap;
+  box-shadow: none;
+  transform: none;
+}
+.settings-menu button svg {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+.settings-menu button:hover {
+  background: var(--accent-light);
+  border-color: transparent;
+  color: var(--text);
+  transform: none;
+}
+.settings-menu button:hover svg { color: var(--accent); }
+.settings-menu button:active { transform: none; }
+.settings-menu button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+.settings-menu button:disabled:hover {
+  background: transparent;
+  color: var(--text);
+}
+.settings-menu button:disabled:hover svg { color: var(--text-faint); }
+.settings-menu-separator {
+  display: block;
+  height: 1px;
+  margin: 5px 6px;
+  background: var(--border-light);
+  flex: 0 0 auto;
+}
+
 /* Panels */
 .documents {
   grid-area: side;
@@ -5902,6 +6076,48 @@ a:focus-visible {
   }
   .management-head h2 { font-size: 20px; }
   .settings-layout { grid-template-columns: 1fr; }
+  .settings-tabs {
+    position: static;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    gap: 6px;
+    padding: 0 0 12px;
+    margin: 0 0 4px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-light);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .settings-tabs::-webkit-scrollbar { display: none; }
+  .settings-tabs button {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 7px;
+    width: auto;
+    min-height: 40px;
+    padding: 8px 12px;
+    border: 1px solid var(--border-light);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+    grid-template-columns: none;
+  }
+  /* Chip tabs: icon + title only; hide subtitle to avoid crowding */
+  .settings-tabs button > span {
+    display: contents;
+  }
+  .settings-tabs button small { display: none; }
+  .settings-tabs button strong { font-size: 12px; white-space: nowrap; }
+  .settings-tabs button.active {
+    border-color: transparent;
+  }
+  .settings-content { padding: 12px 0 28px; }
+  .settings-menu {
+    top: calc(52px + env(safe-area-inset-top, 0px));
+    right: max(8px, env(safe-area-inset-right, 0px));
+    width: min(260px, calc(100vw - 16px));
+  }
   .character-grid { grid-template-columns: 1fr; gap: 10px; }
   .context-graph-layout { grid-template-columns: 1fr; }
   .context-graph-list,
@@ -5991,6 +6207,176 @@ a:focus-visible {
   line-height: 1.55;
   color: var(--text-dim);
 }
+.context-graph-cut-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, #2f9d6a 28%, var(--border));
+  background: color-mix(in srgb, #2f9d6a 7%, var(--surface));
+}
+.context-graph-cut-timeline > strong {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: #1f7a52;
+}
+.context-graph-cut-timeline ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.context-graph-cut-timeline button {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 100%;
+}
+.context-graph-cut-timeline button:hover,
+.context-graph-cut-timeline button.active {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+.context-graph-cut-timeline .cut-kind {
+  font-weight: 750;
+  color: #1f7a52;
+  font-variant-numeric: tabular-nums;
+}
+.context-graph-cut-timeline .cut-path {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-graph-cut-timeline .cut-tokens {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.context-transition-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, #2f9d6a 30%, var(--border));
+  background: color-mix(in srgb, #2f9d6a 6%, var(--surface));
+  margin-bottom: 12px;
+}
+.context-transition-detail h4 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.context-transition-step {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+.context-transition-bar {
+  position: relative;
+  height: 28px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  overflow: hidden;
+}
+.context-transition-bar-before {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.context-transition-bar-after {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  min-width: 48px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 8px;
+  background: linear-gradient(90deg,
+    color-mix(in srgb, #2f9d6a 55%, var(--accent)),
+    color-mix(in srgb, #2f9d6a 35%, var(--surface)));
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  box-sizing: border-box;
+}
+.context-transition-saved {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 700;
+  color: #1f7a52;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+.context-transition-col strong {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.context-transition-col.keep strong { color: #1f7a52; }
+.context-transition-col.drop strong { color: color-mix(in srgb, var(--warn) 80%, var(--text)); }
+.context-transition-col ul {
+  margin: 0;
+  padding-left: 1.1em;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.context-transition-col li {
+  margin: 4px 0;
+}
+.context-transition-col small {
+  display: block;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  margin-top: 1px;
+}
+.context-transition-reread {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+}
+.context-transition-reread strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text);
+  font-size: 12px;
+}
+
 .context-graph-filters {
   display: flex;
   flex-wrap: wrap;
@@ -6056,19 +6442,31 @@ a:focus-visible {
 .context-graph-node.status-archived { opacity: 0.62; }
 .context-graph-kind {
   font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.02em;
   color: var(--text-faint);
   font-weight: 700;
+  /* Do not uppercase — CJK + letter-spacing already used to wrap mid-word in the detail pane. */
+  text-transform: none;
 }
 .context-graph-node strong {
   font-size: 13px;
   font-weight: 650;
   color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  /* Prefer breaking at spaces/punctuation; keep CJK compounds together when possible. */
+  overflow-wrap: break-word;
+  word-break: keep-all;
+  line-height: 1.4;
 }
 .context-graph-node small {
   font-size: 11px;
   color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .context-graph-detail {
   border: 1px solid var(--border);
@@ -6077,25 +6475,104 @@ a:focus-visible {
   overflow: auto;
   max-height: 420px;
   background: color-mix(in srgb, var(--surface) 94%, transparent);
+  min-width: 0;
+}
+.context-graph-detail header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+  min-width: 0;
+}
+/* Override global .eyebrow (uppercase + 0.15em tracking) which splits CJK like 「活跃」. */
+.context-graph-detail header .context-graph-detail-eyebrow,
+.context-graph-detail header .eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  line-height: 1.3;
+  max-width: 100%;
+}
+.context-graph-detail-status {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.context-graph-detail-status.active {
+  color: color-mix(in srgb, var(--ctx-l0) 70%, var(--text));
+  border-color: color-mix(in srgb, var(--ctx-l0) 30%, var(--border));
+  background: color-mix(in srgb, var(--ctx-l0) 12%, transparent);
+}
+.context-graph-detail-status.archived {
+  opacity: 0.8;
 }
 .context-graph-detail header h3 {
-  margin: 4px 0 8px;
-  font-size: 16px;
-  letter-spacing: -0.01em;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: keep-all;
+  min-width: 0;
 }
-.context-graph-detail header p {
-  margin: 0 0 12px;
+.context-graph-detail-meta {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   font-size: 12px;
   color: var(--text-dim);
+  min-width: 0;
+}
+.context-graph-detail-meta li {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+.context-graph-detail-meta .meta-key {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 650;
+  flex-shrink: 0;
+}
+.context-graph-detail-meta code,
+.context-graph-detail-meta .meta-value {
+  font-size: 11px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  line-height: 1.4;
+}
+.context-graph-detail header code {
+  font-size: 11px;
+  word-break: break-all;
 }
 .context-graph-edges h4,
 .context-graph-payload h4 {
   margin: 0 0 8px;
   font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.04em;
   color: var(--text-faint);
   font-weight: 700;
+  text-transform: none;
 }
 .context-graph-edges ul {
   list-style: none;
@@ -6108,6 +6585,28 @@ a:focus-visible {
 .context-graph-edges button {
   font-size: 12px;
   text-align: left;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: keep-all;
+  line-height: 1.45;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+}
+.context-graph-edge-kind {
+  display: inline-block;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0;
+}
+.context-graph-edge-target {
+  min-width: 0;
+  overflow-wrap: break-word;
+  word-break: keep-all;
 }
 .context-graph-payload pre {
   margin: 0;
@@ -6138,17 +6637,18 @@ a:focus-visible {
   overflow: auto;
   background:
     linear-gradient(180deg,
-      color-mix(in srgb, var(--accent) 4%, var(--surface)) 0%,
-      var(--surface) 42%,
-      color-mix(in srgb, var(--surface) 96%, #000) 100%);
-  min-height: 340px;
+      color-mix(in srgb, var(--accent) 3.5%, var(--surface)) 0%,
+      var(--surface) 48%,
+      color-mix(in srgb, var(--surface) 97%, #000) 100%);
+  min-height: 280px;
+  max-height: 580px;
   box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 4%, transparent);
 }
 .context-graph-canvas.empty {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 280px;
+  min-height: 240px;
 }
 .context-graph-empty-card {
   display: flex;
@@ -6198,15 +6698,88 @@ a:focus-visible {
   border-radius: 999px;
   display: inline-block;
 }
-.context-graph-legend-item.kind-message i { background: #e0a84a; }
-.context-graph-legend-item.kind-epoch i { background: var(--accent); }
-.context-graph-legend-item.kind-handoff i { background: #3fad7a; }
-.context-graph-legend-item.kind-assemble_slice i { background: #9b7bed; }
+.context-graph-legend-item.kind-message i { background: var(--ctx-message); }
+.context-graph-legend-item.kind-project_note i { background: var(--ctx-note, #8b7cf6); }
+.context-graph-legend-item.kind-epoch i { background: var(--ctx-epoch); }
+.context-graph-legend-item.kind-handoff i { background: var(--ctx-handoff); }
+.context-graph-legend-item.kind-assemble_slice i { background: var(--ctx-slice); }
+.context-graph-legend-item.layer-L0 i { background: var(--ctx-l0); border-radius: 2px; width: 12px; height: 6px; }
+.context-graph-legend-item.layer-L1 i { background: var(--ctx-l1); border-radius: 2px; width: 12px; height: 6px; }
+.context-graph-legend-item.layer-L2 i { background: var(--ctx-l2); border-radius: 2px; width: 12px; height: 6px; }
+.context-graph-legend-item.layer-L3 i { background: var(--ctx-l3); border-radius: 2px; width: 12px; height: 6px; }
+.context-graph-legend-item.status-archived i {
+  background: transparent;
+  border: 1.5px dashed var(--text-faint);
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+.context-graph-legend-item.edge-supersedes i {
+  width: 14px;
+  height: 0;
+  border-radius: 0;
+  border-top: 2px dashed var(--text-dim);
+}
+.context-graph-legend-item.edge-replays i {
+  width: 14px;
+  height: 0;
+  border-radius: 0;
+  border-top: 2.5px solid var(--ctx-l1);
+}
+.context-graph-legend-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 2px;
+  background: var(--border);
+}
+.context-graph-legend-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-weight: 500;
+  padding: 4px 2px;
+}
 
-.context-graph-lane-bg {
-  fill: color-mix(in srgb, var(--text) 2.5%, transparent);
-  stroke: color-mix(in srgb, var(--border) 70%, transparent);
+.context-graph-row-bg {
+  fill: color-mix(in srgb, var(--text) 2.2%, transparent);
+  stroke: color-mix(in srgb, var(--border) 55%, transparent);
   stroke-width: 1;
+}
+.context-graph-row-bg.warm {
+  fill: color-mix(in srgb, var(--ctx-l1) 6%, transparent);
+  stroke: color-mix(in srgb, var(--ctx-l1) 28%, var(--border));
+}
+.context-graph-row-label {
+  fill: var(--text-faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+.context-graph-row-hit-track {
+  fill: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.context-graph-row-hit-fill {
+  fill: var(--ctx-l1);
+}
+.context-graph-shared-spine-bg {
+  fill: color-mix(in srgb, var(--ctx-l0) 9%, transparent);
+  stroke: color-mix(in srgb, var(--ctx-l0) 35%, var(--border));
+  stroke-width: 1.25;
+  stroke-dasharray: 5 4;
+}
+.context-graph-shared-spine-label {
+  fill: color-mix(in srgb, var(--ctx-l0) 70%, var(--text-dim));
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+.context-graph-cache-rail {
+  stroke: color-mix(in srgb, var(--ctx-l1) 45%, transparent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  opacity: 0.55;
 }
 .context-graph-column-label {
   fill: var(--text-faint);
@@ -6220,25 +6793,33 @@ a:focus-visible {
   stroke: color-mix(in srgb, var(--text-dim) 42%, transparent);
   stroke-width: 1.6;
   stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .context-graph-edge-line.active {
   stroke: var(--accent);
-  stroke-width: 2.4;
+  stroke-width: 2.2;
+}
+/* Edge geometry is under cards; chips are painted later and must stay opaque. */
+.context-graph-edge-chip {
+  pointer-events: none;
+}
+.context-graph-edge-label {
+  pointer-events: none;
 }
 .context-graph-arrow {
-  fill: color-mix(in srgb, var(--text-dim) 55%, transparent);
+  fill: color-mix(in srgb, var(--text-dim) 50%, transparent);
 }
 .context-graph-arrow.active {
   fill: var(--accent);
 }
 .context-graph-edge-chip {
-  fill: color-mix(in srgb, var(--surface) 92%, transparent);
-  stroke: color-mix(in srgb, var(--border) 85%, transparent);
+  fill: color-mix(in srgb, var(--surface) 94%, transparent);
+  stroke: color-mix(in srgb, var(--border) 80%, transparent);
   stroke-width: 1;
 }
 .context-graph-edge-chip.active {
-  fill: color-mix(in srgb, var(--accent) 16%, var(--surface));
-  stroke: color-mix(in srgb, var(--accent) 40%, transparent);
+  fill: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  stroke: color-mix(in srgb, var(--accent) 42%, transparent);
 }
 .context-graph-edge-label {
   fill: var(--text-dim);
@@ -6250,48 +6831,101 @@ a:focus-visible {
   fill: var(--accent);
 }
 .context-graph-edge-g.dim {
-  opacity: 0.14;
+  opacity: var(--ctx-dim-edge);
+}
+.context-graph-edge-g.soft {
+  opacity: 0.55;
+}
+.context-graph-edge-line.soft {
+  stroke-dasharray: 3 4;
+  stroke-width: 1.15;
+}
+/* A rewrite retiring an earlier chapter seam — drawn as a break, not a flow. */
+.context-graph-edge-line.kind-supersedes,
+.context-graph-edge-line.kind-archives {
+  stroke-dasharray: 6 4;
+}
+.context-graph-edge-line.kind-replays,
+.context-graph-edge-line.kind-tree_next {
+  stroke: var(--ctx-l1);
+  stroke-width: 2.4;
+  opacity: 0.92;
+}
+.context-graph-edge-line.kind-tree_child {
+  stroke: color-mix(in srgb, var(--text-dim) 42%, transparent);
+  stroke-width: 1.4;
+}
+.context-graph-edge-chip.replays {
+  fill: color-mix(in srgb, var(--ctx-l1) 22%, var(--surface));
+  stroke: color-mix(in srgb, var(--ctx-l1) 48%, transparent);
+}
+.context-graph-edge-g.replays .context-graph-edge-label {
+  fill: color-mix(in srgb, var(--ctx-l1) 55%, var(--text));
+  font-weight: 750;
+}
+.context-graph-arrow.next {
+  fill: var(--ctx-l1);
+}
+.context-graph-svg-node.role-root .context-graph-svg-card {
+  stroke: color-mix(in srgb, var(--ctx-l0) 50%, var(--border));
+  stroke-width: 1.6;
+}
+.context-graph-svg-node.role-turn .context-graph-svg-card {
+  stroke: color-mix(in srgb, var(--ctx-message) 40%, var(--border));
+  stroke-width: 1.4;
 }
 .context-graph-svg-card {
-  fill: color-mix(in srgb, var(--surface) 96%, #fff 2%);
-  stroke: color-mix(in srgb, var(--border) 92%, transparent);
-  stroke-width: 1.2;
+  fill: color-mix(in srgb, var(--surface) 97%, #fff 3%);
+  stroke: color-mix(in srgb, var(--border) 88%, transparent);
+  stroke-width: 1.15;
 }
 .context-graph-svg-accent {
   fill: var(--accent);
 }
-.context-graph-svg-node.kind-message .context-graph-svg-accent { fill: #d89a36; }
-.context-graph-svg-node.kind-epoch .context-graph-svg-accent { fill: var(--accent); }
-.context-graph-svg-node.kind-handoff .context-graph-svg-accent { fill: #2f9d6a; }
-.context-graph-svg-node.kind-artifact .context-graph-svg-accent { fill: #2f9d6a; }
-.context-graph-svg-node.kind-assemble_slice .context-graph-svg-accent { fill: #8b6ce0; }
-.context-graph-svg-node.kind-project_note .context-graph-svg-accent { fill: var(--text-faint); }
+.context-graph-svg-node.kind-message .context-graph-svg-accent { fill: var(--ctx-message); }
+.context-graph-svg-node.kind-epoch .context-graph-svg-accent { fill: var(--ctx-epoch); }
+.context-graph-svg-node.kind-handoff .context-graph-svg-accent { fill: var(--ctx-handoff); }
+.context-graph-svg-node.kind-artifact .context-graph-svg-accent { fill: var(--ctx-handoff); }
+.context-graph-svg-node.kind-assemble_slice .context-graph-svg-accent { fill: var(--ctx-slice); }
+.context-graph-svg-node.kind-project_note .context-graph-svg-accent { fill: var(--ctx-note); }
 
+/* Keep fills light so dim doesn't turn muddy brown */
 .context-graph-svg-node.kind-message .context-graph-svg-card {
-  fill: color-mix(in srgb, #d89a36 9%, var(--surface));
+  fill: color-mix(in srgb, var(--ctx-message) 7%, var(--surface));
 }
 .context-graph-svg-node.kind-epoch .context-graph-svg-card {
-  fill: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  fill: color-mix(in srgb, var(--ctx-epoch) 8%, var(--surface));
 }
 .context-graph-svg-node.kind-handoff .context-graph-svg-card,
 .context-graph-svg-node.kind-artifact .context-graph-svg-card {
-  fill: color-mix(in srgb, #2f9d6a 10%, var(--surface));
+  fill: color-mix(in srgb, var(--ctx-handoff) 8%, var(--surface));
 }
 .context-graph-svg-node.kind-assemble_slice .context-graph-svg-card {
-  fill: color-mix(in srgb, #8b6ce0 10%, var(--surface));
+  fill: color-mix(in srgb, var(--ctx-slice) 8%, var(--surface));
+}
+.context-graph-svg-node.kind-project_note .context-graph-svg-card {
+  fill: color-mix(in srgb, var(--ctx-note, #8b7cf6) 10%, var(--surface));
 }
 
 .context-graph-svg-node.selected .context-graph-svg-card {
   stroke: var(--accent);
   stroke-width: 2.2;
-  fill: color-mix(in srgb, var(--accent) 16%, var(--surface));
+  fill: color-mix(in srgb, var(--accent) 14%, var(--surface));
 }
 .context-graph-svg-node.related .context-graph-svg-card {
-  stroke: color-mix(in srgb, var(--accent) 55%, var(--border));
-  stroke-width: 1.6;
+  stroke: color-mix(in srgb, var(--accent) 50%, var(--border));
+  stroke-width: 1.55;
 }
 .context-graph-svg-node.dim {
-  opacity: 0.24;
+  opacity: var(--ctx-dim-node);
+}
+.context-graph-svg-node.dim:hover {
+  opacity: 0.85;
+}
+/* Related-but-not-selected stays fully opaque; only its stroke steps back. */
+.context-graph-svg-node.related .context-graph-svg-meta,
+.context-graph-svg-node.related .context-graph-svg-kind {
+  opacity: 0.8;
 }
 .context-graph-svg-node.status-archived .context-graph-svg-card {
   stroke-dasharray: 5 4;
@@ -6313,16 +6947,102 @@ a:focus-visible {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.04em;
+  pointer-events: none;
 }
 .context-graph-svg-label {
   fill: var(--text);
   font-size: 12.5px;
   font-weight: 700;
+  pointer-events: none;
 }
 .context-graph-svg-meta {
   fill: var(--text-dim);
   font-size: 10px;
   font-weight: 500;
+  pointer-events: none;
+}
+.context-graph-svg-metric {
+  fill: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+.context-graph-layer-seg.layer-L0 { fill: var(--ctx-l0); }
+.context-graph-layer-seg.layer-L1 { fill: var(--ctx-l1); }
+.context-graph-layer-seg.layer-L2 { fill: var(--ctx-l2); }
+.context-graph-layer-seg.layer-L3 { fill: var(--ctx-l3); }
+.context-graph-hit-track {
+  fill: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.context-graph-hit-fill {
+  fill: var(--ctx-l0);
+}
+.context-graph-svg-node.superseded .context-graph-svg-card {
+  stroke: color-mix(in srgb, var(--warn) 45%, var(--border));
+}
+.context-graph-svg-node.superseded .context-graph-status-pill {
+  fill: color-mix(in srgb, var(--warn) 24%, var(--surface));
+}
+
+.context-graph-viewport-controls {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(6px);
+}
+.context-graph-viewport-controls button {
+  min-width: 26px;
+  height: 22px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.context-graph-viewport-controls button:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+.context-graph-viewport-readout {
+  padding: 0 8px 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+/* Narrow screens wrap the legend onto several rows — drop the controls below it.
+   This has to live after the base rule above, not with the other responsive
+   overrides earlier in the file, or the later declaration wins the cascade. */
+@media (max-width: 720px) {
+  .context-graph-viewport-controls { top: auto; bottom: 10px; right: 10px; }
+  .context-graph-viewport-readout { display: none; }
+  .context-graph-legend-hint { display: none; }
+}
+.context-graph-canvas svg {
+  cursor: grab;
+  touch-action: none;
+}
+.context-graph-canvas svg.panning {
+  cursor: grabbing;
+}
+.context-graph-stat-cache {
+  color: var(--accent) !important;
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent) !important;
+}
+.context-graph-stat-truncated {
+  color: var(--text-faint) !important;
 }
 
 .context-graph-open-btn {

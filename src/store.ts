@@ -539,6 +539,9 @@ export class WriterStore {
     if (!contextColumns.some(column => column.name === "agent_checkpoint_json")) {
       this.database.exec("ALTER TABLE session_context ADD COLUMN agent_checkpoint_json TEXT NOT NULL DEFAULT '{}'");
     }
+    if (!contextColumns.some(column => column.name === "materials_shelf_json")) {
+      this.database.exec("ALTER TABLE session_context ADD COLUMN materials_shelf_json TEXT NOT NULL DEFAULT '[]'");
+    }
     const messageColumns = this.database.prepare("PRAGMA table_info(messages)").all() as Row[];
     if (!messageColumns.some(column => column.name === "channel")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'agent'");
@@ -1041,12 +1044,74 @@ export class WriterStore {
     }));
   }
 
-  contextGraph(sessionId: string): ContextGraphView {
-    return buildContextGraphView(sessionId, this.contextNodes(sessionId), this.contextEdges(sessionId));
+  contextGraph(sessionId: string, options?: { limit?: number }): ContextGraphView {
+    return buildContextGraphView(sessionId, this.contextNodes(sessionId), this.contextEdges(sessionId), options);
   }
 
   activeContextHandoffs(sessionId: string): ContextNode[] {
     return this.contextNodes(sessionId, { status: "active", kind: "handoff" });
+  }
+
+  /** Active project trunk node (shared outline/character materials), if any. */
+  activeContextTrunk(sessionId: string): ContextNode | undefined {
+    return this.contextNodes(sessionId, { status: "active", kind: "project_note" })
+      .find(node => (node.payload as { kind?: unknown }).kind === "trunk");
+  }
+
+  /**
+   * Upsert the session trunk graph node when materials hash changes.
+   * Same hash reuses the existing node so assemble edges stay stable.
+   */
+  ensureContextTrunk(sessionId: string, input: {
+    hash: string;
+    label: string;
+    payload: Record<string, unknown>;
+  }): ContextNode {
+    const existing = this.activeContextTrunk(sessionId);
+    if (existing) {
+      const prevHash = (existing.payload as { hash?: unknown }).hash;
+      if (prevHash === input.hash) {
+        // Refresh payload metrics without changing identity/bytes linkage.
+        this.updateContextNode(sessionId, existing.id, {
+          label: input.label,
+          payload: { ...existing.payload, ...input.payload, kind: "trunk", hash: input.hash },
+        });
+        return { ...existing, label: input.label, payload: { ...existing.payload, ...input.payload, kind: "trunk", hash: input.hash } };
+      }
+      this.updateContextNode(sessionId, existing.id, { status: "archived" });
+    }
+    const node = this.createContextNode({
+      sessionId,
+      kind: "project_note",
+      label: input.label,
+      payload: { ...input.payload, kind: "trunk", hash: input.hash },
+    });
+    if (existing) {
+      this.addContextEdge({ sessionId, fromId: node.id, toId: existing.id, kind: "supersedes" });
+    }
+    return node;
+  }
+
+  /**
+   * Retire earlier handoffs for the same chapter once it is delivered again.
+   *
+   * Without this a rewrite leaves two active handoffs for one chapter, and the
+   * L2 prompt block hands the model both the stale and the fresh seam tail.
+   * The archived node stays in the graph behind a `supersedes` edge, so the UI
+   * can still show that this chapter was written more than once.
+   */
+  supersedeContextHandoffs(sessionId: string, chapterKey: string, newNodeId: string): number {
+    if (!chapterKey || !this.sessionExists(sessionId)) return 0;
+    const stale = this.activeContextHandoffs(sessionId).filter((node) => {
+      if (node.id === newNodeId) return false;
+      const key = (node.payload as { chapterKey?: unknown }).chapterKey;
+      return typeof key === "string" && key === chapterKey;
+    });
+    for (const node of stale) {
+      this.updateContextNode(sessionId, node.id, { status: "archived" });
+      this.addContextEdge({ sessionId, fromId: newNodeId, toId: node.id, kind: "supersedes" });
+    }
+    return stale.length;
   }
 
   /**
@@ -1115,6 +1180,70 @@ export class WriterStore {
     }
     this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)`)
       .run(sessionId, null, "", json, now);
+  }
+
+  /**
+   * Session-level materials shelf (lore/character digests). Survives jobs in the
+   * same session; call sites invalidate by sourceHash against current files.
+   */
+  sessionMaterialsShelf(sessionId: string): import("./tools/types.js").MaterialsShelfEntry[] {
+    if (!this.sessionExists(sessionId)) return [];
+    const row = this.database.prepare("SELECT materials_shelf_json FROM session_context WHERE session_id=?")
+      .get(sessionId) as Row | undefined;
+    if (typeof row?.materials_shelf_json !== "string" || !row.materials_shelf_json.trim()) return [];
+    try {
+      const parsed = JSON.parse(row.materials_shelf_json) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const rowItem = item as Record<string, unknown>;
+        if (typeof rowItem.key !== "string" || !rowItem.key.trim()) return [];
+        if (typeof rowItem.sourceHash !== "string" || typeof rowItem.kind !== "string") return [];
+        if (typeof rowItem.digest !== "string") return [];
+        return [{
+          key: rowItem.key,
+          ...(typeof rowItem.path === "string" ? { path: rowItem.path } : {}),
+          ...(typeof rowItem.characterId === "number" && Number.isInteger(rowItem.characterId)
+            ? { characterId: rowItem.characterId }
+            : {}),
+          sourceHash: rowItem.sourceHash,
+          kind: rowItem.kind,
+          digest: rowItem.digest,
+          bodyChars: typeof rowItem.bodyChars === "number" ? rowItem.bodyChars : 0,
+          fullBodyServed: rowItem.fullBodyServed === true,
+        }];
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  saveSessionMaterialsShelf(
+    sessionId: string,
+    entries: readonly import("./tools/types.js").MaterialsShelfEntry[],
+  ): void {
+    if (!this.sessionExists(sessionId)) return;
+    const now = new Date().toISOString();
+    const json = JSON.stringify(entries.map(item => ({
+      key: item.key,
+      ...(item.path ? { path: item.path } : {}),
+      ...(item.characterId != null ? { characterId: item.characterId } : {}),
+      sourceHash: item.sourceHash,
+      kind: item.kind,
+      digest: item.digest,
+      bodyChars: item.bodyChars,
+      fullBodyServed: item.fullBodyServed,
+    })));
+    const existing = this.database.prepare("SELECT 1 AS ok FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
+    if (existing) {
+      this.database.prepare("UPDATE session_context SET materials_shelf_json=?, updated_at=? WHERE session_id=?")
+        .run(json, now, sessionId);
+      return;
+    }
+    this.database.prepare(
+      `INSERT INTO session_context(session_id,active_document,current_intent,todos_json,materials_shelf_json,updated_at)
+       VALUES(?,?,?,?,?,?)`,
+    ).run(sessionId, null, "", "[]", json, now);
   }
 
   writingDraft(sessionId: string): { mode: string; instruction: string; path?: string; selection?: string; draft: string } | undefined {

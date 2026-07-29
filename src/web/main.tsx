@@ -578,8 +578,18 @@ type ContextGraphView = {
   edges: ContextGraphEdge[];
   activeHandoffs: ContextGraphNode[];
   activeEpochs: ContextGraphNode[];
+  activeTrunks?: ContextGraphNode[];
   recentSlices: ContextGraphNode[];
-  stats: { activeNodes: number; archivedNodes: number; edgeCount: number; handoffCount: number };
+  stats: {
+    activeNodes: number;
+    archivedNodes: number;
+    edgeCount: number;
+    handoffCount: number;
+    trunkCount?: number;
+    totalNodes: number;
+  };
+  /** True when `nodes` is a recent window rather than the whole session. */
+  truncated: boolean;
 };
 type State = {
   accessMode?: "owner" | "readonly";
@@ -792,16 +802,22 @@ function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRu
   onContinuityFacts: () => void;
 }) {
   if (!open) return null;
+  const pick = (action: () => void) => () => {
+    action();
+    onClose();
+  };
   return (
     <div className="settings-menu-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="settings-menu" role="menu" aria-label="设置快捷入口" onMouseDown={(event) => event.stopPropagation()}>
-        <button role="menuitem" onClick={() => onSelect("models")}><Bot size={16} />模型与分工</button>
-        <button role="menuitem" onClick={() => onSelect("writing")}><Pencil size={16} />写作行为</button>
-        <button role="menuitem" onClick={() => onSelect("style")}><WandSparkles size={16} />写作风格</button>
-        <button role="menuitem" onClick={onReviewRules}><ShieldCheck size={16} />作者复审规则</button>
-        <button role="menuitem" onClick={onContinuityFacts}><Library size={16} />连续性事实</button>
-        <button role="menuitem" disabled={!connectionAvailable} onClick={() => onSelect("connection")}><Wifi size={16} />连接设置</button>
-        <button role="menuitem" onClick={() => onSelect("appearance")}><Sun size={16} />界面主题</button>
+        <button type="button" role="menuitem" onClick={pick(() => onSelect("models"))}><Bot size={16} aria-hidden="true" />模型与分工</button>
+        <button type="button" role="menuitem" onClick={pick(() => onSelect("writing"))}><Pencil size={16} aria-hidden="true" />写作行为</button>
+        <button type="button" role="menuitem" onClick={pick(() => onSelect("style"))}><WandSparkles size={16} aria-hidden="true" />写作风格</button>
+        <i className="settings-menu-separator" aria-hidden="true" />
+        <button type="button" role="menuitem" onClick={pick(onReviewRules)}><ShieldCheck size={16} aria-hidden="true" />作者复审规则</button>
+        <button type="button" role="menuitem" onClick={pick(onContinuityFacts)}><Library size={16} aria-hidden="true" />连续性事实</button>
+        <i className="settings-menu-separator" aria-hidden="true" />
+        <button type="button" role="menuitem" disabled={!connectionAvailable} onClick={pick(() => onSelect("connection"))}><Wifi size={16} aria-hidden="true" />连接设置</button>
+        <button type="button" role="menuitem" onClick={pick(() => onSelect("appearance"))}><Sun size={16} aria-hidden="true" />界面主题</button>
       </div>
     </div>
   );
@@ -912,13 +928,6 @@ function readStepTrailMap(): Record<string, StoredStepTrail> {
   } catch {
     return {};
   }
-}
-
-function loadStepTrail(sessionId: string): StoredStepTrail | null {
-  if (!sessionId) return null;
-  const trail = readStepTrailMap()[sessionId];
-  if (!trail || !Array.isArray(trail.steps) || !trail.steps.length) return null;
-  return trail;
 }
 
 function saveStepTrail(sessionId: string, messageId: number, steps: StreamStep[]): void {
@@ -1083,30 +1092,6 @@ function stepsFromServerTrail(trail: MessageStepTrail): StreamStep[] {
     status: step.status === "running" || step.status === "failed" || step.status === "completed"
       ? step.status
       : "completed",
-    expanded: false,
-    ...(step.usage ? { usage: step.usage } : {}),
-  }));
-}
-
-function pickServerStepTrail(
-  trails: MessageStepTrail[] | undefined,
-  preferredMessageId?: number | null,
-): MessageStepTrail | null {
-  if (!trails?.length) return null;
-  if (preferredMessageId != null && preferredMessageId > 0) {
-    const match = trails.find((trail) => trail.sourceMessageId === preferredMessageId);
-    if (match) return match;
-  }
-  return trails.slice().sort((a, b) => b.sourceMessageId - a.sourceMessageId)[0] ?? null;
-}
-
-function restoreTrailSteps(trail: StoredStepTrail): StreamStep[] {
-  return trail.steps.map((step) => ({
-    id: step.id,
-    output: step.output ?? "",
-    reasoning: step.reasoning ?? "",
-    tools: Array.isArray(step.tools) ? step.tools : [],
-    status: step.status === "running" ? "failed" : step.status,
     expanded: false,
     ...(step.usage ? { usage: step.usage } : {}),
   }));
@@ -1954,7 +1939,68 @@ function FileTreeItem({
   );
 }
 
-function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => void }) {
+/**
+ * Detect mid-job context cut from consecutive step prompt sizes.
+ * Chapter boundary typically drops ~40%+ of prompt (e.g. 53k → 16k).
+ */
+function detectStepContextReset(
+  prev: StreamStep | undefined,
+  step: StreamStep,
+): { fromStep: number; toStep: number; before: number; after: number; ratio: number } | null {
+  if (!prev || prev.id < 1 || step.id < 1) return null;
+  const before = prev.usage?.promptTokens ?? 0;
+  const after = step.usage?.promptTokens ?? 0;
+  if (before < 8_000 || after < 1_000) return null;
+  if (after >= before * 0.62) return null;
+  // Prefer cuts after a document delivery / scene write.
+  const prevTools = prev.tools.join(" ");
+  const likelyBoundary = /propose_document|propose_chapter|write_chapter_scene|write_document/.test(prevTools)
+    || before - after > 12_000;
+  if (!likelyBoundary) return null;
+  return {
+    fromStep: prev.id,
+    toStep: step.id,
+    before,
+    after,
+    ratio: after / before,
+  };
+}
+
+function AgentStepContextResetBanner({
+  reset,
+}: {
+  reset: { fromStep: number; toStep: number; before: number; after: number; ratio: number };
+}) {
+  const saved = reset.before - reset.after;
+  return (
+    <div
+      className="agent-step-context-reset"
+      title="章/场边界：截断回稳定前缀+树干+交接，丢弃上一章/场的工具过程。后续 read_document 是按需补读细节，不是裁剪失败。"
+    >
+      <span className="agent-step-context-reset-badge">上下文裁剪</span>
+      <span className="agent-step-context-reset-flow">
+        Step {reset.fromStep} → {reset.toStep}
+      </span>
+      <span className="agent-step-context-reset-tokens">
+        {formatGraphTokens(reset.before)} → {formatGraphTokens(reset.after)}
+        <em>−{formatGraphTokens(saved)}</em>
+      </span>
+      <span className="agent-step-context-reset-hint">
+        保留 L0 前缀+树干+交接 · 丢弃上一章过程 · 细节仍须工具补读
+      </span>
+    </div>
+  );
+}
+
+function AgentStepCard({
+  step,
+  prevStep,
+  onToggle,
+}: {
+  step: StreamStep;
+  prevStep?: StreamStep;
+  onToggle: () => void;
+}) {
   const label =
     step.id === 0
       ? "Planning"
@@ -1963,9 +2009,12 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
       : step.status === "failed"
         ? `Step ${step.id} failed`
         : `Step ${step.id} done`;
+  const reset = detectStepContextReset(prevStep, step);
 
   return (
-    <article className={`agent-step ${step.status}`}>
+    <>
+    {reset ? <AgentStepContextResetBanner reset={reset} /> : null}
+    <article className={`agent-step ${step.status}${reset ? " after-context-reset" : ""}`}>
       <button className="agent-step-summary" onClick={onToggle} type="button">
         <span className="agent-step-indicator" />
         <strong>{label}</strong>
@@ -1996,6 +2045,22 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
       </button>
       {step.expanded && (
         <div className="agent-step-content">
+          {reset ? (
+            <div className="agent-step-context-reset-detail">
+              <strong>本步继承（裁剪后）</strong>
+              <ul>
+                <li>稳定系统前缀 + 项目树干（L0，跨章缓存）</li>
+                <li>本轮开轮任务块 + 章/场交接 handoff（结果态，非全文）</li>
+                <li>
+                  已丢弃约 {formatGraphTokens(reset.before - reset.after)} tok 的上一章/场工具过程
+                  （read/propose 全文等）
+                </li>
+                <li>
+                  若仍出现 read_document / search_project：树干只有索引与路径，具体 lore/前章细节需最小补读，属预期
+                </li>
+              </ul>
+            </div>
+          ) : null}
           <div className="agent-step-usage-detail">
             {step.usage
               ? (
@@ -2090,18 +2155,10 @@ function AgentStepCard({ step, onToggle }: { step: StreamStep; onToggle: () => v
         </div>
       )}
     </article>
+    </>
   );
 }
 
-
-const CONTEXT_GRAPH_KIND_COLUMN: Record<string, number> = {
-  message: 0,
-  epoch: 1,
-  handoff: 2,
-  artifact: 2,
-  assemble_slice: 3,
-  project_note: 4,
-};
 
 const CONTEXT_GRAPH_KIND_LABEL: Record<string, string> = {
   message: "消息",
@@ -2109,7 +2166,7 @@ const CONTEXT_GRAPH_KIND_LABEL: Record<string, string> = {
   handoff: "交接",
   artifact: "交付",
   assemble_slice: "装配",
-  project_note: "备注",
+  project_note: "树干",
 };
 
 const CONTEXT_GRAPH_EDGE_LABEL: Record<string, string> = {
@@ -2119,102 +2176,584 @@ const CONTEXT_GRAPH_EDGE_LABEL: Record<string, string> = {
   supersedes: "取代",
   archives: "归档",
   includes: "包含",
+  replays: "续前缀",
+  tree_child: "子节点",
+  tree_next: "下一轮",
 };
 
-type ContextGraphLayoutNode = ContextGraphNode & { x: number; y: number; w: number; h: number };
+/** Child kind order under a turn (outline readability). */
+const CONTEXT_GRAPH_TURN_CHILD_ORDER: Record<string, number> = {
+  epoch: 0,
+  assemble_slice: 1,
+  handoff: 2,
+  artifact: 3,
+  project_note: 4,
+  message: 5,
+};
 
-function truncateGraphLabel(value: string, max = 14): string {
-  const text = value.replace(/\s+/g, " ").trim();
-  if (text.length <= max) return text;
-  return `${text.slice(0, max - 1)}…`;
+const CONTEXT_GRAPH_LAYER_LABEL: Record<string, string> = {
+  L0: "L0 稳定前缀/树干",
+  L1: "L1 冻块 replay",
+  L2: "L2 交接结果态",
+  L3: "L3 本轮过程",
+};
+
+/**
+ * The number the card shows, when the payload carries one worth showing.
+ *
+ * An assemble slice knows how its prompt split across L0~L3; an epoch knows what
+ * it froze and — since the runtime writes provider usage back — how much of that
+ * the cache actually covered. Everything else stays a plain card rather than
+ * inventing a metric.
+ */
+type ContextGraphNodeMetric =
+  | { kind: "layers"; segments: Array<{ layer: string; label: string; tokens: number }>; total: number }
+  | { kind: "cache"; frozenTokens?: number; hitRate?: number; promptTokens?: number }
+  | null;
+
+function contextGraphNodeMetric(node: ContextGraphNode): ContextGraphNodeMetric {
+  if (node.kind === "assemble_slice") {
+    const raw = Array.isArray(node.payload?.layers) ? (node.payload.layers as Array<Record<string, unknown>>) : [];
+    // Merge same layer code (e.g. L0 stable + L0 trunk) so the bar stays readable.
+    const byLayer = new Map<string, { layer: string; label: string; tokens: number }>();
+    for (const layer of raw) {
+      const code = typeof layer.layer === "string" ? layer.layer : "L3";
+      const tokens = typeof layer.estimatedTokens === "number" && layer.estimatedTokens > 0 ? layer.estimatedTokens : 0;
+      if (tokens <= 0) continue;
+      const label = typeof layer.label === "string" ? layer.label : "";
+      const prev = byLayer.get(code);
+      if (prev) {
+        prev.tokens += tokens;
+        if (label && !prev.label.includes(label.slice(0, 6))) prev.label = `${prev.label} · ${label}`;
+      } else {
+        byLayer.set(code, { layer: code, label, tokens });
+      }
+    }
+    const segments = [...byLayer.values()];
+    if (!segments.length) return null;
+    return { kind: "layers", segments, total: segments.reduce((sum, segment) => sum + segment.tokens, 0) };
+  }
+  if (node.kind === "epoch") {
+    const frozenTokens = typeof node.payload?.frozenTokens === "number" ? node.payload.frozenTokens : undefined;
+    const cache = node.payload?.cache as { hitRate?: unknown; promptTokens?: unknown } | undefined;
+    const hitRate = typeof cache?.hitRate === "number" ? cache.hitRate : undefined;
+    const promptTokens = typeof cache?.promptTokens === "number" ? cache.promptTokens : undefined;
+    if (frozenTokens == null && hitRate == null) return null;
+    return { kind: "cache", frozenTokens, hitRate, promptTokens };
+  }
+  if (node.kind === "project_note" && node.payload?.kind === "trunk") {
+    const estimatedTokens = typeof node.payload.estimatedTokens === "number" ? node.payload.estimatedTokens : undefined;
+    if (estimatedTokens == null || estimatedTokens <= 0) return null;
+    return {
+      kind: "layers",
+      segments: [{ layer: "L0", label: "项目树干", tokens: estimatedTokens }],
+      total: estimatedTokens,
+    };
+  }
+  return null;
 }
 
-function layoutContextGraphNodes(nodes: ContextGraphNode[]): {
+/** Compact token count: 1240 → "1.2k". */
+function formatGraphTokens(tokens: number): string {
+  if (tokens >= 10_000) return `${Math.round(tokens / 1000)}k`;
+  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
+  return String(Math.round(tokens));
+}
+
+/**
+ * Session-level hit rate over the most recent measured turns.
+ *
+ * Token-weighted rather than a mean of per-turn rates: one tiny turn should not
+ * count as much as a long one when the question is "how much of what we paid for
+ * was already cached".
+ */
+function contextGraphCacheSummary(
+  nodes: ContextGraphNode[],
+  recent = 20,
+): { hitRate: number; promptTokens: number; turns: number } | null {
+  const measured = nodes
+    .filter((node) => node.kind === "epoch")
+    .map((node) => node.payload?.cache as { promptTokens?: unknown; cacheHitTokens?: unknown } | undefined)
+    .filter((cache): cache is { promptTokens: number; cacheHitTokens: number } =>
+      typeof cache?.promptTokens === "number" && cache.promptTokens > 0 && typeof cache.cacheHitTokens === "number")
+    .slice(-recent);
+  if (!measured.length) return null;
+  const promptTokens = measured.reduce((sum, cache) => sum + cache.promptTokens, 0);
+  const hitTokens = measured.reduce((sum, cache) => sum + cache.cacheHitTokens, 0);
+  return { hitRate: hitTokens / promptTokens, promptTokens, turns: measured.length };
+}
+
+const CONTEXT_GRAPH_NODE_H = 68;
+const CONTEXT_GRAPH_NODE_H_TALL = 88;
+
+/** Cards carrying a metric strip need the extra row; everything else stays compact. */
+function contextGraphNodeHeight(node: ContextGraphNode): number {
+  return contextGraphNodeMetric(node) ? CONTEXT_GRAPH_NODE_H_TALL : CONTEXT_GRAPH_NODE_H;
+}
+
+type ContextGraphLayoutNode = ContextGraphNode & {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  depth: number;
+  treeRole: "root" | "turn" | "leaf";
+};
+
+type ContextGraphTreeLink = {
+  id: string;
+  fromId: string;
+  toId: string;
+  /** next = turn chain (prefix grows); child = process under a turn */
+  kind: "tree_next" | "tree_child";
+  label: string;
+};
+
+type ContextGraphLayout = {
   placed: ContextGraphLayoutNode[];
   width: number;
   height: number;
-  columns: Array<{ index: number; label: string; x: number; width: number }>;
-} {
-  const colWidth = 210;
-  const rowGap = 22;
-  const nodeH = 72;
-  const nodeW = 176;
-  const padX = 28;
-  const padY = 56;
-  const laneGap = 12;
-  const byCol = new Map<number, ContextGraphNode[]>();
-  for (const node of nodes) {
-    const col = CONTEXT_GRAPH_KIND_COLUMN[node.kind] ?? 4;
-    const list = byCol.get(col) ?? [];
+  nodeW: number;
+  nodeHeights: number[];
+  /** Only these edges are drawn — pure tree, no spaghetti. */
+  treeLinks: ContextGraphTreeLink[];
+};
+
+type ContextGraphTreeItem = {
+  node: ContextGraphNode;
+  role: "root" | "turn" | "leaf";
+  children: ContextGraphTreeItem[];
+};
+
+function epochHitRate(node: ContextGraphNode): number | undefined {
+  const cache = node.payload?.cache as { hitRate?: unknown } | undefined;
+  return typeof cache?.hitRate === "number" ? cache.hitRate : undefined;
+}
+
+function assembleReplayTurns(node: ContextGraphNode): number | undefined {
+  const replay = node.payload?.replay as { turns?: unknown } | undefined;
+  return typeof replay?.turns === "number" ? replay.turns : undefined;
+}
+
+function isTrunkNode(node: ContextGraphNode): boolean {
+  return node.kind === "project_note" && node.payload?.kind === "trunk";
+}
+
+function turnGroupKey(node: ContextGraphNode): string {
+  if (node.sourceMessageId != null) return `msg:${node.sourceMessageId}`;
+  if (node.jobId) return `job:${node.jobId}`;
+  return `solo:${node.id}`;
+}
+
+/**
+ * Build one session tree:
+ *   root(trunk/L0)
+ *     └─ turn1 ─┬─ epoch / assemble / handoff …
+ *               └─ turn2 ─┬─ …
+ *                         └─ turn3 …
+ * Nesting turns expresses growing prefix cache; process nodes hang off each turn.
+ */
+function buildContextGraphTree(nodes: ContextGraphNode[]): ContextGraphTreeItem | null {
+  if (!nodes.length) return null;
+
+  const trunks = nodes.filter(isTrunkNode).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const rest = nodes.filter((node) => !isTrunkNode(node));
+
+  const groups = new Map<string, ContextGraphNode[]>();
+  for (const node of rest) {
+    const key = turnGroupKey(node);
+    const list = groups.get(key) ?? [];
     list.push(node);
-    byCol.set(col, list);
+    groups.set(key, list);
   }
-  const colIndexes = [...byCol.keys()].sort((a, b) => a - b);
-  const placed: ContextGraphLayoutNode[] = [];
-  let maxY = padY;
-  colIndexes.forEach((col, order) => {
-    const list = (byCol.get(col) ?? []).slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    list.forEach((node, index) => {
-      const x = padX + order * colWidth + (colWidth - nodeW) / 2;
-      const y = padY + index * (nodeH + rowGap);
-      maxY = Math.max(maxY, y + nodeH);
-      placed.push({ ...node, x, y, w: nodeW, h: nodeH });
-    });
-  });
-  const columns = colIndexes.map((index, order) => {
-    const sample = (byCol.get(index) ?? [])[0];
-    const kind = sample?.kind ?? "project_note";
-    return {
-      index,
-      label: CONTEXT_GRAPH_KIND_LABEL[kind] ?? kind,
-      x: padX + order * colWidth - laneGap / 2,
-      width: colWidth,
-    };
-  });
+
+  const turns = [...groups.entries()]
+    .map(([key, list]) => {
+      const sorted = list.slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const message = sorted.find((node) => node.kind === "message");
+      const epoch = sorted.find((node) => node.kind === "epoch");
+      const sortAt = sorted[0]!.createdAt;
+      const msgId = message?.sourceMessageId
+        ?? sorted.find((node) => node.sourceMessageId != null)?.sourceMessageId
+        ?? 0;
+      return { key, list: sorted, message, epoch, sortAt, msgId };
+    })
+    .sort((a, b) => a.sortAt.localeCompare(b.sortAt) || a.msgId - b.msgId);
+
+  const sessionId = nodes[0]!.sessionId;
+  const rootNode: ContextGraphNode = trunks[0] ?? {
+    id: `virtual-root-${sessionId}`,
+    sessionId,
+    kind: "project_note",
+    status: "active",
+    label: "会话共享前缀 · L0",
+    payload: { kind: "trunk", virtual: true, estimatedTokens: 0 },
+    createdAt: turns[0]?.sortAt ?? new Date().toISOString(),
+    updatedAt: turns[0]?.sortAt ?? new Date().toISOString(),
+  };
+
+  // Build turn chain from the end so each turn's last child is the next turn.
+  let nextTurnItem: ContextGraphTreeItem | undefined;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index]!;
+    const turnRoot = turn.message ?? turn.epoch ?? turn.list[0]!;
+    const processKids = turn.list
+      .filter((node) => node.id !== turnRoot.id)
+      .slice()
+      .sort((a, b) => {
+        const oa = CONTEXT_GRAPH_TURN_CHILD_ORDER[a.kind] ?? 9;
+        const ob = CONTEXT_GRAPH_TURN_CHILD_ORDER[b.kind] ?? 9;
+        if (oa !== ob) return oa - ob;
+        return a.createdAt.localeCompare(b.createdAt);
+      })
+      .map((node): ContextGraphTreeItem => ({ node, role: "leaf", children: [] }));
+
+    const children: ContextGraphTreeItem[] = [...processKids];
+    if (nextTurnItem) children.push(nextTurnItem);
+
+    nextTurnItem = { node: turnRoot, role: "turn", children };
+  }
+
   return {
-    placed,
-    width: Math.max(720, padX * 2 + Math.max(colIndexes.length, 1) * colWidth),
-    height: Math.max(320, maxY + padY),
-    columns,
+    node: rootNode,
+    role: "root",
+    children: nextTurnItem ? [nextTurnItem] : [],
   };
 }
 
-function nodeAnchor(
-  from: ContextGraphLayoutNode,
-  to: ContextGraphLayoutNode,
-  end: "start" | "finish",
-): { x: number; y: number } {
-  const fromCx = from.x + from.w / 2;
-  const fromCy = from.y + from.h / 2;
-  const toCx = to.x + to.w / 2;
-  const toCy = to.y + to.h / 2;
-  const dx = toCx - fromCx;
-  const dy = toCy - fromCy;
-  const node = end === "start" ? from : to;
-  const cx = node.x + node.w / 2;
-  const cy = node.y + node.h / 2;
-  // Prefer horizontal ports for left/right layout; fall back to vertical for same-column links.
-  if (Math.abs(dx) >= Math.abs(dy) * 0.55) {
-    const right = end === "start" ? dx > 0 : dx < 0;
-    return { x: right ? node.x + node.w : node.x, y: cy };
+/** Approximate display units: CJK ≈ 2, ASCII ≈ 1. Avoids SVG text overflowing cards. */
+function graphLabelUnits(text: string): number {
+  let units = 0;
+  for (const ch of text) {
+    units += /[\u1100-\u115f\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\ufe10-\ufe1f\ufe30-\ufe6f\uff00-\uffef]/.test(ch) ? 2 : 1;
   }
-  const down = end === "start" ? dy > 0 : dy < 0;
-  return { x: cx, y: down ? node.y + node.h : node.y };
+  return units;
 }
 
-function edgePath(from: ContextGraphLayoutNode, to: ContextGraphLayoutNode): string {
-  const a = nodeAnchor(from, to, "start");
-  const b = nodeAnchor(from, to, "finish");
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    const bend = Math.max(36, Math.abs(dx) * 0.42);
-    const s = dx >= 0 ? 1 : -1;
-    return `M ${a.x} ${a.y} C ${a.x + bend * s} ${a.y}, ${b.x - bend * s} ${b.y}, ${b.x} ${b.y}`;
+function truncateGraphLabel(value: string, maxUnits = 18): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (graphLabelUnits(text) <= maxUnits) return text;
+  let out = "";
+  let units = 0;
+  for (const ch of text) {
+    const add = /[\u1100-\u115f\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\ufe10-\ufe1f\ufe30-\ufe6f\uff00-\uffef]/.test(ch) ? 2 : 1;
+    if (units + add > maxUnits - 1) break;
+    out += ch;
+    units += add;
   }
-  const bend = Math.max(28, Math.abs(dy) * 0.4);
-  const s = dy >= 0 ? 1 : -1;
-  return `M ${a.x} ${a.y} C ${a.x} ${a.y + bend * s}, ${b.x} ${b.y - bend * s}, ${b.x} ${b.y}`;
+  return `${out}…`;
+}
+
+function contextGraphStatusLabel(status: string): string {
+  if (status === "active") return "活跃";
+  if (status === "archived") return "归档";
+  return status;
+}
+
+function contextGraphNodeTitle(node: ContextGraphNode): string {
+  const raw = node.label.replace(/\s+/g, " ").trim();
+  if (node.kind === "message") {
+    return truncateGraphLabel(raw.replace(/^用户\s*[·.\-—]\s*/, ""), 22);
+  }
+  if (node.kind === "epoch") {
+    return truncateGraphLabel(raw.replace(/^任务\s*[·.\-—]\s*/, ""), 20);
+  }
+  if (node.kind === "handoff" || node.kind === "artifact") {
+    return truncateGraphLabel(raw.replace(/^(章交接|交付)\s*[·.\-—]\s*/, ""), 20);
+  }
+  if (node.kind === "project_note" && node.payload?.kind === "trunk") {
+    const chars = typeof node.payload.characterCount === "number" ? node.payload.characterCount : undefined;
+    const outline = typeof node.payload.outlineNodeCount === "number" ? node.payload.outlineNodeCount : undefined;
+    if (chars != null || outline != null) {
+      return truncateGraphLabel(`共享 · 角${chars ?? 0}/纲${outline ?? 0}`, 20);
+    }
+    return truncateGraphLabel(raw.replace(/^树干\s*[·.\-—]\s*/, "") || "项目树干", 18);
+  }
+  if (node.kind === "assemble_slice") {
+    const note = typeof node.payload?.note === "string" ? node.payload.note : "";
+    const step = typeof node.payload?.step === "number" ? node.payload.step : undefined;
+    const transition = node.payload?.transition as { kind?: string } | undefined;
+    const stepTag = step != null && step > 0 ? ` · s${step}` : "";
+    if (transition?.kind === "chapter_boundary" || raw.includes("章边界") || note.includes("章边界") || /chapter boundary/i.test(note)) {
+      return truncateGraphLabel(`章边界截断${stepTag}`, 22);
+    }
+    if (transition?.kind === "scene_boundary" || raw.includes("场边界") || note.includes("场边界")) {
+      return truncateGraphLabel(`场边界截断${stepTag}`, 22);
+    }
+    if (transition?.kind === "open_turn" || note.includes("开轮") || /initial assemble/i.test(note)) {
+      return "开轮装配";
+    }
+    if (note) return truncateGraphLabel(note, 20);
+    return truncateGraphLabel(raw.replace(/^装配\s*[·.\-—]\s*/, "") || "开轮", 18);
+  }
+  return truncateGraphLabel(raw, 20);
+}
+
+function contextGraphNodeMeta(node: ContextGraphNode): string {
+  const time = new Date(node.createdAt).toLocaleString(undefined, {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  if (node.kind === "assemble_slice") {
+    const t = node.payload?.transition as {
+      beforeTokens?: number;
+      afterTokens?: number;
+      atStep?: number;
+    } | undefined;
+    if (typeof t?.beforeTokens === "number" && typeof t?.afterTokens === "number" && t.beforeTokens > t.afterTokens) {
+      return `${formatGraphTokens(t.beforeTokens)}→${formatGraphTokens(t.afterTokens)} · ${time}`;
+    }
+  }
+  if (node.sourceMessageId != null) return `#${node.sourceMessageId} · ${time}`;
+  return time;
+}
+
+type ContextTransitionView = {
+  kind: string;
+  atStep?: number;
+  beforeTokens?: number;
+  afterTokens?: number;
+  beforeMessageCount?: number;
+  afterMessageCount?: number;
+  path?: string;
+  kept: Array<{ id: string; label: string; detail?: string }>;
+  dropped: Array<{ id: string; label: string; detail?: string }>;
+  reReadHint?: string;
+};
+
+function contextTransitionFromPayload(payload: Record<string, unknown> | undefined): ContextTransitionView | null {
+  if (!payload) return null;
+  const raw = payload.transition;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const t = raw as Record<string, unknown>;
+  const kept = Array.isArray(t.kept)
+    ? t.kept.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const row = item as Record<string, unknown>;
+      if (typeof row.label !== "string") return [];
+      return [{
+        id: typeof row.id === "string" ? row.id : row.label,
+        label: row.label,
+        ...(typeof row.detail === "string" ? { detail: row.detail } : {}),
+      }];
+    })
+    : [];
+  const dropped = Array.isArray(t.dropped)
+    ? t.dropped.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const row = item as Record<string, unknown>;
+      if (typeof row.label !== "string") return [];
+      return [{
+        id: typeof row.id === "string" ? row.id : row.label,
+        label: row.label,
+        ...(typeof row.detail === "string" ? { detail: row.detail } : {}),
+      }];
+    })
+    : [];
+  if (!kept.length && !dropped.length && t.kind !== "open_turn") return null;
+  return {
+    kind: typeof t.kind === "string" ? t.kind : "unknown",
+    ...(typeof t.atStep === "number" ? { atStep: t.atStep } : {}),
+    ...(typeof t.beforeTokens === "number" ? { beforeTokens: t.beforeTokens } : {}),
+    ...(typeof t.afterTokens === "number" ? { afterTokens: t.afterTokens } : {}),
+    ...(typeof t.beforeMessageCount === "number" ? { beforeMessageCount: t.beforeMessageCount } : {}),
+    ...(typeof t.afterMessageCount === "number" ? { afterMessageCount: t.afterMessageCount } : {}),
+    ...(typeof t.path === "string" ? { path: t.path } : {}),
+    kept,
+    dropped,
+    ...(typeof t.reReadHint === "string" ? { reReadHint: t.reReadHint } : {}),
+  };
+}
+
+function ContextTransitionDetail({ transition }: { transition: ContextTransitionView }) {
+  const kindLabel = transition.kind === "chapter_boundary"
+    ? "章边界截断"
+    : transition.kind === "scene_boundary"
+      ? "场边界截断"
+      : transition.kind === "open_turn"
+        ? "开轮装配"
+        : "上下文变化";
+  const saved = transition.beforeTokens != null && transition.afterTokens != null
+    ? Math.max(0, transition.beforeTokens - transition.afterTokens)
+    : undefined;
+  return (
+    <div className="context-transition-detail">
+      <h4>继承对照 · {kindLabel}</h4>
+      {transition.atStep != null ? (
+        <p className="context-transition-step">
+          发生在 Step {transition.atStep} 结束时
+          {transition.path ? ` · ${transition.path}` : ""}
+          {" → 下一步继承裁剪后的前缀"}
+        </p>
+      ) : null}
+      {transition.beforeTokens != null && transition.afterTokens != null ? (
+        <div className="context-transition-bar" aria-hidden="true">
+          <div className="context-transition-bar-before" title={`裁剪前 ${transition.beforeTokens} tok`}>
+            <span>前 {formatGraphTokens(transition.beforeTokens)}</span>
+          </div>
+          <div
+            className="context-transition-bar-after"
+            style={{
+              width: `${Math.max(12, Math.min(100, (transition.afterTokens / Math.max(1, transition.beforeTokens)) * 100))}%`,
+            }}
+            title={`裁剪后 ${transition.afterTokens} tok`}
+          >
+            <span>后 {formatGraphTokens(transition.afterTokens)}</span>
+          </div>
+          {saved != null && saved > 0 ? (
+            <em className="context-transition-saved">省 {formatGraphTokens(saved)}</em>
+          ) : null}
+        </div>
+      ) : null}
+      {transition.kept.length ? (
+        <div className="context-transition-col keep">
+          <strong>保留 / 继承</strong>
+          <ul>
+            {transition.kept.map((item) => (
+              <li key={item.id}>
+                <span>{item.label}</span>
+                {item.detail ? <small>{item.detail}</small> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {transition.dropped.length ? (
+        <div className="context-transition-col drop">
+          <strong>丢弃 / 不继承</strong>
+          <ul>
+            {transition.dropped.map((item) => (
+              <li key={item.id}>
+                <span>{item.label}</span>
+                {item.detail ? <small>{item.detail}</small> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {transition.reReadHint ? (
+        <p className="context-transition-reread">
+          <strong>为何还会 read_document？</strong>
+          {transition.reReadHint}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Outline-style tree layout (indent by depth, stack by preorder).
+ * Only parent→child links are drawn — one session = one tree.
+ *
+ * depthGap must stay wide enough for elbow routes + optional edge chips;
+ * too narrow and arrows/labels sit under the next column of cards.
+ */
+function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraphLayout {
+  const nodeW = 200;
+  /** Gutter between depth columns — edge bus + labels live here, never under cards. */
+  const depthGap = 88;
+  const vGap = 16;
+  const padX = 24;
+  const padTop = 24;
+  const padBottom = 32;
+
+  const tree = buildContextGraphTree(nodes);
+  const placed: ContextGraphLayoutNode[] = [];
+  const treeLinks: ContextGraphTreeLink[] = [];
+  let cursorY = padTop;
+  let maxDepth = 0;
+
+  const place = (item: ContextGraphTreeItem, depth: number, parentId?: string, linkKind?: ContextGraphTreeLink["kind"]) => {
+    const h = contextGraphNodeHeight(item.node);
+    const x = padX + depth * (nodeW + depthGap);
+    const y = cursorY;
+    placed.push({
+      ...item.node,
+      x,
+      y,
+      w: nodeW,
+      h,
+      depth,
+      treeRole: item.role,
+    });
+    maxDepth = Math.max(maxDepth, depth);
+    if (parentId && linkKind) {
+      const label = linkKind === "tree_next"
+        ? "下一轮"
+        : item.node.kind === "epoch"
+          ? "任务"
+          : item.node.kind === "handoff" || item.node.kind === "artifact"
+            ? "产出"
+            : item.node.kind === "assemble_slice"
+              ? "装配"
+              : "子节点";
+      treeLinks.push({
+        id: `tree-${parentId}-${item.node.id}`,
+        fromId: parentId,
+        toId: item.node.id,
+        kind: linkKind,
+        label,
+      });
+    }
+    cursorY += h + vGap;
+    for (const child of item.children) {
+      const childLink: ContextGraphTreeLink["kind"] = child.role === "turn" ? "tree_next" : "tree_child";
+      place(child, depth + 1, item.node.id, childLink);
+    }
+  };
+
+  if (tree) place(tree, 0);
+
+  const seen = new Set<string>();
+  const unique = placed.filter((node) => {
+    if (seen.has(node.id)) return false;
+    seen.add(node.id);
+    return true;
+  });
+
+  return {
+    placed: unique,
+    width: Math.max(520, padX + (maxDepth + 1) * (nodeW + depthGap) + padX),
+    height: Math.max(200, cursorY - vGap + padBottom),
+    nodeW,
+    nodeHeights: [...new Set(unique.map((node) => node.h))],
+    treeLinks,
+  };
+}
+
+/**
+ * Orthogonal route through the depth gutter so the stroke never runs under cards.
+ * Ends short of the child face so the arrowhead stays visible (nodes paint above edges).
+ */
+function treeEdgeRoute(from: ContextGraphLayoutNode, to: ContextGraphLayoutNode): {
+  d: string;
+  labelX: number;
+  labelY: number;
+} {
+  const startX = from.x + from.w;
+  const startY = from.y + from.h / 2;
+  // Leave room for the 8px marker tip; nodes are drawn after edges and would cover it.
+  const endX = to.x - 6;
+  const endY = to.y + to.h / 2;
+  const gap = to.x - (from.x + from.w);
+  const gutterX = from.x + from.w + Math.max(20, gap * 0.5);
+
+  const d = Math.abs(endY - startY) < 1.5
+    ? `M ${startX} ${startY} L ${endX} ${endY}`
+    : `M ${startX} ${startY} L ${gutterX} ${startY} L ${gutterX} ${endY} L ${endX} ${endY}`;
+
+  // Label sits on the gutter bus (vertical if the link drops, else mid-horizontal).
+  const labelX = Math.abs(endY - startY) < 1.5
+    ? (startX + endX) / 2
+    : gutterX;
+  const labelY = Math.abs(endY - startY) < 1.5
+    ? startY - 10
+    : (startY + endY) / 2;
+
+  return { d, labelX, labelY };
 }
 
 function ContextGraphCanvas({
@@ -2228,26 +2767,75 @@ function ContextGraphCanvas({
   selectedId: string | null;
   onSelect: (id: string) => void;
 }) {
+  // Layout uses only the filtered `nodes`; tree structure is rebuilt from them.
   const layout = React.useMemo(() => layoutContextGraphNodes(nodes), [nodes]);
   const pos = React.useMemo(() => {
     const map = new Map<string, ContextGraphLayoutNode>();
     for (const node of layout.placed) map.set(node.id, node);
     return map;
   }, [layout.placed]);
-  const visibleIds = React.useMemo(() => new Set(nodes.map((node) => node.id)), [nodes]);
-  const visibleEdges = React.useMemo(
-    () => edges.filter((edge) => visibleIds.has(edge.fromId) && visibleIds.has(edge.toId)),
-    [edges, visibleIds],
-  );
+
   const relatedIds = React.useMemo(() => {
     if (!selectedId) return new Set<string>();
     const set = new Set<string>([selectedId]);
-    for (const edge of visibleEdges) {
-      if (edge.fromId === selectedId) set.add(edge.toId);
-      if (edge.toId === selectedId) set.add(edge.fromId);
+    // Walk tree links both ways so selecting a turn highlights its process + next turn.
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const link of layout.treeLinks) {
+        if (set.has(link.fromId) && !set.has(link.toId)) {
+          set.add(link.toId);
+          grew = true;
+        }
+        if (set.has(link.toId) && !set.has(link.fromId)) {
+          set.add(link.fromId);
+          grew = true;
+        }
+      }
     }
     return set;
-  }, [selectedId, visibleEdges]);
+  }, [selectedId, layout.treeLinks]);
+
+  /** Handoffs a later delivery of the same chapter retired. */
+  const supersededIds = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const edge of edges) if (edge.kind === "supersedes") set.add(edge.toId);
+    return set;
+  }, [edges]);
+
+  const svgRef = React.useRef<SVGSVGElement | null>(null);
+  const [viewport, setViewport] = React.useState({ scale: 1, tx: 0, ty: 0 });
+  const dragRef = React.useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
+  const [panning, setPanning] = React.useState(false);
+
+  const toUserSpace = React.useCallback((event: { clientX: number; clientY: number }) => {
+    const matrix = svgRef.current?.getScreenCTM();
+    if (!matrix) return null;
+    const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse());
+    return { x: point.x, y: point.y };
+  }, []);
+
+  const zoomAround = React.useCallback((factor: number, anchor: { x: number; y: number } | null) => {
+    setViewport((current) => {
+      const scale = Math.min(2.4, Math.max(0.4, current.scale * factor));
+      if (Math.abs(scale - current.scale) < 1e-4) return current;
+      const point = anchor ?? { x: current.tx, y: current.ty };
+      const cx = (point.x - current.tx) / current.scale;
+      const cy = (point.y - current.ty) / current.scale;
+      return { scale, tx: point.x - cx * scale, ty: point.y - cy * scale };
+    });
+  }, []);
+
+  React.useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      zoomAround(Math.exp(-event.deltaY * 0.0016), toUserSpace(event));
+    };
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, [zoomAround, toUserSpace, nodes.length]);
 
   if (!nodes.length) {
     return (
@@ -2255,93 +2843,108 @@ function ContextGraphCanvas({
         <div className="context-graph-empty-card">
           <GitBranch size={22} aria-hidden="true" />
           <strong>暂无上下文节点</strong>
-          <span>跑一轮 Agent 写作任务后，这里会显示任务、交接与装配关系。</span>
+          <span>跑一轮 Agent 写作任务后，这里会显示会话树：共享前缀 → 各轮消息 → 任务与交接。</span>
         </div>
       </div>
     );
   }
 
-  const svgHeight = Math.min(560, Math.max(340, layout.height));
+  const svgHeight = Math.min(620, Math.max(280, layout.height + 4));
 
   return (
-    <div className="context-graph-canvas" role="img" aria-label="上下文关系图">
+    <div className="context-graph-canvas" role="img" aria-label="上下文会话树">
       <div className="context-graph-legend" aria-hidden="true">
-        {(["message", "epoch", "handoff", "assemble_slice"] as const).map((kind) => (
+        {(["project_note", "message", "epoch", "handoff", "assemble_slice"] as const).map((kind) => (
           <span key={kind} className={`context-graph-legend-item kind-${kind}`}>
             <i />
             {CONTEXT_GRAPH_KIND_LABEL[kind]}
           </span>
         ))}
+        <span className="context-graph-legend-sep" />
+        <span className="context-graph-legend-item edge-replays"><i />下一轮 · 续前缀</span>
+        <span className="context-graph-legend-item status-archived"><i />归档</span>
+        <span className="context-graph-legend-hint">
+          一会话一棵树 · 根=共享 L0 · 嵌套轮次=前缀变长 · 侧枝=该轮过程
+        </span>
+      </div>
+      <div className="context-graph-viewport-controls">
+        <button type="button" onClick={() => zoomAround(1 / 1.2, null)} aria-label="缩小" title="缩小">−</button>
+        <button type="button" onClick={() => setViewport({ scale: 1, tx: 0, ty: 0 })} title="适应画布">适应</button>
+        <button type="button" onClick={() => zoomAround(1.2, null)} aria-label="放大" title="放大">＋</button>
+        <span className="context-graph-viewport-readout">{Math.round(viewport.scale * 100)}% · {layout.placed.length} 节点</span>
       </div>
       <svg
+        ref={svgRef}
+        className={panning ? "panning" : ""}
         viewBox={`0 0 ${layout.width} ${layout.height}`}
         width="100%"
         height={svgHeight}
-        preserveAspectRatio="xMidYMin meet"
+        preserveAspectRatio="xMinYMin meet"
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          const point = toUserSpace(event);
+          if (!point) return;
+          dragRef.current = { x: point.x, y: point.y, tx: viewport.tx, ty: viewport.ty };
+          setPanning(true);
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = dragRef.current;
+          if (!drag) return;
+          const point = toUserSpace(event);
+          if (!point) return;
+          setViewport((current) => ({ ...current, tx: drag.tx + (point.x - drag.x), ty: drag.ty + (point.y - drag.y) }));
+        }}
+        onPointerUp={(event) => {
+          dragRef.current = null;
+          setPanning(false);
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => { dragRef.current = null; setPanning(false); }}
       >
         <defs>
           <filter id="ctx-node-shadow" x="-20%" y="-20%" width="140%" height="140%">
-            <feDropShadow dx="0" dy="2" stdDeviation="3" floodOpacity="0.18" />
+            <feDropShadow dx="0" dy="1.5" stdDeviation="2.4" floodOpacity="0.16" />
           </filter>
-          <marker id="ctx-arrow" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
-            <path d="M0,0 L8,3.5 L0,7 Z" className="context-graph-arrow" />
+          {layout.nodeHeights.map((height) => (
+            <clipPath key={height} id={`ctx-node-clip-${height}`}>
+              <rect x="0" y="0" width={layout.nodeW} height={height} rx="12" ry="12" />
+            </clipPath>
+          ))}
+          {/* userSpaceOnUse keeps arrow size stable regardless of stroke width */}
+          <marker id="ctx-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0.5 L9,4.5 L0,8.5 Z" className="context-graph-arrow" />
           </marker>
-          <marker id="ctx-arrow-active" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
-            <path d="M0,0 L8,3.5 L0,7 Z" className="context-graph-arrow active" />
+          <marker id="ctx-arrow-active" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0.5 L9,4.5 L0,8.5 Z" className="context-graph-arrow active" />
+          </marker>
+          <marker id="ctx-arrow-next" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0.5 L9,4.5 L0,8.5 Z" className="context-graph-arrow next" />
           </marker>
         </defs>
 
-        {layout.columns.map((column) => (
-          <g key={`lane-${column.index}`} className="context-graph-lane">
-            <rect
-              x={column.x}
-              y={18}
-              width={column.width - 12}
-              height={Math.max(120, layout.height - 36)}
-              rx={16}
-              className="context-graph-lane-bg"
-            />
-            <text
-              x={column.x + (column.width - 12) / 2}
-              y={40}
-              textAnchor="middle"
-              className="context-graph-column-label"
-            >
-              {column.label}
-            </text>
-          </g>
-        ))}
-
-        {visibleEdges.map((edge) => {
-          const from = pos.get(edge.fromId);
-          const to = pos.get(edge.toId);
+        <g transform={`translate(${viewport.tx}, ${viewport.ty}) scale(${viewport.scale})`}>
+        {/* Edges under cards (paths only). Labels are painted after nodes so chips never sit under cards. */}
+        {layout.treeLinks.map((link) => {
+          const from = pos.get(link.fromId);
+          const to = pos.get(link.toId);
           if (!from || !to) return null;
-          const path = edgePath(from, to);
-          const active = Boolean(selectedId && (edge.fromId === selectedId || edge.toId === selectedId));
-          const a = nodeAnchor(from, to, "start");
-          const b = nodeAnchor(from, to, "finish");
-          const midX = (a.x + b.x) / 2;
-          const midY = (a.y + b.y) / 2;
-          const label = CONTEXT_GRAPH_EDGE_LABEL[edge.kind] ?? edge.kind;
-          const labelW = Math.max(28, label.length * 11);
+          const route = treeEdgeRoute(from, to);
+          const isNext = link.kind === "tree_next";
+          const edgeActive = Boolean(selectedId && (link.fromId === selectedId || link.toId === selectedId));
+          const inCluster = Boolean(selectedId && relatedIds.has(link.fromId) && relatedIds.has(link.toId));
+          const lit = edgeActive || (inCluster && isNext) || (!selectedId && isNext);
           return (
-            <g key={edge.id} className={`context-graph-edge-g${active ? " active" : selectedId ? " dim" : ""}`}>
+            <g
+              key={`path-${link.id}`}
+              className={`context-graph-edge-g${lit ? " active" : selectedId && !edgeActive ? " dim" : ""}${isNext ? " replays" : ""}`}
+              pointerEvents="none"
+            >
               <path
-                d={path}
-                className={`context-graph-edge-line${active ? " active" : ""}`}
-                markerEnd={active ? "url(#ctx-arrow-active)" : "url(#ctx-arrow)"}
+                d={route.d}
+                className={`context-graph-edge-line kind-${link.kind}${lit ? " active" : ""}`}
+                markerEnd={isNext ? "url(#ctx-arrow-next)" : lit ? "url(#ctx-arrow-active)" : "url(#ctx-arrow)"}
               />
-              <rect
-                x={midX - labelW / 2}
-                y={midY - 9}
-                width={labelW}
-                height={16}
-                rx={8}
-                className={`context-graph-edge-chip${active ? " active" : ""}`}
-              />
-              <text x={midX} y={midY + 3} textAnchor="middle" className={`context-graph-edge-label${active ? " active" : ""}`}>
-                {label}
-              </text>
             </g>
           );
         })}
@@ -2350,34 +2953,153 @@ function ContextGraphCanvas({
           const selected = node.id === selectedId;
           const related = relatedIds.has(node.id);
           const dim = Boolean(selectedId && !related);
-          const kindLabel = CONTEXT_GRAPH_KIND_LABEL[node.kind] ?? node.kind;
-          const title = truncateGraphLabel(node.label.replace(/^(用户|任务|章交接|装配)[ ·]+/, ""), 15);
-          const meta = node.sourceMessageId != null
-            ? `msg #${node.sourceMessageId}`
-            : new Date(node.createdAt).toLocaleString(undefined, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+          const kindLabel = node.treeRole === "root"
+            ? "会话根"
+            : node.treeRole === "turn"
+              ? "轮次"
+              : (CONTEXT_GRAPH_KIND_LABEL[node.kind] ?? node.kind);
+          const title = contextGraphNodeTitle(node);
+          const meta = contextGraphNodeMeta(node);
+          const metric = contextGraphNodeMetric(node);
+          const superseded = supersededIds.has(node.id);
+          const pillText = superseded ? "已被取代" : "归档";
+          const pillW = Math.max(30, graphLabelUnits(pillText) * 5.4 + 10);
+          const barX = 14;
+          const barW = node.w - 28;
+          const barY = node.h - 12;
+          const replayTurns = node.kind === "assemble_slice" ? assembleReplayTurns(node) : undefined;
           return (
             <g
               key={node.id}
-              className={`context-graph-svg-node kind-${node.kind} status-${node.status}${selected ? " selected" : ""}${related && !selected ? " related" : ""}${dim ? " dim" : ""}`}
+              className={`context-graph-svg-node kind-${node.kind} role-${node.treeRole} status-${node.status}${superseded ? " superseded" : ""}${selected ? " selected" : ""}${related && !selected ? " related" : ""}${dim ? " dim" : ""}`}
               transform={`translate(${node.x}, ${node.y})`}
               onClick={() => onSelect(node.id)}
               style={{ cursor: "pointer" }}
             >
               <title>{`${kindLabel}: ${node.label}`}</title>
-              <rect width={node.w} height={node.h} rx={14} ry={14} className="context-graph-svg-card" filter="url(#ctx-node-shadow)" />
-              <rect x={0} y={0} width={5} height={node.h} rx={2.5} className="context-graph-svg-accent" />
-              <text x={16} y={22} className="context-graph-svg-kind">{kindLabel}</text>
-              {node.status === "archived" ? (
-                <g transform={`translate(${node.w - 42}, 10)`}>
-                  <rect width={32} height={14} rx={7} className="context-graph-status-pill" />
-                  <text x={16} y={10.5} textAnchor="middle" className="context-graph-status-pill-text">归档</text>
-                </g>
-              ) : null}
-              <text x={16} y={42} className="context-graph-svg-label">{title}</text>
-              <text x={16} y={58} className="context-graph-svg-meta">{meta}</text>
+              <rect width={node.w} height={node.h} rx={12} ry={12} className="context-graph-svg-card" filter="url(#ctx-node-shadow)" />
+              <g clipPath={`url(#ctx-node-clip-${node.h})`}>
+                <rect x={0} y={0} width={4} height={node.h} className="context-graph-svg-accent" />
+                <text x={14} y={22} className="context-graph-svg-kind">{kindLabel}</text>
+                {node.status === "archived" ? (
+                  <g transform={`translate(${node.w - pillW - 12}, 10)`}>
+                    <rect width={pillW} height={13} rx={6} className="context-graph-status-pill" />
+                    <text x={pillW / 2} y={10} textAnchor="middle" className="context-graph-status-pill-text">{pillText}</text>
+                  </g>
+                ) : null}
+                <text x={14} y={42} className="context-graph-svg-label">{title}</text>
+                <text x={14} y={58} className="context-graph-svg-meta">
+                  {meta}{replayTurns != null && replayTurns > 0 ? ` · 复放${replayTurns}` : ""}
+                </text>
+                {metric?.kind === "layers" ? (
+                  <>
+                    <text x={14} y={74} className="context-graph-svg-metric">
+                      {`装配 ${formatGraphTokens(metric.total)} tok`}
+                    </text>
+                    {(() => {
+                      let offset = 0;
+                      return metric.segments.map((segment) => {
+                        const width = Math.max(2, (segment.tokens / metric.total) * barW);
+                        const x = barX + offset;
+                        offset += width;
+                        return (
+                          <rect
+                            key={`${segment.layer}-${segment.label}`}
+                            x={x}
+                            y={barY}
+                            width={Math.min(width, barX + barW - x)}
+                            height={6}
+                            className={`context-graph-layer-seg layer-${segment.layer}`}
+                          >
+                            <title>{`${CONTEXT_GRAPH_LAYER_LABEL[segment.layer] ?? segment.layer} · ${formatGraphTokens(segment.tokens)} tok`}</title>
+                          </rect>
+                        );
+                      });
+                    })()}
+                  </>
+                ) : null}
+                {metric?.kind === "cache" ? (
+                  <>
+                    <text x={14} y={74} className="context-graph-svg-metric">
+                      {[
+                        metric.frozenTokens != null ? `冻结 ${formatGraphTokens(metric.frozenTokens)}` : null,
+                        metric.hitRate != null ? `命中 ${Math.round(metric.hitRate * 100)}%` : "命中 未实测",
+                      ].filter(Boolean).join(" · ")}
+                    </text>
+                    <rect x={barX} y={barY} width={barW} height={6} rx={3} className="context-graph-hit-track" />
+                    {metric.hitRate != null ? (
+                      <rect
+                        x={barX}
+                        y={barY}
+                        width={Math.max(2, Math.min(1, metric.hitRate) * barW)}
+                        height={6}
+                        rx={3}
+                        className="context-graph-hit-fill"
+                      >
+                        <title>{`实测前缀命中 ${Math.round(metric.hitRate * 100)}%${metric.promptTokens ? ` · prompt ${formatGraphTokens(metric.promptTokens)} tok` : ""}`}</title>
+                      </rect>
+                    ) : null}
+                  </>
+                ) : null}
+              </g>
             </g>
           );
         })}
+
+        {/* Edge chips above cards, anchored in the depth gutter (never under a node face). */}
+        {layout.treeLinks.map((link) => {
+          const from = pos.get(link.fromId);
+          const to = pos.get(link.toId);
+          if (!from || !to) return null;
+          const isNext = link.kind === "tree_next";
+          const edgeActive = Boolean(selectedId && (link.fromId === selectedId || link.toId === selectedId));
+          // Default: only annotate turn-chain links. Child edges stay quiet unless that edge is selected.
+          if (!isNext && !edgeActive) return null;
+          const route = treeEdgeRoute(from, to);
+          const childEpochHit = isNext
+            ? (() => {
+                const turnNode = pos.get(link.toId);
+                if (!turnNode) return undefined;
+                for (const node of layout.placed) {
+                  if (node.kind !== "epoch") continue;
+                  if (node.sourceMessageId != null && turnNode.sourceMessageId === node.sourceMessageId) {
+                    return epochHitRate(node);
+                  }
+                }
+                return undefined;
+              })()
+            : undefined;
+          const label = isNext && childEpochHit != null
+            ? `下一轮 ${Math.round(childEpochHit * 100)}%`
+            : link.label;
+          // Keep chips narrow so they fit inside depthGap.
+          const labelW = Math.min(76, Math.max(28, graphLabelUnits(label) * 5.6 + 12));
+          return (
+            <g
+              key={`label-${link.id}`}
+              className={`context-graph-edge-g${isNext ? " replays" : ""}${edgeActive ? " active" : ""}`}
+              pointerEvents="none"
+            >
+              <rect
+                x={route.labelX - labelW / 2}
+                y={route.labelY - 8}
+                width={labelW}
+                height={15}
+                rx={7}
+                className={`context-graph-edge-chip${isNext || edgeActive ? " active" : ""}${isNext ? " replays" : ""}`}
+              />
+              <text
+                x={route.labelX}
+                y={route.labelY + 3}
+                textAnchor="middle"
+                className={`context-graph-edge-label${isNext || edgeActive ? " active" : ""}`}
+              >
+                {label}
+              </text>
+            </g>
+          );
+        })}
+        </g>
       </svg>
     </div>
   );
@@ -2542,9 +3264,17 @@ function App() {
   const [documentDraft, setDocumentDraft] = useState("");
   const [editingDocument, setEditingDocument] = useState(false);
   const [prompt, setPrompt] = useState("");
+  /**
+   * Live step buffer for the *current* Agent job only.
+   * Completed / historical trails render from `state.stepTrails` (server truth).
+   * Never rehydrate an older turn into this buffer — that made a new message
+   * briefly (or permanently until reload) show the previous turn's steps.
+   */
   const [streamSteps, setStreamSteps] = useState<StreamStep[]>([]);
-  /** User message id these steps belong to. Kept after job ends; cleared on rewind / session switch. */
+  /** User message id the live streamSteps belong to (temp negative id until source_message). */
   const [streamStepsAnchorId, setStreamStepsAnchorId] = useState<number | null>(null);
+  /** Expand toggles for server-backed trails (key = `${messageId}:${stepId}`). */
+  const [stepTrailExpanded, setStepTrailExpanded] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [olderMessagesLoading, setOlderMessagesLoading] = useState(false);
   const [conversationAtBottom, setConversationAtBottom] = useState(true);
@@ -2864,11 +3594,34 @@ function App() {
     return merged;
   }, []);
 
+  /**
+   * Align a temporary (negative) live anchor to the real user message id after
+   * the server has written the turn. Never re-point a live buffer at an older
+   * completed turn — that is how previous-round steps appeared under a new message.
+   */
   const reconcileStreamStepsAnchor = useCallback((messages: Message[]) => {
     if (!streamStepsRef.current.length) return;
     const anchor = streamStepsAnchorIdRef.current;
     if (anchor != null && anchor > 0 && messages.some((message) => message.id === anchor)) return;
+    // Only upgrade optimistic anchors. If the anchor is already a real id that
+    // disappeared (rewind), clear the live buffer instead of grafting it onto lastUser.
+    if (anchor != null && anchor > 0) {
+      if (streamStepsRafRef.current != null) {
+        window.cancelAnimationFrame(streamStepsRafRef.current);
+        streamStepsRafRef.current = null;
+      }
+      streamStepsRef.current = [];
+      setStreamSteps([]);
+      updateStreamStepsAnchorId(null);
+      return;
+    }
+    if (anchor == null || anchor >= 0) return;
+    // Match optimistic bubble content when possible; otherwise newest user row.
+    const optimistic = messages.find((message) => message.id === anchor);
     const lastUser = [...messages].reverse().find((message) => (
+      message.role === "user" && message.id > 0 && message.content.trim()
+      && (!optimistic || message.content === optimistic.content)
+    )) ?? [...messages].reverse().find((message) => (
       message.role === "user" && message.id > 0 && message.content.trim()
     ));
     if (lastUser) updateStreamStepsAnchorId(lastUser.id);
@@ -2913,21 +3666,25 @@ function App() {
         return { ...next, messages, messagesHasMore, activeJobs };
       });
       if (seq === refreshSeqRef.current) {
-        reconcileStreamStepsAnchor(appliedMessages);
-        // Architecture: steps are server-truth. Refresh must rehydrate from stepTrails
-        // unless a live job is still streaming into streamSteps.
-        if (!currentJobRef.current) {
-          const trail = pickServerStepTrail(next.stepTrails, streamStepsAnchorIdRef.current);
-          if (trail) {
-            const restored = stepsFromServerTrail(trail);
+        // Live buffer only: upgrade temp anchors. History is rendered from next.stepTrails.
+        if (currentJobRef.current && streamStepsRef.current.length) {
+          reconcileStreamStepsAnchor(appliedMessages);
+        } else if (!currentJobRef.current && streamStepsRef.current.length) {
+          // Job finished: if the server already has *this* turn's trail, drop the live
+          // buffer so a subsequent new message cannot inherit it via re-anchor.
+          const anchor = streamStepsAnchorIdRef.current;
+          const serverHasThisTurn = anchor != null && anchor > 0
+            && Boolean(next.stepTrails?.some((trail) => trail.sourceMessageId === anchor && trail.steps.length > 0));
+          if (serverHasThisTurn) {
             if (streamStepsRafRef.current != null) {
               window.cancelAnimationFrame(streamStepsRafRef.current);
               streamStepsRafRef.current = null;
             }
-            streamStepsRef.current = restored;
-            setStreamSteps(restored);
-            updateStreamStepsAnchorId(trail.sourceMessageId);
-            saveStepTrail(next.sessionId, trail.sourceMessageId, restored);
+            streamStepsRef.current = [];
+            setStreamSteps([]);
+            updateStreamStepsAnchorId(null);
+          } else {
+            reconcileStreamStepsAnchor(appliedMessages);
           }
         }
       }
@@ -3054,7 +3811,7 @@ function App() {
     };
   }, []);
 
-  // Switching sessions: hide previous trail; restore this session's local collapsed trail if any.
+  // Switching sessions: drop the live buffer. History comes from state.stepTrails.
   useEffect(() => {
     const nextId = state?.sessionId;
     if (!nextId) return;
@@ -3067,21 +3824,14 @@ function App() {
       setBusy(false);
       streamOutputRef.current = "";
       setCollapsedAssistantIds(new Set());
+      setStepTrailExpanded({});
       if (streamStepsRafRef.current != null) {
         window.cancelAnimationFrame(streamStepsRafRef.current);
         streamStepsRafRef.current = null;
       }
-      const trail = loadStepTrail(nextId);
-      if (trail) {
-        const restored = restoreTrailSteps(trail);
-        streamStepsRef.current = restored;
-        setStreamSteps(restored);
-        updateStreamStepsAnchorId(trail.messageId);
-      } else {
-        streamStepsRef.current = [];
-        setStreamSteps([]);
-        updateStreamStepsAnchorId(null);
-      }
+      streamStepsRef.current = [];
+      setStreamSteps([]);
+      updateStreamStepsAnchorId(null);
       setNotice("");
       setError("");
       setComposerBranch(null);
@@ -3114,39 +3864,21 @@ function App() {
     todosCompletionRef.current = { sessionId, complete };
   }, [state?.sessionId, state?.todos]);
 
-  // Restore step trail: server stepTrails first, localStorage only as legacy fallback.
-  useEffect(() => {
-    if (!state?.sessionId || busy || currentJobRef.current) return;
-    if (streamSteps.length > 0) return;
-    const serverTrail = pickServerStepTrail(state.stepTrails, streamStepsAnchorIdRef.current);
-    if (serverTrail) {
-      updateStreamSteps(stepsFromServerTrail(serverTrail));
-      updateStreamStepsAnchorId(serverTrail.sourceMessageId);
-      return;
-    }
-    const trail = loadStepTrail(state.sessionId);
-    if (!trail) return;
-    const messageStillExists = trail.messageId < 0 || state.messages.some((msg) => msg.id === trail.messageId);
-    // A paginated initial response may not include an older anchor yet. Only delete
-    // the trail when all messages are loaded and the positive id is truly gone.
-    if (!messageStillExists && !state.messagesHasMore) {
-      clearStepTrail(state.sessionId);
-      return;
-    }
-    updateStreamSteps(restoreTrailSteps(trail));
-    updateStreamStepsAnchorId(trail.messageId);
-  }, [state?.sessionId, state?.messages, state?.messagesHasMore, state?.stepTrails, busy, streamSteps.length, updateStreamSteps, updateStreamStepsAnchorId]);
+  // Intentionally do NOT rehydrate completed trails into streamSteps when idle.
+  // History is rendered from state.stepTrails per message. Rehydrating the latest
+  // server trail into the live buffer caused new messages to inherit previous steps
+  // once source_message re-anchored the buffer to the new user id.
 
-  // Persist live/completed steps locally (collapsed) for the current user message.
+  // Persist live steps locally (collapsed) only while a job is active — crash recovery.
   useEffect(() => {
     const sessionId = state?.sessionId;
     if (!sessionId || streamStepsAnchorId == null || streamStepsAnchorId === 0) return;
-    if (!streamSteps.length) return;
+    if (!streamSteps.length || !busy) return;
     const timer = window.setTimeout(() => {
       saveStepTrail(sessionId, streamStepsAnchorId, streamSteps);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [state?.sessionId, streamStepsAnchorId, streamSteps]);
+  }, [state?.sessionId, streamStepsAnchorId, streamSteps, busy]);
 
   useEffect(() => {
     const persistBeforeUnload = () => {
@@ -3715,8 +4447,9 @@ function App() {
       if (terminal) {
         if (sessionIdRef.current !== sessionId) return;
         flushStreamStepsNow();
-        // Intentionally keep streamSteps so the tool trail stays visible after completion.
-        // Re-anchor to the persisted user message id (temp negative ids are replaced by refresh).
+        // Snapshot live steps for the brief window before refresh returns stepTrails.
+        // After refresh, history is owned by state.stepTrails — clear the live buffer
+        // whenever the server has this turn so a later new message cannot inherit it.
         const next = await refresh(sessionId);
         const messages = next.messages;
         let anchorId = streamStepsAnchorIdRef.current;
@@ -3729,26 +4462,25 @@ function App() {
           ));
           if (lastUser) anchorId = lastUser.id;
         }
-        // Prefer server trail when present (source of truth); keep richer live steps as fallback.
-        const serverTrail = pickServerStepTrail(next.stepTrails, anchorId);
+        // Only accept a server trail for *this* turn's source message — never the
+        // globally latest trail (that is how a new turn inherited the previous one).
+        const serverTrail = anchorId != null && anchorId > 0
+          ? next.stepTrails?.find((trail) => trail.sourceMessageId === anchorId && trail.steps.length > 0)
+          : undefined;
         if (serverTrail) {
-          const restored = stepsFromServerTrail(serverTrail);
-          const liveLen = streamStepsRef.current.reduce((sum, step) => sum + step.output.length + step.reasoning.length, 0);
-          const serverLen = restored.reduce((sum, step) => sum + step.output.length + step.reasoning.length, 0);
-          if (!streamStepsRef.current.length || serverLen >= liveLen * 0.8 || restored.length >= streamStepsRef.current.length) {
-            if (streamStepsRafRef.current != null) {
-              window.cancelAnimationFrame(streamStepsRafRef.current);
-              streamStepsRafRef.current = null;
-            }
-            streamStepsRef.current = restored;
-            setStreamSteps(restored);
-            anchorId = serverTrail.sourceMessageId;
-          } else {
-            anchorId = serverTrail.sourceMessageId;
+          // Server is source of truth for completed turns. Drop live buffer so it
+          // cannot be re-anchored onto the next user message.
+          if (streamStepsRafRef.current != null) {
+            window.cancelAnimationFrame(streamStepsRafRef.current);
+            streamStepsRafRef.current = null;
           }
-        }
-        updateStreamStepsAnchorId(anchorId);
-        if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
+          streamStepsRef.current = [];
+          setStreamSteps([]);
+          updateStreamStepsAnchorId(null);
+          clearStepTrail(sessionId);
+        } else if (anchorId != null && anchorId !== 0 && streamStepsRef.current.length) {
+          // Server trail not ready yet — keep live cards under this turn only.
+          updateStreamStepsAnchorId(anchorId);
           saveStepTrail(sessionId, anchorId, streamStepsRef.current);
         }
         // Auto mode may have written the open document; reload so the editor matches disk.
@@ -3798,10 +4530,18 @@ function App() {
     const currentSessionId = state?.sessionId;
     if (!currentSessionId || !activeJobId) return;
     if (currentJobRef.current === activeJobId) return;
-    const switchingJob = Boolean(currentJobRef.current && currentJobRef.current !== activeJobId);
-    // Only clear the trail when attaching to a different job. Re-subscribe after a
-    // workspace refresh must keep in-memory steps so the pane does not flash empty.
-    if (switchingJob) {
+    const previousJob = currentJobRef.current;
+    const switchingJob = Boolean(previousJob && previousJob !== activeJobId);
+    // Re-subscribe to the same in-flight job (e.g. after connection drop) must keep
+    // the live buffer. Attaching to a *different* job, or starting a job while leftover
+    // completed steps are still in the buffer, must reset so history cannot leak.
+    const leftoverCompletedTrail = !previousJob && streamStepsRef.current.length > 0
+      && streamStepsAnchorIdRef.current != null
+      && streamStepsAnchorIdRef.current > 0
+      && Boolean(state?.stepTrails?.some((trail) => (
+        trail.sourceMessageId === streamStepsAnchorIdRef.current && trail.steps.length > 0
+      )));
+    if (switchingJob || leftoverCompletedTrail) {
       if (streamStepsRafRef.current != null) {
         window.cancelAnimationFrame(streamStepsRafRef.current);
         streamStepsRafRef.current = null;
@@ -3809,18 +4549,15 @@ function App() {
       streamStepsRef.current = [];
       setStreamSteps([]);
       streamOutputRef.current = "";
-      const lastUser = [...(state?.messages ?? [])]
-        .reverse()
-        .find((msg) => msg.role === "user" && msg.content.trim());
-      updateStreamStepsAnchorId(lastUser?.id ?? null);
-    } else if (streamStepsAnchorIdRef.current == null) {
+    }
+    if (streamStepsAnchorIdRef.current == null || switchingJob || leftoverCompletedTrail) {
       const lastUser = [...(state?.messages ?? [])]
         .reverse()
         .find((msg) => msg.role === "user" && msg.content.trim());
       updateStreamStepsAnchorId(lastUser?.id ?? null);
     }
     void subscribeAgentJob(activeJobId, currentSessionId);
-  }, [state?.sessionId, activeJobId]);
+  }, [state?.sessionId, activeJobId, state?.stepTrails, state?.messages, updateStreamStepsAnchorId]);
 
   useEffect(() => {
     if (!activeJobId) return;
@@ -6413,40 +7150,42 @@ function App() {
               );
             })()}
             {(() => {
+              // Live buffer only for the turn currently streaming (or the brief
+              // post-complete gap before stepTrails catches up). Never let live
+              // steps shadow a different message's server trail.
               const liveHere = streamStepsAnchorId === msg.id && streamSteps.length > 0;
-              const serverTrail = !liveHere
-                ? state.stepTrails?.find((trail) => trail.sourceMessageId === msg.id)
-                : undefined;
+              const serverTrail = state.stepTrails?.find((trail) => trail.sourceMessageId === msg.id);
               const stepsHere = liveHere
                 ? streamSteps
                 : serverTrail
-                  ? stepsFromServerTrail(serverTrail)
+                  ? stepsFromServerTrail(serverTrail).map((step) => {
+                      const key = `${msg.id}:${step.id}`;
+                      return stepTrailExpanded[key] !== undefined
+                        ? { ...step, expanded: stepTrailExpanded[key] }
+                        : step;
+                    })
                   : [];
               if (!stepsHere.length) return null;
               return (
               <>
-                {stepsHere.map((step) => (
+                {stepsHere.map((step, index) => (
                   <AgentStepCard
                     key={`${msg.id}-${step.id}`}
                     step={step}
+                    prevStep={index > 0 ? stepsHere[index - 1] : undefined}
                     onToggle={() => {
-                      if (liveHere || streamStepsAnchorId === msg.id) {
+                      if (liveHere) {
                         updateStreamSteps((current) =>
                           current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
                         );
                         return;
                       }
-                      // Promote server trail into live UI state so expand works after refresh.
-                      const promoted = stepsHere.map((s) => (
-                        s.id === step.id ? { ...s, expanded: !s.expanded } : s
-                      ));
-                      if (streamStepsRafRef.current != null) {
-                        window.cancelAnimationFrame(streamStepsRafRef.current);
-                        streamStepsRafRef.current = null;
-                      }
-                      streamStepsRef.current = promoted;
-                      setStreamSteps(promoted);
-                      updateStreamStepsAnchorId(msg.id);
+                      // Keep expand state local — never promote history into the live buffer.
+                      const key = `${msg.id}:${step.id}`;
+                      setStepTrailExpanded((current) => ({
+                        ...current,
+                        [key]: !(current[key] ?? false),
+                      }));
                     }}
                   />
                 ))}
@@ -6469,10 +7208,11 @@ function App() {
           {streamSteps.length > 0 && streamStepsAnchorId != null
             && !visibleMessages.some((msg) => msg.id === streamStepsAnchorId) && (
             <>
-              {streamSteps.map((step) => (
+              {streamSteps.map((step, index) => (
                 <AgentStepCard
                   key={`orphan-${step.id}`}
                   step={step}
+                  prevStep={index > 0 ? streamSteps[index - 1] : undefined}
                   onToggle={() =>
                     updateStreamSteps((current) =>
                       current.map((s) => (s.id === step.id ? { ...s, expanded: !s.expanded } : s)),
@@ -7666,11 +8406,68 @@ function App() {
                   <span>活跃 {contextGraph?.stats.activeNodes ?? 0}</span>
                   <span>归档 {contextGraph?.stats.archivedNodes ?? 0}</span>
                   <span>交接 {contextGraph?.stats.handoffCount ?? 0}</span>
+                  <span>树干 {contextGraph?.stats.trunkCount ?? contextGraph?.activeTrunks?.length ?? 0}</span>
                   <span>边 {contextGraph?.stats.edgeCount ?? 0}</span>
+                  {(() => {
+                    const summary = contextGraphCacheSummary(contextGraph?.nodes ?? []);
+                    if (!summary) return null;
+                    return (
+                      <span
+                        className="context-graph-stat-cache"
+                        title={`近 ${summary.turns} 轮实测：prompt 共 ${summary.promptTokens.toLocaleString()} tok`}
+                      >
+                        近 {summary.turns} 轮前缀命中 {Math.round(summary.hitRate * 100)}%
+                      </span>
+                    );
+                  })()}
+                  {contextGraph?.truncated ? (
+                    <span className="context-graph-stat-truncated">
+                      已截断，仅显示最近 {contextGraph.nodes.length} / {contextGraph.stats.totalNodes} 个节点
+                    </span>
+                  ) : null}
                 </div>
                 <p className="context-graph-hint">
-                  过程（工具链）只活在任务 epoch 内；章完成后写入交接节点。编辑/重跑会归档旧枝。点节点查看装配与依赖。
+                  看<strong>装配 · 章/场边界</strong>节点可知 step 之间继承了什么、裁掉了什么。
+                  步骤条在 prompt 骤降处也会标「上下文裁剪」。树干只有索引——边界后仍 read_document 是按需补读，不是裁剪失效。
                 </p>
+                {(() => {
+                  const cuts = (contextGraph?.nodes ?? [])
+                    .filter((node) => node.kind === "assemble_slice")
+                    .map((node) => ({ node, transition: contextTransitionFromPayload(node.payload) }))
+                    .filter((row) => row.transition && (row.transition.kind === "chapter_boundary" || row.transition.kind === "scene_boundary"))
+                    .sort((a, b) => a.node.createdAt.localeCompare(b.node.createdAt));
+                  if (!cuts.length) return null;
+                  return (
+                    <div className="context-graph-cut-timeline" aria-label="上下文裁剪时间线">
+                      <strong>本会话裁剪</strong>
+                      <ol>
+                        {cuts.map(({ node, transition }) => {
+                          const t = transition!;
+                          return (
+                            <li key={node.id}>
+                              <button
+                                type="button"
+                                className={contextGraphSelectedId === node.id ? "active" : ""}
+                                onClick={() => setContextGraphSelectedId(node.id)}
+                              >
+                                <span className="cut-kind">
+                                  {t.kind === "scene_boundary" ? "场" : "章"}
+                                  {t.atStep != null ? ` · s${t.atStep}` : ""}
+                                </span>
+                                <span className="cut-path" title={t.path}>{t.path ? t.path.replace(/^chapters\//, "") : "—"}</span>
+                                {t.beforeTokens != null && t.afterTokens != null ? (
+                                  <span className="cut-tokens">
+                                    {formatGraphTokens(t.beforeTokens)}→{formatGraphTokens(t.afterTokens)}
+                                  </span>
+                                ) : null}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    </div>
+                  );
+                })()}
                 <div className="context-graph-filters" role="tablist" aria-label="节点筛选">
                   {([
                     ["all", "全部"],
@@ -7708,27 +8505,49 @@ function App() {
                 />
                 <div className="context-graph-layout">
                   <ul className="context-graph-list">
-                    {filteredNodes
-                      .slice()
-                      .reverse()
-                      .map((node) => (
-                        <li key={node.id}>
-                          <button
-                            type="button"
-                            className={`context-graph-node ${contextGraphSelectedId === node.id ? "selected" : ""} status-${node.status}`}
-                            onClick={() => setContextGraphSelectedId(node.id)}
-                          >
-                            <span className="context-graph-kind">{node.kind}</span>
-                            <strong>{node.label}</strong>
-                            <small>
-                              {node.status}
-                              {node.sourceMessageId != null ? ` · msg #${node.sourceMessageId}` : ""}
-                              {" · "}
-                              {new Date(node.createdAt).toLocaleString()}
-                            </small>
-                          </button>
-                        </li>
-                      ))}
+                    {(() => {
+                      // Tree preorder (root → turns → process), matching the canvas — not reverse chronology.
+                      const tree = buildContextGraphTree(filteredNodes);
+                      const ordered: ContextGraphNode[] = [];
+                      const walk = (item: ContextGraphTreeItem | null) => {
+                        if (!item) return;
+                        // Skip pure-virtual root when it was synthesized (not in the filtered set).
+                        if (filteredNodes.some((node) => node.id === item.node.id)) ordered.push(item.node);
+                        for (const child of item.children) walk(child);
+                      };
+                      walk(tree);
+                      // Any nodes the tree builder dropped (unexpected kinds) still show up at the end.
+                      const seen = new Set(ordered.map((node) => node.id));
+                      for (const node of filteredNodes) {
+                        if (!seen.has(node.id)) ordered.push(node);
+                      }
+                      return ordered.map((node) => {
+                        const title = contextGraphNodeTitle(node);
+                        return (
+                          <li key={node.id}>
+                            <button
+                              type="button"
+                              className={`context-graph-node ${contextGraphSelectedId === node.id ? "selected" : ""} status-${node.status}`}
+                              onClick={() => setContextGraphSelectedId(node.id)}
+                            >
+                              <span className="context-graph-kind">{CONTEXT_GRAPH_KIND_LABEL[node.kind] ?? node.kind}</span>
+                              <strong title={node.label}>{title || node.label}</strong>
+                              <small>
+                                {contextGraphStatusLabel(node.status)}
+                                {node.sourceMessageId != null ? ` · msg #${node.sourceMessageId}` : ""}
+                                {" · "}
+                                {new Date(node.createdAt).toLocaleString(undefined, {
+                                  month: "numeric",
+                                  day: "numeric",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })}
+                              </small>
+                            </button>
+                          </li>
+                        );
+                      });
+                    })()}
                     {!contextGraphLoading && !(contextGraph?.nodes.length) && (
                       <li className="context-graph-empty">暂无节点。跑一轮 Agent 写作任务后，这里会出现任务、交接与装配切片。</li>
                     )}
@@ -7736,22 +8555,48 @@ function App() {
                   </ul>
                   <div className="context-graph-detail">
                     {(() => {
-                      const node = contextGraph?.nodes.find((item) => item.id === contextGraphSelectedId);
+                      const node = contextGraph?.nodes.find((item) => item.id === contextGraphSelectedId)
+                        ?? filteredNodes.find((item) => item.id === contextGraphSelectedId);
                       if (!node) return <p className="context-graph-empty">选择左侧节点查看详情。</p>;
                       const related = (contextGraph?.edges ?? []).filter(
                         (edge) => edge.fromId === node.id || edge.toId === node.id,
                       );
+                      const kindLabel = CONTEXT_GRAPH_KIND_LABEL[node.kind] ?? node.kind;
+                      const title = contextGraphNodeTitle(node) || node.label;
+                      const statusLabel = contextGraphStatusLabel(node.status);
+                      const transition = contextTransitionFromPayload(node.payload);
                       return (
                         <>
                           <header>
-                            <span className="eyebrow">{node.kind} · {node.status}</span>
-                            <h3>{node.label}</h3>
-                            <p>
-                              id <code>{node.id}</code>
-                              {node.jobId ? <> · job <code>{node.jobId}</code></> : null}
-                              {node.sourceMessageId != null ? <> · message #{node.sourceMessageId}</> : null}
-                            </p>
+                            <span className="context-graph-detail-eyebrow">
+                              <span>{kindLabel}</span>
+                              <span className={`context-graph-detail-status ${node.status}`}>{statusLabel}</span>
+                            </span>
+                            <h3 title={node.label}>{title}</h3>
+                            <ul className="context-graph-detail-meta">
+                              <li>
+                                <span className="meta-key">节点</span>
+                                <code className="meta-value">{node.id}</code>
+                              </li>
+                              {node.jobId ? (
+                                <li>
+                                  <span className="meta-key">任务</span>
+                                  <code className="meta-value">{node.jobId}</code>
+                                </li>
+                              ) : null}
+                              {node.sourceMessageId != null ? (
+                                <li>
+                                  <span className="meta-key">消息</span>
+                                  <span className="meta-value">#{node.sourceMessageId}</span>
+                                </li>
+                              ) : null}
+                              <li>
+                                <span className="meta-key">时间</span>
+                                <span className="meta-value">{new Date(node.createdAt).toLocaleString()}</span>
+                              </li>
+                            </ul>
                           </header>
+                          {transition ? <ContextTransitionDetail transition={transition} /> : null}
                           {related.length > 0 && (
                             <div className="context-graph-edges">
                               <h4>关系</h4>
@@ -7760,10 +8605,16 @@ function App() {
                                   const otherId = edge.fromId === node.id ? edge.toId : edge.fromId;
                                   const other = contextGraph?.nodes.find((item) => item.id === otherId);
                                   const direction = edge.fromId === node.id ? "→" : "←";
+                                  const edgeLabel = CONTEXT_GRAPH_EDGE_LABEL[edge.kind] ?? edge.kind;
+                                  const otherTitle = other
+                                    ? (contextGraphNodeTitle(other) || other.label)
+                                    : otherId;
                                   return (
                                     <li key={edge.id}>
                                       <button type="button" className="ghost" onClick={() => setContextGraphSelectedId(otherId)}>
-                                        <code>{edge.kind}</code> {direction} {other?.label ?? otherId}
+                                        <span className="context-graph-edge-kind">{edgeLabel}</span>
+                                        <span>{direction}</span>
+                                        <span className="context-graph-edge-target" title={other?.label ?? otherId}>{otherTitle}</span>
                                       </button>
                                     </li>
                                   );
@@ -7772,7 +8623,7 @@ function App() {
                             </div>
                           )}
                           <div className="context-graph-payload">
-                            <h4>载荷</h4>
+                            <h4>原始载荷</h4>
                             <pre>{JSON.stringify(node.payload, null, 2)}</pre>
                           </div>
                         </>

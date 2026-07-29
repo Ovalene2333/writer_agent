@@ -612,6 +612,8 @@ async function reviewDirectNarrativeProposal(
         status: "final_review_revision_required",
         code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
         path,
+        // Keep explicit so callers never treat this as a created proposal.
+        proposalCreated: false,
         chapterReview: reviewed.review,
         message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
       });
@@ -635,6 +637,7 @@ async function reviewDirectNarrativeProposal(
     status: "final_review_unavailable",
     code: "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
     path,
+    proposalCreated: false,
     errors,
     message: "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
   });

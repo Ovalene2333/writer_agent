@@ -11,6 +11,7 @@ import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { prefixCacheLogPath, summarizePrefixCacheLog } from "./prefix_cache.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
+import { startGrokBuildProxy } from "./grok_proxy.js";
 import { startWriterServer } from "./server.js";
 import { startShareTunnel } from "./share_tunnel.js";
 import { WriterStore } from "./store.js";
@@ -185,6 +186,42 @@ program.command("web")
     await new Promise(() => undefined);
   });
 
+program.command("grok-proxy")
+  .description("启动 Grok Build 到 OpenAI Chat Completions 的本地反代")
+  .option("-p, --project <directory>", "写作项目目录", ".")
+  .option("--host <host>", "监听地址", "127.0.0.1")
+  .option("--port <port>", "监听端口", "4101")
+  .option("--model <model>", "固定映射的 Grok 模型", "grok-build-0.1")
+  .option("--proxy-url <url>", "访问 xAI 使用的 HTTP(S) 代理")
+  .option("--login", "忽略已有凭据并重新进行 xAI OAuth 授权")
+  .option("--no-open", "不自动打开 OAuth 授权页")
+  .action(async (options: { project: string; host: string; port: string; model: string; proxyUrl?: string; login?: boolean; open: boolean }) => {
+    const project = new WriterProject(options.project);
+    if (!project.exists()) throw new Error("当前目录不是写作项目，请先执行 writer init");
+    const port = Number(options.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("端口必须是 0 至 65535 的整数");
+    const proxy = await startGrokBuildProxy({
+      project,
+      host: options.host,
+      port,
+      model: options.model,
+      proxyUrl: options.proxyUrl,
+      forceLogin: options.login,
+      ...(options.open ? { openUrl: openBrowser } : {}),
+    });
+    try {
+      upsertGrokProxyProvider(project, proxy);
+    } catch (error) {
+      await proxy.close();
+      throw error;
+    }
+    process.stdout.write(`Grok Build 反代已启动：${proxy.url}\n模型：${proxy.model}\nAPI Key：${proxy.apiKey}\n凭据：${proxy.credentialsPath}\n网络代理：${proxy.proxyEnabled ? "已启用" : "直连"}\n`);
+    process.stdout.write("已更新 providers.json 中的“Grok Build 本地反代”供应商；现有模型分工保持不变。\n");
+    const stop = async () => { await proxy.close(); process.exit(0); };
+    process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    await new Promise(() => undefined);
+  });
+
 program.command("export")
   .description("按章节顺序导出作品")
   .option("-p, --project <directory>", "项目目录", ".")
@@ -295,12 +332,65 @@ function resolvePermissionMode(project: WriterProject, requested: string | undef
   return requested;
 }
 
+function upsertGrokProxyProvider(
+  project: WriterProject,
+  proxy: { url: string; apiKey: string; model: string },
+): void {
+  const providers = new ProviderManager(project);
+  const name = "Grok Build 本地反代";
+  const existing = providers.catalog().providers.find(profile => profile.name === name);
+  const existingModel = existing?.models.find(model => model.name === proxy.model) ?? existing?.models[0];
+  providers.saveProfile({
+    id: existing?.id,
+    name,
+    provider: "openai-compatible",
+    baseUrl: proxy.url,
+    apiKey: proxy.apiKey,
+    models: [{
+      id: existingModel?.id,
+      name: proxy.model,
+      pricing: existingModel?.pricing ?? {
+        billingMode: "unmetered",
+        cacheHit: 0,
+        cacheMiss: 0,
+        output: 0,
+        currency: "CNY",
+        contextWindow: 128_000,
+      },
+      disableSampling: true,
+    }],
+  });
+}
+
 function openBrowser(url: string): void {
+  if (process.platform === "linux" && (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP)) {
+    try {
+      const child = spawn("explorer.exe", [url], { detached: true, stdio: "ignore", windowsHide: true });
+      child.once("error", () => openBrowserWith("xdg-open", [url], url));
+      child.unref();
+      return;
+    } catch {
+      openBrowserWith("xdg-open", [url], url);
+      return;
+    }
+  }
+  if (process.platform === "win32") {
+    try {
+      const child = spawn("explorer.exe", [url], { detached: true, stdio: "ignore", windowsHide: true });
+      child.once("error", () => openBrowserWith("rundll32.exe", ["url.dll,FileProtocolHandler", url], url));
+      child.unref();
+      return;
+    } catch {
+      openBrowserWith("rundll32.exe", ["url.dll,FileProtocolHandler", url], url);
+      return;
+    }
+  }
+  const command = process.platform === "darwin" ? "open" : "xdg-open";
+  openBrowserWith(command, [url], url);
+}
+
+function openBrowserWith(command: string, args: string[], url: string): void {
   try {
-    const command = process.platform === "win32" ? "cmd"
-      : process.platform === "darwin" ? "open"
-        : "xdg-open";
-    const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
     const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
     child.once("error", () => process.stderr.write(`无法自动打开浏览器，请手动访问：${url}\n`));
     child.unref();

@@ -8,6 +8,7 @@ import {
   advanceTodosAfterProposal,
   completeCharacterTaskTodos,
   formatTodosForPrompt,
+  isSuccessfulDocumentSubmission,
   listProjectSkills,
   loadSkillById,
   loadAgentSettings,
@@ -15,6 +16,8 @@ import {
   normalizeTodos,
   persistAdvancedTodosAfterProposal,
   persistCompletedCharacterTaskTodos,
+  protectDocumentWritingTodos,
+  proposalIdFromToolResult,
   reconcileManagedTodos,
   saveAgentSettings,
 } from "./agent_runtime.js";
@@ -80,6 +83,61 @@ test("manage_todos cannot manually complete the built-in scene pipeline", () => 
     todos: custom,
     scenePipelineProtected: false,
   });
+});
+
+test("final-review blocks are not successful document submissions", () => {
+  assert.equal(isSuccessfulDocumentSubmission("propose_document", {
+    status: "final_review_revision_required",
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    path: "chapters/第03章 父亲.md",
+    proposalCreated: false,
+  }), false);
+  assert.equal(isSuccessfulDocumentSubmission("propose_document", {
+    status: "final_review_unavailable",
+    code: "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    path: "chapters/x.md",
+  }), false);
+  assert.equal(isSuccessfulDocumentSubmission("propose_document", {
+    error: "风格门禁命中",
+  }), false);
+  assert.equal(isSuccessfulDocumentSubmission("propose_document", {
+    proposalId: 65,
+    status: "accepted",
+    message: "auto 模式：提案已自动写入文件",
+  }), true);
+  assert.equal(isSuccessfulDocumentSubmission("inspect_chapter_draft", {
+    status: "proposal_submitted",
+    proposalSubmitted: true,
+    proposal: { proposalId: 12, status: "accepted" },
+  }), true);
+  assert.equal(proposalIdFromToolResult({ proposal: { proposalId: 12 } }), 12);
+});
+
+test("manage_todos cannot manually complete multi-chapter writing items", () => {
+  const current: AgentTodoItem[] = [
+    { id: "t1", content: "搜索项目资料与第一章内容", status: "completed" },
+    { id: "t2", content: "撰写第02章：康复训练（学步）", status: "completed" },
+    { id: "t3", content: "补写第03章：父亲来访", status: "in_progress" },
+    { id: "t4", content: "撰写第04章：接受身份", status: "pending" },
+  ];
+  const requested = current.map(item => (
+    item.id === "t3" || item.id === "t4"
+      ? { ...item, status: "completed" as const }
+      : item
+  ));
+  const protectedTodos = protectDocumentWritingTodos(current, requested);
+  assert.equal(protectedTodos.find(item => item.id === "t3")?.status, "in_progress");
+  assert.equal(protectedTodos.find(item => item.id === "t4")?.status, "pending");
+
+  const reconciled = reconcileManagedTodos(current, requested);
+  assert.equal(reconciled.writingTodosProtected, true);
+  assert.equal(reconciled.todos.find(item => item.id === "t3")?.status, "in_progress");
+  // Non-writing checklist items can still be completed manually.
+  const soft = reconcileManagedTodos(
+    [{ id: "s1", content: "提交文档提案", status: "pending" }],
+    [{ id: "s1", content: "提交文档提案", status: "completed" }],
+  );
+  assert.equal(soft.todos[0]?.status, "completed");
 });
 
 test("scene pipeline milestones migrate the legacy chapter todo labels", () => {

@@ -1,6 +1,13 @@
 export { TOOLS, TOOL_NAMES, agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./schema.js";
 export { executeTool, registeredToolNames } from "./execute.js";
-export type { CompletedChapterHandoff, ToolCall, ToolDefinition, ToolExecutionContext, ToolHandlerArgs } from "./types.js";
+export type {
+  CompletedChapterHandoff,
+  MaterialsShelfEntry,
+  ToolCall,
+  ToolDefinition,
+  ToolExecutionContext,
+  ToolHandlerArgs,
+} from "./types.js";
 export {
   parseChapterNumber,
   chapterTitleMatches,

@@ -533,7 +533,84 @@ export function isFurtherWritingTodo(content: string): boolean {
   if (!text) return false;
   // Require multi-deliverable signals (章号/初稿/续写…). Avoid matching the default
   // single-scene step "完成正文并自检", which would false-continue after one proposal.
-  return /撰写|写第|续写|创作|起草|初稿|改写|重写|第\s*\d+\s*章|第\s*[一二三四五六七八九十两零〇]+\s*章|场景正文|章节正文|第\s*\d+\s*节/.test(text);
+  return /撰写|写第|续写|创作|起草|初稿|改写|重写|补写|第\s*\d+\s*章|第\s*[一二三四五六七八九十两零〇]+\s*章|场景正文|章节正文|第\s*\d+\s*节/.test(text);
+}
+
+/**
+ * True when a tool result actually created (and possibly auto-accepted) a document
+ * proposal / change set — not merely "no error key".
+ *
+ * Final-review blocks and style-gate throws used to be misread as success because
+ * review returns `{ status, code, path }` without `error` or `proposalId`, which
+ * falsely advanced chapter boundaries and closed multi-chapter todos.
+ */
+export function isSuccessfulDocumentSubmission(
+  toolName: string,
+  result: Record<string, unknown>,
+): boolean {
+  if ("error" in result) return false;
+  const status = typeof result.status === "string" ? result.status : "";
+  if (
+    status === "final_review_revision_required"
+    || status === "final_review_unavailable"
+    || status === "proposal_failed"
+    || status === "waiting"
+  ) {
+    return false;
+  }
+  const code = typeof result.code === "string" ? result.code : "";
+  if (code && /BLOCKED|UNAVAILABLE|REQUIRED|REJECTED|FAILED/i.test(code)) return false;
+
+  if (typeof result.proposalId === "number" && result.proposalId > 0) return true;
+  if (typeof result.changeSetId === "number" && result.changeSetId > 0) return true;
+
+  const nested = result.proposal;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const nestedId = (nested as Record<string, unknown>).proposalId;
+    if (typeof nestedId === "number" && nestedId > 0) return true;
+  }
+
+  // inspect_chapter_draft that already submitted a proposal inside the same call
+  if (toolName === "inspect_chapter_draft" && result.proposalSubmitted === true) {
+    return true;
+  }
+  return false;
+}
+
+/** Best-effort proposal id from a successful document tool payload. */
+export function proposalIdFromToolResult(result: Record<string, unknown>): number | undefined {
+  if (typeof result.proposalId === "number" && result.proposalId > 0) return result.proposalId;
+  const nested = result.proposal;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const nestedId = (nested as Record<string, unknown>).proposalId;
+    if (typeof nestedId === "number" && nestedId > 0) return nestedId;
+  }
+  return undefined;
+}
+
+/**
+ * Writing deliverables may only be completed by a real proposal advance
+ * (`persistAdvancedTodosAfterProposal`), not by optimistic manage_todos ticks.
+ * Cancel / reopen / rewrite content remain allowed.
+ */
+export function protectDocumentWritingTodos(
+  current: AgentTodoItem[],
+  requested: AgentTodoItem[],
+): AgentTodoItem[] {
+  if (!current.length) return requested;
+  const byId = new Map(current.map(item => [item.id, item]));
+  return requested.map((item) => {
+    const prev = byId.get(item.id);
+    if (!prev) return item;
+    if (item.status !== "completed" || prev.status === "completed" || prev.status === "cancelled") {
+      return item;
+    }
+    // Match either the previous or requested label — models often rephrase while completing.
+    if (isFurtherWritingTodo(prev.content) || isFurtherWritingTodo(item.content)) {
+      return { ...item, status: prev.status };
+    }
+    return item;
+  });
 }
 
 /**
@@ -604,14 +681,21 @@ export function completeCharacterTaskTodos(todos: AgentTodoItem[]): { todos: Age
 export function reconcileManagedTodos(
   current: AgentTodoItem[],
   requested: AgentTodoItem[],
-): { todos: AgentTodoItem[]; scenePipelineProtected: boolean } {
+): { todos: AgentTodoItem[]; scenePipelineProtected: boolean; writingTodosProtected?: boolean } {
   const hasScenePipeline = SCENE_PIPELINE_TODO_SIGNATURES.some(contents =>
     current.length === contents.length
       && contents.every(content => current.some(item => item.content === content)),
   );
-  return hasScenePipeline
-    ? { todos: current, scenePipelineProtected: true }
-    : { todos: requested, scenePipelineProtected: false };
+  if (hasScenePipeline) {
+    return { todos: current, scenePipelineProtected: true };
+  }
+  const protectedTodos = protectDocumentWritingTodos(current, requested);
+  const writingTodosProtected = protectedTodos.some((item, index) => item.status !== requested[index]?.status);
+  return {
+    todos: protectedTodos,
+    scenePipelineProtected: false,
+    ...(writingTodosProtected ? { writingTodosProtected: true } : {}),
+  };
 }
 
 /** Persist completion after the character-only task's save tool succeeds. */

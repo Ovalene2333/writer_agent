@@ -74,6 +74,9 @@ export function handleManageTodos({ input, store, sessionId, emit, context }: To
     message: [
       active.length ? `任务清单已更新；进行中：${active.join("、")}` : "任务清单已更新",
       reconciled.scenePipelineProtected ? "内置章节阶段只能由实际场景工具结果推进；本次手动状态变更未应用。" : "",
+      reconciled.writingTodosProtected
+        ? "撰写/章节类条目须在文档提案真正创建后由运行时勾选完成；本次手动 completed 未生效（可改文案或 cancelled）。"
+        : "",
       draftNudge,
     ].filter(Boolean).join(" "),
   });

@@ -1644,7 +1644,9 @@ export async function startWriterServer(options: {
     try {
       const sessionId = context.req.param("id");
       if (!sessionId || !options.store.sessionExists(sessionId)) throw new Error("会话不存在");
-      return context.json(options.store.contextGraph(sessionId));
+      const requested = Number(context.req.query("limit"));
+      const limit = Number.isFinite(requested) && requested > 0 ? Math.min(2000, Math.max(1, Math.floor(requested))) : undefined;
+      return context.json(options.store.contextGraph(sessionId, limit ? { limit } : undefined));
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 

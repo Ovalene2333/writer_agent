@@ -35,20 +35,26 @@ import {
 import { writingWorkflowPrompt } from "./writing_workflow.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
+  buildProjectTrunk,
+  chapterHandoffKey,
   chapterHandoffLabel,
   formatActiveHandoffsForPrompt,
   type AssembleSlicePayload,
   type ChapterHandoffPayload,
+  type EpochCacheStats,
+  type ProjectTrunkPayload,
 } from "./context_graph.js";
 import {
   DEFAULT_SCENE_NOTES_CHARACTERS,
   formatTodosForPrompt,
   loadAgentSettings,
   permissionModeLabel,
+  isSuccessfulDocumentSubmission,
   persistAdvancedTodosAfterProposal,
   persistCompletedCharacterTaskTodos,
   persistScenePipelineTodos,
   projectInstructionsPrompt,
+  proposalIdFromToolResult,
   skillsCatalogPrompt,
   type ScenePipelineSettings,
   type WritingExecutionMode,
@@ -63,6 +69,7 @@ import {
   previousPath,
   safeReadHeading,
   type CompletedChapterHandoff,
+  type MaterialsShelfEntry,
   type ToolCall,
   type ToolExecutionContext,
   type ToolDefinition,
@@ -92,9 +99,10 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  * a byte-stable longest common prefix on the request. Follow these rules whenever
  * you add or rewrite prompts, system slots, tools, or message assembly:
  *
- * 1) MESSAGE ORDER — stable first, replayed history next, this turn's bytes last
+ * 1) MESSAGE ORDER — stable first, project trunk, replayed history, this turn last
  *    [tools schema]
  *    [buildStableSystemPrefix: 6 fixed system slots]
+ *    [project trunk: 1 system — outline skeleton + character index + lore paths]
  *    [frozen turns 1..N-1, replayed byte-verbatim from agent_turn_blocks]
  *    [this turn's dynamic block]
  *      turn 1 : buildDynamicTurnMessages — 8 fixed system slots + 1 user
@@ -102,10 +110,13 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    [assistant / tool turns appended during the job]
  *    Never insert optional system messages *between* stable slots; use the
  *    existing placeholder text when a block is empty so slot indices never shift.
+ *    Trunk is session-level materials (not frozen into turn blocks). Same material
+ *    hash ⇒ identical trunk bytes across turns so the provider prefix can hit
+ *    through it; material edits roll a new hash and only miss from the trunk on.
  *    Each finished turn is frozen (freezeTurnBlock) and replayed on the next turn,
  *    so the only new bytes in turn N are turn N's own block. Replay is VERBATIM —
  *    never lean-ify a block on the way out, or the common prefix ends right there.
- *    Boundaries reported to the observers: stableMessageCount(6) ≤
+ *    Boundaries reported to the observers: stableMessageCount(6) ≤ trunkEnd ≤
  *    replayedMessageCount ≤ initialMessageCount.
  *
  * 2) STABLE PREFIX (cross-turn cache)
@@ -1880,6 +1891,14 @@ export async function runAgent(options: {
     });
     contextEpochId = epochNode.id;
     store.addContextEdge({ sessionId, fromId: epochNode.id, toId: messageNode.id, kind: "caused_by" });
+    // Cross-msg cache chain: this turn's request replays earlier freezes (L1) after L0+trunk.
+    const priorEpochs = store.contextNodes(sessionId, { kind: "epoch" })
+      .filter(node => node.id !== epochNode.id)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || (b.sourceMessageId ?? 0) - (a.sourceMessageId ?? 0));
+    const priorEpoch = priorEpochs[0];
+    if (priorEpoch) {
+      store.addContextEdge({ sessionId, fromId: epochNode.id, toId: priorEpoch.id, kind: "replays" });
+    }
     for (const handoff of store.activeContextHandoffs(sessionId)) {
       store.addContextEdge({ sessionId, fromId: epochNode.id, toId: handoff.id, kind: "uses" });
     }
@@ -1947,6 +1966,8 @@ export async function runAgent(options: {
     modelUsageReporter: reportToolUsage,
     readSnapshots: new Map(),
     readCharactersUsed: 0,
+    // Session-level shelf: digests survive jobs; stale sourceHash dropped on load.
+    materialsShelf: hydrateSessionMaterialsShelf(store, sessionId, project),
     simpleCharacterScope,
     reviewCharacterIds: [...new Set([...task.characterIds, ...(characterScope ?? [])])],
     characterEvolutionEnabled: runtimeSettings.characterEvolutionEnabled,
@@ -2023,9 +2044,9 @@ export async function runAgent(options: {
       : {}),
   };
   // Assemble per PROMPT / PREFIX-CACHE CONTRACT (top of this file):
-  // stable 6 + replayed frozen turns + this turn's context block, then append-only
-  // tool loop. See buildStableSystemPrefix / buildDynamicTurnMessages / mergedTurnContext
-  // for slot maps when adding new prompt material.
+  // stable 6 + project trunk + replayed frozen turns + this turn's context block,
+  // then append-only tool loop. See buildStableSystemPrefix / buildDynamicTurnMessages /
+  // mergedTurnContext for slot maps when adding new prompt material.
   const replayBudgetTokens = Math.max(8_000, Math.floor((executionModel.pricing?.contextWindow ?? 128_000) / 2));
   const replay = loadReplayMessages({
     store,
@@ -2033,6 +2054,27 @@ export async function runAgent(options: {
     budgetTokens: replayBudgetTokens,
     compact: compactRuntimeMessages,
   });
+  const projectTrunk = buildSessionProjectTrunk(project, store);
+  const trunkMessage: ApiMessage = { role: "system", content: projectTrunk.content };
+  let trunkNodeId: string | undefined;
+  try {
+    const trunkPayload: ProjectTrunkPayload = {
+      kind: "trunk",
+      hash: projectTrunk.hash,
+      characterCount: projectTrunk.characterCount,
+      outlineNodeCount: projectTrunk.outlineNodeCount,
+      lorePathCount: projectTrunk.lorePathCount,
+      estimatedTokens: projectTrunk.estimatedTokens,
+    };
+    const trunkNode = store.ensureContextTrunk(sessionId, {
+      hash: projectTrunk.hash,
+      label: projectTrunk.empty
+        ? "树干 · 空"
+        : `树干 · 角色${projectTrunk.characterCount} · 大纲${projectTrunk.outlineNodeCount}`,
+      payload: trunkPayload as unknown as Record<string, unknown>,
+    });
+    trunkNodeId = trunkNode.id;
+  } catch { /* graph is diagnostic */ }
   const managedHandoffContext = formatActiveHandoffsForPrompt(store.activeContextHandoffs(sessionId));
   const turnContextParts = {
     taskContext: `${dynamicContextPrompt(
@@ -2061,26 +2103,52 @@ ${managedHandoffContext}`,
   };
   const messages: ApiMessage[] = [
     ...stableSystemPrefix,
+    trunkMessage,
     ...replay.messages,
     // First turn of a session keeps today's exact 8-system + 1-user shape (nothing
-    // precedes it, so system slots are still legal). From turn 2 the same bodies in
-    // the same order must fold into one `user` message — see mergedTurnContext.
+    // but stable+trunk precedes it, so system slots are still legal). From turn 2
+    // the same bodies in the same order must fold into one `user` message — see
+    // mergedTurnContext (no system after assistant/tool in replay).
     ...(replay.messages.length
       ? [mergedTurnContext(turnContextParts)]
       : buildDynamicTurnMessages({ historyText, archiveContext, ...turnContextParts })),
   ];
   // Everything before this turn's own context block: frozen bytes the provider has
-  // already seen. Observation classifies these separately from the live dynamic tail.
-  const replayedMessageCount = stableSystemPrefix.length + replay.messages.length;
-  // Multi-chapter boundary resets truncate back to exactly this prefix (see contract §4).
+  // already seen (plus the session trunk, which is rebuilt identically by hash).
+  const trunkEnd = stableSystemPrefix.length + 1;
+  const replayedMessageCount = trunkEnd + replay.messages.length;
+  // Open-turn prefix before session materials shelf (chapter cuts rebuild shelf after this).
   const initialMessageCount = messages.length;
+  // Session shelf from prior jobs: inject now so step 1 is not a cold start.
+  const openShelfPrompt = formatJobMaterialsShelfPrompt(toolContext);
+  if (openShelfPrompt) {
+    messages.push({ role: "user", content: openShelfPrompt });
+  }
+  // Chapter boundaries truncate here: open-turn prefix + materials shelf (if any).
+  let materialsBase = messages.length;
+  const openShelfCount = toolContext.materialsShelf?.size ?? 0;
   try {
     const activeHandoffs = store.activeContextHandoffs(sessionId);
     const slicePayload: AssembleSlicePayload = {
       step: 0,
       layers: [
         { id: "L0", layer: "L0", label: "稳定前缀 + 工具 schema", estimatedTokens: approximateMessageTokens(stableSystemPrefix) },
+        {
+          id: "trunk",
+          layer: "L0",
+          label: "项目树干（大纲/角色/设定路径）",
+          estimatedTokens: projectTrunk.estimatedTokens,
+          ...(trunkNodeId ? { nodeIds: [trunkNodeId] } : {}),
+        },
         { id: "L1", layer: "L1", label: "跨 turn 冻块 replay", estimatedTokens: approximateMessageTokens(replay.messages) },
+        {
+          id: "shelf",
+          layer: "L0",
+          label: openShelfCount ? `会话材料架 ${openShelfCount} 项` : "会话材料架 · 空",
+          estimatedTokens: openShelfPrompt
+            ? Math.ceil(Buffer.byteLength(openShelfPrompt, "utf8") / 4)
+            : 0,
+        },
         {
           id: "L2",
           layer: "L2",
@@ -2088,9 +2156,48 @@ ${managedHandoffContext}`,
           nodeIds: activeHandoffs.map(node => node.id),
           estimatedTokens: Math.ceil(Buffer.byteLength(managedHandoffContext, "utf8") / 4),
         },
-        { id: "L3", layer: "L3", label: "本 epoch 工具过程（append-only，边界后截断）" },
+        { id: "L3", layer: "L3", label: "本 epoch 工具过程（append-only，边界后截断）", estimatedTokens: 0 },
       ],
-      note: "initial assemble for this user turn",
+      replay: {
+        turns: replay.replayedTurns,
+        estimatedTokens: replay.estimatedTokens,
+        compacted: replay.compacted,
+        droppedTurns: replay.droppedTurns,
+        budgetTokens: replayBudgetTokens,
+      },
+      trunk: { hash: projectTrunk.hash, estimatedTokens: projectTrunk.estimatedTokens },
+      transition: {
+        kind: "open_turn",
+        afterTokens: approximateMessageTokens(messages),
+        afterMessageCount: messages.length,
+        kept: [
+          { id: "L0", label: "稳定前缀 + 工具 schema", detail: "跨会话产品规则" },
+          { id: "trunk", label: "项目树干", detail: projectTrunk.empty ? "空占位" : `角色${projectTrunk.characterCount} · 大纲${projectTrunk.outlineNodeCount} · lore${projectTrunk.lorePathCount}` },
+          {
+            id: "L1",
+            label: "跨 turn 冻块 replay",
+            detail: replay.replayedTurns
+              ? `${replay.replayedTurns} 轮 · 约 ${replay.estimatedTokens.toLocaleString()} tok`
+              : "本会话首轮，无 replay",
+          },
+          {
+            id: "shelf",
+            label: openShelfCount
+              ? `会话材料架 ${openShelfCount} 项（跨 job 保留）`
+              : "会话材料架为空",
+            detail: openShelfCount
+              ? "同 session 此前读过的设定 digests；hash 未变禁止再 read 全文"
+              : "本会话尚未完整读过设定；读后会写入材料架",
+          },
+          { id: "L2", label: "本轮任务 + 活跃章交接", detail: "焦点任务与结果态 handoff" },
+        ],
+        dropped: [],
+        reReadHint: openShelfCount
+          ? "材料架已有 digests 的 path 勿再全文 read；未收录或文件变更才补读。"
+          : "树干是索引不是全文；设定需工具读取一次后进入会话材料架。",
+      },
+      materialsShelfCount: openShelfCount,
+      note: "开轮装配",
     };
     const slice = store.createContextNode({
       sessionId,
@@ -2105,11 +2212,14 @@ ${managedHandoffContext}`,
       for (const handoff of activeHandoffs) {
         store.addContextEdge({ sessionId, fromId: slice.id, toId: handoff.id, kind: "uses" });
       }
+      if (trunkNodeId) {
+        store.addContextEdge({ sessionId, fromId: slice.id, toId: trunkNodeId, kind: "uses" });
+      }
     }
   } catch { /* ignore graph errors */ }
   // Scene-boundary resets truncate back here (§4b): advanced past prep reads when
   // begin_chapter_draft succeeds, so chapter facts survive while scene prose does not.
-  let contextBase = initialMessageCount;
+  let contextBase = materialsBase;
   const restoredCheckpoint = restoredChapterDraft ? store.agentCheckpoint(sessionId) : undefined;
   let chapterReviewRequired = chapterDraftNeedsReview(restoredChapterDraft, restoredCheckpoint?.stage);
   let chapterReviewRejectedAttempts = 0;
@@ -2124,6 +2234,13 @@ ${managedHandoffContext}`,
   }
   let transcript = "";
   let documentProposalSubmitted = false;
+  /** Proposal that actually succeeded this step (never "latest in store" alone). */
+  let submittedProposalRef: {
+    id: number;
+    path: string;
+    summary: string;
+    afterContent: string;
+  } | undefined;
   let completedDocumentDeliverables = 0;
   let characterMutationSubmitted = false;
   let characterMutationName = "";
@@ -2139,6 +2256,10 @@ ${managedHandoffContext}`,
   ));
   const replannedFailures = new Set<string>();
   let thinkingContinuationDisabled = false;
+  // Measured prefix-cache usage for this turn, summed over its agent_step calls.
+  // Written onto the epoch node at freeze so the context graph can answer
+  // "what did this turn actually cost, and how much of it was already cached".
+  const turnCache = { promptTokens: 0, cacheHitTokens: 0, steps: 0 };
   /**
    * Freeze this turn (its context block + tool transcript) so the next turn in the
    * same session replays it instead of rebuilding from zero. Called on the normal
@@ -2147,6 +2268,7 @@ ${managedHandoffContext}`,
    */
   const freezeCurrentTurn = () => {
     try {
+      persistSessionMaterialsShelf(store, sessionId, toolContext);
       const block = freezeTurnBlock(messages, replayedMessageCount);
       if (!block.length) return;
       store.appendAgentTurnBlock(sessionId, {
@@ -2163,6 +2285,18 @@ ${managedHandoffContext}`,
             promptPreview: prompt.slice(0, 240),
             frozen: true,
             frozenTokens: approximateMessageTokens(block),
+            ...(turnCache.steps
+              ? {
+                  cache: {
+                    promptTokens: turnCache.promptTokens,
+                    cacheHitTokens: turnCache.cacheHitTokens,
+                    steps: turnCache.steps,
+                    ...(turnCache.promptTokens > 0
+                      ? { hitRate: turnCache.cacheHitTokens / turnCache.promptTokens }
+                      : {}),
+                  } satisfies EpochCacheStats,
+                }
+              : {}),
           },
         });
       }
@@ -2200,7 +2334,14 @@ ${managedHandoffContext}`,
         : thinkingContinuationDisabled
         ? nonThinkingRequestOptions(stepModel)
         : thinkingRequestOptions(stepModel);
-      const requestComponents = buildRequestComponentUsage(messages, executionTools, 6, initialMessageCount, replayedMessageCount);
+      const requestComponents = buildRequestComponentUsage(
+        messages,
+        executionTools,
+        6,
+        initialMessageCount,
+        replayedMessageCount,
+        1,
+      );
       const result = await streamCompletion(stepModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
@@ -2235,6 +2376,14 @@ ${managedHandoffContext}`,
       };
       if (result.usage) {
         emitUsageEvent(emit, store, sessionId, stepModel, result.usage, step, "agent_step", options.jobId, requestComponents);
+        // Estimated usage is a fallback shape with cacheHitTokens 0 — counting it
+        // would drag the reported hit rate toward zero for reasons unrelated to
+        // the prompt layout.
+        if (!result.usage.estimated) {
+          turnCache.promptTokens += result.usage.promptTokens;
+          turnCache.cacheHitTokens += result.usage.cacheHitTokens;
+          turnCache.steps += 1;
+        }
       }
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
@@ -2292,6 +2441,7 @@ ${managedHandoffContext}`,
 
       waitingForUser = false;
       documentProposalSubmitted = false;
+      submittedProposalRef = undefined;
       let beginChapterSucceeded = false;
       let sceneWrittenFeedback: string[] | undefined;
       let chapterReviewInStep = false;
@@ -2430,7 +2580,25 @@ ${managedHandoffContext}`,
             // Every declared inspect outcome means the terminal action ran. Keep
             // its tool result in the transcript and release the inspect-only lock
             // so the Agent can submit, precisely repair, or use fallback review.
-            documentProposalSubmitted = parsed.proposalSubmitted === true;
+            if (isSuccessfulDocumentSubmission(call.name, parsed)) {
+              documentProposalSubmitted = true;
+              const proposalId = proposalIdFromToolResult(parsed);
+              if (proposalId !== undefined) {
+                try {
+                  const proposal = store.proposal(proposalId);
+                  if (proposal.sessionId === sessionId) {
+                    submittedProposalRef = {
+                      id: proposal.id,
+                      path: proposal.path,
+                      summary: proposal.summary,
+                      afterContent: proposal.afterContent,
+                    };
+                  }
+                } catch { /* proposal row may be missing in edge cases */ }
+              }
+            } else {
+              documentProposalSubmitted = false;
+            }
             chapterReviewRequired = false;
             chapterReviewRepair = chapterReviewRepairLock(parsed);
           }
@@ -2440,10 +2608,29 @@ ${managedHandoffContext}`,
           // so the scene-boundary reset below is skipped for this step.
           chapterReviewInStep = true;
         }
+        // Only count tools that actually created a proposal / change set. Final-review
+        // blocks return structured JSON without `error` but also without proposalId —
+        // treating them as success used to fire false chapter boundaries (jn3 林千夏).
         if (call.name === "propose_document" || call.name === "write_document_isolated" || call.name === "propose_document_patch" || call.name === "revise_document_isolated" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch" || call.name === "propose_change_set") {
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
-            if (!("error" in parsed)) documentProposalSubmitted = true;
+            if (isSuccessfulDocumentSubmission(call.name, parsed)) {
+              documentProposalSubmitted = true;
+              const proposalId = proposalIdFromToolResult(parsed);
+              if (proposalId !== undefined) {
+                try {
+                  const proposal = store.proposal(proposalId);
+                  if (proposal.sessionId === sessionId) {
+                    submittedProposalRef = {
+                      id: proposal.id,
+                      path: proposal.path,
+                      summary: proposal.summary,
+                      afterContent: proposal.afterContent,
+                    };
+                  }
+                } catch { /* ignore missing proposal row */ }
+              }
+            }
           } catch { /* 无效工具结果不能视为已提交。 */ }
         }
         if (call.name === "ask_user") {
@@ -2454,6 +2641,8 @@ ${managedHandoffContext}`,
         }
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
+      // Persist session shelf after any reads this step so the next user turn can reload.
+      persistSessionMaterialsShelf(store, sessionId, toolContext);
       let automaticReviewHandoff: string | undefined;
       if (chapterReviewRequired && toolContext.chapterSceneDraft
         && automaticChapterReviewEnabled(toolContext.characterEvolutionEnabled)
@@ -2479,7 +2668,25 @@ ${managedHandoffContext}`,
         } catch { /* malformed automatic review keeps the ordinary terminal lock */ }
         recordAgentToolResult(executionProgress, automaticReviewCall.name, parsedAutomaticReview);
         if (parsedAutomaticReview && chapterReviewCompleted(parsedAutomaticReview)) {
-          documentProposalSubmitted = parsedAutomaticReview.proposalSubmitted === true;
+          if (isSuccessfulDocumentSubmission("inspect_chapter_draft", parsedAutomaticReview)) {
+            documentProposalSubmitted = true;
+            const proposalId = proposalIdFromToolResult(parsedAutomaticReview);
+            if (proposalId !== undefined) {
+              try {
+                const proposal = store.proposal(proposalId);
+                if (proposal.sessionId === sessionId) {
+                  submittedProposalRef = {
+                    id: proposal.id,
+                    path: proposal.path,
+                    summary: proposal.summary,
+                    afterContent: proposal.afterContent,
+                  };
+                }
+              } catch { /* ignore */ }
+            }
+          } else {
+            documentProposalSubmitted = false;
+          }
           chapterReviewRequired = false;
           chapterReviewRepair = chapterReviewRepairLock(parsedAutomaticReview);
           chapterReviewInStep = true;
@@ -2555,6 +2762,8 @@ ${managedHandoffContext}`,
         // cache-hits. Skipped when begin+write landed in one step (contextBase
         // then already contains this scene — nothing older to drop).
         if (!beginChapterSucceeded) {
+          const beforeTokens = approximateMessageTokens(messages);
+          const beforeMessageCount = messages.length;
           messages.length = contextBase;
           messages.push({
             // CACHE: user role — a mid-job system message flips DeepSeek's
@@ -2566,6 +2775,43 @@ ${managedHandoffContext}`,
               isolatedWriter: scenePipelineSettings.isolatedWriter,
             }),
           });
+          const afterTokens = approximateMessageTokens(messages);
+          try {
+            const draft = toolContext.chapterSceneDraft;
+            store.createContextNode({
+              sessionId,
+              kind: "assemble_slice",
+              label: `装配 · 场边界 · ${draft?.path ?? "scene"}`,
+              sourceMessageId,
+              jobId: options.jobId,
+              payload: {
+                step,
+                layers: [
+                  { id: "L0", layer: "L0", label: "保留 · 开章 base（含 begin 前准备读）", estimatedTokens: approximateMessageTokens(messages.slice(0, contextBase)) },
+                  { id: "L2", layer: "L2", label: "新增 · 场交接 handoff", estimatedTokens: Math.max(0, afterTokens - approximateMessageTokens(messages.slice(0, contextBase))) },
+                  { id: "L3", layer: "L3", label: "丢弃 · 上一场完整正文过程", estimatedTokens: 0 },
+                ],
+                transition: {
+                  kind: "scene_boundary",
+                  atStep: step,
+                  beforeTokens,
+                  afterTokens,
+                  beforeMessageCount,
+                  afterMessageCount: messages.length,
+                  path: draft?.path,
+                  kept: [
+                    { id: "base", label: "章内 context base", detail: "begin 前准备读 + 初始 scene guide" },
+                    { id: "handoff", label: "场交接", detail: "上一段约 800 字尾 + 各场 actualState + 下一场 guide" },
+                  ],
+                  dropped: [
+                    { id: "L3", label: "上一场工具正文", detail: `约 ${Math.max(0, beforeTokens - afterTokens).toLocaleString()} tok 的 notes/正文/重试过程` },
+                  ],
+                  reReadHint: "已完成场的全文在内存草稿中；终审用隔离 inspect。主循环不再挂全文，故不会为了「再看上一场」而自动重注入。",
+                },
+                note: "场边界截断",
+              } as unknown as Record<string, unknown>,
+            });
+          } catch { /* ignore graph errors */ }
           turnStart = messages.length;
         }
         ensureThinkingTranscriptCanContinue();
@@ -2588,10 +2834,26 @@ ${managedHandoffContext}`,
           // Per-chapter context reset: drop the finished chapter's tool transcript
           // and restart from the byte-stable initial prefix (still a cache hit), so
           // the next chapter stops paying the previous chapter's prose on every step.
-          const latestProposal = store.proposals().find(item => item.sessionId === sessionId);
+          // Prefer the proposal that succeeded *this step* — store.latest can be a
+          // previous chapter when the current propose failed review but was mis-counted.
+          const latestProposal = submittedProposalRef
+            ?? (() => {
+              try {
+                return store.proposals().find(item => item.sessionId === sessionId);
+              } catch { return undefined; }
+            })();
           const handoff = toolContext.completedChapterHandoff;
           toolContext.completedChapterHandoff = undefined;
+          // Measure *before* the cut so the graph can show step N → N+1 inheritance.
+          const beforeTokens = approximateMessageTokens(messages);
+          const beforeMessageCount = messages.length;
+          // Rebuild kept base: open-turn prefix + latest session materials shelf.
+          // Drops previous chapter process and prior handoff only.
           messages.length = initialMessageCount;
+          const shelfPrompt = formatJobMaterialsShelfPrompt(toolContext);
+          if (shelfPrompt) messages.push({ role: "user", content: shelfPrompt });
+          materialsBase = messages.length;
+          persistSessionMaterialsShelf(store, sessionId, toolContext);
           messages.push({
             // CACHE: user role — a mid-job system message flips DeepSeek's
             // whole-request rendering and forfeits the cached prefix (§4).
@@ -2605,9 +2867,17 @@ ${managedHandoffContext}`,
               ...(handoff ? { handoff } : {}),
             }),
           });
+          const afterTokens = approximateMessageTokens(messages);
+          const afterMessageCount = messages.length;
+          const shelfCount = toolContext.materialsShelf?.size ?? 0;
           try {
+            const chapterKey = chapterHandoffKey({
+              path: latestProposal?.path,
+              index: completedDocumentDeliverables,
+            });
             const handoffPayload: ChapterHandoffPayload = {
               kind: "chapter",
+              ...(chapterKey ? { chapterKey } : {}),
               ...(latestProposal ? {
                 path: latestProposal.path,
                 summary: latestProposal.summary,
@@ -2630,6 +2900,12 @@ ${managedHandoffContext}`,
             if (contextEpochId) {
               store.addContextEdge({ sessionId, fromId: contextEpochId, toId: handoffNode.id, kind: "produces" });
             }
+            // A rewrite of the same chapter must retire the previous seam, or the
+            // L2 block hands the model two competing tails for one chapter.
+            const superseded = store.supersedeContextHandoffs(sessionId, chapterKey, handoffNode.id);
+            const keptPrefixTokens = approximateMessageTokens(messages.slice(0, materialsBase));
+            const handoffTokens = Math.max(0, afterTokens - keptPrefixTokens);
+            const droppedTokens = Math.max(0, beforeTokens - afterTokens + handoffTokens);
             store.createContextNode({
               sessionId,
               kind: "assemble_slice",
@@ -2639,23 +2915,75 @@ ${managedHandoffContext}`,
               payload: {
                 step,
                 layers: [
-                  { id: "L0", layer: "L0", label: "稳定前缀保留（截断回 initial）" },
-                  { id: "L2", layer: "L2", label: "写入章交接", nodeIds: [handoffNode.id] },
-                  { id: "L3", layer: "L3", label: "丢弃上一章工具过程" },
+                  { id: "L0", layer: "L0", label: "保留 · 稳定前缀+树干+开轮动态", estimatedTokens: approximateMessageTokens(messages.slice(0, initialMessageCount)) },
+                  {
+                    id: "shelf",
+                    layer: "L0",
+                    label: shelfCount ? `保留 · 材料架 ${shelfCount} 项` : "材料架 · 空",
+                    estimatedTokens: Math.max(0, keptPrefixTokens - approximateMessageTokens(messages.slice(0, initialMessageCount))),
+                  },
+                  {
+                    id: "L2",
+                    layer: "L2",
+                    label: "新增 · 章交接 handoff",
+                    nodeIds: [handoffNode.id],
+                    estimatedTokens: handoffTokens,
+                  },
+                  { id: "L3", layer: "L3", label: "丢弃 · 上一章工具过程", estimatedTokens: 0 },
                 ],
-                note: "chapter boundary: messages truncated to initialMessageCount",
+                transition: {
+                  kind: "chapter_boundary",
+                  atStep: step,
+                  beforeTokens,
+                  afterTokens,
+                  beforeMessageCount,
+                  afterMessageCount,
+                  path: latestProposal?.path,
+                  kept: [
+                    { id: "L0", label: "稳定系统前缀 + 项目树干", detail: "跨章字节稳定，下一批 step 仍可前缀命中" },
+                    { id: "turn", label: "本轮开轮动态块", detail: "任务说明 / todos / 选区等 initial 前缀内内容" },
+                    {
+                      id: "shelf",
+                      label: shelfCount
+                        ? `会话材料架 ${shelfCount} 项（跨 job；已读 path 不再灌全文）`
+                        : "会话材料架为空",
+                      detail: "同 session 持久 digests；sourceHash 未变则 materials_shelf_hit",
+                    },
+                    {
+                      id: "L2",
+                      label: "章交接（约 800 字章尾 + 摘要 + actualState）",
+                      detail: latestProposal?.path
+                        ? `已交付 ${latestProposal.path}`
+                        : "上一章交付缝",
+                    },
+                  ],
+                  dropped: [
+                    {
+                      id: "L3",
+                      label: "上一章完整工具过程",
+                      detail: `约 ${droppedTokens.toLocaleString()} tok：propose 正文、失败重试、过程性 tool 配对等（设定 digests 已进材料架）`,
+                    },
+                  ],
+                  reReadHint: shelfCount
+                    ? "会话材料架已收录设定/角色 digests（跨本 session 各 job）。同 path+hash 再 read/search → materials_shelf_hit；仅未收录或文件变更才新读。"
+                    : "会话材料架仍空：下一章可能补读。读过后会写入 session，后续 job/章可复用。",
+                },
+                ...(superseded ? { supersededHandoffs: superseded } : {}),
+                ...(submittedProposalRef ? { proposalId: submittedProposalRef.id } : {}),
+                materialsShelfCount: shelfCount,
+                note: "章边界截断",
               } as unknown as Record<string, unknown>,
             });
           } catch { /* ignore graph errors */ }
           turnStart = messages.length;
           // Next chapter's scene resets truncate to here until its begin succeeds.
           contextBase = messages.length;
-          // Allow fresh reads/searches for the next chapter within the same job;
-          // store-cached artifacts still short-circuit identical repeat reads.
+          // Keep readSnapshots + materialsShelf across chapters (same job). Clearing
+          // them forced post-boundary cold re-reads of the same lore.
+          // Still reset write-tool thrash counters; read cache keys are re-derived.
           toolCallCounts.clear();
-          toolContext.readSnapshots?.clear();
-          toolContext.readCharactersUsed = 0;
           documentProposalSubmitted = false;
+          submittedProposalRef = undefined;
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
           toolContext.lastWritePack = undefined;
@@ -2674,6 +3002,7 @@ ${managedHandoffContext}`,
         const gaps = agentCompletionGaps(task, executionProgress, advanced.todos);
         if (gaps.length && !waitingForUser) {
           documentProposalSubmitted = false;
+          submittedProposalRef = undefined;
           messages.push({ role: "user", content: completionRecoveryPrompt(gaps, executionProgress) });
           ensureThinkingTranscriptCanContinue();
           continue;
@@ -3097,12 +3426,160 @@ ${JSON.stringify({
   })}`;
 }
 
-const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft"]);
+const CACHEABLE_TOOLS = new Set(["list_documents", "inspect_document", "locate_document_span", "read_document", "read_document_span", "search_project", "list_files", "inspect_file", "read_file", "search_files", "audit_prose_style", "list_outline_nodes", "get_outline_node", "validate_outline", "compare_outline_with_draft", "get_character", "list_characters"]);
 const DOCUMENT_READ_TOOLS = new Set(["inspect_document", "locate_document_span", "read_document", "read_document_span", "inspect_file", "read_file"]);
 const DOCUMENT_BODY_READ_TOOLS = new Set(["read_document", "read_document_span", "read_file"]);
 const READ_ATOM_CACHE_VERSION = "v2";
 /** Structural / catalog tools must stay intact so the model does not re-list after compaction. */
 const NEVER_COMPACT_KEYS = new Set(["nodes", "matches", "issues"]);
+/** Max body chars stored as a shelf digest excerpt (not full prose). */
+const MATERIALS_SHELF_DIGEST_CHARS = 360;
+/** Cap shelf entries so the cross-chapter kept block stays cheap. */
+const MATERIALS_SHELF_MAX_ENTRIES = 24;
+
+function materialsShelfKeyForPath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function materialsShelfKeyForCharacter(id: number): string {
+  return `character:${id}`;
+}
+
+/** Prefer lore/outline/character materials for the cross-chapter shelf; skip delivered chapter drafts. */
+function shouldShelfPath(path: string): boolean {
+  const kind = documentKind(path);
+  return kind === "lore" || kind === "outline" || kind === "other";
+}
+
+export function registerMaterialsShelfEntry(
+  context: ToolExecutionContext,
+  entry: Omit<MaterialsShelfEntry, "key"> & { key?: string },
+): MaterialsShelfEntry {
+  context.materialsShelf ??= new Map();
+  const key = entry.key
+    ?? (entry.characterId != null
+      ? materialsShelfKeyForCharacter(entry.characterId)
+      : materialsShelfKeyForPath(entry.path ?? entry.kind));
+  const prev = context.materialsShelf.get(key);
+  const next: MaterialsShelfEntry = {
+    key,
+    path: entry.path ?? prev?.path,
+    characterId: entry.characterId ?? prev?.characterId,
+    sourceHash: entry.sourceHash,
+    kind: entry.kind,
+    digest: entry.digest.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS),
+    bodyChars: Math.max(entry.bodyChars, prev?.bodyChars ?? 0),
+    fullBodyServed: Boolean(entry.fullBodyServed || prev?.fullBodyServed),
+  };
+  // Bound size: drop oldest non-full-body entries first, then oldest.
+  if (!context.materialsShelf.has(key) && context.materialsShelf.size >= MATERIALS_SHELF_MAX_ENTRIES) {
+    const removable = [...context.materialsShelf.values()]
+      .filter(item => !item.fullBodyServed)
+      .slice(0, 1);
+    const drop = removable[0] ?? [...context.materialsShelf.values()][0];
+    if (drop) context.materialsShelf.delete(drop.key);
+  }
+  context.materialsShelf.set(key, next);
+  return next;
+}
+
+/**
+ * Compact prompt block for the session materials shelf.
+ * Injected at open turn when non-empty, and re-frozen at each chapter boundary.
+ */
+export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): string {
+  const entries = [...(context.materialsShelf?.values() ?? [])]
+    .sort((a, b) => (a.path ?? a.key).localeCompare(b.path ?? b.key, undefined, { numeric: true }));
+  if (!entries.length) return "";
+  const payload = entries.map(item => ({
+    key: item.key,
+    ...(item.path ? { path: item.path } : {}),
+    ...(item.characterId != null ? { characterId: item.characterId } : {}),
+    kind: item.kind,
+    sourceHash: item.sourceHash.slice(0, 12),
+    bodyChars: item.bodyChars,
+    fullBodyServed: item.fullBodyServed,
+    digest: item.digest,
+  }));
+  return [
+    "【会话材料架 · 跨任务保留】以下设定/角色已在本会话读过（sourceHash 未变则禁止再 read 全文或反复 search）。",
+    "写作直接依据 digest 与章交接；仅当需要 digest 未覆盖的行号区间或文件已变更时才再读。",
+    "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
+    JSON.stringify({ materials: payload, count: payload.length, scope: "session" }),
+  ].join("\n");
+}
+
+/**
+ * Load session shelf and drop entries whose on-disk (or character) identity no longer matches.
+ */
+export function hydrateSessionMaterialsShelf(
+  store: WriterStore,
+  sessionId: string,
+  project: WriterProject,
+): Map<string, MaterialsShelfEntry> {
+  const map = new Map<string, MaterialsShelfEntry>();
+  let dirty = false;
+  const characterIds = new Set(store.characters().map(item => item.id));
+  for (const entry of store.sessionMaterialsShelf(sessionId)) {
+    if (entry.characterId != null) {
+      if (!characterIds.has(entry.characterId)) {
+        dirty = true;
+        continue;
+      }
+      map.set(entry.key, entry);
+      continue;
+    }
+    if (!entry.path) {
+      dirty = true;
+      continue;
+    }
+    const path = entry.path;
+    try {
+      if (!project.textFileExists(path) && !project.documentExists(path)) {
+        dirty = true;
+        continue;
+      }
+      const currentHash = project.textFileExists(path)
+        ? project.hash(project.readTextFile(path))
+        : project.hash(project.read(path));
+      if (currentHash !== entry.sourceHash) {
+        dirty = true;
+        continue;
+      }
+      map.set(entry.key, entry);
+    } catch {
+      dirty = true;
+    }
+  }
+  if (dirty) store.saveSessionMaterialsShelf(sessionId, [...map.values()]);
+  return map;
+}
+
+export function persistSessionMaterialsShelf(
+  store: WriterStore,
+  sessionId: string,
+  context: ToolExecutionContext,
+): void {
+  // Always write the in-memory map (hydrated at job start, mutated by reads).
+  // Empty map is valid only when hydrate already emptied stale entries.
+  if (!context.materialsShelf) return;
+  store.saveSessionMaterialsShelf(sessionId, [...context.materialsShelf.values()]);
+}
+
+function materialsShelfHitPayload(entry: MaterialsShelfEntry, extra?: Record<string, unknown>): string {
+  return JSON.stringify({
+    status: "materials_shelf_hit",
+    key: entry.key,
+    ...(entry.path ? { path: entry.path } : {}),
+    ...(entry.characterId != null ? { characterId: entry.characterId } : {}),
+    sourceHash: entry.sourceHash,
+    kind: entry.kind,
+    digest: entry.digest,
+    bodyChars: entry.bodyChars,
+    message: "该材料已在会话材料架中（全文已提供过）。禁止重复 read/search 同路径；请直接依据材料架与交接续写。",
+    ...extra,
+  });
+}
 
 function readResultRanges(parsed: Record<string, unknown>): Array<{ startLine: number; endLine: number }> {
   const ranges: Array<{ startLine: number; endLine: number }> = [];
@@ -3257,6 +3734,45 @@ async function executeToolCached(
         lockedSourceHash: locked.sourceHash,
       });
     }
+    // Same lore/path already paid full body once this job → never re-inject.
+    if (shouldShelfPath(sourcePath)) {
+      const shelfKey = materialsShelfKeyForPath(sourcePath);
+      const shelf = context.materialsShelf?.get(shelfKey);
+      if (shelf && shelf.sourceHash === sourceHash && shelf.fullBodyServed) {
+        return materialsShelfHitPayload(shelf, { tool: call.name });
+      }
+    }
+  }
+
+  if (call.name === "get_character") {
+    const id = Number(normalized.id);
+    if (Number.isInteger(id) && id > 0) {
+      const shelf = context.materialsShelf?.get(materialsShelfKeyForCharacter(id));
+      if (shelf?.fullBodyServed) return materialsShelfHitPayload(shelf, { tool: call.name });
+    }
+  }
+
+  // search_project: once every lore/outline file has been fully served this job,
+  // block thrashing re-scans (small projects finish prep in 1–2 passes).
+  if (call.name === "search_project") {
+    const loreDocs = project.listDocuments()
+      .filter(path => !project.isDocumentHidden(path) && shouldShelfPath(path));
+    if (loreDocs.length > 0) {
+      const served = new Set(
+        [...(context.materialsShelf?.values() ?? [])]
+          .filter(item => item.path && item.fullBodyServed && shouldShelfPath(item.path))
+          .map(item => materialsShelfKeyForPath(item.path!)),
+      );
+      const allServed = loreDocs.every(path => served.has(materialsShelfKeyForPath(path)));
+      if (allServed) {
+        return JSON.stringify({
+          status: "materials_shelf_search_redirect",
+          message: "本 job 材料架已收录项目全部设定/大纲路径的正文。禁止再 search_project；请直接依据材料架 digests 与章交接写作。",
+          shelfPaths: loreDocs.slice(0, 20),
+          shelfCount: loreDocs.length,
+        });
+      }
+    }
   }
 
   // Version read artifacts so older cached payload shapes are not mixed in.
@@ -3267,6 +3783,16 @@ async function executeToolCached(
   const cached = store.contextArtifact(sessionId, cacheKey);
   if (cached) {
     if (DOCUMENT_READ_TOOLS.has(call.name) && count > 1) {
+      if (sourcePath && shouldShelfPath(sourcePath)) {
+        registerMaterialsShelfEntry(context, {
+          path: sourcePath,
+          sourceHash: cached.sourceHash ?? sourceHash,
+          kind: call.name,
+          digest: cached.digest,
+          bodyChars: 0,
+          fullBodyServed: true,
+        });
+      }
       return JSON.stringify({
         status: "read_atom_reused",
         artifactId: cached.id,
@@ -3276,16 +3802,29 @@ async function executeToolCached(
         message: "相同读取已存在于本轮上下文，正文不再重复返回。",
       });
     }
+    // First restore after a chapter-boundary count clear: still do not re-pour full
+    // lore if the shelf already served that path once.
+    if (DOCUMENT_BODY_READ_TOOLS.has(call.name) && sourcePath && shouldShelfPath(sourcePath)) {
+      const shelf = context.materialsShelf?.get(materialsShelfKeyForPath(sourcePath));
+      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash) {
+        return materialsShelfHitPayload(shelf, { artifactId: cached.id, tool: call.name });
+      }
+    }
     const restored = withReuseMarker(cached.content,
       count === 1
         ? "工作记忆中已有相同且未变化的工具结果；以下为完整内容，请直接使用，勿再次读取。"
         : "相同读取已执行过且文档未变；以下从工作记忆恢复完整结果，请直接使用，禁止再次调用。",
       cached.id);
-    return sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, restored, context) : restored;
+    const admitted = sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, restored, context) : restored;
+    rememberMaterialsFromToolResult(call.name, admitted, sourcePath, sourceHash, context);
+    return admitted;
   }
   const result = await executeTool(call, project, store, sessionId, emit, characterScope, context);
   const admitted = sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, result, context) : result;
-  if (admitted !== result) return admitted;
+  if (admitted !== result) {
+    rememberMaterialsFromToolResult(call.name, admitted, sourcePath, sourceHash, context);
+    return admitted;
+  }
   let digest = `${call.name} 已完成`;
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
@@ -3298,7 +3837,67 @@ async function executeToolCached(
     digest = [call.name, location, excerpt].filter(Boolean).join("：");
   } catch { digest = `${call.name} 返回了非 JSON 结果`; }
   const artifactId = store.saveContextArtifact(sessionId, { cacheKey, kind: call.name, path: sourcePath, sourceHash, content: result, digest });
-  return attachArtifactId(result, artifactId);
+  const attached = attachArtifactId(result, artifactId);
+  rememberMaterialsFromToolResult(call.name, attached, sourcePath, sourceHash, context);
+  return attached;
+}
+
+/** Record setting/character payloads onto the job materials shelf after a successful read. */
+function rememberMaterialsFromToolResult(
+  toolName: string,
+  result: string,
+  sourcePath: string | undefined,
+  sourceHash: string,
+  context: ToolExecutionContext,
+): void {
+  try {
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    if (typeof parsed.error === "string") return;
+    if (parsed.status === "materials_shelf_hit" || parsed.status === "read_atom_reused") return;
+
+    if (toolName === "get_character") {
+      const id = typeof parsed.id === "number" ? parsed.id : Number(parsed.id);
+      if (!Number.isInteger(id) || id <= 0) return;
+      const name = typeof parsed.name === "string" ? parsed.name
+        : typeof (parsed.identity as { name?: unknown } | undefined)?.name === "string"
+          ? String((parsed.identity as { name: string }).name)
+          : `角色#${id}`;
+      const summary = typeof parsed.summary === "string" ? parsed.summary
+        : typeof (parsed.identity as { summary?: unknown } | undefined)?.summary === "string"
+          ? String((parsed.identity as { summary: string }).summary)
+          : "";
+      registerMaterialsShelfEntry(context, {
+        key: materialsShelfKeyForCharacter(id),
+        characterId: id,
+        sourceHash: `character:${id}`,
+        kind: toolName,
+        digest: `${name} ${summary}`.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS),
+        bodyChars: result.length,
+        fullBodyServed: true,
+      });
+      return;
+    }
+
+    if (!sourcePath || !shouldShelfPath(sourcePath)) return;
+    if (!DOCUMENT_READ_TOOLS.has(toolName) && toolName !== "get_outline_node") return;
+    const body = typeof parsed.content === "string" ? parsed.content
+      : typeof parsed.markdown === "string" ? parsed.markdown
+        : typeof parsed.excerpt === "string" ? parsed.excerpt
+          : "";
+    const isBody = DOCUMENT_BODY_READ_TOOLS.has(toolName) && body.length > 0;
+    const digest = body
+      ? body.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS)
+      : `${toolName} ${sourcePath}`;
+    registerMaterialsShelfEntry(context, {
+      path: sourcePath,
+      sourceHash: typeof parsed.sourceHash === "string" ? parsed.sourceHash : sourceHash,
+      kind: toolName,
+      digest,
+      bodyChars: body.length,
+      // Only body reads mark fullBodyServed — inspect alone still allows one full read.
+      fullBodyServed: isBody,
+    });
+  } catch { /* ignore non-JSON */ }
 }
 
 /** Windowing for agent history preview only (roleplay uses its own limit). CACHE: keep small. */
@@ -3332,15 +3931,25 @@ function compactHistory(messages: Array<{ role: string; content: string; channel
  * runAgent job (e.g. tests or future cross-turn rebuild). Never call between
  * multi-step tool turns in the same job — mutating earlier messages invalidates
  * the provider prefix cache for all subsequent steps.
+ *
+ * `keepRecent: 0` + `force` is the replay path (src/turn_replay.ts): a frozen turn
+ * that has gone cold is compacted as a *whole*, with no sliding "keep the last two"
+ * window. That makes the operation idempotent on a fixed message array — every
+ * heavy body is already a digest on the second pass — which is what lets an
+ * already-shrunk block stay byte-identical on every later turn.
  */
-export function compactRuntimeMessages(messages: ApiMessage[]): void {
+export function compactRuntimeMessages(
+  messages: ApiMessage[],
+  options: { keepRecent?: number; force?: boolean } = {},
+): void {
+  const keepRecent = Math.max(0, options.keepRecent ?? 2);
   const toolIndexes = messages.flatMap((message, index) => message.role === "tool" ? [index] : []);
   const totalChars = toolIndexes.reduce((sum, index) => sum + (messages[index].content?.length ?? 0), 0);
   // Earlier compact once digests stay in the transcript (no full rehydrate of all tools).
-  if (toolIndexes.length <= 4 && totalChars <= 20_000) return;
+  if (!options.force && toolIndexes.length <= 4 && totalChars <= 20_000) return;
 
-  const keepRecent = 2;
-  for (const index of toolIndexes.slice(0, -keepRecent)) {
+  // slice(0, -0) is slice(0, 0) — an empty list. keepRecent 0 must mean "all of them".
+  for (const index of keepRecent > 0 ? toolIndexes.slice(0, -keepRecent) : toolIndexes) {
     const message = messages[index];
     if (!message.content || message.content.length <= 800) continue;
     try {
@@ -3613,8 +4222,11 @@ export function buildRequestComponentUsage(
   initialMessageCount: number,
   /** End of the replayed frozen turns; defaults to "no replay" for isolated calls. */
   replayedMessageCount = stableMessageCount,
+  /** Project trunk messages immediately after the stable prefix (0 or 1). */
+  trunkMessageCount = 0,
 ): RequestComponentUsage[] {
   const components: RequestComponentUsage[] = [];
+  const trunkEnd = stableMessageCount + Math.max(0, trunkMessageCount);
   const append = (kind: RequestComponentUsage["kind"], label: string, text: string, fingerprint = false) => {
     if (!text) return;
     components.push({
@@ -3635,7 +4247,8 @@ export function buildRequestComponentUsage(
       ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
     });
     if (index < stableMessageCount) append("stable_system", `稳定 system ${index + 1}`, serialized, true);
-    else if (index < replayedMessageCount) append("replayed_turn", `复放历史 ${index - stableMessageCount + 1}`, serialized);
+    else if (index < trunkEnd) append("stable_system", "项目树干", serialized, true);
+    else if (index < replayedMessageCount) append("replayed_turn", `复放历史 ${index - trunkEnd + 1}`, serialized);
     else if (index < initialMessageCount && message.role === "user") append("user", "当前用户请求", serialized);
     else if (index < initialMessageCount) append("dynamic_system", `动态尾部 ${index - replayedMessageCount + 1}`, serialized);
     else if (message.role === "tool") append("tool_result", `工具结果 ${message.tool_call_id ?? index}`, serialized);
@@ -3644,6 +4257,66 @@ export function buildRequestComponentUsage(
     else append("other", `其他消息 ${index + 1}`, serialized);
   });
   return components;
+}
+
+/** Session-shared trunk from current project materials (hash-stable until they change). */
+export function buildSessionProjectTrunk(project: WriterProject, store: WriterStore) {
+  let outline: { sourcePath: string; nodes: Array<{
+    id: string;
+    type: string;
+    title: string;
+    summary?: string;
+    documentPath?: string;
+    depth?: number;
+  }> } | undefined;
+  try {
+    const snapshot = new OutlineStore(project).sync();
+    // Prefer structural spine: chapters/arcs first, then scenes — cap inside buildProjectTrunk.
+    const ranked = snapshot.nodes
+      .map((node, index) => {
+        const rank = node.type === "act" || node.type === "chapter" ? 0
+          : node.type === "scene" ? 1
+            : 2;
+        return { node, index, rank };
+      })
+      .sort((a, b) => a.rank - b.rank || a.index - b.index)
+      .slice(0, 48)
+      .map(({ node }) => ({
+        id: node.id,
+        type: node.type,
+        title: node.title,
+        summary: node.summary,
+        ...(node.documentPath ? { documentPath: node.documentPath } : {}),
+      }));
+    if (ranked.length) outline = { sourcePath: snapshot.sourcePath, nodes: ranked };
+  } catch {
+    outline = undefined;
+  }
+
+  const characters = store.characters().map(item => ({
+    id: item.id,
+    name: item.identity.name,
+    aliases: item.identity.aliases,
+    narrativeRole: item.identity.narrativeRole,
+    summary: item.identity.summary,
+  }));
+
+  const lorePaths = project.listDocuments()
+    .filter(path => !project.isDocumentHidden(path))
+    .filter(path => {
+      const kind = documentKind(path);
+      return kind === "lore" || kind === "outline";
+    })
+    .slice(0, 40);
+
+  let title: string | undefined;
+  try { title = project.config().title; } catch { title = undefined; }
+  return buildProjectTrunk({
+    title,
+    characters,
+    outline,
+    lorePaths,
+  });
 }
 
 /**

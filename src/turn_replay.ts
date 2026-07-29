@@ -25,7 +25,10 @@ import type { WriterStore } from "./store.js";
  *    why `freezeTurnBlock` drops system messages defensively.
  */
 
-export type ReplayCompactor = (messages: AgentTurnMessage[]) => void;
+export type ReplayCompactor = (
+  messages: AgentTurnMessage[],
+  options?: { keepRecent?: number; force?: boolean },
+) => void;
 
 export type ReplayLoadResult = {
   /** Frozen turns to splice in directly after the stable system prefix. */
@@ -34,8 +37,22 @@ export type ReplayLoadResult = {
   compacted: boolean;
   /** Whole turns dropped from the head because compaction was not enough. */
   droppedTurns: number;
+  /** Turns replayed ahead of this turn's live block. */
+  replayedTurns: number;
   estimatedTokens: number;
 };
+
+/** The newest frozen turn is never compacted: its tool bodies are still the live context. */
+const KEEP_WARM_TURNS = 1;
+
+/**
+ * Shrink past the high-water mark down to this fraction of it.
+ *
+ * Without hysteresis the chain settles just under the budget and the very next
+ * turn pushes it over again, so *every* turn rewrites bytes the provider has
+ * already cached. Overshooting downwards buys many quiet turns per rewrite.
+ */
+const DEFAULT_LOW_WATER_RATIO = 0.6;
 
 type ReplayStore = Pick<WriterStore, "agentTurnBlocks" | "replaceAgentTurnBlocks">;
 
@@ -136,20 +153,36 @@ export function mergedTurnContext(parts: {
 /**
  * Read the frozen chain, keeping it inside `budgetTokens`.
  *
- * Over budget → compact the oldest turns in place and write the compacted form
- * back, so the shrink is paid for exactly once and the result becomes the new
- * cacheable prefix. Still over → drop whole turns from the head. Both happen
- * before the job's first request, so contract §4 (append-only *within* a job)
- * is untouched.
+ * Over the high-water mark → compact cold turns **one block at a time** and write
+ * the result back; still over → drop whole turns from the head. Both happen before
+ * the job's first request, so contract §4 (append-only *within* a job) is untouched.
+ *
+ * Two properties make the rewrite worth paying for, and both are load-bearing:
+ *
+ *  - PER-BLOCK, NOT WHOLE-CHAIN. Compacting the concatenated chain with the
+ *    compactor's default sliding "keep the last two tool bodies" window means the
+ *    window moves forward every time a turn is appended, so last turn's still-full
+ *    bodies get digested on this turn — rewriting bytes the provider already
+ *    cached, every single turn, forever. Compacting each cold block in isolation
+ *    with `keepRecent: 0` is idempotent: a block that has been shrunk once yields
+ *    byte-identical output on every later load, so the prefix in front of the
+ *    newest rewrite keeps hitting.
+ *  - HYSTERESIS. Compact down to `lowWaterRatio × budget`, not to just-under-budget,
+ *    so the next few turns fit without touching the chain at all. Dropping stops at
+ *    the budget itself — a discarded turn is gone for good, so it gets no overshoot.
  */
 export function loadReplayMessages(input: {
   store: ReplayStore;
   sessionId: string;
   budgetTokens: number;
   compact: ReplayCompactor;
+  /** Shrink down to this fraction of the budget once the budget is exceeded. */
+  lowWaterRatio?: number;
 }): ReplayLoadResult {
   const blocks = input.store.agentTurnBlocks(input.sessionId);
-  if (!blocks.length) return { messages: [], compacted: false, droppedTurns: 0, estimatedTokens: 0 };
+  if (!blocks.length) {
+    return { messages: [], compacted: false, droppedTurns: 0, replayedTurns: 0, estimatedTokens: 0 };
+  }
 
   let chain = blocks.map(block => ({ messages: block.messages, estimatedTokens: block.estimatedTokens || approximateMessageTokens(block.messages) }));
   const total = () => chain.reduce((sum, block) => sum + block.estimatedTokens, 0);
@@ -157,24 +190,25 @@ export function loadReplayMessages(input: {
   let droppedTurns = 0;
 
   if (total() > input.budgetTokens) {
-    // Compact the chain as one transcript, not block by block: the compactor keeps
-    // the most recent tool bodies intact, and that "recent" window has to mean
-    // recent *overall*, otherwise every turn would retain its own last two reads.
-    const offsets: number[] = [];
-    const combined: AgentTurnMessage[] = [];
-    for (const block of chain) {
-      offsets.push(combined.length);
-      for (const message of block.messages) combined.push({ ...message });
-    }
-    input.compact(combined);
-    const rebuilt = chain.map((block, index) => {
-      const messages = combined.slice(offsets[index], offsets[index] + block.messages.length);
-      return { messages, estimatedTokens: approximateMessageTokens(messages) };
-    });
-    if (rebuilt.reduce((sum, block) => sum + block.estimatedTokens, 0) < total()) {
-      chain = rebuilt;
+    const ratio = Math.min(1, Math.max(0.1, input.lowWaterRatio ?? DEFAULT_LOW_WATER_RATIO));
+    const lowWater = Math.floor(input.budgetTokens * ratio);
+
+    // Oldest first: the coldest bytes are the cheapest to lose and the least
+    // likely to be re-read. Stop as soon as the low-water mark is reached so
+    // recent turns keep their full tool bodies.
+    for (let index = 0; index < chain.length - KEEP_WARM_TURNS && total() > lowWater; index += 1) {
+      const block = chain[index];
+      const candidate = block.messages.map(message => ({ ...message }));
+      input.compact(candidate, { keepRecent: 0, force: true });
+      const estimatedTokens = approximateMessageTokens(candidate);
+      if (estimatedTokens >= block.estimatedTokens) continue; // Already compact — leave the bytes alone.
+      chain[index] = { messages: candidate, estimatedTokens };
       compacted = true;
     }
+
+    // Dropping targets the high-water mark, not the low one: losing a turn costs
+    // continuity the model cannot get back, whereas compaction only costs detail.
+    // Overshoot where it is cheap, do the minimum where it is not.
     while (chain.length > 1 && total() > input.budgetTokens) {
       chain = chain.slice(1);
       droppedTurns += 1;
@@ -192,6 +226,7 @@ export function loadReplayMessages(input: {
     messages: chain.flatMap(block => block.messages),
     compacted,
     droppedTurns,
+    replayedTurns: chain.length,
     estimatedTokens: total(),
   };
 }
