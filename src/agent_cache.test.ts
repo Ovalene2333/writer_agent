@@ -22,6 +22,7 @@ import {
   buildToolArgumentRepairMessages,
   characterMutationCompletesTask,
   chapterContinuationPrompt,
+  proposalRevisionConvergePrompt,
   chapterDraftNeedsReview,
   chapterReviewAllowsTool,
   chapterReviewCompleted,
@@ -592,19 +593,46 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
         situation: ["警报已触发"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
       },
     },
+    materialsShelf: [
+      { path: "lore/world.md", digest: "世界规则摘要", fullBodyServed: true },
+      { characterId: 3, digest: "林千夏", fullBodyServed: true },
+    ],
   });
   assert.match(prompt, /禁止重复提交同一章/);
   assert.match(prompt, /chapters\/第1章\.md/);
   assert.match(prompt, /警报已触发/);
   assert.match(prompt, /重新选择直接成稿/);
   assert.match(prompt, /撰写第2章/);
+  assert.match(prompt, /材料架已收录/);
+  assert.match(prompt, /lore\/world\.md/);
+  assert.match(prompt, /禁止对上述路径\/角色再/);
   // Tail excerpt is bounded so the handoff stays cheap on every remaining step.
-  const tailBlock = prompt.split("上一章结尾")[1] ?? "";
-  assert.ok(tailBlock.length < 1_200, `tail block too long: ${tailBlock.length}`);
+  const afterTail = prompt.split("上一章结尾")[1] ?? "";
+  const tailOnly = afterTail.split("上一章末场")[0] ?? afterTail;
+  assert.ok(tailOnly.length < 1_200, `tail block too long: ${tailOnly.length}`);
 
   const minimal = chapterContinuationPrompt({ todosText: "（空）" });
   assert.match(minimal, /任务清单仍有未完成的写作步骤/);
   assert.doesNotMatch(minimal, /已交付：/);
+  assert.match(minimal, /材料架仍空/);
+});
+
+test("proposal revision converge prompt escalates after repeated blocks", () => {
+  const first = proposalRevisionConvergePrompt({
+    status: "final_review_revision_required",
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    path: "chapters/a.md",
+    message: "修英文残留",
+  }, 1);
+  assert.match(first, /修订窗口第 1 次/);
+  assert.match(first, /最小修订/);
+  assert.doesNotMatch(first, /最后一轮/);
+  const last = proposalRevisionConvergePrompt({
+    status: "error",
+    message: "句式门禁",
+  }, 2);
+  assert.match(last, /最后一轮/);
+  assert.match(last, /manage_todos|ask_user/);
 });
 
 test("scene continuation handoff carries seam tail, states and next card without full prose", () => {

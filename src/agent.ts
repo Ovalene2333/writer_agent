@@ -1570,6 +1570,13 @@ export function chapterContinuationPrompt(parts: {
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
   isolatedWriter?: boolean;
+  /** Paths/characters already on the session materials shelf — do not re-read. */
+  materialsShelf?: ReadonlyArray<{
+    path?: string;
+    characterId?: number;
+    digest?: string;
+    fullBodyServed?: boolean;
+  }>;
 }): string {
   const lines: string[] = [
     "上一份文档提案已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
@@ -1582,11 +1589,48 @@ export function chapterContinuationPrompt(parts: {
   if (parts.handoff?.finalActualState) {
     lines.push(`上一章末场 actualState（人物与局面现状，续写以此为准）：${JSON.stringify(parts.handoff.finalActualState)}`);
   }
+  const shelf = parts.materialsShelf ?? [];
+  if (shelf.length) {
+    const labels = shelf
+      .map((item) => {
+        if (item.path) return item.path;
+        if (item.characterId != null) return `character:${item.characterId}`;
+        return undefined;
+      })
+      .filter((item): item is string => Boolean(item))
+      .slice(0, 16);
+    lines.push(
+      `本会话材料架已收录 ${shelf.length} 项已读材料${labels.length ? `（${labels.join("、")}）` : ""}。`
+      + "禁止对上述路径/角色再 read_document、search_project 或 get_character 拉全文；下一章直接依据材料架 digest、章末衔接与任务清单成稿。"
+      + "仅当 digest 未覆盖且文件 sourceHash 已变时，才允许最小 span 读取。",
+    );
+  } else {
+    lines.push("材料架仍空：仅对写作必需的事实做最小读取；不要重读已交付章节全文。");
+  }
   lines.push(
-    `任务清单仍有未完成的写作步骤，请立即继续下一项。根据下一项正文的篇幅、连续性风险和现有材料重新选择直接成稿、局部 patch、write pack 或场景草稿链；不要沿用上一章的流程作为默认。缺少事实时做最小读取补齐，不要重读已交付章节全文。`,
+    "任务清单仍有未完成的写作步骤，请立即继续下一项。根据下一项正文的篇幅、连续性风险和现有材料重新选择直接成稿、局部 patch、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
     parts.todosText,
   );
   return lines.join("\n");
+}
+
+/** After propose_* is blocked by gate/review — force minimal repair, not a full rewrite loop. */
+export function proposalRevisionConvergePrompt(
+  result: Record<string, unknown>,
+  attempt: number,
+): string {
+  const status = typeof result.status === "string" ? result.status : "rejected";
+  const code = typeof result.code === "string" ? result.code : "";
+  const message = typeof result.message === "string" ? result.message.replace(/\s+/g, " ").slice(0, 360) : "";
+  const path = typeof result.path === "string" ? result.path : "";
+  const hardLimit = attempt >= 2;
+  return [
+    `文档提案未创建（${status}${code ? `/${code}` : ""}，修订窗口第 ${attempt} 次${path ? `，路径 ${path}` : ""}）。`,
+    message ? `原因：${message}` : "",
+    hardLimit
+      ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
+      : "下一步必须是针对驳回点的最小修订后的 propose_document 或 propose_document_patch；禁止为同一章重新 search/read 已读材料，禁止全文重写。",
+  ].filter(Boolean).join("\n");
 }
 
 /**
@@ -2286,6 +2330,8 @@ ${managedHandoffContext}`,
   }
   let transcript = "";
   let documentProposalSubmitted = false;
+  /** Consecutive blocked propose_* attempts in this job (reset on success). */
+  let proposalRevisionAttempts = 0;
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
   let submittedProposalRef: {
     id: number;
@@ -2586,6 +2632,8 @@ ${managedHandoffContext}`,
       let chapterReviewInStep = false;
       let characterMutationFailedThisStep = false;
       const chapterReviewRejectedTools: string[] = [];
+      /** Injected after all tool results of this step (never between tool rows). */
+      let pendingProposalRevisionPrompt: string | undefined;
       for (const call of result.toolCalls) {
         let effectiveCall = call;
         emit({ type: "tool", name: call.name });
@@ -2755,6 +2803,7 @@ ${managedHandoffContext}`,
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (isSuccessfulDocumentSubmission(call.name, parsed)) {
               documentProposalSubmitted = true;
+              proposalRevisionAttempts = 0;
               const proposalId = proposalIdFromToolResult(parsed);
               if (proposalId !== undefined) {
                 try {
@@ -2769,6 +2818,15 @@ ${managedHandoffContext}`,
                   }
                 } catch { /* ignore missing proposal row */ }
               }
+            } else if (!("error" in parsed) || typeof parsed.error === "string") {
+              // Gate/review blocks or tool errors: converge retries instead of open-ended rewrite loops.
+              proposalRevisionAttempts += 1;
+              pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(
+                "error" in parsed && typeof parsed.error === "string"
+                  ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
+                  : parsed,
+                proposalRevisionAttempts,
+              );
             }
           } catch { /* 无效工具结果不能视为已提交。 */ }
         }
@@ -2779,6 +2837,9 @@ ${managedHandoffContext}`,
           } catch { /* 无效工具结果不能视为等待。 */ }
         }
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
+      }
+      if (pendingProposalRevisionPrompt && !documentProposalSubmitted && !waitingForUser) {
+        messages.push({ role: "user", content: pendingProposalRevisionPrompt });
       }
       // Persist session shelf after any reads this step so the next user turn can reload.
       persistSessionMaterialsShelf(store, sessionId, toolContext);
@@ -2993,6 +3054,7 @@ ${managedHandoffContext}`,
           if (shelfPrompt) messages.push({ role: "user", content: shelfPrompt });
           materialsBase = messages.length;
           persistSessionMaterialsShelf(store, sessionId, toolContext);
+          const shelfEntries = [...(toolContext.materialsShelf?.values() ?? [])];
           messages.push({
             // CACHE: user role — a mid-job system message flips DeepSeek's
             // whole-request rendering and forfeits the cached prefix (§4).
@@ -3004,8 +3066,20 @@ ${managedHandoffContext}`,
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
                 : {}),
               ...(handoff ? { handoff } : {}),
+              ...(shelfEntries.length
+                ? {
+                    materialsShelf: shelfEntries.map(item => ({
+                      ...(item.path ? { path: item.path } : {}),
+                      ...(item.characterId != null ? { characterId: item.characterId } : {}),
+                      ...(item.digest ? { digest: item.digest } : {}),
+                      fullBodyServed: item.fullBodyServed,
+                    })),
+                  }
+                : {}),
             }),
           });
+          // Fresh chapter: allow one clean revision window again.
+          proposalRevisionAttempts = 0;
           const afterTokens = approximateMessageTokens(messages);
           const afterMessageCount = messages.length;
           const shelfCount = toolContext.materialsShelf?.size ?? 0;
@@ -3793,8 +3867,8 @@ export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): st
   }));
   return [
     "【会话材料架 · 跨任务保留】以下设定/角色已在本会话读过（sourceHash 未变则禁止再 read 全文或反复 search）。",
-    "写作直接依据 digest 与章交接；仅当需要 digest 未覆盖的行号区间或文件已变更时才再读。",
-    "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
+    "写作直接依据 digest 与章交接；章切换后仍适用本表，禁止为下一章「重新摸底」重复 load/read/search 同路径。",
+    "仅当需要 digest 未覆盖的行号区间或文件已变更时才再读。材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
     JSON.stringify({ materials: payload, count: payload.length, scope: "session" }),
   ].join("\n");
 }
