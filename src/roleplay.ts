@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   Character,
   ModelConfig,
+  RoleplayContentRating,
   RoleplayInputMode,
   RoleplayInterlocutor,
   RoleplayLoreEvidence,
@@ -14,7 +15,7 @@ import type {
 import { characterName, characterPromptCard, characterPromptViews } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelSupportsToolChoice, nonThinkingRequestOptions } from "./model_compat.js";
+import { modelSupportsToolChoice, nonThinkingRequestOptions, samplingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { documentKind, WriterProject } from "./project.js";
@@ -43,9 +44,13 @@ export const ROLEPLAY_RERUN_DIRECTIONS = [
   "shorter",
   "more_emotional",
   "less_explanation",
+  "more_subtext",
+  "warmer",
+  "more_confrontational",
   "dialogue_only",
   "with_action",
   "no_question",
+  "change_tactic",
 ] as const;
 export type RoleplayRerunDirection = typeof ROLEPLAY_RERUN_DIRECTIONS[number];
 
@@ -53,9 +58,13 @@ const ROLEPLAY_RERUN_DIRECTION_LINES: Record<RoleplayRerunDirection, string> = {
   shorter: "比上一版更短，只保留不可替代的一拍。",
   more_emotional: "让情绪通过措辞、停顿或动作自然显露，不解释情绪。",
   less_explanation: "删除解释、归纳和分析，只演角色的即时反应。",
+  more_subtext: "减少直说，让真正意图通过措辞、停顿或动作形成潜台词。",
+  warmer: "让表达更柔和、更有善意，但保持既有人设和关系边界。",
+  more_confrontational: "让表达更直接、更有对抗性，但不无故升级冲突。",
   dialogue_only: "本轮只输出一块 dialogue，不添加动作或旁白。",
   with_action: "本轮可以用一个角色自身动作承载反应，但不要写动作清单。",
   no_question: "本轮不用问题推进，以陈述、动作或留白结束。",
+  change_tactic: "保持角色目标不变，但改用与上一版不同的表达或行动策略。",
 };
 
 export function normalizeRoleplayRerunDirections(value: unknown): RoleplayRerunDirection[] {
@@ -73,6 +82,68 @@ export function formatRoleplayRerunDirections(value: readonly RoleplayRerunDirec
     : "";
 }
 
+export interface RoleplayRerunControls {
+  length: number;
+  pace: number;
+  emotion: number;
+  action: number;
+  initiative: number;
+  contentRating: RoleplayContentRating;
+}
+
+export const DEFAULT_ROLEPLAY_RERUN_CONTROLS: RoleplayRerunControls = {
+  length: 0,
+  pace: 0,
+  emotion: 0,
+  action: 0,
+  initiative: 0,
+  contentRating: "default",
+};
+
+function normalizedRerunLevel(value: unknown): number {
+  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : 0;
+  return Math.max(-2, Math.min(2, numeric));
+}
+
+export function normalizeRoleplayRerunControls(value: unknown): RoleplayRerunControls {
+  const raw = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  return {
+    length: normalizedRerunLevel(raw.length),
+    pace: normalizedRerunLevel(raw.pace),
+    emotion: normalizedRerunLevel(raw.emotion),
+    action: normalizedRerunLevel(raw.action),
+    initiative: normalizedRerunLevel(raw.initiative),
+    contentRating: raw.contentRating === "sfw" || raw.contentRating === "nsfw"
+      ? raw.contentRating
+      : "default",
+  };
+}
+
+function rerunLevelLine(value: number, negative: string, positive: string): string {
+  if (value === 0) return "";
+  return `${Math.abs(value) === 2 ? "显著" : "适度"}${value < 0 ? negative : positive}`;
+}
+
+export function formatRoleplayRerunControls(value: RoleplayRerunControls | undefined): string {
+  const controls = normalizeRoleplayRerunControls(value);
+  const ratingLine = controls.contentRating === "sfw"
+    ? "强制 SFW：本轮不得出现露骨性内容、裸露细节或色情化描写；亲密互动保持非露骨。"
+    : controls.contentRating === "nsfw"
+      ? "强制 NSFW：本轮采用成人向露骨尺度，不淡出、不规避身体与欲望细节；仍须保持角色人设、双方自愿和既有边界。"
+      : "";
+  const lines = [
+    rerunLevelLine(controls.length, "缩短篇幅，只保留关键反应。", "增加篇幅，补足这一拍必要的动作与台词。"),
+    rerunLevelLine(controls.pace, "放慢节奏，保留有意义的停顿。", "加快节奏，尽快落到决定或反应。"),
+    rerunLevelLine(controls.emotion, "收敛外露情绪，以克制和留白表达。", "增强情绪外显，但不要解释情绪。"),
+    rerunLevelLine(controls.action, "降低动作占比，以台词或沉默为主。", "提高动作占比，用角色自身动作承载反应。"),
+    rerunLevelLine(controls.initiative, "降低主动程度，表现迟疑、试探或保留。", "提高主动程度，采取符合当前目标的下一步。"),
+    ratingLine,
+  ].filter(Boolean);
+  return lines.length ? ["本轮重演参数：", ...lines.map(line => `- ${line}`)].join("\n") : "";
+}
+
 export function roleplaySummaryBatchDue(
   messages: Array<{ id: number }>,
   firstRecentId: number,
@@ -82,14 +153,19 @@ export function roleplaySummaryBatchDue(
     >= ROLEPLAY_SUMMARY_BATCH;
 }
 
+export function roleplayCacheBatch<T extends { id: number }>(messages: T[], summarizedThroughId: number): T[] {
+  return messages.filter(message => message.id > summarizedThroughId);
+}
+
 /**
  * Roleplay prompt / prefix-cache contract (separate from agent.ts):
  * 1) Fixed system slots first: rules+cards | summary routing | memory routing | stable turn contract
  * 2) Never omit a slot — use stable placeholder text so indices do not shift
  * 3) Stable slot 0 must stay byte-stable within a session (no live scene / turn counters)
  * 4) Slots 1/2 are byte-stable routing placeholders; live summary/memory belongs after history
- * 5) Recent history is short; older facts live in the dynamic tail, not full transcripts
- * 6) Dynamic summary, memory and anti-formula hints are appended to the final user turn
+ * 5) History is append-only inside one summary batch; reset only when summarizedThroughId advances
+ * 6) Persist the exact final user payload and replay it byte-for-byte when it becomes history
+ * 7) Dynamic summary, memory and anti-formula hints are appended to the final user turn
  */
 
 /** 会话内角色扮演状态（测试性子功能，不落库）。 */
@@ -126,6 +202,20 @@ export function stripRoleplayOocMarker(text: string): string {
 /** Wrap a director instruction so the model adjusts the scene without treating it as in-character dialogue. */
 export function formatRoleplayOocDirective(instruction: string): string {
   return `［OOC 导演指示——这不是角色对白，而是用户以“导演/旁观”身份提出的调整要求。请据此调整接下来的演出（例如推进时间、切换场景、改变态度、设定新前提等），但不要把这段文字当作台词来回应，也不要替对话者（用户）说话或行动。指示：${instruction}］`;
+}
+
+/** Apply a director turn to session-local stage continuity without mutating a reusable scene card. */
+export function applyRoleplayDirectorSceneUpdate(
+  memory: RoleplaySessionMemory,
+  instruction: string,
+): RoleplaySessionMemory {
+  const scene = instruction.trim().slice(0, 400);
+  if (!scene) return memory;
+  return {
+    ...memory,
+    state: { ...memory.state, scene },
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 /** Generate concrete next-beat director prompts with the roleplay model. */
@@ -342,9 +432,10 @@ export function slimRoleplayCharacterViews(
       id: views.stable.id,
       identity: views.stable.identity,
       profile: {
+        appearance: views.stable.profile.appearance.slice(0, 600),
         appearanceSummary: views.stable.profile.appearanceSummary,
-        distinguishingFeatures: views.stable.profile.distinguishingFeatures.slice(0, 6),
-        backgroundSummary: views.stable.profile.backgroundSummary.slice(0, 400),
+        background: views.stable.profile.background.slice(0, 800),
+        backgroundSummary: views.stable.profile.backgroundSummary,
       },
       psychology: {
         summary: views.stable.psychology.summary,
@@ -353,6 +444,7 @@ export function slimRoleplayCharacterViews(
         fears: views.stable.psychology.fears.slice(0, 4),
         conflicts: views.stable.psychology.conflicts.slice(0, 4),
       },
+      features: views.stable.features.slice(0, 8),
       competencies: views.stable.competencies,
       experiences: (views.stable.experiences ?? []).slice(-3).map(item => ({
         label: item.label,
@@ -829,13 +921,14 @@ async function finalizeRoleplayPerformance(options: {
   source: string;
   perception: string;
   rerunDirections: RoleplayRerunDirection[];
+  rerunControls?: RoleplayRerunControls;
   budget: RoleplayPresentationBudget;
   signal?: AbortSignal;
   usageReporter?: ModelUsageReporter;
 }): Promise<RoleplayPresentationBlock[]> {
   const completed = await completeJsonText(options.model, [
     { role: "system", content: `你是即时角色对戏的终审剪辑器，不续写剧情。依据 currentPerception、定向要求和候选演出，返回可以直接展示的最终演出块。
-语义规则：删除对玩家输入的引用、改写、逐项回应和理解汇报；删除技术、心理、风险分析，以及角色对自身动机、情绪、反应原因的解释、归纳、总结和说教。含义与潜台词必须留在角色的措辞、停顿和动作里。删除 currentPerception 与既有表达中没有依据的具体数值、制度、机制、经历或结论；不得使用角色不可能知道的信息；不得替玩家角色决定动作、内心、情绪或结果；必须遵守 requestedDirections。
+语义规则：删除对玩家输入的引用、改写、逐项回应和理解汇报；删除技术、心理、风险分析，以及角色对自身动机、情绪、反应原因的解释、归纳、总结和说教。含义与潜台词必须留在角色的措辞、停顿和动作里。删除 currentPerception 与既有表达中没有依据的具体数值、制度、机制、经历或结论；不得使用角色不可能知道的信息；不得替玩家角色决定动作、内心、情绪或结果；必须遵守 requestedDirections 与 requestedControls，包括内容分级。
 提问规则：普通回合默认不保留问句。只有候选中的问题所索取的信息会立即阻塞角色当前已经选择的行动，且无法改成陈述、动作或留白时，才保留一个简短问题；删除用于续聊、确认理解、索取态度、让玩家选择、镜像原话、逐项追问或以问代答的问题。requestedDirections 包含 no_question 时删除全部问题。
 演出规则：保留角色口吻和一个完整核心反应，可保留相互连贯的动作、停顿与台词；删除场景复述、物件清单、冗余过程和重复信息。不得新增事实、数值、动作或台词。action=角色自身动作/神态/主观感受，dialogue=说出口的台词，ooc=出戏说明。
 只输出严格 JSON：{"blocks":[{"kind":"action|dialogue|ooc","text":"..."}]}。` },
@@ -844,6 +937,7 @@ async function finalizeRoleplayPerformance(options: {
       requirement: "blocks 不得超过 maxBlocks。保留一个完整反应所需的动作与台词，但不要扩展新情节，也不要按固定字数裁剪自然表达。",
       currentPerception: options.perception,
       requestedDirections: normalizeRoleplayRerunDirections(options.rerunDirections),
+      requestedControls: normalizeRoleplayRerunControls(options.rerunControls),
       candidatePerformance: options.source,
     }) },
   ], options.signal);
@@ -985,10 +1079,12 @@ export function buildRoleplayChatMessages(parts: {
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userText: string;
   rerunDirections?: RoleplayRerunDirection[];
+  rerunControls?: RoleplayRerunControls;
 }): ChatMessage[] {
   const dynamicTurnHints = [
     formatRoleplayAntiFormulaSlot(parts.recentAssistantReplies),
     formatRoleplayRerunDirections(parts.rerunDirections ?? []),
+    formatRoleplayRerunControls(parts.rerunControls),
   ].filter(Boolean).join("\n");
   const dynamicContext = [
     ROLEPLAY_DYNAMIC_CONTEXT_MARKER + formatRoleplaySummarySlot(parts.summary),
@@ -1056,6 +1152,7 @@ export async function runRoleplayChat(options: {
   performerAutoReply?: boolean;
   variantGroupId?: string;
   rerunDirections?: RoleplayRerunDirection[];
+  rerunControls?: RoleplayRerunControls;
   perceptionOverride?: RoleplayPerceptionProjection;
   jobId?: string;
   model: ModelConfig;
@@ -1093,18 +1190,21 @@ export async function runRoleplayChat(options: {
   const userText = options.prompt.trim();
   if (!userText && !modelInitiated) throw new Error("扮演消息不能为空");
   const directorInput = options.inputMode === "director" || (options.inputMode === undefined && isRoleplayOocInput(userText));
+  const directorInstruction = directorInput ? stripRoleplayOocMarker(userText) : "";
 
-  // Model-initiated turns do not fabricate a user bubble in the transcript.
-  const currentUserMessageId = !modelInitiated
+  // A continuation gets an explicit transcript anchor so it can be edited or rerun.
+  // Openings remain bubble-free because they start a scene rather than continue a turn.
+  const currentUserMessageId = !opening
     ? options.store.addMessage(
         options.sessionId,
         "user",
-        userText,
+        performerAutoReply ? "<续演>" : userText,
         "roleplay",
         options.variantGroupId,
         directorInput ? "director" : "dialogue",
       )
     : undefined;
+  if (currentUserMessageId) emit({ type: "source_message", messageId: currentUserMessageId, channel: "roleplay" });
   emit({ type: "step_start", step: 1 });
 
   const identitySource = options.identity?.kind === "normal" && options.identity.id
@@ -1129,15 +1229,20 @@ export async function runRoleplayChat(options: {
     };
     options.store.saveRoleplayMemory(options.sessionId, memory);
   }
+  if (directorInput && directorInstruction) {
+    memory = applyRoleplayDirectorSceneUpdate(memory, directorInstruction);
+    options.store.saveRoleplayMemory(options.sessionId, memory);
+  }
 
   let storedPerception: string | undefined;
   let modelUserText: string;
   if (performerAutoReply) {
     modelUserText = formatRoleplayPerformerAutoReplyDirective(performerDisplayName);
+    storedPerception = modelUserText;
   } else if (opening) {
     modelUserText = formatRoleplayOpeningDirective(performerDisplayName, openingVariant);
   } else if (directorInput) {
-    modelUserText = formatRoleplayOocDirective(stripRoleplayOocMarker(userText));
+    modelUserText = formatRoleplayOocDirective(directorInstruction);
     storedPerception = modelUserText;
   } else {
     const projection = options.perceptionOverride ?? await compileRoleplayPerception({
@@ -1149,15 +1254,19 @@ export async function runRoleplayChat(options: {
     modelUserText = formatRoleplayPerceptionForModel(projection);
     storedPerception = serializeRoleplayPerception(projection);
   }
-  // Full archive stays in DB; prompt only loads a short recent window + memory.
+  // Full archive stays in DB; the prompt keeps one append-only unsummarized cache batch.
   const channelAll = options.store.messages(options.sessionId, 500, { channel: "roleplay" })
     .filter(message => message.role === "user" || message.role === "assistant");
-  // Player-authored turns already wrote the current user message; exclude it from history.
-  const prior = modelInitiated ? channelAll : channelAll.slice(0, -1);
+  // Turns with a transcript anchor already wrote it; exclude that current marker/input from history.
+  const prior = currentUserMessageId === undefined ? channelAll : channelAll.slice(0, -1);
+  const cachedModelInputs = options.store.roleplayModelInputs(
+    options.sessionId,
+    prior.filter(message => message.role === "user").map(message => message.id),
+  );
   const projectedPrior = prior.map(message => message.role === "user"
     ? {
         ...message,
-        content: storedRoleplayPerceptionForModel(
+        content: cachedModelInputs.get(message.id) ?? storedRoleplayPerceptionForModel(
           options.store.roleplayPerception(options.sessionId, message.id)
             ?? "［历史玩家回合没有经过感知编译，原文已隔离；不得推测其内容。］",
         ),
@@ -1167,7 +1276,10 @@ export async function runRoleplayChat(options: {
     ? { ...message, content: roleplayPerceptionForMemory(message.content) }
     : message);
   const recent = projectedPrior.slice(-ROLEPLAY_RECENT_MESSAGES);
-  const history = recent.map(message => ({
+  // Keep the whole unsummarized batch stable and append-only. The history resets only
+  // when summarizedThroughId advances, instead of sliding left on every mature turn.
+  const cacheBatch = roleplayCacheBatch(projectedPrior, memory.summarizedThroughId);
+  const history = cacheBatch.map(message => ({
     role: message.role as "user" | "assistant",
     content: message.content,
   }));
@@ -1201,13 +1313,18 @@ export async function runRoleplayChat(options: {
     history,
     userText: modelUserText,
     rerunDirections: options.rerunDirections,
+    rerunControls: options.rerunControls,
   });
+  const currentModelInput = messages.at(-1)?.content;
   if (currentUserMessageId !== undefined && storedPerception !== undefined) {
     options.store.saveRoleplayPerception(
       options.sessionId,
       currentUserMessageId,
       storedPerception,
     );
+    if (currentModelInput) {
+      options.store.saveRoleplayModelInput(options.sessionId, currentUserMessageId, currentModelInput);
+    }
   }
 
   try {
@@ -1221,6 +1338,7 @@ export async function runRoleplayChat(options: {
           source: rawReply,
           perception: modelUserText,
           rerunDirections: options.rerunDirections ?? [],
+          rerunControls: options.rerunControls,
           budget,
           signal: options.signal,
           usageReporter: reportInternalUsage,
@@ -1356,8 +1474,7 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
       model: options.model.model, messages, tools,
       ...(modelSupportsToolChoice(options.model) ? { tool_choice: "auto" } : {}),
       stream: false,
-      temperature: options.model.temperature ?? 0.4,
-      ...(options.model.topP === undefined ? {} : { top_p: options.model.topP }),
+      ...samplingRequestOptions(options.model, { temperature: options.model.temperature ?? 0.4 }),
     });
     logModelRequest(endpoint, requestBody);
     const response = await modelFetch(endpoint, {
@@ -1406,6 +1523,62 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
     }
   }
   throw new Error("对话者设定查询次数过多，请缩短要求后重试");
+}
+
+export type GeneratedRoleplayScene = Pick<RoleplayScene, "name" | "setting" | "premise">;
+
+/** Turn a short natural-language request into the three-field scene-card draft used by the UI. */
+export async function generateRoleplayScene(options: {
+  request: string;
+  performer?: RoleplayParticipant;
+  identity?: RoleplayParticipant;
+  currentScene?: RoleplayScene;
+  model: ModelConfig;
+  signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
+}): Promise<GeneratedRoleplayScene> {
+  const request = options.request.trim();
+  if (!request) throw new Error("请先描述想要的场景");
+  if (!options.model.apiKey && !options.model.baseUrl.includes("localhost") && !options.model.baseUrl.includes("127.0.0.1")) {
+    throw new Error("未设置模型 API Key");
+  }
+  const completed = await completeJsonText(options.model, [
+    {
+      role: "system",
+      content: `你负责把用户的自然语言要求整理为一张简洁的角色扮演场景卡。只整理用户明确给出的内容，可以结合随请求提供的当前角色和现场信息，但不得编造关键经历、关系或世界观设定。场景要点写成一段简短、可直接指导下一场演出的文字，不写角色对白。
+只输出 JSON 对象，且恰好包含三个字符串字段：name、setting、premise。name 是简短场景名；setting 合并地点与时间；premise 是场景要点。`,
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        request,
+        performer: options.performer ? { name: options.performer.name, card: options.performer.card } : null,
+        identity: options.identity ? { name: options.identity.name, card: options.identity.card } : null,
+        currentScene: options.currentScene ? {
+          name: options.currentScene.name,
+          setting: options.currentScene.setting,
+          premise: options.currentScene.premise,
+        } : null,
+      }),
+    },
+  ], options.signal, { strictJson: true, errorLabel: "场景生成" });
+  if (completed.usage) options.usageReporter?.(options.model, completed.usage, { callKind: "roleplay_scene_generation" });
+  return parseGeneratedRoleplayScene(completed.content);
+}
+
+export function parseGeneratedRoleplayScene(text: string): GeneratedRoleplayScene {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("模型没有返回有效的场景卡 JSON");
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>; }
+  catch { throw new Error("模型返回的场景卡无法解析"); }
+  const field = (key: "name" | "setting" | "premise", max: number) =>
+    typeof value[key] === "string" ? value[key].trim().slice(0, max) : "";
+  const name = field("name", 120);
+  if (!name) throw new Error("模型返回的场景卡缺少名称");
+  return { name, setting: field("setting", 2_000), premise: field("premise", 2_000) };
 }
 
 function parseInterlocutor(text: string): RoleplayInterlocutor {
@@ -1545,11 +1718,13 @@ async function streamRoleplayText(
     messages,
     stream: true,
     stream_options: { include_usage: true },
-    temperature: sampling.temperature,
-    top_p: sampling.topP,
     // Mild de-echo for long chats; structure still relies on anti-formula slots.
-    frequency_penalty: 0.3,
-    presence_penalty: 0.15,
+    ...samplingRequestOptions(model, {
+      temperature: sampling.temperature,
+      topP: sampling.topP,
+      frequencyPenalty: 0.3,
+      presencePenalty: 0.15,
+    }),
   });
   logModelRequest(endpoint, requestBody);
   const response = await modelFetch(endpoint, {
@@ -1821,14 +1996,14 @@ async function completeJsonText(
   model: ModelConfig,
   messages: ChatMessage[],
   signal?: AbortSignal,
-  options?: { strictJson?: boolean },
+  options?: { strictJson?: boolean; errorLabel?: string },
 ): Promise<{ content: string; usage?: import("./types.js").ModelTokenUsage }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const requestBody = JSON.stringify({
     model: model.model,
     messages,
     stream: false,
-    temperature: 0.2,
+    ...samplingRequestOptions(model, { temperature: 0.2 }),
     max_tokens: 1_800,
     ...(options?.strictJson ? { response_format: { type: "json_object" } } : {}),
     ...nonThinkingRequestOptions(model),
@@ -1845,7 +2020,7 @@ async function completeJsonText(
   }, model.proxyUrl);
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
-  if (!response.ok) throw new Error(`扮演记忆刷新失败（${response.status}）：${responseBody.slice(0, 300)}`);
+  if (!response.ok) throw new Error(`${options?.errorLabel ?? "扮演记忆刷新"}失败（${response.status}）：${responseBody.slice(0, 300)}`);
   const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null } }>; usage?: unknown };
   const usage = parseModelTokenUsage(payload.usage);
   return { content: payload.choices?.[0]?.message?.content ?? "", ...(usage ? { usage } : {}) };

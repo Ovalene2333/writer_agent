@@ -1,9 +1,9 @@
 import type {
   Character,
   CharacterCompetency,
+  CharacterFeature,
   CharacterGoal,
   CharacterRelationship,
-  CharacterSourceRef,
   CharacterStoryState,
   CharacterTemporal,
   CharacterTextEntry,
@@ -16,6 +16,7 @@ export type CharacterSection =
   | "psychology"
   | "motivations"
   | "voice"
+  | "features"
   | "competencies"
   | "relationships"
   | "storyState"
@@ -25,6 +26,7 @@ export type CharacterSection =
 /** Array sections that support upsert / deleteEntryIds / replaceSections. */
 export type CharacterArraySection =
   | "motivations"
+  | "features"
   | "competencies"
   | "relationships"
   | "storyStates"
@@ -36,6 +38,7 @@ export type CharacterArraySection =
 
 export type CharacterReplaceSection =
   | "motivations"
+  | "features"
   | "competencies"
   | "relationships"
   | "storyStates"
@@ -62,7 +65,6 @@ export type CharacterChangeOp = {
 
 export type ApplyCharacterChangesInput = {
   reason: string;
-  sourceRef?: CharacterSourceRef;
   changes: CharacterChangeOp[];
 };
 
@@ -72,18 +74,19 @@ export type SkippedCharacterChange = { op: string; reason: string };
 const VALID_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PSYCH_GROUPS = ["traits", "values", "fears", "conflicts"] as const;
 type PsychGroup = (typeof PSYCH_GROUPS)[number];
-const TOP_ARRAY_SECTIONS = ["motivations", "competencies", "relationships", "storyStates", "experiences"] as const;
+const TOP_ARRAY_SECTIONS = ["motivations", "features", "competencies", "relationships", "storyStates", "experiences"] as const;
 type TopArraySection = (typeof TOP_ARRAY_SECTIONS)[number];
 
-const temporalEmpty = (): CharacterTemporal => ({ sourceRefs: [] });
+const temporalEmpty = (): CharacterTemporal => ({});
 
 export const emptyCharacter = (name = ""): Omit<Character, "id" | "updatedAt"> => ({
   schemaVersion: 3,
   identity: { name, aliases: [], tags: [], narrativeRole: "", summary: "" },
-  profile: { appearanceSummary: "", distinguishingFeatures: [], backgroundSummary: "", biography: "" },
+  profile: { appearance: "", appearanceSummary: "", background: "", backgroundSummary: "", biography: "" },
   psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] },
   motivations: [],
   voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
+  features: [],
   competencies: [],
   relationships: [],
   storyStates: [],
@@ -95,22 +98,12 @@ const obj = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const arr = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 const txt = (v: unknown): string => typeof v === "string" ? v.trim() : "";
+const singleLineTxt = (v: unknown): string => txt(v).replace(/\s+/g, " ");
 const strs = (v: unknown): string[] =>
   arr(v).filter((x): x is string => typeof x === "string").map(x => x.trim()).filter(Boolean);
 
-function sourceRef(v: unknown): CharacterSourceRef[] {
-  const r = obj(v);
-  if (!(["outline", "document", "manual"] as unknown[]).includes(r.type) || !txt(r.ref)) return [];
-  return [{ type: r.type as CharacterSourceRef["type"], ref: txt(r.ref), ...(txt(r.note) ? { note: txt(r.note) } : {}) }];
-}
-
-function parseSourceRef(v: unknown): CharacterSourceRef | undefined {
-  return sourceRef(v)[0];
-}
-
 function temporal(r: Record<string, unknown>): CharacterTemporal {
   return {
-    sourceRefs: arr(r.sourceRefs).flatMap(sourceRef),
     ...(txt(r.validFrom) ? { validFrom: txt(r.validFrom) } : {}),
     ...(txt(r.validUntil) ? { validUntil: txt(r.validUntil) } : {}),
   };
@@ -141,7 +134,7 @@ function competency(v: unknown): CharacterCompetency {
   return {
     id: txt(r.id),
     name: txt(r.name),
-    summary: txt(r.summary),
+    summary: singleLineTxt(r.summary),
     level: txt(r.level),
     unlocked: r.unlocked === true,
     description: txt(r.description),
@@ -149,6 +142,16 @@ function competency(v: unknown): CharacterCompetency {
     limitations: strs(r.limitations),
     costs: strs(r.costs),
     ...temporal(r),
+  };
+}
+
+function feature(v: unknown): CharacterFeature {
+  const r = obj(v);
+  return {
+    id: txt(r.id),
+    name: txt(r.name),
+    summary: singleLineTxt(r.summary),
+    description: txt(r.description),
   };
 }
 
@@ -202,6 +205,25 @@ export function characterPromptCard(character: Character) {
   };
 }
 
+/** First-pass tool view: only the essential portrayal summaries, never full card details. */
+export function characterSummaryCard(character: Character) {
+  return {
+    id: character.id,
+    name: character.identity.name,
+    updatedAt: character.updatedAt,
+    identity: { summary: character.identity.summary },
+    appearance: { summary: character.profile.appearanceSummary },
+    features: character.features.map(item => ({ id: item.id, name: item.name, summary: item.summary })),
+    competencies: character.competencies.map(item => ({
+      id: item.id,
+      name: item.name,
+      summary: item.summary,
+      unlocked: item.unlocked,
+    })),
+    voice: { summary: character.voice.summary },
+  };
+}
+
 function relationship(v: unknown): CharacterRelationship {
   const r = obj(v);
   const statuses = ["active", "ended", "strained", "unknown"];
@@ -241,6 +263,11 @@ export function normalizeV3Character(value: unknown): Character {
   const p = obj(r.profile);
   const y = obj(r.psychology);
   const v = obj(r.voice);
+  const hasNewAppearance = typeof p.appearance === "string";
+  const hasNewBackground = typeof p.background === "string";
+  const legacyAppearance = txt(p.appearanceSummary);
+  const legacyFeatures = strs(p.distinguishingFeatures);
+  const legacyBackground = txt(p.backgroundSummary);
   return {
     schemaVersion: 3,
     id: Number(r.id),
@@ -252,8 +279,11 @@ export function normalizeV3Character(value: unknown): Character {
       summary: txt(i.summary),
     },
     profile: {
-      appearanceSummary: txt(p.appearanceSummary),
-      distinguishingFeatures: strs(p.distinguishingFeatures),
+      appearance: hasNewAppearance ? txt(p.appearance) : legacyAppearance,
+      appearanceSummary: hasNewAppearance
+        ? txt(p.appearanceSummary)
+        : (legacyFeatures.length ? legacyFeatures.join("\n") : legacyAppearance),
+      background: hasNewBackground ? txt(p.background) : legacyBackground,
       backgroundSummary: txt(p.backgroundSummary),
       biography: txt(p.biography),
     },
@@ -273,6 +303,7 @@ export function normalizeV3Character(value: unknown): Character {
       avoidedExpressions: strs(v.avoidedExpressions),
       examples: strs(v.examples),
     },
+    features: arr(r.features).map(feature),
     competencies: arr(r.competencies).map(competency),
     relationships: arr(r.relationships).map(relationship),
     storyStates: arr(r.storyStates).map(state),
@@ -341,8 +372,9 @@ export function migrateV2Character(value: unknown): Character {
       summary: txt(r.identity),
     },
     profile: {
+      appearance: txt(r.appearance),
       appearanceSummary: txt(r.appearance),
-      distinguishingFeatures: [],
+      background: txt(r.background),
       backgroundSummary: txt(r.background),
       biography: "",
     },
@@ -366,6 +398,7 @@ export function migrateV2Character(value: unknown): Character {
       avoidedExpressions: [],
       examples: [],
     },
+    features: [],
     competencies: (txt(r.capabilities) || txt(r.abilities) || txt(r.limitations))
       ? [{
         id: `competency-${id}-legacy`,
@@ -506,6 +539,14 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
       goal,
       "goal",
     ),
+    features: mergeArraySection(
+      base.features,
+      input.features,
+      deleted.features,
+      replace.has("features"),
+      feature,
+      "feature",
+    ),
     competencies: mergeArraySection(
       base.competencies,
       input.competencies,
@@ -541,16 +582,6 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
     notes: input.notes !== undefined ? txt(input.notes) : base.notes,
     extensions: input.extensions !== undefined ? input.extensions : base.extensions,
   });
-}
-
-function withOptionalSourceRef<T extends CharacterTemporal>(
-  item: T,
-  ref: CharacterSourceRef | undefined,
-): T {
-  if (!ref) return item;
-  const exists = item.sourceRefs.some(x => x.type === ref.type && x.ref === ref.ref);
-  if (exists) return item;
-  return { ...item, sourceRefs: [...item.sourceRefs, ref] };
 }
 
 let generatedEntrySequence = 0;
@@ -633,7 +664,6 @@ export function applyCharacterChanges(
   const changes = Array.isArray(input.changes) ? input.changes : [];
   if (!changes.length) throw new Error("apply_character_changes 需要至少一条 changes");
 
-  const defaultRef = parseSourceRef(input.sourceRef);
   let current = normalizeV3Character(base);
   const applied: AppliedCharacterChange[] = [];
   const skipped: SkippedCharacterChange[] = [];
@@ -665,7 +695,7 @@ export function applyCharacterChanges(
             break;
           }
           const next = [...current.competencies];
-          next[index] = withOptionalSourceRef({ ...next[index], unlocked }, defaultRef);
+          next[index] = { ...next[index], unlocked };
           current = { ...current, competencies: next };
           applied.push({ op, detail: `${competencyId} → unlocked=${unlocked}` });
           break;
@@ -673,7 +703,7 @@ export function applyCharacterChanges(
         case "upsert_competency": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "competency");
-          const item = withOptionalSourceRef(competency({ ...entryRaw, id }), defaultRef);
+          const item = competency({ ...entryRaw, id });
           if (!item.name && !item.description) {
             skip(op, "能力缺少 name/description");
             break;
@@ -699,7 +729,7 @@ export function applyCharacterChanges(
           }
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, group);
-          const item = withOptionalSourceRef(entry({ ...entryRaw, id }), defaultRef);
+          const item = entry({ ...entryRaw, id });
           if (!item.label && !item.description) {
             skip(op, "心理条目缺少 label/description");
             break;
@@ -735,7 +765,7 @@ export function applyCharacterChanges(
         case "upsert_experience": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "exp");
-          const item = withOptionalSourceRef(entry({ ...entryRaw, id }), defaultRef);
+          const item = entry({ ...entryRaw, id });
           if (!item.label && !item.description) {
             skip(op, "经历缺少 label/description");
             break;
@@ -757,7 +787,7 @@ export function applyCharacterChanges(
         case "upsert_motivation": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "goal");
-          const item = withOptionalSourceRef(goal({ ...entryRaw, id }), defaultRef);
+          const item = goal({ ...entryRaw, id });
           if (!item.summary) {
             skip(op, "目标缺少 summary");
             break;
@@ -769,7 +799,7 @@ export function applyCharacterChanges(
         case "upsert_relationship": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "rel");
-          const item = withOptionalSourceRef(relationship({ ...entryRaw, id }), defaultRef);
+          const item = relationship({ ...entryRaw, id });
           if (!Number.isInteger(item.characterId) || item.characterId <= 0) {
             skip(op, "关系缺少有效 characterId");
             break;
@@ -781,7 +811,7 @@ export function applyCharacterChanges(
         case "upsert_story_state": {
           const entryRaw = obj(raw.entry ?? raw);
           const id = ensureEntryId(entryRaw, "state");
-          const item = withOptionalSourceRef(state({ ...entryRaw, id }), defaultRef);
+          const item = state({ ...entryRaw, id });
           if (!item.outlineNodeId && !item.unanchored) {
             skip(op, "storyState 需要 outlineNodeId 或 unanchored=true");
             break;
@@ -860,6 +890,7 @@ function validateOne(
     ["fears", c.psychology.fears],
     ["conflicts", c.psychology.conflicts],
     ["motivations", c.motivations],
+    ["features", c.features],
     ["competencies", c.competencies],
     ["relationships", c.relationships],
     ["storyStates", c.storyStates],
@@ -883,6 +914,9 @@ function validateOne(
   });
   c.competencies.forEach((x, i) => {
     if (!x.name && !x.description) errors.push(`${root}.competencies[${i}]: 记录没有内容`);
+  });
+  c.features.forEach((x, i) => {
+    if (!x.name && !x.description) errors.push(`${root}.features[${i}]: 记录没有内容`);
   });
   const relationTargets = new Set<number>();
   c.relationships.forEach((x, i) => {
@@ -990,6 +1024,7 @@ export function characterPromptViews(character: Character, nodes: OutlineNode[] 
       identity: character.identity,
       profile: character.profile,
       psychology: targetNodeId ? scene.psychology : character.psychology,
+      features: character.features,
       // Prose-bound: no unlocked:false flags (those become「还锁着」inventory diction).
       competencies: competenciesWritingPayload(character.competencies),
       experiences,

@@ -1,7 +1,7 @@
 import { documentBlocks, documentSections } from "../document_blocks.js";
 import { documentSpanCatalog, documentSpans } from "../document_spans.js";
 import { requestDocumentLocator, type DocumentLocatorCandidate } from "../document_locator.js";
-import { adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
+import { adjudicateLearnedProseGates, adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -67,6 +67,16 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
     },
   );
   const issues = flash.issues;
+  issues.push(...await adjudicateLearnedProseGates(
+    content,
+    context.proseGateRules ?? [],
+    context.proseAdjudicator?.model,
+    {
+      signal: context.proseAdjudicator?.signal,
+      usageReporter: context.modelUsageReporter,
+      callKind: "learned_prose_audit",
+    },
+  ));
   return JSON.stringify({
     path,
     source: activeDraft ? "chapter_draft" : "document",
@@ -315,6 +325,20 @@ export async function handleLocateDocumentSpan({ input, project, context }: Tool
   const sourceHash = project.hash(content);
   assertExpectedSourceHash(input, sourceHash);
   const spans = documentSpans(content, sourceHash);
+  const locked = context.editScope === "point" ? context.editTargetLocked : undefined;
+  if (locked) {
+    return JSON.stringify({
+      status: "target_locked",
+      path: locked.path,
+      sourceHash: locked.sourceHash,
+      anchorIds: locked.anchorIds,
+      anchors: locked.path === path && locked.sourceHash === sourceHash
+        ? spans.filter(span => locked.anchorIds.includes(span.anchorId)).map(span => documentSpanCatalog(span, 260))
+        : [],
+      nextAction: "propose_document_patch",
+      message: "局部目标已经完整定位并读取；不要再次 search、locate、read 或改用整篇修订，下一步直接调用 propose_document_patch。",
+    });
+  }
   const quote = typeof input.quote === "string" ? input.quote.trim() : "";
   const heading = typeof input.heading === "string" ? input.heading.trim().replace(/^#{1,6}\s+/, "") : "";
   const query = typeof input.query === "string" ? input.query.trim() : "";
@@ -390,22 +414,46 @@ export function handleReadDocumentSpan({ input, project, context }: ToolHandlerA
     characters: body.length,
     anchors: selected.map(span => documentSpanCatalog(span, 80)),
     content: body,
-    message: "写入时使用目标 anchorId+spanHash；行号只用于展示。",
+    nextAction: context.editScope === "point" ? "propose_document_patch" : undefined,
+    message: context.editScope === "point"
+      ? "目标正文已经完整读取。下一步直接调用 propose_document_patch；不要继续 search、locate、read、整篇修订或维护 todos。"
+      : "写入时使用目标 anchorId+spanHash；行号只用于展示。",
   });
 }
 
-export function handleSearchProject({ input, project, store }: ToolHandlerArgs): string {
+export function handleSearchProject({ input, project, store, context }: ToolHandlerArgs): string {
   const allowedScopes = new Set(["all", "lore", "story", "outline", "chapters"]);
   const allowedModes = new Set(["any", "all", "exact"]);
   const scope = typeof input.scope === "string" && allowedScopes.has(input.scope)
     ? input.scope as "all" | "lore" | "story" | "outline" | "chapters"
     : "all";
+  const locked = context.editScope === "point" ? context.editTargetLocked : undefined;
+  if (locked && scope === "chapters") {
+    return JSON.stringify({
+      status: "target_locked",
+      path: locked.path,
+      sourceHash: locked.sourceHash,
+      anchorIds: locked.anchorIds,
+      nextAction: "propose_document_patch",
+      message: "章节中的局部目标已经完整定位并读取；不要继续搜索正文，下一步直接调用 propose_document_patch。",
+    });
+  }
   const mode = typeof input.mode === "string" && allowedModes.has(input.mode) ? input.mode as "any" | "all" | "exact" : "any";
   const limit = Math.max(1, Math.min(12, optionalPositiveInteger(input.limit, "limit") ?? 8));
   const contextLines = typeof input.contextLines === "number" && Number.isFinite(input.contextLines)
     ? Math.max(0, Math.min(12, Math.round(input.contextLines))) : 2;
   const pathPrefix = typeof input.pathPrefix === "string" ? input.pathPrefix : undefined;
   const query = requireString(input.query, "query");
+  const facts = store.searchContinuityFacts(query, Math.min(8, limit)).map(fact => ({
+    id: fact.id,
+    statement: fact.statement,
+    kind: fact.kind,
+    scope: [fact.scopeKind, fact.scopeValue].filter(Boolean).join(":"),
+    epistemic: fact.epistemic,
+    knownBy: fact.knownBy,
+    status: fact.status,
+    sourcePath: fact.sourcePath,
+  }));
   const found = store.search(query, limit, { scope, mode, contextLines, pathPrefix })
     .filter(item => !project.isDocumentHidden(item.path));
   // Search is a locator, not a bulk reader. Keep the complete result atom under
@@ -418,5 +466,12 @@ export function handleSearchProject({ input, project, store }: ToolHandlerArgs):
     matches.push({ ...item, excerpt });
     excerptBudget -= excerpt.length;
   }
-  return JSON.stringify({ query, scope, mode, matches, truncated: matches.length < found.length || matches.some((item, index) => item.excerpt.length < found[index].excerpt.length) });
+  return JSON.stringify({
+    query,
+    scope,
+    mode,
+    facts,
+    matches,
+    truncated: matches.length < found.length || matches.some((item, index) => item.excerpt.length < found[index].excerpt.length),
+  });
 }

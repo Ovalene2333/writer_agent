@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildSceneRewriteMessages, pickBestSceneCandidate, sceneRewriteLengthOk } from "./scene_candidates.js";
+import {
+  buildSceneJudgeMessages,
+  buildSceneRewriteMessages,
+  parseSceneJudgeResult,
+  pickBestSceneCandidate,
+  sceneRewriteLengthOk,
+} from "./scene_candidates.js";
 import { sceneProseScore } from "./prose_metrics.js";
 
 const MANNERED = [
@@ -55,4 +61,24 @@ test("buildSceneRewriteMessages carries evidence, brief and original with prose-
   assert.match(messages[0].content, /保留原稿的每一个事件/);
   assert.match(messages[1].content, /进入矿场/);
   assert.match(messages[1].content, /她推开门/);
+});
+
+test("judge selection parses a choice and rejects out-of-range indices", () => {
+  const parsed = parseSceneJudgeResult('{"choice": 1, "reason": "第二稿把决定留给了人物"}', 2);
+  assert.equal(parsed.index, 1);
+  assert.match(parsed.reason, /留给了人物/u);
+  assert.throws(() => parseSceneJudgeResult('{"choice": 2}', 2), /无效序号/u);
+  assert.throws(() => parseSceneJudgeResult('{"choice": -1}', 2), /无效序号/u);
+  assert.throws(() => parseSceneJudgeResult("没有 JSON", 2), /JSON/u);
+});
+
+test("judge prompt asks whether the page is worth turning, and defaults to the original", () => {
+  const messages = buildSceneJudgeMessages({ sceneBrief: "目标：确认偏差", candidates: ["原稿正文", "重写正文"] });
+  assert.match(messages[0].content, /想不想翻下一页/u);
+  assert.match(messages[0].content, /像有自己的目的/u);
+  assert.match(messages[0].content, /难分高下，选 0/u);
+  // Length and ornament are the two things a naive judge rewards; rule them out.
+  assert.match(messages[0].content, /字数更多、辞藻更密、比喻更多都不是优点/u);
+  assert.match(messages[1].content, /候选 0·原稿/u);
+  assert.match(messages[1].content, /重写正文/u);
 });

@@ -9,6 +9,7 @@ import {
   completeCharacterTaskTodos,
   formatTodosForPrompt,
   listProjectSkills,
+  loadSkillById,
   loadAgentSettings,
   loadProjectInstructions,
   normalizeTodos,
@@ -20,7 +21,7 @@ import {
 import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
-import { handleApplyCharacterChanges } from "./tools/characters.js";
+import { handleApplyCharacterChanges, handleSaveCharacter } from "./tools/characters.js";
 import type { ToolHandlerArgs } from "./tools/types.js";
 import type { AgentTodoItem } from "./types.js";
 
@@ -132,6 +133,17 @@ test("advanceTodosAfterProposal closes single-scene soft checklist and stops", (
   assert.equal(todos.every(item => item.status === "completed"), true);
 });
 
+test("advanceTodosAfterProposal does not treat same-document scene todos as new deliverables", () => {
+  const { todos, shouldContinue } = advanceTodosAfterProposal([
+    { id: "t2", content: "规划第二章场景顺序", status: "in_progress" },
+    { id: "t3", content: "撰写千夏苏醒与适应", status: "pending" },
+    { id: "t4", content: "撰写与父亲的长谈", status: "pending" },
+    { id: "t5", content: "终审氛围与风格", status: "pending" },
+  ], false);
+  assert.equal(shouldContinue, false);
+  assert.equal(todos.every(item => item.status === "completed"), true);
+});
+
 test("persistCompletedCharacterTaskTodos closes todos after a character save", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
@@ -192,50 +204,88 @@ test("project instructions prefer WRITER.md", () => {
   }
 });
 
-test("agent settings round-trip permission mode and scene pipeline", () => {
+test("agent settings round-trip permission, writing mode, and scene pipeline", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
     const project = WriterProject.init(root, "测试");
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "ask",
+      writingMode: "fast",
+      characterEvolutionEnabled: true,
+      continuityFactsEnabled: false,
+      reviewFollowsProseModel: true,
       scenePipeline: {
+        enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
       },
+      proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
+      writingMode: "fast",
+      characterEvolutionEnabled: false,
+      continuityFactsEnabled: true,
       scenePipeline: {
+        enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4,
       },
     });
     assert.deepEqual(loadAgentSettings(project), {
       permissionMode: "plan",
+      writingMode: "fast",
+      characterEvolutionEnabled: false,
+      continuityFactsEnabled: true,
+      reviewFollowsProseModel: true,
       scenePipeline: {
+        enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
-        notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 2,
       },
+      proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
     });
-    // Experimental best-of-N switch: persisted, clamped to 1—3.
+    // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
+    saveAgentSettings(project, { reviewFollowsProseModel: false });
+    assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false);
+    assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "review toggle must preserve continuity toggle");
+    saveAgentSettings(project, { scenePipeline: { enabled: false } });
+    assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false, "scene patch must preserve review toggle");
+    saveAgentSettings(project, { reviewFollowsProseModel: true });
+    assert.equal(loadAgentSettings(project).reviewFollowsProseModel, true);
+    // 篇幅档：可单独打补丁，越界值 clamp 而不是抛错，且不碰同组的其他开关。
+    saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 6_000, enforceMinimum: true } });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 6_000, enforceMinimum: true });
+    saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 90_000 } });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 50_000, enforceMinimum: true });
+    saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 100 } });
+    assert.equal(loadAgentSettings(project).proseLength.chapterTargetCharacters, 500);
+    // Best-of-N switch: persisted, clamped to 1—3 (2 by default).
     saveAgentSettings(project, { scenePipeline: { candidateCount: 9 } });
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 3);
-    saveAgentSettings(project, { scenePipeline: { candidateCount: 2 } });
-    assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 2);
+    saveAgentSettings(project, { scenePipeline: { candidateCount: 1 } });
+    assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 1);
     assert.equal(loadAgentSettings(project).scenePipeline.maxScenes, 6, "candidate patch must not reset scene counts");
     assert.equal(loadAgentSettings(project).scenePipeline.notesMaxCharacters, 4_200);
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriterMaxRatio, 2.4);
     saveAgentSettings(project, { scenePipeline: { isolatedWriter: true } });
     assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriter, true);
+    assert.equal(loadAgentSettings(project).writingMode, "fast", "scene patch must preserve writing mode");
+    assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
+    assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "scene patch must preserve continuity toggle");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("listProjectSkills reads .writer/skills", () => {
+test("listProjectSkills merges built-in skills with project overrides", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {
     const project = WriterProject.init(root, "测试");
+    const builtIn = loadSkillById(project, "chapter-planning");
+    assert.equal(builtIn?.path, "builtin/chapter-planning/SKILL.md");
+    assert.match(builtIn?.description ?? "", /完整章节/);
+    assert.match(builtIn?.body ?? "", /不得把任何工具或固定顺序当成前置条件/);
     const skillDir = join(project.privateDir, "skills", "scene-open");
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, "SKILL.md"), `---
@@ -248,9 +298,15 @@ description: 用动作切入
 先写具体动作。
 `, "utf8");
     const skills = listProjectSkills(project);
-    assert.equal(skills.length, 1);
-    assert.equal(skills[0].id, "scene-open");
-    assert.equal(skills[0].name, "场景开场");
+    assert.equal(skills.length, 2);
+    assert.equal(skills.find(skill => skill.id === "scene-open")?.name, "场景开场");
+
+    const overrideDir = join(project.privateDir, "skills", "chapter-planning");
+    mkdirSync(overrideDir, { recursive: true });
+    writeFileSync(join(overrideDir, "SKILL.md"), "---\nname: 项目章节规划\ndescription: 项目自定义章节方法\n---\n\n# 自定义\n", "utf8");
+    const overridden = loadSkillById(project, "chapter-planning");
+    assert.equal(overridden?.name, "项目章节规划");
+    assert.equal(overridden?.path, ".writer/skills/chapter-planning/SKILL.md");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -285,6 +341,34 @@ test("session task state does not sticky-inherit activeDocument across turns", (
     assert.equal(store.sessionTodos(sessionId).length, 0);
     assert.equal(store.recentContextArtifacts(sessionId, 8).length, 0);
     assert.equal(store.agentCheckpoint(sessionId), undefined);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary task switches preserve immutable context artifacts", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-artifacts-"));
+  try {
+    const project = WriterProject.init(root, "跨任务读取缓存");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("cache");
+    store.saveSessionContext(sessionId, { activeDocument: "lore/world.md", currentIntent: "write_scene/document/document: 写正文" });
+    store.saveSessionTodos(sessionId, [{ id: "t1", content: "写正文", status: "in_progress" }]);
+    store.saveContextArtifact(sessionId, {
+      cacheKey: "read:v2:lore/world.md:h1",
+      kind: "read_document",
+      path: "lore/world.md",
+      sourceHash: "h1",
+      content: "{}",
+      digest: "世界观摘要",
+    });
+
+    store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true });
+
+    assert.equal(store.sessionContext(sessionId).currentIntent, "");
+    assert.equal(store.sessionTodos(sessionId).length, 0);
+    assert.equal(store.recentContextArtifacts(sessionId, 8).length, 1);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -393,6 +477,40 @@ test("message rerun can keep accepted document changes", () => {
     assert.equal(project.documentExists("chapters/第2章.md"), false);
     // Chapter 1 was kept earlier and not part of this second rewind scope after new messages only undid ch2.
     assert.equal(project.documentExists("chapters/第1章.md"), true);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("character evolution tool is blocked when the setting is disabled", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-toggle-"));
+  try {
+    const project = WriterProject.init(root, "角色演进开关");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("character-toggle");
+    const character = store.saveCharacter(emptyCharacter("甲"));
+    const args: ToolHandlerArgs = {
+      input: {
+        id: character.id,
+        reason: "调试写作",
+        changes: [{ op: "append_experience", label: "不应写入", description: "开关关闭" }],
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      characterScope: [character.id],
+      context: { permissionMode: "ask", characterEvolutionEnabled: false },
+    };
+    assert.throws(() => handleApplyCharacterChanges(args), /角色演进已关闭/);
+    assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 0);
+    const saved = JSON.parse(handleSaveCharacter({
+      ...args,
+      input: { identity: { name: "乙" } },
+      characterScope: undefined,
+    })) as Record<string, unknown>;
+    assert.equal(saved.created, true, "explicit character-card editing remains available");
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

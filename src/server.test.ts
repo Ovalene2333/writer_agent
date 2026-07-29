@@ -7,7 +7,13 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
-import { BackgroundAgentJobs, conversationMessageForWeb, resolveWebRoot, startWriterServer } from "./server.js";
+import {
+  BackgroundAgentJobs,
+  conversationMessageForWeb,
+  resolveWebRoot,
+  scheduleAcceptedContinuityIndexing,
+  startWriterServer,
+} from "./server.js";
 import { WriterStore } from "./store.js";
 
 test("web assets always resolve to Vite's build output", () => {
@@ -48,6 +54,38 @@ test("agent event snapshot keeps events emitted during replay", async () => {
   ]);
 });
 
+test("accepted continuity indexing starts after the approval response turn", async () => {
+  let started = false;
+  scheduleAcceptedContinuityIndexing(async () => { started = true; });
+  assert.equal(started, false);
+  await waitForImmediate();
+  assert.equal(started, true);
+});
+
+test("interrupted agent resume can use either assistant marker or step anchor user", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-resume-"));
+  try {
+    const project = WriterProject.init(root, "resume");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("resume");
+    const userId = store.addMessage(sessionId, "user", "写第一章", "agent");
+    const assistantId = store.addMessage(sessionId, "assistant", "已经完成几步\n\n[生成已中断]", "agent");
+    assert.deepEqual(store.interruptedAgentResumePrompt(sessionId, userId), {
+      fromId: userId,
+      prompt: "写第一章",
+    });
+    assert.deepEqual(store.interruptedAgentResumePrompt(sessionId, assistantId), {
+      fromId: userId,
+      prompt: "写第一章",
+    });
+    const doneId = store.addMessage(sessionId, "assistant", "已完成", "agent");
+    assert.throws(() => store.interruptedAgentResumePrompt(sessionId, doneId), /只能续跑/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("web roleplay messages expose the parsed perception without internal turn hints", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-web-perception-"));
   try {
@@ -74,6 +112,25 @@ test("web roleplay messages expose the parsed perception without internal turn h
     assert.deepEqual(webMessage.roleplayPerceptionData?.speech, ["你好。"]);
     assert.deepEqual(webMessage.roleplayPerceptionData?.knowableFacts, []);
     assert.deepEqual(webMessage.roleplayPerceptionData?.unknowableFacts, []);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("web director messages hide the internal OOC wrapper", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-server-director-message-"));
+  try {
+    const project = WriterProject.init(root, "Director message");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("roleplay");
+    const messageId = store.addMessage(sessionId, "user", "推进到第二天。", "roleplay", undefined, "director");
+    store.saveRoleplayPerception(sessionId, messageId, "［OOC 导演指示——推进到第二天。］");
+    const message = store.messages(sessionId, 1, { channel: "roleplay" })[0];
+
+    const webMessage = conversationMessageForWeb(store, message);
+    assert.equal(webMessage.roleplayInputMode, "director");
+    assert.equal(webMessage.roleplayPerception, undefined);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -152,6 +209,39 @@ test("--no-token server mode disables public API authentication only when explic
       });
       const disconnectedPayload = await disconnectedHealth.json() as { publicOrigin: string | null };
       assert.equal(disconnectedPayload.publicOrigin, null);
+      const shareResponse = await fetch(`http://127.0.0.1:${protectedPort}/api/share/readonly`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${protectedServer.token}` },
+      });
+      assert.equal(shareResponse.status, 200);
+      const share = await shareResponse.json() as { token: string; accessMode: string };
+      assert.ok(share.token.length >= 24);
+      assert.equal(share.accessMode, "readonly");
+      const readonlyState = await fetch(`http://127.0.0.1:${protectedPort}/api/state`, {
+        headers: { authorization: `Bearer ${share.token}` },
+      });
+      assert.equal(readonlyState.status, 200);
+      assert.equal((await readonlyState.json() as { accessMode: string }).accessMode, "readonly");
+      const readonlyWrite = await fetch(`http://127.0.0.1:${protectedPort}/api/agent-settings`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${share.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ permissionMode: "auto" }),
+      });
+      assert.equal(readonlyWrite.status, 403);
+      assert.match(await readonlyWrite.text(), /只读模式/);
+      const rotatedResponse = await fetch(`http://127.0.0.1:${protectedPort}/api/share/readonly`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${protectedServer.token}` },
+      });
+      const rotated = await rotatedResponse.json() as { token: string };
+      assert.notEqual(rotated.token, share.token);
+      const expiredReadonly = await fetch(`http://127.0.0.1:${protectedPort}/api/health`, {
+        headers: { authorization: `Bearer ${share.token}` },
+      });
+      assert.equal(expiredReadonly.status, 401);
       assert.ok(protectedServer.token.length >= 24);
     } finally {
       await protectedServer.close();
@@ -163,6 +253,68 @@ test("--no-token server mode disables public API authentication only when explic
       assert.equal(openServer.token, "");
       const allowed = await fetch(`http://127.0.0.1:${openPort}/api/health`);
       assert.equal(allowed.status, 200);
+      const createdRuleResponse = await fetch(`http://127.0.0.1:${openPort}/api/prose-gates`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id: "dialogue-register",
+          instruction: "人物对白必须符合各自身份和语域。",
+          severity: "warn",
+          enabled: true,
+          sourceFeedback: "作者要求长期检查人物声口。",
+        }),
+      });
+      assert.equal(createdRuleResponse.status, 200);
+      const createdRules = await createdRuleResponse.json() as { rules: Array<{ id: string; severity: string }> };
+      assert.equal(createdRules.rules.find(rule => rule.id === "dialogue-register")?.severity, "warn");
+      const disabledRuleResponse = await fetch(
+        `http://127.0.0.1:${openPort}/api/prose-gates/dialogue-register/enabled`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: false }),
+        },
+      );
+      assert.equal(disabledRuleResponse.status, 200);
+      const disabledRules = await disabledRuleResponse.json() as { rules: Array<{ id: string; enabled: boolean }> };
+      assert.equal(disabledRules.rules.find(rule => rule.id === "dialogue-register")?.enabled, false);
+      const removedRuleResponse = await fetch(
+        `http://127.0.0.1:${openPort}/api/prose-gates/dialogue-register`,
+        { method: "DELETE" },
+      );
+      assert.equal(removedRuleResponse.status, 200);
+      assert.equal((await removedRuleResponse.json() as { removed: boolean }).removed, true);
+      // 篇幅设置是作者调的旋钮，越界值必须在服务端就挡住，别等到写作时才发现目标不合理。
+      const badLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { chapterTargetCharacters: 120 } }),
+      });
+      assert.equal(badLength.status, 400);
+      assert.match(await badLength.text(), /chapterTargetCharacters/);
+      const badEnforce = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { enforceMinimum: "yes" } }),
+      });
+      assert.equal(badEnforce.status, 400);
+      const savedLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { chapterTargetCharacters: 4_200, enforceMinimum: true } }),
+      });
+      assert.equal(savedLength.status, 200);
+      assert.deepEqual(
+        (await savedLength.json() as { proseLength: unknown }).proseLength,
+        { chapterTargetCharacters: 4_200, enforceMinimum: true },
+      );
+      const reloadedLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`);
+      assert.deepEqual(
+        (await reloadedLength.json() as { proseLength: unknown }).proseLength,
+        { chapterTargetCharacters: 4_200, enforceMinimum: true },
+      );
+      const unsafeShare = await fetch(`http://127.0.0.1:${openPort}/api/share/readonly`, { method: "POST" });
+      assert.equal(unsafeShare.status, 400);
     } finally {
       await openServer.close();
     }

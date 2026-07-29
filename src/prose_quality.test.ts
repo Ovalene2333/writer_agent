@@ -11,19 +11,17 @@ import {
   sceneMannerismGateError,
 } from "./prose_quality.js";
 
-test("generation-time constraint prompt is positive-first and never demos banned patterns", () => {
+test("generation-time constraint prompt explicitly blocks negation-redefinition frames", () => {
   const full = proseMannerismConstraintPrompt();
   assert.match(full, /直接陈述成立的事实/);
   assert.match(full, /破折号/);
   assert.match(full, /解释只在引入新事实时出现/);
   const compact = proseMannerismConstraintPrompt({ compact: true });
   assert.match(compact, /句式基准/);
-  assert.ok(full.length < 600, "constraint prompt must stay short");
-  // Pink-elephant guard: quoting a banned frame in the prompt raises its salience.
+  assert.ok(full.length < 760, "constraint prompt must stay short");
   for (const prompt of [full, compact, proseMannerismPreflightLine()]) {
-    assert.ok(!prompt.includes("不是A"), "must not demo the negation frame");
+    assert.match(prompt, /否定|不是/);
     assert.ok(!prompt.includes("坏例"), "must not carry bad-example demos");
-    assert.ok(!prompt.includes("禁止"), "must stay positively framed");
   }
   assert.match(proseMannerismPreflightLine(), /自检/);
 });
@@ -42,6 +40,23 @@ test("sceneMannerismGateError blocks dense split_redefinition before draft write
   assert.ok(blocked);
   assert.match(blocked!, /本场说明式写法过密/);
   assert.match(blocked!, /不是/);
+});
+
+test("scene gate deterministically blocks a single split negation-redefinition", () => {
+  const blocked = sceneMannerismGateError("母亲的手收紧。不是抱。是扣。随后地板断了。");
+  assert.ok(blocked);
+  assert.match(blocked!, /不是抱/);
+});
+
+test("repeated factual negation frames become a hard scene error", () => {
+  const blocked = sceneMannerismGateError("走廊里不是风声，是人的脚步。门后不是护士，是一名警卫。");
+  assert.ok(blocked);
+  assert.match(blocked!, /说明式写法过密/);
+});
+
+test("pure negative enumeration is not mistaken for a positive redefinition", () => {
+  const issues = analyzeProseStyle("她的停顿不是烦躁，也不是无聊。");
+  assert.equal(issues.some(issue => issue.kind === "contrast"), false);
 });
 
 test("classifies speech extension, interruption and hesitation without warnings", () => {
@@ -149,20 +164,20 @@ test("a single abstract contrast remains advisory", () => {
   assert.equal(contrastStyleError(text), undefined);
 });
 
-test("detects split not-A-is-B narration as a semantic review candidate", () => {
+test("detects split not-A-is-B narration as a deterministic error", () => {
   const text = "她不是被叫醒。是自己醒的。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
   assert.ok(issue);
-  assert.equal(issue.severity, "warning");
+  assert.equal(issue.severity, "error");
   assert.equal(issue.sentence, text);
-  assert.equal(proseStyleIssuesError([issue]), undefined);
+  assert.ok(proseStyleIssuesError([issue]));
 });
 
-test("keeps a single factual split contrast advisory until semantic review", () => {
+test("blocks a single factual split contrast", () => {
   const text = "他不是坏人。他是个逃兵。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
-  assert.equal(issue?.severity, "warning");
-  assert.equal(contrastStyleError(text), undefined);
+  assert.equal(issue?.severity, "error");
+  assert.ok(contrastStyleError(text));
 });
 
 test("reports only newly introduced issues for patches", () => {

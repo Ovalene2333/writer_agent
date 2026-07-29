@@ -69,10 +69,18 @@ export function naturalProseCraftPrompt(): string {
 
 【写活一场戏】
 - 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现；叙述距离贴近谁，就停在谁的感知里。
-- 场景推进：刺激引出反应、选择或代价；每个动作改变关系、位置、信息或下一步的可能。
+- 场景发动：尽早让人物为一个可辨认的眼前结果采取行动；阻力针对他的办法，每次应对都改变退路、代价、暴露、关系、信息或时间条件。
+- 张力累积：让读者看清人物在乎什么、可能失去什么、还有多少选择，同时保留结果的不确定；用期限、信息差、承诺、两难与对手的有效反制逐步收紧选择。
+- 转折余波：关键变化由此前行动招致；重大受挫或发现之后，按篇幅留出反应、权衡与决定，使人物的新决定成为下一步的原因。静场也改变理解、关系或选择。
 - 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改变关系；设定让人物在行动里试错撞出来，旁人只在关键处补一句。
 - 细节取舍：每处细节至少承担空间、习惯、冲突、因果或伏笔之一；用此时此地才成立的物件、动作或感官，代替随处可用的气氛标签。
 - 具体性检查：一句话若换掉人名地点仍能套进多数故事，就换成本场独有的说法或后果；没有有效信息就删。
+
+【篇章完整与衔接】
+- 章首接住可用前文留下的动作、压力与未决问题，保持时间、地点、人物位置、伤势、持有物、已知信息和承诺一致；用新行动承接，不复述前情。
+- 承担完整章节时，开头立住本章当前问题，中段让预期、优势、目标或关系发生实质偏转，结尾兑现这个局部问题的阶段性结果，并让结果产生新的约束、代价或选择。
+- 已有下一章时，以其开场状态为离场边界：本章铺成通往它的因果条件，把下一章的事件与决定留给下一章发生。
+- 完整收束允许谜团继续存在；章尾的牵引力来自已经发生的变化及其未完后果，而非把本章应有的结果截在发生之前。
 
 【节奏与质感】
 - 段落默认 2—5 句，长短随情绪压力起伏；单句成段是重音，省着用才有力。
@@ -81,7 +89,7 @@ export function naturalProseCraftPrompt(): string {
 - 读数、参数、系统状态优先转译为人物可感的后果（器物轻响、对方停顿、地板闷震）或一个准确的比喻；精确数字一章少而准。
 - 情绪刚起时先给半拍体感或动作，再进任何说明。
 - 同一信息、情绪、感官公式或因果只写一次；比喻与金句的效果来自克制。
-- 段落与章节收在具体后果、关系余波或未决问题上。`;
+- 段落收在具体后果、关系余波或仍在施压的问题上。`;
 }
 
 /**
@@ -184,24 +192,60 @@ export function dynamicStyleGroundingPrompt(
 }
 
 /**
- * One raw prose window for the isolated scene writer. Unlike the Agent's dynamic
- * grounding block this deliberately returns no notes, source paths or template
- * instructions: the prose-only call gets imitation evidence, not workflow text.
+ * Style constraints for the isolated scene writer.
+ *
+ * The prose-only call used to receive NONE of this: no active template, no craft
+ * baseline — every rule the Agent path treats as mandatory was silently dropped
+ * on the one call that actually produces chapter text. Mannerism prohibitions are
+ * deliberately still excluded: ISOLATED_WRITER_SYSTEM already carries them, and
+ * re-pasting a prohibition wall raises the salience of the patterns it bans.
  */
-export function isolatedWriterVoiceSample(
+export function isolatedWriterStyleDirectives(project: WriterProject): string {
+  const config = project.config();
+  const template = config.style ? project.styleTemplate(config.style) : undefined;
+  const sections: string[] = [];
+  if (template) {
+    sections.push(`本作品的激活风格模板：${template.name}`, template.systemPromptAddition.trim());
+  }
+  sections.push(naturalProseCraftPrompt());
+  return sections.join("\n\n");
+}
+
+export type IsolatedWriterVoiceEvidence = {
+  /** Imitation target: user 范文 or template example. Never the project's own prose. */
+  exemplar: string;
+  /** Continuity anchor: the work's existing prose. Used only when no in-chapter seam exists. */
+  continuation: string;
+};
+
+/**
+ * Two voice slots with different jobs, for the isolated scene writer.
+ *
+ * These must not substitute for each other. The single-slot predecessor returned
+ * project prose whenever any existed, so on every chapter after the first the
+ * writer's only stylistic target was its own previous output — a self-imitation
+ * loop that regresses to the mean the longer a work runs, which is exactly when
+ * voice matters most. The exemplar now always comes from outside the draft; the
+ * continuation slot carries seam continuity separately.
+ *
+ * Unlike the Agent's dynamic grounding block both return bare prose: no notes,
+ * source paths or workflow text — the prose-only call gets evidence, not
+ * instructions.
+ */
+export function isolatedWriterVoiceEvidence(
   project: WriterProject,
   store: WriterStore,
   targetPath?: string,
   random: () => number = Math.random,
-): string {
-  const projectSample = pickProjectVoiceSample(project, targetPath);
-  if (projectSample) return projectSample.text.slice(-1_200);
-
+): IsolatedWriterVoiceEvidence {
   const config = project.config();
   const template = config.style ? project.styleTemplate(config.style) : undefined;
   const example = pickStyleExamples(store, template?.name, undefined, random)[0];
-  if (example) return sampleProseWindow(example.content, 1_200, random);
-  return template?.exampleContent ? sampleProseWindow(template.exampleContent, 1_200, random) : "";
+  const exemplar = example
+    ? sampleProseWindow(example.content, 1_200, random)
+    : template?.exampleContent ? sampleProseWindow(template.exampleContent, 1_200, random) : "";
+  const projectSample = pickProjectVoiceSample(project, targetPath);
+  return { exemplar, continuation: projectSample ? projectSample.text.slice(-1_200) : "" };
 }
 
 /**

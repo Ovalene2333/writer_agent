@@ -33,6 +33,7 @@ import {
   handleProposeDocument,
   handleProposeDocumentPatch,
   handleReviseDocumentIsolated,
+  handleWriteDocumentIsolated,
 } from "./proposals.js";
 import {
   handleInspectFile,
@@ -49,11 +50,13 @@ import {
   handleReviseChapterDraftStyle,
   handleReviseChapterSceneGuide,
   handleWriteChapterScene,
+  handleWriteChapterSceneNotes,
 } from "./scene_pipeline.js";
 import {
   handleAskUser,
   handleLoadSkill,
   handleManageTodos,
+  handleManageProseGates,
   handleReadContextArtifact,
 } from "./meta.js";
 
@@ -80,11 +83,13 @@ const HANDLERS: Record<string, Handler> = {
   compile_write_pack: handleCompileWritePack,
   begin_chapter_draft: handleBeginChapterDraft,
   write_chapter_scene: handleWriteChapterScene,
+  write_chapter_scene_notes: handleWriteChapterSceneNotes,
   revise_chapter_scene_guide: handleReviseChapterSceneGuide,
   revise_chapter_draft_style: handleReviseChapterDraftStyle,
   inspect_chapter_draft: handleInspectChapterDraft,
   propose_chapter_draft: handleProposeChapterDraft,
   propose_document: handleProposeDocument,
+  write_document_isolated: handleWriteDocumentIsolated,
   propose_document_patch: handleProposeDocumentPatch,
   revise_document_isolated: handleReviseDocumentIsolated,
   propose_change_set: handleProposeChangeSet,
@@ -101,6 +106,7 @@ const HANDLERS: Record<string, Handler> = {
   manage_todos: handleManageTodos,
   load_skill: handleLoadSkill,
   read_context_artifact: handleReadContextArtifact,
+  manage_prose_gates: handleManageProseGates,
 };
 
 export async function executeTool(

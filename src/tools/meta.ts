@@ -2,6 +2,43 @@ import { loadSkillById, normalizeTodos, reconcileManagedTodos } from "../agent_r
 import { chapterSceneDraftComplete, nextChapterScene } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { requireString } from "./helpers.js";
+import {
+  loadProseGateRules,
+  removeProseGateRule,
+  setProseGateRuleEnabled,
+  upsertProseGateRule,
+} from "../prose_gate_rules.js";
+
+export function handleManageProseGates({ input, project, context }: ToolHandlerArgs): string {
+  const operation = requireString(input.operation, "operation");
+  if (operation === "list") {
+    return JSON.stringify({ rules: loadProseGateRules(project) });
+  }
+  if (context.permissionMode === "plan") throw new Error("plan 模式不能修改项目复审规则");
+  if (operation === "upsert") {
+    const rule = upsertProseGateRule(project, {
+      id: requireString(input.id, "id"),
+      instruction: requireString(input.instruction, "instruction"),
+      severity: input.severity === "warn" ? "warn" : "block",
+      enabled: input.enabled !== false,
+      sourceFeedback: typeof input.sourceFeedback === "string" ? input.sourceFeedback : "",
+    });
+    context.proseGateRules = loadProseGateRules(project);
+    return JSON.stringify({ status: "saved", rule, message: "作者反馈已沉淀为项目复审规则；后续正文出口会进行语义复审。" });
+  }
+  if (operation === "remove") {
+    const id = requireString(input.id, "id");
+    const removed = removeProseGateRule(project, id);
+    context.proseGateRules = loadProseGateRules(project);
+    return JSON.stringify({ status: removed ? "removed" : "not_found", id });
+  }
+  if (operation === "enable" || operation === "disable") {
+    const rule = setProseGateRuleEnabled(project, requireString(input.id, "id"), operation === "enable");
+    context.proseGateRules = loadProseGateRules(project);
+    return JSON.stringify({ status: operation === "enable" ? "enabled" : "disabled", rule });
+  }
+  throw new Error("operation 仅支持 list、upsert、enable、disable、remove");
+}
 
 export function handleAskUser({ input }: ToolHandlerArgs): string {
   const question = requireString(input.question, "question").slice(0, 300);
@@ -28,7 +65,7 @@ export function handleManageTodos({ input, store, sessionId, emit, context }: To
   const nextScene = draft && !chapterSceneDraftComplete(draft) ? nextChapterScene(draft) : undefined;
   const draftNudge = draft
     ? nextScene
-      ? `章节场景草稿进行中（${draft.completed.length}/${draft.scenes.length}），内置阶段由工具结果自动推进；下一步直接调用 write_chapter_scene（sceneId=${nextScene.id}），要点直接写进 notes 参数，勿再为规划单独消耗步骤。`
+      ? `章节场景草稿进行中（${draft.completed.length}/${draft.scenes.length}），内置阶段由工具结果自动推进；下一步直接调用 ${context.scenePipelineSettings?.isolatedWriter ? "write_chapter_scene_notes" : "write_chapter_scene"}（sceneId=${nextScene.id}），要点直接写进 notes 参数，勿再为规划单独消耗步骤。`
       : "章节场景已全部写完；下一步直接调用 inspect_chapter_draft，勿再为勾选清单单独消耗步骤。"
     : "";
   return JSON.stringify({

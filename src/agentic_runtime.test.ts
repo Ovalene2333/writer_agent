@@ -70,6 +70,66 @@ test("reusable grounded context satisfies an evidence obligation", () => {
   assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
 });
 
+test("planned author review rules must be persisted before completion", () => {
+  const progress = createAgentExecutionProgress();
+  const contract: AgentTaskContract = {
+    mode: "general",
+    outcome: "answer",
+    evidence: "none",
+    mutation: "none",
+    planning: "direct",
+    capabilities: ["review"],
+    proseGateRequired: true,
+  };
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "尚未把 planning 识别出的可复用作者反馈保存为复审规则",
+  ]);
+  recordAgentToolResult(progress, "manage_prose_gates", { rules: [] });
+  assert.equal(progress.proseGateRuleSaved, false);
+  recordAgentToolResult(progress, "manage_prose_gates", { status: "saved" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
+test("self-contained document creation only requires a delivered artifact", () => {
+  const progress = createAgentExecutionProgress();
+  const contract: AgentTaskContract = {
+    mode: "write_scene",
+    outcome: "document",
+    evidence: "none",
+    mutation: "document",
+    planning: "adaptive",
+    capabilities: ["documents", "scenes"],
+  };
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "尚未成功提交文档提案或 change set",
+  ]);
+  recordAgentToolResult(progress, "propose_document", { status: "pending" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
+test("chapter workflow stage gaps require review after a scene chain starts", () => {
+  const progress = createAgentExecutionProgress(true);
+  const contract: AgentTaskContract = {
+    mode: "write_scene",
+    outcome: "document",
+    evidence: "none",
+    mutation: "document",
+    planning: "adaptive",
+    capabilities: ["documents", "scenes", "review"],
+    documentProposalRequired: true,
+    workflow: "chapter_delivery",
+    qualityProfile: "standard",
+  };
+  recordAgentToolResult(progress, "begin_chapter_draft", { status: "started" });
+  recordAgentToolResult(progress, "write_chapter_scene", { status: "written", complete: true });
+  recordAgentToolResult(progress, "propose_document", { status: "pending" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "章节场景链已启动但尚未完成整章终审",
+  ]);
+  recordAgentToolResult(progress, "inspect_chapter_draft", { status: "review_passed", proposalSubmitted: true });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
 test("mixed contracts require and authorize both artifact families", () => {
   const contract: AgentTaskContract = {
     ...documentContract,

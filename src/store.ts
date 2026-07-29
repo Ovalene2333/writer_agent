@@ -3,11 +3,13 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange,
-  RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange, ProseQualityReport,
+  RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
+  MessageStepTrail, PersistedStreamStep,
 } from "./types.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
+import { documentSpans } from "./document_spans.js";
 import {
   applyCharacterChanges as applyCharacterChangesCore,
   applyCharacterInput,
@@ -24,6 +26,23 @@ import {
 import { OutlineStore } from "./outline.js";
 import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
+import {
+  CONTINUITY_FACT_EPISTEMIC_KINDS,
+  CONTINUITY_FACT_KINDS,
+  CONTINUITY_FACT_SCOPE_KINDS,
+  type ContinuityFact,
+  type ContinuityFactCandidate,
+  type ContinuityFactEpistemicKind,
+  type ContinuityFactKind,
+  type ContinuityFactScopeKind,
+  type ContinuityFactStatus,
+} from "./continuity_facts.js";
+import type {
+  ContextEdge, ContextEdgeKind, ContextNode, ContextNodeKind, ContextNodeStatus,
+} from "./context_graph.js";
+import {
+  buildContextGraphView, newContextEdgeId, newContextNodeId, type ContextGraphView,
+} from "./context_graph.js";
 
 type Row = Record<string, unknown>;
 type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
@@ -47,6 +66,7 @@ type RoleplayBranchPayload = {
     channel: MessageChannel;
     variantGroupId?: string;
     roleplayPerception?: string;
+    roleplayModelInput?: string;
     roleplayInputMode?: RoleplayInputMode;
   }>;
   memory?: RoleplaySessionMemory;
@@ -67,6 +87,60 @@ function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[
     ));
   } catch {
     return [];
+  }
+}
+
+/**
+ * Advisory data only — a proposal written before the column existed, or one whose
+ * report shape has since changed, simply shows no quality card in the review dock.
+ * Never throw here: a bad blob must not make the proposal unreadable.
+ */
+/**
+ * Cache optimisation only — a block written by an older build, or one whose blob
+ * got truncated, simply drops out of the replay chain and that turn is paid for
+ * again. Never throw: a bad blob must not make the session unrunnable.
+ */
+function parseAgentTurnMessages(value: unknown): AgentTurnMessage[] | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed) || !parsed.length) return undefined;
+    const messages: AgentTurnMessage[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") return undefined;
+      const message = item as Partial<AgentTurnMessage>;
+      if (message.role !== "system" && message.role !== "user" && message.role !== "assistant" && message.role !== "tool") return undefined;
+      if (typeof message.content !== "string" && message.content !== null) return undefined;
+      messages.push({
+        role: message.role,
+        content: message.content,
+        ...(typeof message.tool_call_id === "string" ? { tool_call_id: message.tool_call_id } : {}),
+        ...(Array.isArray(message.tool_calls) ? { tool_calls: message.tool_calls } : {}),
+        ...(typeof message.reasoning_content === "string" ? { reasoning_content: message.reasoning_content } : {}),
+      });
+    }
+    return messages;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseProposalQualityReport(value: unknown): ProseQualityReport | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const report = parsed as Partial<ProseQualityReport>;
+    if (typeof report.grade !== "string" || !report.vividness || !report.aiTells) return undefined;
+    return {
+      characters: Number(report.characters) || 0,
+      vividness: report.vividness,
+      aiTells: report.aiTells,
+      grade: report.grade as ProseQualityReport["grade"],
+      warnings: Array.isArray(report.warnings) ? report.warnings : [],
+    };
+  } catch {
+    return undefined;
   }
 }
 
@@ -150,6 +224,7 @@ export class WriterStore {
         after_content TEXT NOT NULL,
         base_hash TEXT NOT NULL,
         character_changes_json TEXT NOT NULL DEFAULT '[]',
+        quality_report_json TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'pending',
         created_at TEXT NOT NULL
       );
@@ -163,6 +238,7 @@ export class WriterStore {
         created_file INTEGER NOT NULL DEFAULT 0,
         character_revisions_json TEXT NOT NULL DEFAULT '[]',
         undone INTEGER NOT NULL DEFAULT 0,
+        label TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS change_sets (
@@ -303,6 +379,34 @@ export class WriterStore {
         last_used_at TEXT NOT NULL,
         UNIQUE(session_id, cache_key)
       );
+      CREATE TABLE IF NOT EXISTS continuity_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        statement TEXT NOT NULL,
+        normalized_statement TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        scope_kind TEXT NOT NULL,
+        scope_value TEXT NOT NULL DEFAULT '',
+        valid_from TEXT NOT NULL DEFAULT '',
+        valid_until TEXT NOT NULL DEFAULT '',
+        epistemic TEXT NOT NULL DEFAULT 'objective',
+        known_by_json TEXT NOT NULL DEFAULT '[]',
+        importance INTEGER NOT NULL DEFAULT 50,
+        status TEXT NOT NULL DEFAULT 'active',
+        resume_status TEXT NOT NULL DEFAULT 'active',
+        source_path TEXT NOT NULL DEFAULT '',
+        source_hash TEXT NOT NULL DEFAULT '',
+        source_evidence TEXT NOT NULL DEFAULT '',
+        source_anchor_id TEXT NOT NULL DEFAULT '',
+        source_proposal_id INTEGER,
+        conflicts_with_json TEXT NOT NULL DEFAULT '[]',
+        supersedes_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS continuity_facts_status_scope
+        ON continuity_facts(status,scope_kind,scope_value,importance);
+      CREATE INDEX IF NOT EXISTS continuity_facts_source
+        ON continuity_facts(source_path,source_hash,status);
       CREATE TABLE IF NOT EXISTS session_context (
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
         active_document TEXT,
@@ -310,6 +414,52 @@ export class WriterStore {
         agent_checkpoint_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS agent_turn_blocks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_index INTEGER NOT NULL,
+        messages_json TEXT NOT NULL,
+        estimated_tokens INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(session_id, turn_index)
+      );
+      CREATE INDEX IF NOT EXISTS agent_turn_blocks_session ON agent_turn_blocks(session_id, turn_index);
+      CREATE TABLE IF NOT EXISTS message_step_trails (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_message_id INTEGER NOT NULL,
+        job_id TEXT,
+        steps_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_message_id)
+      );
+      CREATE INDEX IF NOT EXISTS message_step_trails_session
+        ON message_step_trails(session_id, source_message_id);
+      CREATE TABLE IF NOT EXISTS context_nodes (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        label TEXT NOT NULL DEFAULT '',
+        source_message_id INTEGER,
+        job_id TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS context_nodes_session
+        ON context_nodes(session_id, status, kind, created_at);
+      CREATE INDEX IF NOT EXISTS context_nodes_message
+        ON context_nodes(session_id, source_message_id);
+      CREATE TABLE IF NOT EXISTS context_edges (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS context_edges_session
+        ON context_edges(session_id, kind);
       CREATE TABLE IF NOT EXISTS character_revisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -348,11 +498,21 @@ export class WriterStore {
       CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(path UNINDEXED, content);
     `);
     const revisionColumns = this.database.prepare("PRAGMA table_info(revisions)").all() as Row[];
+    const continuityFactColumns = this.database.prepare("PRAGMA table_info(continuity_facts)").all() as Row[];
+    if (!continuityFactColumns.some(column => column.name === "resume_status")) {
+      this.database.exec("ALTER TABLE continuity_facts ADD COLUMN resume_status TEXT NOT NULL DEFAULT 'active'");
+    }
+    if (!continuityFactColumns.some(column => column.name === "source_anchor_id")) {
+      this.database.exec("ALTER TABLE continuity_facts ADD COLUMN source_anchor_id TEXT NOT NULL DEFAULT ''");
+    }
     if (!revisionColumns.some(column => column.name === "created_file")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN created_file INTEGER NOT NULL DEFAULT 0");
     }
     if (!revisionColumns.some(column => column.name === "character_revisions_json")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN character_revisions_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!revisionColumns.some(column => column.name === "label")) {
+      this.database.exec("ALTER TABLE revisions ADD COLUMN label TEXT NOT NULL DEFAULT ''");
     }
     const changeSetColumns = this.database.prepare("PRAGMA table_info(change_sets)").all() as Row[];
     if (!changeSetColumns.some(column => column.name === "before_config")) {
@@ -364,6 +524,9 @@ export class WriterStore {
     const proposalColumns = this.database.prepare("PRAGMA table_info(proposals)").all() as Row[];
     if (!proposalColumns.some(column => column.name === "character_changes_json")) {
       this.database.exec("ALTER TABLE proposals ADD COLUMN character_changes_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!proposalColumns.some(column => column.name === "quality_report_json")) {
+      this.database.exec("ALTER TABLE proposals ADD COLUMN quality_report_json TEXT NOT NULL DEFAULT ''");
     }
     const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as Row[];
     if (!sessionColumns.some(column => column.name === "auto_title_done")) {
@@ -385,6 +548,9 @@ export class WriterStore {
     }
     if (!messageColumns.some(column => column.name === "roleplay_perception")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_perception TEXT");
+    }
+    if (!messageColumns.some(column => column.name === "roleplay_model_input")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_model_input TEXT");
     }
     if (!messageColumns.some(column => column.name === "roleplay_input_mode")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_input_mode TEXT");
@@ -412,6 +578,9 @@ export class WriterStore {
     }
     if (!usageColumns.some(column => column.name === "request_components_json")) {
       this.database.exec("ALTER TABLE model_usage ADD COLUMN request_components_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!usageColumns.some(column => column.name === "provider_name")) {
+      this.database.exec("ALTER TABLE model_usage ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -451,6 +620,216 @@ export class WriterStore {
       });
   }
 
+  continuityFacts(options: {
+    statuses?: ContinuityFactStatus[];
+    sourcePath?: string;
+    limit?: number;
+  } = {}): ContinuityFact[] {
+    const statuses = options.statuses?.filter(status =>
+      ["active", "conflict", "pending", "stale", "retracted"].includes(status));
+    const where: string[] = [];
+    const values: Array<string | number> = [];
+    if (statuses?.length) {
+      where.push(`status IN (${statuses.map(() => "?").join(",")})`);
+      values.push(...statuses);
+    }
+    if (options.sourcePath) {
+      where.push("source_path=?");
+      values.push(options.sourcePath);
+    }
+    const limit = Math.max(1, Math.min(1_000, Math.round(options.limit ?? 300)));
+    values.push(limit);
+    return (this.database.prepare(`SELECT * FROM continuity_facts
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY CASE status WHEN 'conflict' THEN 0 WHEN 'pending' THEN 1 WHEN 'active' THEN 2 ELSE 3 END,
+        importance DESC,updated_at DESC,id DESC LIMIT ?`).all(...values) as Row[])
+      .map(row => continuityFactFromRow(row));
+  }
+
+  saveContinuityFact(input: Partial<ContinuityFact> & { statement: string }): ContinuityFact {
+    const statement = input.statement.trim().replace(/\s+/gu, " ").slice(0, 280);
+    if (!statement) throw new Error("事实陈述不能为空");
+    const kind = continuityEnum(input.kind, CONTINUITY_FACT_KINDS, "other");
+    const scopeKind = continuityEnum(input.scopeKind, CONTINUITY_FACT_SCOPE_KINDS, "global");
+    const epistemic = continuityEnum(input.epistemic, CONTINUITY_FACT_EPISTEMIC_KINDS, "objective");
+    const status = continuityStatus(input.status);
+    const now = new Date().toISOString();
+    const knownBy = continuityStrings(input.knownBy, 20);
+    const conflictsWith = continuityIds(input.conflictsWith);
+    const supersedes = continuityIds(input.supersedes);
+    const sourcePath = typeof input.sourcePath === "string" ? input.sourcePath.trim().slice(0, 500) : "";
+    const sourceEvidence = typeof input.sourceEvidence === "string" ? input.sourceEvidence.trim().slice(0, 500) : "";
+    const sourceContent = sourcePath && this.project.textFileExists(sourcePath)
+      ? this.project.readTextFile(sourcePath)
+      : "";
+    const sourceHash = sourceContent
+      ? this.project.hash(sourceContent)
+      : typeof input.sourceHash === "string" ? input.sourceHash : "";
+    if (sourcePath && sourceEvidence && sourceContent && !sourceContent.includes(sourceEvidence)) {
+      throw new Error("来源证据不在当前文档中");
+    }
+    const sourceAnchorId = sourceContent && sourceEvidence
+      ? continuityEvidenceAnchor(sourceContent, sourceHash, sourceEvidence)
+      : typeof input.sourceAnchorId === "string" ? input.sourceAnchorId : "";
+    let id = Number(input.id);
+    const values = [
+      statement,
+      normalizeContinuityStatement(statement),
+      kind,
+      scopeKind,
+      typeof input.scopeValue === "string" ? input.scopeValue.trim().slice(0, 160) : "",
+      typeof input.validFrom === "string" ? input.validFrom.trim().slice(0, 120) : "",
+      typeof input.validUntil === "string" ? input.validUntil.trim().slice(0, 120) : "",
+      epistemic,
+      JSON.stringify(knownBy),
+      Math.max(0, Math.min(100, Math.round(Number(input.importance ?? 50)) || 0)),
+      status,
+      status === "active" || status === "conflict" || status === "pending" ? status : "active",
+      sourcePath,
+      sourceHash,
+      sourceEvidence,
+      sourceAnchorId,
+      Number.isInteger(input.sourceProposalId) && Number(input.sourceProposalId) > 0 ? Number(input.sourceProposalId) : null,
+      JSON.stringify(conflictsWith),
+      JSON.stringify(supersedes),
+    ] as const;
+    if (Number.isInteger(id) && id > 0) {
+      const result = this.database.prepare(`UPDATE continuity_facts SET
+        statement=?,normalized_statement=?,kind=?,scope_kind=?,scope_value=?,valid_from=?,valid_until=?,
+        epistemic=?,known_by_json=?,importance=?,status=?,resume_status=?,source_path=?,source_hash=?,source_evidence=?,source_anchor_id=?,
+        source_proposal_id=?,conflicts_with_json=?,supersedes_json=?,updated_at=? WHERE id=?`)
+        .run(...values, now, id);
+      if (!result.changes) throw new Error("连续性事实不存在");
+    } else {
+      id = Number(this.database.prepare(`INSERT INTO continuity_facts(
+        statement,normalized_statement,kind,scope_kind,scope_value,valid_from,valid_until,epistemic,
+        known_by_json,importance,status,resume_status,source_path,source_hash,source_evidence,source_anchor_id,source_proposal_id,
+        conflicts_with_json,supersedes_json,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(...values, now, now).lastInsertRowid);
+    }
+    const row = this.database.prepare("SELECT * FROM continuity_facts WHERE id=?").get(id) as Row | undefined;
+    if (!row) throw new Error("连续性事实保存失败");
+    return continuityFactFromRow(row);
+  }
+
+  retractContinuityFact(id: number): ContinuityFact {
+    if (!Number.isInteger(id) || id <= 0) throw new Error("连续性事实 ID 无效");
+    const now = new Date().toISOString();
+    if (!this.database.prepare("UPDATE continuity_facts SET status='retracted',updated_at=? WHERE id=?").run(now, id).changes) {
+      throw new Error("连续性事实不存在");
+    }
+    return continuityFactFromRow(this.database.prepare("SELECT * FROM continuity_facts WHERE id=?").get(id) as Row);
+  }
+
+  /**
+   * Revalidate provenance after a document revision. Evidence that survived stays
+   * usable under the new hash; missing evidence becomes stale, never silently deleted.
+   */
+  refreshContinuityFactsForDocument(path: string, content: string): void {
+    const hash = this.project.hash(content);
+    const rows = this.database.prepare(`SELECT id,source_evidence,status,resume_status FROM continuity_facts
+      WHERE source_path=? AND status!='retracted'`).all(path) as Row[];
+    const now = new Date().toISOString();
+    const update = this.database.prepare(`UPDATE continuity_facts
+      SET source_hash=?,source_anchor_id=?,status=?,resume_status=?,updated_at=? WHERE id=?`);
+    for (const row of rows) {
+      const evidence = String(row.source_evidence ?? "");
+      const survives = Boolean(evidence && content.includes(evidence));
+      const oldStatus = String(row.status);
+      const oldResumeStatus = continuityStatus(row.resume_status);
+      const status = survives
+        ? oldStatus === "stale" ? oldResumeStatus : oldStatus
+        : "stale";
+      const resumeStatus = !survives && oldStatus !== "stale"
+        && (oldStatus === "active" || oldStatus === "conflict" || oldStatus === "pending")
+        ? oldStatus
+        : oldResumeStatus;
+      update.run(hash, survives ? continuityEvidenceAnchor(content, hash, evidence) : "", status, resumeStatus, now, Number(row.id));
+    }
+  }
+
+  moveContinuityFactsSource(fromPath: string, toPath: string, content: string): void {
+    const now = new Date().toISOString();
+    const hash = this.project.hash(content);
+    const rows = this.database.prepare(`SELECT id,source_evidence FROM continuity_facts
+      WHERE source_path=? AND status!='retracted'`).all(fromPath) as Row[];
+    const update = this.database.prepare(`UPDATE continuity_facts
+      SET source_path=?,source_hash=?,source_anchor_id=?,updated_at=? WHERE id=?`);
+    for (const row of rows) {
+      update.run(toPath, hash, continuityEvidenceAnchor(content, hash, String(row.source_evidence ?? "")), now, Number(row.id));
+    }
+  }
+
+  saveExtractedContinuityFacts(
+    path: string,
+    content: string,
+    proposalId: number,
+    candidates: ContinuityFactCandidate[],
+  ): ContinuityFact[] {
+    const saved: ContinuityFact[] = [];
+    const hash = this.project.hash(content);
+    for (const candidate of candidates.slice(0, 24)) {
+      if (!candidate.sourceEvidence || !content.includes(candidate.sourceEvidence)) continue;
+      const normalized = normalizeContinuityStatement(candidate.statement);
+      const existing = this.database.prepare(`SELECT * FROM continuity_facts
+        WHERE normalized_statement=? AND scope_kind=? AND scope_value=? AND epistemic=?
+          AND status!='retracted' ORDER BY id DESC LIMIT 1`)
+        .get(normalized, candidate.scopeKind, candidate.scopeValue, candidate.epistemic) as Row | undefined;
+      const status: ContinuityFactStatus = candidate.conflictsWith.length || candidate.supersedes.length
+        ? "conflict"
+        : "active";
+      saved.push(this.saveContinuityFact({
+        ...(existing ? { id: Number(existing.id) } : {}),
+        ...candidate,
+        status,
+        sourcePath: path,
+        sourceHash: hash,
+        sourceProposalId: proposalId,
+      }));
+    }
+    return saved;
+  }
+
+  continuityFactPacket(options: {
+    targetPath?: string;
+    characterIds?: number[];
+    limit?: number;
+  } = {}): ContinuityFact[] {
+    const facts = this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 });
+    const characterKeys = new Set((options.characterIds ?? []).map(String));
+    const targetPath = options.targetPath ?? "";
+    return facts.map(fact => {
+      let score = fact.importance;
+      if (fact.scopeKind === "global") score += 45;
+      if (fact.kind === "milieu") score += 25;
+      if (targetPath && (fact.sourcePath === targetPath || fact.scopeValue === targetPath)) score += 80;
+      if (fact.scopeKind === "character" && characterKeys.has(fact.scopeValue)) score += 80;
+      if (fact.status === "conflict") score += 100;
+      return { fact, score };
+    }).sort((a, b) => b.score - a.score || b.fact.id - a.fact.id)
+      .slice(0, Math.max(1, Math.min(40, options.limit ?? 24)))
+      .map(item => item.fact);
+  }
+
+  searchContinuityFacts(query: string, limit = 8): ContinuityFact[] {
+    const normalized = query.trim().toLocaleLowerCase("zh-CN");
+    if (!normalized) return [];
+    const terms = normalized.match(/[a-z0-9_]{2,}|[\p{Script=Han}]{2,}/gu)?.slice(0, 8) ?? [];
+    if (!terms.length) return [];
+    return this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 })
+      .map(fact => {
+        const haystack = `${fact.statement} ${fact.scopeValue} ${fact.knownBy.join(" ")} ${fact.sourcePath}`
+          .toLocaleLowerCase("zh-CN");
+        const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? Math.max(2, term.length) : 0), 0)
+          + (haystack.includes(normalized) ? 20 : 0);
+        return { fact, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score || b.fact.importance - a.fact.importance)
+      .slice(0, Math.max(1, Math.min(20, limit)))
+      .map(item => item.fact);
+  }
+
   sessionContext(sessionId: string): { activeDocument?: string; currentIntent: string } {
     const row = this.database.prepare("SELECT active_document,current_intent FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
     return { currentIntent: typeof row?.current_intent === "string" ? row.current_intent : "",
@@ -470,13 +849,239 @@ export class WriterStore {
       .run(sessionId, value.activeDocument ?? null, value.currentIntent, "[]", now);
   }
 
-  /** Drop sticky task residue (todos / intent / active doc / tool memory) when dialogue is rewound or a new non-continuation turn starts. */
-  clearSessionTaskState(sessionId: string): void {
+  /**
+   * Drop sticky task residue when the dialogue is rewound or a new task starts.
+   * Immutable context artifacts are session-level read-through cache entries, not
+   * task workflow state. Preserve them across ordinary task switches; rewinds and
+   * reruns keep the default full clear so removed dialogue cannot leak its reads.
+   */
+  clearSessionTaskState(sessionId: string, options: { preserveContextArtifacts?: boolean } = {}): void {
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,agent_checkpoint_json,updated_at) VALUES(?,?,?,?,?,?)
       ON CONFLICT(session_id) DO UPDATE SET active_document=NULL, current_intent='', todos_json='[]', agent_checkpoint_json='{}', updated_at=excluded.updated_at`)
       .run(sessionId, null, "", "[]", "{}", now);
-    this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
+    if (!options.preserveContextArtifacts) {
+      this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
+    }
+  }
+
+  upsertMessageStepTrail(
+    sessionId: string,
+    sourceMessageId: number,
+    steps: PersistedStreamStep[],
+    options?: { jobId?: string },
+  ): void {
+    if (!this.sessionExists(sessionId)) return;
+    if (!Number.isInteger(sourceMessageId) || sourceMessageId < 1) return;
+    if (!Array.isArray(steps) || !steps.length) return;
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO message_step_trails(session_id,source_message_id,job_id,steps_json,updated_at)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(session_id,source_message_id) DO UPDATE SET
+        job_id=excluded.job_id,
+        steps_json=excluded.steps_json,
+        updated_at=excluded.updated_at`)
+      .run(sessionId, sourceMessageId, options?.jobId ?? null, JSON.stringify(steps), now);
+  }
+
+  messageStepTrails(sessionId: string, sourceMessageIds?: number[]): MessageStepTrail[] {
+    if (!this.sessionExists(sessionId)) return [];
+    const rows = sourceMessageIds?.length
+      ? (() => {
+          const ids = [...new Set(sourceMessageIds.filter(id => Number.isInteger(id) && id > 0))];
+          if (!ids.length) return [] as Row[];
+          const placeholders = ids.map(() => "?").join(",");
+          return this.database.prepare(
+            `SELECT source_message_id,job_id,steps_json,updated_at FROM message_step_trails
+              WHERE session_id=? AND source_message_id IN (${placeholders})
+              ORDER BY source_message_id ASC`,
+          ).all(sessionId, ...ids) as Row[];
+        })()
+      : this.database.prepare(
+          `SELECT source_message_id,job_id,steps_json,updated_at FROM message_step_trails
+            WHERE session_id=? ORDER BY source_message_id DESC LIMIT 50`,
+        ).all(sessionId) as Row[];
+    return rows.flatMap(row => {
+      try {
+        const steps = JSON.parse(String(row.steps_json ?? "[]")) as unknown;
+        if (!Array.isArray(steps) || !steps.length) return [];
+        const normalized = steps.flatMap((item): PersistedStreamStep[] => {
+          if (!item || typeof item !== "object") return [];
+          const step = item as Record<string, unknown>;
+          const id = Number(step.id);
+          if (!Number.isFinite(id)) return [];
+          const status = step.status === "running" || step.status === "failed" ? step.status : "completed";
+          return [{
+            id,
+            output: typeof step.output === "string" ? step.output : "",
+            reasoning: typeof step.reasoning === "string" ? step.reasoning : "",
+            tools: Array.isArray(step.tools) ? step.tools.filter((name): name is string => typeof name === "string") : [],
+            status,
+            ...(step.usage && typeof step.usage === "object" ? { usage: step.usage as PersistedStreamStep["usage"] } : {}),
+          }];
+        });
+        if (!normalized.length) return [];
+        return [{
+          sourceMessageId: Number(row.source_message_id),
+          ...(typeof row.job_id === "string" && row.job_id ? { jobId: row.job_id } : {}),
+          steps: normalized,
+          updatedAt: String(row.updated_at ?? ""),
+        }];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  deleteMessageStepTrailsFrom(sessionId: string, fromMessageId: number): void {
+    if (!this.sessionExists(sessionId)) return;
+    if (!Number.isInteger(fromMessageId) || fromMessageId < 1) return;
+    this.database.prepare(
+      "DELETE FROM message_step_trails WHERE session_id=? AND source_message_id>=?",
+    ).run(sessionId, fromMessageId);
+  }
+
+  createContextNode(input: {
+    sessionId: string;
+    kind: ContextNodeKind;
+    label: string;
+    status?: ContextNodeStatus;
+    sourceMessageId?: number;
+    jobId?: string;
+    payload?: Record<string, unknown>;
+    id?: string;
+  }): ContextNode {
+    const now = new Date().toISOString();
+    const node: ContextNode = {
+      id: input.id ?? newContextNodeId(input.kind === "epoch" ? "epoch" : input.kind === "handoff" ? "hand" : "ctx"),
+      sessionId: input.sessionId,
+      kind: input.kind,
+      status: input.status ?? "active",
+      label: input.label,
+      ...(input.sourceMessageId != null ? { sourceMessageId: input.sourceMessageId } : {}),
+      ...(input.jobId ? { jobId: input.jobId } : {}),
+      payload: input.payload ?? {},
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.database.prepare(`INSERT INTO context_nodes(
+      id,session_id,kind,status,label,source_message_id,job_id,payload_json,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      node.id, node.sessionId, node.kind, node.status, node.label,
+      node.sourceMessageId ?? null, node.jobId ?? null, JSON.stringify(node.payload),
+      node.createdAt, node.updatedAt,
+    );
+    return node;
+  }
+
+  addContextEdge(input: {
+    sessionId: string;
+    fromId: string;
+    toId: string;
+    kind: ContextEdgeKind;
+  }): ContextEdge {
+    const edge: ContextEdge = {
+      id: newContextEdgeId(),
+      sessionId: input.sessionId,
+      fromId: input.fromId,
+      toId: input.toId,
+      kind: input.kind,
+      createdAt: new Date().toISOString(),
+    };
+    this.database.prepare(
+      "INSERT INTO context_edges(id,session_id,from_id,to_id,kind,created_at) VALUES(?,?,?,?,?,?)",
+    ).run(edge.id, edge.sessionId, edge.fromId, edge.toId, edge.kind, edge.createdAt);
+    return edge;
+  }
+
+  updateContextNode(sessionId: string, id: string, patch: {
+    status?: ContextNodeStatus;
+    label?: string;
+    payload?: Record<string, unknown>;
+  }): void {
+    const row = this.database.prepare("SELECT * FROM context_nodes WHERE session_id=? AND id=?")
+      .get(sessionId, id) as Row | undefined;
+    if (!row) return;
+    const status = patch.status ?? String(row.status);
+    const label = patch.label ?? String(row.label ?? "");
+    const payload = patch.payload ?? JSON.parse(String(row.payload_json || "{}"));
+    const updatedAt = new Date().toISOString();
+    this.database.prepare(
+      "UPDATE context_nodes SET status=?, label=?, payload_json=?, updated_at=? WHERE session_id=? AND id=?",
+    ).run(status, label, JSON.stringify(payload), updatedAt, sessionId, id);
+  }
+
+  contextNodes(sessionId: string, options?: { status?: ContextNodeStatus; kind?: ContextNodeKind }): ContextNode[] {
+    if (!this.sessionExists(sessionId)) return [];
+    let sql = "SELECT * FROM context_nodes WHERE session_id=?";
+    const args: Array<string | number | null> = [sessionId];
+    if (options?.status) {
+      sql += " AND status=?";
+      args.push(options.status);
+    }
+    if (options?.kind) {
+      sql += " AND kind=?";
+      args.push(options.kind);
+    }
+    sql += " ORDER BY created_at ASC";
+    return (this.database.prepare(sql).all(...args) as Row[]).map(row => this.contextNodeFromRow(row));
+  }
+
+  contextEdges(sessionId: string): ContextEdge[] {
+    if (!this.sessionExists(sessionId)) return [];
+    return (this.database.prepare(
+      "SELECT * FROM context_edges WHERE session_id=? ORDER BY created_at ASC",
+    ).all(sessionId) as Row[]).map(row => ({
+      id: String(row.id),
+      sessionId: String(row.session_id),
+      fromId: String(row.from_id),
+      toId: String(row.to_id),
+      kind: row.kind as ContextEdgeKind,
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  contextGraph(sessionId: string): ContextGraphView {
+    return buildContextGraphView(sessionId, this.contextNodes(sessionId), this.contextEdges(sessionId));
+  }
+
+  activeContextHandoffs(sessionId: string): ContextNode[] {
+    return this.contextNodes(sessionId, { status: "active", kind: "handoff" });
+  }
+
+  /**
+   * Archive graph nodes tied to rewound messages (edit / re-run).
+   * Keeps history for debugging but removes them from active assemble.
+   */
+  archiveContextGraphFrom(sessionId: string, fromMessageId: number): void {
+    if (!this.sessionExists(sessionId)) return;
+    if (!Number.isInteger(fromMessageId) || fromMessageId < 1) return;
+    const now = new Date().toISOString();
+    this.database.prepare(`UPDATE context_nodes SET status='archived', updated_at=?
+      WHERE session_id=? AND source_message_id IS NOT NULL AND source_message_id>=? AND status='active'`)
+      .run(now, sessionId, fromMessageId);
+    // Also archive epochs/handoffs that only hang off archived messages via job id later if needed.
+  }
+
+  private contextNodeFromRow(row: Row): ContextNode {
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(String(row.payload_json || "{}")) as Record<string, unknown>;
+    } catch {
+      payload = {};
+    }
+    return {
+      id: String(row.id),
+      sessionId: String(row.session_id),
+      kind: row.kind as ContextNodeKind,
+      status: row.status === "archived" ? "archived" : "active",
+      label: String(row.label ?? ""),
+      ...(row.source_message_id != null ? { sourceMessageId: Number(row.source_message_id) } : {}),
+      ...(typeof row.job_id === "string" && row.job_id ? { jobId: String(row.job_id) } : {}),
+      payload,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
   }
 
   sessionTodos(sessionId: string): AgentTodoItem[] {
@@ -658,6 +1263,57 @@ export class WriterStore {
       .run(new Date().toISOString(), sessionId);
   }
 
+  /**
+   * The session's frozen turn chain, oldest first. A block that fails to parse is
+   * dropped along with everything after it: replay must be a contiguous prefix of
+   * what was actually sent, otherwise tool_call/tool_result pairs can straddle the gap.
+   */
+  agentTurnBlocks(sessionId: string): AgentTurnBlock[] {
+    const rows = this.database
+      .prepare("SELECT turn_index,messages_json,estimated_tokens,created_at FROM agent_turn_blocks WHERE session_id=? ORDER BY turn_index")
+      .all(sessionId) as Row[];
+    const blocks: AgentTurnBlock[] = [];
+    for (const row of rows) {
+      const messages = parseAgentTurnMessages(row.messages_json);
+      if (!messages) break;
+      blocks.push({
+        turnIndex: Number(row.turn_index) || 0,
+        messages,
+        estimatedTokens: Number(row.estimated_tokens) || 0,
+        createdAt: String(row.created_at ?? ""),
+      });
+    }
+    return blocks;
+  }
+
+  appendAgentTurnBlock(sessionId: string, block: { turnIndex: number; messages: AgentTurnMessage[]; estimatedTokens: number }): void {
+    if (!block.messages.length) return;
+    this.database.prepare(`INSERT INTO agent_turn_blocks(session_id,turn_index,messages_json,estimated_tokens,created_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(session_id,turn_index) DO UPDATE SET
+        messages_json=excluded.messages_json,estimated_tokens=excluded.estimated_tokens,created_at=excluded.created_at`)
+      .run(sessionId, block.turnIndex, JSON.stringify(block.messages), block.estimatedTokens, new Date().toISOString());
+  }
+
+  /** Rewrite the whole chain (boundary compaction). Turn indexes are renumbered from 0. */
+  replaceAgentTurnBlocks(sessionId: string, blocks: { messages: AgentTurnMessage[]; estimatedTokens: number }[]): void {
+    this.clearAgentTurnBlocks(sessionId);
+    blocks.forEach((block, index) => {
+      this.appendAgentTurnBlock(sessionId, { turnIndex: index, messages: block.messages, estimatedTokens: block.estimatedTokens });
+    });
+  }
+
+  clearAgentTurnBlocks(sessionId: string): void {
+    this.database.prepare("DELETE FROM agent_turn_blocks WHERE session_id=?").run(sessionId);
+  }
+
+  nextAgentTurnIndex(sessionId: string): number {
+    const row = this.database.prepare("SELECT MAX(turn_index) AS max_index FROM agent_turn_blocks WHERE session_id=?").get(sessionId) as Row | undefined;
+    // MAX over no rows is NULL, and Number(null) is 0 — an empty chain must start at 0, not 1.
+    if (row?.max_index === null || row?.max_index === undefined) return 0;
+    const max = Number(row.max_index);
+    return Number.isFinite(max) ? max + 1 : 0;
+  }
+
   saveRoleplayInterlocutor(input: RoleplayInterlocutor & { id?: number; targetCharacterId?: number }): SavedRoleplayInterlocutor {
     const value: RoleplayInterlocutor = {
       name: roleplayField(input.name, "名称", 120, true),
@@ -767,9 +1423,27 @@ export class WriterStore {
         this.clearActiveRoleplay(sessionId);
         return undefined;
       }
-      const sceneId = Number(raw.sceneId);
-      const scene = Number.isInteger(sceneId) && sceneId > 0 ? this.roleplayScenes().find(item => item.id === sceneId) : undefined;
-      return { performer, identity, ...(scene ? { scene } : {}) };
+      const scenes = this.roleplayScenes();
+      const storedSceneIds = Array.isArray(raw.sceneIds)
+        ? [...new Set(raw.sceneIds.map(Number).filter(id => Number.isInteger(id) && id > 0))]
+        : [];
+      const legacySceneId = Number(raw.sceneId);
+      const sceneIds = Array.isArray(raw.sceneIds)
+        ? storedSceneIds
+        : Number.isInteger(legacySceneId) && legacySceneId > 0 ? [legacySceneId] : [];
+      const sceneSequence = sceneIds.flatMap(id => {
+        const scene = scenes.find(item => item.id === id);
+        return scene ? [scene] : [];
+      });
+      const storedSceneIndex = Number(raw.sceneIndex);
+      const sceneIndex = sceneSequence.length
+        ? Math.min(Math.max(Number.isInteger(storedSceneIndex) ? storedSceneIndex : 0, 0), sceneSequence.length - 1)
+        : 0;
+      const scene = sceneSequence[sceneIndex];
+      const contentRating: RoleplayContentRating = raw.contentRating === "sfw" || raw.contentRating === "nsfw"
+        ? raw.contentRating
+        : "default";
+      return { performer, identity, ...(scene ? { scene } : {}), sceneSequence, sceneIndex, contentRating };
     }
     // Compatibility with the previous shape: normal performer + interlocutor JSON.
     const character = this.characters().find(item => item.id === characterId);
@@ -785,6 +1459,9 @@ export class WriterStore {
     return {
       performer: normalRoleplayParticipant(character),
       identity: saved ? simpleRoleplayParticipant(saved) : { kind: "generated", name: base.name, card: base },
+      sceneSequence: [],
+      sceneIndex: 0,
+      contentRating: "default",
     };
   }
 
@@ -793,6 +1470,9 @@ export class WriterStore {
     performerInput: number | RoleplayParticipant,
     identityInput: RoleplayParticipant | RoleplayInterlocutor | SavedRoleplayInterlocutor,
     sceneInput?: number | RoleplayScene,
+    contentRatingInput?: RoleplayContentRating,
+    sceneSequenceInput?: number[],
+    sceneIndexInput?: number,
   ): ActiveRoleplayState {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
     const performer = typeof performerInput === "number"
@@ -812,16 +1492,42 @@ export class WriterStore {
       identity = { kind: "generated", name: base.name, card: base };
     }
     if (!identity) throw new Error("当前身份角色卡不存在");
+    const scenes = this.roleplayScenes();
     const sceneId = typeof sceneInput === "number" ? sceneInput : sceneInput?.id;
-    const scene = Number.isInteger(sceneId) ? this.roleplayScenes().find(item => item.id === sceneId) : undefined;
-    if (sceneId !== undefined && !scene) throw new Error("角色扮演场景不存在");
-    const active: ActiveRoleplayState = { performer: normalizedPerformer, identity, ...(scene ? { scene } : {}) };
+    const legacyScene = Number.isInteger(sceneId) ? scenes.find(item => item.id === sceneId) : undefined;
+    if (sceneId !== undefined && !legacyScene) throw new Error("角色扮演场景不存在");
+    const requestedSceneIds = sceneSequenceInput === undefined
+      ? (legacyScene ? [legacyScene.id] : [])
+      : [...new Set(sceneSequenceInput.map(Number).filter(id => Number.isInteger(id) && id > 0))];
+    const sceneSequence = requestedSceneIds.map(id => {
+      const scene = scenes.find(item => item.id === id);
+      if (!scene) throw new Error("角色扮演场景不存在");
+      return scene;
+    });
+    const requestedSceneIndex = Number(sceneIndexInput);
+    const sceneIndex = sceneSequence.length
+      ? Math.min(Math.max(Number.isInteger(requestedSceneIndex) ? requestedSceneIndex : 0, 0), sceneSequence.length - 1)
+      : 0;
+    const scene = sceneSequence[sceneIndex];
+    const contentRating: RoleplayContentRating = contentRatingInput === "sfw" || contentRatingInput === "nsfw"
+      ? contentRatingInput
+      : "default";
+    const active: ActiveRoleplayState = {
+      performer: normalizedPerformer, identity, ...(scene ? { scene } : {}), sceneSequence, sceneIndex, contentRating,
+    };
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO active_roleplays(session_id,character_id,interlocutor_json,updated_at)
       VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
       character_id=excluded.character_id,interlocutor_json=excluded.interlocutor_json,updated_at=excluded.updated_at`)
       .run(sessionId, normalizedPerformer.kind === "normal" ? (normalizedPerformer.id ?? 0) : 0,
-        JSON.stringify({ performer: active.performer, identity: active.identity, ...(scene ? { sceneId: scene.id } : {}) }), now);
+        JSON.stringify({
+          performer: active.performer,
+          identity: active.identity,
+          ...(scene ? { sceneId: scene.id } : {}),
+          sceneIds: sceneSequence.map(item => item.id),
+          sceneIndex,
+          contentRating,
+        }), now);
     return active;
   }
 
@@ -844,9 +1550,9 @@ export class WriterStore {
     return undefined;
   }
 
-  clearActiveRoleplay(sessionId: string): void {
+  clearActiveRoleplay(sessionId: string, options?: { preserveMemory?: boolean }): void {
     this.database.prepare("DELETE FROM active_roleplays WHERE session_id=?").run(sessionId);
-    this.clearRoleplayMemory(sessionId);
+    if (!options?.preserveMemory) this.clearRoleplayMemory(sessionId);
   }
 
   roleplayMemory(sessionId: string): RoleplaySessionMemory | undefined {
@@ -1242,6 +1948,37 @@ export class WriterStore {
       : undefined;
   }
 
+  /** Persist the exact user message sent to the roleplay model for prefix-cache replay. */
+  saveRoleplayModelInput(sessionId: string, messageId: number, content: string): void {
+    const result = this.database.prepare(`UPDATE messages SET roleplay_model_input=?
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .run(content, sessionId, messageId);
+    if (!result.changes) throw new Error("角色扮演消息不存在");
+  }
+
+  roleplayModelInput(sessionId: string, messageId: number): string | undefined {
+    const row = this.database.prepare(`SELECT roleplay_model_input FROM messages
+      WHERE session_id=? AND id=? AND channel='roleplay' AND role='user'`)
+      .get(sessionId, messageId) as Row | undefined;
+    return typeof row?.roleplay_model_input === "string" && row.roleplay_model_input
+      ? row.roleplay_model_input
+      : undefined;
+  }
+
+  roleplayModelInputs(sessionId: string, messageIds: number[]): Map<number, string> {
+    const ids = [...new Set(messageIds.filter(id => Number.isInteger(id) && id > 0))];
+    if (!ids.length) return new Map();
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.database.prepare(`SELECT id,roleplay_model_input FROM messages
+      WHERE session_id=? AND channel='roleplay' AND role='user' AND id IN (${placeholders})`)
+      .all(sessionId, ...ids) as Row[];
+    return new Map(rows.flatMap(row =>
+      typeof row.roleplay_model_input === "string" && row.roleplay_model_input
+        ? [[Number(row.id), row.roleplay_model_input] as const]
+        : [],
+    ));
+  }
+
   messages(sessionId: string, limit = 30, options?: { channel?: MessageChannel }): Message[] {
     const channel = options?.channel;
     const rows = channel
@@ -1372,11 +2109,11 @@ export class WriterStore {
 
   recordUsage(sessionId: string, model: string, usage: {
     promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number;
-  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number; requestComponents?: import("./types.js").RequestComponentUsage[] } = {}): UsageSummary {
+  }, pricing: TokenPricing, at: Date = new Date(), meta: { jobId?: string; callKind?: string; step?: number; providerName?: string; requestComponents?: import("./types.js").RequestComponentUsage[] } = {}): UsageSummary {
     const miss = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
     const cost = calculateUsageCost({ ...usage, cacheMissTokens: miss }, pricing, at);
-    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step,request_components_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null, JSON.stringify(meta.requestComponents ?? []));
+    this.database.prepare(`INSERT INTO model_usage(session_id,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,currency,created_at,job_id,call_kind,step,request_components_json,provider_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(sessionId, model, usage.promptTokens, usage.completionTokens, usage.cacheHitTokens, miss, cost, pricing.currency, at.toISOString(), meta.jobId ?? null, meta.callKind ?? "unspecified", meta.step ?? null, JSON.stringify(meta.requestComponents ?? []), meta.providerName?.trim() ?? "");
     return this.usage(sessionId);
   }
 
@@ -1394,11 +2131,32 @@ export class WriterStore {
     const cacheHitTokens = Number(row.cache_hit_tokens);
     const cacheMissTokens = Number(row.cache_miss_tokens);
     const measuredInput = cacheHitTokens + cacheMissTokens;
+    const callBreakdown = (this.database.prepare(`SELECT
+      provider_name, model, COUNT(*) call_count,
+      COALESCE(SUM(prompt_tokens),0) prompt_tokens,
+      COALESCE(SUM(completion_tokens),0) completion_tokens,
+      COALESCE(SUM(cache_hit_tokens),0) cache_hit_tokens,
+      COALESCE(SUM(cache_miss_tokens),0) cache_miss_tokens,
+      COALESCE(SUM(cost),0) cost, COALESCE(MAX(currency),'CNY') currency,
+      MAX(id) recent_id
+      FROM model_usage WHERE session_id=?
+      GROUP BY provider_name,model,currency ORDER BY recent_id DESC`).all(sessionId) as Row[]).map(item => ({
+        providerName: String(item.provider_name || "未记录"),
+        model: String(item.model),
+        callCount: Number(item.call_count),
+        promptTokens: Number(item.prompt_tokens),
+        completionTokens: Number(item.completion_tokens),
+        cacheHitTokens: Number(item.cache_hit_tokens),
+        cacheMissTokens: Number(item.cache_miss_tokens),
+        cost: Number(item.cost),
+        currency: String(item.currency),
+      }));
     return {
       promptTokens, completionTokens, cacheHitTokens,
       cacheMissTokens, totalTokens: promptTokens + completionTokens,
       cost: Number(row.cost), currency: String(row.currency), lastPromptTokens: Number(row.last_prompt_tokens),
       cacheHitRate: measuredInput > 0 ? cacheHitTokens / measuredInput : 0,
+      callBreakdown,
     };
   }
 
@@ -1547,8 +2305,7 @@ export class WriterStore {
         ...(targetPath ? { targetBaseHash: "__missing__" } : {}),
       };
     });
-    const sourceRef = files[0]?.targetPath ?? files[0]?.path ?? "characters/characters.jsonl";
-    this.evolveCharactersForProposal(sourceRef, summary, characterChanges);
+    this.evolveCharactersForProposal(characterChanges);
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -1616,8 +2373,7 @@ export class WriterStore {
       this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
       throw error;
     }
-    const sourceRef = changeSet.files[0]?.targetPath ?? changeSet.files[0]?.path ?? "characters/characters.jsonl";
-    const evolved = this.evolveCharactersForProposal(sourceRef, changeSet.summary, changeSet.characterChanges);
+    const evolved = this.evolveCharactersForProposal(changeSet.characterChanges);
     const snapshots = this.captureManagedFiles(changeSet.files);
     const originalCharacters = this.characters();
     const originalConfig = this.project.readRaw("writer.yaml");
@@ -1629,6 +2385,7 @@ export class WriterStore {
       if (evolved.revisions.length) this.writeCharacters(evolved.characters);
       this.database.prepare("UPDATE change_sets SET status='accepted',undone=0,character_revisions_json=?,after_config=? WHERE id=?")
         .run(JSON.stringify(evolved.revisions), this.project.readRaw("writer.yaml"), id);
+      this.refreshContinuityFactsForChangeSet(changeSet.files, true);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -1660,6 +2417,7 @@ export class WriterStore {
       validateCharacters(restoredCharacters, this.outlineNodeIds());
       if (characterRevisions.length) this.writeCharacters(restoredCharacters);
       this.database.prepare("UPDATE change_sets SET undone=1 WHERE id=?").run(id);
+      this.refreshContinuityFactsForChangeSet(changeSet.files, false);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -1691,6 +2449,7 @@ export class WriterStore {
       validateCharacters(restoredCharacters, this.outlineNodeIds());
       if (characterRevisions.length) this.writeCharacters(restoredCharacters);
       this.database.prepare("UPDATE change_sets SET undone=0 WHERE id=?").run(id);
+      this.refreshContinuityFactsForChangeSet(changeSet.files, true);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -1785,6 +2544,20 @@ export class WriterStore {
     }
   }
 
+  private refreshContinuityFactsForChangeSet(files: ChangeSetFileChange[], applied: boolean): void {
+    for (const file of files) {
+      if (file.operation === "move" && file.targetPath) {
+        if (applied) this.moveContinuityFactsSource(file.path, file.targetPath, file.afterContent);
+        else this.moveContinuityFactsSource(file.targetPath, file.path, file.beforeContent);
+        continue;
+      }
+      this.refreshContinuityFactsForDocument(
+        file.path,
+        applied ? file.operation === "delete" ? "" : file.afterContent : file.beforeContent,
+      );
+    }
+  }
+
   private restoreChangeSetFiles(files: ChangeSetFileChange[]): void {
     for (const file of [...files].reverse()) {
       if (file.operation === "move" && file.targetPath && this.project.textFileExists(file.targetPath)) {
@@ -1807,21 +2580,26 @@ export class WriterStore {
     else this.project.removeTextFile(path);
   }
 
-  createProposal(sessionId: string, path: string, content: string, summary: string, characterChanges: ProposalCharacterChange[] = []): Proposal {
+  createProposal(
+    sessionId: string,
+    path: string,
+    content: string,
+    summary: string,
+    characterChanges: ProposalCharacterChange[] = [],
+    qualityReport?: ProseQualityReport,
+  ): Proposal {
     const exists = this.project.documentExists(path);
     const before = exists ? this.project.read(path) : "";
-    this.evolveCharactersForProposal(path, summary, characterChanges);
+    this.evolveCharactersForProposal(characterChanges);
     const now = new Date().toISOString();
     const result = this.database.prepare(`
-      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,status,created_at)
-      VALUES(?,?,?,?,?,?,?,'pending',?)
-    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), now);
+      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
+      VALUES(?,?,?,?,?,?,?,?,'pending',?)
+    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
     return this.proposal(Number(result.lastInsertRowid));
   }
 
   private evolveCharactersForProposal(
-    path: string,
-    summary: string,
     changes: ProposalCharacterChange[],
   ): { characters: Character[]; revisions: ProposalCharacterRevision[] } {
     let characters = this.characters();
@@ -1831,7 +2609,6 @@ export class WriterStore {
       if (!before) throw new Error(`延迟角色演进失败：角色 ${change.characterId} 不存在`);
       const result = applyCharacterChangesCore(before, {
         reason: change.reason,
-        sourceRef: { type: "document", ref: path, note: summary },
         changes: change.changes,
       });
       if (result.skipped.length) {
@@ -1858,6 +2635,7 @@ export class WriterStore {
   }
 
   private proposalFromRow(row: Row): Proposal {
+    const qualityReport = parseProposalQualityReport(row.quality_report_json);
     return {
       id: row.id as number,
       sessionId: row.session_id as string,
@@ -1869,11 +2647,13 @@ export class WriterStore {
       status: row.status as Proposal["status"],
       createdAt: row.created_at as string,
       characterChanges: parseProposalCharacterChanges(row.character_changes_json),
+      ...(qualityReport ? { qualityReport } : {}),
     };
   }
 
   acceptProposal(id: number): Proposal {
     const proposal = this.proposal(id);
+    if (proposal.status === "accepted") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
     const intendedCreate = proposal.baseHash === "__missing__";
     const exists = this.project.documentExists(proposal.path);
@@ -1888,7 +2668,7 @@ export class WriterStore {
       this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
       throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
     }
-    const evolved = this.evolveCharactersForProposal(proposal.path, proposal.summary, proposal.characterChanges);
+    const evolved = this.evolveCharactersForProposal(proposal.characterChanges);
     this.project.writeRaw(proposal.path, proposal.afterContent);
     if (evolved.revisions.length) this.writeCharacters(evolved.characters);
     const now = new Date().toISOString();
@@ -1900,12 +2680,14 @@ export class WriterStore {
       JSON.stringify(evolved.revisions), now,
     );
     this.database.prepare("UPDATE proposals SET status='accepted' WHERE id=?").run(id);
+    this.refreshContinuityFactsForDocument(proposal.path, proposal.afterContent);
     this.reindex();
     return this.proposal(id);
   }
 
   rejectProposal(id: number): Proposal {
     const proposal = this.proposal(id);
+    if (proposal.status === "rejected") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
     this.database.prepare("UPDATE proposals SET status='rejected' WHERE id=?").run(id);
     return this.proposal(id);
@@ -1933,6 +2715,7 @@ export class WriterStore {
     else this.project.writeRaw(path, row.before_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(row.id as number);
+    this.refreshContinuityFactsForDocument(path, row.created_file === 1 ? "" : String(row.before_content));
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已撤销文档修改：${path}`);
     return path;
@@ -1962,6 +2745,7 @@ export class WriterStore {
     this.project.writeRaw(path, row.after_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=0 WHERE id=?").run(row.id as number);
+    this.refreshContinuityFactsForDocument(path, String(row.after_content));
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已重做文档修改：${path}`);
     return path;
@@ -1979,6 +2763,7 @@ export class WriterStore {
     else this.project.writeRaw(path, String(row.before_content));
     if (revisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(Number(row.id));
+    this.refreshContinuityFactsForDocument(path, Number(row.created_file) === 1 ? "" : String(row.before_content));
     return {
       path,
       characterNames: revisions.map(revision => this.normalizeCharacter(revision.after).identity.name),
@@ -2049,6 +2834,8 @@ export class WriterStore {
     }
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
+    this.deleteMessageStepTrailsFrom(sessionId, fromId);
+    this.archiveContextGraphFrom(sessionId, fromId);
     // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
     if (userRow.channel === "roleplay") this.restoreRoleplayMemoryBefore(sessionId, fromId);
@@ -2076,7 +2863,7 @@ export class WriterStore {
   ): {
     fromId: number; prompt: string; channel: MessageChannel; variantGroupId: string; keepChanges: boolean;
     inputMode?: RoleplayInputMode;
-    modelInitiatedRoleplay?: "opening";
+    modelInitiatedRoleplay?: "opening" | "continuation";
   } {
     if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
     const target = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id
@@ -2103,6 +2890,8 @@ export class WriterStore {
         this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
         this.clearSessionTaskState(sessionId);
         this.restoreRoleplayMemoryBefore(sessionId, fromId);
+        this.deleteMessageStepTrailsFrom(sessionId, fromId);
+        this.archiveContextGraphFrom(sessionId, fromId);
         this.addSystemMessage(sessionId, `已撤销角色主动开场 #${fromId} 及其后续对话，准备重新演出。`);
         this.reindex();
         return {
@@ -2152,7 +2941,31 @@ export class WriterStore {
       variantGroupId: groupId,
       keepChanges: rewound.keepChanges,
       ...(inputMode ? { inputMode } : {}),
+      ...(channel === "roleplay" && prompt === "<续演>"
+        ? { modelInitiatedRoleplay: "continuation" as const }
+      : {}),
     };
+  }
+
+  interruptedAgentResumePrompt(sessionId: string, targetId: number): { prompt: string; fromId: number } {
+    if (!this.sessionExists(sessionId)) throw new Error("会话不存在");
+    const target = this.database.prepare(`SELECT id,role,content,channel FROM messages WHERE id=? AND session_id=?`)
+      .get(targetId, sessionId) as Row | undefined;
+    if (!target) throw new Error("消息不存在");
+    if (target.channel !== "agent") throw new Error("只能续跑 Agent 消息");
+    if (target.role === "user") {
+      const prompt = String(target.content).trim();
+      if (!prompt) throw new Error("原始用户指令为空，无法续跑");
+      return { fromId: Number(target.id), prompt };
+    }
+    if (target.role !== "assistant" || !String(target.content).includes("[生成已中断]")) {
+      throw new Error("只能续跑已中断的 Agent 回复或对应用户指令");
+    }
+    const user = this.database.prepare(`SELECT id,content FROM messages
+      WHERE session_id=? AND role='user' AND channel='agent' AND id<? ORDER BY id DESC LIMIT 1`)
+      .get(sessionId, targetId) as Row | undefined;
+    if (!user || !String(user.content).trim()) throw new Error("未找到可续跑的原始用户指令");
+    return { fromId: Number(user.id), prompt: String(user.content) };
   }
 
   archiveRoleplayBranch(sessionId: string, fromMessageId: number, groupId: string): RoleplayBranchSummary | undefined {
@@ -2166,7 +2979,7 @@ export class WriterStore {
     const baseMessageId = existingBase.value === null || existingBase.value === undefined
       ? Number(immediateBase.value) || 0
       : Number(existingBase.value) || 0;
-    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
+    const rows = this.database.prepare(`SELECT id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_model_input,roleplay_input_mode
       FROM messages WHERE session_id=? AND id>? ORDER BY id`).all(sessionId, baseMessageId) as Row[];
     const dialogueRows = rows.filter(row => row.role === "user" || row.role === "assistant");
     if (dialogueRows.some(row => row.channel !== "roleplay")) return undefined;
@@ -2178,6 +2991,7 @@ export class WriterStore {
       channel: row.channel === "roleplay" ? "roleplay" : "agent",
       ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
       ...(typeof row.roleplay_perception === "string" ? { roleplayPerception: row.roleplay_perception } : {}),
+      ...(typeof row.roleplay_model_input === "string" ? { roleplayModelInput: row.roleplay_model_input } : {}),
       ...(row.roleplay_input_mode === "director" || row.roleplay_input_mode === "dialogue"
         ? { roleplayInputMode: row.roleplay_input_mode }
         : {}),
@@ -2250,16 +3064,17 @@ export class WriterStore {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>?").run(sessionId, baseMessageId);
+      this.database.prepare("DELETE FROM message_step_trails WHERE session_id=? AND source_message_id>?").run(sessionId, baseMessageId);
       this.database.prepare("DELETE FROM roleplay_memory_snapshots WHERE session_id=? AND through_message_id>?")
         .run(sessionId, baseMessageId);
       this.database.prepare("DELETE FROM roleplay_memory_facts WHERE session_id=? AND source_message_id>? AND pinned=0")
         .run(sessionId, baseMessageId);
       const insertMessage = this.database.prepare(`INSERT INTO messages(
-        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_input_mode
-      ) VALUES(?,?,?,?,?,?,?,?,?)`);
+        id,session_id,role,content,created_at,channel,variant_group_id,roleplay_perception,roleplay_model_input,roleplay_input_mode
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`);
       for (const message of payload.messages) insertMessage.run(
         message.id, sessionId, message.role, message.content, message.createdAt, message.channel,
-        message.variantGroupId ?? null, message.roleplayPerception ?? null,
+        message.variantGroupId ?? null, message.roleplayPerception ?? null, message.roleplayModelInput ?? null,
         message.roleplayInputMode === "director" || message.roleplayInputMode === "dialogue"
           ? message.roleplayInputMode
           : message.channel === "roleplay" && message.role === "user"
@@ -2337,10 +3152,40 @@ export class WriterStore {
     if (this.project.hash(current) !== baseHash) throw new Error("文档已在其他位置修改，请刷新后重试");
     this.project.writeRaw(path, content);
     this.database.prepare(`
-      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_at)
-      VALUES(NULL,?,?,?,?,?)
-    `).run(path, current, content, this.project.hash(content), new Date().toISOString());
+      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,label,created_at)
+      VALUES(NULL,?,?,?,?,?,?)
+    `).run(path, current, content, this.project.hash(content), "手动编辑", new Date().toISOString());
     this.reindex();
+  }
+
+  chapterSummaries(): ChapterSummary[] {
+    const revisionRows = this.database.prepare(`
+      SELECT path, COUNT(*) AS version_count, MAX(created_at) AS updated_at
+      FROM revisions WHERE path LIKE 'chapters/%' GROUP BY path
+    `).all() as Row[];
+    const revisions = new Map(revisionRows.map(row => [String(row.path), {
+      count: Number(row.version_count),
+      updatedAt: String(row.updated_at ?? ""),
+    }]));
+    return this.project.listDocuments()
+      .filter(path => path.startsWith("chapters/"))
+      .map((path) => {
+        const content = this.project.read(path);
+        const title = content.match(/^\s*#\s+(.+)$/mu)?.[1]?.trim()
+          || path.split("/").pop()!.replace(/\.md$/iu, "");
+        const relative = path.slice("chapters/".length);
+        const slash = relative.lastIndexOf("/");
+        const revision = revisions.get(path);
+        return {
+          path,
+          title,
+          volume: slash >= 0 ? relative.slice(0, slash) : "",
+          wordCount: content.replace(/\s+/gu, "").length,
+          versionCount: revision?.count ?? 0,
+          updatedAt: revision?.updatedAt ?? "",
+        };
+      })
+      .sort((a, b) => a.path.localeCompare(b.path, "zh-CN", { numeric: true }));
   }
 
   /**
@@ -2353,7 +3198,7 @@ export class WriterStore {
     const live = this.project.documentExists(path) ? this.project.read(path) : "";
     const liveHash = live ? this.project.hash(live) : "";
     const rows = this.database.prepare(`
-      SELECT r.id, r.path, r.after_hash, r.created_file, r.created_at, r.undone,
+      SELECT r.id, r.path, r.after_hash, r.created_file, r.created_at, r.undone, r.label,
              p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
@@ -2363,7 +3208,9 @@ export class WriterStore {
     `).all(path) as Row[];
     return rows.map((row) => {
       const undone = Number(row.undone) === 1;
-      const baseSummary = typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+      const baseSummary = typeof row.label === "string" && row.label.trim()
+        ? String(row.label)
+        : typeof row.proposal_summary === "string" && row.proposal_summary.trim()
         ? String(row.proposal_summary)
         : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
       return {
@@ -2384,7 +3231,7 @@ export class WriterStore {
     if (!Number.isInteger(revisionId) || revisionId <= 0) throw new Error("版本编号无效");
     const row = this.database.prepare(`
       SELECT r.id, r.path, r.before_content, r.after_content, r.after_hash,
-             r.created_file, r.created_at, r.undone, p.summary AS proposal_summary
+             r.created_file, r.created_at, r.undone, r.label, p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
       WHERE r.id = ? AND r.path = ?
@@ -2393,7 +3240,9 @@ export class WriterStore {
     const live = this.project.documentExists(path) ? this.project.read(path) : "";
     const liveHash = live ? this.project.hash(live) : "";
     const undone = Number(row.undone) === 1;
-    const baseSummary = typeof row.proposal_summary === "string" && row.proposal_summary.trim()
+    const baseSummary = typeof row.label === "string" && row.label.trim()
+      ? String(row.label)
+      : typeof row.proposal_summary === "string" && row.proposal_summary.trim()
       ? String(row.proposal_summary)
       : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
     return {
@@ -2409,10 +3258,28 @@ export class WriterStore {
     };
   }
 
+  restoreDocumentVersion(path: string, revisionId: number, baseHash: string): DocumentVersionMeta {
+    if (!this.project.documentExists(path)) throw new Error("当前文档不存在，无法恢复历史版本");
+    const current = this.project.read(path);
+    if (this.project.hash(current) !== baseHash) throw new Error("文档已在其他位置修改，请刷新后重试");
+    const target = this.documentVersion(path, revisionId);
+    if (current === target.afterContent) throw new Error("当前内容已经是该版本");
+    const now = new Date().toISOString();
+    this.project.writeRaw(path, target.afterContent);
+    const result = this.database.prepare(`
+      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,label,created_at)
+      VALUES(NULL,?,?,?,?,?,?)
+    `).run(path, current, target.afterContent, this.project.hash(target.afterContent), `恢复版本 #${revisionId}`, now);
+    this.refreshContinuityFactsForDocument(path, target.afterContent);
+    this.reindex();
+    return this.documentVersions(path).find(version => version.id === Number(result.lastInsertRowid))!;
+  }
+
   renameDocument(fromPath: string, toPath: string): void {
     this.project.renameDocument(fromPath, toPath);
     this.database.prepare("UPDATE proposals SET path=? WHERE path=?").run(toPath, fromPath);
     this.database.prepare("UPDATE revisions SET path=? WHERE path=?").run(toPath, fromPath);
+    this.moveContinuityFactsSource(fromPath, toPath, this.project.read(toPath));
     this.reindex();
   }
 
@@ -2427,11 +3294,22 @@ export class WriterStore {
     const updateRevision = this.database.prepare("UPDATE revisions SET path=? WHERE id=?");
     for (const row of proposalRows) updateProposal.run(rewrite(row.path), row.id);
     for (const row of revisionRows) updateRevision.run(rewrite(row.path), row.id);
+    const factRows = this.database.prepare("SELECT DISTINCT source_path FROM continuity_facts WHERE source_path LIKE ?")
+      .all(`${fromPrefix}%`) as Row[];
+    for (const row of factRows) {
+      const from = String(row.source_path);
+      const to = rewrite(from);
+      if (this.project.textFileExists(to)) this.moveContinuityFactsSource(from, to, this.project.readTextFile(to));
+    }
     this.reindex();
   }
 
   removeFolder(path: string): void {
+    const prefix = `${path.replace(/\/+$/u, "")}/`;
     this.project.removeFolder(path);
+    const rows = this.database.prepare("SELECT DISTINCT source_path FROM continuity_facts WHERE source_path LIKE ?")
+      .all(`${prefix}%`) as Row[];
+    for (const row of rows) this.refreshContinuityFactsForDocument(String(row.source_path), "");
     this.reindex();
   }
 
@@ -2534,6 +3412,74 @@ function headingAtLine(lines: string[], line: number): string | undefined {
 
 function canonicalTextPath(path: string): string {
   return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "").replace(/^resource(?:\/|$)/, "");
+}
+
+function normalizeContinuityStatement(value: string): string {
+  return value.trim().replace(/\s+/gu, " ").toLocaleLowerCase("zh-CN");
+}
+
+function continuityEvidenceAnchor(content: string, sourceHash: string, evidence: string): string {
+  const offset = evidence ? content.indexOf(evidence) : -1;
+  if (offset < 0) return "";
+  return documentSpans(content, sourceHash)
+    .find(span => span.startOffset <= offset && span.endOffset > offset)?.anchorId ?? "";
+}
+
+function continuityEnum<T extends readonly string[]>(value: unknown, allowed: T, fallback: T[number]): T[number] {
+  return typeof value === "string" && allowed.includes(value) ? value as T[number] : fallback;
+}
+
+function continuityStatus(value: unknown): ContinuityFactStatus {
+  return typeof value === "string" && ["active", "conflict", "pending", "stale", "retracted"].includes(value)
+    ? value as ContinuityFactStatus
+    : "active";
+}
+
+function continuityStrings(value: unknown, limit: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === "string")
+    .map(item => item.trim()).filter(Boolean))].slice(0, limit);
+}
+
+function continuityIds(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(Number).filter(id => Number.isInteger(id) && id > 0))].slice(0, 12);
+}
+
+function continuityFactFromRow(row: Row): ContinuityFact {
+  const parseArray = <T>(value: unknown): T[] => {
+    if (typeof value !== "string") return [];
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return Array.isArray(parsed) ? parsed as T[] : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: Number(row.id),
+    statement: String(row.statement),
+    kind: continuityEnum(row.kind, CONTINUITY_FACT_KINDS, "other") as ContinuityFactKind,
+    scopeKind: continuityEnum(row.scope_kind, CONTINUITY_FACT_SCOPE_KINDS, "global") as ContinuityFactScopeKind,
+    scopeValue: String(row.scope_value ?? ""),
+    validFrom: String(row.valid_from ?? ""),
+    validUntil: String(row.valid_until ?? ""),
+    epistemic: continuityEnum(row.epistemic, CONTINUITY_FACT_EPISTEMIC_KINDS, "objective") as ContinuityFactEpistemicKind,
+    knownBy: parseArray<string>(row.known_by_json),
+    importance: Number(row.importance),
+    status: continuityStatus(row.status),
+    sourcePath: String(row.source_path ?? ""),
+    sourceHash: String(row.source_hash ?? ""),
+    sourceEvidence: String(row.source_evidence ?? ""),
+    sourceAnchorId: String(row.source_anchor_id ?? ""),
+    ...(Number.isInteger(Number(row.source_proposal_id)) && Number(row.source_proposal_id) > 0
+      ? { sourceProposalId: Number(row.source_proposal_id) }
+      : {}),
+    conflictsWith: parseArray<number>(row.conflicts_with_json).map(Number).filter(id => Number.isInteger(id) && id > 0),
+    supersedes: parseArray<number>(row.supersedes_json).map(Number).filter(id => Number.isInteger(id) && id > 0),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
 }
 
 function textOccurrences(content: string, search: string): number {

@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { thinkingRequestOptions } from "./model_compat.js";
+import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -15,7 +15,9 @@ export type ChapterReviewScene = {
 export type ChapterReviewIssue = {
   severity: "blocker" | "warning";
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
-    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo";
+    | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "identity_relationship"
+    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo" | "generic_prose"
+    | "voice_homogenization" | "theme_stated" | "resolution_too_smooth";
   sceneId?: string;
   evidence: string[];
   problem: string;
@@ -44,17 +46,39 @@ export class ChapterReviewRequestError extends Error {
   }
 }
 
-const REVIEW_SYSTEM = `你是中文小说整章终审员。完整阅读全文后，检查跨场景结构与会破坏现场感的语义堆砌：
+const REVIEW_SYSTEM = `你是中文小说整章终审员。事实正确性与人物认知边界是最高优先级；其次检查跨场景结构与会破坏现场感的语义堆砌。
+
+先建立“谁在何时知道什么”的信息账本，再逐句检查对白、内心、叙述判断和行动依据：
+- 客观事实不自动等于角色知识。角色只有在亲历/目击、被可信来源告知、从正文可见证据合理推断，或该事实已明确属于公共知识时，才能说出、想到或据此行动；
+- 合理推断必须在本章或证据包中找到可感知线索。不得把作者、叙述者、其他视角人物或后续章节掌握的信息偷渡给当前角色；
+- rumor 与 beliefs 只能按传闻、怀疑或信念呈现，不能无新证据升级成已确认事实；conflict/pending 事实不能擅自选边；
+- 核对时间先后、地点与移动、伤势与体力、物品持有/损毁、身份、关系、经历、能力及 unlocked 状态、组织规则和世界机制；
+- 新增的无害且兼容的小细节不必判错；但没有来源、且被用于解题、定罪、转折或重大决定的关键事实，判 unsupported_fact blocker；
+- 对每个事实问题说明冲突基准或缺失的获知路径。若文本给出了足够的观察和推理链，不得因为证据包未逐字登记而误判。
+
+问题类型：fact_conflict=与已确立事实直接冲突；knowledge_leak=角色使用了自己不应知道的信息；unsupported_fact=关键事实无来源却承担因果功能；identity_relationship=身份、关系、称谓或立场不一致。
+
+随后检查：
 - 相邻场景是否由前场后果推动，接缝是否断裂或状态矛盾；
 - 各场目标、阻力、转折和结果是否承担不同功能，是否只是换地点重复同一过程；
 - 人物关系、信息、目标或处境是否逐场发生可辨认变化；
+- 张力是否围绕人物在乎且结果未定的事情累积，每轮应对是否收紧选择、提高代价或触发有效反制，而非只罗列事件；
 - 是否重复使用同类转折、意象、参数展示、沉默或总结式章尾；
-- 全文开头到结尾是否形成清楚且有证据的总变化；
+- 章首是否尽快立住承接压力与当前问题，章尾是否给出阶段性结果及其后果，而非在本章结果发生前突然截断；
+- 全文开头到结尾是否形成清楚且有证据的总变化，并留下由结果自然产生的新约束、代价或选择；
 - telemetry_pileup：同一现场连续播报角度、频率、温度、百分比、状态值，读数没有改变人物下一步选择；
 - expository_mechanics：动作已经成立后，叙述又展开原理、计算或教程式过程，挤压人物反应与环境后果；
 - semantic_echo：相邻句段换一种说法重复同一动作、判断或结论，没有新增事实。
-单个准确数字、确实触发选择的测量、角色偶尔使用技术语言均可保留，不得仅因出现术语或数字判错。只有同类堆砌在一个场景内反复出现并明显遮蔽行动、关系或留白时，才把对应场景判 blocker；轻微问题列 warning。句式符号已由独立门禁处理，不做全文润色。evidence 必须逐字引用短句。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|telemetry_pileup|expository_mechanics|semantic_echo、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。`;
+- generic_prose：句子换掉人名、地点后仍能原样放进多数别的故事——用「气氛/仿佛/某种/一切」这类泛化标签代替此时此地才成立的物件、动作或后果；现场只被叙述者报告，没有被人物看见、听见、摸到。这是唯一一类"写得没错但没有画面"的问题，其余检查都发现不了它，请主动找。
+
+最后检查三类"生成腔"。它们不违反任何事实、结构或句式规则，前面的检查全都发现不了，必须单独找：
+- voice_homogenization：把说话人的名字和提示语遮住后，台词还能在人物之间互换——所有人用同样的句长、同样的书面程度、同样的方式起头和收束，没有各自的回避方式、口头禅或说话目的。只要有两个人物在同一场里说话且无法区分，就至少记 warning。
+- theme_stated：叙述者或人物把本章的主题、教训或人物成长直接说出口，替读者完成判断。章尾与场尾尤其要查：「他终于明白……」「从此以后……」「一切都不一样了」「这一刻他懂得了……」，以及人物在对白里总结自己的转变。让意义由后果承担，而不是由句子宣告。
+- resolution_too_smooth：冲突靠互相理解或坦白化解，代价被抹平；阻力恰好在需要时让路；反对者在没有新证据或新压力的情况下改变立场；每个细节都恰好服务主线，没有任何东西是白费的。判定看的是"有没有人付出了不可撤销的代价"，不是"结局是否圆满"——刻意的圆满结局本身不判错。
+
+以上三类的判定尺度与前面一致：零星命中列 warning；只有当整章都成立（例如全章对白无一处可区分、章尾整段都在宣告主题、核心冲突完全无代价地消解）才判 blocker。proseSignals.aiTells 是规则层测得的参考数字（AI 味分越高越可疑），只用来提示往哪里看，不能作为判据；判 blocker 仍须逐字引用正文证据。
+单个准确数字、确实触发选择的测量、角色偶尔使用技术语言均可保留，不得仅因出现术语或数字判错。只有同类堆砌在一个场景内反复出现并明显遮蔽行动、关系或留白时，才把对应场景判 blocker；轻微问题列 warning。generic_prose 仅在整场都停留在泛化叙述、读者无法看见任何具体现场时才判 blocker；零星抽象句列 warning。句式符号已由独立门禁处理，不做全文润色。evidence 必须逐字引用短句。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
+字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|theme_stated|resolution_too_smooth、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -102,7 +126,9 @@ export function parseChapterReview(
 
   const kinds = new Set<ChapterReviewIssue["kind"]>([
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
-    "telemetry_pileup", "expository_mechanics", "semantic_echo",
+    "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship",
+    "telemetry_pileup", "expository_mechanics", "semantic_echo", "generic_prose",
+    "voice_homogenization", "theme_stated", "resolution_too_smooth",
   ]);
   const rows = Array.isArray(value.issues) ? value.issues.slice(0, 8) : [];
   const issues: ChapterReviewIssue[] = [];
@@ -146,7 +172,7 @@ export async function reviewChapterDraft(
     model: model.model,
     messages: buildChapterReviewMessages(input),
     stream: false,
-    temperature: 0,
+    ...samplingRequestOptions(model, { temperature: 0 }),
     response_format: { type: "json_object" },
     ...thinkingRequestOptions(model),
   });

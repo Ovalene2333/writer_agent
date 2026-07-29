@@ -2,6 +2,7 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
+import { samplingRequestOptions } from "./model_compat.js";
 
 export type DocumentRevisionInput = {
   instruction: string;
@@ -49,7 +50,7 @@ export async function requestDocumentRevision(
     model: model.model,
     messages,
     stream: false,
-    temperature: model.temperature ?? 0.5,
+    ...samplingRequestOptions(model, { temperature: model.temperature ?? 0.5 }),
     max_tokens: Math.min(8_000, Math.max(1_200, Math.ceil(input.content.length * 1.5))),
     response_format: { type: "json_object" },
   });

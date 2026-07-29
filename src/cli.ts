@@ -8,6 +8,7 @@ import { runAgent } from "./agent.js";
 import { DEFAULT_AGENT_EVALUATION_CASES, prepareAgentEvaluationFixtures, runPersistedAgentEvaluation } from "./agent_eval.js";
 import { isPermissionMode, loadAgentSettings, saveAgentSettings } from "./agent_runtime.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
+import { prefixCacheLogPath, summarizePrefixCacheLog } from "./prefix_cache.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { startWriterServer } from "./server.js";
@@ -196,6 +197,50 @@ program.command("export")
     const content = project.export(options.format);
     if (options.output) writeFileSync(resolve(options.output), content, "utf8");
     else process.stdout.write(content);
+  });
+
+program.command("cache")
+  .description("统计前缀缓存命中：预测 vs 实测，以及钱漏在哪个区块")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .option("--kind <kind>", "只看某类调用，如 agent_step")
+  .option("--top <count>", "分叉点榜单条数", "5")
+  .option("--json", "输出原始 JSON")
+  .action((options: { project: string; kind?: string; top: string; json?: boolean }) => {
+    const project = new WriterProject(options.project);
+    if (!project.exists()) throw new Error("当前目录不是写作项目，请先执行 writer init");
+    const summary = summarizePrefixCacheLog(prefixCacheLogPath(project.root), {
+      ...(options.kind ? { callKind: options.kind } : {}),
+      topDivergences: Math.max(1, Number(options.top) || 5),
+    });
+    if (options.json) {
+      process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+      return;
+    }
+    if (!summary.totalRequests) {
+      process.stdout.write(`暂无观测记录：${summary.logPath}\n`);
+      return;
+    }
+    const percent = (value?: number) => value === undefined ? "—" : `${(value * 100).toFixed(1)}%`;
+    process.stdout.write(`前缀缓存观测：${summary.logPath}（${summary.totalRequests} 次请求）\n`);
+    for (const kind of summary.callKinds) {
+      process.stdout.write(`\n[${kind.callKind}] 请求 ${kind.requests} 次，其中 ${kind.measuredRequests} 次有 provider 用量\n`);
+      process.stdout.write(`  实测命中 ${percent(kind.actualHitRate)}（${kind.cacheHitTokens}/${kind.promptTokens} token）`
+        + ` | 预测命中 ${percent(kind.predictedHitRate)}`
+        + (kind.predictionErrorTokens === undefined ? "" : ` | 预测偏差 ${kind.predictionErrorTokens > 0 ? "+" : ""}${Math.round(kind.predictionErrorTokens)} token/次`)
+        + "\n");
+      const components = Object.entries(kind.componentTokens).sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0));
+      if (components.length) {
+        process.stdout.write(`  区块 token：${components.map(([name, tokens]) => `${name} ${tokens}`).join("，")}\n`);
+      }
+      if (!kind.topDivergences.length) {
+        process.stdout.write("  未出现分叉：整条请求都命中已知前缀。\n");
+        continue;
+      }
+      process.stdout.write("  首个分叉点（钱从这里开始全价）：\n");
+      for (const divergence of kind.topDivergences) {
+        process.stdout.write(`    ${divergence.label}（${divergence.kind}）× ${divergence.requests}，累计未命中约 ${divergence.missedTokens} token\n`);
+      }
+    }
   });
 
 const session = program.command("session").description("管理写作会话");

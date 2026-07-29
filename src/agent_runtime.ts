@@ -1,9 +1,11 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { basename, dirname, join, resolve } from "node:path";
 import type { WriterProject } from "./project.js";
 
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
 export type PermissionMode = "ask" | "auto" | "plan";
+export type WritingExecutionMode = "delegated" | "fast";
 
 export const ABSOLUTE_MAX_SCENES = 8;
 export const MIN_SCENE_NOTES_CHARACTERS = 500;
@@ -12,8 +14,26 @@ export const DEFAULT_SCENE_NOTES_CHARACTERS = 3_000;
 export const MIN_ISOLATED_WRITER_MAX_RATIO = 1.2;
 export const MAX_ISOLATED_WRITER_MAX_RATIO = 3;
 export const DEFAULT_ISOLATED_WRITER_MAX_RATIO = 2;
+export const MIN_CHAPTER_TARGET_CHARACTERS = 500;
+export const MAX_CHAPTER_TARGET_CHARACTERS = 50_000;
+export const DEFAULT_CHAPTER_TARGET_CHARACTERS = 3_000;
+
+export interface ProseLengthSettings {
+  /**
+   * 对话没有指定字数时的默认整章目标。作者在这里定一次「这个项目一章多长」，
+   * 之后不必每轮复述数字，也不再由模型按事件密度自行拍板。
+   */
+  chapterTargetCharacters: number;
+  /**
+   * 下限是否硬性拦截。默认关：偏短只提示并记进质量报告，交付照常继续。
+   * 打开后恢复旧行为 —— 不达下限就报错要求重写。上限任何时候都硬拦。
+   */
+  enforceMinimum: boolean;
+}
 
 export interface ScenePipelineSettings {
+  /** Whether the optional multi-scene chapter draft pipeline may be used. */
+  enabled: boolean;
   preferredMinScenes: number;
   preferredMaxScenes: number;
   maxScenes: number;
@@ -24,17 +44,36 @@ export interface ScenePipelineSettings {
   /** Experimental prose-only model call with a separate state extraction pass. */
   isolatedWriter: boolean;
   /**
-   * Experimental best-of-N scene prose sampling: 1 = off (default);
-   * 2–3 = per scene, request candidateCount-1 fact-preserving rewrites and keep
-   * the highest-scoring candidate. Adds one plain-text model call per extra
-   * candidate per scene.
+   * Best-of-N scene prose sampling: 1 = off; 2–3 = per scene, request
+   * candidateCount-1 fact-preserving rewrites and keep the winner (judge model if
+   * configured, deterministic score otherwise). Adds one plain-text model call per
+   * extra candidate per scene, plus one cheap judging call when a rewrite survives.
+   *
+   * Defaults to 2: sampling is skipped outright for scenes that are already clean
+   * and vivid, so the cost only lands where a second draft has something to win.
    */
   candidateCount: number;
 }
 
 export interface AgentRuntimeSettings {
   permissionMode: PermissionMode;
+  /** delegated = isolated prose tools; fast = traditional single-Agent writing with no Writer calls. */
+  writingMode: WritingExecutionMode;
+  /** Allow narrative tasks to append character experiences and story state. */
+  characterEvolutionEnabled: boolean;
+  /** Extract accepted prose/lore facts and inject relevant facts into later Agent tasks. */
+  continuityFactsEnabled: boolean;
+  /**
+   * 终审与候选评判跟随正文模型（默认开）。
+   *
+   * 判「这章像不像人写的」用的是语感，不是清单：一个比正文便宜的模型评自己写不出来的
+   * 文字，只会把标准降到它自己的水平，新增的 voice_homogenization / theme_stated /
+   * resolution_too_smooth 尤其吃这一点。关闭后回到「审阅校对」角色配置的模型。
+   */
+  reviewFollowsProseModel: boolean;
   scenePipeline: ScenePipelineSettings;
+  /** 作者的篇幅偏好：默认目标字数与下限执行强度。 */
+  proseLength: ProseLengthSettings;
 }
 
 export interface AgentTodoItem {
@@ -90,23 +129,37 @@ const SCENE_PIPELINE_TODO_SIGNATURES = [
 
 const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
+  writingMode: "fast",
+  characterEvolutionEnabled: true,
+  continuityFactsEnabled: false,
+  reviewFollowsProseModel: true,
   scenePipeline: {
+    enabled: false,
     preferredMinScenes: 3,
     preferredMaxScenes: 5,
     maxScenes: 5,
     notesMaxCharacters: DEFAULT_SCENE_NOTES_CHARACTERS,
     isolatedWriterMaxRatio: DEFAULT_ISOLATED_WRITER_MAX_RATIO,
     isolatedWriter: false,
-    candidateCount: 1,
+    candidateCount: 2,
+  },
+  proseLength: {
+    chapterTargetCharacters: DEFAULT_CHAPTER_TARGET_CHARACTERS,
+    enforceMinimum: false,
   },
 };
 
 export const MAX_SCENE_CANDIDATES = 3;
 
 const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
+const WRITING_EXECUTION_MODES = new Set<WritingExecutionMode>(["delegated", "fast"]);
 
 export function isPermissionMode(value: string): value is PermissionMode {
   return PERMISSION_MODES.has(value as PermissionMode);
+}
+
+export function isWritingExecutionMode(value: string): value is WritingExecutionMode {
+  return WRITING_EXECUTION_MODES.has(value as WritingExecutionMode);
 }
 
 export function settingsPath(project: WriterProject): string {
@@ -114,6 +167,7 @@ export function settingsPath(project: WriterProject): string {
 }
 
 export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSettings>): ScenePipelineSettings {
+  const enabled = value?.enabled === true;
   const integer = (candidate: unknown, fallback: number) => Number.isInteger(candidate)
     ? Math.min(ABSOLUTE_MAX_SCENES, Math.max(1, Number(candidate)))
     : fallback;
@@ -132,8 +186,19 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
     ? Math.round(Math.min(MAX_ISOLATED_WRITER_MAX_RATIO, Math.max(MIN_ISOLATED_WRITER_MAX_RATIO, rawWriterRatio)) * 10) / 10
     : DEFAULT_SETTINGS.scenePipeline.isolatedWriterMaxRatio;
   return {
+    enabled,
     preferredMinScenes, preferredMaxScenes, maxScenes,
     notesMaxCharacters, isolatedWriterMaxRatio, isolatedWriter, candidateCount,
+  };
+}
+
+export function normalizeProseLengthSettings(value?: Partial<ProseLengthSettings>): ProseLengthSettings {
+  const raw = Number(value?.chapterTargetCharacters);
+  return {
+    chapterTargetCharacters: Number.isFinite(raw) && raw > 0
+      ? Math.round(Math.min(MAX_CHAPTER_TARGET_CHARACTERS, Math.max(MIN_CHAPTER_TARGET_CHARACTERS, raw)))
+      : DEFAULT_SETTINGS.proseLength.chapterTargetCharacters,
+    enforceMinimum: value?.enforceMinimum === true,
   };
 }
 
@@ -145,7 +210,17 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
     const mode = typeof raw.permissionMode === "string" && isPermissionMode(raw.permissionMode)
       ? raw.permissionMode
       : DEFAULT_SETTINGS.permissionMode;
-    return { permissionMode: mode, scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline) };
+    return {
+      permissionMode: mode,
+      writingMode: typeof raw.writingMode === "string" && isWritingExecutionMode(raw.writingMode)
+        ? raw.writingMode
+        : DEFAULT_SETTINGS.writingMode,
+      characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
+      continuityFactsEnabled: raw.continuityFactsEnabled === true,
+      reviewFollowsProseModel: raw.reviewFollowsProseModel !== false,
+      scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
+      proseLength: normalizeProseLengthSettings(raw.proseLength),
+    };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -153,16 +228,39 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
 
 export function saveAgentSettings(
   project: WriterProject,
-  patch: { permissionMode?: PermissionMode; scenePipeline?: Partial<ScenePipelineSettings> },
+  patch: {
+    permissionMode?: PermissionMode;
+    writingMode?: WritingExecutionMode;
+    characterEvolutionEnabled?: boolean;
+    continuityFactsEnabled?: boolean;
+    reviewFollowsProseModel?: boolean;
+    scenePipeline?: Partial<ScenePipelineSettings>;
+    proseLength?: Partial<ProseLengthSettings>;
+  },
 ): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
   const next: AgentRuntimeSettings = {
     permissionMode: patch.permissionMode && isPermissionMode(patch.permissionMode)
       ? patch.permissionMode
       : current.permissionMode,
+    writingMode: patch.writingMode && isWritingExecutionMode(patch.writingMode)
+      ? patch.writingMode
+      : current.writingMode,
+    characterEvolutionEnabled: typeof patch.characterEvolutionEnabled === "boolean"
+      ? patch.characterEvolutionEnabled
+      : current.characterEvolutionEnabled,
+    continuityFactsEnabled: typeof patch.continuityFactsEnabled === "boolean"
+      ? patch.continuityFactsEnabled
+      : current.continuityFactsEnabled,
+    reviewFollowsProseModel: typeof patch.reviewFollowsProseModel === "boolean"
+      ? patch.reviewFollowsProseModel
+      : current.reviewFollowsProseModel,
     scenePipeline: patch.scenePipeline
       ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
       : current.scenePipeline,
+    proseLength: patch.proseLength
+      ? normalizeProseLengthSettings({ ...current.proseLength, ...patch.proseLength })
+      : current.proseLength,
   };
   mkdirSync(project.privateDir, { recursive: true });
   writeFileSync(settingsPath(project), `${JSON.stringify(next, null, 2)}\n`, "utf8");
@@ -225,14 +323,17 @@ function parseSkillMarkdown(raw: string, fallbackName: string): { name: string; 
   return { name: title, description, body: trimmed };
 }
 
+const BUILTIN_SKILLS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+
 function skillRoots(project: WriterProject): string[] {
   return [
     resolve(project.root, ".writer", "skills"),
     resolve(project.root, ".agents", "skills"),
+    BUILTIN_SKILLS_ROOT,
   ];
 }
 
-/** 扫描项目技能目录（仿 code agent skills）。 */
+/** 扫描项目技能目录，并以项目同名技能覆盖内置技能。 */
 export function listProjectSkills(project: WriterProject): ProjectSkill[] {
   const skills: ProjectSkill[] = [];
   const seen = new Set<string>();
@@ -257,6 +358,8 @@ export function listProjectSkills(project: WriterProject): ProjectSkill[] {
         const parsed = parseSkillMarkdown(raw, id);
         const relative = file.startsWith(project.root)
           ? file.slice(project.root.length + 1).replace(/\\/g, "/")
+          : file.startsWith(BUILTIN_SKILLS_ROOT)
+            ? `builtin/${file.slice(BUILTIN_SKILLS_ROOT.length + 1).replace(/\\/g, "/")}`
           : file;
         skills.push({
           id,
@@ -438,7 +541,10 @@ export function isFurtherWritingTodo(content: string): boolean {
  * "submit proposal" checkboxes. If further writing steps remain, promote the next
  * one and signal the agent loop to continue instead of finalizing the whole plan.
  */
-export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
+export function advanceTodosAfterProposal(
+  todos: AgentTodoItem[],
+  allowFurtherDocumentDelivery = true,
+): {
   todos: AgentTodoItem[];
   changed: boolean;
   shouldContinue: boolean;
@@ -459,7 +565,9 @@ export function advanceTodosAfterProposal(todos: AgentTodoItem[]): {
       changed = true;
     }
   }
-  const furtherPending = next.filter(item => item.status === "pending" && isFurtherWritingTodo(item.content));
+  const furtherPending = allowFurtherDocumentDelivery
+    ? next.filter(item => item.status === "pending" && isFurtherWritingTodo(item.content))
+    : [];
   if (furtherPending.length) {
     // Only one in_progress at a time.
     for (const item of next) {
@@ -532,10 +640,14 @@ export function persistAdvancedTodosAfterProposal(
   },
   sessionId: string,
   emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
+  allowFurtherDocumentDelivery = true,
 ): { todos: AgentTodoItem[]; shouldContinue: boolean } {
   const current = store.sessionTodos(sessionId);
   if (!current.length) return { todos: current, shouldContinue: false };
-  const { todos, changed, shouldContinue } = advanceTodosAfterProposal(current);
+  const { todos, changed, shouldContinue } = advanceTodosAfterProposal(
+    current,
+    allowFurtherDocumentDelivery,
+  );
   if (changed) {
     store.saveSessionTodos(sessionId, todos);
     emit?.({ type: "todos", todos });

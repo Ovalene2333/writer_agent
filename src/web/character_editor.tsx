@@ -1,7 +1,6 @@
 import React, { useMemo, useRef, useState } from "react";
 
 type Temporal = {
-  sourceRefs: Array<{ type: "outline" | "document" | "manual"; ref: string; note?: string }>;
   validFrom?: string;
   validUntil?: string;
 };
@@ -34,6 +33,12 @@ type Competency = Temporal & {
   limitations: string[];
   costs: string[];
 };
+type Feature = {
+  id: string;
+  name: string;
+  summary: string;
+  description: string;
+};
 type StoryState = Temporal & {
   id: string;
   outlineNodeId?: string;
@@ -52,7 +57,7 @@ export type CharacterDraft = {
   schemaVersion: 3;
   id?: number;
   identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
-  profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
+  profile: { appearance: string; appearanceSummary: string; background: string; backgroundSummary: string; biography: string };
   psychology: {
     summary: string;
     traits: TextEntry[];
@@ -69,6 +74,7 @@ export type CharacterDraft = {
     avoidedExpressions: string[];
     examples: string[];
   };
+  features: Feature[];
   competencies: Competency[];
   relationships: Relationship[];
   storyStates: StoryState[];
@@ -81,6 +87,15 @@ export type CharacterListItem = {
   identity: { name: string };
 };
 
+export type CharacterSummaryKind =
+  | "identity"
+  | "appearance"
+  | "background"
+  | "psychology"
+  | "voice"
+  | "feature"
+  | "competency";
+
 type SectionId =
   | "overview"
   | "identity"
@@ -88,6 +103,7 @@ type SectionId =
   | "psychology"
   | "voice"
   | "goals"
+  | "features"
   | "skills"
   | "relations"
   | "experiences"
@@ -101,6 +117,7 @@ const SECTIONS: Array<{ id: SectionId; label: string; hint: string }> = [
   { id: "psychology", label: "心理", hint: "性格价值" },
   { id: "voice", label: "声线", hint: "对白口吻" },
   { id: "goals", label: "目标", hint: "动机赌注" },
+  { id: "features", label: "特性", hint: "习惯细节" },
   { id: "skills", label: "能力", hint: "技能资源" },
   { id: "relations", label: "关系", hint: "人际网络" },
   { id: "experiences", label: "经历", hint: "已确认事件" },
@@ -223,17 +240,18 @@ export function CharacterEditor(props: {
   onClose: () => void;
   onSave: () => void;
   onDelete?: () => void;
-  onSummarizeCompetency?: (competency: CharacterDraft["competencies"][number]) => Promise<string>;
+  onSummarizeCharacter?: (kind: CharacterSummaryKind, source: unknown) => Promise<string>;
 }) {
   const draft: CharacterDraft = {
     ...props.draft,
+    features: Array.isArray(props.draft.features) ? props.draft.features : [],
     experiences: Array.isArray(props.draft.experiences) ? props.draft.experiences : [],
   };
   const onChange = props.onChange;
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const [section, setSection] = useState<SectionId>("overview");
-  const [summarizingSkillId, setSummarizingSkillId] = useState<string | null>(null);
+  const [summarizingId, setSummarizingId] = useState<string | null>(null);
   const [summaryError, setSummaryError] = useState<{ id: string; message: string } | null>(null);
   const name = draft.identity.name.trim() || "未命名角色";
   const avatar = name.slice(0, 1);
@@ -249,10 +267,11 @@ export function CharacterEditor(props: {
       identity: [draft.identity.name, draft.identity.narrativeRole, draft.identity.summary, draft.identity.aliases, draft.identity.tags]
         .filter(filled).length,
       profile: [
+        draft.profile.appearance,
         draft.profile.appearanceSummary,
+        draft.profile.background,
         draft.profile.backgroundSummary,
         draft.profile.biography,
-        draft.profile.distinguishingFeatures,
       ].filter(filled).length,
       psychology: (filled(draft.psychology.summary) ? 1 : 0) + psych,
       voice: [
@@ -264,6 +283,7 @@ export function CharacterEditor(props: {
         draft.voice.examples,
       ].filter(filled).length,
       goals: draft.motivations.length,
+      features: draft.features.length,
       skills: draft.competencies.length,
       relations: draft.relationships.length,
       experiences: draft.experiences.length,
@@ -282,6 +302,31 @@ export function CharacterEditor(props: {
     onChange({ ...draft, voice: { ...draft.voice, ...patch } });
 
   const overviewSummary = draft.identity.summary || draft.psychology.summary || draft.profile.backgroundSummary;
+  const summaryAction = (
+    id: string,
+    kind: CharacterSummaryKind,
+    source: unknown,
+    apply: (current: CharacterDraft, summary: string) => CharacterDraft,
+  ) => props.onSummarizeCharacter ? (
+    <div className="ce-field-actions wide">
+      <button
+        type="button"
+        className="ghost"
+        disabled={summarizingId !== null}
+        onClick={() => {
+          setSummarizingId(id);
+          setSummaryError(null);
+          void props.onSummarizeCharacter!(kind, source)
+            .then(summary => onChange(apply(draftRef.current, summary)))
+            .catch(error => setSummaryError({ id, message: String(error) }))
+            .finally(() => setSummarizingId(null));
+        }}
+      >
+        {summarizingId === id ? "摘要模型归纳中…" : "用摘要模型生成"}
+      </button>
+      {summaryError?.id === id && <small role="alert">{summaryError.message}</small>}
+    </div>
+  ) : null;
 
   return (
     <div className="modal-backdrop" onMouseDown={props.onClose}>
@@ -382,9 +427,6 @@ export function CharacterEditor(props: {
                     onJump={() => setSection("profile")}
                   >
                     <p>{clip(draft.profile.appearanceSummary || draft.profile.backgroundSummary) || "尚未填写外形或背景"}</p>
-                    {draft.profile.distinguishingFeatures.length > 0 && (
-                      <small>特征：{draft.profile.distinguishingFeatures.join("、")}</small>
-                    )}
                   </OverviewCard>
                   <OverviewCard
                     title="心理"
@@ -414,6 +456,22 @@ export function CharacterEditor(props: {
                       <ul>
                         {draft.motivations.slice(0, 3).map(goal => (
                           <li key={goal.id}>{clip(goal.summary, 80) || "（空目标）"}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </OverviewCard>
+                  <OverviewCard
+                    title="特性"
+                    badge={`${draft.features.length}`}
+                    empty={draft.features.length === 0}
+                    onJump={() => setSection("features")}
+                  >
+                    {draft.features.length === 0 ? (
+                      <p>暂无特性条目</p>
+                    ) : (
+                      <ul>
+                        {draft.features.slice(0, 4).map(feature => (
+                          <li key={feature.id}>{feature.name || "未命名"}{feature.summary ? ` · ${clip(feature.summary, 60)}` : ""}</li>
                         ))}
                       </ul>
                     )}
@@ -509,43 +567,80 @@ export function CharacterEditor(props: {
                   <Field label="标签" hint="逗号或换行分隔" wide>
                     <input value={draft.identity.tags.join(", ")} onChange={e => patchIdentity({ tags: splitList(e.target.value) })} placeholder="机娘, 银翼计划" />
                   </Field>
-                  <Field label="身份摘要" hint="一句话说明她是谁" wide>
-                    <textarea value={draft.identity.summary} onChange={e => patchIdentity({ summary: e.target.value })} placeholder="在故事里站在什么位置？读者最先记住什么？" rows={3} />
+                  <Field label="身份摘要" hint="浓缩定位、处境与辨识点" wide>
+                    <textarea value={draft.identity.summary} onChange={e => patchIdentity({ summary: e.target.value })} placeholder="她是谁、在故事中处于什么位置，以及最值得记住的背景或反差。" rows={4} />
                   </Field>
+                  {summaryAction("identity", "identity", {
+                    existingSummary: draft.identity.summary,
+                    name: draft.identity.name,
+                    aliases: draft.identity.aliases,
+                    tags: draft.identity.tags,
+                    narrativeRole: draft.identity.narrativeRole,
+                    background: draft.profile.backgroundSummary,
+                    psychology: draft.psychology.summary,
+                    motivations: draft.motivations.map(item => item.summary),
+                  }, (current, summary) => ({
+                    ...current,
+                    identity: { ...current.identity, summary },
+                  }))}
                 </div>
               </div>
             )}
 
             {section === "profile" && (
               <div className="ce-panel">
-                <SectionHead title="外形与背景" description="从上到下：先看一眼 → 记住特征 → 出身背景 → 详细传记。" />
+                <SectionHead title="外形与背景" description="完整资料供按需选读；摘要用于智能体首轮快速把握人物。" />
                 <div className="ce-form-stack">
                   <Field label="外貌" hint="身高体态、五官气质、常服" wide>
                     <textarea
-                      value={draft.profile.appearanceSummary}
-                      onChange={e => patchProfile({ appearanceSummary: e.target.value })}
+                      value={draft.profile.appearance}
+                      onChange={e => patchProfile({ appearance: e.target.value })}
                       placeholder="身高体态、发型发色、穿着与整体气质…"
                       rows={5}
                     />
                   </Field>
-                  <Field label="辨识特征" hint="每行一条，写作时最容易被点名" wide>
+                  <Field label="外貌摘要" hint="每行一个辨识要点；智能体首轮只读取这里" wide>
                     <textarea
-                      value={draft.profile.distinguishingFeatures.join("\n")}
-                      onChange={e => patchProfile({
-                        distinguishingFeatures: e.target.value.split(/\n/).map(item => item.trim()).filter(Boolean),
-                      })}
+                      value={draft.profile.appearanceSummary}
+                      onChange={e => patchProfile({ appearanceSummary: e.target.value })}
                       placeholder={"浅琥珀色虹膜\n浅亚麻色长发\n右耳简约银钉"}
-                      rows={4}
+                      rows={5}
                     />
                   </Field>
-                  <Field label="背景摘要" hint="出身与关键经历，控制在一段内" wide>
+                  {summaryAction("appearance", "appearance", {
+                    existingSummary: draft.profile.appearanceSummary,
+                    appearance: draft.profile.appearance,
+                    identityTags: draft.identity.tags,
+                  }, (current, summary) => ({
+                    ...current,
+                    profile: { ...current.profile, appearanceSummary: summary },
+                  }))}
+                  <Field label="背景" hint="出身、成长环境与进入主线前的经历" wide>
                     <textarea
-                      value={draft.profile.backgroundSummary}
-                      onChange={e => patchProfile({ backgroundSummary: e.target.value })}
+                      value={draft.profile.background}
+                      onChange={e => patchProfile({ background: e.target.value })}
                       placeholder="家庭、成长环境、进入主线前的位置…"
                       rows={5}
                     />
                   </Field>
+                  <Field label="背景摘要" hint="每行一个独立要点；智能体首轮或列表速读时使用" wide>
+                    <textarea
+                      value={draft.profile.backgroundSummary}
+                      onChange={e => patchProfile({ backgroundSummary: e.target.value })}
+                      placeholder={"北城旧工业区长大\n少年时期承担家庭照护责任\n这段经历使其习惯先解决现实问题"}
+                      rows={5}
+                    />
+                  </Field>
+                  {summaryAction("background", "background", {
+                    existingSummary: draft.profile.backgroundSummary,
+                    narrativeRole: draft.identity.narrativeRole,
+                    background: draft.profile.background,
+                    biography: draft.profile.biography,
+                    experiences: draft.experiences,
+                  }, (current, summary) => ({
+                    ...current,
+                    profile: { ...current.profile, backgroundSummary: summary },
+                  }))}
                   <details className="ce-details" open={Boolean(draft.profile.biography.trim())}>
                     <summary>
                       <span>详细传记</span>
@@ -569,9 +664,20 @@ export function CharacterEditor(props: {
               <div className="ce-panel">
                 <SectionHead title="心理" description="先写总述，再按需补特质 / 价值 / 恐惧 / 冲突。" />
                 <div className="ce-form-stack">
-                  <Field label="性格摘要" hint="一句话抓住内核" wide>
-                    <textarea value={draft.psychology.summary} onChange={e => patchPsychology({ summary: e.target.value })} placeholder="外表冷静，内里紧绷；对亲近的人话少但认真。" rows={3} />
+                  <Field label="性格摘要" hint="概括行为、驱动力与内在张力" wide>
+                    <textarea value={draft.psychology.summary} onChange={e => patchPsychology({ summary: e.target.value })} placeholder="外表如何行动、内里被什么驱动，以及在关系或压力下会暴露什么矛盾。" rows={4} />
                   </Field>
+                  {summaryAction("psychology", "psychology", {
+                    existingSummary: draft.psychology.summary,
+                    traits: draft.psychology.traits,
+                    values: draft.psychology.values,
+                    fears: draft.psychology.fears,
+                    conflicts: draft.psychology.conflicts,
+                    motivations: draft.motivations,
+                  }, (current, summary) => ({
+                    ...current,
+                    psychology: { ...current.psychology, summary },
+                  }))}
                 </div>
                 {PSYCH_GROUPS.map(group => (
                   <div className="ce-list-block" key={group.key}>
@@ -583,7 +689,7 @@ export function CharacterEditor(props: {
                           onClick={() => patchPsychology({
                             [group.key]: [
                               ...draft.psychology[group.key],
-                              { id: entryId(group.key), label: "", description: "", sourceRefs: [] },
+                              { id: entryId(group.key), label: "", description: "" },
                             ],
                           })}
                         >
@@ -626,9 +732,20 @@ export function CharacterEditor(props: {
               <div className="ce-panel">
                 <SectionHead title="声线与对白" description="写作与角色扮演时优先读这里。" />
                 <div className="ce-form-stack">
-                  <Field label="声线摘要" hint="节奏、态度、口头禅倾向" wide>
-                    <textarea value={draft.voice.summary} onChange={e => patchVoice({ summary: e.target.value })} placeholder="简洁、略带吐槽；累的时候句子更短。" rows={3} />
+                  <Field label="声线摘要" hint="节奏、语域、互动姿态与变化" wide>
+                    <textarea value={draft.voice.summary} onChange={e => patchVoice({ summary: e.target.value })} placeholder="平时怎样组织句子、如何对待听者，以及压力下声线会怎样变化。" rows={4} />
                   </Field>
+                  {summaryAction("voice", "voice", {
+                    existingSummary: draft.voice.summary,
+                    register: draft.voice.register,
+                    diction: draft.voice.diction,
+                    verbalHabits: draft.voice.verbalHabits,
+                    avoidedExpressions: draft.voice.avoidedExpressions,
+                    examples: draft.voice.examples,
+                  }, (current, summary) => ({
+                    ...current,
+                    voice: { ...current.voice, summary },
+                  }))}
                   <div className="ce-form-grid">
                     <Field label="语域 / 口气"><input value={draft.voice.register} onChange={e => patchVoice({ register: e.target.value })} placeholder="口语 / 冷淡 / 文雅…" /></Field>
                     <Field label="用词与习惯" hint="逗号分隔"><input value={[...draft.voice.diction, ...draft.voice.verbalHabits].join(", ")} onChange={e => patchVoice({ diction: splitList(e.target.value), verbalHabits: [] })} placeholder="……嗯, 少用敬语" /></Field>
@@ -653,7 +770,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       motivations: [...draft.motivations, {
                         id: entryId("goal"), category: "current", status: "active", priority: 50,
-                        summary: "", stakes: "", obstacles: [], sourceRefs: [],
+                        summary: "", stakes: "", obstacles: [],
                       }],
                     })}>+ 添加目标</button>
                   )}
@@ -730,7 +847,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       competencies: [...draft.competencies, {
                         id: entryId("skill"), name: "", summary: "", level: "", unlocked: false, description: "",
-                        resources: [], limitations: [], costs: [], sourceRefs: [],
+                        resources: [], limitations: [], costs: [],
                       }],
                     })}>+ 添加能力</button>
                   )}
@@ -767,34 +884,12 @@ export function CharacterEditor(props: {
                             <textarea value={skill.summary} onChange={e => onChange({
                               ...draft,
                               competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, summary: e.target.value } : x),
-                            })} rows={2} />
+                            })} rows={3} />
                           </Field>
-                          {props.onSummarizeCompetency && (
-                            <div className="ce-field-actions wide">
-                              <button
-                                type="button"
-                                className="ghost"
-                                disabled={summarizingSkillId !== null}
-                                onClick={() => {
-                                  setSummarizingSkillId(skill.id);
-                                  setSummaryError(null);
-                                  void props.onSummarizeCompetency!(skill)
-                                    .then(summary => {
-                                      const current = draftRef.current;
-                                      onChange({
-                                        ...current,
-                                        competencies: current.competencies.map(x => x.id === skill.id ? { ...x, summary } : x),
-                                      });
-                                    })
-                                    .catch(error => setSummaryError({ id: skill.id, message: String(error) }))
-                                    .finally(() => setSummarizingSkillId(null));
-                                }}
-                              >
-                                {summarizingSkillId === skill.id ? "摘要模型归纳中…" : "用摘要模型生成"}
-                              </button>
-                              {summaryError?.id === skill.id && <small role="alert">{summaryError.message}</small>}
-                            </div>
-                          )}
+                          {summaryAction(`competency:${skill.id}`, "competency", skill, (current, summary) => ({
+                            ...current,
+                            competencies: current.competencies.map(x => x.id === skill.id ? { ...x, summary } : x),
+                          }))}
                           <Field label="详细说明" hint="仅解锁后向智能体暴露" wide>
                             <textarea value={skill.description} onChange={e => onChange({
                               ...draft,
@@ -817,6 +912,63 @@ export function CharacterEditor(props: {
               </div>
             )}
 
+            {section === "features" && (
+              <div className="ce-panel">
+                <SectionHead
+                  title="特性"
+                  description="记录会影响描写、但不属于能力的稳定细节，例如生理特点、习惯、感知偏差或物件依赖。"
+                  action={(
+                    <button type="button" onClick={() => onChange({
+                      ...draft,
+                      features: [...draft.features, {
+                        id: entryId("feature"), name: "", summary: "", description: "",
+                      }],
+                    })}>+ 添加特性</button>
+                  )}
+                />
+                {draft.features.length === 0 ? (
+                  <EmptyHint text="暂无特性条目。" />
+                ) : (
+                  <div className="ce-entry-list">
+                    {draft.features.map((feature, index) => (
+                      <EntryCard
+                        key={feature.id}
+                        title={feature.name.trim() || `特性 ${index + 1}`}
+                        onRemove={() => onChange({ ...draft, features: draft.features.filter(x => x.id !== feature.id) })}
+                      >
+                        <div className="ce-form-grid">
+                          <Field label="名称"><input value={feature.name} onChange={e => onChange({
+                            ...draft,
+                            features: draft.features.map(x => x.id === feature.id ? { ...x, name: e.target.value } : x),
+                          })} placeholder="怕冷 / 左利手 / 随身记账…" /></Field>
+                          <Field label="摘要" hint="智能体首轮只读取这部分" wide>
+                            <textarea value={feature.summary} onChange={e => onChange({
+                              ...draft,
+                              features: draft.features.map(x => x.id === feature.id ? { ...x, summary: e.target.value } : x),
+                            })} rows={3} placeholder="说明特性本身、触发情形，以及写作中能观察到的表现或影响。" />
+                          </Field>
+                          {summaryAction(`feature:${feature.id}`, "feature", {
+                            name: feature.name,
+                            existingSummary: feature.summary,
+                            description: feature.description,
+                          }, (current, summary) => ({
+                            ...current,
+                            features: current.features.map(x => x.id === feature.id ? { ...x, summary } : x),
+                          }))}
+                          <Field label="详细说明" hint="智能体按需选读" wide>
+                            <textarea value={feature.description} onChange={e => onChange({
+                              ...draft,
+                              features: draft.features.map(x => x.id === feature.id ? { ...x, description: e.target.value } : x),
+                            })} rows={3} />
+                          </Field>
+                        </div>
+                      </EntryCard>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {section === "experiences" && (
               <div className="ce-panel">
                 <SectionHead
@@ -825,7 +977,7 @@ export function CharacterEditor(props: {
                   action={(
                     <button type="button" onClick={() => onChange({
                       ...draft,
-                      experiences: [...draft.experiences, { id: entryId("exp"), label: "", description: "", sourceRefs: [] }],
+                      experiences: [...draft.experiences, { id: entryId("exp"), label: "", description: "" }],
                     })}>+ 添加经历</button>
                   )}
                 />
@@ -910,7 +1062,6 @@ export function CharacterEditor(props: {
                                 description: "",
                                 attitude: "",
                                 status: "active",
-                                sourceRefs: [],
                               }],
                           })}
                         >
@@ -970,7 +1121,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       storyStates: [...draft.storyStates, {
                         id: entryId("state"), unanchored: true, location: "", physical: "", emotion: "",
-                        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "", sourceRefs: [],
+                        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "",
                       }],
                     })}>+ 添加状态</button>
                   )}
@@ -1047,7 +1198,6 @@ export function CharacterEditor(props: {
                                     id: `${story.id}-knowledge-${i + 1}`,
                                     label: "",
                                     description,
-                                    sourceRefs: [],
                                   })),
                                 }
                                 : x),

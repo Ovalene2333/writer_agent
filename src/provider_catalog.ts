@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import type { ModelConfig, ModelUsageRole, ProviderCatalogPublic, ProviderId, ProviderModelPublic, ProviderProfilePublic, ProviderPublicConfig, TokenPricing } from "./types.js";
+import type { ModelConfig, ModelUsageRole, ProviderCatalogPublic, ProviderId, ProviderModelPublic, ProviderProfilePublic, ProviderPublicConfig, ReasoningEffort, ResponseVerbosity, TokenPricing } from "./types.js";
 import { defaultPricing, normalizePricing } from "./pricing.js";
 import { modelFetch, normalizeProxyUrl } from "./model_fetch.js";
 import { WriterProject } from "./project.js";
@@ -42,17 +42,17 @@ export class ProviderManager {
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
     const { profile, model } = this.assigned(role); const baseUrl = process.env.WRITER_BASE_URL || profile.baseUrl;
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP };
+    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP, frequencyPenalty: model.frequencyPenalty, presencePenalty: model.presencePenalty, reasoningEffort: model.reasoningEffort, verbosity: model.verbosity, disableSampling: model.disableSampling };
   }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {
     const { profile, model } = this.active(); const config = this.modelConfig();
     const environmentConfigured = Boolean(process.env.WRITER_API_KEY || process.env.WRITER_BASE_URL || process.env.WRITER_MODEL);
-    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, proxyUrl: config.proxyUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP };
+    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, proxyUrl: config.proxyUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP, frequencyPenalty: config.frequencyPenalty, presencePenalty: config.presencePenalty, reasoningEffort: config.reasoningEffort, verbosity: config.verbosity, disableSampling: config.disableSampling };
   }
   catalog(): ProviderCatalogPublic { return { activeProviderId: this.saved.activeProviderId, activeModelId: this.saved.activeModelId, assignments: this.saved.assignments, providers: this.saved.providers.map(profile => this.publicProfile(profile)) }; }
 
-  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }> }): ProviderCatalogPublic {
+  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean }> }): ProviderCatalogPublic {
     if (!input.models?.length) throw new Error("每个供应商至少需要一个模型");
     const existing = input.id ? this.saved.providers.find(item => item.id === input.id) : undefined;
     const profile: SavedProfile = { id: existing?.id ?? randomUUID(), name: input.name.trim() || providerLabel(input.provider), provider: validateProvider(input.provider), baseUrl: normalizeBaseUrl(input.baseUrl), proxyUrl: normalizeProxyUrl(input.proxyUrl), apiKey: input.apiKey?.trim() || existing?.apiKey || "", models: [] };
@@ -82,6 +82,11 @@ export class ProviderManager {
           pricing: model.pricing,
           temperature: model.temperature,
           topP: model.topP,
+          frequencyPenalty: model.frequencyPenalty,
+          presencePenalty: model.presencePenalty,
+          reasoningEffort: model.reasoningEffort,
+          verbosity: model.verbosity,
+          disableSampling: model.disableSampling,
         };
       }
       return {
@@ -90,6 +95,11 @@ export class ProviderManager {
         pricing: input.pricing ?? model.pricing,
         temperature: input.temperature !== undefined ? input.temperature : model.temperature,
         topP: input.topP !== undefined ? input.topP : model.topP,
+        frequencyPenalty: model.frequencyPenalty,
+        presencePenalty: model.presencePenalty,
+        reasoningEffort: model.reasoningEffort,
+        verbosity: model.verbosity,
+        disableSampling: model.disableSampling,
       };
     });
     this.saveProfile({
@@ -103,48 +113,6 @@ export class ProviderManager {
     return this.publicConfig();
   }
 
-  /**
-   * Apply style-template sampling to every model currently used by a role
-   * (and the catalog active model). Does not require API keys — only patches
-   * temperature / topP and persists the catalog.
-   */
-  applySamplingDefaults(temperature: number, topP: number): {
-    temperature: number;
-    topP: number;
-    updatedModels: number;
-    provider: ProviderPublicConfig;
-    catalog: ProviderCatalogPublic;
-  } {
-    const nextTemp = optional(temperature, 0, 2);
-    const nextTopP = optional(topP, 0, 1);
-    if (nextTemp === undefined || nextTopP === undefined) {
-      throw new Error("temperature / topP 无效");
-    }
-    const targets = new Set<string>();
-    targets.add(`${this.saved.activeProviderId}:${this.saved.activeModelId}`);
-    for (const role of modelRoles()) {
-      const ref = this.saved.assignments[role];
-      if (ref) targets.add(`${ref.providerId}:${ref.modelId}`);
-    }
-    let updatedModels = 0;
-    for (const profile of this.saved.providers) {
-      for (const model of profile.models) {
-        if (!targets.has(`${profile.id}:${model.id}`)) continue;
-        if (model.temperature === nextTemp && model.topP === nextTopP) continue;
-        model.temperature = nextTemp;
-        model.topP = nextTopP;
-        updatedModels += 1;
-      }
-    }
-    if (updatedModels > 0) this.persist();
-    return {
-      temperature: nextTemp,
-      topP: nextTopP,
-      updatedModels,
-      provider: this.publicConfig(),
-      catalog: this.catalog(),
-    };
-  }
   /** 通过 GET /models 探测可达性，不调用 chat/completions，不消耗 token。 */
   async testConnection(profileId = this.saved.activeProviderId, modelId = this.saved.activeModelId): Promise<{ ok: true; message: string; modelListed?: boolean }> {
     const profile = this.saved.providers.find(item => item.id === profileId);
@@ -298,6 +266,12 @@ function parseCatalog(raw: string): SavedCatalog {
       profile.proxyUrl = normalizeProxyUrl(profile.proxyUrl);
       for (const model of profile.models) {
         model.pricing = normalizePricing(profile.provider, model.name, undefined, model.pricing);
+        model.temperature = optional(model.temperature, 0, 2);
+        model.topP = optional(model.topP, 0, 1);
+        model.frequencyPenalty = optional(model.frequencyPenalty, -2, 2);
+        model.presencePenalty = optional(model.presencePenalty, -2, 2);
+        model.reasoningEffort = profile.provider === "openai-compatible" ? reasoningEffort(model.reasoningEffort) : undefined;
+        model.verbosity = profile.provider === "openai-compatible" ? responseVerbosity(model.verbosity) : undefined;
       }
     }
     return parsed;
@@ -400,7 +374,7 @@ function defaultCatalog(): SavedCatalog {
   };
 }
 function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "flash", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
-function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }, provider: ProviderId, existing?: SavedModel): SavedModel {
+function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();
   if (!name) throw new Error("模型名称不能为空");
   const pricing = normalizePricing(provider, name, input.pricing, existing?.pricing);
@@ -410,10 +384,17 @@ function normalizeModel(input: { id?: string; name: string; pricing?: Partial<To
     pricing,
     temperature: optional(input.temperature, 0, 2),
     topP: optional(input.topP, 0, 1),
+    frequencyPenalty: optional(input.frequencyPenalty, -2, 2),
+    presencePenalty: optional(input.presencePenalty, -2, 2),
+    reasoningEffort: provider === "openai-compatible" ? reasoningEffort(input.reasoningEffort) : undefined,
+    verbosity: provider === "openai-compatible" ? responseVerbosity(input.verbosity) : undefined,
+    ...(input.disableSampling ? { disableSampling: true } : {}),
   };
 }
 function validateProvider(value: ProviderId) { if (value !== "deepseek" && value !== "openai-compatible") throw new Error("不支持的模型供应商"); return value; }
 function providerLabel(value: ProviderId) { return value === "deepseek" ? "DeepSeek" : "OpenAI 兼容"; }
 function optional(value: number | undefined, min: number, max: number) { return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max ? Math.round(value * 100) / 100 : undefined; }
+function reasoningEffort(value: unknown): ReasoningEffort | undefined { return value === "none" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" ? value : undefined; }
+function responseVerbosity(value: unknown): ResponseVerbosity | undefined { return value === "low" || value === "medium" || value === "high" ? value : undefined; }
 function normalizeBaseUrl(value: string) { const text = value.trim().replace(/\/+$/, ""); let url: URL; try { url = new URL(text); } catch { throw new Error("API 地址格式无效"); } const local = url.hostname === "localhost" || url.hostname === "127.0.0.1"; if (url.protocol !== "https:" && !(local && url.protocol === "http:")) throw new Error("API 地址必须使用 HTTPS，本地服务除外"); return text; }
 function maskKey(value: string) { return !value ? "" : value.length < 9 ? "••••••••" : `${value.slice(0, 3)}••••${value.slice(-4)}`; }

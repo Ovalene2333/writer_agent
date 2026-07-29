@@ -2,6 +2,7 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
+import { samplingRequestOptions } from "./model_compat.js";
 
 export type DocumentLocatorCandidate = {
   anchorId: string;
@@ -57,7 +58,7 @@ export async function requestDocumentLocator(
     model: model.model,
     messages,
     stream: false,
-    temperature: 0,
+    ...samplingRequestOptions(model, { temperature: 0 }),
     max_tokens: 700,
     response_format: { type: "json_object" },
   });

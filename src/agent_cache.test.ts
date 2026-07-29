@@ -13,24 +13,38 @@ import {
   agentToolSchemaHash,
   agentToolsForTask,
   admitReadAtom,
+  automaticChapterReviewEnabled,
   boundToolResultForModel,
   buildRequestComponentUsage,
   buildDynamicTurnMessages,
   buildStableSystemPrefix,
+  dynamicContextPrompt,
   buildToolArgumentRepairMessages,
   characterMutationCompletesTask,
   chapterContinuationPrompt,
+  chapterDraftNeedsReview,
+  chapterReviewAllowsTool,
+  chapterReviewCompleted,
+  chapterReviewRepairAllowsTool,
+  chapterReviewRepairLock,
+  chapterReviewRequiredPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
+  documentDeliveryRemaining,
   executionModelForTask,
   executionModelForStep,
+  projectCacheUserId,
   initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
+  normalizePlannedProseGateCandidate,
+  normalizeRewriteEditScope,
   parsePlannerJson,
   parseToolArgumentRepair,
   plannerCompletionOptions,
+  priorTurnContentForContext,
   rehydrateRecentToolMessages,
+  recentRoleplayHandoffContext,
   requestNeedsProjectFactSearch,
   repairTruncatedToolArguments,
   resolveRecentCharacterIds,
@@ -39,6 +53,8 @@ import {
   stripStaleReasoningContent,
   taskInstructions,
 } from "./agent.js";
+import { freezeTurnBlock, mergedTurnContext } from "./turn_replay.js";
+import type { AgentTurnMessage } from "./types.js";
 import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -54,7 +70,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "eb1981f0bfecf5b3");
+  assert.equal(agentToolSchemaHash(), "5fa7836838927d43");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -63,12 +79,23 @@ test("isolated chapter review carries the full draft once and returns bounded st
     sceneId: "arrival", title: "进入", plannedTurn: "门禁变红", plannedOutcome: "主角违规进入",
     actualState: { situation: ["主角违规进入"] },
   }];
-  const proseSignals = { stats: { numericTokenDensityPer10k: 112 }, warnings: [] };
+  const proseSignals = {
+    stats: { numericTokenDensityPer10k: 112 },
+    warnings: [],
+    // 规则层测得的 AI 味，只作参考不作判据；它进 user 消息，不进缓存前缀。
+    aiTells: { score: 62.5, thematicUpliftCount: 2, idiomPer10k: 44 },
+    aiTellWarnings: [{ code: "thematic_uplift", message: "收尾自己点破主题", examples: ["从此以后"] }],
+  };
   const messages = buildChapterReviewMessages({
     chapterGoal: "关系改变", content, scenes, context: "稳定项目约束", proseSignals,
   });
   assert.deepEqual(messages.map(message => message.role), ["system", "system", "user"]);
   assert.equal(messages[1].content, "稳定项目约束");
+  assert.match(messages[0].content, /客观事实不自动等于角色知识/u);
+  assert.match(messages[0].content, /亲历\/目击、被可信来源告知/u);
+  assert.match(messages[0].content, /voice_homogenization/u);
+  assert.match(messages[0].content, /theme_stated/u);
+  assert.match(messages[0].content, /resolution_too_smooth/u);
   assert.match(messages[2].content, /门禁灯由绿变红/u);
   assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 
@@ -77,12 +104,12 @@ test("isolated chapter review carries the full draft once and returns bounded st
     chapterChange: "主角从服从转为违规",
     reviewNotes: "结果与计划一致，但接缝需要补强。",
     issues: [{
-      severity: "blocker", kind: "telemetry_pileup", sceneId: "arrival",
-      evidence: ["门禁灯由绿变红。"], problem: "读数堆砌遮蔽人物选择", action: "只保留改变行动的读数",
+      severity: "blocker", kind: "knowledge_leak", sceneId: "arrival",
+      evidence: ["门禁灯由绿变红。"], problem: "角色没有获知门禁规则的路径，却据此判断违规", action: "补入可见线索或删除判断",
     }],
   }), new Set(["arrival"]), content);
   assert.equal(review.verdict, "revise");
-  assert.equal(review.issues[0].kind, "telemetry_pileup");
+  assert.equal(review.issues[0].kind, "knowledge_leak");
   assert.deepEqual(review.issues[0].evidence, ["门禁灯由绿变红。"]);
   assert.throws(() => parseChapterReview(JSON.stringify({
     verdict: "revise",
@@ -203,7 +230,7 @@ test("task modes share one frozen universal capability catalog", () => {
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
   assert.deepEqual(writeNames, catalog);
-  for (const required of ["read_document", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
+  for (const required of ["read_document", "begin_chapter_draft", "write_document_isolated", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
   assert.equal(writeNames.includes("save_character"), true);
@@ -212,6 +239,7 @@ test("task modes share one frozen universal capability catalog", () => {
 
   const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
   assert.equal(planNames.includes("write_chapter_scene"), false);
+  assert.equal(planNames.includes("write_chapter_scene_notes"), false);
   assert.equal(planNames.includes("propose_chapter_draft"), false);
   assert.ok(planNames.includes("read_document"));
 });
@@ -247,7 +275,7 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.match(normal, /检查同名卡/);
   assert.match(normal, /角色保存成功即完成本任务/);
   assert.match(normal, /禁止再提交文档提案或 change set/);
-  assert.match(normal, /必须 get_character/);
+  assert.match(normal, /直接 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
   assert.match(normal, /结构化错误/);
 });
@@ -314,7 +342,57 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   });
 });
 
-test("scene orchestration always stays on Agent regardless of Writer isolation", () => {
+test("planner prose gate candidates require an independently executable semantic rule", () => {
+  assert.deepEqual(normalizePlannedProseGateCandidate({
+    id: "technical-telemetry-density",
+    instruction: "正文不要连续堆叠精确技术参数；只有数值直接影响人物判断、风险或行动时才保留。",
+    severity: "warn",
+    sourceFeedback: "作者要求避免频繁细写元件温度升降数值。",
+  }), {
+    id: "technical-telemetry-density",
+    instruction: "正文不要连续堆叠精确技术参数；只有数值直接影响人物判断、风险或行动时才保留。",
+    severity: "warn",
+    sourceFeedback: "作者要求避免频繁细写元件温度升降数值。",
+  });
+  assert.equal(normalizePlannedProseGateCandidate({
+    id: "中文-id",
+    instruction: "少写一点。",
+    sourceFeedback: "不喜欢。",
+  }), undefined);
+  assert.equal(normalizePlannedProseGateCandidate({
+    id: "vague-feedback",
+    instruction: "",
+    sourceFeedback: "不喜欢。",
+  }), undefined);
+});
+
+test("immediately previous reply preserves named options for follow-up references", () => {
+  const prior = [
+    "前置分析。",
+    "**A. 第一次杀人**",
+    "A线的具体内容。",
+    "**B. 方晓的极限**",
+    "B线的具体内容。",
+    "**C. 父亲的另一面**",
+    "C线的具体内容。",
+  ].join("\n\n");
+  const admitted = priorTurnContentForContext(prior);
+  assert.equal(admitted, prior);
+  assert.match(admitted, /A\. 第一次杀人/);
+  assert.match(admitted, /C\. 父亲的另一面/);
+});
+
+test("exceptionally long previous replies mark middle omission instead of posing as complete", () => {
+  const prior = `HEAD-${"甲".repeat(15_000)}-${"乙".repeat(15_000)}-TAIL`;
+  const admitted = priorTurnContentForContext(prior);
+  assert.match(admitted, /^HEAD-/);
+  assert.match(admitted, /上一条消息中段已省略/);
+  assert.match(admitted, /原文 30011 字/);
+  assert.match(admitted, /-TAIL$/);
+  assert.ok(admitted.length < prior.length);
+});
+
+test("main orchestration always stays on Agent across task modes", () => {
   const model = (name: string) => ({
     provider: "openai-compatible" as const,
     baseUrl: "https://api.example.com/v1",
@@ -330,11 +408,19 @@ test("scene orchestration always stays on Agent regardless of Writer isolation",
 
   assert.equal(executionModelForTask(writing, models, agent), agent);
   assert.equal(executionModelForTask({ mode: "outline", documentProposalRequired: true }, models, agent), agent);
-  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent), inline);
-  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), reviewer);
+  assert.equal(executionModelForTask({ mode: "rewrite", documentProposalRequired: true }, models, agent), agent);
+  assert.equal(executionModelForTask({ mode: "audit", documentProposalRequired: false }, models, agent), agent);
 });
 
-test("standard scene steps use Writer only while prose scenes remain pending", () => {
+test("project cache user id is opaque and stable within a project", () => {
+  const first = projectCacheUserId("/projects/novel-a");
+  assert.equal(first, projectCacheUserId("/projects/novel-a"));
+  assert.notEqual(first, projectCacheUserId("/projects/novel-b"));
+  assert.match(first, /^writer-project-[a-f0-9]{32}$/);
+  assert.doesNotMatch(first, /novel-a/);
+});
+
+test("fast writing mode keeps every step on Agent, including pending prose scenes", () => {
   const model = (name: string) => ({ baseUrl: "https://api.example.com/v1", apiKey: "test", model: name });
   const agent = model("agent");
   const writer = model("writer");
@@ -342,10 +428,13 @@ test("standard scene steps use Writer only while prose scenes remain pending", (
   const complete = { scenes: [{ id: "one" }], completed: [{ sceneId: "one" }] } as unknown as Pick<import("./scene_pipeline.js").ChapterSceneDraft, "scenes" | "completed">;
 
   assert.equal(executionModelForStep("write_scene", agent, writer, false), agent);
-  assert.equal(executionModelForStep("write_scene", agent, writer, false, pending), writer);
+  assert.equal(executionModelForStep("write_scene", agent, writer, false, pending), agent);
   assert.equal(executionModelForStep("write_scene", agent, writer, false, complete), agent);
   assert.equal(executionModelForStep("write_scene", agent, writer, true, pending), agent);
-  assert.equal(executionModelForStep("outline", agent, writer, false, pending), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, true, complete), agent);
+  assert.equal(executionModelForStep("write_scene", agent, writer, true), agent);
+  assert.equal(executionModelForStep("write_scene", agent, undefined, true), agent);
+  assert.equal(executionModelForStep("outline", agent, writer, true, pending), agent);
 });
 
 test("provider usage parsing and tagged persistence include hidden model calls", () => {
@@ -398,7 +487,10 @@ test("provider usage parsing and tagged persistence include hidden model calls",
     }, { cacheHit: 0.1, cacheMiss: 1, output: 2, currency: "CNY", contextWindow: 1000 }, new Date("2026-01-01T00:00:02Z"), {
       jobId: "job-1", callKind: "auto_title",
     });
-    assert.equal(store.usage(sessionId).lastPromptTokens, 500);
+    const summary = store.usage(sessionId);
+    assert.equal(summary.lastPromptTokens, 500);
+    assert.equal(summary.callBreakdown.find(call => call.model === "flash")?.promptTokens, 160);
+    assert.equal(summary.callBreakdown.find(call => call.model === "pro")?.completionTokens, 20);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });
@@ -408,6 +500,17 @@ test("provider usage parsing and tagged persistence include hidden model calls",
 test("audit workflow separates review-only from repair", () => {
   assert.match(taskInstructions("audit", "shape", "ask", false), /不提案/);
   assert.match(taskInstructions("audit", "shape", "ask", true), /最小提案/);
+});
+
+test("rewrite scope requires concrete evidence before locking to one point", () => {
+  assert.equal(normalizeRewriteEditScope(
+    "见父亲的片段改一下，关系不要那么僵，更多交流未来规划",
+    "point",
+    0,
+  ), "section");
+  assert.equal(normalizeRewriteEditScope("把“他没有回答。”改得自然些", "section", 0), "point");
+  assert.equal(normalizeRewriteEditScope("调整当前浏览器选区", "section", 24), "point");
+  assert.equal(normalizeRewriteEditScope("全文统一调整父子关系", "point", 0), "document");
 });
 
 test("lore entity discussion upgrades to project fact search", () => {
@@ -443,30 +546,34 @@ test("prebuilt todo plans start with one active step", () => {
   ]);
 });
 
-test("chapter workflow uses the model-driven scene tool chain", () => {
+test("chapter workflow lets the Agent choose a delivery path", () => {
   const instructions = taskInstructions("write_scene", "deliver", "ask", true);
+  assert.match(instructions, /自主决定/);
+  assert.match(instructions, /直接用 propose_document/);
+  assert.match(instructions, /propose_document_patch/);
+  assert.match(instructions, /compile_write_pack/);
   assert.match(instructions, /begin_chapter_draft/);
   assert.match(instructions, /write_chapter_scene/);
-  assert.match(instructions, /revise_chapter_scene_guide/);
-  assert.match(instructions, /revise_chapter_draft_style/);
-  assert.match(instructions, /每次 write_chapter_scene 只处理当前一场/);
-  assert.match(instructions, /styleDeferred/);
-  assert.match(instructions, /禁止为句式问题重写整场/);
-  assert.match(instructions, /禁止通读上一章全文/);
+  assert.match(instructions, /只有长篇连续状态/);
+  assert.match(instructions, /不要为了展示流程/);
   const isolated = taskInstructions("write_scene", "deliver", "ask", true, true);
-  assert.match(isolated, /每次 write_chapter_scene 只处理当前一场/);
-  assert.match(isolated, /不要生成 content 或 actualState/);
-  assert.match(isolated, /隔离模式不把风格统计写进下一场 notes/);
+  assert.match(isolated, /write_chapter_scene_notes/);
+  assert.match(isolated, /由隔离 Writer 生成正文和状态/);
   assert.match(taskInstructions("write_scene", "deliver", "ask", true, true, 4_200), /4200 字/);
   assert.match(instructions, /inspect_chapter_draft/);
-  assert.match(instructions, /propose_chapter_draft/);
-  assert.match(instructions, /直接创建提案/);
   assert.match(instructions, /actualState/);
-  assert.match(instructions, /禁止 propose_document\/patch/);
-  assert.match(instructions, /大纲不是章节写作的前置条件/);
-  assert.match(instructions, /禁止 design_creative_outline/);
-  assert.match(instructions, /guide 只提供下一步方向/);
-  assert.match(instructions, /side\/ 的支线片段/u);
+  assert.match(instructions, /大纲不是前置条件/);
+  assert.match(instructions, /问题密集/);
+  assert.match(instructions, /重写受影响场景乃至全文/);
+  assert.doesNotMatch(instructions, /不能跳过逐场景|禁止 propose_document\/patch/);
+  const fast = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true);
+  assert.match(fast, /传统单 Agent 链路/);
+  assert.match(fast, /不得调用或等待正文 Writer/);
+  assert.match(fast, /不要为了展示流程而建立场景链/);
+  const withoutScenePipeline = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true, false);
+  assert.match(withoutScenePipeline, /场景链已关闭/);
+  assert.match(withoutScenePipeline, /禁止调用章节场景链工具/);
+  assert.doesNotMatch(withoutScenePipeline, /write_chapter_scene 提交/);
 });
 
 test("chapter continuation handoff carries delivery, tail, and final scene state", () => {
@@ -485,7 +592,7 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   assert.match(prompt, /禁止重复提交同一章/);
   assert.match(prompt, /chapters\/第1章\.md/);
   assert.match(prompt, /警报已触发/);
-  assert.match(prompt, /begin_chapter_draft/);
+  assert.match(prompt, /重新选择直接成稿/);
   assert.match(prompt, /撰写第2章/);
   // Tail excerpt is bounded so the handoff stays cheap on every remaining step.
   const tailBlock = prompt.split("上一章结尾")[1] ?? "";
@@ -527,7 +634,7 @@ test("scene continuation handoff carries seam tail, states and next card without
   const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
   assert.ok(tailBlock.length > 0 && tailBlock.length < 1_000, `tail block out of bounds: ${tailBlock.length}`);
   const isolatedPrompt = sceneContinuationPrompt(draft, { isolatedWriter: true });
-  assert.match(isolatedPrompt, /调用 write_chapter_scene/);
+  assert.match(isolatedPrompt, /调用 write_chapter_scene_notes/);
   assert.match(isolatedPrompt, /只提交要点式 notes/);
   assert.doesNotMatch(isolatedPrompt, /提交要点式 notes、正文与 actualState/);
 
@@ -537,6 +644,68 @@ test("scene continuation handoff carries seam tail, states and next card without
   const complete = sceneContinuationPrompt(draft, {});
   assert.match(complete, /当前没有未写 scene guide/);
   assert.match(complete, /inspect_chapter_draft/);
+  const reviewLock = chapterReviewRequiredPrompt(draft);
+  assert.match(reviewLock, /已完成（2\/2）/);
+  assert.match(reviewLock, /唯一下一步：立即调用 inspect_chapter_draft/);
+  assert.match(reviewLock, /不要调用 manage_todos/);
+  assert.match(reviewLock, /禁止重写、续写或重新建立 scene guide/);
+  assert.equal(chapterReviewAllowsTool("inspect_chapter_draft"), true);
+  assert.equal(chapterReviewAllowsTool("manage_todos"), false);
+  assert.equal(chapterReviewAllowsTool("write_chapter_scene"), false);
+  const reviewRetry = chapterReviewRequiredPrompt(draft, {
+    rejectedTools: ["write_chapter_scene", "manage_todos", "write_chapter_scene"],
+    attempt: 2,
+  });
+  assert.match(reviewRetry, /第 2 次/);
+  assert.match(reviewRetry, /write_chapter_scene、manage_todos/);
+  assert.match(reviewRetry, /这些调用未执行，草稿没有变化/);
+  assert.equal(chapterDraftNeedsReview(draft, "scene_written"), true);
+  assert.equal(chapterDraftNeedsReview(draft, "review_blocked"), false);
+  draft.inspectedVersion = draft.version;
+  assert.equal(chapterDraftNeedsReview(draft, "scene_written"), false);
+});
+
+test("actionable chapter review results release the inspect-only terminal lock", () => {
+  assert.equal(chapterReviewCompleted({
+    status: "style_revision_required",
+    error: "六个句子需要精确替换",
+  }), true);
+  assert.equal(chapterReviewCompleted({ status: "structural_revision_required" }), true);
+  assert.equal(chapterReviewCompleted({ status: "inspection_required" }), true);
+  assert.equal(chapterReviewCompleted({ status: "proposal_failed", error: "提案暂时失败" }), true);
+  assert.equal(chapterReviewCompleted({ status: "proposal_submitted" }), true);
+  assert.equal(chapterReviewCompleted({ error: "缺少有效参数：summary" }), false);
+  assert.equal(chapterReviewCompleted({ status: "error", error: "工具执行失败" }), false);
+});
+
+test("automatic chapter review preserves character evolution and scopes rejected repairs", () => {
+  assert.equal(automaticChapterReviewEnabled(false), true);
+  assert.equal(automaticChapterReviewEnabled(true), false);
+  assert.equal(automaticChapterReviewEnabled(undefined), false);
+
+  const style = chapterReviewRepairLock({ status: "style_revision_required" });
+  assert.deepEqual(style, { mode: "style" });
+  assert.equal(chapterReviewRepairAllowsTool(style!, "revise_chapter_draft_style"), true);
+  assert.equal(chapterReviewRepairAllowsTool(style!, "write_chapter_scene", JSON.stringify({ sceneId: "s1" })), false);
+  assert.equal(chapterReviewRepairAllowsTool(style!, "propose_chapter_draft"), false);
+  assert.equal(chapterReviewRepairAllowsTool(style!, "read_document", JSON.stringify({ path: "chapters/one.md" })), true);
+
+  const structural = chapterReviewRepairLock({
+    status: "structural_revision_required",
+    targetScenes: [{ sceneId: "s2" }, { sceneId: "s2" }, { sceneId: "s4" }],
+  });
+  assert.deepEqual(structural, { mode: "structural", targetSceneIds: ["s2", "s4"] });
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s2" })), true);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene_notes", JSON.stringify({ sceneId: "s4" })), true);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s3" })), false);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "revise_chapter_scene_guide"), false);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", "{"), false);
+});
+
+test("document delivery continuation uses contract outputs instead of todo wording", () => {
+  assert.equal(documentDeliveryRemaining(["第二章"], 1), false);
+  assert.equal(documentDeliveryRemaining(["第二章", "第三章"], 1), true);
+  assert.equal(documentDeliveryRemaining([], 0), false);
 });
 
 type Msg = {
@@ -557,9 +726,11 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.equal(a.length, 6);
     assert.ok(a.every(message => message.role === "system"));
     assert.deepEqual(a.map(m => m.content), b.map(m => m.content));
-    // Placeholders keep slot count when project has no instructions/skills.
+    // Placeholders/catalogs keep slot count when optional project files are absent.
     assert.match(a[2].content ?? "", /项目指令/);
     assert.match(a[3].content ?? "", /项目技能/);
+    assert.match(a[3].content ?? "", /chapter-planning/);
+    assert.doesNotMatch(a[3].content ?? "", /提交前验收/);
     assert.match(a[0].content ?? "", /characterChanges/);
     // Slot 4/5 must not flip with intensive or audit — those go in the dynamic tail.
     const intensive = buildStableSystemPrefix(project, store, "ask", { intensive: true }, "write_scene");
@@ -571,6 +742,60 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.match(a[4].content ?? "", /风格锚定/);
     assert.match(a[5].content ?? "", /当前任务/);
     assert.doesNotMatch(a[5].content ?? "", /终审专则/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the turn's prose-length target lives in the dynamic tail, never in the stable prefix", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-length-"));
+  try {
+    const project = WriterProject.init(root, "篇幅");
+    const store = new WriterStore(project);
+    const task = {
+      mode: "write_scene" as const,
+      label: "写一章",
+      searchQuery: "",
+      characterIds: [],
+      exampleIds: [],
+      documentContext: "target" as const,
+      creativeDepth: "deliver" as const,
+      editScope: "document" as const,
+      documentProposalRequired: true,
+      continuation: false,
+      todoPlan: [],
+      documentDeliverables: ["chapters/01.md"],
+      outcome: "document" as const,
+      evidence: "none" as const,
+      mutation: "document" as const,
+      planning: "adaptive" as const,
+      capabilities: ["documents" as const],
+      workflow: "chapter_delivery" as const,
+      qualityProfile: "standard" as const,
+    };
+    const scenePipeline = {
+      enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
+      notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+    };
+    const withTarget = dynamicContextPrompt(
+      project, store, "写一章", task, "ask", scenePipeline, "fast", false,
+      undefined, undefined, undefined, false,
+      { targetCharacters: 4_200, source: "prompt_relative" },
+    );
+    assert.match(withTarget, /本轮篇幅目标：整章约 4200 字/u);
+    assert.match(withTarget, /用户本轮要求相对项目默认调整/u);
+
+    // 这个数字每轮都可能变，只能待在 miss-priced 的动态块里。
+    const stable = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "write_scene");
+    assert.equal(stable.length, 6);
+    assert.ok(stable.every(message => !/本轮篇幅目标/u.test(message.content ?? "")));
+
+    // 没有解析出目标时不占位，免得给动态块加一行常量字节。
+    const withoutTarget = dynamicContextPrompt(
+      project, store, "写一章", task, "ask", scenePipeline, "fast", false,
+    );
+    assert.doesNotMatch(withoutTarget, /本轮篇幅目标：/u);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -601,6 +826,40 @@ test("dynamic turn messages always expose the same slot count", () => {
   assert.equal(empty.at(-1)?.content, "闲聊");
   assert.match(empty[3].content ?? "", /动态声线/);
   assert.match(empty[6].content ?? "", /工作记忆/);
+});
+
+test("cache waterfall fingerprints stable messages and tools but not dynamic content", () => {
+  const tools = agentToolsForTask("general", "ask");
+  const components = buildRequestComponentUsage([
+    { role: "system", content: "稳定" },
+    { role: "system", content: "动态" },
+    { role: "user", content: "请求" },
+  ], tools, 1, 3);
+  assert.equal(components.find(item => item.kind === "tool_schema")?.fingerprint?.length, 12);
+  assert.equal(components.find(item => item.kind === "stable_system")?.fingerprint?.length, 12);
+  assert.equal(components.find(item => item.kind === "dynamic_system")?.fingerprint, undefined);
+  assert.equal(components.find(item => item.kind === "user")?.fingerprint, undefined);
+});
+
+test("recent roleplay handoff preserves exact turns and director boundaries", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-roleplay-handoff-"));
+  try {
+    const project = WriterProject.init(root, "试演转正文");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("转换");
+    store.addMessage(sessionId, "user", "先讨论大纲", "agent");
+    store.addMessage(sessionId, "user", "把地点改到雨夜站台，怀表已经摔碎。", "roleplay", undefined, "director");
+    store.addMessage(sessionId, "assistant", "她捡起两截表链，没有把表盘复原。", "roleplay");
+
+    const handoff = recentRoleplayHandoffContext(store, sessionId);
+    assert.match(handoff, /\[导演指令\]/);
+    assert.match(handoff, /怀表已经摔碎/);
+    assert.match(handoff, /没有把表盘复原/);
+    assert.doesNotMatch(handoff, /先讨论大纲/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("read atoms lock one source snapshot, reuse exact coverage and allow wider context", () => {
@@ -724,4 +983,80 @@ test("compactCompletedToolCalls keeps only the latest propose payload", () => {
   const second = JSON.parse(messages[1].tool_calls![0].function.arguments) as { content: string };
   assert.match(first.content, /已压缩/);
   assert.equal(second.content, "新正文");
+});
+
+test("turn one keeps today's 9-slot shape; later turns fold into a single user block", () => {
+  const turnParts = {
+    taskContext: "当前任务：改稿",
+    dynamicStyleContext: "声线",
+    bootstrapContext: "线索",
+    todosPrompt: "清单",
+    artifactContext: "记忆",
+    selectedContext: "选区",
+    prompt: "把这段改短",
+  };
+  const stable = [1, 2, 3, 4, 5, 6].map(index => ({ role: "system" as const, content: `稳定 ${index}` }));
+
+  // Turn 1: no replay, so the 8 system slots are still legal (nothing precedes them).
+  const first = [...stable, ...buildDynamicTurnMessages({ historyText: "历史", archiveContext: "归档", ...turnParts })];
+  assert.equal(first.length, 15);
+  assert.equal(first.filter(message => message.role === "system").length, 14);
+
+  // Turn 2: the same bodies, one user message, appended after the frozen transcript.
+  const frozen = freezeTurnBlock([...first, { role: "assistant", content: "已改" }], stable.length);
+  const second = [...stable, ...frozen, mergedTurnContext(turnParts)];
+  assert.equal(second.at(-1)?.role, "user");
+  for (const body of ["当前任务：改稿", "声线", "线索", "清单", "记忆", "选区", "把这段改短"]) {
+    assert.match(second.at(-1)?.content ?? "", new RegExp(body));
+  }
+});
+
+test("no system message ever follows an assistant or tool turn across three turns", () => {
+  const stable = [1, 2, 3, 4, 5, 6].map(index => ({ role: "system" as const, content: `稳定 ${index}` }));
+  const parts = (turn: number) => ({ taskContext: `任务 ${turn}`, prompt: `请求 ${turn}` });
+
+  let chain: AgentTurnMessage[] = [];
+  let request: AgentTurnMessage[] = [];
+  for (const turn of [1, 2, 3]) {
+    request = [
+      ...stable,
+      ...chain,
+      ...(chain.length
+        ? [mergedTurnContext(parts(turn))]
+        : buildDynamicTurnMessages({ historyText: "历史", archiveContext: "归档", ...parts(turn) })),
+    ];
+    const live = [
+      ...request,
+      { role: "assistant" as const, content: "读", tool_calls: [{ id: `t${turn}`, type: "function" as const, function: { name: "read_document", arguments: "{}" } }] },
+      { role: "tool" as const, content: "{}", tool_call_id: `t${turn}` },
+      { role: "assistant" as const, content: `完成 ${turn}` },
+    ];
+    chain = freezeTurnBlock(live, stable.length);
+  }
+
+  // DeepSeek re-renders the whole request under a different template when a system
+  // message trails assistant/tool history — measured twice (contract §4).
+  let transcriptStarted = false;
+  request.forEach((message, index) => {
+    if (message.role === "assistant" || message.role === "tool") transcriptStarted = true;
+    assert.ok(!(transcriptStarted && message.role === "system"), `system message at index ${index} follows the transcript`);
+  });
+  // Replay must be a real prefix of what was sent, not a rebuilt approximation.
+  assert.deepEqual(request.slice(0, 6), stable);
+  assert.equal(request.at(-1)?.role, "user");
+  assert.match(request.at(-1)?.content ?? "", /任务 3/);
+});
+
+test("cache waterfall reports replayed turns separately from the live dynamic tail", () => {
+  const tools = agentToolsForTask("general", "ask");
+  const components = buildRequestComponentUsage([
+    { role: "system", content: "稳定" },
+    { role: "user", content: "上一轮请求" },
+    { role: "assistant", content: "上一轮回答" },
+    { role: "user", content: "本轮请求" },
+  ], tools, 1, 4, 3);
+  assert.equal(components.filter(item => item.kind === "replayed_turn").length, 2);
+  assert.equal(components.filter(item => item.kind === "user").length, 1);
+  assert.equal(components.find(item => item.kind === "user")?.label, "当前用户请求");
+  assert.equal(components.find(item => item.kind === "dynamic_system"), undefined);
 });

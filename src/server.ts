@@ -11,9 +11,11 @@ import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
 import {
   ABSOLUTE_MAX_SCENES,
+  MAX_CHAPTER_TARGET_CHARACTERS,
   MAX_ISOLATED_WRITER_MAX_RATIO,
   MAX_SCENE_NOTES_CHARACTERS,
   MAX_SCENE_CANDIDATES,
+  MIN_CHAPTER_TARGET_CHARACTERS,
   MIN_ISOLATED_WRITER_MAX_RATIO,
   MIN_SCENE_NOTES_CHARACTERS,
   isPermissionMode,
@@ -21,11 +23,25 @@ import {
   loadAgentSettings,
   loadProjectInstructions,
   saveAgentSettings,
+  isWritingExecutionMode,
+  type ProseLengthSettings,
   type ScenePipelineSettings,
+  type WritingExecutionMode,
 } from "./agent_runtime.js";
-import { generateCharacter, maybeAutoTitleSession, suggestActions, summarizeCharacterCompetency, updateCharacterFromConversation, type WritingMode } from "./generation.js";
+import {
+  generateCharacter,
+  maybeAutoTitleSession,
+  suggestActions,
+  summarizeCharacterCompetency,
+  summarizeCharacterField,
+  updateCharacterFromConversation,
+  type CharacterSummaryKind,
+  type WritingMode,
+} from "./generation.js";
 import {
   generateRoleplayInterlocutor,
+  generateRoleplayScene,
+  normalizeRoleplayRerunControls,
   normalizeRoleplayRerunDirections,
   parseRoleplayPerception,
   parseStoredRoleplayPerception,
@@ -38,12 +54,20 @@ import {
 } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
-import { WriterProject } from "./project.js";
+import { documentKind, WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import type { AgentEvent, Message, PermissionMode, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StyleTemplate } from "./types.js";
+import type { AgentEvent, Message, MessageStepTrail, PermissionMode, PersistedStreamStep, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StepUsage, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
+import {
+  loadProseGateRules,
+  removeProseGateRule,
+  setProseGateRuleEnabled,
+  upsertProseGateRule,
+  type ProseGateRule,
+} from "./prose_gate_rules.js";
+import { extractContinuityFacts, type ContinuityFact } from "./continuity_facts.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -54,6 +78,7 @@ export type WebConversationMessage = Message & {
 
 export function conversationMessageForWeb(store: WriterStore, message: Message): WebConversationMessage {
   if (message.channel !== "roleplay" || message.role !== "user") return message;
+  if (message.roleplayInputMode === "director") return message;
   const stored = store.roleplayPerception(message.sessionId, message.id);
   const roleplayPerception = stored ? storedRoleplayPerceptionForDisplay(stored).trim() : "";
   const roleplayPerceptionData = stored ? parseStoredRoleplayPerception(stored) : undefined;
@@ -95,8 +120,55 @@ type AgentJob = {
   listeners: Set<(event: StoredAgentEvent) => void>;
 };
 
+const STEP_TRAIL_TEXT_MAX = 12_000;
+const STEP_TRAIL_FLUSH_MS = 1_500;
+
+function compactStepTrailText(value: string): string {
+  if (value.length <= STEP_TRAIL_TEXT_MAX) return value;
+  const tailLength = 2_000;
+  const headLength = STEP_TRAIL_TEXT_MAX - tailLength;
+  return `${value.slice(0, headLength)}\n\n[内容过长，已截断]\n\n${value.slice(-tailLength)}`;
+}
+
+function mergePersistedStepUsage(current: StepUsage | undefined, next: StepUsage): StepUsage {
+  if (!current) return next;
+  const models = [...new Set([current.model, next.model].filter((value): value is string => Boolean(value)))];
+  const hits = (current.cacheHitTokens ?? 0) + (next.cacheHitTokens ?? 0);
+  const misses = (current.cacheMissTokens ?? 0) + (next.cacheMissTokens ?? 0);
+  return {
+    ...(models.length ? { model: models.length === 1 ? models[0] : "多个模型" } : {}),
+    ...(current.providerName || next.providerName
+      ? { providerName: current.providerName === next.providerName
+          ? current.providerName
+          : [current.providerName, next.providerName].filter(Boolean).join(",") }
+      : {}),
+    promptTokens: (current.promptTokens ?? 0) + (next.promptTokens ?? 0),
+    completionTokens: (current.completionTokens ?? 0) + (next.completionTokens ?? 0),
+    cacheHitTokens: hits,
+    cacheMissTokens: misses,
+    totalTokens: (current.totalTokens ?? 0) + (next.totalTokens ?? 0),
+    cost: (current.cost ?? 0) + (next.cost ?? 0),
+    currency: current.cost > 0 ? current.currency : next.currency || current.currency,
+    estimated: Boolean(current.estimated || next.estimated),
+    ...(hits + misses > 0 && !current.estimated && !next.estimated
+      ? { cacheHitRate: hits / (hits + misses) }
+      : {}),
+    requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
+  };
+}
+
+type JobTrailState = {
+  sourceMessageId?: number;
+  steps: PersistedStreamStep[];
+  lastFlushAt: number;
+  dirty: boolean;
+};
+
 export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
+  private trails = new Map<string, JobTrailState>();
+
+  constructor(private store?: WriterStore) {}
 
   start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
     if (this.activeJob(sessionId)) throw new Error("SESSION_JOB_ALREADY_RUNNING");
@@ -111,6 +183,7 @@ export class BackgroundAgentJobs {
       listeners: new Set(),
     };
     this.jobs.set(job.id, job);
+    this.trails.set(job.id, { steps: [], lastFlushAt: 0, dirty: false });
     const emit = (event: AgentEvent) => this.emit(job.id, event);
     // Defer so callers can finish `const job = start(...)` before the runner touches `job`.
     queueMicrotask(() => {
@@ -174,6 +247,7 @@ export class BackgroundAgentJobs {
     const stored = { ...event, index: job.events.length } as StoredAgentEvent;
     job.events.push(stored);
     job.updatedAt = new Date().toISOString();
+    this.applyTrailEvent(job, event);
     if (event.type === "done") this.finish(job, "completed");
     if (event.type === "cancelled") this.finish(job, "cancelled");
     if (event.type === "waiting_for_input") this.finish(job, "completed");
@@ -181,10 +255,125 @@ export class BackgroundAgentJobs {
     for (const listener of job.listeners) listener(stored);
   }
 
+  private applyTrailEvent(job: AgentJob, event: AgentEvent): void {
+    const trail = this.trails.get(job.id);
+    if (!trail) return;
+    let forceFlush = false;
+    if (event.type === "source_message" && typeof event.messageId === "number" && Number.isFinite(event.messageId)) {
+      trail.sourceMessageId = event.messageId;
+      trail.dirty = true;
+      forceFlush = true;
+    } else if (event.type === "step_start") {
+      const id = event.step ?? trail.steps.length + 1;
+      if (!trail.steps.some(step => step.id === id)) {
+        trail.steps.push({ id, output: "", reasoning: "", tools: [], status: "running" });
+        trail.dirty = true;
+        forceFlush = true;
+      }
+    } else if (event.type === "text" && event.text) {
+      const idx = activeTrailStepIndex(trail.steps);
+      if (idx >= 0) {
+        const key = event.channel === "reasoning" ? "reasoning" : "output";
+        trail.steps[idx] = {
+          ...trail.steps[idx],
+          [key]: compactStepTrailText(trail.steps[idx][key] + event.text),
+        };
+        trail.dirty = true;
+      }
+    } else if (event.type === "tool" && event.name) {
+      const idx = activeTrailStepIndex(trail.steps);
+      if (idx >= 0) {
+        trail.steps[idx] = {
+          ...trail.steps[idx],
+          tools: [...trail.steps[idx].tools, event.name],
+        };
+        trail.dirty = true;
+      }
+    } else if (event.type === "usage" && event.call) {
+      const targetId = event.step;
+      let idx = targetId != null
+        ? trail.steps.findIndex(step => step.id === targetId)
+        : activeTrailStepIndex(trail.steps);
+      if (idx < 0 && targetId != null) {
+        trail.steps.push({
+          id: targetId,
+          output: "",
+          reasoning: "",
+          tools: [],
+          status: "completed",
+          usage: event.call,
+        });
+        trail.steps.sort((left, right) => left.id - right.id);
+        trail.dirty = true;
+      } else if (idx >= 0) {
+        trail.steps[idx] = {
+          ...trail.steps[idx],
+          usage: mergePersistedStepUsage(trail.steps[idx].usage, event.call),
+        };
+        trail.dirty = true;
+      }
+    } else if (event.type === "step_done") {
+      trail.steps = trail.steps.map(step => (
+        step.id === event.step
+          ? { ...step, status: "completed", output: compactStepTrailText(step.output), reasoning: compactStepTrailText(step.reasoning) }
+          : step
+      ));
+      trail.dirty = true;
+      forceFlush = true;
+    } else if (event.type === "error") {
+      trail.steps = trail.steps.map(step => (
+        step.status === "running" ? { ...step, status: "failed" } : step
+      ));
+      trail.dirty = true;
+      forceFlush = true;
+    } else if (
+      event.type === "done"
+      || event.type === "cancelled"
+      || event.type === "waiting_for_input"
+    ) {
+      trail.steps = trail.steps.map(step => (
+        step.status === "running"
+          ? { ...step, status: event.type === "cancelled" ? "failed" : "completed" }
+          : step
+      ));
+      trail.dirty = true;
+      forceFlush = true;
+    }
+    if (trail.dirty) this.flushTrail(job, forceFlush);
+  }
+
+  private flushTrail(job: AgentJob, force: boolean): void {
+    const trail = this.trails.get(job.id);
+    if (!trail?.dirty || !trail.sourceMessageId || !trail.steps.length || !this.store) return;
+    const now = Date.now();
+    if (!force && now - trail.lastFlushAt < STEP_TRAIL_FLUSH_MS) return;
+    const steps = trail.steps.map(step => ({
+      ...step,
+      output: compactStepTrailText(step.output),
+      reasoning: compactStepTrailText(step.reasoning),
+    }));
+    try {
+      this.store.upsertMessageStepTrail(job.sessionId, trail.sourceMessageId, steps, { jobId: job.id });
+      trail.lastFlushAt = now;
+      trail.dirty = false;
+    } catch {
+      // Persistence is best-effort; live SSE remains authoritative while the job runs.
+    }
+  }
+
   private finish(job: AgentJob, status: Exclude<AgentJobStatus, "running">): void {
     job.status = status;
     job.updatedAt = new Date().toISOString();
+    this.flushTrail(job, true);
+    this.trails.delete(job.id);
   }
+}
+
+function activeTrailStepIndex(steps: PersistedStreamStep[]): number {
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    if (steps[i].status === "running") return i;
+  }
+  return -1;
 }
 
 function jobInfo({ id, sessionId, status, createdAt, updatedAt }: AgentJob): AgentJobInfo {
@@ -214,8 +403,9 @@ export async function startWriterServer(options: {
   const requireToken = options.requireToken !== false;
   const token = requireToken ? randomBytes(24).toString("base64url") : "";
   const localBypassToken = randomBytes(24).toString("base64url");
+  let readonlyToken = "";
   const app = new Hono();
-  const agentJobs = new BackgroundAgentJobs();
+  const agentJobs = new BackgroundAgentJobs(options.store);
   let publicOrigin: string | null | undefined;
 
   // CORS：手机页在局域网 HTTP 打开时，离开家后 API 会跨域打到 Cloudflare HTTPS。
@@ -239,11 +429,21 @@ export async function startWriterServer(options: {
     }
     const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
     const localBypass = context.req.header("x-writer-local-access") ?? "";
-    if (!tokensEqual(provided, token) && !tokensEqual(localBypass, localBypassToken)) {
+    const ownerAccess = tokensEqual(provided, token) || tokensEqual(localBypass, localBypassToken);
+    const readonlyAccess = Boolean(readonlyToken) && tokensEqual(provided, readonlyToken);
+    if (!ownerAccess && !readonlyAccess) {
       return context.json({ error: "访问令牌无效或已失效" }, 401);
+    }
+    if (readonlyAccess && context.req.method !== "GET") {
+      return context.json({ error: "此分享链接为只读模式，不能执行写入操作" }, 403);
     }
     await next();
   });
+
+  const requestAccessMode = (authorization: string | undefined): "owner" | "readonly" => {
+    const provided = authorization?.replace(/^Bearer\s+/i, "") ?? "";
+    return readonlyToken && tokensEqual(provided, readonlyToken) ? "readonly" : "owner";
+  };
 
   app.get("/api/health", (context) => context.json({
     ok: true,
@@ -251,12 +451,28 @@ export async function startWriterServer(options: {
     ...(publicOrigin !== undefined ? { publicOrigin } : {}),
   }));
 
+  app.post("/api/share/readonly", (context) => {
+    if (!requireToken) {
+      return context.json({ error: "当前服务未启用访问令牌，无法创建安全的只读分享链接" }, 400);
+    }
+    // Rotation is intentional: at most one read-only bearer link is valid.
+    readonlyToken = randomBytes(24).toString("base64url");
+    return context.json({ token: readonlyToken, accessMode: "readonly" as const });
+  });
+
+  app.delete("/api/share/readonly", (context) => {
+    readonlyToken = "";
+    return context.json({ ok: true });
+  });
+
   app.get("/api/state", (context) => {
+    const accessMode = requestAccessMode(context.req.header("authorization"));
     const requested = context.req.query("session");
     const sessionId = requested && options.store.sessionExists(requested)
       ? requested
       : options.store.latestSession() ?? options.store.createSession();
     return context.json({
+      accessMode,
       config: options.project.config(),
       documents: options.project.listDocuments(),
       documentFolders: options.project.listDocumentFolders(),
@@ -277,6 +493,12 @@ export async function startWriterServer(options: {
         const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
         return firstId !== undefined && firstArchiveId !== undefined && firstId > firstArchiveId;
       })(),
+      stepTrails: (() => {
+        const visible = options.store.conversationMessagesBefore(sessionId, undefined, 50)
+          .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim());
+        const messageIds = visible.map(message => message.id);
+        return options.store.messageStepTrails(sessionId, messageIds);
+      })(),
       proposals: options.store.proposals(),
       changeSets: options.store.changeSets(),
       characters: options.store.characters(),
@@ -291,6 +513,8 @@ export async function startWriterServer(options: {
       usage: options.store.usage(sessionId),
       todos: options.store.sessionTodos(sessionId),
       agentSettings: loadAgentSettings(options.project),
+      proseGateRules: loadProseGateRules(options.project),
+      continuityFacts: options.store.continuityFacts({ limit: 500 }),
       projectInstructions: loadProjectInstructions(options.project)?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description,
@@ -321,6 +545,14 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.get("/api/chapters", (context) => {
+    try {
+      return context.json({ chapters: options.store.chapterSummaries() });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.get("/api/document/version", (context) => {
     try {
       const path = context.req.query("path") ?? "";
@@ -329,6 +561,16 @@ export async function startWriterServer(options: {
       return context.json({ version: options.store.documentVersion(path, id) });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
+  app.post("/api/document/version/restore", async (context) => {
+    try {
+      const body = await context.req.json<{ path: string; id: number; baseHash: string }>();
+      const version = options.store.restoreDocumentVersion(body.path ?? "", Number(body.id), body.baseHash ?? "");
+      return context.json({ version, hash: options.project.hash(options.project.read(body.path)) });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 409);
     }
   });
 
@@ -448,10 +690,10 @@ export async function startWriterServer(options: {
       const rawLimit = Number(context.req.query("limit") || 50);
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 50;
       const messages = options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, beforeId, limit)
-        .filter(message => message.content.trim())
+        .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
         .map(message => ({
           ...conversationMessageForWeb(options.store, message),
-          content: stripDsmlText(message.content, "[tool call hidden]"),
+          content: stripDsmlText(message.content, "[工具调用已隐藏]"),
         })));
       const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
       const hasMore = Boolean(messages.length && firstArchiveId !== undefined && messages[0].id > firstArchiveId);
@@ -519,6 +761,21 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/characters/summarize", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string; kind?: CharacterSummaryKind; source?: unknown }>();
+      if (!body.kind) throw new Error("缺少摘要类型");
+      const summary = await summarizeCharacterField({
+        model: options.providers.summaryModelConfig(),
+        kind: body.kind,
+        source: body.source,
+        signal: context.req.raw.signal,
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
+      });
+      return context.json({ summary });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.delete("/api/characters/:id", (context) => {
     try {
       const id = Number(context.req.param("id"));
@@ -534,22 +791,79 @@ export async function startWriterServer(options: {
     return context.json({ templates: styleTemplatesForClient(options.project), active: activeTemplate ?? null });
   });
 
+  app.get("/api/prose-gates", (context) => {
+    try {
+      return context.json({ rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/prose-gates", async (context) => {
+    try {
+      const body = await context.req.json<Partial<ProseGateRule>>();
+      const rule = upsertProseGateRule(options.project, {
+        id: typeof body.id === "string" ? body.id : "",
+        instruction: typeof body.instruction === "string" ? body.instruction : "",
+        kind: body.kind === "style_preference" ? "style_preference" : body.kind === "hard_gate" ? "hard_gate" : undefined,
+        severity: body.severity === "warn" ? "warn" : "block",
+        enabled: body.enabled !== false,
+        sourceFeedback: typeof body.sourceFeedback === "string" ? body.sourceFeedback : "",
+      });
+      return context.json({ rule, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.put("/api/prose-gates/:id/enabled", async (context) => {
+    try {
+      const body = await context.req.json<{ enabled?: boolean }>();
+      if (typeof body.enabled !== "boolean") throw new Error("enabled 必须是布尔值");
+      const rule = setProseGateRuleEnabled(options.project, context.req.param("id"), body.enabled);
+      return context.json({ rule, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.delete("/api/prose-gates/:id", (context) => {
+    try {
+      const id = context.req.param("id");
+      const removed = removeProseGateRule(options.project, id);
+      return context.json({ removed, id, rules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.get("/api/continuity-facts", (context) => {
+    try {
+      return context.json({ facts: options.store.continuityFacts({ limit: 1_000 }) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/continuity-facts", async (context) => {
+    try {
+      const body = await context.req.json<Partial<ContinuityFact>>();
+      const fact = options.store.saveContinuityFact({
+        ...body,
+        statement: typeof body.statement === "string" ? body.statement : "",
+      });
+      return context.json({ fact, facts: options.store.continuityFacts({ limit: 1_000 }) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.delete("/api/continuity-facts/:id", (context) => {
+    try {
+      const id = Number(context.req.param("id"));
+      const fact = options.store.retractContinuityFact(id);
+      return context.json({ fact, facts: options.store.continuityFacts({ limit: 1_000 }) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.post("/api/style/templates", async (context) => {
     try {
       const body = await context.req.json<Partial<StyleTemplate>>();
       const template = options.project.saveStyleTemplate(body);
-      let sampling: ReturnType<ProviderManager["applySamplingDefaults"]> | null = null;
       if (options.project.config().style === template.id) {
         options.store.seedStyleExample(template);
-        sampling = options.providers.applySamplingDefaults(
-          template.suggestedTemperature,
-          template.suggestedTopP,
-        );
       }
       return context.json({
         template,
         templates: styleTemplatesForClient(options.project),
-        sampling,
         provider: options.providers.publicConfig(),
         catalog: options.providers.catalog(),
       });
@@ -565,20 +879,14 @@ export async function startWriterServer(options: {
         if (!template) throw new Error(`未知的风格模板：${styleId}`);
         options.project.setStyle(styleId);
         options.store.seedStyleExample(template);
-        // Always write suggested sampling onto role-assigned models (no API key required).
-        const sampling = options.providers.applySamplingDefaults(
-          template.suggestedTemperature,
-          template.suggestedTopP,
-        );
         return context.json({
           active: template,
-          sampling,
-          provider: sampling.provider,
-          catalog: sampling.catalog,
+          provider: options.providers.publicConfig(),
+          catalog: options.providers.catalog(),
         });
       } else {
         options.project.setStyle("");
-        return context.json({ active: null, sampling: null });
+        return context.json({ active: null });
       }
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
@@ -656,7 +964,11 @@ export async function startWriterServer(options: {
     const instructions = loadProjectInstructions(options.project);
     return context.json({
       permissionMode: settings.permissionMode,
+      writingMode: settings.writingMode,
+      characterEvolutionEnabled: settings.characterEvolutionEnabled,
+      reviewFollowsProseModel: settings.reviewFollowsProseModel,
       scenePipeline: settings.scenePipeline,
+      proseLength: settings.proseLength,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description, path: skill.path,
@@ -666,11 +978,26 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; scenePipeline?: Partial<ScenePipelineSettings> }>();
+      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline?: Partial<ScenePipelineSettings>; proseLength?: Partial<ProseLengthSettings> }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
+      if (body.characterEvolutionEnabled !== undefined && typeof body.characterEvolutionEnabled !== "boolean") {
+        return context.json({ error: "characterEvolutionEnabled 必须是布尔值" }, 400);
+      }
+      if (body.continuityFactsEnabled !== undefined && typeof body.continuityFactsEnabled !== "boolean") {
+        return context.json({ error: "continuityFactsEnabled 必须是布尔值" }, 400);
+      }
+      if (body.reviewFollowsProseModel !== undefined && typeof body.reviewFollowsProseModel !== "boolean") {
+        return context.json({ error: "reviewFollowsProseModel 必须是布尔值" }, 400);
+      }
+      if (body.writingMode !== undefined && !isWritingExecutionMode(body.writingMode)) {
+        return context.json({ error: "writingMode 仅支持 delegated、fast" }, 400);
+      }
       if (body.scenePipeline !== undefined) {
+        if (body.scenePipeline.enabled !== undefined && typeof body.scenePipeline.enabled !== "boolean") {
+          return context.json({ error: "scenePipeline.enabled 必须是布尔值" }, 400);
+        }
         const values = [
           body.scenePipeline.preferredMinScenes,
           body.scenePipeline.preferredMaxScenes,
@@ -707,13 +1034,38 @@ export async function startWriterServer(options: {
           }, 400);
         }
       }
+      if (body.proseLength !== undefined) {
+        const target = body.proseLength.chapterTargetCharacters;
+        if (target !== undefined && (
+          !Number.isInteger(target)
+          || Number(target) < MIN_CHAPTER_TARGET_CHARACTERS
+          || Number(target) > MAX_CHAPTER_TARGET_CHARACTERS
+        )) {
+          return context.json({
+            error: `chapterTargetCharacters 须为 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS} 的整数`,
+          }, 400);
+        }
+        if (body.proseLength.enforceMinimum !== undefined && typeof body.proseLength.enforceMinimum !== "boolean") {
+          return context.json({ error: "enforceMinimum 必须是布尔值" }, 400);
+        }
+      }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
+        ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
+        ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
+        ...(typeof body.continuityFactsEnabled === "boolean" ? { continuityFactsEnabled: body.continuityFactsEnabled } : {}),
+        ...(typeof body.reviewFollowsProseModel === "boolean" ? { reviewFollowsProseModel: body.reviewFollowsProseModel } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
+        ...(body.proseLength ? { proseLength: body.proseLength } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
+        writingMode: settings.writingMode,
+        characterEvolutionEnabled: settings.characterEvolutionEnabled,
+        continuityFactsEnabled: settings.continuityFactsEnabled,
+        reviewFollowsProseModel: settings.reviewFollowsProseModel,
         scenePipeline: settings.scenePipeline,
+        proseLength: settings.proseLength,
       });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
@@ -768,6 +1120,30 @@ export async function startWriterServer(options: {
     }
   });
 
+  app.post("/api/roleplay/scenes/generate", async (context) => {
+    try {
+      const body = await context.req.json<{
+        sessionId?: string;
+        request?: string;
+        performer?: RoleplayParticipant;
+        identity?: RoleplayParticipant;
+        currentScene?: RoleplayScene;
+      }>();
+      const active = body.sessionId ? options.store.activeRoleplay(body.sessionId) : undefined;
+      const scene = await generateRoleplayScene({
+        request: body.request ?? "",
+        performer: body.performer ?? active?.performer,
+        identity: body.identity ?? active?.identity,
+        currentScene: body.currentScene ?? active?.scene,
+        model: options.providers.modelConfig("roleplay"),
+        usageReporter: usageReporterForSession(options.store, body.sessionId),
+      });
+      return context.json(scene);
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.delete("/api/roleplay/scenes/:id", (context) => {
     try {
       const id = Number(context.req.param("id"));
@@ -805,13 +1181,15 @@ export async function startWriterServer(options: {
 
   app.put("/api/roleplay/state", async (context) => {
     try {
-      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; sceneId?: number }>();
+      const body = await context.req.json<{ sessionId?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; sceneId?: number; sceneIds?: number[]; sceneIndex?: number; contentRating?: RoleplayContentRating }>();
       if (!body.sessionId) throw new Error("缺少会话 ID");
       const performer = body.performer ?? body.characterId;
       const identity = body.identity ?? body.interlocutor;
       if (!performer) throw new Error("缺少扮演者角色卡");
       if (!identity) throw new Error("缺少当前身份角色卡");
-      return context.json(options.store.saveActiveRoleplay(body.sessionId, performer, identity, body.sceneId));
+      return context.json(options.store.saveActiveRoleplay(
+        body.sessionId, performer, identity, body.sceneId, body.contentRating, body.sceneIds, body.sceneIndex,
+      ));
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }
@@ -821,7 +1199,9 @@ export async function startWriterServer(options: {
     try {
       const sessionId = context.req.param("sessionId");
       if (!options.store.sessionExists(sessionId)) throw new Error("会话不存在");
-      options.store.clearActiveRoleplay(sessionId);
+      // Exiting the UI mode must not discard the just-finished scene state: the
+      // writing Agent uses it to turn the roleplay transcript into faithful prose.
+      options.store.clearActiveRoleplay(sessionId, { preserveMemory: true });
       return context.json({ ok: true });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
@@ -870,7 +1250,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }> }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }>; resumeInterrupted?: boolean }>();
     if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
@@ -945,6 +1325,7 @@ export async function startWriterServer(options: {
             performerAutoReply: body.performerAutoReply === true,
             variantGroupId,
             rerunDirections: normalizeRoleplayRerunDirections(body.rerunDirections),
+            rerunControls: normalizeRoleplayRerunControls(body.rerunControls),
             ...(body.perceptionOverride
               ? { perceptionOverride: parseRoleplayPerception(JSON.stringify(body.perceptionOverride)) }
               : {}),
@@ -964,6 +1345,7 @@ export async function startWriterServer(options: {
             prompt: body.prompt,
             variantGroupId,
             selectedDocumentBlocks: body.documentSelections,
+            resumeInterrupted: body.resumeInterrupted === true,
             characterScope,
             simpleCharacterScope,
             permissionMode,
@@ -1104,19 +1486,34 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
-  app.post("/api/proposals/:id/:action", (context) => {
+  app.post("/api/proposals/:id/:action", async (context) => {
     try {
       const id = Number(context.req.param("id"));
       const action = context.req.param("action");
       if (!Number.isInteger(id) || !["accept", "reject"].includes(action)) throw new Error("审批参数无效");
       const proposal = action === "accept" ? options.store.acceptProposal(id) : options.store.rejectProposal(id);
-      return context.json({ proposal });
+      const shouldIndexContinuity = action === "accept"
+        && loadAgentSettings(options.project).continuityFactsEnabled
+        && ["lore", "chapter", "side"].includes(documentKind(proposal.path));
+      if (shouldIndexContinuity) {
+        scheduleAcceptedContinuityIndexing(() => indexAcceptedContinuityFacts({
+            project: options.project,
+            store: options.store,
+            providers: options.providers,
+            path: proposal.path,
+            beforeContent: proposal.beforeContent,
+            afterContent: proposal.afterContent,
+            sourceId: proposal.id,
+            sessionId: proposal.sessionId,
+        }));
+      }
+      return context.json({ proposal, continuityFacts: 0, continuityFactsPending: shouldIndexContinuity });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
   });
 
-  app.post("/api/change-sets/:id/:action", (context) => {
+  app.post("/api/change-sets/:id/:action", async (context) => {
     try {
       const id = Number(context.req.param("id"));
       const action = context.req.param("action");
@@ -1125,7 +1522,27 @@ export async function startWriterServer(options: {
         : action === "reject" ? options.store.rejectChangeSet(id)
           : action === "undo" ? options.store.undoChangeSet(id)
             : options.store.redoChangeSet(id);
-      return context.json({ changeSet });
+      const continuityFiles = action === "accept" && loadAgentSettings(options.project).continuityFactsEnabled
+        ? changeSet.files.filter(file => file.operation !== "delete" && file.operation !== "move"
+          && ["lore", "chapter", "side"].includes(documentKind(file.path)))
+        : [];
+      for (const file of continuityFiles) {
+        scheduleAcceptedContinuityIndexing(() => indexAcceptedContinuityFacts({
+          project: options.project,
+          store: options.store,
+          providers: options.providers,
+          path: file.path,
+          beforeContent: file.beforeContent,
+          afterContent: file.afterContent,
+          sessionId: changeSet.sessionId,
+        }));
+      }
+      return context.json({
+        changeSet,
+        continuityFacts: 0,
+        continuityFactWarnings: [],
+        continuityFactsPending: continuityFiles.length > 0,
+      });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -1179,6 +1596,16 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/messages/:id/resume", async (context) => {
+    try {
+      const body = await context.req.json<{ sessionId?: string }>();
+      const sessionId = body.sessionId ?? "";
+      const targetId = Number(context.req.param("id"));
+      if (!sessionId || !Number.isInteger(targetId) || targetId < 1) throw new Error("参数无效");
+      return context.json(options.store.interruptedAgentResumePrompt(sessionId, targetId));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.put("/api/roleplay/messages/:id/perception", async (context) => {
     try {
       const body = await context.req.json<{ sessionId?: string; perception?: unknown }>();
@@ -1213,7 +1640,15 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
-  app.get("/api/messages/:id/versions", (context) => {
+  app.get("/api/session/:id/context-graph", (context) => {
+    try {
+      const sessionId = context.req.param("id");
+      if (!sessionId || !options.store.sessionExists(sessionId)) throw new Error("会话不存在");
+      return context.json(options.store.contextGraph(sessionId));
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+    app.get("/api/messages/:id/versions", (context) => {
     try {
       const sessionId = context.req.query("session") ?? "";
       const messageId = Number(context.req.param("id"));
@@ -1399,4 +1834,52 @@ function usageReporterForSession(store: WriterStore, sessionId?: string): ModelU
   return (model, usage, meta) => {
     buildRecordedUsageEvent(store, sessionId, model, usage, meta);
   };
+}
+
+/** Keep manual approval latency independent from the best-effort model indexer. */
+export function scheduleAcceptedContinuityIndexing(run: () => Promise<unknown>): void {
+  setImmediate(() => {
+    void run().catch(() => undefined);
+  });
+}
+
+async function indexAcceptedContinuityFacts(options: {
+  project: WriterProject;
+  store: WriterStore;
+  providers: ProviderManager;
+  path: string;
+  beforeContent: string;
+  afterContent: string;
+  sourceId?: number;
+  sessionId?: string;
+  signal?: AbortSignal;
+}): Promise<{ continuityFacts: number; continuityFactWarning?: string }> {
+  if (!["lore", "chapter", "side"].includes(documentKind(options.path))) return { continuityFacts: 0 };
+  try {
+    const candidates = await extractContinuityFacts({
+      model: options.providers.summaryModelConfig(),
+      path: options.path,
+      beforeContent: options.beforeContent,
+      afterContent: options.afterContent,
+      existingFacts: options.store.continuityFacts({ statuses: ["active", "conflict", "pending"], limit: 300 }),
+      signal: options.signal,
+      usageReporter: usageReporterForSession(options.store, options.sessionId),
+    });
+    if (!options.project.documentExists(options.path)
+      || options.project.hash(options.project.read(options.path)) !== options.project.hash(options.afterContent)) {
+      return { continuityFacts: 0 };
+    }
+    const saved = options.store.saveExtractedContinuityFacts(
+      options.path,
+      options.afterContent,
+      options.sourceId ?? 0,
+      candidates,
+    );
+    return { continuityFacts: saved.length };
+  } catch (error) {
+    return {
+      continuityFacts: 0,
+      continuityFactWarning: `内容已接受，但事实索引更新失败：${errorMessage(error)}`,
+    };
+  }
 }

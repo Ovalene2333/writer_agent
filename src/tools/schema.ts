@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  MAX_CHAPTER_TARGET_CHARACTERS,
+  MIN_CHAPTER_TARGET_CHARACTERS,
+} from "../agent_runtime.js";
+import { PROSE_TARGET_BAND_TEXT } from "../prose_length.js";
 import type { ToolDefinition } from "./types.js";
 
 /**
@@ -336,7 +341,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "本场直接结果" },
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "预计字数 200—8000，仅作篇幅引导" },
+                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -351,8 +356,49 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "write_document_isolated",
+      description: "用隔离 Writer 一次生成并提议短篇单场正文；长篇或多次关键转折改用场景链",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
+          mode: { type: "string", enum: ["create", "replace", "append"] },
+          sourceHash: { type: "string", description: "replace/append 时必传当前文档哈希" },
+          heading: { type: "string", description: "create/replace 时的正文标题（不含 #）" },
+          goal: { type: "string", description: "全文结束后真正改变什么" },
+          entryState: { type: "array", items: { type: "string" }, description: "入场局面" },
+          characterIntent: { type: "array", items: { type: "string" }, description: "人物各自诉求" },
+          obstacle: { type: "string", description: "直接阻力" },
+          turn: { type: "string", description: "预期落空、代价或关系变化" },
+          outcome: { type: "string", description: "正文收束时的直接结果" },
+          notes: { type: "string", description: "故事内材料；长度上限由场景链设置决定" },
+          targetCharacters: { type: "number", description: `目标正文 500—5000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收并在偏差时重试` },
+          summary: { type: "string", description: "提案摘要" },
+          characterChanges: {
+            type: "array", maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                characterId: { type: "number" }, reason: { type: "string" },
+                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+              },
+              required: ["characterId", "reason", "changes"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["path", "mode", "goal", "obstacle", "turn", "outcome", "notes", "targetCharacters", "summary"],
+        additionalProperties: false,
+      },
+    },
+  },
+  // Scene writing has two payload contracts. Keep both tools in this fixed
+  // catalog: switching schemas by runtime mode would destroy provider prefix
+  // cache reuse, while a shared weak schema lets standard calls omit required data.
+  {
+    type: "function",
+    function: {
       name: "write_chapter_scene",
-      description: "写入一场章节草稿；隔离 Writer 模式只提交 notes，标准模式同时提交正文与状态",
+      description: "标准/Fast 场景写入：提交故事内 notes、本场正文和实际离场状态",
       parameters: {
         type: "object",
         properties: {
@@ -361,7 +407,7 @@ export const TOOLS = deepFreeze([
             type: "string",
             description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
-          content: { type: "string", description: "仅本场正文，不含任何 markdown 标题（正文标题与 ## 场景小标题由组装自动生成）" },
+          content: { type: "string", description: `仅本场正文，不含任何 markdown 标题；guide 有 targetCharacters 时按 ${PROSE_TARGET_BAND_TEXT} 验收` },
           actualState: {
             type: "object",
             description: "从实际正文归纳的离场状态；不可照抄计划",
@@ -375,6 +421,25 @@ export const TOOLS = deepFreeze([
               usedMotifs: { type: "array", items: { type: "string" } },
             },
             additionalProperties: false,
+          },
+        },
+        required: ["sceneId", "notes", "content", "actualState"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_chapter_scene_notes",
+      description: "隔离 Writer 场景写入：只提交故事内 notes，由工具生成正文并提取实际离场状态",
+      parameters: {
+        type: "object",
+        properties: {
+          sceneId: { type: "string" },
+          notes: {
+            type: "string",
+            description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
         },
         required: ["sceneId", "notes"],
@@ -406,7 +471,7 @@ export const TOOLS = deepFreeze([
                 outcome: { type: "string", description: "预期结果；实际正文可以合理偏离" },
                 handoff: { type: "string", description: "可能如何交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: "预计字数 200—8000，仅作篇幅引导" },
+                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -510,6 +575,7 @@ export const TOOLS = deepFreeze([
         properties: {
           path: { type: "string", description: "文档路径" },
           content: { type: "string", description: "完整 Markdown" },
+          targetCharacters: { type: "number", description: `正文目标字数 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS}；章节/支线正文须传，用本轮篇幅目标，按 ${PROSE_TARGET_BAND_TEXT} 验收（不计首行标题）：超上限拒收，不足下限只提示` },
           summary: { type: "string", description: "修改摘要" },
           characterChanges: {
             type: "array", maxItems: 8,
@@ -655,7 +721,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "list_characters",
-      description: "列出可读普通角色卡（含本轮新建；受角色范围限制）",
+      description: "列出可读普通角色卡及分区计数/更新时间（含本轮新建；受角色范围限制）",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -663,17 +729,22 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "get_character",
-      description: "按 ID 读 v3 角色卡；可 sections 分区。locked 能力不可当已用",
+      description: "按 ID 分层读 v3 角色卡：写作先 summary，不足用 sections；编辑直接 edit，可用 sections 限定编辑分区",
       parameters: {
         type: "object",
         properties: {
           id: { type: "number", description: "角色 ID" },
+          view: {
+            type: "string",
+            enum: ["summary", "sections", "edit"],
+            description: "summary=必要摘要；sections=写作安全的指定分区；edit=完整可编辑字段，可配 sections 限定范围。省略时有 sections 则为 sections，否则 summary",
+          },
           sections: {
             type: "array",
-            description: "顶层分区；省略=全卡",
+            description: "view=sections 时必填；view=edit 时可选，指定则只读这些编辑分区",
             items: {
               type: "string",
-              enum: ["identity", "profile", "psychology", "motivations", "voice", "competencies", "relationships", "storyState", "experiences", "notes"],
+              enum: ["identity", "profile", "psychology", "motivations", "voice", "features", "competencies", "relationships", "storyState", "experiences", "notes"],
             },
           },
           outlineNodeId: { type: "string", description: "场景态/经历用的大纲节点 ID" },
@@ -692,11 +763,13 @@ export const TOOLS = deepFreeze([
         type: "object",
         properties: {
           id: { type: "number", description: "更新时必填；新建省略" },
+          expectedUpdatedAt: { type: "string", description: "更新已有卡必填；来自最近一次 get_character，防止覆盖并发修改" },
           identity: { type: "object", description: "身份", additionalProperties: true },
-          profile: { type: "object", description: "外貌/背景", additionalProperties: true },
+          profile: { type: "object", description: "外形/背景；appearance/background 为详情，两个 Summary 为逐行要点摘要（每行一项）", additionalProperties: true },
           psychology: { type: "object", description: "心理", additionalProperties: true },
           motivations: { type: "array", description: "目标", items: { type: "object", additionalProperties: true } },
           voice: { type: "object", description: "声线", additionalProperties: true },
+          features: { type: "array", description: "特性（不属于能力的稳定细节）", items: { type: "object", additionalProperties: true } },
           competencies: { type: "array", description: "能力", items: { type: "object", additionalProperties: true } },
           relationships: { type: "array", description: "关系", items: { type: "object", additionalProperties: true } },
           storyStates: { type: "array", description: "剧情状态", items: { type: "object", additionalProperties: true } },
@@ -727,11 +800,6 @@ export const TOOLS = deepFreeze([
         properties: {
           id: { type: "number", description: "角色 ID" },
           reason: { type: "string", description: "已确认事实摘要" },
-          sourceRef: {
-            type: "object",
-            description: "来源 type+ref",
-            additionalProperties: true,
-          },
           changes: {
             type: "array",
             description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,location|physical|emotion|notes|knowledge|beliefs|intentions|temporaryGoals}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
@@ -829,6 +897,26 @@ export const TOOLS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "manage_prose_gates",
+      description: "管理项目级语义复审规则；作者明确要求以后持续检查/避免某类问题时 upsert，单次改稿偏好不要沉淀",
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["list", "upsert", "enable", "disable", "remove"] },
+          id: { type: "string", description: "稳定英文短 ID；list 时省略" },
+          instruction: { type: "string", description: "可独立执行的语义核验标准；upsert 必填" },
+          severity: { type: "string", enum: ["block", "warn"], description: "确定错误用 block，偏好风险用 warn" },
+          enabled: { type: "boolean", description: "upsert 后是否启用，默认 true" },
+          sourceFeedback: { type: "string", description: "触发沉淀的作者反馈摘要，不粘贴长对话" },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description: "缺关键事实/目标且无法推断时提问并暂停；可逆创作选择勿滥用。勿与其他工具同轮",
       parameters: {
@@ -890,10 +978,11 @@ export const TOOLS = deepFreeze([
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
 const WRITE_TOOLS = new Set([
-  "propose_outline_patch", "propose_document", "propose_document_patch", "propose_change_set",
+  "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set",
   "revise_document_isolated",
-  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
+  "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
+  "manage_prose_gates",
 ]);
 
 /**

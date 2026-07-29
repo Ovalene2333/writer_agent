@@ -1,5 +1,5 @@
 import {
-  characterPromptCard,
+  characterSummaryCard,
   competencyPromptView,
   normalizeCharacterChangeOp,
   resolveCharacterAt,
@@ -7,7 +7,6 @@ import {
   type CharacterInput,
   type CharacterSection,
 } from "../characters.js";
-import type { CharacterSourceRef } from "../types.js";
 import { OutlineStore } from "../outline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
@@ -18,6 +17,7 @@ const SECTIONS = new Set<CharacterSection>([
   "psychology",
   "motivations",
   "voice",
+  "features",
   "competencies",
   "relationships",
   "storyState",
@@ -30,10 +30,24 @@ export function handleListCharacters({ store, characterScope }: ToolHandlerArgs)
   return JSON.stringify(store.characters().filter(c => !allowed || allowed.has(c.id)).map(c => ({
     id: c.id,
     name: c.identity.name,
+    updatedAt: c.updatedAt,
     aliases: c.identity.aliases,
     narrativeRole: c.identity.narrativeRole,
     summary: c.identity.summary,
     tags: c.identity.tags,
+    sections: {
+      identity: true,
+      profile: Boolean(c.profile.appearance || c.profile.appearanceSummary || c.profile.background || c.profile.backgroundSummary || c.profile.biography),
+      psychology: c.psychology.traits.length + c.psychology.values.length + c.psychology.fears.length + c.psychology.conflicts.length,
+      motivations: c.motivations.length,
+      voice: Boolean(c.voice.summary || c.voice.register || c.voice.diction.length || c.voice.verbalHabits.length || c.voice.examples.length),
+      features: c.features.length,
+      competencies: c.competencies.length,
+      relationships: c.relationships.length,
+      storyStates: c.storyStates.length,
+      experiences: c.experiences.length,
+      notes: Boolean(c.notes),
+    },
   })));
 }
 
@@ -46,19 +60,35 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
   const sections = Array.isArray(input.sections)
     ? [...new Set(input.sections.filter((x): x is CharacterSection => typeof x === "string" && SECTIONS.has(x as CharacterSection)))]
     : [];
-  if (!sections.length) return JSON.stringify(characterPromptCard(character));
+  const explicitView = typeof input.view === "string" ? input.view : undefined;
+  if (explicitView && !["summary", "sections", "edit"].includes(explicitView)) {
+    throw new Error("view 必须是 summary、sections 或 edit");
+  }
+  const view = explicitView ?? (sections.length ? "sections" : "summary");
+  if (view === "summary") {
+    if (sections.length) throw new Error("summary 视图不能指定 sections");
+    return JSON.stringify(characterSummaryCard(character));
+  }
+  if (view === "edit" && !sections.length) return JSON.stringify(character);
+  if (!sections.length) throw new Error("sections 视图必须指定至少一个分区");
   const outlineNodeId = typeof input.outlineNodeId === "string" ? input.outlineNodeId : undefined;
   const needsScene = sections.includes("storyState")
     || (Boolean(outlineNodeId) && (sections.includes("experiences") || sections.includes("psychology")));
   const scene = needsScene
     ? resolveCharacterAt(character, new OutlineStore(project).sync().nodes, outlineNodeId)
     : undefined;
-  const selected: Record<string, unknown> = { id: character.id, name: character.identity.name };
+  const selected: Record<string, unknown> = {
+    id: character.id,
+    name: character.identity.name,
+    updatedAt: character.updatedAt,
+  };
   for (const section of sections) {
     if (section === "storyState") {
       selected.storyState = scene ?? resolveCharacterAt(character, new OutlineStore(project).sync().nodes, outlineNodeId);
     } else if (section === "competencies") {
-      selected.competencies = character.competencies.map(competencyPromptView);
+      selected.competencies = view === "edit"
+        ? character.competencies
+        : character.competencies.map(competencyPromptView);
     } else if (section === "experiences") {
       selected.experiences = scene && outlineNodeId ? scene.experiences : character.experiences;
     } else if (section === "psychology") {
@@ -97,6 +127,11 @@ export function handleSaveCharacter({ input, store, sessionId, characterScope, c
   const id = typeof input.id === "number" && Number.isInteger(input.id) && input.id > 0 ? input.id : undefined;
   const existing = id ? store.characters().find(item => item.id === id) : undefined;
   if (id && !existing) throw new Error("要修改的角色不存在");
+  const expectedUpdatedAt = typeof input.expectedUpdatedAt === "string" ? input.expectedUpdatedAt.trim() : "";
+  if (id && !expectedUpdatedAt) throw new Error("更新已有角色卡必须提供 expectedUpdatedAt");
+  if (existing && expectedUpdatedAt !== existing.updatedAt) {
+    throw new Error("角色卡已被其他操作更新；请重新读取后再修改");
+  }
   if (id && characterScope !== undefined && !characterScope.includes(id)) {
     throw new Error("不能修改范围外的已有角色卡；新建请省略 id");
   }
@@ -119,23 +154,17 @@ export function handleSaveCharacter({ input, store, sessionId, characterScope, c
   return JSON.stringify({
     id: character.id,
     name: character.identity.name,
+    updatedAt: character.updatedAt,
     message: id ? "角色卡已更新" : "角色卡已新建；本轮可继续读取该 ID",
     created: !id,
   });
 }
 
-function parseSourceRef(value: unknown): CharacterSourceRef | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const r = value as Record<string, unknown>;
-  const type = r.type;
-  const ref = typeof r.ref === "string" ? r.ref.trim() : "";
-  if (!(type === "outline" || type === "document" || type === "manual") || !ref) return undefined;
-  const note = typeof r.note === "string" ? r.note.trim() : "";
-  return { type, ref, ...(note ? { note } : {}) };
-}
-
 export function handleApplyCharacterChanges({ input, store, sessionId, characterScope, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "apply_character_changes");
+  if (context.characterEvolutionEnabled === false) {
+    throw new Error("角色演进已关闭；本轮不能自动添加角色经历或故事状态。显式角色卡编辑仍可使用 save_character");
+  }
   const id = optionalPositiveInteger(input.id, "id");
   if (!id) throw new Error("缺少有效参数：id（仅可更新已有角色）");
   if (characterScope !== undefined && !characterScope.includes(id)) {
@@ -158,10 +187,8 @@ export function handleApplyCharacterChanges({ input, store, sessionId, character
     }
   }
 
-  const sourceRef = parseSourceRef(input.sourceRef);
   const payload: ApplyCharacterChangesInput = {
     reason,
-    ...(sourceRef ? { sourceRef } : {}),
     changes: changes
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
       .map(item => ({ op: String((item as { op?: unknown }).op ?? ""), ...item })),

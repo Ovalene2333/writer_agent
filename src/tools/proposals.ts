@@ -6,48 +6,40 @@ import {
   normalizeCharacterChangeOp,
   validateCharacters,
 } from "../characters.js";
-import { isScenePipelineDocument } from "../project.js";
-import { adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
+import { adjudicateLearnedProseGates, adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
 import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
-import { findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
+import { compileWritePack, findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
 import { documentSpans } from "../document_spans.js";
 import { documentBlocks } from "../document_blocks.js";
 import { requestDocumentRevision } from "../document_revision.js";
+import {
+  IsolatedSceneRequestError,
+  proseCharacterCount,
+  proseTargetBounds,
+  requestIsolatedScene,
+} from "../isolated_scene_writer.js";
+import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
+import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } from "../prose_length.js";
+import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "../agent_runtime.js";
+import { documentKind, isScenePipelineDocument } from "../project.js";
+import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
+import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
+import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
+import {
+  DEFAULT_ISOLATED_WRITER_MAX_RATIO,
+  DEFAULT_SCENE_NOTES_CHARACTERS,
+} from "../agent_runtime.js";
 import type { WriterStore } from "../store.js";
-import type { ToolHandlerArgs } from "./types.js";
-import { assertCreativeOutlineDesigned, assertWritableMode, countOccurrences, rejectCompressedPlaceholder, requireString } from "./helpers.js";
-
-function assertWritePackReady(context: ToolHandlerArgs["context"], toolName: string): void {
-  if (!context.requireWritePack) return;
-  if (context.writePackCompiled) return;
-  throw new Error(
-    `${toolName} 前须先调用 compile_write_pack：把大纲/设定/衔接笔记编译为故事内「可写材料」，再据此提交正文。禁止跳过编译直接提案。`,
-  );
-}
-
-/**
- * Sentence-level fixes must stay cheap: patches whose total replacement text fits
- * this budget skip the scene pipeline and write-pack gates. Anything larger is
- * chapter (re)writing and keeps the full delivery contract.
- */
-export const LIGHT_PATCH_MAX_REPLACE_CHARS = 1_500;
-
-function patchReplaceCharacters(edits: unknown[]): number {
-  return edits.reduce<number>((sum, edit) => {
-    const row = edit && typeof edit === "object" ? edit as Record<string, unknown> : undefined;
-    const replace = row?.replace ?? row?.content;
-    return sum + (typeof replace === "string" ? replace.length : 0);
-  }, 0);
-}
-
-function assertDirectChapterWriteAllowed(context: ToolHandlerArgs["context"], path: string, toolName: string): void {
-  if (!context.requireScenePipeline || !isScenePipelineDocument(path)) return;
-  throw new Error(
-    `${toolName} 不能跳过逐场景正文流水线：先 begin_chapter_draft，逐场 write_chapter_scene（内含 notes 编译），` +
-    `再用 inspect_chapter_draft 终审并直接创建提案。已有正文的少量句段修正（总替换 ≤ ${LIGHT_PATCH_MAX_REPLACE_CHARS} 字）` +
-    "可直接用 propose_document_patch，不受此限。",
-  );
-}
+import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
+import {
+  assertCreativeOutlineDesigned,
+  assertWritableMode,
+  countOccurrences,
+  rejectCompressedPlaceholder,
+  requireString,
+  resolveDocumentWriteTarget,
+  type DocumentWriteMode,
+} from "./helpers.js";
 
 /** Auto-fix referential meta leaks; block if residual high-confidence leaks remain. */
 function gateProseMetaLeaks(content: string, path: string): { content: string; stripped: string[] } {
@@ -92,6 +84,18 @@ export function deferredCharacterChanges(value: unknown, characterScope?: number
     });
     return { characterId, reason, changes };
   });
+}
+
+export function prepareDeferredCharacterChanges(
+  value: unknown,
+  context: Pick<ToolExecutionContext, "characterEvolutionEnabled">,
+  characterScope?: number[],
+): { changes: ProposalCharacterChange[]; skipped: boolean } {
+  const requested = value !== undefined && (!Array.isArray(value) || value.length > 0);
+  if (context.characterEvolutionEnabled === false) {
+    return { changes: [], skipped: requested };
+  }
+  return { changes: deferredCharacterChanges(value, characterScope), skipped: false };
 }
 
 export function tolerantDeferredCharacterChanges(
@@ -179,12 +183,47 @@ function normalizeProposalCharacterChange(
   return { ...change, entry: { ...source, notes } };
 }
 
-export function maybeAutoAcceptProposal(
+export async function captureAcceptedContinuityFacts(
+  store: WriterStore,
+  proposal: Pick<Proposal, "id" | "path" | "beforeContent" | "afterContent">,
+  context: ToolExecutionContext,
+): Promise<{ continuityFacts: number; continuityFactWarning?: string }> {
+  const kind = documentKind(proposal.path);
+  if (!context.continuityExtractor || !["lore", "chapter", "side"].includes(kind)) {
+    return { continuityFacts: 0 };
+  }
+  try {
+    const existingFacts = store.continuityFacts({ statuses: ["active", "conflict", "pending"], limit: 300 });
+    const candidates = context.continuityExtractor.run
+      ? await context.continuityExtractor.run({
+          path: proposal.path,
+          beforeContent: proposal.beforeContent,
+          afterContent: proposal.afterContent,
+          existingFacts,
+        })
+      : [];
+    const saved = store.saveExtractedContinuityFacts(
+      proposal.path,
+      proposal.afterContent,
+      proposal.id,
+      candidates,
+    );
+    return { continuityFacts: saved.length };
+  } catch (error) {
+    return {
+      continuityFacts: 0,
+      continuityFactWarning: `正文已接受，但事实索引更新失败：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+export async function maybeAutoAcceptProposal(
   store: WriterStore,
   proposal: { id: number; status: string },
   permissionMode: PermissionMode,
   emit: (event: AgentEvent) => void,
-): { proposalId: number; status: string; message: string; autoAccepted?: boolean } {
+  context: ToolExecutionContext,
+): Promise<{ proposalId: number; status: string; message: string; autoAccepted?: boolean; continuityFacts?: number; continuityFactWarning?: string }> {
   if (permissionMode !== "auto" || proposal.status !== "pending") {
     return {
       proposalId: proposal.id,
@@ -195,11 +234,13 @@ export function maybeAutoAcceptProposal(
   try {
     const accepted = store.acceptProposal(proposal.id);
     emit({ type: "proposal", proposal: accepted });
+    const continuity = await captureAcceptedContinuityFacts(store, accepted, context);
     return {
       proposalId: accepted.id,
       status: accepted.status,
       autoAccepted: true,
       message: "auto 模式：提案已自动写入文件",
+      ...continuity,
     };
   } catch (error) {
     return {
@@ -242,6 +283,17 @@ export async function proseStyleGateIssues(
       },
     );
     issues = flash.issues;
+    issues.push(...await adjudicateLearnedProseGates(
+      afterContent,
+      context.proseGateRules ?? [],
+      context.proseAdjudicator.model,
+      {
+        signal: context.proseAdjudicator.signal,
+        usageReporter: context.modelUsageReporter,
+        callKind: "learned_prose_gate",
+        beforeText: beforeContent,
+      },
+    ));
   }
   return issues;
 }
@@ -249,43 +301,342 @@ export async function proseStyleGateIssues(
 export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
   const path = requireString(input.path, "path");
-  assertDirectChapterWriteAllowed(context, path, "propose_document");
+  const content = requireString(input.content, "content");
+  // 调用方没给数字时用本轮篇幅目标兜底，而不是把交付卡在「必须先报个数」上。
+  const rawTargetCharacters = input.targetCharacters
+    ?? (isScenePipelineDocument(path) ? context.proseLength?.targetCharacters : undefined);
+  if (isScenePipelineDocument(path) && rawTargetCharacters === undefined) {
+    throw new Error("章节/支线完整正文必须传 targetCharacters；先确定全文目标字数再提交");
+  }
+  let lengthNotice: string | undefined;
+  if (rawTargetCharacters !== undefined) {
+    const targetCharacters = Number(rawTargetCharacters);
+    if (!Number.isInteger(targetCharacters)
+      || targetCharacters < MIN_CHAPTER_TARGET_CHARACTERS
+      || targetCharacters > MAX_CHAPTER_TARGET_CHARACTERS) {
+      throw new Error(`targetCharacters 须为 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS} 的整数`);
+    }
+    const lines = content.trim().split(/\r?\n/u);
+    const body = lines[0]?.startsWith("# ") ? lines.slice(1).join("\n").trim() : content.trim();
+    const outcome = proseLengthOutcome(
+      assessProseLength(targetCharacters, body),
+      context.proseLength?.enforceMinimum === true,
+    );
+    if (outcome.blocked) throw new Error(outcome.message);
+    lengthNotice = outcome.notice;
+  }
   return submitFullDocumentProposal(
     { input, project, store, sessionId, emit, context, characterScope },
     path,
-    requireString(input.content, "content"),
+    content,
     requireString(input.summary, "summary"),
     input.characterChanges,
+    false,
+    false,
+    lengthNotice,
   );
 }
 
+/**
+ * Direct prose path for a short, single-change document. The parent Agent chooses
+ * the material and delivery topology; the configured Writer only realizes prose.
+ */
+export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promise<string> {
+  const { input, project, store, context } = args;
+  assertWritableMode(context.permissionMode, "write_document_isolated");
+  if (!context.scenePipelineSettings?.isolatedWriter || !context.isolatedSceneWriter) {
+    throw new Error("当前未开启隔离 Writer；可直接 propose_document，或开启后重试");
+  }
+  if (context.chapterSceneDraft) {
+    throw new Error("已有章节场景草稿正在进行；请完成当前草稿，避免直接成稿覆盖已写场景");
+  }
+  const path = requireString(input.path, "path");
+  if (!isScenePipelineDocument(path)) throw new Error("直接隔离正文只能写入 chapters/ 或 side/");
+  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  const requestedMode = requireString(input.mode, "mode");
+  if (!(["create", "replace", "append"] as string[]).includes(requestedMode)) {
+    throw new Error("mode 只能是 create/replace/append");
+  }
+  const target = resolveDocumentWriteTarget(project, path, requestedMode as DocumentWriteMode);
+  const mode = target.mode;
+  const beforeContent = target.beforeContent;
+  if (requestedMode !== "create") {
+    const sourceHash = target.baseHash;
+    if (typeof input.sourceHash !== "string" || input.sourceHash !== sourceHash) {
+      throw new Error("replace/append 必须携带 inspect_document 返回的当前 sourceHash");
+    }
+  }
+
+  const notes = requireString(input.notes, "notes");
+  const notesMaxCharacters = context.scenePipelineSettings.notesMaxCharacters
+    ?? DEFAULT_SCENE_NOTES_CHARACTERS;
+  if (notes.length > notesMaxCharacters) {
+    throw new Error(`notes 过长（当前上限 ${notesMaxCharacters} 字）；只保留会约束正文的故事内材料`);
+  }
+  const targetCharacters = Number(input.targetCharacters);
+  if (!Number.isInteger(targetCharacters) || targetCharacters < 500 || targetCharacters > 5_000) {
+    throw new Error("targetCharacters 须为 500—5000 的整数；更长或包含多次关键转折时使用场景链");
+  }
+  const heading = mode === "append"
+    ? ""
+    : requireString(input.heading, "heading").replace(/^#+\s*/u, "").trim();
+  if (mode !== "append" && !heading) throw new Error("create/replace 必须提供正文标题");
+
+  const writePack = compileWritePack(notes, {
+    targetPath: path,
+    instruction: requireString(input.goal, "goal"),
+  });
+  const stringList = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+      .map(item => item.trim()).filter(Boolean).slice(0, 8)
+    : [];
+  const scene = {
+    id: "direct-document",
+    title: heading || "续写",
+    goal: requireString(input.goal, "goal"),
+    entryState: stringList(input.entryState),
+    characterIntent: stringList(input.characterIntent),
+    obstacle: requireString(input.obstacle, "obstacle"),
+    turn: requireString(input.turn, "turn"),
+    outcome: requireString(input.outcome, "outcome"),
+    handoff: "",
+    dividerBefore: false,
+    targetCharacters,
+  };
+  const evidence = isolatedWriterVoiceEvidence(project, store, path);
+  const writer = context.isolatedSceneWriter;
+  const runner = writer.run ?? requestIsolatedScene;
+  const maximumCharacters = Math.floor(targetCharacters * (
+    context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO
+  ));
+  const targetBounds = proseTargetBounds(targetCharacters);
+  const writerInput = {
+    scene,
+    writePack,
+    ...(mode === "append" ? { previousTail: beforeContent.slice(-800) } : {}),
+    voiceSample: evidence.exemplar,
+    voiceContinuation: evidence.continuation,
+    styleDirectives: isolatedWriterStyleDirectives(project),
+    maximumCharacters,
+  };
+  const runWriter = async (lengthAdjustment?: ProseLengthAssessment, forceBounds = false) => {
+    const lengthRetry = Boolean(lengthAdjustment) || forceBounds;
+    const callKind = lengthRetry
+      ? "isolated_document_writer_length_retry"
+      : "isolated_document_writer";
+    try {
+      const generated = await runner(writer.model, {
+        ...writerInput,
+        ...(lengthAdjustment || forceBounds ? {
+          strictMinimumCharacters: targetBounds.minimum,
+          strictMaximumCharacters: targetBounds.maximum,
+          ...(lengthAdjustment ? { lengthAdjustment } : {}),
+        } : {}),
+      }, writer.signal);
+      if (generated.usage) {
+        context.modelUsageReporter?.(writer.model, generated.usage, {
+          callKind,
+          requestComponents: [{
+            kind: "other",
+            label: "直接隔离正文",
+            characters: generated.requestCharacters,
+            estimatedTokens: Math.ceil(generated.requestCharacters * 0.75),
+            callKind,
+          }],
+        });
+      }
+      return generated;
+    } catch (error) {
+      if (error instanceof IsolatedSceneRequestError && error.usage) {
+        context.modelUsageReporter?.(writer.model, error.usage, {
+          callKind: `${callKind}_failed`,
+        });
+      }
+      throw error;
+    }
+  };
+
+  let generated;
+  try {
+    generated = await runWriter();
+  } catch (error) {
+    if (!(error instanceof IsolatedSceneRequestError)
+      || error.stage !== "writer"
+      || error.failureKind !== "truncated") throw error;
+    generated = await runWriter(undefined, true);
+  }
+  const initialAssessment = assessProseLength(targetCharacters, generated.content);
+  if (initialAssessment.status !== "ok") {
+    generated = await runWriter(initialAssessment);
+  }
+  const finalAssessment = assessProseLength(targetCharacters, generated.content);
+  const finalCharacters = finalAssessment.actual;
+  // 一次按差量重试之后就不再纠缠：偏长仍然拒收，偏短默认接受并提示。
+  const finalOutcome = proseLengthOutcome(finalAssessment, context.proseLength?.enforceMinimum === true);
+  if (finalOutcome.blocked) {
+    throw new Error(`隔离 Writer 重试后正文仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整事件密度或改用场景链`);
+  }
+  rejectCompressedPlaceholder(generated.content, "隔离 Writer 正文");
+  const generatedBody = generated.content.trim();
+  if (!target.existed) {
+    if (project.documentExists(path)) throw new Error("Writer 生成期间目标文档已被创建；请重新判断 create/replace");
+  } else if (!project.documentExists(path)
+    || project.hash(project.read(path)) !== target.baseHash) {
+    throw new Error("Writer 生成期间目标文档已变化；未创建提案，请重新读取后再试");
+  }
+  const proposedContent = mode === "append"
+    ? `${beforeContent.trimEnd()}\n\n${generatedBody}`
+    : `# ${heading}\n\n${generatedBody}`;
+  const submitted = await submitFullDocumentProposal(
+    args,
+    path,
+    proposedContent,
+    requireString(input.summary, "summary"),
+    input.characterChanges,
+    false,
+    false,
+    finalOutcome.notice,
+  );
+  const parsed = JSON.parse(submitted) as Record<string, unknown>;
+  return JSON.stringify({
+    ...parsed,
+    generationMode: "isolated_document",
+    requestedMode: target.requestedMode,
+    effectiveMode: target.mode,
+    submissionKind: target.versionSubmission ? "new_version" : "new_document",
+    generatedCharacters: proseCharacterCount(generatedBody),
+    targetCharacters,
+  });
+}
+
 export async function submitFullDocumentProposal(
-  { project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs,
+  args: ToolHandlerArgs,
   path: string,
   proposedContent: string,
   summary: string,
   characterChanges: unknown,
-  scenePipelineAssembled = false,
   proseStyleApproved = false,
+  semanticReviewApproved = false,
+  /** 偏短但不阻断时给作者/Agent 看的一句话；随提案结果一起回给 Agent。 */
+  lengthNotice?: string,
 ): Promise<string> {
+  const { project, store, sessionId, emit, context, characterScope } = args;
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document");
-  if (!scenePipelineAssembled) assertWritePackReady(context, "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
-  const beforeContent = project.documentExists(path) ? project.read(path) : "";
+  const existed = project.documentExists(path);
+  const beforeContent = existed ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
   if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
+  if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
+    const blocked = await reviewDirectNarrativeProposal(args, path, meta.content, summary);
+    if (blocked) return blocked;
+  }
+  const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
+  // Single funnel for every narrative proposal (场景管线与直接文档两条路都走这里), so the
+  // author sees the same quality picture in the review dock no matter how it was written.
+  // Advisory: the report never blocks — everything that blocks已在上面 gate 掉了。
+  const qualityReport = isScenePipelineDocument(path)
+    ? buildProseQualityReport(meta.content, context.proseLength
+      ? { lengthTarget: context.proseLength.targetCharacters }
+      : undefined)
+    : undefined;
   const proposal = store.createProposal(
     sessionId,
     path,
     meta.content,
     summary,
-    deferredCharacterChanges(characterChanges, characterScope),
+    preparedCharacterChanges.changes,
+    qualityReport,
   );
   emit({ type: "proposal", proposal });
   return JSON.stringify({
-    ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
+    submissionKind: existed ? "new_version" : "new_document",
+    ...(lengthNotice ? { lengthNotice } : {}),
+    ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
+    ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
+    ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
+  });
+}
+
+async function reviewDirectNarrativeProposal(
+  args: ToolHandlerArgs,
+  path: string,
+  content: string,
+  summary: string,
+): Promise<string | undefined> {
+  const reviewer = args.context.chapterReviewer!;
+  const runReview = reviewer.run ?? reviewChapterDraft;
+  const models = [reviewer.model, reviewer.fallbackModel]
+    .filter((model): model is NonNullable<typeof model> => Boolean(model))
+    .filter((model, index, all) => all.findIndex(candidate =>
+      candidate.baseUrl === model.baseUrl && candidate.model === model.model) === index);
+  const reviewContext = buildFactualChapterReviewContext({
+    project: args.project,
+    store: args.store,
+    context: args.context,
+    path,
+    characterScope: args.characterScope,
+    baseContext: reviewer.context,
+  });
+  const requestCharacters = content.length + reviewContext.length + summary.length + 1_200;
+  const errors: string[] = [];
+  for (const model of models) {
+    try {
+      const reviewed = await runReview(model, {
+        chapterGoal: summary,
+        content,
+        context: reviewContext,
+        scenes: [{
+          sceneId: "document",
+          title: path,
+          plannedTurn: summary,
+          plannedOutcome: summary,
+          actualState: null,
+        }],
+      }, reviewer.signal);
+      if (reviewed.usage) args.context.modelUsageReporter?.(model, reviewed.usage, {
+        callKind: "direct_chapter_review",
+        requestComponents: [{
+          kind: "other",
+          label: "直接整章终审请求",
+          characters: requestCharacters,
+          estimatedTokens: Math.ceil(requestCharacters * 0.75),
+          callKind: "direct_chapter_review",
+        }],
+      });
+      if (reviewed.review.verdict === "pass") return undefined;
+      return JSON.stringify({
+        status: "final_review_revision_required",
+        code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+        path,
+        chapterReview: reviewed.review,
+        message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
+      });
+    } catch (error) {
+      if (error instanceof ChapterReviewRequestError && error.usage) {
+        args.context.modelUsageReporter?.(model, error.usage, {
+          callKind: "direct_chapter_review_failed",
+          requestComponents: [{
+            kind: "other",
+            label: "失败的直接整章终审请求",
+            characters: requestCharacters,
+            estimatedTokens: Math.ceil(requestCharacters * 0.75),
+            callKind: "direct_chapter_review_failed",
+          }],
+        });
+      }
+      errors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+    }
+  }
+  return JSON.stringify({
+    status: "final_review_unavailable",
+    code: "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    path,
+    errors,
+    message: "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
   });
 }
 
@@ -294,14 +645,8 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   const path = requireString(input.path, "path");
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
-  // Light patches (sentence-level fixes) skip the chapter pipeline / write-pack
-  // gates: forcing begin_chapter_draft + compile_write_pack to fix one OOC line
-  // costs a full chapter regeneration for a few-hundred-character change.
-  const lightPatch = patchReplaceCharacters(edits) <= LIGHT_PATCH_MAX_REPLACE_CHARS;
-  if (!lightPatch) assertDirectChapterWriteAllowed(context, path, "propose_document_patch");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, "propose_document_patch");
-  if (!lightPatch) assertWritePackReady(context, "propose_document_patch");
   const beforeContent = project.read(path);
   const sourceHash = project.hash(beforeContent);
   if (input.sourceHash !== undefined && input.sourceHash !== sourceHash) {
@@ -385,15 +730,17 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     }
   }
   await gateProseStyle(beforeContent, content, context);
+  const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId, path, content, requireString(input.summary, "summary"),
-    deferredCharacterChanges(input.characterChanges, characterScope),
+    preparedCharacterChanges.changes,
   );
   emit({ type: "proposal", proposal });
   const uniqueStripped = [...new Set(strippedMeta)];
   return JSON.stringify({
     edits: edits.length,
-    ...maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit),
+    ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
+    ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(uniqueStripped.length ? { metaSanitized: uniqueStripped } : {}),
   });
 }

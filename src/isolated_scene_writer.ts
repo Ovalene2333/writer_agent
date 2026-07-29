@@ -1,7 +1,13 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { nonThinkingRequestOptions } from "./model_compat.js";
+import { nonThinkingRequestOptions, samplingRequestOptions, type SamplingRequestBody } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
+import {
+  proseCharacterCount,
+  proseLengthAdjustmentInstruction,
+  proseTargetBounds,
+  type ProseLengthAssessment,
+} from "./prose_length.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import type { WritePack } from "./write_pack.js";
@@ -11,10 +17,21 @@ export type IsolatedSceneWriterInput = {
   writePack: WritePack;
   previousTail?: string;
   currentState?: SceneActualState;
+  /** Imitation target from outside the draft (范文 / 模板范例). */
   voiceSample?: string;
+  /** The work's own prior prose — continuity anchor when there is no in-chapter seam. */
+  voiceContinuation?: string;
+  /** Active style template + craft baseline, prepared by the caller. */
+  styleDirectives?: string;
+  /** Machine-measured anti-self-imitation and vividness notes for this scene. */
+  avoidNotes?: string[];
   maximumCharacters?: number;
+  strictMinimumCharacters?: number;
   strictMaximumCharacters?: number;
+  lengthAdjustment?: ProseLengthAssessment;
 };
+
+export { proseCharacterCount, proseTargetBounds };
 
 export type SceneStateExtractionInput = {
   previousState?: SceneActualState;
@@ -61,6 +78,8 @@ const ISOLATED_WRITER_SYSTEM = `你是成熟的中文小说作者，只写眼前
 
 输入中的场景目标、转折和事实有主次，不是待逐项改写的清单。合并能够由同一动作完成的内容，舍弃不影响本场变化的背景，让场景沿一条清楚的欲望与阻力线生长。声线样本只用于学习叙述距离、节奏和措辞，不借用其中的人物、意象或事件。
 
+避免用叙述者先否定、再改判来制造力度，包括「不是……是/而是……」以及拆成「不是……。是……。」的同构短句。直接写真正成立的动作、感受或事实；需要排除误解时，让人物对白、观察过程或后续后果完成。也不要连续用「没有……只有……」「与其说……不如说……」替读者归纳意义。写完后逐段检查并改掉这些叙述框架，对白中符合人物语气的即时纠正不受此限。
+
 只输出可直接入稿的本场正文，不要标题、说明、清单、JSON 或代码围栏。`;
 
 const STATE_EXTRACTOR_SYSTEM = `你是小说场景状态压缩器。根据 previousState 和 sceneContent，输出正文结束时、下一场仍需要的最小当前状态；nextScene 只用于相关性筛选，不是已经发生的事实。
@@ -75,11 +94,16 @@ export function buildIsolatedSceneWriterMessages(
   ];
   const voiceSample = input.voiceSample?.trim().slice(-1_200);
   const previousTail = input.previousTail?.trim().slice(-800);
+  const voiceContinuation = input.voiceContinuation?.trim().slice(-1_200);
   if (voiceSample) {
     sections.push(`先听准这段文字的呼吸、叙述距离和用词习惯；只学写法，不沿用其中的内容：\n\n${voiceSample}`);
   }
   if (previousTail) {
     sections.push(`故事刚刚停在这里。不要复述，接住它留下的动作、语气和未完成的压力：\n\n${previousTail}`);
+  } else if (voiceContinuation) {
+    // Chapter opening: no in-chapter seam yet, so the work's own tail carries continuity.
+    // Once a seam exists it is the better anchor and this slot drops out.
+    sections.push(`这部作品此前的正文停在这里。新的一场要像同一支笔写下去，但不要延用它的句式清单或意象：\n\n${voiceContinuation}`);
   }
 
   const currentState = formatCurrentState(input.currentState);
@@ -128,20 +152,40 @@ export function buildIsolatedSceneWriterMessages(
   if (voiceNotes.length) {
     sections.push(`叙述时还请记住：${naturalClause(voiceNotes)}。这些提醒服从现场，不要把它们写成可见技巧。`);
   }
+  // Measured from the prose already written in this chapter and the previous one.
+  // The standard scene path has always received these; the isolated path — the one
+  // most exposed to self-imitation, since it re-reads its own output every scene —
+  // used to get nothing.
+  const avoidNotes = compactLines(input.avoidNotes ?? []);
+  if (avoidNotes.length) {
+    sections.push(`已写正文的机器统计给出这些要求，写这一场时遵守：\n${avoidNotes.map(note => `- ${note}`).join("\n")}`);
+  }
 
   const target = input.scene.targetCharacters;
   const maximumCharacters = input.strictMaximumCharacters
     ?? input.maximumCharacters
     ?? (target ? Math.floor(target * 2) : undefined);
+  // 只给目标和硬上限，绝不报下限：模型会把它看到的最小合法值当成目标，
+  // 一路写到那里就收尾，于是下限反而成了实际篇幅（还常常压不住地掉到线下）。
   sections.push(target
-    ? `篇幅大致落在 ${Math.ceil(target * 0.85)}—${Math.floor(target * 1.2)} 字${maximumCharacters ? `，绝不要超过 ${maximumCharacters} 字` : ""}。变化完成、余波抵达时就结束，不用解释、原理展开或回顾来填满篇幅。`
+    ? `目标篇幅是 ${target} 字${maximumCharacters ? `，硬上限 ${maximumCharacters} 字` : ""}。写足这次变化需要的动作、阻力、后果与余波，宁可略超目标也不要提前收尾；过门、解释和重复过程应压缩，不得用总结、回顾或同义反复凑字。`
     : "变化完成、余波抵达时就结束，不用解释或回顾来填满篇幅。");
+  if (input.lengthAdjustment && input.lengthAdjustment.status !== "ok") {
+    sections.push(proseLengthAdjustmentInstruction(input.lengthAdjustment));
+  }
+  if (input.strictMinimumCharacters) {
+    sections.push(`这一次正文不得少于 ${input.strictMinimumCharacters} 字。`);
+  }
   if (input.strictMaximumCharacters) {
-    sections.push(`上一次写得太长。这一次把枝节留在场外，正文不得超过 ${input.strictMaximumCharacters} 字；先压缩原理说明、重复读数和不改变选择的过程，但要给结尾留下完整余波。`);
+    sections.push(`这一次正文不得超过 ${input.strictMaximumCharacters} 字。`);
   }
 
+  const styleDirectives = input.styleDirectives?.trim();
   return [
     { role: "system", content: ISOLATED_WRITER_SYSTEM },
+    // Project-level constraints as a separate system message so the craft prompt
+    // above stays byte-identical across every scene and project.
+    ...(styleDirectives ? [{ role: "system" as const, content: styleDirectives }] : []),
     { role: "user", content: sections.join("\n\n") },
   ];
 }
@@ -228,12 +272,9 @@ export async function requestIsolatedScene(
 }
 
 export function isolatedSceneWriterSamplingOptions(
-  model: Pick<ModelConfig, "temperature" | "topP">,
-): { temperature?: number; top_p?: number } {
-  return {
-    ...(model.temperature === undefined ? {} : { temperature: model.temperature }),
-    ...(model.topP === undefined ? {} : { top_p: model.topP }),
-  };
+  model: Pick<ModelConfig, "temperature" | "topP" | "disableSampling">,
+): SamplingRequestBody {
+  return samplingRequestOptions(model);
 }
 
 export function isolatedSceneWriterMaxTokens(input: IsolatedSceneWriterInput): number {
@@ -256,7 +297,7 @@ export async function requestSceneStateExtraction(
     model: model.model,
     messages,
     stream: false,
-    temperature: 0,
+    ...samplingRequestOptions(model, { temperature: 0 }),
     max_tokens: input.retryJsonOnly ? 2_400 : 1_800,
     response_format: { type: "json_object" },
     ...nonThinkingRequestOptions(model),

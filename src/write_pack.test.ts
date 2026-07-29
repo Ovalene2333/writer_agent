@@ -23,11 +23,13 @@ import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { executeTool } from "./tools/execute.js";
+import { submitFullDocumentProposal } from "./tools/proposals.js";
 import type { ToolExecutionContext } from "./tools/types.js";
-import { sceneProseScore } from "./prose_metrics.js";
-import { SCENE_CANDIDATE_SKIP_SCORE } from "./scene_candidates.js";
+import { sceneProseScoreBreakdown } from "./prose_metrics.js";
+import { shouldSkipSceneCandidates } from "./scene_candidates.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
 import { documentSpans } from "./document_spans.js";
+import type { AgentEvent } from "./types.js";
 
 test("sanitizeDiegeticText rewrites 序章 meta into story-world phrasing", () => {
   const { text, stripped } = sanitizeDiegeticText("比序章里预估的还高了零点七。");
@@ -209,9 +211,8 @@ test("side prose treats scene count and target length as guidance", async () => 
     const sessionId = store.createSession("展开支线片段");
     const context: ToolExecutionContext = {
       permissionMode: "ask",
-      requireWritePack: true,
-      requireScenePipeline: true,
       scenePipelineSettings: {
+        enabled: true,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
       },
@@ -241,10 +242,82 @@ test("side prose treats scene count and target length as guidance", async () => 
     );
     assert.equal(written.draft.completed.length, 1);
 
-    const bypass = JSON.parse(await call("propose_document", {
-      path: "side/arc-08.md", content: "试图绕过场景链。".repeat(30), summary: "支线片段",
+    const direct = JSON.parse(await call("propose_document", {
+      path: "side/arc-08.md",
+      content: "她走到城门下，守卫从阴影里抬起长枪。风卷着灰烬越过墙头，她没有停，只把通行牌放在掌心。",
+      summary: "直接交付支线片段",
     })) as Record<string, unknown>;
-    assert.match(String(bypass.error), /不能跳过逐场景/u);
+    assert.equal(direct.status, "pending");
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("direct chapter proposal blocks factual knowledge leaks before creating a proposal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-direct-review-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "事实终审");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("直接整章");
+    store.saveContinuityFact({
+      statement: "密钥藏在北塔钟摆内",
+      epistemic: "character_knowledge",
+      knownBy: ["守塔人"],
+      status: "active",
+      sourcePath: "",
+      sourceEvidence: "",
+    });
+    let shouldBlock = true;
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      readSnapshots: new Map(),
+      chapterReviewer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "reviewer-test" },
+        context: "项目终审约束",
+        run: async (_model, input) => {
+          assert.match(input.context ?? "", /character_knowledge/u);
+          assert.match(input.context ?? "", /守塔人/u);
+          return {
+            review: shouldBlock ? {
+              verdict: "revise" as const,
+              chapterChange: "来客试图进入北塔",
+              reviewNotes: "来客越过了认知边界",
+              issues: [{
+                severity: "blocker" as const,
+                kind: "knowledge_leak" as const,
+                sceneId: "document",
+                evidence: ["来客径直说密钥藏在钟摆里。"],
+                problem: "该事实仅守塔人知晓，正文没有来客获知它的路径",
+                action: "补入获知路径或删除准确断言",
+              }],
+            } : {
+              verdict: "pass" as const,
+              chapterChange: "来客从试探转为撤退",
+              reviewNotes: "事实与认知路径一致",
+              issues: [],
+            },
+          };
+        },
+      },
+    };
+    const args = {
+      input: {}, project, store, sessionId, emit: (_event: AgentEvent) => {}, context,
+    };
+    const content = "# 第一章\n\n来客径直说密钥藏在钟摆里。";
+    const blocked = JSON.parse(await submitFullDocumentProposal(
+      args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+    )) as Record<string, unknown>;
+    assert.equal(blocked.code, "DIRECT_CHAPTER_REVIEW_BLOCKED");
+    assert.equal(store.proposals().length, 0);
+
+    shouldBlock = false;
+    const passed = JSON.parse(await submitFullDocumentProposal(
+      args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+    )) as Record<string, unknown>;
+    assert.equal(passed.status, "pending");
+    assert.equal(store.proposals().length, 1);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });
@@ -379,9 +452,11 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     const sessionId = activeStore.createSession("逐场写作");
     const evolvingCharacter = activeStore.saveCharacter(emptyCharacter("学员"));
     const chapterReviewUsage: Array<{ model: string; callKind: string }> = [];
+    const emitted: AgentEvent[] = [];
     const context: ToolExecutionContext = {
-      permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      permissionMode: "ask",
       scenePipelineSettings: {
+        enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
       },
@@ -413,7 +488,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
-      { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, () => {}, undefined, context,
+      { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, event => emitted.push(event), undefined, context,
     );
     const begun = JSON.parse(await call("begin_chapter_draft", {
       path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变", scenes: [sceneChain[0]],
@@ -421,6 +496,10 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(begun.status, "started");
     assert.equal(begun.sceneCount, 1);
     assert.equal("scenes" in begun, false, "begin result must not echo the full scene chain");
+    const wrongMode = JSON.parse(await call("write_chapter_scene_notes", {
+      sceneId: "arrival", notes: "只提交笔记。",
+    })) as Record<string, unknown>;
+    assert.match(String(wrongMode.error), /标准\/Fast 模式请调用 write_chapter_scene/u);
     // Planning-only steps mid-draft get steered back to write_chapter_scene.
     const todosNudge = JSON.parse(await call("manage_todos", {
       todos: [{ id: "t1", content: "自定义步骤", status: "in_progress" }],
@@ -457,9 +536,9 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       ].join(""),
       actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
-    assert.equal(denseStyle.status, "written");
-    assert.equal((denseStyle.styleDeferred as Record<string, unknown>).code, "SCENE_STYLE_DENSE");
-    assert.equal(context.chapterSceneDraft?.completed.length, 1);
+    assert.equal(denseStyle.status, "style_revision_required");
+    assert.equal(denseStyle.code, "SCENE_STYLE_DENSE");
+    assert.equal(context.chapterSceneDraft?.completed.length, 0);
     // AA repeats are auto-fixed in-tool: the deduped scene enters the draft directly.
     const duplicated = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
@@ -468,7 +547,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
         `第${String.fromCharCode(65 + index)}区的警报灯保持沉默。`).join("")}`,
       actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
-    assert.equal(duplicated.status, "revised");
+    assert.equal(duplicated.status, "written");
     const autoFixes = duplicated.autoFixes as { duplicateSentencesRemoved: string[] };
     assert.deepEqual(autoFixes.duplicateSentencesRemoved, ["她沿着走廊走到尽头的门前。"]);
     assert.equal(context.chapterSceneDraft?.completed.length, 1);
@@ -524,6 +603,9 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       }],
     });
     const inspected = JSON.parse(inspectedRaw) as Record<string, unknown>;
+    const previews = emitted.filter(event => event.type === "text" && event.text.includes("草稿预览"));
+    assert.equal(previews.length, 1);
+    assert.match(previews[0].type === "text" ? previews[0].text : "", /# 第一章/u);
     assert.equal(inspected.status, "proposal_submitted");
     assert.equal(inspected.reviewCompleted, true);
     assert.equal(inspected.proposalSubmitted, true);
@@ -531,7 +613,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal("content" in inspected, false, "isolated review must not append the full chapter to the Agent loop");
     assert.equal((inspected.chapterReview as Record<string, unknown>).verdict, "pass");
     assert.equal((inspected.characterChangeWarnings as string[]).length, 1);
-    assert.deepEqual(chapterReviewUsage, [], "single-scene chapters skip the cross-scene model review");
+    assert.deepEqual(chapterReviewUsage.map(item => item.callKind), ["chapter_review_failed", "chapter_review"]);
     const proposed = inspected.proposal as Record<string, unknown>;
     assert.equal(proposed.status, "pending");
     const storedProposal = activeStore.proposal(Number(proposed.proposalId));
@@ -556,7 +638,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
   }
 });
 
-test("scene dense gate accepts once with a deferred sentence-level warning", async () => {
+test("scene dense gate rejects prose before it enters the chapter draft", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-scene-dense-"));
   let store: WriterStore | undefined;
   try {
@@ -565,7 +647,7 @@ test("scene dense gate accepts once with a deferred sentence-level warning", asy
     const activeStore = store;
     const sessionId = activeStore.createSession("密度回弹");
     const context: ToolExecutionContext = {
-      permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      permissionMode: "ask",
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
       { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, () => {}, undefined, context,
@@ -587,12 +669,159 @@ test("scene dense gate accepts once with a deferred sentence-level warning", asy
       content: dense,
       actualState: actualState("主角违规进入训练区"),
     })) as Record<string, unknown>;
-    assert.equal(first.status, "written");
-    assert.equal((first.styleDeferred as Record<string, unknown>).code, "SCENE_STYLE_DENSE");
-    assert.equal(context.chapterSceneDraft?.completed.length, 1);
-    const inspected = JSON.parse(await call("inspect_chapter_draft", { summary: "新建第一章" })) as Record<string, unknown>;
-    assert.equal(inspected.status, "style_revision_required");
-    assert.equal(inspected.code, "CHAPTER_DRAFT_STYLE_BLOCKED");
+    assert.equal(first.status, "style_revision_required");
+    assert.equal(first.code, "SCENE_STYLE_DENSE");
+    assert.equal(context.chapterSceneDraft?.completed.length, 0);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("disabled scene pipeline rejects a new chapter draft", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-scene-disabled-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "关闭场景链");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("关闭场景链");
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      scenePipelineSettings: {
+        enabled: false,
+        preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+      },
+    };
+    const result = JSON.parse(await executeTool(
+      {
+        id: "begin-disabled",
+        name: "begin_chapter_draft",
+        arguments: JSON.stringify({
+          path: "chapters/第一章.md",
+          mode: "create",
+          chapterGoal: "关系改变",
+          scenes: [sceneChain[0]],
+        }),
+      },
+      project,
+      store,
+      sessionId,
+      () => {},
+      undefined,
+      context,
+    )) as Record<string, unknown>;
+    assert.match(String(result.error), /场景链当前已关闭/);
+    assert.equal(context.chapterSceneDraft, undefined);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("scene gate applies sparse sentence repairs before asking for a rewrite", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-scene-local-repair-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "逐句修订");
+    store = new WriterStore(project);
+    const activeStore = store;
+    const sessionId = activeStore.createSession("逐句修订");
+    let repairCalls = 0;
+    const replacements = [
+      "走廊尽头传来逃跑的脚步声。",
+      "悬浮颗粒让空气发涩。",
+      "油性液体在地面反光。",
+      "预埋装药震得立柱发颤。",
+    ];
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      chapterStyleRepairer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "repair-test" },
+        run: async (_model, input) => {
+          repairCalls += 1;
+          return {
+            edits: input.issues.map((issue, index) => ({
+              search: issue.sentence,
+              replace: replacements[index] ?? `门禁句已按原事实改为直接陈述${index + 1}。`,
+            })),
+            requestCharacters: 300,
+          };
+        },
+      },
+    };
+    const call = (name: string, input: Record<string, unknown>) => executeTool(
+      { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, () => {}, undefined, context,
+    );
+    await call("begin_chapter_draft", {
+      path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变", scenes: [sceneChain[0]],
+    });
+    const sparse = [
+      "走廊尽头有动静。不是埋伏。是逃跑。",
+      "空气发涩。不是气体。是悬浮颗粒。",
+      "地面反光。不是水。是油性液体。",
+      "立柱在颤。不是塌方。是预埋装药。",
+      "应急门沿着轨道落下，主角侧身挤进最后一道缝隙，鞋底在油膜上拖出半圈亮痕。",
+    ].join("");
+    const written = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: "## 场景目标\n主角违规进入训练区。",
+      content: sparse,
+      actualState: actualState("主角违规进入训练区"),
+    })) as Record<string, unknown>;
+    assert.equal(written.status, "written");
+    assert.equal(repairCalls, 1);
+    const autoFixes = written.autoFixes as {
+      sceneStyleEdits: Array<{ search: string; replace: string }>;
+      sceneStyleRepairAttempts: number;
+    };
+    assert.ok(autoFixes.sceneStyleEdits.length > 0);
+    assert.equal(autoFixes.sceneStyleRepairAttempts, 1);
+    assert.doesNotMatch(context.chapterSceneDraft?.completed[0].content ?? "", /不是/u);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("scene gate skips local repair when blockers exceed one repair batch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-scene-rewrite-fallback-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "密集重写回退");
+    store = new WriterStore(project);
+    const activeStore = store;
+    const sessionId = activeStore.createSession("密集重写回退");
+    let repairCalls = 0;
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      chapterStyleRepairer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "repair-test" },
+        run: async () => {
+          repairCalls += 1;
+          return { edits: [], requestCharacters: 0 };
+        },
+      },
+    };
+    const call = (name: string, input: Record<string, unknown>) => executeTool(
+      { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, () => {}, undefined, context,
+    );
+    await call("begin_chapter_draft", {
+      path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变", scenes: [sceneChain[0]],
+    });
+    const dense = Array.from({ length: 10 }, (_, index) =>
+      `第${index + 1}道门在响。不是故障。是有人触发了警报。`
+    ).join("");
+    const rejected = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "arrival",
+      notes: "## 场景目标\n主角违规进入训练区。",
+      content: dense,
+      actualState: actualState("主角违规进入训练区"),
+    })) as Record<string, unknown>;
+    assert.equal(rejected.status, "style_revision_required");
+    assert.equal(rejected.code, "SCENE_STYLE_DENSE");
+    assert.equal(repairCalls, 0);
+    assert.ok(Number(rejected.styleIssueCount) > 8);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });
@@ -608,8 +837,9 @@ test("scene candidate sampling skips clean originals without extra model calls",
     const activeStore = store;
     const sessionId = activeStore.createSession("候选跳过");
     const context: ToolExecutionContext = {
-      permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      permissionMode: "ask",
       scenePipelineSettings: {
+        enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
       },
@@ -629,7 +859,10 @@ test("scene candidate sampling skips clean originals without extra model calls",
       "他没有立刻回答，先把一根柴推进去，看着火苗舔上来，才说：「去。」",
       "夜里下了点雨，屋檐滴水的声音断断续续，到天亮才停。",
     ].join("\n\n");
-    assert.ok(sceneProseScore(clean) >= SCENE_CANDIDATE_SKIP_SCORE, "fixture must score clean");
+    assert.ok(
+      shouldSkipSceneCandidates(sceneProseScoreBreakdown(clean)),
+      "fixture must be both clean and vivid enough to skip sampling",
+    );
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。",
@@ -638,7 +871,7 @@ test("scene candidate sampling skips clean originals without extra model calls",
     })) as Record<string, unknown>;
     assert.equal(written.status, "written");
     const sampling = written.candidateSampling as Record<string, unknown>;
-    assert.equal(sampling.skipped, "original_clean");
+    assert.equal(sampling.skipped, "original_clean_and_vivid");
     assert.equal(sampling.chosen, "original");
     assert.equal(sampling.generated, 0);
   } finally {
@@ -716,7 +949,7 @@ test("read_document bounds large sections to one snapshot atom", async () => {
   }
 });
 
-test("light chapter patch bypasses pipeline gates; heavy patch stays blocked", async () => {
+test("chapter patch can submit without workflow prerequisites", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-light-patch-"));
   let store: WriterStore | undefined;
   try {
@@ -727,12 +960,12 @@ test("light chapter patch bypasses pipeline gates; heavy patch stays blocked", a
     const path = "chapters/第一章.md";
     project.writeRaw(path, "# 第一章\n\n她伸出手。老人的体重数字出现在她脑子里。她收回手。\n");
     const context: ToolExecutionContext = {
-      permissionMode: "ask", requireWritePack: true, requireScenePipeline: true,
+      permissionMode: "ask",
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
       { id: name, name, arguments: JSON.stringify(input) }, project, activeStore, sessionId, () => {}, undefined, context,
     );
-    // Sentence-level fix goes straight to a proposal without begin_chapter_draft/compile_write_pack.
+    // The Agent chooses the patch because it matches the requested scope, not to bypass a workflow gate.
     const light = JSON.parse(await call("propose_document_patch", {
       path,
       edits: [{ search: "老人的体重数字出现在她脑子里。", replace: "她凭手上传来的分量估出老人很轻。" }],
@@ -740,13 +973,6 @@ test("light chapter patch bypasses pipeline gates; heavy patch stays blocked", a
     })) as Record<string, unknown>;
     assert.equal(light.status, "pending");
     assert.equal(light.edits, 1);
-    // A patch large enough to rewrite prose wholesale keeps the pipeline contract.
-    const heavy = JSON.parse(await call("propose_document_patch", {
-      path,
-      edits: [{ search: "她收回手。", replace: "长句替换。".repeat(400) }],
-      summary: "大改",
-    })) as Record<string, unknown>;
-    assert.match(String(heavy.error), /场景|流水线/);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });
@@ -791,6 +1017,39 @@ test("proposal characterChanges validate ops at propose time and accept synonyms
   }
 });
 
+test("disabled character evolution strips proposal character changes without blocking prose", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-proposal-character-toggle-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "演进关闭");
+    store = new WriterStore(project);
+    const activeStore = store;
+    const sessionId = activeStore.createSession("演进关闭");
+    const card = activeStore.saveCharacter(emptyCharacter("甲"));
+    const path = "chapters/第一章.md";
+    project.writeRaw(path, "# 第一章\n\n她伸出手。她收回手。\n");
+    const context: ToolExecutionContext = { permissionMode: "ask", characterEvolutionEnabled: false };
+    const result = JSON.parse(await executeTool(
+      { id: "toggle", name: "propose_document_patch", arguments: JSON.stringify({
+        path,
+        edits: [{ search: "她收回手。", replace: "她缓缓收回手。" }],
+        summary: "小修",
+        characterChanges: [{ characterId: card.id, reason: "误附带", changes: [
+          { op: "append_experience", label: "不应写入", description: "开关关闭" },
+        ] }],
+      }) },
+      project, activeStore, sessionId, () => {}, undefined, context,
+    )) as Record<string, unknown>;
+    assert.equal(result.status, "pending");
+    assert.equal(result.characterEvolutionSkipped, true);
+    const proposal = activeStore.proposal(Number(result.proposalId));
+    assert.deepEqual(proposal.characterChanges, []);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("document anchors locate, read and patch one paragraph without a full-document payload", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-anchor-patch-"));
   let store: WriterStore | undefined;
@@ -814,6 +1073,31 @@ test("document anchors locate, read and patch one paragraph without a full-docum
     })) as Record<string, unknown>;
     assert.match(String(read.content), /门禁灯由绿变红/u);
     assert.ok(String(read.content).length < project.read("lore/world.md").length);
+    assert.equal(read.nextAction, "propose_document_patch");
+    let locatorCalls = 0;
+    context.documentLocator = {
+      model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "test" },
+      run: async () => {
+        locatorCalls += 1;
+        return { matches: [], requestCharacters: 0 };
+      },
+    };
+    const relocalized = JSON.parse(await call("locate_document_span", {
+      path: "lore/world.md", query: "远处警报的位置",
+    })) as Record<string, unknown>;
+    assert.equal(relocalized.status, "target_locked");
+    assert.equal(relocalized.nextAction, "propose_document_patch");
+    assert.equal(locatorCalls, 0);
+    const chapterSearch = JSON.parse(await call("search_project", {
+      query: "警报", scope: "chapters",
+    })) as Record<string, unknown>;
+    assert.equal(chapterSearch.status, "target_locked");
+    assert.equal(chapterSearch.nextAction, "propose_document_patch");
+    const loreSearch = JSON.parse(await call("search_project", {
+      query: "门禁灯", scope: "lore",
+    })) as Record<string, unknown>;
+    assert.equal(loreSearch.status, undefined);
+    assert.equal(loreSearch.scope, "lore");
     const otherAnchor = documentSpans(project.read("lore/world.md"), String(located.sourceHash)).at(-1)!;
     const drifted = JSON.parse(await call("read_document_span", {
       path: "lore/world.md", sourceHash: located.sourceHash, anchorId: otherAnchor.anchorId,

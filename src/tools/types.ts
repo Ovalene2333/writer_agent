@@ -5,10 +5,13 @@ import type { ChapterSceneDraft, SceneActualState } from "../scene_pipeline.js";
 import type { ScenePipelineSettings } from "../agent_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
+import type { IsolatedWriterVoiceEvidence } from "../style_grounding.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
 import type { DocumentRevisionInput } from "../document_revision.js";
+import type { ProseGateRule } from "../prose_gate_rules.js";
+import type { ContinuityFact, ContinuityFactCandidate } from "../continuity_facts.js";
 import type {
   IsolatedSceneWriterInput,
   IsolatedSceneWriterResult,
@@ -31,6 +34,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Whether narrative tasks may append experiences and story state to character cards. */
+  characterEvolutionEnabled?: boolean;
   /** User message that owns mutations made by this Agent job. */
   sourceMessageId?: number;
   /** Planner-classified rewrite scope; point edits enforce a narrow read lock. */
@@ -51,6 +56,8 @@ export type ToolExecutionContext = {
   readCharactersUsed?: number;
   /** Optional UI-selected scope for compact/simple character cards. */
   simpleCharacterScope?: number[];
+  /** Planner/UI-selected characters whose factual state should be supplied to final review. */
+  reviewCharacterIds?: number[];
   /**
    * When true (outline mode), propose_document / propose_document_patch targeting
    * outline paths require a successful design_creative_outline earlier in this run.
@@ -59,21 +66,19 @@ export type ToolExecutionContext = {
   requireCreativeOutlineDesign?: boolean;
   /** Set true after design_creative_outline succeeds this run. */
   creativeOutlineDesigned?: boolean;
-  /**
-   * When true (write_scene delivery), propose_document / patch require a prior
-   * compile_write_pack in this run so prose is grounded on diegetic materials only.
-   */
-  requireWritePack?: boolean;
   /** Set true after compile_write_pack succeeds this run. */
   writePackCompiled?: boolean;
   /** Last compiled write pack text (for debugging / optional agent reuse). */
   lastWritePack?: string;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
-  /** Long-form chapter/side delivery uses the scene pipeline instead of a one-shot proposal. */
-  requireScenePipeline?: boolean;
   /** Current project scene-chain guidance and enforced per-document limit. */
   scenePipelineSettings?: ScenePipelineSettings;
+  /**
+   * 本轮整章篇幅目标与下限执行强度。工具在调用方没给 targetCharacters 时用它兜底，
+   * 并据 enforceMinimum 决定偏短是拦截还是只提示。
+   */
+  proseLength?: { targetCharacters: number; enforceMinimum: boolean };
   /** In-run narrative draft; never writes a partial document to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**
@@ -95,6 +100,19 @@ export type ToolExecutionContext = {
     model: ModelConfig;
     signal?: AbortSignal;
   };
+  /** Best-effort delta extractor run only after a lore/chapter proposal is accepted. */
+  continuityExtractor?: {
+    model: ModelConfig;
+    signal?: AbortSignal;
+    run?: (input: {
+      path: string;
+      beforeContent: string;
+      afterContent: string;
+      existingFacts: ContinuityFact[];
+    }) => Promise<ContinuityFactCandidate[]>;
+  };
+  /** Project-persisted semantic review rules learned from explicit author feedback. */
+  proseGateRules?: ProseGateRule[];
   /**
    * Full-chapter structural review runs in an isolated, tool-free call so the
    * assembled prose is not appended to every later Agent step. Production uses
@@ -151,6 +169,11 @@ export type ToolExecutionContext = {
    */
   sceneCandidates?: {
     model: ModelConfig;
+    /**
+     * Reader-side selector: picks the winning candidate by judgment rather than by
+     * rule score. Absent = deterministic rerank only.
+     */
+    judgeModel?: ModelConfig;
     signal?: AbortSignal;
   };
   /** Opt-in prose-only scene generation followed by a separate state extraction call. */
@@ -169,8 +192,10 @@ export type ToolExecutionContext = {
       signal?: AbortSignal,
     ) => Promise<SceneStateExtractionResult>;
   };
-  /** One raw voice sample cached for the isolated writer during the chapter. */
-  isolatedSceneVoiceSample?: { forPath: string; text: string };
+  /** Exemplar + continuation voice slots cached for the isolated writer during the chapter. */
+  isolatedSceneVoiceSample?: { forPath: string; evidence: IsolatedWriterVoiceEvidence };
+  /** Template + craft baseline for the isolated writer; project-scoped, built once. */
+  isolatedSceneStyleDirectives?: string;
   /** Complete prose retained when only isolated state extraction failed. */
   isolatedPendingScene?: {
     forPath: string;
@@ -195,6 +220,8 @@ export type ToolExecutionContext = {
    * revise_chapter_draft_style. Reset at chapter boundaries.
    */
   proseVerdictCache?: ProseVerdictCache;
+  /** Full read-only chapter preview already streamed before the first inspection. */
+  chapterDraftPreviewed?: { path: string };
 };
 
 export type ToolHandlerArgs = {

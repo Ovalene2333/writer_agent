@@ -71,11 +71,69 @@ test("isolated scene writer receives only the current prose packet", () => {
   assert.match(messages[1].content, /不是台词任务/u);
   assert.match(messages[1].content, /可以合并、改序或舍弃/u);
   assert.match(messages[1].content, /对白简短，动作留白/u);
-  assert.match(messages[1].content, /绝不要超过 800 字/u);
+  assert.match(messages[1].content, /硬上限 800 字/u);
   assert.doesNotMatch(messages[1].content, /［|^\s*[-•]\s/mu);
   assert.doesNotMatch(messages[1].content, /chapters\//u);
   assert.doesNotMatch(messages[1].content, /write_chapter_scene|actualState|styleFeedback|todo/iu);
   assert.ok(messages.reduce((sum, message) => sum + message.content.length, 0) < 4_000);
+});
+
+test("isolated scene writer receives the project's style directives as its own system slot", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    styleDirectives: "本作品的激活风格模板：悬疑推理\n模板要求：线索先于结论出现。",
+  });
+  assert.equal(messages.length, 3);
+  assert.equal(messages[1].role, "system");
+  assert.match(messages[1].content, /悬疑推理/u);
+  // The craft prompt must stay byte-identical across projects so it can be reasoned
+  // about (and cached) independently of whichever template is active.
+  assert.doesNotMatch(messages[0].content, /悬疑推理/u);
+});
+
+test("exemplar and continuation are separate slots with different jobs", () => {
+  const withSeam = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    voiceSample: "范文：檐下的水滴砸在铁皮上。",
+    voiceContinuation: "本作旧稿：他把灯关了。",
+    previousTail: "第一发炮弹撞上装甲，火光一闪就灭了。",
+  });
+  // Mid-chapter: the in-chapter seam is the continuity anchor, so the project tail
+  // drops out — but the outside exemplar always stays.
+  assert.match(withSeam[1].content, /范文：檐下的水滴/u);
+  assert.match(withSeam[1].content, /火光一闪就灭了/u);
+  assert.doesNotMatch(withSeam[1].content, /本作旧稿/u);
+
+  const chapterOpening = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    voiceSample: "范文：檐下的水滴砸在铁皮上。",
+    voiceContinuation: "本作旧稿：他把灯关了。",
+  });
+  assert.match(chapterOpening[1].content, /范文：檐下的水滴/u);
+  assert.match(chapterOpening[1].content, /本作旧稿/u);
+});
+
+test("isolated scene writer receives the anti-self-imitation notes the standard path always had", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    avoidNotes: ["上一章高频段首：「他的」；本章换用不同的开场形态。", "感官通道只有 2/5 出场。"],
+  });
+  assert.match(messages[1].content, /上一章高频段首/u);
+  assert.match(messages[1].content, /感官通道只有 2\/5/u);
+});
+
+test("isolated scene writer explicitly suppresses narrator negation-redefinition frames", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+  });
+  assert.match(messages[0].content, /先否定、再改判/);
+  assert.match(messages[0].content, /不是……。是……。/);
+  assert.match(messages[0].content, /对白中符合人物语气的即时纠正不受此限/);
 });
 
 test("scene state extraction receives only bounded next-scene relevance fields", () => {
@@ -142,9 +200,8 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     ].join("\n\n");
     const context: ToolExecutionContext = {
       permissionMode: "ask",
-      requireWritePack: true,
-      requireScenePipeline: true,
       scenePipelineSettings: {
+        enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,
       },
@@ -167,7 +224,8 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
             );
           }
           assert.equal(input.maximumCharacters, 800);
-          assert.equal(input.strictMaximumCharacters, 800);
+          assert.equal(input.strictMinimumCharacters, 300);
+          assert.equal(input.strictMaximumCharacters, 540);
           return {
             content,
             usage: { promptTokens: 300, completionTokens: 200, cacheHitTokens: 0, cacheMissTokens: 300 },
@@ -205,11 +263,20 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     await call("begin_chapter_draft", {
       path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "改变战术", scenes: [scene],
     });
-    const failed = JSON.parse(await call("write_chapter_scene", {
+    const wrongMode = JSON.parse(await call("write_chapter_scene", {
+      sceneId: "armor",
+      notes: "## 场景目标\n改变战术",
+      content: "这段正文不应被隔离模式接收。",
+      actualState: state("不应写入"),
+    })) as Record<string, unknown>;
+    assert.match(String(wrongMode.error), /隔离 Writer 模式请调用 write_chapter_scene_notes/u);
+    const failed = JSON.parse(await call("write_chapter_scene_notes", {
+      sceneId: "armor",
       notes: "## 已知事实\n双方都读过委托书上的装甲参数\n## 须自然落地\n装甲实际厚度比旧参数高三成",
     })) as Record<string, unknown>;
     assert.match(String(failed.error), /正文已暂存/u);
-    const result = JSON.parse(await call("write_chapter_scene", {
+    const result = JSON.parse(await call("write_chapter_scene_notes", {
+      sceneId: "armor",
       notes: "状态提取重试；正文已经生成，不要重新生成。",
     })) as Record<string, unknown>;
     assert.deepEqual(calls, ["writer", "writer", "state", "state", "state"]);
@@ -232,4 +299,90 @@ test("isolated scene tool writes prose and extracts state in separate calls", as
     store?.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("direct isolated document keeps prose generation outside the Agent transcript", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-isolated-document-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "直接隔离正文");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("直接正文");
+    const usageKinds: string[] = [];
+    const prose = [
+      "雨沿着候机楼的玻璃往下淌。林岚把登机牌压在桌沿，等父亲把那杯没有动过的咖啡推回来。",
+      "「到了那边先住学校安排的宿舍。」他说，「月底我把剩下的材料寄过去。」",
+      "她把杯子接住，问的却是下一次复查。两个人对着日历算了几分钟，广播第三次催促登机时，纸上已经多了两个日期。",
+      "父亲把那张写满时间的便签折了两折，塞进她护照夹最外层，又像怕动作太郑重似的补了一句只是顺手。林岚没有拆穿他，只把咖啡重新推回去，说飞机落地后会先发消息。",
+      "检票口前的队伍慢慢缩短。她拖着箱子往前走了几步，听见父亲在身后叫她名字。那一声并不响，却让她回头看见他举起手机，屏幕上已经存好下一次复查和视频通话的提醒。",
+      "她隔着人群点头。广播盖过了后半句话，但父亲的口型很清楚，是让她别省药，也别省电话。林岚把登机牌夹进书里，第一次没有急着说自己都知道。",
+    ].join("\n\n");
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      characterEvolutionEnabled: false,
+      scenePipelineSettings: {
+        enabled: true,
+        preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
+        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: true, candidateCount: 1,
+      },
+      modelUsageReporter: (_model, _usage, meta) => usageKinds.push(meta.callKind),
+      isolatedSceneWriter: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" },
+        stateModel: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "state-test" },
+        run: async (_model, input) => {
+          assert.equal(input.scene.id, "direct-document");
+          assert.equal(input.scene.targetCharacters, 500);
+          assert.match(input.writePack.narrativeBrief, /机场/u);
+          return {
+            content: prose,
+            usage: { promptTokens: 240, completionTokens: 160, cacheHitTokens: 0, cacheMissTokens: 240 },
+            requestCharacters: 1_000,
+          };
+        },
+      },
+    };
+    const result = JSON.parse(await executeTool({
+      id: "direct",
+      name: "write_document_isolated",
+      arguments: JSON.stringify({
+        path: "chapters/序章.md",
+        mode: "create",
+        heading: "序章",
+        goal: "父女完成对未来安排的确认",
+        obstacle: "登机时间逼近，两人都不习惯直接表达关心",
+        turn: "讨论从住宿转到复查与下次见面",
+        outcome: "两人留下明确日期后分别",
+        notes: "机场候机区。父女关系不僵，重点是交换情况并规划未来。",
+        targetCharacters: 500,
+        summary: "新增序章",
+      }),
+    }, project, store, sessionId, () => {}, undefined, context)) as Record<string, unknown>;
+    assert.equal(result.generationMode, "isolated_document");
+    assert.equal(result.generatedCharacters, prose.length);
+    assert.equal("content" in result, false);
+    assert.deepEqual(usageKinds, ["isolated_document_writer"]);
+    assert.equal(store.proposals()[0].afterContent, `# 序章\n\n${prose}`);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the first writer pass sees the target and the ceiling but never a floor number", () => {
+  // 模型会把它看到的最小合法值当成目标；报下限等于把下限变成实际篇幅。
+  const messages = buildIsolatedSceneWriterMessages({ scene, writePack: pack });
+  assert.match(messages[1].content, /目标篇幅是 400 字/u);
+  assert.match(messages[1].content, /硬上限 800 字/u);
+  assert.doesNotMatch(messages[1].content, /可接受范围/u);
+  assert.doesNotMatch(messages[1].content, /不得少于/u);
+  assert.doesNotMatch(messages[1].content, /300 字/u);
+});
+
+test("the retry pass is the only place a hard floor appears", () => {
+  const messages = buildIsolatedSceneWriterMessages({
+    scene,
+    writePack: pack,
+    strictMinimumCharacters: 360,
+  });
+  assert.match(messages[1].content, /不得少于 360 字/u);
 });

@@ -15,6 +15,22 @@ export interface ModelConfig {
   pricing?: TokenPricing;
   temperature?: number;
   topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  /** OpenAI-compatible reasoning depth. Omitted to use the provider default. */
+  reasoningEffort?: ReasoningEffort;
+  /** OpenAI-compatible response detail. Omitted to use the provider default. */
+  verbosity?: ResponseVerbosity;
+  /**
+   * Suppress every sampling / penalty parameter for this model.
+   *
+   * Newer model families (GPT-5, o-series and their compatible clones) reject
+   * `temperature` outright rather than ignoring it, and reject `top_p` and the
+   * penalty fields alongside it. Omitting a parameter is never an error — sending
+   * a rejected one fails the whole request — so this switch drops the entire group
+   * and lets the provider apply its own defaults.
+   */
+  disableSampling?: boolean;
 }
 
 /** 峰谷/分时计费：高峰时段使用 peak 单价，平时使用基础单价。 */
@@ -52,6 +68,20 @@ export interface UsageSummary {
   lastPromptTokens: number;
   /** Provider-reported cache hit ratio. Estimated calls are never persisted or included. */
   cacheHitRate: number;
+  /** Session totals grouped by provider profile and model for billing inspection. */
+  callBreakdown: UsageCallSummary[];
+}
+
+export interface UsageCallSummary {
+  providerName: string;
+  model: string;
+  callCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  cost: number;
+  currency: string;
 }
 
 /** Provider-reported token counts before pricing/UI normalization. */
@@ -63,6 +93,8 @@ export interface ModelTokenUsage {
 }
 
 export type ProviderId = "deepseek" | "openai-compatible";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ResponseVerbosity = "low" | "medium" | "high";
 
 export interface ProviderPublicConfig {
   profileId?: string;
@@ -77,6 +109,11 @@ export interface ProviderPublicConfig {
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  reasoningEffort?: ReasoningEffort;
+  verbosity?: ResponseVerbosity;
+  disableSampling?: boolean;
 }
 
 export interface ProviderModelPublic {
@@ -85,6 +122,12 @@ export interface ProviderModelPublic {
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  reasoningEffort?: ReasoningEffort;
+  verbosity?: ResponseVerbosity;
+  /** See ModelConfig.disableSampling — set per model, since this is a model capability. */
+  disableSampling?: boolean;
 }
 
 export interface ProviderProfilePublic {
@@ -114,8 +157,6 @@ export interface StyleTemplate {
   name: string;
   description: string;
   systemPromptAddition: string;
-  suggestedTemperature: number;
-  suggestedTopP: number;
   exampleContent: string;
   exampleNotes: string;
 }
@@ -139,8 +180,7 @@ export interface Message {
   variantCount?: number;
 }
 
-export interface CharacterSourceRef { type: "outline" | "document" | "manual"; ref: string; note?: string }
-export interface CharacterTemporal { sourceRefs: CharacterSourceRef[]; validFrom?: string; validUntil?: string }
+export interface CharacterTemporal { validFrom?: string; validUntil?: string }
 export interface CharacterTextEntry extends CharacterTemporal { id: string; label: string; description: string }
 export interface CharacterGoal extends CharacterTemporal {
   id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown";
@@ -153,6 +193,9 @@ export interface CharacterRelationship extends CharacterTemporal {
 export interface CharacterCompetency extends CharacterTemporal {
   id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[];
 }
+export interface CharacterFeature {
+  id: string; name: string; summary: string; description: string;
+}
 export interface CharacterStoryState extends CharacterTemporal {
   id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string;
   knowledge: CharacterTextEntry[]; beliefs: CharacterTextEntry[]; intentions: string[]; temporaryGoals: CharacterGoal[]; notes: string;
@@ -161,10 +204,12 @@ export interface Character {
   schemaVersion: 3;
   id: number;
   identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
-  profile: { appearanceSummary: string; distinguishingFeatures: string[]; backgroundSummary: string; biography: string };
+  profile: { appearance: string; appearanceSummary: string; background: string; backgroundSummary: string; biography: string };
   psychology: { summary: string; traits: CharacterTextEntry[]; values: CharacterTextEntry[]; fears: CharacterTextEntry[]; conflicts: CharacterTextEntry[] };
   motivations: CharacterGoal[];
   voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
+  /** Stable details that shape portrayal but are not abilities (habits, physiology, quirks, etc.). */
+  features: CharacterFeature[];
   competencies: CharacterCompetency[];
   relationships: CharacterRelationship[];
   storyStates: CharacterStoryState[];
@@ -233,6 +278,33 @@ export interface Proposal {
   createdAt: string;
   /** Applied only when the linked document proposal is accepted. */
   characterChanges: ProposalCharacterChange[];
+  /** Rule-layer writing-quality picture, attached to narrative proposals only. */
+  qualityReport?: ProseQualityReport;
+}
+
+/**
+ * Final writing-quality picture shown to the author before Accept.
+ * Built by `buildProseQualityReport` (src/final_quality.ts) from the three
+ * deterministic layers; advisory only — it never blocks a proposal.
+ */
+export interface ProseQualityReport {
+  characters: number;
+  /** 0–100, higher is better (现场感). */
+  vividness: { score: number; summary: string };
+  /** 0–100, higher is WORSE (AI 味). */
+  aiTells: { score: number; summary: string };
+  grade: "good" | "fair" | "weak";
+  /**
+   * 本轮篇幅目标与实际值。偏短不再阻断交付，作者据这一行决定要不要让它再长一点。
+   * 没有目标（例如非章节文档）时缺省。
+   */
+  length?: { target: number; actual: number; status: "ok" | "too_short" | "too_long" };
+  warnings: Array<{
+    source: "metrics" | "vividness" | "ai_tells";
+    code: string;
+    message: string;
+    examples: string[];
+  }>;
 }
 
 export interface ProposalCharacterChange {
@@ -285,12 +357,24 @@ export interface DocumentVersionDetail extends DocumentVersionMeta {
   afterContent: string;
 }
 
+/** Compact metadata used by the chapter workspace without loading every body in the browser. */
+export interface ChapterSummary {
+  path: string;
+  title: string;
+  volume: string;
+  wordCount: number;
+  versionCount: number;
+  updatedAt: string;
+}
+
 /** Per-model-call token stats (one agent step / draft call). */
 export interface RequestComponentUsage {
-  kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
+  kind: "stable_system" | "replayed_turn" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
   label: string;
   characters: number;
   estimatedTokens: number;
+  /** Short content hash for diagnosing whether a supposedly stable prefix drifted. */
+  fingerprint?: string;
   callKind?: string;
 }
 
@@ -314,6 +398,45 @@ export interface StepUsage {
   requestComponents?: RequestComponentUsage[];
 }
 
+/** Compact Agent step card persisted for workspace refresh / session reload. */
+export interface PersistedStreamStep {
+  id: number;
+  output: string;
+  reasoning: string;
+  tools: string[];
+  status: "running" | "completed" | "failed";
+  usage?: StepUsage;
+}
+
+/** Server-side step trail keyed by the user (source) message of a turn. */
+export interface MessageStepTrail {
+  sourceMessageId: number;
+  jobId?: string;
+  steps: PersistedStreamStep[];
+  updatedAt: string;
+}
+
+/**
+ * One frozen conversation turn (dynamic context block + its tool transcript),
+ * replayed byte-verbatim on later turns of the same session so the provider
+ * prefix cache keeps hitting. `messages` is the exact wire shape that was sent;
+ * never lean-ify it in place — a rewritten body costs one extra full miss.
+ */
+export interface AgentTurnBlock {
+  turnIndex: number;
+  messages: AgentTurnMessage[];
+  estimatedTokens: number;
+  createdAt: string;
+}
+
+export interface AgentTurnMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
+  reasoning_content?: string;
+}
+
 export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
 export interface AgentCheckpoint {
@@ -326,6 +449,7 @@ export interface AgentCheckpoint {
   completedScenes?: number;
   totalScenes?: number;
   unresolved?: string[];
+  reviewRepair?: { mode: "style" | "structural"; targetSceneIds?: string[] };
   artifactIds?: number[];
   proposalId?: number;
   draft?: unknown;
@@ -393,10 +517,15 @@ export type RoleplayParticipant = {
 };
 
 /** Session-scoped roleplay selection restored after refresh/session switching. */
+export type RoleplayContentRating = "default" | "sfw" | "nsfw";
+
 export interface ActiveRoleplayState {
   performer: RoleplayParticipant;
   identity: RoleplayParticipant;
   scene?: RoleplayScene;
+  sceneSequence: RoleplayScene[];
+  sceneIndex: number;
+  contentRating: RoleplayContentRating;
 }
 
 export type RoleplayInputMode = "dialogue" | "director";
@@ -483,6 +612,7 @@ export type PermissionMode = "ask" | "auto" | "plan";
 
 export type AgentEvent =
   | { type: "step_start"; step: number }
+  | { type: "source_message"; messageId: number; channel?: MessageChannel }
   | { type: "task_contract"; contract: {
       mode: string;
       outcome: "answer" | "document" | "character" | "review" | "multiple";
@@ -490,6 +620,8 @@ export type AgentEvent =
       mutation: "none" | "document" | "character" | "mixed";
       planning: "direct" | "adaptive";
       capabilities: string[];
+      workflow?: "free" | "scene_graph" | "chapter_delivery";
+      qualityProfile?: "fast" | "standard" | "strict";
     } }
   | { type: "text"; text: string; channel?: "output" | "reasoning" }
   | { type: "tool"; name: string }

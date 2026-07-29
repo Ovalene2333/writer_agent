@@ -1,0 +1,4 @@
+interface:
+  display_name: "章节规划"
+  short_description: "把完整章节拆成可充分展开并可在提交前逐项验收的叙事单元"
+  default_prompt: "Use $chapter-planning to plan and draft this chapter without reducing major events to summary."

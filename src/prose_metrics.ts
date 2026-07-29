@@ -15,6 +15,7 @@
  */
 
 import { analyzeProseStyle } from "./prose_quality.js";
+import { proseVividnessScore } from "./prose_vividness.js";
 
 export type ChapterMetricSeverity = "error" | "warning";
 
@@ -130,9 +131,14 @@ export function analyzeChapterProseMetrics(
   if (dashPer10k > DASH_PER_10K_LIMIT) {
     issues.push({
       code: "dash_density",
-      severity: "warning",
-      message: `破折号 ${dashPer10k}/万字（上限 ${DASH_PER_10K_LIMIT}）；它正在替代逗号、冒号和因果从句，把补注改写为完整句或直接删除。`,
-      examples: [],
+      severity: "error",
+      message: `破折号 ${dashPer10k}/万字（硬上限 ${DASH_PER_10K_LIMIT}）；保留确有必要的对白拖音、中断或偶发揭示，其余补注改写为完整句、逗号或冒号，或直接删除。`,
+      examples: splitSentences(body)
+        .filter(sentence => {
+          DASH_UNIT.lastIndex = 0;
+          return DASH_UNIT.test(sentence);
+        })
+        .slice(0, 8),
     });
   }
 
@@ -211,7 +217,7 @@ export function analyzeChapterProseMetrics(
   };
 }
 
-/** Blocking message for metric errors only (warnings ship separately as checklist). */
+/** Blocking message for metric errors only (including chapter-wide dash overload). */
 export function chapterMetricsBlockError(metrics: ChapterProseMetrics): string | undefined {
   const errors = metrics.issues.filter(issue => issue.severity === "error");
   if (!errors.length) return undefined;
@@ -353,31 +359,61 @@ export function sceneAntiFormulaFeedback(options: {
   return lines;
 }
 
+export type SceneScoreBreakdown = {
+  /** Accumulated mannerism / reuse / rhythm penalty (0 = nothing wrong found). */
+  penalty: number;
+  /** 0–100 additive vividness (see prose_vividness.ts). */
+  vividness: number;
+  /** 100 − penalty + vividness adjustment. */
+  total: number;
+};
+
+/** Vividness maps into roughly [−15, +10] so it can separate two clean candidates
+ * without ever outweighing a real defect (an adjacent duplicate alone costs 40). */
+export function vividnessAdjustment(vividness: number): number {
+  return Math.round(Math.max(-15, Math.min(10, (vividness - 60) * 0.25)) * 10) / 10;
+}
+
 /**
  * Deterministic prose score for best-of-N scene candidate reranking (higher is
- * better, ~100 for clean prose). Purely rule-based so ranking is reproducible
- * and free; penalizes exactly the failure modes the chapter metrics measure,
- * with a small reward for long-sentence presence (rhythm shifting).
+ * better). Purely rule-based so ranking is reproducible and free.
+ *
+ * Two terms: a penalty ledger for the failure modes the chapter metrics measure,
+ * and an additive vividness term. The penalty half alone tops out at exactly 100
+ * for any clean prose — including flat, correct, unreadable prose — which is why
+ * the vividness term exists: without it every clean candidate ties and best-of-N
+ * silently degenerates into "keep the original".
  */
-export function sceneProseScore(text: string): number {
+export function sceneProseScoreBreakdown(text: string): SceneScoreBreakdown {
   const body = stripStructuralLines(text);
   const characters = Math.max(1, body.replace(/\s/g, "").length);
   const per10k = (count: number) => (count / characters) * 10_000;
-  let score = 100;
-  score -= Math.max(0, per10k(countMatches(body, DASH_UNIT)) - DASH_PER_10K_LIMIT) * 0.2;
-  score -= Math.max(0, per10k(collectContrastFrames(body).length) - CONTRAST_PER_10K_LIMIT) * 2;
-  score -= Math.max(0, per10k((body.match(SAMENESS_FRAME) ?? []).length) - SAMENESS_PER_10K_LIMIT) * 1.5;
-  score -= Math.max(0, per10k(countMatches(body, NUMERIC_READOUT)) - NUMERIC_PER_10K_LIMIT) * 0.3;
+  let penalty = 0;
+  penalty += Math.max(0, per10k(countMatches(body, DASH_UNIT)) - DASH_PER_10K_LIMIT) * 0.2;
+  penalty += Math.max(0, per10k(collectContrastFrames(body).length) - CONTRAST_PER_10K_LIMIT) * 2;
+  penalty += Math.max(0, per10k((body.match(SAMENESS_FRAME) ?? []).length) - SAMENESS_PER_10K_LIMIT) * 1.5;
+  penalty += Math.max(0, per10k(countMatches(body, NUMERIC_READOUT)) - NUMERIC_PER_10K_LIMIT) * 0.3;
   const rhythm = narrativeRhythm(body);
-  score -= per10k(rhythm.fragmentRuns) * 1.2;
+  penalty += per10k(rhythm.fragmentRuns) * 1.2;
+  // Staccato overload still costs; the former long-sentence *bonus* moved into the
+  // vividness term (rhythm spread) so this ledger stays monotonically non-negative.
   if (rhythm.sentenceCount >= 20) {
-    score -= Math.max(0, rhythm.shortSentenceRatio - 0.45) * 100;
-    score += Math.min(0.08, rhythm.longSentenceRatio) * 150;
+    penalty += Math.max(0, rhythm.shortSentenceRatio - 0.45) * 100;
   }
-  score -= findAdjacentDuplicateSentences(body).length * 40;
-  score -= repeatedShortSentences(body, 3).length * 5;
-  score -= analyzeProseStyle(body).filter(issue => issue.severity === "error").length * 25;
-  return Math.round(score * 10) / 10;
+  penalty += findAdjacentDuplicateSentences(body).length * 40;
+  penalty += repeatedShortSentences(body, 3).length * 5;
+  penalty += analyzeProseStyle(body).filter(issue => issue.severity === "error").length * 25;
+  penalty = Math.round(penalty * 10) / 10;
+  const vividness = proseVividnessScore(text);
+  return {
+    penalty,
+    vividness,
+    total: Math.round((100 - penalty + vividnessAdjustment(vividness)) * 10) / 10,
+  };
+}
+
+export function sceneProseScore(text: string): number {
+  return sceneProseScoreBreakdown(text).total;
 }
 
 /** Negative list from the previous chapter, injected once at begin_chapter_draft. */

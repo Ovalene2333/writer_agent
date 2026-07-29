@@ -3,6 +3,11 @@
 export type ConnectionRoute = "lan" | "public" | "local";
 /** 用户偏好：自动择优，或锁定某一通道。 */
 export type ConnectionPreference = "auto" | "lan" | "public";
+export type ConnectionProbeResult = {
+  status: "ok" | "unreachable" | "blocked" | "unconfigured";
+  latencyMs: number | null;
+};
+export type ConnectionProbeResults = Record<"lan" | "public", ConnectionProbeResult>;
 
 export type ConnectionInfo = {
   route: ConnectionRoute;
@@ -314,6 +319,26 @@ async function probe(base: string): Promise<boolean> {
   }
 }
 
+async function measureProbe(base: string | null): Promise<ConnectionProbeResult> {
+  if (!base) return { status: "unconfigured", latencyMs: null };
+  if (!canFetchBase(base)) return { status: "blocked", latencyMs: null };
+  const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const reachable = await probe(base);
+  const finishedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+  return reachable
+    ? { status: "ok", latencyMs: Math.max(1, Math.round(finishedAt - startedAt)) }
+    : { status: "unreachable", latencyMs: null };
+}
+
+/** 用户主动重新探测时，并行测量局域网和公网健康检查的往返耗时。 */
+export async function probeConnectionRoutes(): Promise<ConnectionProbeResults> {
+  const [lan, publicRoute] = await Promise.all([
+    measureProbe(lanBase),
+    measureProbe(publicBase),
+  ]);
+  return { lan, public: publicRoute };
+}
+
 /** 带 token 的入口链接（可复制 / 在新标签打开 / 整页跳转）。 */
 export function buildEntryUrl(kind: "lan" | "public"): string | null {
   if (!token && !tokenless) return null;
@@ -331,6 +356,19 @@ export function buildEntryUrl(kind: "lan" | "public"): string | null {
   else params.set("auth", "none");
   if (lanBase) params.set("lan", lanBase);
   return `${publicBase}/#${params.toString()}`;
+}
+
+/** Build a bearer link that authenticates with the server's read-only token. */
+export function buildReadonlyEntryUrl(readonlyToken: string): string | null {
+  const safeToken = readonlyToken.trim();
+  if (!safeToken) return null;
+  const base = publicBase || activeBase || lanBase
+    || (typeof location !== "undefined" ? normalizeBase(location.origin) : "");
+  if (!base || !isHttpUrl(base)) return null;
+  const params = new URLSearchParams({ token: safeToken, readonly: "1" });
+  if (publicBase && base === publicBase && lanBase) params.set("lan", lanBase);
+  if (lanBase && base === lanBase && publicBase) params.set("public", publicBase);
+  return `${normalizeBase(base)}/#${params.toString()}`;
 }
 
 /**

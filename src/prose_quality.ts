@@ -4,11 +4,12 @@ export type ProseStyleSubtype =
   | "system_or_metadata" | "parenthetical_explanation" | "appositive_definition"
   | "cause_or_judgment" | "ambiguous_dash"
   | "narrator_redefinition" | "abstract_reframing" | "split_redefinition" | "dialogue_correction" | "factual_exclusion"
-  | "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss";
+  | "semantic_echo" | "emotion_label" | "intent_translation" | "thematic_summary" | "causal_gloss"
+  | "learned_rule";
 
 export interface ProseStyleIssue {
   id: string;
-  kind: "dash" | "contrast" | "explanation";
+  kind: "dash" | "contrast" | "explanation" | "learned";
   subtype: ProseStyleSubtype;
   severity: ProseStyleSeverity;
   confidence: number;
@@ -35,7 +36,7 @@ export interface ContrastStyleReport {
 type MatchRange = { start: number; end: number; text: string };
 const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const CONTRAST_PATTERNS = [
-  /(?:并)?不是[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
+  /(?:并)?不是[^\n。！？!?]{0,48}(?:(?:而|却|只)是|(?<!不)是)/gu,
   /(?:并)?不是[^\n。！？!?]{1,48}[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
   /并非[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
   /与其(?:说)?[^\n。！？!?]{0,48}不如(?:说)?/gu,
@@ -72,12 +73,14 @@ export const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
   "cause_or_judgment",
   "abstract_reframing",
   "split_redefinition",
+  "factual_exclusion",
   "narrator_redefinition",
   "semantic_echo",
   "emotion_label",
   "intent_translation",
   "thematic_summary",
   "causal_gloss",
+  "learned_rule",
 ]);
 
 export function isHardBlockSubtype(subtype: ProseStyleSubtype): boolean {
@@ -92,7 +95,8 @@ export function hardMannerismLimit(text: string): number {
 
 function hardMannerismFamily(subtype: ProseStyleSubtype): "dash" | "contrast" | "explanation" {
   if (subtype === "parenthetical_explanation" || subtype === "cause_or_judgment") return "dash";
-  if (subtype === "abstract_reframing" || subtype === "split_redefinition" || subtype === "narrator_redefinition") return "contrast";
+  if (subtype === "abstract_reframing" || subtype === "split_redefinition"
+    || subtype === "factual_exclusion" || subtype === "narrator_redefinition") return "contrast";
   return "explanation";
 }
 
@@ -110,28 +114,26 @@ function hardMannerismFamilyLimit(text: string, family: "dash" | "contrast" | "e
 }
 
 /**
- * Generation-time guidance (positive-first).
- * Research on negative instructions (Pink Elephant / ironic rebound) shows that
- * demonstrating a forbidden pattern in the prompt RAISES its salience and output
- * probability. So this block states what good narration does and never quotes a
- * bad example; enforcement lives in the machine gate, and the gate's block
- * messages name the offending sentences at the point of failure instead.
+ * Generation-time guidance. The explicit negative frame is intentional: the
+ * writing models otherwise reproduce it often enough that a positive-only hint
+ * leaves the deterministic gate doing expensive cleanup after generation.
  */
 export function proseMannerismConstraintPrompt(options?: { compact?: boolean }): string {
   const lines = [
     "句式基准（出口有机器门禁复核，按此写省返工）：",
     "1. 叙述直接陈述成立的事实；需要纠正误解或对比时，交给人物对白或后续行动完成。",
-    "2. 补充说明写成独立完整句；破折号留给对白里的拖音、中断，以及偶发的停顿—揭示。",
-    "3. 动作、对白或细节已经传达情绪与意图时，就停在那里进入下一拍；解释只在引入新事实时出现。",
-    "4. 相邻段落换句式骨架：起笔方式、句长结构、信息展开方式各不相同。",
+    "2. 避免叙述中的「不是……是/而是……」及拆成「不是……。是……。」的改判句；直接写成立的动作、感受或事实。",
+    "3. 补充说明写成独立完整句；破折号留给对白里的拖音、中断，以及偶发的停顿—揭示。",
+    "4. 动作、对白或细节已经传达情绪与意图时，就停在那里进入下一拍；解释只在引入新事实时出现。",
+    "5. 相邻段落换句式骨架：起笔方式、句长结构、信息展开方式各不相同。",
   ];
   if (options?.compact) return lines.join("\n");
-  return `${lines.join("\n")}\n5. 对白保留口语的自然形态：拖音、改口、半句、口语纠正都可以；每个人物的说话方式彼此可区分。\n6. 每场提交前通读一遍：删去不新增事实的解释句，把补注并入叙述或独立成句。`;
+  return `${lines.join("\n")}\n6. 对白保留口语的自然形态：拖音、改口、半句、口语纠正都可以；每个人物的说话方式彼此可区分。\n7. 每场提交前通读一遍：删去不新增事实的解释句，把补注并入叙述或独立成句。`;
 }
 
 /** One-line checklist for pre-submit self-check in task workflows. */
 export function proseMannerismPreflightLine(): string {
-  return "提交前自检：删去不新增事实的解释句与补注；补充说明写成独立句；相邻段落句式骨架不同形；对白语气自然且人物可区分。";
+  return "提交前自检：改掉叙述中的先否定再改判句；删去不新增事实的解释与补注；相邻段落句式骨架不同形；对白语气自然且人物可区分。";
 }
 
 /**
@@ -159,7 +161,9 @@ export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
  */
 export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]): ProseStyleIssue[] {
   for (const issue of issues) {
-    if (issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype)) {
+    if (issue.severity === "error"
+      && HARD_BLOCK_SUBTYPES.has(issue.subtype)
+      && issue.subtype !== "split_redefinition") {
       issue.severity = "warning";
     }
   }
@@ -238,7 +242,10 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
     || (issue.subtype === "split_redefinition" && issue.severity === "warning" && issue.confidence >= 0.95),
   );
   if (!errors.length) return undefined;
-  return formatProseStyleBlockError(errors, "本次修改新增过密的高置信度说明式写法");
+  const headline = errors.some(issue => issue.subtype === "learned_rule")
+    ? "本次修改违反作者沉淀的复审规则"
+    : "本次修改新增过密的高置信度说明式写法";
+  return formatProseStyleBlockError(errors, headline);
 }
 
 /** Actionable block message so one local rewrite can pass re-submit. */
@@ -247,8 +254,11 @@ function formatProseStyleBlockError(errors: ProseStyleIssue[], headline: string)
     const tip = issue.suggestions[0] ?? rewriteTipForSubtype(issue.subtype);
     return `第${issue.line}行「${issue.evidence}」→ ${tip}`;
   });
+  const learnedOnly = errors.every(issue => issue.subtype === "learned_rule");
   return `${headline}（${errors.length}处硬拦截）：${located.join("；")}。` +
-    "只改命中句，勿全文重写。保留：对白拖音/中断/迟疑、口语纠正、偶发停顿—揭示与短同位。配方：删「——因为/也就是」类补注；抽象「不是…而是」改成直接事实或人物行动。";
+    (learnedOnly
+      ? "只按规则精确修正命中句，勿全文重写。"
+      : "只改命中句，勿全文重写。保留：对白拖音/中断/迟疑、口语纠正、偶发停顿—揭示与短同位。配方：删「——因为/也就是」类补注；抽象「不是…而是」改成直接事实或人物行动。");
 }
 
 function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
@@ -271,6 +281,8 @@ function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
       return "删去即时总结，让意义由场景后果或后续回收形成";
     case "causal_gloss":
       return "必要因果写成新事实；若只是复述前文则删除";
+    case "learned_rule":
+      return "按作者沉淀的项目复审规则做最小修正";
     default:
       return "改成可观察动作或独立句，去掉说明体";
   }
@@ -376,8 +388,8 @@ function scanContrasts(text: string): ProseStyleIssue[] {
     }
     const split = /[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是/u.test(match.text);
     if (split) {
-      issues.push(makeIssue(text, match, "contrast", "split_redefinition", "warning", 0.92,
-        "叙述者用句号拆开同一否定—肯定框架，容易形成刻意顿挫和机器化重定义；需结合语境区分必要事实澄清。",
+      issues.push(makeIssue(text, match, "contrast", "split_redefinition", "error", 0.99,
+        "叙述者用句号拆开同一否定—肯定框架，形成刻意顿挫和机器化重定义。",
         ["直接写真正成立的动作或事实", "若确需纠正误解，让人物通过对白或后续反应完成"]));
       continue;
     }
@@ -389,9 +401,10 @@ function scanContrasts(text: string): ProseStyleIssue[] {
         "叙述者先否定表象再定义抽象意义；偶发可用，过密时再改。",
         ["直接陈述真正成立的事实", "若确有误解需要纠正，把纠正落到人物行动或对白中"]));
     } else {
-      // 事实排除（不是 A 而是 B）在叙事中极常见，仅 info
-      issues.push(makeIssue(text, match, "contrast", "factual_exclusion", "info", 0.65,
-        "否定—肯定结构更像事实排除或转折，默认允许。", []));
+      // 事实排除本身可能成立，但连续出现仍会形成稳定的机器句式。
+      issues.push(makeIssue(text, match, "contrast", "factual_exclusion", "warning", 0.92,
+        "叙述者使用否定—肯定框架排除事实；偶发可读，重复时应直接陈述成立事实。",
+        ["直接陈述真正成立的事实", "若确需纠正误解，让人物通过对白或观察过程完成"]));
     }
   }
   return issues;
