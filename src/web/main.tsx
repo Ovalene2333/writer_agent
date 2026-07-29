@@ -52,7 +52,7 @@ import {
 import { Marked, type Token, type Tokens } from "marked";
 import { documentDiff, renderDiffHtml } from "../diff";
 import { characterEditorSaveInput } from "../character_editor_payload";
-import { CharacterEditor, type CharacterSummaryKind } from "./character_editor";
+import type { CharacterSummaryKind } from "./character_editor";
 import {
   apiUrl,
   buildReadonlyEntryUrl,
@@ -71,7 +71,17 @@ import {
   type ConnectionProbeResults,
   type ConnectionPreference,
 } from "./connection";
-import { ModelConfig, type ProseLengthSettings, type ProviderCatalog, type ScenePipelineSettings, type SettingsSection, type WritingExecutionMode } from "./model_config";
+import type { ProseLengthSettings, ProviderCatalog, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
+
+/** Heavy management panels — code-split so first paint does not pay for them. */
+const CharacterEditor = React.lazy(async () => {
+  const mod = await import("./character_editor");
+  return { default: mod.CharacterEditor };
+});
+const ModelConfig = React.lazy(async () => {
+  const mod = await import("./model_config");
+  return { default: mod.ModelConfig };
+});
 
 /** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
 const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, enforceMinimum: false };
@@ -8257,7 +8267,8 @@ function App() {
       )}
 
       {characterDraft && (
-        <CharacterEditor
+                <React.Suspense fallback={<div className="management-empty">加载角色编辑器…</div>}>
+          <CharacterEditor
           draft={characterDraft}
           characters={state?.characters ?? []}
           busy={busy}
@@ -8266,195 +8277,200 @@ function App() {
           onSave={() => void saveCharacter()}
           onSummarizeCharacter={summarizeCharacter}
           onDelete={characterDraft.id ? () => void deleteCharacter(characterDraft as Character) : undefined}
-        />
+          />
+        </React.Suspense>
       )}
 
-      {managementView === "models" && <ModelConfig
-        initialCatalog={state.providerCatalog}
-        scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
-        proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
-        writingMode={state.agentSettings?.writingMode ?? "fast"}
-        characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
-        continuityFactsEnabled={state.agentSettings?.continuityFactsEnabled ?? false}
-        reviewFollowsProseModel={state.agentSettings?.reviewFollowsProseModel ?? true}
-        section={settingsSection}
-        onSectionChanged={setSettingsSection}
-        connectionAvailable={connection.dualMode}
-        styleContent={<div className="settings-section-body">
+      {managementView === "models" && (
+        <React.Suspense fallback={<div className="management-empty">加载模型设置…</div>}>
+          <ModelConfig
+          initialCatalog={state.providerCatalog}
+          scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
+          proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
+          writingMode={state.agentSettings?.writingMode ?? "fast"}
+          characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
+          continuityFactsEnabled={state.agentSettings?.continuityFactsEnabled ?? false}
+          reviewFollowsProseModel={state.agentSettings?.reviewFollowsProseModel ?? true}
+          section={settingsSection}
+          onSectionChanged={setSettingsSection}
+          connectionAvailable={connection.dualMode}
+          styleContent={<div className="settings-section-body">
           <div className="style-picker-actions">
-            <button type="button" className="primary" disabled={styleBusy} onClick={() => openStyleTemplate()}>新建模板</button>
-            {activeStyle && <button type="button" disabled={styleBusy} onClick={() => openStyleTemplate(activeStyle)}>
-              {(activeStyle.readOnly || activeStyle.builtIn) ? "浏览当前模板" : "编辑当前模板"}
-            </button>}
-            <button type="button" className={`style-off${activeStyleId ? "" : " active"}`} disabled={styleBusy || !activeStyleId} onClick={() => void applyWritingStyle("")}>不使用模板</button>
-            {activeStyle && <span className="style-active-hint">当前：{activeStyle.name}{(activeStyle.readOnly || activeStyle.builtIn) ? "（内置·只读）" : ""}</span>}
+          <button type="button" className="primary" disabled={styleBusy} onClick={() => openStyleTemplate()}>新建模板</button>
+          {activeStyle && <button type="button" disabled={styleBusy} onClick={() => openStyleTemplate(activeStyle)}>
+          {(activeStyle.readOnly || activeStyle.builtIn) ? "浏览当前模板" : "编辑当前模板"}
+          </button>}
+          <button type="button" className={`style-off${activeStyleId ? "" : " active"}`} disabled={styleBusy || !activeStyleId} onClick={() => void applyWritingStyle("")}>不使用模板</button>
+          {activeStyle && <span className="style-active-hint">当前：{activeStyle.name}{(activeStyle.readOnly || activeStyle.builtIn) ? "（内置·只读）" : ""}</span>}
           </div>
           <div className="theme-grid style-grid">
-            {styleTemplates.length === 0 ? <div className="management-empty">暂无写作风格模板</div> : styleTemplates.map((item) => {
-              const selected = item.id === activeStyleId;
-              const readOnly = Boolean(item.readOnly || item.builtIn);
-              const preview = (item.exampleContent ?? "").replace(/\s+/g, " ").trim().slice(0, 96);
-              return <div key={item.id} className={`theme-card style-card${selected ? " active" : ""}`}>
-                <button type="button" className="style-card-select" disabled={styleBusy} onClick={() => void applyWritingStyle(item.id, item.name)}>
-                  <div className="theme-card-meta">
-                    <strong>{item.name}{selected && <span className="theme-tag">使用中</span>}{readOnly && <span className="theme-tag">内置</span>}{!readOnly && item.customized && <span className="theme-tag">自定义</span>}</strong>
-                    <small>{item.description}</small>
-                    {preview && <span className="theme-example style-example">{preview}{preview.length >= 96 ? "…" : ""}</span>}
-                  </div>
-                </button>
-                <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => openStyleTemplate(item)}>{readOnly ? "浏览" : "编辑"}</button>
-              </div>;
-            })}
+          {styleTemplates.length === 0 ? <div className="management-empty">暂无写作风格模板</div> : styleTemplates.map((item) => {
+          const selected = item.id === activeStyleId;
+          const readOnly = Boolean(item.readOnly || item.builtIn);
+          const preview = (item.exampleContent ?? "").replace(/\s+/g, " ").trim().slice(0, 96);
+          return <div key={item.id} className={`theme-card style-card${selected ? " active" : ""}`}>
+          <button type="button" className="style-card-select" disabled={styleBusy} onClick={() => void applyWritingStyle(item.id, item.name)}>
+          <div className="theme-card-meta">
+          <strong>{item.name}{selected && <span className="theme-tag">使用中</span>}{readOnly && <span className="theme-tag">内置</span>}{!readOnly && item.customized && <span className="theme-tag">自定义</span>}</strong>
+          <small>{item.description}</small>
+          {preview && <span className="theme-example style-example">{preview}{preview.length >= 96 ? "…" : ""}</span>}
           </div>
-        </div>}
-        proseGatesContent={proseGatesSettingsContent}
-        continuityFactsContent={continuityFactsSettingsContent}
-        connectionContent={connection.dualMode ? <div className="settings-section-body connection-settings">
+          </button>
+          <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => openStyleTemplate(item)}>{readOnly ? "浏览" : "编辑"}</button>
+          </div>;
+          })}
+          </div>
+          </div>}
+          proseGatesContent={proseGatesSettingsContent}
+          continuityFactsContent={continuityFactsSettingsContent}
+          connectionContent={connection.dualMode ? <div className="settings-section-body connection-settings">
           <div className="connection-status-row">
-            <span className={`connection-status-dot route-${connection.route}`} aria-hidden="true" />
-            <div className="connection-status-meta"><strong>{connection.label}</strong><small title={connection.base}>{connection.base}</small></div>
-            <button type="button" className="ghost" disabled={connectionBusy} onClick={() => {
-              setConnectionBusy(true);
-              setConnectionPanelMsg("");
-              void Promise.all([ensureConnection(), probeConnectionRoutes()]).then(([info, probes]) => {
-                setConnection(info);
-                setConnectionProbeResults(probes);
-                setConnectionPanelMsg(`已重新探测：${info.label}`);
-              }).catch((e) => setConnectionPanelMsg(String(e))).finally(() => setConnectionBusy(false));
-            }}>重新探测</button>
+          <span className={`connection-status-dot route-${connection.route}`} aria-hidden="true" />
+          <div className="connection-status-meta"><strong>{connection.label}</strong><small title={connection.base}>{connection.base}</small></div>
+          <button type="button" className="ghost" disabled={connectionBusy} onClick={() => {
+          setConnectionBusy(true);
+          setConnectionPanelMsg("");
+          void Promise.all([ensureConnection(), probeConnectionRoutes()]).then(([info, probes]) => {
+          setConnection(info);
+          setConnectionProbeResults(probes);
+          setConnectionPanelMsg(`已重新探测：${info.label}`);
+          }).catch((e) => setConnectionPanelMsg(String(e))).finally(() => setConnectionBusy(false));
+          }}>重新探测</button>
           </div>
           <div className="connection-section">
-            <h3>通道偏好</h3>
-            <div className="connection-pref-grid">{([
-              { id: "auto" as const, name: "自动", desc: "局域网优先，不可达则公网" },
-              { id: "lan" as const, name: "局域网", desc: "尽量锁定，低延迟" },
-              { id: "public" as const, name: "公网", desc: "Cloudflare 隧道" },
-            ] satisfies Array<{ id: ConnectionPreference; name: string; desc: string }>).map((item) => <button
-              key={item.id}
-              type="button"
-              className={`connection-pref-card${connection.preference === item.id ? " active" : ""}${connection.route === item.id ? " live" : ""}`}
-              disabled={connectionBusy}
-              onClick={() => {
-                setConnectionBusy(true);
-                setConnectionPanelMsg("");
-                void setConnectionPreference(item.id).then((result) => {
-                  setConnection(getConnectionInfo());
-                  if (result.needNavigate || result.error) {
-                    setConnectionPanelMsg(result.error || "请用下方入口链接打开对应通道");
-                    return;
-                  }
-                  setConnectionPanelMsg(item.id === "auto" ? `已设为自动 · 当前 ${result.label}` : `已切换到${item.name}`);
-                }).finally(() => setConnectionBusy(false));
-              }}
-            >
-              <span className="connection-pref-title">
-                <strong>{item.name}</strong>
-                {connectionProbeLabel(item.id) && <em>{connectionProbeLabel(item.id)}</em>}
-              </span>
-              <small>{item.desc}</small>
-            </button>)}</div>
+          <h3>通道偏好</h3>
+          <div className="connection-pref-grid">{([
+          { id: "auto" as const, name: "自动", desc: "局域网优先，不可达则公网" },
+          { id: "lan" as const, name: "局域网", desc: "尽量锁定，低延迟" },
+          { id: "public" as const, name: "公网", desc: "Cloudflare 隧道" },
+          ] satisfies Array<{ id: ConnectionPreference; name: string; desc: string }>).map((item) => <button
+          key={item.id}
+          type="button"
+          className={`connection-pref-card${connection.preference === item.id ? " active" : ""}${connection.route === item.id ? " live" : ""}`}
+          disabled={connectionBusy}
+          onClick={() => {
+          setConnectionBusy(true);
+          setConnectionPanelMsg("");
+          void setConnectionPreference(item.id).then((result) => {
+          setConnection(getConnectionInfo());
+          if (result.needNavigate || result.error) {
+          setConnectionPanelMsg(result.error || "请用下方入口链接打开对应通道");
+          return;
+          }
+          setConnectionPanelMsg(item.id === "auto" ? `已设为自动 · 当前 ${result.label}` : `已切换到${item.name}`);
+          }).finally(() => setConnectionBusy(false));
+          }}
+          >
+          <span className="connection-pref-title">
+          <strong>{item.name}</strong>
+          {connectionProbeLabel(item.id) && <em>{connectionProbeLabel(item.id)}</em>}
+          </span>
+          <small>{item.desc}</small>
+          </button>)}</div>
           </div>
           <div className="connection-section">
-            <h3>入口链接</h3>
-            <p className="connection-hint">在家 Wi‑Fi 推荐使用局域网入口；公网 HTTPS 页面受浏览器混合内容限制，不能直接探测局域网 HTTP。</p>
-            {connection.lanBlockedByMixedContent && <p className="connection-warn">当前是 HTTPS 公网页，回家后请用下方局域网链接打开工作区。</p>}
-            {([
-              { kind: "lan" as const, name: "局域网", base: connection.lanBase },
-              { kind: "public" as const, name: "公网", base: connection.publicBase },
-            ]).map((item) => {
-              const entry = buildEntryUrl(item.kind);
-              return <div key={item.kind} className="connection-link-row">
-                <div className="connection-link-meta"><strong>{item.name}</strong><small title={item.base || undefined}>{item.base || "未配置"}</small></div>
-                <div className="connection-link-actions">
-                  <button type="button" className="ghost" disabled={!entry} onClick={() => entry && void navigator.clipboard?.writeText(entry).then(() => setConnectionPanelMsg(`已复制${item.name}链接`)).catch(() => setConnectionPanelMsg(entry))}>复制</button>
-                  <button type="button" className="ghost" disabled={!entry} onClick={() => entry && window.open(entry, "_blank", "noopener,noreferrer")}>新标签</button>
-                  <button type="button" className="primary" disabled={!entry} onClick={() => entry && window.location.assign(entry)}>打开</button>
-                </div>
-              </div>;
-            })}
+          <h3>入口链接</h3>
+          <p className="connection-hint">在家 Wi‑Fi 推荐使用局域网入口；公网 HTTPS 页面受浏览器混合内容限制，不能直接探测局域网 HTTP。</p>
+          {connection.lanBlockedByMixedContent && <p className="connection-warn">当前是 HTTPS 公网页，回家后请用下方局域网链接打开工作区。</p>}
+          {([
+          { kind: "lan" as const, name: "局域网", base: connection.lanBase },
+          { kind: "public" as const, name: "公网", base: connection.publicBase },
+          ]).map((item) => {
+          const entry = buildEntryUrl(item.kind);
+          return <div key={item.kind} className="connection-link-row">
+          <div className="connection-link-meta"><strong>{item.name}</strong><small title={item.base || undefined}>{item.base || "未配置"}</small></div>
+          <div className="connection-link-actions">
+          <button type="button" className="ghost" disabled={!entry} onClick={() => entry && void navigator.clipboard?.writeText(entry).then(() => setConnectionPanelMsg(`已复制${item.name}链接`)).catch(() => setConnectionPanelMsg(entry))}>复制</button>
+          <button type="button" className="ghost" disabled={!entry} onClick={() => entry && window.open(entry, "_blank", "noopener,noreferrer")}>新标签</button>
+          <button type="button" className="primary" disabled={!entry} onClick={() => entry && window.location.assign(entry)}>打开</button>
+          </div>
+          </div>;
+          })}
           </div>
           {connectionPanelMsg && <p className="connection-panel-msg" role="status">{connectionPanelMsg}</p>}
-        </div> : <div className="management-empty">当前环境只配置了单一连接通道。</div>}
-        appearanceContent={<div className="settings-section-body"><div className="theme-grid">
+          </div> : <div className="management-empty">当前环境只配置了单一连接通道。</div>}
+          appearanceContent={<div className="settings-section-body"><div className="theme-grid">
           {UI_THEMES.map((item) => <button key={item.id} type="button" className={`theme-card${theme === item.id ? " active" : ""}`} onClick={() => setTheme(item.id)}>
-            <div className="theme-preview" style={{
-              ["--tp-bg"]: item.preview.bg,
-              ["--tp-surface"]: item.preview.surface,
-              ["--tp-surface2"]: item.preview.surface2,
-              ["--tp-border"]: item.preview.border,
-              ["--tp-accent"]: item.preview.accent,
-              ["--tp-text"]: item.preview.text,
-            } as React.CSSProperties} aria-hidden="true">
-              <div className="theme-preview-chrome"><i/><i/><i/></div>
-              <div className="theme-preview-body"><div className="theme-preview-side"/><div className="theme-preview-main"><span/><span/><span/></div><div className="theme-preview-agent"/></div>
-            </div>
-            <div className="theme-card-meta"><strong>{item.name}<span className="theme-tag">{item.tag}</span></strong></div>
+          <div className="theme-preview" style={{
+          ["--tp-bg"]: item.preview.bg,
+          ["--tp-surface"]: item.preview.surface,
+          ["--tp-surface2"]: item.preview.surface2,
+          ["--tp-border"]: item.preview.border,
+          ["--tp-accent"]: item.preview.accent,
+          ["--tp-text"]: item.preview.text,
+          } as React.CSSProperties} aria-hidden="true">
+          <div className="theme-preview-chrome"><i/><i/><i/></div>
+          <div className="theme-preview-body"><div className="theme-preview-side"/><div className="theme-preview-main"><span/><span/><span/></div><div className="theme-preview-agent"/></div>
+          </div>
+          <div className="theme-card-meta"><strong>{item.name}<span className="theme-tag">{item.tag}</span></strong></div>
           </button>)}
-        </div></div>}
-        request={api}
-        onClose={() => setManagementView(null)}
-        onChanged={() => { void refresh(state.sessionId); }}
-        onScenePipelineChanged={scenePipeline => setState(previous => previous ? {
+          </div></div>}
+          request={api}
+          onClose={() => setManagementView(null)}
+          onChanged={() => { void refresh(state.sessionId); }}
+          onScenePipelineChanged={scenePipeline => setState(previous => previous ? {
           ...previous,
           agentSettings: {
-            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "fast",
-            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
-            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
-            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
-            scenePipeline,
-            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          scenePipeline,
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
-        } : previous)}
-        onProseLengthChanged={proseLength => setState(previous => previous ? {
+          } : previous)}
+          onProseLengthChanged={proseLength => setState(previous => previous ? {
           ...previous,
           agentSettings: {
-            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "fast",
-            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
-            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
-            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
-            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
-            proseLength,
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          proseLength,
           },
-        } : previous)}
-        onCharacterEvolutionChanged={characterEvolutionEnabled => setState(previous => previous ? {
+          } : previous)}
+          onCharacterEvolutionChanged={characterEvolutionEnabled => setState(previous => previous ? {
           ...previous,
           agentSettings: {
-            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "fast",
-            characterEvolutionEnabled,
-            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
-            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
-            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
-            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled,
+          continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
-        } : previous)}
-        onContinuityFactsChanged={continuityFactsEnabled => setState(previous => previous ? {
+          } : previous)}
+          onContinuityFactsChanged={continuityFactsEnabled => setState(previous => previous ? {
           ...previous,
           agentSettings: {
-            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "fast",
-            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
-            continuityFactsEnabled,
-            reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
-            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
-            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          continuityFactsEnabled,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
-        } : previous)}
-        onReviewFollowsProseModelChanged={reviewFollowsProseModel => setState(previous => previous ? {
+          } : previous)}
+          onReviewFollowsProseModelChanged={reviewFollowsProseModel => setState(previous => previous ? {
           ...previous,
           agentSettings: {
-            permissionMode: previous.agentSettings?.permissionMode ?? "ask",
-            writingMode: previous.agentSettings?.writingMode ?? "fast",
-            characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
-            continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
-            reviewFollowsProseModel,
-            scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
-            proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+          reviewFollowsProseModel,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
-        } : previous)}
-      />}
+          } : previous)}
+          />
+        </React.Suspense>
+      )}
     </WorkspaceShell>
   );
 }
