@@ -11,19 +11,23 @@ import QRCode from "qrcode";
 import { runAgent, stripDsmlText } from "./agent.js";
 import {
   ABSOLUTE_MAX_SCENES,
+  MAX_AGENT_STEPS,
   MAX_CHAPTER_TARGET_CHARACTERS,
   MAX_ISOLATED_WRITER_MAX_RATIO,
   MAX_SCENE_NOTES_CHARACTERS,
   MAX_SCENE_CANDIDATES,
+  MIN_AGENT_STEPS,
   MIN_CHAPTER_TARGET_CHARACTERS,
   MIN_ISOLATED_WRITER_MAX_RATIO,
   MIN_SCENE_NOTES_CHARACTERS,
+  isAgentStepBudgetMode,
   isPermissionMode,
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
   saveAgentSettings,
   isWritingExecutionMode,
+  type AgentStepBudgetMode,
   type ProseLengthSettings,
   type ScenePipelineSettings,
   type WritingExecutionMode,
@@ -1054,6 +1058,8 @@ export async function startWriterServer(options: {
       writingMode: settings.writingMode,
       characterEvolutionEnabled: settings.characterEvolutionEnabled,
       reviewFollowsProseModel: settings.reviewFollowsProseModel,
+      stepBudgetMode: settings.stepBudgetMode,
+      maxAgentSteps: settings.maxAgentSteps,
       scenePipeline: settings.scenePipeline,
       proseLength: settings.proseLength,
       instructionsPath: instructions?.path ?? null,
@@ -1065,7 +1071,17 @@ export async function startWriterServer(options: {
 
   app.post("/api/agent-settings", async (context) => {
     try {
-      const body = await context.req.json<{ permissionMode?: string; writingMode?: string; characterEvolutionEnabled?: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline?: Partial<ScenePipelineSettings>; proseLength?: Partial<ProseLengthSettings> }>();
+      const body = await context.req.json<{
+        permissionMode?: string;
+        writingMode?: string;
+        characterEvolutionEnabled?: boolean;
+        continuityFactsEnabled?: boolean;
+        reviewFollowsProseModel?: boolean;
+        stepBudgetMode?: string;
+        maxAgentSteps?: number;
+        scenePipeline?: Partial<ScenePipelineSettings>;
+        proseLength?: Partial<ProseLengthSettings>;
+      }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
       }
@@ -1080,6 +1096,18 @@ export async function startWriterServer(options: {
       }
       if (body.writingMode !== undefined && !isWritingExecutionMode(body.writingMode)) {
         return context.json({ error: "writingMode 仅支持 delegated、fast" }, 400);
+      }
+      if (body.stepBudgetMode !== undefined && !isAgentStepBudgetMode(body.stepBudgetMode)) {
+        return context.json({ error: "stepBudgetMode 仅支持 hard、experimental" }, 400);
+      }
+      if (body.maxAgentSteps !== undefined && (
+        !Number.isInteger(body.maxAgentSteps)
+        || Number(body.maxAgentSteps) < MIN_AGENT_STEPS
+        || Number(body.maxAgentSteps) > MAX_AGENT_STEPS
+      )) {
+        return context.json({
+          error: `maxAgentSteps 须为 ${MIN_AGENT_STEPS}—${MAX_AGENT_STEPS} 的整数`,
+        }, 400);
       }
       if (body.scenePipeline !== undefined) {
         if (body.scenePipeline.enabled !== undefined && typeof body.scenePipeline.enabled !== "boolean") {
@@ -1142,6 +1170,8 @@ export async function startWriterServer(options: {
         ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
         ...(typeof body.continuityFactsEnabled === "boolean" ? { continuityFactsEnabled: body.continuityFactsEnabled } : {}),
         ...(typeof body.reviewFollowsProseModel === "boolean" ? { reviewFollowsProseModel: body.reviewFollowsProseModel } : {}),
+        ...(body.stepBudgetMode ? { stepBudgetMode: body.stepBudgetMode as AgentStepBudgetMode } : {}),
+        ...(body.maxAgentSteps !== undefined ? { maxAgentSteps: body.maxAgentSteps } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
         ...(body.proseLength ? { proseLength: body.proseLength } : {}),
       });
@@ -1151,6 +1181,8 @@ export async function startWriterServer(options: {
         characterEvolutionEnabled: settings.characterEvolutionEnabled,
         continuityFactsEnabled: settings.continuityFactsEnabled,
         reviewFollowsProseModel: settings.reviewFollowsProseModel,
+        stepBudgetMode: settings.stepBudgetMode,
+        maxAgentSteps: settings.maxAgentSteps,
         scenePipeline: settings.scenePipeline,
         proseLength: settings.proseLength,
       });

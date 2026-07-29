@@ -1,6 +1,6 @@
 /** Shared web types & pure constants extracted from main.tsx. */
 
-import type { ProseLengthSettings, ProviderCatalog, ScenePipelineSettings, WritingExecutionMode } from "./model_config";
+import type { AgentStepBudgetMode, ProseLengthSettings, ProviderCatalog, ScenePipelineSettings, WritingExecutionMode } from "./model_config";
 
 /** Rule-layer writing-quality picture. Absent on非正文提案与旧提案 —— 渲染时必须容忍。 */
 export type ProseQualityReport = {
@@ -525,7 +525,17 @@ export type State = {
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
   todos?: AgentTodoItem[];
-  agentSettings?: { permissionMode: PermissionMode; writingMode: WritingExecutionMode; characterEvolutionEnabled: boolean; continuityFactsEnabled?: boolean; reviewFollowsProseModel?: boolean; scenePipeline: ScenePipelineSettings; proseLength?: ProseLengthSettings };
+  agentSettings?: {
+    permissionMode: PermissionMode;
+    writingMode: WritingExecutionMode;
+    characterEvolutionEnabled: boolean;
+    continuityFactsEnabled?: boolean;
+    reviewFollowsProseModel?: boolean;
+    stepBudgetMode?: AgentStepBudgetMode;
+    maxAgentSteps?: number;
+    scenePipeline: ScenePipelineSettings;
+    proseLength?: ProseLengthSettings;
+  };
   proseGateRules?: ProseGateRule[];
   continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;

@@ -418,7 +418,7 @@ function writingSystemPrompt(project: WriterProject): string {
 
 创作立场：成人向虚构可直接写暴力/情欲/权谋/残酷/粗口；勿道德说教或自行软化；直写用具体名词与动作。法律边界：不协助现实犯罪；不生成针对真实未成年人的性内容。
 
-分区：lore/=设定事实；outline/=情节计划；chapters/=主线正文；side/=支线；archive/=旧稿（非现行事实）；characters/=结构化角色卡。旧 story/ ≡ lore/。
+分区：lore/=设定事实；outline/=情节计划；chapters/=主线正文；side/=支线；archive/=旧稿（仅人工浏览，Agent 不可搜索/读取，不作现行事实）；characters/=结构化角色卡。旧 story/ ≡ lore/。
 
 正文底线（正文/续写/改写/终审；构思可大胆但须标明非既有事实）：
 1. 用动作、选择、代价、对白与感官呈现；勿在其后追加情绪/象征解释。
@@ -2424,10 +2424,16 @@ ${managedHandoffContext}`,
   };
 
   try {
-    // Soft budget scales with remaining work; hard cap is only a safety rail.
-    // Exhaustion (soft after converge, stall after converge, or hard) never throws —
-    // it freezes the turn and leaves the existing「续跑」channel via [生成已中断].
-    const hardCap = Math.max(1, options.maxTurns ?? AGENT_HARD_TURN_CAP);
+    // Step budget:
+    // - hard (default): single configurable hard cap; no soft/stall converge.
+    // - experimental: soft budget + stall converge + absolute safety rail.
+    // Exhaustion never throws — freezes the turn and leaves「续跑」via [生成已中断].
+    // options.maxTurns (tests) always forces a single hard limit.
+    const stepBudgetMode = options.maxTurns !== undefined
+      ? "hard" as const
+      : runtimeSettings.stepBudgetMode;
+    // Single configurable hard ceiling for both modes; experimental only adds soft/stall below it.
+    const hardCap = Math.max(1, options.maxTurns ?? runtimeSettings.maxAgentSteps);
     // A completed draft must not fail merely because scene retries consumed the
     // ordinary budget. These turns exist only while the terminal review lock is
     // active; unfinished scene chains receive no extra capacity.
@@ -2448,7 +2454,7 @@ ${managedHandoffContext}`,
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; ; turn += 1) {
       const liveTodos = store.sessionTodos(sessionId);
-      const softBudget = options.maxTurns !== undefined
+      const softBudget = stepBudgetMode === "hard"
         ? hardCap
         : Math.min(hardCap, computeSoftTurnBudget({
           todos: liveTodos,
@@ -2496,31 +2502,34 @@ ${managedHandoffContext}`,
         };
         break;
       }
-      if (!convergeMode && !reviewGrace && stallStreak >= AGENT_STALL_WINDOW) {
-        convergeMode = "stall";
-        convergeTurnsLeft = AGENT_CONVERGE_TURNS;
-        messages.push({
-          role: "user",
-          content: agentBudgetConvergePrompt("stall", {
-            step: turn + 1,
-            softBudget,
-            hardCap,
-            openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
-          }),
-        });
-        stallStreak = 0;
-      } else if (!convergeMode && !reviewGrace && turn >= softBudget) {
-        convergeMode = "soft_budget";
-        convergeTurnsLeft = AGENT_CONVERGE_TURNS;
-        messages.push({
-          role: "user",
-          content: agentBudgetConvergePrompt("soft_budget", {
-            step: turn + 1,
-            softBudget,
-            hardCap,
-            openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
-          }),
-        });
+      // Soft/stall converge only in experimental mode.
+      if (stepBudgetMode === "experimental") {
+        if (!convergeMode && !reviewGrace && stallStreak >= AGENT_STALL_WINDOW) {
+          convergeMode = "stall";
+          convergeTurnsLeft = AGENT_CONVERGE_TURNS;
+          messages.push({
+            role: "user",
+            content: agentBudgetConvergePrompt("stall", {
+              step: turn + 1,
+              softBudget,
+              hardCap,
+              openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
+            }),
+          });
+          stallStreak = 0;
+        } else if (!convergeMode && !reviewGrace && turn >= softBudget) {
+          convergeMode = "soft_budget";
+          convergeTurnsLeft = AGENT_CONVERGE_TURNS;
+          messages.push({
+            role: "user",
+            content: agentBudgetConvergePrompt("soft_budget", {
+              step: turn + 1,
+              softBudget,
+              hardCap,
+              openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
+            }),
+          });
+        }
       }
       if (convergeMode) convergeTurnsLeft -= 1;
 
@@ -3392,7 +3401,10 @@ const REVIEW_PROMPT = `终审专则：降低机器生成感，不是换成另一
 改法：动作有结果；细节供判断；因果拆句；笼统判断落到可见动作/感官；勿堆修辞伪装生动；勿新增事实。
 无问题句保持原样。只审阅→有证据结论不提案；要求修复→最小 patch。`;
 
-/** Absolute per-job safety rail. Soft budget stays below this unless tests pass maxTurns. */
+/**
+ * Absolute safety rail for experimental step budget (soft + stall).
+ * Daily hard mode uses agent.json `maxAgentSteps` instead.
+ */
 export const AGENT_HARD_TURN_CAP = 100;
 /** Consecutive steps with an unchanged progress fingerprint before stall converge. */
 export const AGENT_STALL_WINDOW = 4;
@@ -3615,6 +3627,7 @@ function recentArtifactsContext(
   let artifacts = store.recentContextArtifacts(sessionId, 12)
     .filter((artifact) => {
       if (!artifact.path) return true;
+      if (project.isDocumentHidden(artifact.path)) return false;
       if (!project.textFileExists(artifact.path)) return false;
       return project.hash(project.readTextFile(artifact.path)) === artifact.sourceHash;
     });

@@ -1350,7 +1350,12 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
       "冲突是否靠互相理解化解、代价被抹平、阻力恰好让路；有没有人付出了不可撤销的代价",
     ],
-    message: "隔离终审不可用，已回退到主 Agent 通读：content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
+    message: (
+      reviewFailure?.errors.every(err => /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(err))
+        ? "隔离终审已响应但结论无法解析或缺少可定位证据，已回退到主 Agent 通读（非服务故障）。"
+        : "隔离终审不可用，已回退到主 Agent 通读："
+    )
+      + "content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
       + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",
   });
 }

@@ -667,14 +667,25 @@ async function reviewDirectNarrativeProposal(
       errors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
     }
   }
+  // Parse/schema failures (e.g. revise without locatable evidence) are not outages; jn3
+  // sessions were empty-retrying the same draft under a misleading "服务暂时不可用" line.
+  const parseOnly = errors.length > 0 && errors.every(isChapterReviewParseFailure);
   return JSON.stringify({
     status: "final_review_unavailable",
-    code: "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    code: parseOnly ? "DIRECT_CHAPTER_REVIEW_INVALID" : "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
     path,
     proposalCreated: false,
     errors,
-    message: "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
+    message: parseOnly
+      ? "终审已响应但结论无法解析或缺少可定位证据，未创建提案（非服务故障）。请按 errors 自检事实/认知边界后做最小修订再提交；不要原样空重试。"
+      : "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
   });
+}
+
+/** Transport/API failures vs review JSON / evidence validation failures. */
+function isChapterReviewParseFailure(message: string): boolean {
+  return /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i
+    .test(message);
 }
 
 export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {

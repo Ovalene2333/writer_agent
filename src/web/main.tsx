@@ -3988,7 +3988,7 @@ function App() {
               </span>
             )}
           </span>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="editor-bar-tools">
             <button
               type="button"
               className={`style-chip${activeStyle ? " active" : ""}`}
@@ -6653,6 +6653,8 @@ function App() {
           characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
           continuityFactsEnabled={state.agentSettings?.continuityFactsEnabled ?? false}
           reviewFollowsProseModel={state.agentSettings?.reviewFollowsProseModel ?? true}
+          stepBudgetMode={state.agentSettings?.stepBudgetMode ?? "hard"}
+          maxAgentSteps={state.agentSettings?.maxAgentSteps ?? 32}
           section={settingsSection}
           onSectionChanged={setSettingsSection}
           connectionAvailable={connection.dualMode}
@@ -6778,6 +6780,8 @@ function App() {
           characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
           continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline,
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
@@ -6790,6 +6794,8 @@ function App() {
           characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
           continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           proseLength,
           },
@@ -6802,6 +6808,8 @@ function App() {
           characterEvolutionEnabled,
           continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
@@ -6814,6 +6822,8 @@ function App() {
           characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
           continuityFactsEnabled,
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
@@ -6826,6 +6836,22 @@ function App() {
           characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
           continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
           reviewFollowsProseModel,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          },
+          } : previous)}
+          onStepBudgetChanged={({ stepBudgetMode, maxAgentSteps }) => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          continuityFactsEnabled: previous.agentSettings?.continuityFactsEnabled ?? false,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode,
+          maxAgentSteps,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },

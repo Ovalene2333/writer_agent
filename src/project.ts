@@ -30,6 +30,18 @@ export function isSupportedTextFilePath(path: string): boolean {
   return Boolean(name && name !== "." && name !== ".." && !name.includes("\0"));
 }
 
+/**
+ * Archive / 屏蔽区路径：仅供人工浏览，Agent 一律不可 list/search/read。
+ * 不依赖 agent-visibility 开关，取消「对 Agent 隐藏」也不能放行。
+ */
+export function isArchivePath(path: string): boolean {
+  const normalized = normalizeDocumentPath(path);
+  return normalized === "archive"
+    || normalized.startsWith("archive/")
+    || normalized === "屏蔽"
+    || normalized.startsWith("屏蔽/");
+}
+
 export function documentKind(path: string): DocumentKind {
   const normalized = normalizeDocumentPath(path);
   if (normalized.startsWith("lore/") || normalized.startsWith("story/")) {
@@ -37,7 +49,7 @@ export function documentKind(path: string): DocumentKind {
   }
   if (normalized.startsWith("outline/") || /(?:^|\/)(?:outline|大纲)[^/]*\.md$/i.test(normalized)) return "outline";
   if (normalized.startsWith("chapters/")) return "chapter";
-  if (normalized.startsWith("archive/") || normalized.startsWith("屏蔽/")) return "archive";
+  if (isArchivePath(normalized)) return "archive";
   if (normalized.startsWith("side/") || normalized.startsWith("涩涩/")) return "side";
   return "other";
 }
@@ -445,6 +457,8 @@ export class WriterProject {
 
   isDocumentHidden(path: string): boolean {
     path = normalizeDocumentPath(path);
+    // Hard block: archive is never agent-visible, regardless of visibility toggles.
+    if (isArchivePath(path)) return true;
     return this.hiddenDocuments().includes(path)
       || this.hiddenFolders().some(folder => path === folder || path.startsWith(`${folder}/`));
   }

@@ -831,6 +831,7 @@ export class WriterStore {
     proposalId: number,
     candidates: ContinuityFactCandidate[],
   ): ContinuityFact[] {
+    if (this.project.isDocumentHidden(path)) return [];
     const saved: ContinuityFact[] = [];
     const hash = this.project.hash(content);
     for (const candidate of candidates.slice(0, 24)) {
@@ -860,7 +861,8 @@ export class WriterStore {
     characterIds?: number[];
     limit?: number;
   } = {}): ContinuityFact[] {
-    const facts = this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 });
+    const facts = this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 })
+      .filter(fact => !fact.sourcePath || !this.project.isDocumentHidden(fact.sourcePath));
     const characterKeys = new Set((options.characterIds ?? []).map(String));
     const targetPath = options.targetPath ?? "";
     return facts.map(fact => {
@@ -882,6 +884,7 @@ export class WriterStore {
     const terms = normalized.match(/[a-z0-9_]{2,}|[\p{Script=Han}]{2,}/gu)?.slice(0, 8) ?? [];
     if (!terms.length) return [];
     return this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 })
+      .filter(fact => !fact.sourcePath || !this.project.isDocumentHidden(fact.sourcePath))
       .map(fact => {
         const haystack = `${fact.statement} ${fact.scopeValue} ${fact.knownBy.join(" ")} ${fact.sourcePath}`
           .toLocaleLowerCase("zh-CN");
@@ -3629,7 +3632,13 @@ export class WriterStore {
     const finalPath = this.project.renameDocument(fromPath, toPath, options);
     this.database.prepare("UPDATE proposals SET path=? WHERE path=?").run(finalPath, fromPath);
     this.database.prepare("UPDATE revisions SET path=? WHERE path=?").run(finalPath, fromPath);
-    this.moveContinuityFactsSource(fromPath, finalPath, this.project.read(finalPath));
+    if (this.project.isDocumentHidden(finalPath)) {
+      // Moving into archive/屏蔽：废弃该来源事实，避免旧稿继续注入 Agent。
+      this.refreshContinuityFactsForDocument(fromPath, "");
+      this.refreshContinuityFactsForDocument(finalPath, "");
+    } else {
+      this.moveContinuityFactsSource(fromPath, finalPath, this.project.read(finalPath));
+    }
     this.reindex();
     return finalPath;
   }
@@ -3650,7 +3659,12 @@ export class WriterStore {
     for (const row of factRows) {
       const from = String(row.source_path);
       const to = rewrite(from);
-      if (this.project.textFileExists(to)) this.moveContinuityFactsSource(from, to, this.project.readTextFile(to));
+      if (this.project.isDocumentHidden(to) || this.project.isDocumentHidden(from)) {
+        this.refreshContinuityFactsForDocument(from, "");
+        this.refreshContinuityFactsForDocument(to, "");
+      } else if (this.project.textFileExists(to)) {
+        this.moveContinuityFactsSource(from, to, this.project.readTextFile(to));
+      }
     }
     this.reindex();
     return finalPath;
@@ -3668,7 +3682,11 @@ export class WriterStore {
   reindex(): void {
     this.database.exec("DELETE FROM document_index");
     const insert = this.database.prepare("INSERT INTO document_index(path,content) VALUES(?,?)");
-    for (const path of this.project.listDocuments()) insert.run(path, this.project.read(path));
+    for (const path of this.project.listDocuments()) {
+      // Archive / agent-hidden paths must not enter FTS — search filters are a second line only.
+      if (this.project.isDocumentHidden(path)) continue;
+      insert.run(path, this.project.read(path));
+    }
   }
 
   search(query: string, limit = 6, options: {

@@ -101,6 +101,23 @@ export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ r
   ];
 }
 
+/** Strip whitespace / quote variants so model evidence can still match source text. */
+function normalizeEvidenceNeedle(text: string): string {
+  return text
+    .replace(/\s+/g, "")
+    .replace(/[“”「」『』]/g, "\"")
+    .replace(/[‘’]/g, "'")
+    .replace(/…/g, "...")
+    .replace(/[—–]/g, "-");
+}
+
+function evidenceInSource(sourceText: string | undefined, quote: string): boolean {
+  if (!sourceText) return true;
+  if (sourceText.includes(quote)) return true;
+  const needle = normalizeEvidenceNeedle(quote);
+  return needle.length > 0 && normalizeEvidenceNeedle(sourceText).includes(needle);
+}
+
 export function parseChapterReview(
   raw: string,
   allowedSceneIds: ReadonlySet<string>,
@@ -130,6 +147,9 @@ export function parseChapterReview(
     "telemetry_pileup", "expository_mechanics", "semantic_echo", "generic_prose",
     "voice_homogenization", "theme_stated", "resolution_too_smooth",
   ]);
+  // Direct-document reviews only allow sceneId "document". Models often omit it or invent
+  // ids; with a single legal target, attach that id so a valid revise is not discarded.
+  const soleSceneId = allowedSceneIds.size === 1 ? [...allowedSceneIds][0] : undefined;
   const rows = Array.isArray(value.issues) ? value.issues.slice(0, 8) : [];
   const issues: ChapterReviewIssue[] = [];
   for (const row of rows) {
@@ -142,21 +162,37 @@ export function parseChapterReview(
     const problem = boundedString(issue.problem, 240);
     const action = boundedString(issue.action, 240);
     if (!severity || !kind || !problem || !action) continue;
-    const sceneId = typeof issue.sceneId === "string" && allowedSceneIds.has(issue.sceneId)
+    let sceneId = typeof issue.sceneId === "string" && allowedSceneIds.has(issue.sceneId)
       ? issue.sceneId
       : undefined;
+    if (!sceneId && soleSceneId) sceneId = soleSceneId;
     const evidence = Array.isArray(issue.evidence)
       ? issue.evidence.map(item => boundedString(item, 180))
-        .filter(item => Boolean(item) && (!sourceText || sourceText.includes(item)))
+        .filter(item => Boolean(item) && evidenceInSource(sourceText, item))
         .slice(0, 3)
       : [];
     issues.push({ severity, kind, ...(sceneId ? { sceneId } : {}), evidence, problem, action });
   }
-  const blockers = issues.filter(issue => issue.severity === "blocker");
-  if (verdict === "revise" && (!blockers.length || blockers.some(issue => !issue.sceneId || !issue.evidence.length))) {
+  // Incomplete blockers must not invalidate sibling locatable blockers (old `.some` did that).
+  const locatableBlockers = issues.filter(
+    issue => issue.severity === "blocker" && issue.sceneId && issue.evidence.length > 0,
+  );
+  const normalizedIssues = issues.map(issue => {
+    if (issue.severity === "blocker" && (!issue.sceneId || !issue.evidence.length)) {
+      return { ...issue, severity: "warning" as const };
+    }
+    return issue;
+  });
+  if (verdict === "revise" && locatableBlockers.length === 0) {
+    // Model claimed revise but substantiated nothing. Direct-doc (single scene) demotes to
+    // pass so we do not mis-report "终审服务不可用" and empty-retry the same draft. Multi-scene
+    // structural review still requires a locatable target scene.
+    if (soleSceneId) {
+      return { verdict: "pass", chapterChange, reviewNotes, issues: normalizedIssues };
+    }
     throw new Error("整章终审要求 revise，但没有提供可定位的 blocker 证据");
   }
-  return { verdict, chapterChange, reviewNotes, issues };
+  return { verdict, chapterChange, reviewNotes, issues: normalizedIssues };
 }
 
 export async function reviewChapterDraft(

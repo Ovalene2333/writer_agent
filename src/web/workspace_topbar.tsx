@@ -137,14 +137,6 @@ export function WorkspaceTopbar({
               <IconButton label="设置" className={settingsOpen ? "active" : ""} onClick={onToggleSettings}>
                 <Settings size={17} />
               </IconButton>
-              <SettingsMenu
-                open={settingsOpen}
-                connectionAvailable={connection.dualMode}
-                onClose={onCloseSettings}
-                onSelect={onSelectSettings}
-                onReviewRules={onReviewRules}
-                onContinuityFacts={onContinuityFacts}
-              />
             </div>
           )}
           <IconButton label="刷新工作区" className="nav-refresh" onClick={onRefresh}>
@@ -172,6 +164,20 @@ export function WorkspaceTopbar({
             onRefresh={onRefresh}
           />
         </div>
+        {/*
+          SettingsMenu must not live under .header-utility: that cluster is display:none
+          on mobile, which also hides position:fixed descendants. Mount at header-right.
+        */}
+        {!readOnly && (
+          <SettingsMenu
+            open={settingsOpen}
+            connectionAvailable={connection.dualMode}
+            onClose={onCloseSettings}
+            onSelect={onSelectSettings}
+            onReviewRules={onReviewRules}
+            onContinuityFacts={onContinuityFacts}
+          />
+        )}
       </div>
     </header>
   );

@@ -37,6 +37,7 @@ export type ProseLengthSettings = {
   enforceMinimum: boolean;
 };
 export type WritingExecutionMode = "delegated" | "fast";
+export type AgentStepBudgetMode = "hard" | "experimental";
 export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "continuity-facts" | "connection" | "appearance";
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
@@ -82,6 +83,8 @@ type ModelConfigProps = {
   characterEvolutionEnabled: boolean;
   continuityFactsEnabled: boolean;
   reviewFollowsProseModel: boolean;
+  stepBudgetMode: AgentStepBudgetMode;
+  maxAgentSteps: number;
   section: SettingsSection;
   styleContent: React.ReactNode;
   proseGatesContent: React.ReactNode;
@@ -98,6 +101,7 @@ type ModelConfigProps = {
   onCharacterEvolutionChanged: (enabled: boolean) => void;
   onContinuityFactsChanged: (enabled: boolean) => void;
   onReviewFollowsProseModelChanged: (enabled: boolean) => void;
+  onStepBudgetChanged: (settings: { stepBudgetMode: AgentStepBudgetMode; maxAgentSteps: number }) => void;
 };
 
 export function ModelConfig({
@@ -108,6 +112,8 @@ export function ModelConfig({
   characterEvolutionEnabled,
   continuityFactsEnabled,
   reviewFollowsProseModel,
+  stepBudgetMode,
+  maxAgentSteps,
   section,
   styleContent,
   proseGatesContent,
@@ -124,6 +130,7 @@ export function ModelConfig({
   onCharacterEvolutionChanged,
   onContinuityFactsChanged,
   onReviewFollowsProseModelChanged,
+  onStepBudgetChanged,
 }: ModelConfigProps) {
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
@@ -131,6 +138,8 @@ export function ModelConfig({
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [continuityFactsDraft, setContinuityFactsDraft] = useState(continuityFactsEnabled);
   const [reviewFollowsProseDraft, setReviewFollowsProseDraft] = useState(reviewFollowsProseModel);
+  const [stepBudgetModeDraft, setStepBudgetModeDraft] = useState(stepBudgetMode);
+  const [maxAgentStepsDraft, setMaxAgentStepsDraft] = useState(maxAgentSteps);
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -146,18 +155,25 @@ export function ModelConfig({
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
   useEffect(() => setContinuityFactsDraft(continuityFactsEnabled), [continuityFactsEnabled]);
   useEffect(() => setReviewFollowsProseDraft(reviewFollowsProseModel), [reviewFollowsProseModel]);
+  useEffect(() => setStepBudgetModeDraft(stepBudgetMode), [stepBudgetMode]);
+  useEffect(() => setMaxAgentStepsDraft(maxAgentSteps), [maxAgentSteps]);
 
   const anyTesting = Object.values(testStatus).some(status => status === "testing");
   const lengthDraftInvalid = !Number.isInteger(lengthDraft.chapterTargetCharacters)
     || lengthDraft.chapterTargetCharacters < 500
     || lengthDraft.chapterTargetCharacters > 50_000;
+  const stepsDraftInvalid = !Number.isInteger(maxAgentStepsDraft)
+    || maxAgentStepsDraft < 8
+    || maxAgentStepsDraft > 100;
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
     || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
     || continuityFactsDraft !== continuityFactsEnabled
     || reviewFollowsProseDraft !== reviewFollowsProseModel
+    || stepBudgetModeDraft !== stepBudgetMode
+    || maxAgentStepsDraft !== maxAgentSteps
     || Object.keys(sceneDraft).some(key => sceneDraft[key as keyof ScenePipelineSettings] !== scenePipeline[key as keyof ScenePipelineSettings]);
-  const sceneDraftValid = !lengthDraftInvalid && [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
+  const sceneDraftValid = !lengthDraftInvalid && !stepsDraftInvalid && [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
     && sceneDraft.preferredMinScenes <= sceneDraft.preferredMaxScenes
     && sceneDraft.preferredMaxScenes <= sceneDraft.maxScenes
@@ -334,18 +350,31 @@ export function ModelConfig({
           characterEvolutionEnabled: characterEvolutionDraft,
           continuityFactsEnabled: continuityFactsDraft,
           reviewFollowsProseModel: reviewFollowsProseDraft,
+          stepBudgetMode: stepBudgetModeDraft,
+          maxAgentSteps: maxAgentStepsDraft,
         }),
-      }) as { scenePipeline: ScenePipelineSettings; proseLength: ProseLengthSettings; characterEvolutionEnabled: boolean; continuityFactsEnabled: boolean; reviewFollowsProseModel: boolean };
+      }) as {
+        scenePipeline: ScenePipelineSettings;
+        proseLength: ProseLengthSettings;
+        characterEvolutionEnabled: boolean;
+        continuityFactsEnabled: boolean;
+        reviewFollowsProseModel: boolean;
+        stepBudgetMode: AgentStepBudgetMode;
+        maxAgentSteps: number;
+      };
       setSceneDraft(result.scenePipeline);
       setLengthDraft(result.proseLength);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
       setContinuityFactsDraft(result.continuityFactsEnabled);
       setReviewFollowsProseDraft(result.reviewFollowsProseModel);
+      setStepBudgetModeDraft(result.stepBudgetMode);
+      setMaxAgentStepsDraft(result.maxAgentSteps);
       onScenePipelineChanged(result.scenePipeline);
       onProseLengthChanged(result.proseLength);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
       onContinuityFactsChanged(result.continuityFactsEnabled);
       onReviewFollowsProseModelChanged(result.reviewFollowsProseModel);
+      onStepBudgetChanged({ stepBudgetMode: result.stepBudgetMode, maxAgentSteps: result.maxAgentSteps });
       setMessage("写作设置已保存，将从下一次 Agent 任务开始生效");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -360,6 +389,8 @@ export function ModelConfig({
     setCharacterEvolutionDraft(characterEvolutionEnabled);
     setContinuityFactsDraft(continuityFactsEnabled);
     setReviewFollowsProseDraft(reviewFollowsProseModel);
+    setStepBudgetModeDraft(stepBudgetMode);
+    setMaxAgentStepsDraft(maxAgentSteps);
     setError("");
     setMessage("");
   }
@@ -534,6 +565,38 @@ export function ModelConfig({
         </section>
 
         <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>Agent 步数预算</h4><p>控制单次任务最多跑多少步；到上限后暂停并保留「续跑」，不丢上下文。</p></div></div>
+          <div className="scene-settings-grid compact">
+            <label>
+              <span>预算策略</span>
+              <select
+                value={stepBudgetModeDraft}
+                onChange={event => setStepBudgetModeDraft(event.target.value as AgentStepBudgetMode)}
+              >
+                <option value="hard">硬上限（推荐日常）</option>
+                <option value="experimental">实验：soft + 停滞收敛</option>
+              </select>
+              <small>{stepBudgetModeDraft === "hard"
+                ? "到达配置步数即暂停，逻辑简单可预期。"
+                : "按剩余工作算 soft 预算，停滞时强制收敛；硬上限仍为下方配置值。"}</small>
+            </label>
+            <label className={stepsDraftInvalid ? "field-invalid" : ""}>
+              <span>步数硬上限</span>
+              <input
+                aria-invalid={stepsDraftInvalid}
+                type="number"
+                min={8}
+                max={100}
+                step={1}
+                value={maxAgentStepsDraft}
+                onChange={event => setMaxAgentStepsDraft(Number(event.target.value))}
+              />
+              <small>8—100；两种策略共用此硬顶。hard 模式到顶即停；experimental 在顶下另有 soft/停滞收敛。</small>
+            </label>
+          </div>
+        </section>
+
+        <section className="writing-settings-section">
           <div className="writing-settings-section-head"><div><h4>章节篇幅</h4><p>不在对话里说字数时，这里就是每章的目标长度；说了「写 6000 字」或「这章长一点」时以对话为准。</p></div></div>
           <div className="scene-settings-grid compact">
             <label className={lengthDraftInvalid ? "field-invalid" : ""}><span>默认章节字数</span><input aria-invalid={lengthDraftInvalid} type="number" min="500" max="50000" step="100" value={lengthDraft.chapterTargetCharacters} onChange={event => setLengthDraft(current => ({ ...current, chapterTargetCharacters: Number(event.target.value) }))}/><small>500—50000 字，不计空白。</small></label>
@@ -571,11 +634,11 @@ export function ModelConfig({
 
         <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid ? "status" : "alert"}>{sceneDraftValid
           ? !sceneDraft.enabled
-            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式开启" : "分工模式开启"}，正文直接成稿。`
+            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式开启" : "分工模式开启"}，正文直接成稿。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
             : writingMode === "fast"
-            ? `当前：快速模式。全部写作步骤使用 Agent，不调用正文 Writer；场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场。`
-            : `当前：分工模式${sceneDraft.isolatedWriter ? " + 隔离 Writer" : ""}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。`
-          : "请检查默认章节字数、场景数量、notes 上限、正文倍率与候选稿数量。"}</div>
+            ? `当前：快速模式。全部写作步骤使用 Agent，不调用正文 Writer；场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+            : `当前：分工模式${sceneDraft.isolatedWriter ? " + 隔离 Writer" : ""}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+          : "请检查默认章节字数、Agent 步数、场景数量、notes 上限、正文倍率与候选稿数量。"}</div>
         <div className="scene-settings-actions">
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
           <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>

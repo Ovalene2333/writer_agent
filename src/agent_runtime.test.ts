@@ -272,6 +272,8 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       characterEvolutionEnabled: true,
       continuityFactsEnabled: false,
       reviewFollowsProseModel: true,
+      stepBudgetMode: "hard",
+      maxAgentSteps: 32,
       scenePipeline: {
         enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
@@ -284,6 +286,8 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       writingMode: "fast",
       characterEvolutionEnabled: false,
       continuityFactsEnabled: true,
+      stepBudgetMode: "experimental",
+      maxAgentSteps: 48,
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
@@ -296,6 +300,8 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       characterEvolutionEnabled: false,
       continuityFactsEnabled: true,
       reviewFollowsProseModel: true,
+      stepBudgetMode: "experimental",
+      maxAgentSteps: 48,
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
@@ -331,6 +337,13 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.equal(loadAgentSettings(project).writingMode, "fast", "scene patch must preserve writing mode");
     assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
     assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "scene patch must preserve continuity toggle");
+    assert.equal(loadAgentSettings(project).stepBudgetMode, "experimental", "scene patch must preserve step budget mode");
+    assert.equal(loadAgentSettings(project).maxAgentSteps, 48, "scene patch must preserve maxAgentSteps");
+    saveAgentSettings(project, { stepBudgetMode: "hard", maxAgentSteps: 200 });
+    assert.equal(loadAgentSettings(project).stepBudgetMode, "hard");
+    assert.equal(loadAgentSettings(project).maxAgentSteps, 100, "maxAgentSteps clamps to 100");
+    saveAgentSettings(project, { maxAgentSteps: 3 });
+    assert.equal(loadAgentSettings(project).maxAgentSteps, 8, "maxAgentSteps clamps to 8");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -418,7 +418,7 @@ async function buildWritingDraft(
   });
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
-项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文（分区名仅用于你选文档，不得写入草案正文）。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料，也不要把 archive/side 旧稿当现行事实。
+项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文（分区名仅用于你选文档，不得写入草案正文）。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料；archive 旧稿对 Agent 不可见，side 不作现行事实。
 草案语气保持直接：标出冲突、欲望、身体或暴力要点时用准确词，不要改成含蓄代称；不做道德评判。
 ${proseMannerismConstraintPrompt({ compact: true })}
 ${writePackDraftContractPrompt()}

@@ -6,8 +6,17 @@ import type { WriterProject } from "./project.js";
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
 export type PermissionMode = "ask" | "auto" | "plan";
 export type WritingExecutionMode = "delegated" | "fast";
+/**
+ * Agent 单次任务步数策略：
+ * - hard：日常默认，单一可配置硬上限，到点即暂停可续跑
+ * - experimental：soft 预算 + 停滞收敛 + 安全硬顶（试验用）
+ */
+export type AgentStepBudgetMode = "hard" | "experimental";
 
 export const ABSOLUTE_MAX_SCENES = 8;
+export const MIN_AGENT_STEPS = 8;
+export const MAX_AGENT_STEPS = 100;
+export const DEFAULT_AGENT_STEPS = 32;
 export const MIN_SCENE_NOTES_CHARACTERS = 500;
 export const MAX_SCENE_NOTES_CHARACTERS = 8_000;
 export const DEFAULT_SCENE_NOTES_CHARACTERS = 3_000;
@@ -71,6 +80,15 @@ export interface AgentRuntimeSettings {
    * resolution_too_smooth 尤其吃这一点。关闭后回到「审阅校对」角色配置的模型。
    */
   reviewFollowsProseModel: boolean;
+  /**
+   * 单次 runAgent 任务的步数策略。日常用 hard；experimental 保留 soft/停滞收敛试验。
+   */
+  stepBudgetMode: AgentStepBudgetMode;
+  /**
+   * hard 模式下的单一硬上限（也是 experimental 的参考尺度之一）。
+   * 到上限后暂停并保留续跑，不抛错。
+   */
+  maxAgentSteps: number;
   scenePipeline: ScenePipelineSettings;
   /** 作者的篇幅偏好：默认目标字数与下限执行强度。 */
   proseLength: ProseLengthSettings;
@@ -133,6 +151,8 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   characterEvolutionEnabled: true,
   continuityFactsEnabled: false,
   reviewFollowsProseModel: true,
+  stepBudgetMode: "hard",
+  maxAgentSteps: DEFAULT_AGENT_STEPS,
   scenePipeline: {
     enabled: false,
     preferredMinScenes: 3,
@@ -153,6 +173,7 @@ export const MAX_SCENE_CANDIDATES = 3;
 
 const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
 const WRITING_EXECUTION_MODES = new Set<WritingExecutionMode>(["delegated", "fast"]);
+const STEP_BUDGET_MODES = new Set<AgentStepBudgetMode>(["hard", "experimental"]);
 
 export function isPermissionMode(value: string): value is PermissionMode {
   return PERMISSION_MODES.has(value as PermissionMode);
@@ -160,6 +181,16 @@ export function isPermissionMode(value: string): value is PermissionMode {
 
 export function isWritingExecutionMode(value: string): value is WritingExecutionMode {
   return WRITING_EXECUTION_MODES.has(value as WritingExecutionMode);
+}
+
+export function isAgentStepBudgetMode(value: string): value is AgentStepBudgetMode {
+  return STEP_BUDGET_MODES.has(value as AgentStepBudgetMode);
+}
+
+export function normalizeMaxAgentSteps(value: unknown, fallback = DEFAULT_AGENT_STEPS): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return fallback;
+  return Math.round(Math.min(MAX_AGENT_STEPS, Math.max(MIN_AGENT_STEPS, raw)));
 }
 
 export function settingsPath(project: WriterProject): string {
@@ -218,6 +249,10 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
       continuityFactsEnabled: raw.continuityFactsEnabled === true,
       reviewFollowsProseModel: raw.reviewFollowsProseModel !== false,
+      stepBudgetMode: typeof raw.stepBudgetMode === "string" && isAgentStepBudgetMode(raw.stepBudgetMode)
+        ? raw.stepBudgetMode
+        : DEFAULT_SETTINGS.stepBudgetMode,
+      maxAgentSteps: normalizeMaxAgentSteps(raw.maxAgentSteps, DEFAULT_SETTINGS.maxAgentSteps),
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
       proseLength: normalizeProseLengthSettings(raw.proseLength),
     };
@@ -234,6 +269,8 @@ export function saveAgentSettings(
     characterEvolutionEnabled?: boolean;
     continuityFactsEnabled?: boolean;
     reviewFollowsProseModel?: boolean;
+    stepBudgetMode?: AgentStepBudgetMode;
+    maxAgentSteps?: number;
     scenePipeline?: Partial<ScenePipelineSettings>;
     proseLength?: Partial<ProseLengthSettings>;
   },
@@ -255,6 +292,12 @@ export function saveAgentSettings(
     reviewFollowsProseModel: typeof patch.reviewFollowsProseModel === "boolean"
       ? patch.reviewFollowsProseModel
       : current.reviewFollowsProseModel,
+    stepBudgetMode: patch.stepBudgetMode && isAgentStepBudgetMode(patch.stepBudgetMode)
+      ? patch.stepBudgetMode
+      : current.stepBudgetMode,
+    maxAgentSteps: patch.maxAgentSteps !== undefined
+      ? normalizeMaxAgentSteps(patch.maxAgentSteps, current.maxAgentSteps)
+      : current.maxAgentSteps,
     scenePipeline: patch.scenePipeline
       ? normalizeScenePipelineSettings({ ...current.scenePipeline, ...patch.scenePipeline })
       : current.scenePipeline,
