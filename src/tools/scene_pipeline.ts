@@ -1175,7 +1175,9 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       path: draft.path,
       complete: true,
       invalidatedSceneIds: [],
-      message: "复读句与逐字回收句用一次 revise_chapter_draft_style 精确替换修完（复读：把「S。S。」替换为单句；回收：只改写命中句，不重写场景），然后重新 inspect 确认计量通过。",
+      message: metrics.issues.some(issue => issue.code === "rhythm_flat")
+        ? "节奏/碎句：按 error 中的验收线合并碎句、恢复双音节用词并补 35+ 字绵延句（可用 revise_chapter_draft_style 分批替换碎句样例，或在仍未写完时重写受影响场），达标后重新 inspect。"
+        : "复读句与逐字回收句用一次 revise_chapter_draft_style 精确替换修完（复读：把「S。S。」替换为单句；回收：只改写命中句，不重写场景），然后重新 inspect 确认计量通过。",
     });
   }
   const styleWarnings = metrics.issues.map(issue => ({

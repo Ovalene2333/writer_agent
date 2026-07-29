@@ -414,6 +414,20 @@ export interface RequestComponentUsage {
   callKind?: string;
 }
 
+/** One provider call inside an Agent step (main step, gate, review, …). */
+export interface StepUsageCall {
+  model?: string;
+  providerName?: string;
+  callKind: string;
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  cost: number;
+  currency: string;
+  estimated?: boolean;
+}
+
 export interface StepUsage {
   /** Actual provider model used for this call; aggregate values may say multiple models. */
   model?: string;
@@ -430,6 +444,11 @@ export interface StepUsage {
   estimated?: boolean;
   /** Undefined for estimated calls; otherwise cacheHit/(cacheHit+cacheMiss). */
   cacheHitRate?: number;
+  /**
+   * Per-call rows for this step. Required to diagnose mixed-model steps
+   * (agent_step + prose_gate + chapter_review); aggregate model may be「多个模型」.
+   */
+  callBreakdown?: StepUsageCall[];
   /** Pre-request estimate by message/schema component; provider usage remains authoritative. */
   requestComponents?: RequestComponentUsage[];
 }

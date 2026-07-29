@@ -122,6 +122,11 @@ export type ToolExecutionContext = {
     model: ModelConfig;
     signal?: AbortSignal;
   };
+  /**
+   * Paths that already used the first-draft rhythm grace (plot/scene first).
+   * Second submit of the same path must pass the hard rhythm gate.
+   */
+  rhythmGracePaths?: Set<string>;
   /** Best-effort delta extractor run only after a lore/chapter proposal is accepted. */
   continuityExtractor?: {
     model: ModelConfig;

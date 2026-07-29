@@ -23,6 +23,7 @@ import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } fro
 import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "../agent_runtime.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
 import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
+import { chapterRhythmGateError } from "../prose_metrics.js";
 import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
@@ -528,6 +529,22 @@ export async function submitFullDocumentProposal(
   const beforeContent = existed ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
   if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
+  // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
+  let rhythmRevisionRequired: string | undefined;
+  if (isScenePipelineDocument(path) && !proseStyleApproved) {
+    context.rhythmGracePaths ??= new Set();
+    const usedGrace = context.rhythmGracePaths.has(path);
+    const rhythmError = chapterRhythmGateError(meta.content, { phase: usedGrace ? "hard" : "first" });
+    if (rhythmError) {
+      if (usedGrace) {
+        throw new Error(rhythmError);
+      }
+      context.rhythmGracePaths.add(path);
+      rhythmRevisionRequired = rhythmError;
+    } else {
+      context.rhythmGracePaths.delete(path);
+    }
+  }
   if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
     const blocked = await reviewDirectNarrativeProposal(args, path, meta.content, summary);
     if (blocked) return blocked;
@@ -550,14 +567,31 @@ export async function submitFullDocumentProposal(
     qualityReport,
   );
   emit({ type: "proposal", proposal });
+  // 首轮节奏未达标：不自动落盘，等句式修订提案通过后再写。
+  const accept = rhythmRevisionRequired
+    ? {
+        proposalId: proposal.id,
+        status: proposal.status,
+        message: "首轮已接收情节/场面草稿（节奏待修订）；提案待审批，请按验收线做一次句式修订后重新提交",
+      }
+    : await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context);
   return JSON.stringify({
-    ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context),
+    ...accept,
     submissionKind: existed ? "new_version" : "new_document",
     ...(lengthNotice ? { lengthNotice } : {}),
     ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
+    ...(rhythmRevisionRequired
+      ? {
+          rhythmRevisionRequired: true,
+          code: "RHYTHM_POLISH_REQUIRED",
+          path,
+          rhythmGate: rhythmRevisionRequired,
+          message: "首轮创作已抓情节与场面；句式节奏/缩词未达标，须按 rhythmGate 验收线修订一次后重新 propose_document。",
+        }
+      : {}),
   });
 }
 
@@ -733,6 +767,12 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     }
   }
   await gateProseStyle(beforeContent, content, context);
+  // 首轮 grace 后若用 patch 抛光：同一 path 必须过硬节奏门禁。
+  if (isScenePipelineDocument(path) && context.rhythmGracePaths?.has(path)) {
+    const rhythmError = chapterRhythmGateError(content);
+    if (rhythmError) throw new Error(rhythmError);
+    context.rhythmGracePaths.delete(path);
+  }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId, path, content, requireString(input.summary, "summary"),

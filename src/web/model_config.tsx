@@ -487,7 +487,34 @@ export function ModelConfig({
           </article>;
           })}
         </div>
-        <div className="role-column"><h3>写作流程分工</h3><p className="section-note">不同环节可使用不同供应商下的模型。</p>{ROLES.map(role => { const ref = catalog.assignments[role.id]; return <label className="role-card" key={role.id}><span><strong>{role.name}</strong><small>{role.detail}</small></span><select value={`${ref.providerId}:${ref.modelId}`} onChange={event => void assign(role.id, event.target.value)}>{choices.map(choice => <option value={choice.value} key={choice.value}>{choice.label}</option>)}</select></label>; })}</div>
+        <div className="role-column">
+          <h3>写作流程分工</h3>
+          <p className="section-note">不同环节可使用不同供应商下的模型。</p>
+          {ROLES.map(role => {
+            const ref = catalog.assignments[role.id];
+            const value = `${ref.providerId}:${ref.modelId}`;
+            const selectedLabel = choices.find(choice => choice.value === value)?.label ?? value;
+            return (
+              <label className="role-card" key={role.id}>
+                <span>
+                  <strong>{role.name}</strong>
+                  <small>{role.detail}</small>
+                </span>
+                <select
+                  value={value}
+                  title={selectedLabel}
+                  onChange={event => void assign(role.id, event.target.value)}
+                >
+                  {choices.map(choice => (
+                    <option value={choice.value} key={choice.value} title={choice.label}>
+                      {choice.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            );
+          })}
+        </div>
           </div>}
           {section === "writing" && <div className="scene-settings">
         <section className="writing-settings-section">

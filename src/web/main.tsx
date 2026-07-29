@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  Archive,
+  ArchiveRestore,
   ArrowDown,
   ArrowUp,
   Bot,
@@ -416,6 +418,18 @@ type Character = {
   features: Feature[]; competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; experiences: TextEntry[]; notes: string; updatedAt: string;
 };
 type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
+type StepUsageCall = {
+  model?: string;
+  providerName?: string;
+  callKind: string;
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  cost: number;
+  currency: string;
+  estimated?: boolean;
+};
 type StepUsage = {
   model?: string;
   providerName?: string;
@@ -428,18 +442,7 @@ type StepUsage = {
   currency: string;
   estimated?: boolean;
   cacheHitRate?: number;
-  callBreakdown?: Array<{
-    model?: string;
-    providerName?: string;
-    callKind: string;
-    promptTokens: number;
-    completionTokens: number;
-    cacheHitTokens: number;
-    cacheMissTokens: number;
-    cost: number;
-    currency: string;
-    estimated?: boolean;
-  }>;
+  callBreakdown?: StepUsageCall[];
   requestComponents?: Array<{
     kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
     label: string;
@@ -449,6 +452,23 @@ type StepUsage = {
     callKind?: string;
   }>;
 };
+
+/** Human labels for nested call kinds shown in step usage breakdown. */
+function callKindLabel(callKind: string): string {
+  const key = callKind.trim();
+  const map: Record<string, string> = {
+    agent_step: "Agent 主步",
+    planner: "任务规划",
+    prose_gate: "句式门禁",
+    learned_prose_gate: "学习门禁",
+    direct_chapter_review: "整章终审",
+    chapter_review: "章节终审",
+    auto_title: "自动标题",
+    unspecified: "未标注",
+    本步汇总: "本步汇总（无分项）",
+  };
+  return map[key] ?? key;
+}
 type StreamStep = {
   id: number;
   output: string;
@@ -843,6 +863,102 @@ function IconButton({ label, children, className = "", onClick, disabled = false
   );
 }
 
+const ARCHIVE_ROOT = "archive";
+
+function isArchivedPath(path: string): boolean {
+  return path === ARCHIVE_ROOT || path.startsWith(`${ARCHIVE_ROOT}/`);
+}
+
+/** Move under archive/ while preserving the original relative path. */
+function archiveDestinationPath(path: string): string {
+  if (isArchivedPath(path)) return path;
+  return `${ARCHIVE_ROOT}/${path}`;
+}
+
+/** Restore from archive/<original>. */
+function unarchiveDestinationPath(path: string): string | null {
+  if (!isArchivedPath(path) || path === ARCHIVE_ROOT) return null;
+  return path.slice(ARCHIVE_ROOT.length + 1);
+}
+
+type RowMenuItem = {
+  id: string;
+  label: string;
+  icon?: React.ReactNode;
+  danger?: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+};
+
+/** Collapse secondary row actions into one overflow menu to reduce button clutter. */
+function RowOverflowMenu({
+  items,
+  label = "更多操作",
+  className = "",
+}: {
+  items: RowMenuItem[];
+  label?: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  const visible = items.filter(Boolean);
+  if (!visible.length) return null;
+  return (
+    <div className={`row-overflow ${className}`.trim()} ref={rootRef}>
+      <button
+        type="button"
+        className="tree-action-btn row-overflow-trigger"
+        title={label}
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen(current => !current);
+        }}
+      >
+        <MoreHorizontal size={14} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="row-overflow-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+          {visible.map(item => (
+            <button
+              key={item.id}
+              type="button"
+              role="menuitem"
+              className={`row-overflow-item${item.danger ? " danger" : ""}`}
+              disabled={item.disabled}
+              onClick={() => {
+                setOpen(false);
+                item.onSelect();
+              }}
+            >
+              {item.icon ? <span className="row-overflow-icon" aria-hidden="true">{item.icon}</span> : null}
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggleDocuments }: {
   mode: WorkspaceMode;
   documentsCollapsed: boolean;
@@ -1112,14 +1228,27 @@ function formatStepCost(usage: StepUsage): string | null {
 }
 
 function stepUsageTitle(usage: StepUsage): string {
+  const multi = (usage.callBreakdown?.length ?? 0) > 1 || usage.model === "多个模型";
   const parts = [
     usage.estimated ? "估算" : null,
+    multi ? "多模型合计" : usage.model ?? null,
     `输入 ${usage.promptTokens.toLocaleString()}`,
     `输出 ${usage.completionTokens.toLocaleString()}`,
     `缓存命中 ${usage.cacheHitTokens.toLocaleString()}`,
-    usage.cacheHitRate !== undefined ? `真实命中率 ${(usage.cacheHitRate * 100).toFixed(1)}%` : null,
+    usage.cacheHitRate !== undefined
+      ? `${multi ? "合计命中率" : "命中率"} ${(usage.cacheHitRate * 100).toFixed(1)}%`
+      : null,
     usage.cost > 0
       ? `费用 ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`
+      : null,
+    multi && usage.callBreakdown?.length
+      ? usage.callBreakdown
+          .map(call => {
+            const m = call.cacheHitTokens + call.cacheMissTokens;
+            const rate = m > 0 ? `${((call.cacheHitTokens / m) * 100).toFixed(0)}%` : "—";
+            return `${callKindLabel(call.callKind)}/${call.model ?? "?"} ${rate}`;
+          })
+          .join("；")
       : null,
   ].filter(Boolean);
   return parts.join(" · ");
@@ -1740,6 +1869,7 @@ function ChapterManager({
   onDuplicate,
   onMove,
   onRequestMove,
+  onArchive,
   onNewChapter,
 }: {
   groups: ChapterGroup[];
@@ -1755,6 +1885,7 @@ function ChapterManager({
   onDuplicate: (path: string) => void;
   onMove: (path: string, kind: "file" | "folder", target: string) => void;
   onRequestMove: (chapter: ChapterSummary) => void;
+  onArchive: (path: string, kind: "file" | "folder", label: string) => void;
   onNewChapter: (folderPath: string) => void;
 }) {
   const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -1800,8 +1931,32 @@ function ChapterManager({
               {!readOnly && (
                 <div className="chapter-group-actions">
                   <IconButton label={`在${group.label}中新建章节`} onClick={() => onNewChapter(group.folderPath)}><Plus size={13} /></IconButton>
-                  {group.id !== "__ungrouped__" && <IconButton label="重命名卷" onClick={() => onRename(group.folderPath, "folder")}><Pencil size={13} /></IconButton>}
-                  {group.id !== "__ungrouped__" && <IconButton label="删除卷" className="danger" onClick={() => onDelete(group.folderPath, "folder")}><Trash2 size={13} /></IconButton>}
+                  {group.id !== "__ungrouped__" && (
+                    <RowOverflowMenu
+                      label={`${group.label} · 更多`}
+                      items={[
+                        {
+                          id: "rename",
+                          label: "重命名卷",
+                          icon: <Pencil size={13} />,
+                          onSelect: () => onRename(group.folderPath, "folder"),
+                        },
+                        {
+                          id: "archive",
+                          label: "归档卷",
+                          icon: <Archive size={13} />,
+                          onSelect: () => onArchive(group.folderPath, "folder", group.label),
+                        },
+                        {
+                          id: "delete",
+                          label: "删除卷",
+                          icon: <Trash2 size={13} />,
+                          danger: true,
+                          onSelect: () => onDelete(group.folderPath, "folder"),
+                        },
+                      ]}
+                    />
+                  )}
                 </div>
               )}
             </div>
@@ -1828,12 +1983,44 @@ function ChapterManager({
                     </button>
                     <div className="chapter-row-actions">
                       <IconButton label="版本历史" onClick={() => onVersions(chapter.path)}><History size={13} /></IconButton>
-                      {!readOnly && <>
-                        <IconButton label="移动章节" onClick={() => onRequestMove(chapter)}><FolderInput size={13} /></IconButton>
-                        <IconButton label="创建副本" onClick={() => onDuplicate(chapter.path)}><Copy size={13} /></IconButton>
-                        <IconButton label="重命名章节" onClick={() => onRename(chapter.path, "file")}><Pencil size={13} /></IconButton>
-                        <IconButton label="删除章节" className="danger" onClick={() => onDelete(chapter.path, "file")}><Trash2 size={13} /></IconButton>
-                      </>}
+                      {!readOnly && (
+                        <RowOverflowMenu
+                          label={`${chapter.title} · 更多`}
+                          items={[
+                            {
+                              id: "move",
+                              label: "移动到其他卷",
+                              icon: <FolderInput size={13} />,
+                              onSelect: () => onRequestMove(chapter),
+                            },
+                            {
+                              id: "duplicate",
+                              label: "创建副本",
+                              icon: <Copy size={13} />,
+                              onSelect: () => onDuplicate(chapter.path),
+                            },
+                            {
+                              id: "rename",
+                              label: "重命名",
+                              icon: <Pencil size={13} />,
+                              onSelect: () => onRename(chapter.path, "file"),
+                            },
+                            {
+                              id: "archive",
+                              label: "归档章节",
+                              icon: <Archive size={13} />,
+                              onSelect: () => onArchive(chapter.path, "file", chapter.title),
+                            },
+                            {
+                              id: "delete",
+                              label: "删除章节",
+                              icon: <Trash2 size={13} />,
+                              danger: true,
+                              onSelect: () => onDelete(chapter.path, "file"),
+                            },
+                          ]}
+                        />
+                      )}
                     </div>
                   </div>
                 ))}
@@ -1858,6 +2045,8 @@ function FileTreeItem({
   onMoveNode,
   onDuplicate,
   onNewChild,
+  onArchive,
+  onUnarchive,
   expandedFolders,
   setExpandedFolders,
 }: {
@@ -1872,6 +2061,8 @@ function FileTreeItem({
   onMoveNode: (path: string, kind: "file" | "folder", targetFolder: string) => void;
   onDuplicate: (path: string) => void;
   onNewChild: (parentFolder: string, kind: "file" | "folder") => void;
+  onArchive: (path: string, kind: "file" | "folder", label: string) => void;
+  onUnarchive: (path: string, kind: "file" | "folder", label: string) => void;
   expandedFolders: Set<string>;
   setExpandedFolders: React.Dispatch<React.SetStateAction<Set<string>>>;
 }) {
@@ -1959,6 +2150,9 @@ function FileTreeItem({
         </span>
         <span className="tree-label" title={node.path}>
           <span className="tree-name">{node.name}</span>
+          {isArchivedPath(node.path) && node.path !== ARCHIVE_ROOT ? (
+            <span className="tree-badge archived" title="已归档，不计入现行章节与 Agent 主事实">归档</span>
+          ) : null}
           {node.kind === "folder" && <span className="tree-count">{countFiles(node)}</span>}
         </span>
         <div className="tree-actions">
@@ -1976,62 +2170,62 @@ function FileTreeItem({
               <Eye size={13} aria-hidden="true" />
             )}
           </button>
-          {node.kind === "folder" && (
-            <>
-              <button
-                className="tree-action-btn"
-                title="在此新建文档"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onNewChild(node.path, "file");
-                }}
-              >
-                <Plus size={13} aria-hidden="true" />
-              </button>
-              <button
-                className="tree-action-btn"
-                title="在此新建文件夹"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onNewChild(node.path, "folder");
-                }}
-              >
-                <FolderPlus size={13} aria-hidden="true" />
-              </button>
-            </>
-          )}
-          {node.kind === "file" && (
-            <button
-              className="tree-action-btn"
-              title="创建副本"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDuplicate(node.path);
-              }}
-            >
-              <Copy size={13} aria-hidden="true" />
-            </button>
-          )}
-          <button
-            className="tree-action-btn"
-            title="重命名"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRename(node.path, node.kind);
-            }}
-          >
-            <Pencil size={13} aria-hidden="true" />
-          </button>
-          <button
-            className="tree-action-btn danger"
-            title="删除"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete(node.path, node.kind);
-            }}
-          >
-            <Trash2 size={13} aria-hidden="true" />
-          </button>
+          <RowOverflowMenu
+            label={`${node.name} · 更多`}
+            items={[
+              ...(node.kind === "folder"
+                ? [
+                    {
+                      id: "new-file",
+                      label: "在此新建文档",
+                      icon: <Plus size={13} />,
+                      onSelect: () => onNewChild(node.path, "file"),
+                    },
+                    {
+                      id: "new-folder",
+                      label: "在此新建文件夹",
+                      icon: <FolderPlus size={13} />,
+                      onSelect: () => onNewChild(node.path, "folder"),
+                    },
+                  ]
+                : [
+                    {
+                      id: "duplicate",
+                      label: "创建副本",
+                      icon: <Copy size={13} />,
+                      onSelect: () => onDuplicate(node.path),
+                    },
+                  ]),
+              {
+                id: "rename",
+                label: "重命名",
+                icon: <Pencil size={13} />,
+                onSelect: () => onRename(node.path, node.kind),
+              },
+              ...(node.path !== ARCHIVE_ROOT
+                ? isArchivedPath(node.path)
+                  ? [{
+                      id: "unarchive",
+                      label: node.kind === "folder" ? "取消归档文件夹" : "取消归档文件",
+                      icon: <ArchiveRestore size={13} />,
+                      onSelect: () => onUnarchive(node.path, node.kind, node.name),
+                    }]
+                  : [{
+                      id: "archive",
+                      label: node.kind === "folder" ? "归档文件夹" : "归档文件",
+                      icon: <Archive size={13} />,
+                      onSelect: () => onArchive(node.path, node.kind, node.name),
+                    }]
+                : []),
+              {
+                id: "delete",
+                label: "删除",
+                icon: <Trash2 size={13} />,
+                danger: true,
+                onSelect: () => onDelete(node.path, node.kind),
+              },
+            ]}
+          />
         </div>
       </div>
       {isExpanded && (
@@ -2050,6 +2244,8 @@ function FileTreeItem({
             onMoveNode={onMoveNode}
             onDuplicate={onDuplicate}
             onNewChild={onNewChild}
+            onArchive={onArchive}
+            onUnarchive={onUnarchive}
             expandedFolders={expandedFolders}
             setExpandedFolders={setExpandedFolders}
           />
@@ -2186,17 +2382,25 @@ function AgentStepCard({
             {step.usage
               ? (
                 <>
-                  本步 token{step.usage.estimated ? "（估算）" : ""}：
-                  总计 {step.usage.totalTokens.toLocaleString()}
+                  本步合计{step.usage.estimated ? "（含估算）" : ""}
+                  {step.usage.model === "多个模型" || (step.usage.callBreakdown?.length ?? 0) > 1
+                    ? " · 多模型"
+                    : step.usage.model
+                      ? ` · ${step.usage.model}`
+                      : ""}
+                  ：总计 {step.usage.totalTokens.toLocaleString()}
                   {" · "}
                   输入 {step.usage.promptTokens.toLocaleString()}
                   {" · "}输出 {step.usage.completionTokens.toLocaleString()}
                   {" · "}缓存 {step.usage.cacheHitTokens.toLocaleString()}
                   {step.usage.cacheHitRate !== undefined
-                    ? ` · 命中率 ${(step.usage.cacheHitRate * 100).toFixed(1)}%`
+                    ? ` · 合计命中 ${(step.usage.cacheHitRate * 100).toFixed(1)}%`
                     : ""}
                   {step.usage.cost > 0
                     ? ` · ${step.usage.currency === "CNY" ? "¥" : "$"}${step.usage.cost.toFixed(6)}`
+                    : ""}
+                  {(step.usage.callBreakdown?.length ?? 0) > 1
+                    ? "（展开查看各调用）"
                     : ""}
                 </>
               )
@@ -2204,7 +2408,12 @@ function AgentStepCard({
           </div>
           {step.usage && ((step.usage.callBreakdown?.length ?? 0) > 0 || step.usage.model) ? (
             <details className="agent-step-context-breakdown" open>
-              <summary>模型调用明细</summary>
+              <summary>
+                模型调用明细
+                {(step.usage.callBreakdown?.length ?? 0) > 1
+                  ? `（${step.usage.callBreakdown!.length} 次）`
+                  : ""}
+              </summary>
               <div className="agent-step-context-list">
                 {(step.usage.callBreakdown?.length
                   ? step.usage.callBreakdown
@@ -2221,14 +2430,15 @@ function AgentStepCard({
                     }]).map((call, index) => {
                   const measured = call.cacheHitTokens + call.cacheMissTokens;
                   const rate = measured > 0 ? call.cacheHitTokens / measured : 0;
+                  const kind = callKindLabel(call.callKind);
                   return (
                     <div className="agent-step-context-row agent-step-model-call-row" key={`${call.model ?? "unknown"}-${call.callKind}-${index}`}>
                       <div className="agent-step-model-call-heading">
                         <span className="agent-step-provider-chip" title={call.providerName?.trim() || "供应商信息未记录"}>
                           {shortProviderName(call.providerName)}
                         </span>
-                        <strong title={call.model ?? "未知模型"}>{call.model ?? "未知模型"}</strong>
-                        <span>{call.callKind}</span>
+                        <strong title={call.model ?? "未知模型"}>{call.model && call.model !== "多个模型" ? call.model : "未知模型"}</strong>
+                        <span title={call.callKind}>{kind}</span>
                       </div>
                       <div className="agent-step-model-call-metrics">
                         <span><small>总计</small>{(call.promptTokens + call.completionTokens).toLocaleString()}</span>
@@ -3543,25 +3753,37 @@ function WorkspaceTopbar({
 }
 
 function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, callKind = "unspecified"): StepUsage {
-  const nextCall = {
-    model: next.model,
-    providerName: next.providerName,
-    callKind,
-    promptTokens: next.promptTokens,
-    completionTokens: next.completionTokens,
-    cacheHitTokens: next.cacheHitTokens,
-    cacheMissTokens: next.cacheMissTokens,
-    cost: next.cost,
-    currency: next.currency,
-    ...(next.estimated ? { estimated: true } : {}),
-  };
-  if (!current) return { ...next, callBreakdown: [nextCall] };
+  const nextCalls: StepUsageCall[] = next.callBreakdown?.length
+    ? next.callBreakdown
+    : [{
+        model: next.model,
+        providerName: next.providerName,
+        callKind,
+        promptTokens: next.promptTokens,
+        completionTokens: next.completionTokens,
+        cacheHitTokens: next.cacheHitTokens,
+        cacheMissTokens: next.cacheMissTokens,
+        cost: next.cost,
+        currency: next.currency,
+        ...(next.estimated ? { estimated: true } : {}),
+      }];
+  if (!current) return { ...next, callBreakdown: nextCalls };
   const cacheHitTokens = current.cacheHitTokens + next.cacheHitTokens;
   const cacheMissTokens = current.cacheMissTokens + next.cacheMissTokens;
   const estimated = Boolean(current.estimated || next.estimated);
+  const models = [...new Set(
+    [...(current.callBreakdown ?? []).map(call => call.model), ...nextCalls.map(call => call.model), current.model, next.model]
+      .filter((value): value is string => Boolean(value) && value !== "多个模型"),
+  )];
+  const providers = [...new Set(
+    [...(current.callBreakdown ?? []).map(call => call.providerName), ...nextCalls.map(call => call.providerName), current.providerName, next.providerName]
+      .filter((value): value is string => Boolean(value?.trim())),
+  )];
   return {
-    model: current.model === next.model ? current.model : "多个模型",
-    providerName: current.providerName === next.providerName ? current.providerName : undefined,
+    model: models.length <= 1 ? (models[0] ?? current.model ?? next.model) : "多个模型",
+    ...(providers.length
+      ? { providerName: providers.length === 1 ? providers[0] : providers.join(",") }
+      : {}),
     promptTokens: current.promptTokens + next.promptTokens,
     completionTokens: current.completionTokens + next.completionTokens,
     cacheHitTokens,
@@ -3574,7 +3796,7 @@ function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsage, cal
       ? { cacheHitRate: cacheHitTokens / (cacheHitTokens + cacheMissTokens) }
       : {}),
     requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
-    callBreakdown: [...(current.callBreakdown ?? []), nextCall],
+    callBreakdown: [...(current.callBreakdown ?? []), ...nextCalls],
   };
 }
 
@@ -5463,6 +5685,84 @@ function App() {
     }
   }
 
+  async function handleArchive(path: string, kind: "file" | "folder", label: string) {
+    if (isArchivedPath(path)) {
+      setNotice("该项已在归档区");
+      return;
+    }
+    const desiredPath = archiveDestinationPath(path);
+    const kindLabel = kind === "folder"
+      ? (path.startsWith("chapters/") ? "卷" : "文件夹")
+      : (path.startsWith("chapters/") ? "章节" : "文件");
+    const chapterCount = kind === "folder"
+      ? chapters.filter(chapter => chapter.path === path || chapter.path.startsWith(`${path}/`)).length
+      : 0;
+    const hint = chapterCount > 0
+      ? `（含 ${chapterCount} 个章节）`
+      : "";
+    if (!confirm(`将${kindLabel}「${label}」${hint}归档到 archive/ ？\n若归档区已有同名项，会自动加「-归档」等后缀，两边都保留。\n归档后不再计入现行章节；可在「全部文件 → archive」中取消归档。`)) {
+      return;
+    }
+    try {
+      const result = await api<{ path: string; renamedDueToConflict?: boolean }>(
+        kind === "file" ? "/api/document/rename" : "/api/folder/rename",
+        {
+          method: "PUT",
+          body: JSON.stringify({ fromPath: path, toPath: desiredPath, uniqueIfExists: true }),
+        },
+      );
+      const finalPath = result.path || desiredPath;
+      if (activePath === path || activePath.startsWith(`${path}/`)) {
+        setActivePath(`${finalPath}${activePath.slice(path.length)}`);
+      }
+      setExpandedFolders((prev) => new Set(prev).add(ARCHIVE_ROOT));
+      await refresh(state?.sessionId);
+      await loadChapters();
+      setNotice(
+        result.renamedDueToConflict
+          ? `已归档${kindLabel}「${label}」→ ${finalPath}（目标已占用，已自动改名）`
+          : `已归档${kindLabel}「${label}」→ ${finalPath}`,
+      );
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleUnarchive(path: string, kind: "file" | "folder", label: string) {
+    const desiredPath = unarchiveDestinationPath(path);
+    if (!desiredPath) {
+      setNotice("无法取消归档：路径无效");
+      return;
+    }
+    if (!confirm(`将「${label}」从归档恢复？\n目标默认 ${desiredPath}；若现行区已有同名，会自动加「-归档」等后缀，两边都保留。`)) {
+      return;
+    }
+    try {
+      const result = await api<{ path: string; renamedDueToConflict?: boolean }>(
+        kind === "file" ? "/api/document/rename" : "/api/folder/rename",
+        {
+          method: "PUT",
+          body: JSON.stringify({ fromPath: path, toPath: desiredPath, uniqueIfExists: true }),
+        },
+      );
+      const finalPath = result.path || desiredPath;
+      if (activePath === path || activePath.startsWith(`${path}/`)) {
+        setActivePath(`${finalPath}${activePath.slice(path.length)}`);
+      }
+      const parent = finalPath.includes("/") ? finalPath.slice(0, finalPath.lastIndexOf("/")) : "";
+      if (parent) setExpandedFolders((prev) => new Set(prev).add(parent));
+      await refresh(state?.sessionId);
+      await loadChapters();
+      setNotice(
+        result.renamedDueToConflict
+          ? `已恢复「${label}」→ ${finalPath}（目标已占用，已自动改名）`
+          : `已恢复「${label}」→ ${finalPath}`,
+      );
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function handleMoveNode(path: string, kind: "file" | "folder", targetFolder: string): Promise<boolean> {
     if (kind === "folder" && (targetFolder === path || targetFolder.startsWith(`${path}/`))) {
       setNotice("不能把文件夹移动到自身内部");
@@ -6909,6 +7209,7 @@ function App() {
                   onDuplicate={handleDuplicate}
                   onMove={handleMoveNode}
                   onRequestMove={requestMoveChapter}
+                  onArchive={handleArchive}
                   onNewChapter={handleNewChapter}
                 />
           ) : tree.length === 0 ? (
@@ -6958,6 +7259,8 @@ function App() {
                   onMoveNode={handleMoveNode}
                   onDuplicate={handleDuplicate}
                   onNewChild={handleNewChild}
+                  onArchive={handleArchive}
+                  onUnarchive={handleUnarchive}
                   expandedFolders={visibleExpandedFolders}
                   setExpandedFolders={setExpandedFolders}
                 />

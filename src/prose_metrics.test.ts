@@ -97,12 +97,15 @@ test("analyzeChapterProseMetrics blocks dash overload and warns on contrast dens
   assert.match(chapterMetricsBlockError(metrics) ?? "", /破折号/);
 });
 
-test("analyzeChapterProseMetrics warns on flat staccato rhythm at chapter scale", () => {
+test("analyzeChapterProseMetrics hard-blocks flat staccato rhythm at chapter scale", () => {
   const text = Array.from({ length: 170 }, (_, index) => `她看灯${index % 7}。`).join("");
   const metrics = analyzeChapterProseMetrics(text);
   const rhythm = metrics.issues.find(issue => issue.code === "rhythm_flat");
   assert.ok(rhythm);
+  assert.equal(rhythm?.severity, "error");
   assert.ok(metrics.stats.meanSentenceLength < 14);
+  assert.match(chapterMetricsBlockError(metrics) ?? "", /一次修订验收/);
+  assert.match(chapterMetricsBlockError(metrics) ?? "", /均长/);
 });
 
 test("analyzeChapterProseMetrics warns on monotone paragraph openings", () => {

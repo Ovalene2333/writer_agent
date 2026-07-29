@@ -1621,15 +1621,37 @@ export function proposalRevisionConvergePrompt(
 ): string {
   const status = typeof result.status === "string" ? result.status : "rejected";
   const code = typeof result.code === "string" ? result.code : "";
-  const message = typeof result.message === "string" ? result.message.replace(/\s+/g, " ").slice(0, 360) : "";
+  const rawMessage = typeof result.message === "string"
+    ? result.message
+    : typeof result.error === "string"
+      ? result.error
+      : typeof result.rhythmGate === "string"
+        ? result.rhythmGate
+        : "";
+  // 节奏驳回文案含验收线与样例，需多留一些字节，否则 Agent 只看见半句「碎句」。
+  const messageCap = /节奏硬拦截|碎句|缩词|均长|电报|RHYTHM_POLISH/.test(rawMessage + code) ? 900 : 360;
+  const message = rawMessage.replace(/\s+/g, " ").slice(0, messageCap);
   const path = typeof result.path === "string" ? result.path : "";
   const hardLimit = attempt >= 2;
+  const rhythmBlock = /节奏硬拦截|碎句|缩词|连发碎句|电报句|RHYTHM_POLISH/.test(rawMessage + code);
+  const firstRoundPolish = result.rhythmRevisionRequired === true || code === "RHYTHM_POLISH_REQUIRED";
+  if (firstRoundPolish) {
+    return [
+      `首轮情节/场面草稿已接收（${path || "当前文档"}），句式节奏尚未达标——这是预期中的第二步，不是失败。`,
+      message ? `验收与样例：${message}` : "",
+      "请在保留情节、场面与人物选择的前提下，按验收线通读合并碎句、恢复双音节用词并补静场绵延句，然后 propose_document 覆盖修订；禁止重读已读设定、禁止另起大纲或重写剧情。",
+    ].filter(Boolean).join("\n");
+  }
   return [
     `文档提案未创建（${status}${code ? `/${code}` : ""}，修订窗口第 ${attempt} 次${path ? `，路径 ${path}` : ""}）。`,
     message ? `原因：${message}` : "",
-    hardLimit
-      ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
-      : "下一步必须是针对驳回点的最小修订后的 propose_document 或 propose_document_patch；禁止为同一章重新 search/read 已读材料，禁止全文重写。",
+    rhythmBlock
+      ? (hardLimit
+        ? "节奏最后一轮：按原因里的验收线通读全章合并碎句、恢复双音节用词并补绵延句后重新提交一次；禁止只改样例三句或另起大纲。若仍不达标，manage_todos 标明阻塞或 ask_user。"
+        : "节奏修订：不要只改命中样例三句。按验收线处理全章碎句串与缩词，静场补 35+ 字绵延句，然后 propose_document；禁止重读已读设定、禁止另起大纲。")
+      : hardLimit
+        ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
+        : "下一步必须是针对驳回点的最小修订后的 propose_document 或 propose_document_patch；禁止为同一章重新 search/read 已读材料，禁止全文重写。",
   ].filter(Boolean).join("\n");
 }
 
@@ -2802,8 +2824,17 @@ ${managedHandoffContext}`,
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (isSuccessfulDocumentSubmission(call.name, parsed)) {
-              documentProposalSubmitted = true;
-              proposalRevisionAttempts = 0;
+              const needsRhythmPolish = parsed.rhythmRevisionRequired === true
+                || parsed.code === "RHYTHM_POLISH_REQUIRED";
+              if (needsRhythmPolish) {
+                // 首轮情节场面已落提案，但不算交付完成：强制一次句式抛光。
+                documentProposalSubmitted = false;
+                proposalRevisionAttempts = Math.max(1, proposalRevisionAttempts + 1);
+                pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(parsed, proposalRevisionAttempts);
+              } else {
+                documentProposalSubmitted = true;
+                proposalRevisionAttempts = 0;
+              }
               const proposalId = proposalIdFromToolResult(parsed);
               if (proposalId !== undefined) {
                 try {

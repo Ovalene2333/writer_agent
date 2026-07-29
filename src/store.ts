@@ -986,15 +986,81 @@ export class WriterStore {
           }];
         });
         if (!normalized.length) return [];
+        const jobId = typeof row.job_id === "string" && row.job_id ? row.job_id : undefined;
+        const withBreakdown = jobId
+          ? this.attachStepCallBreakdownFromUsage(normalized, jobId)
+          : normalized;
         return [{
           sourceMessageId: Number(row.source_message_id),
-          ...(typeof row.job_id === "string" && row.job_id ? { jobId: row.job_id } : {}),
-          steps: normalized,
+          ...(jobId ? { jobId } : {}),
+          steps: withBreakdown,
           updatedAt: String(row.updated_at ?? ""),
         }];
       } catch {
         return [];
       }
+    });
+  }
+
+  /**
+   * Historical trails often only stored the step-level aggregate (model=多个模型).
+   * Rebuild per-call rows from model_usage so the UI can attribute low hit rates.
+   */
+  private attachStepCallBreakdownFromUsage(
+    steps: PersistedStreamStep[],
+    jobId: string,
+  ): PersistedStreamStep[] {
+    if (!steps.some(step => step.usage && !(step.usage.callBreakdown?.length))) return steps;
+    type UsageRow = {
+      step: number | null;
+      call_kind: string;
+      model: string;
+      provider_name: string;
+      prompt_tokens: number;
+      completion_tokens: number;
+      cache_hit_tokens: number;
+      cache_miss_tokens: number;
+      cost: number;
+      currency: string;
+    };
+    let rows: UsageRow[] = [];
+    try {
+      rows = this.database.prepare(
+        `SELECT step, call_kind, model, provider_name,
+                prompt_tokens, completion_tokens, cache_hit_tokens, cache_miss_tokens,
+                cost, currency
+           FROM model_usage
+          WHERE job_id=? AND step IS NOT NULL
+          ORDER BY id ASC`,
+      ).all(jobId) as UsageRow[];
+    } catch {
+      return steps;
+    }
+    if (!rows.length) return steps;
+    const byStep = new Map<number, NonNullable<PersistedStreamStep["usage"]>["callBreakdown"]>();
+    for (const row of rows) {
+      const stepId = Number(row.step);
+      if (!Number.isFinite(stepId)) continue;
+      const call = {
+        model: String(row.model ?? ""),
+        providerName: String(row.provider_name ?? "").trim() || undefined,
+        callKind: String(row.call_kind || "unspecified"),
+        promptTokens: Number(row.prompt_tokens) || 0,
+        completionTokens: Number(row.completion_tokens) || 0,
+        cacheHitTokens: Number(row.cache_hit_tokens) || 0,
+        cacheMissTokens: Number(row.cache_miss_tokens) || 0,
+        cost: Number(row.cost) || 0,
+        currency: String(row.currency || "CNY"),
+      };
+      const list = byStep.get(stepId) ?? [];
+      list.push(call);
+      byStep.set(stepId, list);
+    }
+    return steps.map(step => {
+      if (!step.usage || step.usage.callBreakdown?.length) return step;
+      const breakdown = byStep.get(step.id);
+      if (!breakdown?.length) return step;
+      return { ...step, usage: { ...step.usage, callBreakdown: breakdown } };
     });
   }
 
@@ -3559,18 +3625,19 @@ export class WriterStore {
     return this.documentVersions(path).find(version => version.id === Number(result.lastInsertRowid))!;
   }
 
-  renameDocument(fromPath: string, toPath: string): void {
-    this.project.renameDocument(fromPath, toPath);
-    this.database.prepare("UPDATE proposals SET path=? WHERE path=?").run(toPath, fromPath);
-    this.database.prepare("UPDATE revisions SET path=? WHERE path=?").run(toPath, fromPath);
-    this.moveContinuityFactsSource(fromPath, toPath, this.project.read(toPath));
+  renameDocument(fromPath: string, toPath: string, options?: { uniqueIfExists?: boolean }): string {
+    const finalPath = this.project.renameDocument(fromPath, toPath, options);
+    this.database.prepare("UPDATE proposals SET path=? WHERE path=?").run(finalPath, fromPath);
+    this.database.prepare("UPDATE revisions SET path=? WHERE path=?").run(finalPath, fromPath);
+    this.moveContinuityFactsSource(fromPath, finalPath, this.project.read(finalPath));
     this.reindex();
+    return finalPath;
   }
 
-  renameFolder(fromPath: string, toPath: string): void {
+  renameFolder(fromPath: string, toPath: string, options?: { uniqueIfExists?: boolean }): string {
     const fromPrefix = `${fromPath.replace(/\/+$/u, "")}/`;
-    const toPrefix = `${toPath.replace(/\/+$/u, "")}/`;
-    this.project.renameFolder(fromPath, toPath);
+    const finalPath = this.project.renameFolder(fromPath, toPath, options);
+    const toPrefix = `${finalPath.replace(/\/+$/u, "")}/`;
     const rewrite = (path: string) => path.startsWith(fromPrefix) ? `${toPrefix}${path.slice(fromPrefix.length)}` : path;
     const proposalRows = this.database.prepare("SELECT id,path FROM proposals WHERE path LIKE ?").all(`${fromPrefix}%`) as Array<{ id: number; path: string }>;
     const revisionRows = this.database.prepare("SELECT id,path FROM revisions WHERE path LIKE ?").all(`${fromPrefix}%`) as Array<{ id: number; path: string }>;
@@ -3586,6 +3653,7 @@ export class WriterStore {
       if (this.project.textFileExists(to)) this.moveContinuityFactsSource(from, to, this.project.readTextFile(to));
     }
     this.reindex();
+    return finalPath;
   }
 
   removeFolder(path: string): void {

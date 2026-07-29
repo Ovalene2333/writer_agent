@@ -559,7 +559,10 @@ export function isSuccessfulDocumentSubmission(
     return false;
   }
   const code = typeof result.code === "string" ? result.code : "";
-  if (code && /BLOCKED|UNAVAILABLE|REQUIRED|REJECTED|FAILED/i.test(code)) return false;
+  // RHYTHM_POLISH_REQUIRED 仍带 proposalId（首轮情节草稿），由上层单独识别，不算最终交付成功。
+  if (code && /BLOCKED|UNAVAILABLE|REQUIRED|REJECTED|FAILED/i.test(code) && code !== "RHYTHM_POLISH_REQUIRED") {
+    return false;
+  }
 
   if (typeof result.proposalId === "number" && result.proposalId > 0) return true;
   if (typeof result.changeSetId === "number" && result.changeSetId > 0) return true;

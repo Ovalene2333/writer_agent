@@ -52,11 +52,14 @@ export function buildProseQualityReport(
     })),
   ];
 
+  const rhythmHeavy = warnings.some(warning =>
+    warning.code === "rhythm_flat" || warning.code === "rhythm_uniform",
+  );
   return {
     characters: vividness.stats.characters,
     vividness: { score: vividness.stats.score, summary: formatVividnessSummary(vividness.stats) },
     aiTells: { score: aiTells.stats.score, summary: formatAiTellSummary(aiTells.stats) },
-    grade: gradeOf(vividness.stats.score, aiTells.stats.score, warnings.length),
+    grade: gradeOf(vividness.stats.score, aiTells.stats.score, warnings.length, rhythmHeavy),
     ...(options?.lengthTarget ? { length: lengthOf(options.lengthTarget, text) } : {}),
     warnings,
   };
@@ -66,11 +69,20 @@ export function buildProseQualityReport(
  * Three buckets, deliberately coarse: the author needs "这章可以发 / 还行 / 得再过一遍",
  * not a false-precision number. Both scores plus the warning count have to agree
  * before anything is called weak.
+ *
+ * Mono-staccato rhythm is a frequent AI-looking failure that still scores high on
+ * vividness/objects; weight it so "尚可" is not the default for telegraph prose.
  */
-function gradeOf(vividness: number, aiTells: number, warningCount: number): ProseQualityReport["grade"] {
+function gradeOf(
+  vividness: number,
+  aiTells: number,
+  warningCount: number,
+  rhythmHeavy = false,
+): ProseQualityReport["grade"] {
   const demerits = (vividness < VIVIDNESS_GOOD_SCORE ? 1 : 0)
     + (aiTells > AI_TELL_ALERT_SCORE ? 1 : 0)
-    + (warningCount >= 4 ? 1 : 0);
+    + (warningCount >= 4 ? 1 : 0)
+    + (rhythmHeavy ? 1 : 0);
   if (demerits >= 2) return "weak";
   if (demerits === 1 || warningCount >= 2) return "fair";
   return "good";

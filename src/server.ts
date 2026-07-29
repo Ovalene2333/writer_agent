@@ -152,17 +152,48 @@ function compactStepTrailText(value: string): string {
   return `${value.slice(0, headLength)}\n\n[内容过长，已截断]\n\n${value.slice(-tailLength)}`;
 }
 
-function mergePersistedStepUsage(current: StepUsage | undefined, next: StepUsage): StepUsage {
-  if (!current) return next;
-  const models = [...new Set([current.model, next.model].filter((value): value is string => Boolean(value)))];
+function toStepUsageCall(call: StepUsage, callKind = "unspecified"): NonNullable<StepUsage["callBreakdown"]>[number] {
+  return {
+    model: call.model,
+    providerName: call.providerName,
+    callKind,
+    promptTokens: call.promptTokens,
+    completionTokens: call.completionTokens,
+    cacheHitTokens: call.cacheHitTokens,
+    cacheMissTokens: call.cacheMissTokens,
+    cost: call.cost,
+    currency: call.currency,
+    ...(call.estimated ? { estimated: true } : {}),
+  };
+}
+
+/** Merge nested provider calls into one step usage while keeping a per-call breakdown. */
+function mergePersistedStepUsage(
+  current: StepUsage | undefined,
+  next: StepUsage,
+  callKind = "unspecified",
+): StepUsage {
+  const nextCalls = next.callBreakdown?.length
+    ? next.callBreakdown
+    : [toStepUsageCall(next, callKind)];
+  if (!current) {
+    return { ...next, callBreakdown: nextCalls };
+  }
+  const models = [...new Set(
+    [...(current.callBreakdown ?? []).map(call => call.model), ...nextCalls.map(call => call.model), current.model, next.model]
+      .filter((value): value is string => Boolean(value) && value !== "多个模型"),
+  )];
   const hits = (current.cacheHitTokens ?? 0) + (next.cacheHitTokens ?? 0);
   const misses = (current.cacheMissTokens ?? 0) + (next.cacheMissTokens ?? 0);
+  const estimated = Boolean(current.estimated || next.estimated);
+  const providerNames = [...new Set(
+    [...(current.callBreakdown ?? []).map(call => call.providerName), ...nextCalls.map(call => call.providerName), current.providerName, next.providerName]
+      .filter((value): value is string => Boolean(value?.trim())),
+  )];
   return {
     ...(models.length ? { model: models.length === 1 ? models[0] : "多个模型" } : {}),
-    ...(current.providerName || next.providerName
-      ? { providerName: current.providerName === next.providerName
-          ? current.providerName
-          : [current.providerName, next.providerName].filter(Boolean).join(",") }
+    ...(providerNames.length
+      ? { providerName: providerNames.length === 1 ? providerNames[0] : providerNames.join(",") }
       : {}),
     promptTokens: (current.promptTokens ?? 0) + (next.promptTokens ?? 0),
     completionTokens: (current.completionTokens ?? 0) + (next.completionTokens ?? 0),
@@ -171,11 +202,10 @@ function mergePersistedStepUsage(current: StepUsage | undefined, next: StepUsage
     totalTokens: (current.totalTokens ?? 0) + (next.totalTokens ?? 0),
     cost: (current.cost ?? 0) + (next.cost ?? 0),
     currency: current.cost > 0 ? current.currency : next.currency || current.currency,
-    estimated: Boolean(current.estimated || next.estimated),
-    ...(hits + misses > 0 && !current.estimated && !next.estimated
-      ? { cacheHitRate: hits / (hits + misses) }
-      : {}),
+    ...(estimated ? { estimated: true } : {}),
+    ...(!estimated && hits + misses > 0 ? { cacheHitRate: hits / (hits + misses) } : {}),
     requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
+    callBreakdown: [...(current.callBreakdown ?? []), ...nextCalls],
   };
 }
 
@@ -313,6 +343,9 @@ export class BackgroundAgentJobs {
       }
     } else if (event.type === "usage" && event.call) {
       const targetId = event.step;
+      const callKind = typeof event.callKind === "string" && event.callKind.trim()
+        ? event.callKind.trim()
+        : "unspecified";
       let idx = targetId != null
         ? trail.steps.findIndex(step => step.id === targetId)
         : activeTrailStepIndex(trail.steps);
@@ -323,14 +356,14 @@ export class BackgroundAgentJobs {
           reasoning: "",
           tools: [],
           status: "completed",
-          usage: event.call,
+          usage: mergePersistedStepUsage(undefined, event.call, callKind),
         });
         trail.steps.sort((left, right) => left.id - right.id);
         trail.dirty = true;
       } else if (idx >= 0) {
         trail.steps[idx] = {
           ...trail.steps[idx],
-          usage: mergePersistedStepUsage(trail.steps[idx].usage, event.call),
+          usage: mergePersistedStepUsage(trail.steps[idx].usage, event.call, callKind),
         };
         trail.dirty = true;
       }
@@ -628,9 +661,16 @@ export async function startWriterServer(options: {
 
   app.put("/api/document/rename", async (context) => {
     try {
-      const body = await context.req.json<{ fromPath: string; toPath: string }>();
-      options.store.renameDocument(body.fromPath, body.toPath);
-      return context.json({ ok: true, path: body.toPath, hiddenDocuments: options.project.hiddenDocuments() });
+      const body = await context.req.json<{ fromPath: string; toPath: string; uniqueIfExists?: boolean }>();
+      const path = options.store.renameDocument(body.fromPath, body.toPath, {
+        uniqueIfExists: body.uniqueIfExists === true,
+      });
+      return context.json({
+        ok: true,
+        path,
+        renamedDueToConflict: path !== body.toPath,
+        hiddenDocuments: options.project.hiddenDocuments(),
+      });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -658,11 +698,14 @@ export async function startWriterServer(options: {
 
   app.put("/api/folder/rename", async (context) => {
     try {
-      const body = await context.req.json<{ fromPath: string; toPath: string }>();
-      options.store.renameFolder(body.fromPath, body.toPath);
+      const body = await context.req.json<{ fromPath: string; toPath: string; uniqueIfExists?: boolean }>();
+      const path = options.store.renameFolder(body.fromPath, body.toPath, {
+        uniqueIfExists: body.uniqueIfExists === true,
+      });
       return context.json({
         ok: true,
-        path: body.toPath,
+        path,
+        renamedDueToConflict: path !== body.toPath,
         documentFolders: options.project.listDocumentFolders(),
         hiddenDocuments: options.project.hiddenDocuments(),
         hiddenFolders: options.project.hiddenFolders(),

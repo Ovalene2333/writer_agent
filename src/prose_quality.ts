@@ -74,6 +74,8 @@ export const HARD_BLOCK_SUBTYPES = new Set<ProseStyleSubtype>([
   "abstract_reframing",
   "split_redefinition",
   "factual_exclusion",
+  // 默认 info；仅在 escalate 后对白骨架过密时升为 error
+  "dialogue_correction",
   "narrator_redefinition",
   "semantic_echo",
   "emotion_label",
@@ -108,9 +110,16 @@ function hardMannerismFamily(subtype: ProseStyleSubtype): "dash" | "contrast" | 
  */
 function hardMannerismFamilyLimit(text: string, family: "dash" | "contrast" | "explanation"): number {
   const characters = Math.max(1, text.replace(/\s/g, "").length);
-  if (family === "contrast") return Math.max(1, Math.floor(characters / 3_000));
+  // 「不是…是」骨架很显眼：约 5k 字只放行 1 处叙述侧命中，再多即升 error
+  if (family === "contrast") return Math.max(1, Math.floor(characters / 5_000));
   if (family === "explanation") return Math.max(2, 1 + Math.floor(characters / 2_500));
   return hardMannerismLimit(text);
+}
+
+/** 对白里同一骨架的免费额度（人物即时纠正可留，教学腔/连发要砍）。 */
+function dialogueContrastLimit(text: string): number {
+  const characters = Math.max(1, text.replace(/\s/g, "").length);
+  return Math.max(1, Math.floor(characters / 5_000));
 }
 
 /**
@@ -122,18 +131,19 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
   const lines = [
     "句式基准（出口有机器门禁复核，按此写省返工）：",
     "1. 叙述直接陈述成立的事实；需要纠正误解或对比时，交给人物对白或后续行动完成。",
-    "2. 避免叙述中的「不是……是/而是……」及拆成「不是……。是……。」的改判句；直接写成立的动作、感受或事实。",
+    "2. 叙述禁用「不是……是/而是……」及「不是……。是……。」改判句；对白里同一骨架全章最多偶发一两次（真纠正误解），技术定义与目标用直接陈述，勿写成教学腔「不是A，是B」。",
     "3. 补充说明写成独立完整句；破折号留给对白里的拖音、中断，以及偶发的停顿—揭示。",
     "4. 动作、对白或细节已经传达情绪与意图时，就停在那里进入下一拍；解释只在引入新事实时出现。",
     "5. 相邻段落换句式骨架：起笔方式、句长结构、信息展开方式各不相同。",
+    "6. 节奏勿一律短促：静场与情感段用完整自然句（常 25–50 字），每数百字至少有一个 30 字以上的绵延句；紧张处才收短。禁止为「利落」把常用双音节词压成单字（如感觉→感、恢复→复、身体→体），除非是角色固定口癖或对白抢白。",
   ];
   if (options?.compact) return lines.join("\n");
-  return `${lines.join("\n")}\n6. 对白保留口语的自然形态：拖音、改口、半句、口语纠正都可以；每个人物的说话方式彼此可区分。\n7. 每场提交前通读一遍：删去不新增事实的解释句，把补注并入叙述或独立成句。`;
+  return `${lines.join("\n")}\n7. 对白保留口语的自然形态：拖音、改口、半句、口语纠正都可以；每个人物的说话方式彼此可区分。\n8. 每场提交前通读一遍：删去不新增事实的解释句与多余的「不是…是」骨架，把补注并入叙述或独立成句；若连续多句都在 8 字以内，合并或拉长其中一部分。`;
 }
 
 /** One-line checklist for pre-submit self-check in task workflows. */
 export function proseMannerismPreflightLine(): string {
-  return "提交前自检：改掉叙述中的先否定再改判句；删去不新增事实的解释与补注；相邻段落句式骨架不同形；对白语气自然且人物可区分。";
+  return "提交前自检：改掉叙述与对白里扎堆的先否定再改判句；删去不新增事实的解释与补注；相邻段落句式骨架不同形；避免全篇碎句连发与刻意缩词；对白语气自然且人物可区分。";
 }
 
 /**
@@ -164,6 +174,8 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     if (issue.severity === "error"
       && HARD_BLOCK_SUBTYPES.has(issue.subtype)
       && issue.subtype !== "split_redefinition") {
+      // dialogue_correction 默认从 info 起步，不在此重置
+      if (issue.subtype === "dialogue_correction") continue;
       issue.severity = "warning";
     }
   }
@@ -171,7 +183,8 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
   const candidates = issues.filter(issue =>
     issue.severity === "warning"
     && issue.confidence >= 0.9
-    && HARD_BLOCK_SUBTYPES.has(issue.subtype),
+    && HARD_BLOCK_SUBTYPES.has(issue.subtype)
+    && issue.subtype !== "dialogue_correction",
   );
   const crowdedFamilies = new Set<ReturnType<typeof hardMannerismFamily>>();
   for (const family of ["dash", "contrast", "explanation"] as const) {
@@ -183,6 +196,21 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
       if (candidates.length > limit || crowdedFamilies.has(hardMannerismFamily(issue.subtype))) {
         issue.severity = "error";
       }
+    }
+  }
+  // 对白「不是…是」：免费额度内保持 info；超额升 error，避免教学腔连发钻对白豁免
+  const dialogueBudget = dialogueContrastLimit(text);
+  const dialogueHits = issues
+    .filter(issue => issue.subtype === "dialogue_correction")
+    .sort((left, right) => left.start - right.start);
+  for (let index = 0; index < dialogueHits.length; index += 1) {
+    if (index < dialogueBudget) continue;
+    const issue = dialogueHits[index];
+    issue.severity = "error";
+    issue.confidence = Math.max(issue.confidence, 0.95);
+    issue.reason = "对白中「不是…是」骨架过密；保留最自然的一两处即时纠正，其余改直接陈述（尤其技术定义与目标说明）。";
+    if (!issue.suggestions.length) {
+      issue.suggestions = ["改成直接陈述成立的事实或要求", "若确需纠正误解，全章只保留一处最有力的对白纠正"];
     }
   }
   return issues;

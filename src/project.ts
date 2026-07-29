@@ -334,19 +334,62 @@ export class WriterProject {
     unlinkSync(this.resolveSafe(path));
   }
 
-  renameDocument(fromPath: string, toPath: string): void {
+  /**
+   * If `desired` is free, return it; otherwise append `-归档` / `-归档2` / `-归档-a3f2`
+   * until the path is free. Never overwrites an existing document or folder.
+   */
+  allocateUniquePath(desired: string, kind: "file" | "folder"): string {
+    const basePath = kind === "file" ? normalizeDocumentPath(desired) : normalizeFolderPath(desired);
+    if (!basePath) throw new Error("路径不能为空");
+    const isTaken = (path: string) => {
+      if (kind === "file") return this.documentExists(path) || this.folderExists(path);
+      return this.folderExists(path) || this.documentExists(path);
+    };
+    if (!isTaken(basePath)) return basePath;
+
+    const slash = basePath.lastIndexOf("/");
+    const parent = slash >= 0 ? basePath.slice(0, slash + 1) : "";
+    const name = slash >= 0 ? basePath.slice(slash + 1) : basePath;
+    let stem = name;
+    let ext = "";
+    if (kind === "file") {
+      const match = name.match(/^(.*?)(\.[^.]+)$/u);
+      if (match) {
+        stem = match[1];
+        ext = match[2];
+      }
+    }
+
+    for (let attempt = 0; attempt < 64; attempt += 1) {
+      const suffix = attempt === 0
+        ? "-归档"
+        : attempt < 20
+          ? `-归档${attempt + 1}`
+          : `-归档-${createHash("sha1").update(`${basePath}:${attempt}:${Date.now()}`).digest("hex").slice(0, 6)}`;
+      const candidate = `${parent}${stem}${suffix}${ext}`;
+      if (!isTaken(candidate)) return candidate;
+    }
+    throw new Error(`无法为「${basePath}」分配不冲突的路径`);
+  }
+
+  /** @returns final destination path (may differ from toPath when uniqueIfExists renames). */
+  renameDocument(fromPath: string, toPath: string, options?: { uniqueIfExists?: boolean }): string {
     fromPath = normalizeDocumentPath(fromPath);
     toPath = normalizeDocumentPath(toPath);
     if (fromPath.includes("\\") || toPath.includes("\\")) throw new Error("文档路径请使用 / 作为分隔符");
     const from = this.resolveSafe(fromPath);
+    if (fromPath === toPath) return toPath;
+    if (!existsSync(from)) throw new Error("原文档不存在");
+    if (existsSync(this.resolveSafe(toPath))) {
+      if (!options?.uniqueIfExists) throw new Error("目标文档已经存在");
+      toPath = this.allocateUniquePath(toPath, "file");
+    }
     const to = this.resolveSafe(toPath);
     const wasHidden = this.hiddenDocuments().includes(fromPath);
-    if (fromPath === toPath) return;
-    if (!existsSync(from)) throw new Error("原文档不存在");
-    if (existsSync(to)) throw new Error("目标文档已经存在");
     mkdirSync(dirname(to), { recursive: true });
     renameSync(from, to);
     if (wasHidden) this.writeVisibility([...this.hiddenDocuments(), toPath].filter(path => path !== fromPath).sort(), this.hiddenFolders());
+    return toPath;
   }
 
   hiddenDocuments(): string[] {
@@ -439,16 +482,20 @@ export class WriterProject {
     return folder;
   }
 
-  renameFolder(fromPath: string, toPath: string): void {
+  /** @returns final destination folder path (may differ when uniqueIfExists renames). */
+  renameFolder(fromPath: string, toPath: string, options?: { uniqueIfExists?: boolean }): string {
     const fromFolder = normalizeFolderPath(fromPath);
-    const toFolder = normalizeFolderPath(toPath);
+    let toFolder = normalizeFolderPath(toPath);
     if (!fromFolder || !toFolder) throw new Error("文件夹路径不能为空");
-    if (fromFolder === toFolder) return;
+    if (fromFolder === toFolder) return toFolder;
     const from = this.resolveFolderSafe(fromFolder);
-    const to = this.resolveFolderSafe(toFolder);
     if (!existsSync(from)) throw new Error("原文件夹不存在");
-    if (existsSync(to)) throw new Error("目标文件夹已经存在");
+    if (existsSync(this.resolveFolderSafe(toFolder))) {
+      if (!options?.uniqueIfExists) throw new Error("目标文件夹已经存在");
+      toFolder = this.allocateUniquePath(toFolder, "folder");
+    }
     if (toFolder.startsWith(`${fromFolder}/`)) throw new Error("不能把文件夹移动到自身的子文件夹内");
+    const to = this.resolveFolderSafe(toFolder);
     const hiddenDocuments = this.hiddenDocuments();
     const hiddenFolders = this.hiddenFolders();
     mkdirSync(dirname(to), { recursive: true });
@@ -461,6 +508,7 @@ export class WriterProject {
       hiddenDocuments.map(rewritePath).sort(),
       hiddenFolders.map(rewritePath).sort(),
     );
+    return toFolder;
   }
 
   removeFolder(path: string): void {
