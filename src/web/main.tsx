@@ -23,6 +23,7 @@ import {
   GitBranch,
   History,
   IdCard,
+  ImagePlus,
   Library,
   ListOrdered,
   LockKeyhole,
@@ -176,6 +177,23 @@ function mergeProposalEvent(current: Proposal[], incoming: Proposal): Proposal[]
   if (incoming.status === "pending" && existing && existing.status !== "pending") return current;
   return [incoming, ...current.filter(item => item.id !== incoming.id)];
 }
+type MessageAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  storagePath: string;
+};
+
+type PendingAttachment = {
+  localId: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  dataBase64: string;
+  previewUrl: string;
+};
+
 type Message = {
   id: number;
   role: string;
@@ -186,7 +204,42 @@ type Message = {
   roleplayPerceptionData?: RoleplayPerceptionProjection;
   variantGroupId?: string;
   variantCount?: number;
+  attachments?: MessageAttachment[];
 };
+
+const MULTIMODAL_MAX_ATTACHMENTS = 4;
+const MULTIMODAL_MAX_BYTES = 4 * 1024 * 1024;
+const MULTIMODAL_MIME = new Set(["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]);
+
+function isSupportedComposerImage(file: File): boolean {
+  return MULTIMODAL_MIME.has(file.type.toLowerCase());
+}
+
+async function fileToPendingAttachment(file: File): Promise<PendingAttachment> {
+  if (!isSupportedComposerImage(file)) throw new Error(`不支持的图片类型：${file.type || file.name}`);
+  if (file.size > MULTIMODAL_MAX_BYTES) throw new Error("单张图片不能超过 4MB");
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return {
+    localId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: file.name || "image.png",
+    mimeType: file.type === "image/jpg" ? "image/jpeg" : file.type,
+    size: file.size,
+    dataBase64: btoa(binary),
+    previewUrl: URL.createObjectURL(file),
+  };
+}
+
+function attachmentImageUrl(sessionId: string, attachmentId: string): string {
+  const token = getAccessToken() || "";
+  const query = token ? `?token=${encodeURIComponent(token)}` : "";
+  return apiUrl(`/api/session/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}${query}`);
+}
 type RoleplayPerceptionProjection = {
   speech: string[];
   knowableFacts: string[];
@@ -472,6 +525,7 @@ type Provider = {
   apiKeyConfigured: boolean;
   apiKeyHint: string;
   source: "project" | "environment";
+  supportsMultimodal?: boolean;
   pricing: {
     billingMode?: "metered" | "unmetered";
     cacheHit: number;
@@ -755,6 +809,26 @@ function loadWorkspaceMode(): WorkspaceMode {
   return stored === "editor-focus" || stored === "agent-focus" ? stored : "split";
 }
 
+const LAST_SESSION_KEY = "writer-last-session-id";
+
+function readLastSessionId(): string | undefined {
+  try {
+    const id = localStorage.getItem(LAST_SESSION_KEY)?.trim();
+    return id || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rememberLastSessionId(id: string | undefined): void {
+  if (!id) return;
+  try {
+    localStorage.setItem(LAST_SESSION_KEY, id);
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 function IconButton({ label, children, className = "", onClick, disabled = false }: {
   label: string;
   children: React.ReactNode;
@@ -818,6 +892,53 @@ function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRu
         <i className="settings-menu-separator" aria-hidden="true" />
         <button type="button" role="menuitem" disabled={!connectionAvailable} onClick={pick(() => onSelect("connection"))}><Wifi size={16} aria-hidden="true" />连接设置</button>
         <button type="button" role="menuitem" onClick={pick(() => onSelect("appearance"))}><Sun size={16} aria-hidden="true" />界面主题</button>
+      </div>
+    </div>
+  );
+}
+
+function HeaderMoreMenu({
+  open,
+  busy,
+  readOnly,
+  onClose,
+  onCharacters,
+  onRoleplay,
+  onSessions,
+  onShare,
+  onSettings,
+  onRefresh,
+}: {
+  open: boolean;
+  busy: boolean;
+  readOnly: boolean;
+  onClose: () => void;
+  onCharacters: () => void;
+  onRoleplay: () => void;
+  onSessions: () => void;
+  onShare: () => void;
+  onSettings: () => void;
+  onRefresh: () => void;
+}) {
+  if (!open) return null;
+  const pick = (action: () => void) => () => {
+    action();
+    onClose();
+  };
+  return (
+    <div className="settings-menu-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="settings-menu header-more-menu" role="menu" aria-label="更多操作" onMouseDown={(event) => event.stopPropagation()}>
+        <button type="button" role="menuitem" onClick={pick(onCharacters)}><IdCard size={16} aria-hidden="true" />角色</button>
+        <button type="button" role="menuitem" disabled={busy || readOnly} onClick={pick(onRoleplay)}><Drama size={16} aria-hidden="true" />扮演</button>
+        <button type="button" role="menuitem" onClick={pick(onSessions)}><MessageSquare size={16} aria-hidden="true" />会话</button>
+        <i className="settings-menu-separator" aria-hidden="true" />
+        {!readOnly && (
+          <button type="button" role="menuitem" onClick={pick(onShare)}><Share2 size={16} aria-hidden="true" />分享</button>
+        )}
+        {!readOnly && (
+          <button type="button" role="menuitem" onClick={pick(onSettings)}><Settings size={16} aria-hidden="true" />设置</button>
+        )}
+        <button type="button" role="menuitem" onClick={pick(onRefresh)}><RefreshCw size={16} aria-hidden="true" />刷新</button>
       </div>
     </div>
   );
@@ -1975,9 +2096,9 @@ function AgentStepContextResetBanner({
   return (
     <div
       className="agent-step-context-reset"
-      title="章/场边界：截断回稳定前缀+树干+交接，丢弃上一章/场的工具过程。后续 read_document 是按需补读细节，不是裁剪失败。"
+      title="完成一章或一场后会收束上下文：保留稳定规则、项目索引与章节衔接，丢弃上一章的过程细节。之后若再读设定或前章，属于按需补充，属正常行为。"
     >
-      <span className="agent-step-context-reset-badge">上下文裁剪</span>
+      <span className="agent-step-context-reset-badge">上下文收束</span>
       <span className="agent-step-context-reset-flow">
         Step {reset.fromStep} → {reset.toStep}
       </span>
@@ -1986,7 +2107,7 @@ function AgentStepContextResetBanner({
         <em>−{formatGraphTokens(saved)}</em>
       </span>
       <span className="agent-step-context-reset-hint">
-        保留 L0 前缀+树干+交接 · 丢弃上一章过程 · 细节仍须工具补读
+        章节切换 · 保留规则与衔接 · 清空过程痕迹
       </span>
     </div>
   );
@@ -2047,16 +2168,16 @@ function AgentStepCard({
         <div className="agent-step-content">
           {reset ? (
             <div className="agent-step-context-reset-detail">
-              <strong>本步继承（裁剪后）</strong>
+              <strong>本章节起重新装载的上下文</strong>
               <ul>
-                <li>稳定系统前缀 + 项目树干（L0，跨章缓存）</li>
-                <li>本轮开轮任务块 + 章/场交接 handoff（结果态，非全文）</li>
+                <li>写作规则与项目索引（跨章可复用）</li>
+                <li>当前任务说明与上一章/场的衔接摘要</li>
                 <li>
-                  已丢弃约 {formatGraphTokens(reset.before - reset.after)} tok 的上一章/场工具过程
-                  （read/propose 全文等）
+                  已卸下约 {formatGraphTokens(reset.before - reset.after)} 的过程痕迹
+                  （草稿全文、重试与中间工具结果）
                 </li>
                 <li>
-                  若仍出现 read_document / search_project：树干只有索引与路径，具体 lore/前章细节需最小补读，属预期
+                  若随后仍读取设定或前章：索引不含全文细节，按需补充属正常
                 </li>
               </ul>
             </div>
@@ -2163,10 +2284,10 @@ function AgentStepCard({
 const CONTEXT_GRAPH_KIND_LABEL: Record<string, string> = {
   message: "消息",
   epoch: "任务",
-  handoff: "交接",
+  handoff: "衔接",
   artifact: "交付",
-  assemble_slice: "装配",
-  project_note: "树干",
+  assemble_slice: "装载",
+  project_note: "索引",
 };
 
 const CONTEXT_GRAPH_EDGE_LABEL: Record<string, string> = {
@@ -2176,7 +2297,7 @@ const CONTEXT_GRAPH_EDGE_LABEL: Record<string, string> = {
   supersedes: "取代",
   archives: "归档",
   includes: "包含",
-  replays: "续前缀",
+  replays: "续写",
   tree_child: "子节点",
   tree_next: "下一轮",
 };
@@ -2192,11 +2313,42 @@ const CONTEXT_GRAPH_TURN_CHILD_ORDER: Record<string, number> = {
 };
 
 const CONTEXT_GRAPH_LAYER_LABEL: Record<string, string> = {
-  L0: "L0 稳定前缀/树干",
-  L1: "L1 冻块 replay",
-  L2: "L2 交接结果态",
-  L3: "L3 本轮过程",
+  L0: "规则与项目索引",
+  L1: "历史续写",
+  L2: "章节衔接",
+  L3: "本轮过程",
 };
+
+/** Soften old graph payload jargon when rendering kept/dropped lines. */
+function humanizeContextCopy(text: string): string {
+  return text
+    .replace(/L0\s*/g, "")
+    .replace(/L1\s*/g, "")
+    .replace(/L2\s*/g, "")
+    .replace(/L3\s*/g, "")
+    .replace(/handoff/gi, "衔接")
+    .replace(/replay/gi, "续写")
+    .replace(/材料架/g, "已读材料")
+    .replace(/项目树干/g, "项目索引")
+    .replace(/树干/g, "索引")
+    .replace(/冻块/g, "历史块")
+    .replace(/稳定系统前缀/g, "写作规则")
+    .replace(/稳定前缀/g, "写作规则")
+    .replace(/工具 schema/g, "工具定义")
+    .replace(/跨 turn /g, "跨轮 ")
+    .replace(/跨章字节稳定[，,]?/g, "跨章可复用")
+    .replace(/下一批 step 仍可前缀命中/g, "后续步骤可复用缓存")
+    .replace(/前缀命中/g, "缓存命中")
+    .replace(/actualState/g, "已写状态")
+    .replace(/sourceHash 未变则 materials_shelf_hit/g, "文件未改则直接复用")
+    .replace(/materials_shelf_hit/g, "直接复用")
+    .replace(/同 session 持久 digests[；;]?/g, "本会话已读摘要；")
+    .replace(/digests/g, "摘要")
+    .replace(/tok\b/g, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/[·.\-—]\s*$/g, "")
+    .trim();
+}
 
 /**
  * The number the card shows, when the payload carries one worth showing.
@@ -2246,7 +2398,7 @@ function contextGraphNodeMetric(node: ContextGraphNode): ContextGraphNodeMetric 
     if (estimatedTokens == null || estimatedTokens <= 0) return null;
     return {
       kind: "layers",
-      segments: [{ layer: "L0", label: "项目树干", tokens: estimatedTokens }],
+      segments: [{ layer: "L0", label: "项目索引", tokens: estimatedTokens }],
       total: estimatedTokens,
     };
   }
@@ -2283,8 +2435,8 @@ function contextGraphCacheSummary(
   return { hitRate: hitTokens / promptTokens, promptTokens, turns: measured.length };
 }
 
-const CONTEXT_GRAPH_NODE_H = 68;
-const CONTEXT_GRAPH_NODE_H_TALL = 88;
+const CONTEXT_GRAPH_NODE_H = 58;
+const CONTEXT_GRAPH_NODE_H_TALL = 74;
 
 /** Cards carrying a metric strip need the extra row; everything else stays compact. */
 function contextGraphNodeHeight(node: ContextGraphNode): number {
@@ -2386,7 +2538,7 @@ function buildContextGraphTree(nodes: ContextGraphNode[]): ContextGraphTreeItem 
     sessionId,
     kind: "project_note",
     status: "active",
-    label: "会话共享前缀 · L0",
+    label: "会话共享基础",
     payload: { kind: "trunk", virtual: true, estimatedTokens: 0 },
     createdAt: turns[0]?.sortAt ?? new Date().toISOString(),
     updatedAt: turns[0]?.sortAt ?? new Date().toISOString(),
@@ -2460,32 +2612,32 @@ function contextGraphNodeTitle(node: ContextGraphNode): string {
     return truncateGraphLabel(raw.replace(/^任务\s*[·.\-—]\s*/, ""), 20);
   }
   if (node.kind === "handoff" || node.kind === "artifact") {
-    return truncateGraphLabel(raw.replace(/^(章交接|交付)\s*[·.\-—]\s*/, ""), 20);
+    return truncateGraphLabel(raw.replace(/^(章节衔接|章交接|交付)\s*[·.\-—]\s*/, ""), 20);
   }
   if (node.kind === "project_note" && node.payload?.kind === "trunk") {
     const chars = typeof node.payload.characterCount === "number" ? node.payload.characterCount : undefined;
     const outline = typeof node.payload.outlineNodeCount === "number" ? node.payload.outlineNodeCount : undefined;
     if (chars != null || outline != null) {
-      return truncateGraphLabel(`共享 · 角${chars ?? 0}/纲${outline ?? 0}`, 20);
+      return truncateGraphLabel(`角色 ${chars ?? 0} · 大纲 ${outline ?? 0}`, 22);
     }
-    return truncateGraphLabel(raw.replace(/^树干\s*[·.\-—]\s*/, "") || "项目树干", 18);
+    return truncateGraphLabel(raw.replace(/^树干\s*[·.\-—]\s*/, "") || "项目索引", 18);
   }
   if (node.kind === "assemble_slice") {
     const note = typeof node.payload?.note === "string" ? node.payload.note : "";
     const step = typeof node.payload?.step === "number" ? node.payload.step : undefined;
     const transition = node.payload?.transition as { kind?: string } | undefined;
-    const stepTag = step != null && step > 0 ? ` · s${step}` : "";
+    const stepTag = step != null && step > 0 ? ` · Step ${step}` : "";
     if (transition?.kind === "chapter_boundary" || raw.includes("章边界") || note.includes("章边界") || /chapter boundary/i.test(note)) {
-      return truncateGraphLabel(`章边界截断${stepTag}`, 22);
+      return truncateGraphLabel(`章节切换${stepTag}`, 22);
     }
     if (transition?.kind === "scene_boundary" || raw.includes("场边界") || note.includes("场边界")) {
-      return truncateGraphLabel(`场边界截断${stepTag}`, 22);
+      return truncateGraphLabel(`场次切换${stepTag}`, 22);
     }
     if (transition?.kind === "open_turn" || note.includes("开轮") || /initial assemble/i.test(note)) {
-      return "开轮装配";
+      return "本轮开场";
     }
-    if (note) return truncateGraphLabel(note, 20);
-    return truncateGraphLabel(raw.replace(/^装配\s*[·.\-—]\s*/, "") || "开轮", 18);
+    if (note) return truncateGraphLabel(humanizeContextCopy(note), 20);
+    return truncateGraphLabel(raw.replace(/^装配\s*[·.\-—]\s*/, "") || "本轮开场", 18);
   }
   return truncateGraphLabel(raw, 20);
 }
@@ -2570,28 +2722,28 @@ function contextTransitionFromPayload(payload: Record<string, unknown> | undefin
 
 function ContextTransitionDetail({ transition }: { transition: ContextTransitionView }) {
   const kindLabel = transition.kind === "chapter_boundary"
-    ? "章边界截断"
+    ? "章节切换"
     : transition.kind === "scene_boundary"
-      ? "场边界截断"
+      ? "场次切换"
       : transition.kind === "open_turn"
-        ? "开轮装配"
+        ? "本轮开场"
         : "上下文变化";
   const saved = transition.beforeTokens != null && transition.afterTokens != null
     ? Math.max(0, transition.beforeTokens - transition.afterTokens)
     : undefined;
   return (
     <div className="context-transition-detail">
-      <h4>继承对照 · {kindLabel}</h4>
+      <h4>装载对照 · {kindLabel}</h4>
       {transition.atStep != null ? (
         <p className="context-transition-step">
           发生在 Step {transition.atStep} 结束时
           {transition.path ? ` · ${transition.path}` : ""}
-          {" → 下一步继承裁剪后的前缀"}
+          {" → 下一步只携带收束后的上下文"}
         </p>
       ) : null}
       {transition.beforeTokens != null && transition.afterTokens != null ? (
         <div className="context-transition-bar" aria-hidden="true">
-          <div className="context-transition-bar-before" title={`裁剪前 ${transition.beforeTokens} tok`}>
+          <div className="context-transition-bar-before" title={`收束前 ${transition.beforeTokens.toLocaleString()}`}>
             <span>前 {formatGraphTokens(transition.beforeTokens)}</span>
           </div>
           <div
@@ -2599,7 +2751,7 @@ function ContextTransitionDetail({ transition }: { transition: ContextTransition
             style={{
               width: `${Math.max(12, Math.min(100, (transition.afterTokens / Math.max(1, transition.beforeTokens)) * 100))}%`,
             }}
-            title={`裁剪后 ${transition.afterTokens} tok`}
+            title={`收束后 ${transition.afterTokens.toLocaleString()}`}
           >
             <span>后 {formatGraphTokens(transition.afterTokens)}</span>
           </div>
@@ -2610,12 +2762,12 @@ function ContextTransitionDetail({ transition }: { transition: ContextTransition
       ) : null}
       {transition.kept.length ? (
         <div className="context-transition-col keep">
-          <strong>保留 / 继承</strong>
+          <strong>继续携带</strong>
           <ul>
             {transition.kept.map((item) => (
               <li key={item.id}>
-                <span>{item.label}</span>
-                {item.detail ? <small>{item.detail}</small> : null}
+                <span>{humanizeContextCopy(item.label)}</span>
+                {item.detail ? <small>{humanizeContextCopy(item.detail)}</small> : null}
               </li>
             ))}
           </ul>
@@ -2623,12 +2775,12 @@ function ContextTransitionDetail({ transition }: { transition: ContextTransition
       ) : null}
       {transition.dropped.length ? (
         <div className="context-transition-col drop">
-          <strong>丢弃 / 不继承</strong>
+          <strong>卸下不带</strong>
           <ul>
             {transition.dropped.map((item) => (
               <li key={item.id}>
-                <span>{item.label}</span>
-                {item.detail ? <small>{item.detail}</small> : null}
+                <span>{humanizeContextCopy(item.label)}</span>
+                {item.detail ? <small>{humanizeContextCopy(item.detail)}</small> : null}
               </li>
             ))}
           </ul>
@@ -2636,76 +2788,171 @@ function ContextTransitionDetail({ transition }: { transition: ContextTransition
       ) : null}
       {transition.reReadHint ? (
         <p className="context-transition-reread">
-          <strong>为何还会 read_document？</strong>
-          {transition.reReadHint}
+          <strong>之后仍会读文件？</strong>
+          {humanizeContextCopy(transition.reReadHint)}
         </p>
       ) : null}
     </div>
   );
 }
 
+function treeChildEdgeLabel(item: ContextGraphTreeItem): string {
+  if (item.node.kind === "epoch") return "任务";
+  if (item.node.kind === "handoff" || item.node.kind === "artifact") return "产出";
+  if (item.node.kind === "assemble_slice") return "装载";
+  return "子节点";
+}
+
 /**
- * Outline-style tree layout (indent by depth, stack by preorder).
- * Only parent→child links are drawn — one session = one tree.
+ * Flatten nested turn chain into sibling turns under the root for left→right layout.
+ * Process leaves stay attached to their turn.
+ */
+function flattenContextGraphTurns(tree: ContextGraphTreeItem): Array<{
+  turn: ContextGraphTreeItem;
+  leaves: ContextGraphTreeItem[];
+}> {
+  const bands: Array<{ turn: ContextGraphTreeItem; leaves: ContextGraphTreeItem[] }> = [];
+  let cursor: ContextGraphTreeItem | undefined = tree.role === "root"
+    ? tree.children.find((child) => child.role === "turn")
+    : tree.role === "turn"
+      ? tree
+      : undefined;
+  while (cursor) {
+    const leaves = cursor.children.filter((child) => child.role !== "turn");
+    const next = cursor.children.find((child) => child.role === "turn");
+    bands.push({ turn: cursor, leaves });
+    cursor = next;
+  }
+  return bands;
+}
+
+type ContextGraphMeasure = {
+  item: ContextGraphTreeItem;
+  height: number;
+  children: ContextGraphMeasure[];
+};
+
+/**
+ * Left→right tidy tree (参考：父节点在左，子节点在右同列纵向平铺，竖轨连接).
  *
- * depthGap must stay wide enough for elbow routes + optional edge chips;
- * too narrow and arrows/labels sit under the next column of cards.
+ *   [root]──┬──[turn1]──┬── process
+ *           │           └── process
+ *           ├──[turn2]── process
+ *           └──[turn3]──┬── process
+ *                       └── process
+ *
+ * Turns are siblings under root so the graph grows sideways, not a diagonal staircase.
  */
 function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraphLayout {
-  const nodeW = 200;
-  /** Gutter between depth columns — edge bus + labels live here, never under cards. */
-  const depthGap = 88;
-  const vGap = 16;
-  const padX = 24;
-  const padTop = 24;
-  const padBottom = 32;
+  const nodeW = 176;
+  const colGap = 56; // horizontal gap between parent column and child column
+  const vGap = 12;   // vertical gap between sibling cards
+  const padX = 20;
+  const padTop = 16;
+  const padBottom = 20;
+  const padRight = 20;
 
   const tree = buildContextGraphTree(nodes);
   const placed: ContextGraphLayoutNode[] = [];
   const treeLinks: ContextGraphTreeLink[] = [];
-  let cursorY = padTop;
-  let maxDepth = 0;
+  if (!tree) {
+    return { placed: [], width: 520, height: 200, nodeW, nodeHeights: [], treeLinks };
+  }
 
-  const place = (item: ContextGraphTreeItem, depth: number, parentId?: string, linkKind?: ContextGraphTreeLink["kind"]) => {
-    const h = contextGraphNodeHeight(item.node);
-    const x = padX + depth * (nodeW + depthGap);
-    const y = cursorY;
+  // Display tree: root → turns (siblings) → process leaves
+  const turns = flattenContextGraphTurns(tree);
+  const displayRoot: ContextGraphTreeItem = {
+    node: tree.node,
+    role: "root",
+    children: turns.map(({ turn, leaves }) => ({
+      node: turn.node,
+      role: "turn" as const,
+      children: leaves,
+    })),
+  };
+
+  const measure = (item: ContextGraphTreeItem): ContextGraphMeasure => {
+    const selfH = contextGraphNodeHeight(item.node);
+    if (!item.children.length) {
+      return { item, height: selfH, children: [] };
+    }
+    const childMeasures = item.children.map(measure);
+    const childrenH = childMeasures.reduce((sum, child, index) => (
+      sum + child.height + (index > 0 ? vGap : 0)
+    ), 0);
+    return {
+      item,
+      height: Math.max(selfH, childrenH),
+      children: childMeasures,
+    };
+  };
+
+  const measured = measure(displayRoot);
+
+  const place = (m: ContextGraphMeasure, depth: number, x: number, yTop: number): void => {
+    const selfH = contextGraphNodeHeight(m.item.node);
+    // Parent vertically centered against the whole child block (or just itself).
+    const y = yTop + Math.max(0, (m.height - selfH) / 2);
     placed.push({
-      ...item.node,
+      ...m.item.node,
       x,
       y,
       w: nodeW,
-      h,
+      h: selfH,
       depth,
-      treeRole: item.role,
+      treeRole: m.item.role,
     });
-    maxDepth = Math.max(maxDepth, depth);
-    if (parentId && linkKind) {
-      const label = linkKind === "tree_next"
-        ? "下一轮"
-        : item.node.kind === "epoch"
-          ? "任务"
-          : item.node.kind === "handoff" || item.node.kind === "artifact"
-            ? "产出"
-            : item.node.kind === "assemble_slice"
-              ? "装配"
-              : "子节点";
-      treeLinks.push({
-        id: `tree-${parentId}-${item.node.id}`,
-        fromId: parentId,
-        toId: item.node.id,
-        kind: linkKind,
-        label,
-      });
+
+    if (!m.children.length) return;
+    const childX = x + nodeW + colGap;
+    let childY = yTop;
+    // If children block is shorter than parent, center the block under parent.
+    const childrenH = m.children.reduce((sum, child, index) => (
+      sum + child.height + (index > 0 ? vGap : 0)
+    ), 0);
+    if (childrenH < m.height) {
+      childY = yTop + (m.height - childrenH) / 2;
     }
-    cursorY += h + vGap;
-    for (const child of item.children) {
-      const childLink: ContextGraphTreeLink["kind"] = child.role === "turn" ? "tree_next" : "tree_child";
-      place(child, depth + 1, item.node.id, childLink);
+    for (const child of m.children) {
+      place(child, depth + 1, childX, childY);
+      childY += child.height + vGap;
     }
   };
 
-  if (tree) place(tree, 0);
+  place(measured, 0, padX, padTop);
+
+  const link = (
+    fromId: string,
+    toId: string,
+    kind: ContextGraphTreeLink["kind"],
+    label: string,
+  ) => {
+    treeLinks.push({
+      id: `tree-${fromId}-${toId}`,
+      fromId,
+      toId,
+      kind,
+      label,
+    });
+  };
+
+  // Root → each turn; turn → process leaves; consecutive turns "下一轮"
+  for (const turnItem of displayRoot.children) {
+    link(
+      displayRoot.node.id,
+      turnItem.node.id,
+      "tree_child",
+      "轮次",
+    );
+    for (const leaf of turnItem.children) {
+      link(turnItem.node.id, leaf.node.id, "tree_child", treeChildEdgeLabel(leaf));
+    }
+  }
+  for (let index = 0; index < displayRoot.children.length - 1; index += 1) {
+    const a = displayRoot.children[index]!;
+    const b = displayRoot.children[index + 1]!;
+    link(a.node.id, b.node.id, "tree_next", "下一轮");
+  }
 
   const seen = new Set<string>();
   const unique = placed.filter((node) => {
@@ -2714,10 +2961,13 @@ function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraphLayout 
     return true;
   });
 
+  const maxX = unique.reduce((m, node) => Math.max(m, node.x + node.w), padX + nodeW);
+  const maxY = unique.reduce((m, node) => Math.max(m, node.y + node.h), padTop + CONTEXT_GRAPH_NODE_H);
+
   return {
     placed: unique,
-    width: Math.max(520, padX + (maxDepth + 1) * (nodeW + depthGap) + padX),
-    height: Math.max(200, cursorY - vGap + padBottom),
+    width: Math.max(480, maxX + padRight),
+    height: Math.max(180, maxY + padBottom),
     nodeW,
     nodeHeights: [...new Set(unique.map((node) => node.h))],
     treeLinks,
@@ -2725,35 +2975,55 @@ function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraphLayout 
 }
 
 /**
- * Orthogonal route through the depth gutter so the stroke never runs under cards.
- * Ends short of the child face so the arrowhead stays visible (nodes paint above edges).
+ * Parent→child elbow with a vertical bus in the column gutter
+ * (matches the left-parent / right-stacked-children diagram).
+ * Same-column links (e.g. 下一轮 between sibling turns) use a short side rail.
  */
 function treeEdgeRoute(from: ContextGraphLayoutNode, to: ContextGraphLayoutNode): {
   d: string;
   labelX: number;
   labelY: number;
 } {
-  const startX = from.x + from.w;
-  const startY = from.y + from.h / 2;
-  // Leave room for the 8px marker tip; nodes are drawn after edges and would cover it.
-  const endX = to.x - 6;
-  const endY = to.y + to.h / 2;
-  const gap = to.x - (from.x + from.w);
-  const gutterX = from.x + from.w + Math.max(20, gap * 0.5);
+  const tip = 6;
+  const fromCy = from.y + from.h / 2;
+  const toCy = to.y + to.h / 2;
+  const sameColumn = Math.abs(to.x - from.x) < 8;
 
-  const d = Math.abs(endY - startY) < 1.5
-    ? `M ${startX} ${startY} L ${endX} ${endY}`
-    : `M ${startX} ${startY} L ${gutterX} ${startY} L ${gutterX} ${endY} L ${endX} ${endY}`;
+  // Sibling stack in one column (turn → next turn): rail on the left gutter.
+  if (sameColumn) {
+    const goingDown = to.y >= from.y;
+    const startY = goingDown ? from.y + from.h : from.y;
+    const endY = goingDown ? to.y - tip : to.y + to.h + tip;
+    const railX = from.x - 14;
+    return {
+      d: `M ${from.x} ${startY} L ${railX} ${startY} L ${railX} ${endY} L ${to.x} ${endY}`,
+      labelX: railX - 2,
+      labelY: (startY + endY) / 2,
+    };
+  }
 
-  // Label sits on the gutter bus (vertical if the link drops, else mid-horizontal).
-  const labelX = Math.abs(endY - startY) < 1.5
-    ? (startX + endX) / 2
-    : gutterX;
-  const labelY = Math.abs(endY - startY) < 1.5
-    ? startY - 10
-    : (startY + endY) / 2;
+  const goingRight = to.x > from.x;
+  const startX = goingRight ? from.x + from.w : from.x;
+  const endX = goingRight ? to.x - tip : to.x + to.w + tip;
+  const busX = goingRight
+    ? from.x + from.w + Math.max(16, (to.x - (from.x + from.w)) * 0.45)
+    : from.x - Math.max(16, (from.x - (to.x + to.w)) * 0.45);
 
-  return { d, labelX, labelY };
+  // Same row: straight horizontal.
+  if (Math.abs(toCy - fromCy) < 1.5) {
+    return {
+      d: `M ${startX} ${fromCy} L ${endX} ${toCy}`,
+      labelX: (startX + endX) / 2,
+      labelY: fromCy - 10,
+    };
+  }
+
+  // Bracket: out from parent mid → vertical bus → into child mid-left/right.
+  return {
+    d: `M ${startX} ${fromCy} L ${busX} ${fromCy} L ${busX} ${toCy} L ${endX} ${toCy}`,
+    labelX: busX,
+    labelY: (fromCy + toCy) / 2,
+  };
 }
 
 function ContextGraphCanvas({
@@ -2843,13 +3113,13 @@ function ContextGraphCanvas({
         <div className="context-graph-empty-card">
           <GitBranch size={22} aria-hidden="true" />
           <strong>暂无上下文节点</strong>
-          <span>跑一轮 Agent 写作任务后，这里会显示会话树：共享前缀 → 各轮消息 → 任务与交接。</span>
+          <span>跑一轮写作任务后，这里会展示会话树：共享基础 → 各轮消息 → 任务与衔接。</span>
         </div>
       </div>
     );
   }
 
-  const svgHeight = Math.min(620, Math.max(280, layout.height + 4));
+  const svgHeight = Math.min(560, Math.max(220, layout.height + 4));
 
   return (
     <div className="context-graph-canvas" role="img" aria-label="上下文会话树">
@@ -2861,10 +3131,10 @@ function ContextGraphCanvas({
           </span>
         ))}
         <span className="context-graph-legend-sep" />
-        <span className="context-graph-legend-item edge-replays"><i />下一轮 · 续前缀</span>
+        <span className="context-graph-legend-item edge-replays"><i />下一轮 · 续写</span>
         <span className="context-graph-legend-item status-archived"><i />归档</span>
         <span className="context-graph-legend-hint">
-          一会话一棵树 · 根=共享 L0 · 嵌套轮次=前缀变长 · 侧枝=该轮过程
+          左右平铺 · 父在左 · 子在右纵向排列
         </span>
       </div>
       <div className="context-graph-viewport-controls">
@@ -2964,9 +3234,9 @@ function ContextGraphCanvas({
           const superseded = supersededIds.has(node.id);
           const pillText = superseded ? "已被取代" : "归档";
           const pillW = Math.max(30, graphLabelUnits(pillText) * 5.4 + 10);
-          const barX = 14;
-          const barW = node.w - 28;
-          const barY = node.h - 12;
+          const barX = 12;
+          const barW = node.w - 24;
+          const barY = node.h - 10;
           const replayTurns = node.kind === "assemble_slice" ? assembleReplayTurns(node) : undefined;
           return (
             <g
@@ -2977,24 +3247,24 @@ function ContextGraphCanvas({
               style={{ cursor: "pointer" }}
             >
               <title>{`${kindLabel}: ${node.label}`}</title>
-              <rect width={node.w} height={node.h} rx={12} ry={12} className="context-graph-svg-card" filter="url(#ctx-node-shadow)" />
+              <rect width={node.w} height={node.h} rx={10} ry={10} className="context-graph-svg-card" filter="url(#ctx-node-shadow)" />
               <g clipPath={`url(#ctx-node-clip-${node.h})`}>
-                <rect x={0} y={0} width={4} height={node.h} className="context-graph-svg-accent" />
-                <text x={14} y={22} className="context-graph-svg-kind">{kindLabel}</text>
+                <rect x={0} y={0} width={3} height={node.h} className="context-graph-svg-accent" />
+                <text x={12} y={18} className="context-graph-svg-kind">{kindLabel}</text>
                 {node.status === "archived" ? (
-                  <g transform={`translate(${node.w - pillW - 12}, 10)`}>
-                    <rect width={pillW} height={13} rx={6} className="context-graph-status-pill" />
-                    <text x={pillW / 2} y={10} textAnchor="middle" className="context-graph-status-pill-text">{pillText}</text>
+                  <g transform={`translate(${node.w - pillW - 10}, 8)`}>
+                    <rect width={pillW} height={12} rx={6} className="context-graph-status-pill" />
+                    <text x={pillW / 2} y={9} textAnchor="middle" className="context-graph-status-pill-text">{pillText}</text>
                   </g>
                 ) : null}
-                <text x={14} y={42} className="context-graph-svg-label">{title}</text>
-                <text x={14} y={58} className="context-graph-svg-meta">
-                  {meta}{replayTurns != null && replayTurns > 0 ? ` · 复放${replayTurns}` : ""}
+                <text x={12} y={36} className="context-graph-svg-label">{title}</text>
+                <text x={12} y={50} className="context-graph-svg-meta">
+                  {meta}{replayTurns != null && replayTurns > 0 ? ` · 历史 ${replayTurns} 轮` : ""}
                 </text>
                 {metric?.kind === "layers" ? (
                   <>
-                    <text x={14} y={74} className="context-graph-svg-metric">
-                      {`装配 ${formatGraphTokens(metric.total)} tok`}
+                    <text x={12} y={63} className="context-graph-svg-metric">
+                      {`共 ${formatGraphTokens(metric.total)}`}
                     </text>
                     {(() => {
                       let offset = 0;
@@ -3020,7 +3290,7 @@ function ContextGraphCanvas({
                 ) : null}
                 {metric?.kind === "cache" ? (
                   <>
-                    <text x={14} y={74} className="context-graph-svg-metric">
+                    <text x={12} y={63} className="context-graph-svg-metric">
                       {[
                         metric.frozenTokens != null ? `冻结 ${formatGraphTokens(metric.frozenTokens)}` : null,
                         metric.hitRate != null ? `命中 ${Math.round(metric.hitRate * 100)}%` : "命中 未实测",
@@ -3036,7 +3306,7 @@ function ContextGraphCanvas({
                         rx={3}
                         className="context-graph-hit-fill"
                       >
-                        <title>{`实测前缀命中 ${Math.round(metric.hitRate * 100)}%${metric.promptTokens ? ` · prompt ${formatGraphTokens(metric.promptTokens)} tok` : ""}`}</title>
+                        <title>{`缓存命中 ${Math.round(metric.hitRate * 100)}%${metric.promptTokens ? ` · 输入 ${formatGraphTokens(metric.promptTokens)}` : ""}`}</title>
                       </rect>
                     ) : null}
                   </>
@@ -3116,6 +3386,7 @@ function WorkspaceTopbar({
   busy,
   readOnly,
   settingsOpen,
+  moreOpen,
   workspaceMode,
   documentsCollapsed,
   onCharacters,
@@ -3129,6 +3400,8 @@ function WorkspaceTopbar({
   onSelectSettings,
   onReviewRules,
   onContinuityFacts,
+  onToggleMore,
+  onCloseMore,
   onRefresh,
   onModeChange,
   onToggleDocuments,
@@ -3143,6 +3416,7 @@ function WorkspaceTopbar({
   busy: boolean;
   readOnly: boolean;
   settingsOpen: boolean;
+  moreOpen: boolean;
   workspaceMode: WorkspaceMode;
   documentsCollapsed: boolean;
   onCharacters: () => void;
@@ -3156,10 +3430,13 @@ function WorkspaceTopbar({
   onSelectSettings: (section: SettingsSection) => void;
   onReviewRules: () => void;
   onContinuityFacts: () => void;
+  onToggleMore: () => void;
+  onCloseMore: () => void;
   onRefresh: () => void;
   onModeChange: (mode: WorkspaceMode) => void;
   onToggleDocuments: () => void;
 }) {
+  const usageLabel = usageUnmetered ? "非按量" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(2)}`;
   return (
     <header className="workspace-topbar">
       <div className="header-left">
@@ -3180,7 +3457,7 @@ function WorkspaceTopbar({
             <span className="connection-pill-label">{connection.label}</span>
           </button>
         )}
-        {readOnly && <span className="readonly-pill"><LockKeyhole size={12} />只读分享</span>}
+        {readOnly && <span className="readonly-pill"><LockKeyhole size={12} />只读</span>}
       </div>
       <div className="header-right">
         <LayoutControls
@@ -3189,33 +3466,77 @@ function WorkspaceTopbar({
           onModeChange={onModeChange}
           onToggleDocuments={onToggleDocuments}
         />
-        <nav className="nav-cluster" aria-label="工作区入口">
-          <button type="button" className="ghost nav-action" aria-label="角色" title="角色" onClick={onCharacters}><IdCard size={17} aria-hidden="true" /><span>角色</span></button>
-          <button type="button" className="ghost nav-action" aria-label="扮演" title="扮演" disabled={busy || readOnly} onClick={onRoleplay}><Drama size={17} aria-hidden="true" /><span>扮演</span></button>
-          <button type="button" className="ghost nav-action" aria-label="会话" title="会话" onClick={onSessions}><MessageSquare size={16} aria-hidden="true" /><span>会话</span></button>
+        <nav className="nav-cluster nav-workspace" aria-label="工作区入口">
+          <button type="button" className="ghost nav-action" aria-label="角色" title="角色" onClick={onCharacters}>
+            <IdCard size={17} aria-hidden="true" /><span>角色</span>
+          </button>
+          <button type="button" className="ghost nav-action" aria-label="扮演" title="扮演" disabled={busy || readOnly} onClick={onRoleplay}>
+            <Drama size={17} aria-hidden="true" /><span>扮演</span>
+          </button>
+          <button type="button" className="ghost nav-action nav-sessions" aria-label="会话" title="会话" onClick={onSessions}>
+            <MessageSquare size={16} aria-hidden="true" /><span>会话</span>
+          </button>
         </nav>
-        <button className="usage-strip" onClick={onUsage} title="当前会话用量与计费明细">
+        <button
+          type="button"
+          className="usage-strip"
+          onClick={onUsage}
+          title={`${model} · 上下文 ${usagePct}% · ${usageUnmetered ? "非按量计费" : `费用 ${usageLabel}`}`}
+        >
           <span className="model-name">{model}</span>
-          <span className="context-meter" title={`${usagePct}% context`} aria-hidden="true">
+          <span className="context-meter" title={`上下文 ${usagePct}%`} aria-hidden="true">
             <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
           </span>
-          <span>{usagePct}%</span>
+          <span className="usage-pct">{usagePct}%</span>
           <span className="usage-cost">{usageUnmetered ? "非按量计费" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(4)}`}</span>
-          <ChevronDown size={13} aria-hidden="true" />
+          <ChevronDown size={13} className="usage-chevron-icon" aria-hidden="true" />
         </button>
-        {!readOnly && <button type="button" className="ghost nav-action" onClick={onShare} title="生成新的只读分享链接"><Share2 size={16} /><span>分享</span></button>}
-        {!readOnly && <div className="settings-anchor">
-          <IconButton label="设置" className={settingsOpen ? "active" : ""} onClick={onToggleSettings}><Settings size={17} /></IconButton>
-          <SettingsMenu
-            open={settingsOpen}
-            connectionAvailable={connection.dualMode}
-            onClose={onCloseSettings}
-            onSelect={onSelectSettings}
-            onReviewRules={onReviewRules}
-            onContinuityFacts={onContinuityFacts}
+        <div className="header-utility">
+          {!readOnly && (
+            <button type="button" className="ghost nav-action nav-share" onClick={onShare} title="生成只读分享链接" aria-label="分享">
+              <Share2 size={16} aria-hidden="true" /><span>分享</span>
+            </button>
+          )}
+          {!readOnly && (
+            <div className="settings-anchor">
+              <IconButton label="设置" className={settingsOpen ? "active" : ""} onClick={onToggleSettings}>
+                <Settings size={17} />
+              </IconButton>
+              <SettingsMenu
+                open={settingsOpen}
+                connectionAvailable={connection.dualMode}
+                onClose={onCloseSettings}
+                onSelect={onSelectSettings}
+                onReviewRules={onReviewRules}
+                onContinuityFacts={onContinuityFacts}
+              />
+            </div>
+          )}
+          <IconButton label="刷新工作区" className="nav-refresh" onClick={onRefresh}>
+            <RefreshCw size={17} />
+          </IconButton>
+        </div>
+        <div className="header-more-anchor">
+          <IconButton
+            label="更多"
+            className={`header-more-btn${moreOpen ? " active" : ""}`}
+            onClick={onToggleMore}
+          >
+            <MoreHorizontal size={18} />
+          </IconButton>
+          <HeaderMoreMenu
+            open={moreOpen}
+            busy={busy}
+            readOnly={readOnly}
+            onClose={onCloseMore}
+            onCharacters={onCharacters}
+            onRoleplay={onRoleplay}
+            onSessions={onSessions}
+            onShare={onShare}
+            onSettings={onToggleSettings}
+            onRefresh={onRefresh}
           />
-        </div>}
-        <IconButton label="刷新工作区" onClick={onRefresh}><RefreshCw size={17} /></IconButton>
+        </div>
       </div>
     </header>
   );
@@ -3264,6 +3585,8 @@ function App() {
   const [documentDraft, setDocumentDraft] = useState("");
   const [editingDocument, setEditingDocument] = useState(false);
   const [prompt, setPrompt] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   /**
    * Live step buffer for the *current* Agent job only.
    * Completed / historical trails render from `state.stepTrails` (server truth).
@@ -3297,6 +3620,7 @@ function App() {
   const [contextGraphFilter, setContextGraphFilter] = useState<"all" | "active" | "handoff" | "epoch" | "slice">("all");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [headerMoreOpen, setHeaderMoreOpen] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(loadWorkspaceMode);
   const [documentsCollapsed, setDocumentsCollapsed] = useState(() =>
     localStorage.getItem("writer-documents-collapsed") === "true",
@@ -3630,9 +3954,10 @@ function App() {
   const refresh = useCallback(
     async (targetSession?: string) => {
       const seq = ++refreshSeqRef.current;
-      const requestedSession = targetSession ?? sessionIdRef.current;
+      // Prefer explicit switch → current live session → last visited in this browser.
+      const requestedSession = targetSession ?? sessionIdRef.current ?? readLastSessionId();
       const next = await api<State>(
-        `/api/state${targetSession ? `?session=${encodeURIComponent(targetSession)}` : ""}`,
+        `/api/state${requestedSession ? `?session=${encodeURIComponent(requestedSession)}` : ""}`,
       );
       // Drop stale responses so an older in-flight refresh (e.g. snapshot taken in the
       // re-run rewind gap) cannot overwrite a newer complete conversation.
@@ -3640,6 +3965,7 @@ function App() {
       if (requestedSession && next.sessionId !== requestedSession && sessionIdRef.current === requestedSession) {
         return next;
       }
+      rememberLastSessionId(next.sessionId);
       let appliedMessages = next.messages;
       setState((current) => {
         if (seq !== refreshSeqRef.current) return current ?? next;
@@ -3815,6 +4141,7 @@ function App() {
   useEffect(() => {
     const nextId = state?.sessionId;
     if (!nextId) return;
+    rememberLastSessionId(nextId);
     const prevId = sessionIdRef.current;
     sessionIdRef.current = nextId;
     if (prevId && prevId !== nextId) {
@@ -3911,7 +4238,7 @@ function App() {
   }, [outlineCollapsed]);
 
   useEffect(() => {
-    const overlayOpen = showUsagePopover || settingsMenuOpen || managementView !== null
+    const overlayOpen = showUsagePopover || settingsMenuOpen || headerMoreOpen || managementView !== null
       || styleDraft !== null || characterDraft !== null || simpleCardDraft !== null
       || roleplaySetup !== null || roleplaySceneDraft !== null || roleplaySceneManagerOpen || roleplayFactDraft !== null
       || branchConfirm !== null || roleplayBranchTimeline !== null;
@@ -3930,6 +4257,7 @@ function App() {
       if (roleplaySetup && !roleplaySetupBusy) { setRoleplaySetup(null); return; }
       if (branchConfirm) { setBranchConfirm(null); return; }
       if (roleplayBranchTimeline) { setRoleplayBranchTimeline(null); return; }
+      if (headerMoreOpen) { setHeaderMoreOpen(false); return; }
       if (settingsMenuOpen) { setSettingsMenuOpen(false); return; }
       if (showUsagePopover) { setShowUsagePopover(false); return; }
       if (managementView) { setManagementView(null); return; }
@@ -3939,7 +4267,7 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
-    showUsagePopover, settingsMenuOpen, managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
+    showUsagePopover, settingsMenuOpen, headerMoreOpen, managementView, styleDraft, characterDraft, simpleCardDraft, roleplaySetup, roleplaySetupBusy,
     roleplaySceneDraft, roleplaySceneGenerateBusy, roleplaySceneManagerOpen, roleplaySceneManagerBusy, roleplayFactDraft, branchConfirm, roleplayBranchTimeline,
   ]);
 
@@ -4349,7 +4677,9 @@ function App() {
       );
     }
     if (event.type === "waiting_for_input") {
-      setNotice("");
+      setNotice(event.question?.trim()
+        ? event.question.trim()
+        : "Agent 等待输入。");
     }
     if (event.type === "proposal" && event.proposal) {
       setState((prev) => {
@@ -4507,7 +4837,9 @@ function App() {
               : "Agent job completed.",
           );
         } else if (terminalType === "cancelled") {
-          setNotice("Agent job cancelled.");
+          setNotice("已中断。可在带「生成已中断」的回复上点「续跑」。");
+        } else if (terminalType === "waiting_for_input") {
+          // notice already set from the event question (budget pause / ask_user)
         }
       }
     } catch (cause) {
@@ -4681,6 +5013,35 @@ function App() {
     }
   }
 
+  async function addComposerImages(files: FileList | File[]) {
+    const list = Array.from(files).filter(isSupportedComposerImage);
+    if (!list.length) {
+      setError("仅支持 jpeg / png / gif / webp 图片");
+      return;
+    }
+    try {
+      const next: PendingAttachment[] = [];
+      for (const file of list) next.push(await fileToPendingAttachment(file));
+      setPendingAttachments((current) => {
+        const merged = [...current, ...next].slice(0, MULTIMODAL_MAX_ATTACHMENTS);
+        if (current.length + next.length > MULTIMODAL_MAX_ATTACHMENTS) {
+          setNotice(`单次最多 ${MULTIMODAL_MAX_ATTACHMENTS} 张图片，已截断`);
+        }
+        return merged;
+      });
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  function clearPendingAttachments() {
+    setPendingAttachments((current) => {
+      for (const item of current) URL.revokeObjectURL(item.previewUrl);
+      return [];
+    });
+  }
+
   async function sendChat(options?: {
     text?: string;
     channel?: "agent" | "roleplay";
@@ -4700,12 +5061,26 @@ function App() {
     const requestDocumentSelections = !activeRoleplay && options?.text === undefined
       ? documentContextSelections
       : [];
-    if (!state || busy || !text) return;
+    // Roleplay / rerun paths ignore pending images; agent composer can send image-only.
+    const outboundAttachments = !activeRoleplay && options?.text === undefined
+      ? pendingAttachments
+      : [];
+    if (!state || busy || (!text && !outboundAttachments.length)) return;
     if (requestedChannel === "roleplay" && !activeRoleplay) {
       setError("当前角色扮演身份已退出，无法重新运行这条扮演消息。");
       return;
     }
     const tempMessageId = -Date.now();
+    const tempAttachments: MessageAttachment[] | undefined = outboundAttachments.length
+      ? outboundAttachments.map((item) => ({
+          id: item.localId,
+          name: item.name,
+          mimeType: item.mimeType,
+          size: item.size,
+          // Optimistic bubble uses the local object URL until refresh replaces it.
+          storagePath: item.previewUrl,
+        }))
+      : undefined;
     if (options?.text === undefined) setPrompt("");
     setError("");
     setNotice("");
@@ -4728,9 +5103,10 @@ function App() {
             {
               id: tempMessageId,
               role: "user",
-              content: text,
+              content: text || (tempAttachments?.length ? "请结合附图完成写作任务。" : ""),
               channel: activeRoleplay ? "roleplay" : "agent",
               ...(activeRoleplay ? { roleplayInputMode: options?.inputMode ?? roleplayInputMode } : {}),
+              ...(tempAttachments ? { attachments: tempAttachments } : {}),
             },
           ],
         }
@@ -4771,6 +5147,15 @@ function App() {
                   })),
                 }
               : {}),
+            ...(outboundAttachments.length
+              ? {
+                  attachments: outboundAttachments.map(item => ({
+                    name: item.name,
+                    mimeType: item.mimeType,
+                    dataBase64: item.dataBase64,
+                  })),
+                }
+              : {}),
           } : {}),
           ...(activeRoleplay
             ? { mode: "roleplay", performer: activeRoleplay.performer, identity: activeRoleplay.identity, scene: activeRoleplay.scene, inputMode: options?.inputMode ?? roleplayInputMode }
@@ -4781,6 +5166,7 @@ function App() {
         ? { ...current, activeJobs: [...(current.activeJobs ?? []).filter(job => job.id !== result.job.id), result.job] }
         : current);
       if (requestDocumentSelections.length) setDocumentContextSelections([]);
+      if (outboundAttachments.length) clearPendingAttachments();
       setComposerBranch(null);
       await subscribeAgentJob(result.jobId, state.sessionId, true);
     } catch (cause) {
@@ -5974,7 +6360,11 @@ function App() {
   const pendingProposals = state.proposals.filter((p) => p.status === "pending");
   const readOnly = state.accessMode === "readonly";
   const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
-  const visibleMessages = state.messages.filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.content.trim());
+  const visibleMessages = state.messages.filter((msg) =>
+    (msg.role === "user" || msg.role === "assistant")
+    && (msg.content.trim() || Boolean(msg.attachments?.length)),
+  );
+  const agentSupportsMultimodal = Boolean(state.provider.supportsMultimodal);
   const usagePct = state.provider.pricing.contextWindow
     ? Math.round((state.usage.lastPromptTokens / state.provider.pricing.contextWindow) * 100)
     : 0;
@@ -6316,15 +6706,21 @@ function App() {
         busy={busy}
         readOnly={readOnly}
         settingsOpen={settingsMenuOpen}
+        moreOpen={headerMoreOpen}
         workspaceMode={workspaceMode}
         documentsCollapsed={documentsCollapsed}
         onCharacters={() => {
+          setHeaderMoreOpen(false);
           setSessionBatchMode(false);
           setSelectedSessionIds(new Set());
           setManagementView("characters");
         }}
-        onRoleplay={() => beginRoleplaySetup()}
+        onRoleplay={() => {
+          setHeaderMoreOpen(false);
+          beginRoleplaySetup();
+        }}
         onSessions={() => {
+          setHeaderMoreOpen(false);
           setSessionBatchMode(false);
           setSelectedSessionIds(new Set());
           setManagementView("sessions");
@@ -6335,11 +6731,19 @@ function App() {
           setConnectionPanelMsg("");
           openSettings("connection");
         }}
-        onToggleSettings={() => setSettingsMenuOpen((value) => !value)}
+        onToggleSettings={() => {
+          setHeaderMoreOpen(false);
+          setSettingsMenuOpen((value) => !value);
+        }}
         onCloseSettings={() => setSettingsMenuOpen(false)}
         onSelectSettings={openSettings}
         onReviewRules={openProseGateRules}
         onContinuityFacts={openContinuityFacts}
+        onToggleMore={() => {
+          setSettingsMenuOpen(false);
+          setHeaderMoreOpen((value) => !value);
+        }}
+        onCloseMore={() => setHeaderMoreOpen(false)}
         onRefresh={() => void refresh(state.sessionId)}
         onModeChange={setWorkspaceMode}
         onToggleDocuments={() => setDocumentsCollapsed((value) => !value)}
@@ -6810,7 +7214,7 @@ function App() {
             <button
               type="button"
               className="ghost context-graph-open-btn"
-              title="查看可管理上下文图（任务 / 交接 / 装配）"
+              title="查看上下文图（任务 / 衔接 / 装载）"
               onClick={() => void openContextGraph()}
             >
               <GitBranch size={15} aria-hidden="true" />
@@ -7087,6 +7491,34 @@ function App() {
                   : <Markdown content={displayContent} />
               ) : (
                 <>
+                  {msg.attachments?.length ? (
+                    <div className="message-attachments" aria-label="附图">
+                      {msg.attachments.map((item) => {
+                        const localPreview = item.storagePath.startsWith("blob:") || item.storagePath.startsWith("data:");
+                        const src = msg.id > 0
+                          ? attachmentImageUrl(state.sessionId, item.id)
+                          : localPreview
+                            ? item.storagePath
+                            : "";
+                        return (
+                          <a
+                            key={item.id}
+                            className="message-attachment-thumb"
+                            href={src || "#"}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={item.name}
+                          >
+                            {src ? (
+                              <img src={src} alt={item.name} loading="lazy" />
+                            ) : (
+                              <span className="message-attachment-fallback">{item.name}</span>
+                            )}
+                          </a>
+                        );
+                      })}
+                    </div>
+                  ) : null}
                   {msg.channel === "roleplay"
                     ? continuationMessage
                       ? <div className="roleplay-continuation-placeholder">
@@ -7107,7 +7539,7 @@ function App() {
                           )}
                         </div>
                       : <Markdown content={displayContent} />
-                    : <div>{displayContent}</div>}
+                    : displayContent ? <div>{displayContent}</div> : null}
                   {msg.channel === "roleplay" && msg.roleplayInputMode !== "director" && msg.roleplayPerception
                     && displayContent !== ROLEPLAY_CONTINUATION_PLACEHOLDER
                     ? <RoleplayPerceptionDetails
@@ -7312,12 +7744,44 @@ function App() {
                 </div>
               </div>
             )}
+            {!roleplay && pendingAttachments.length > 0 && (
+              <div className="composer-attachments" aria-label="待发送附图">
+                {pendingAttachments.map((item) => (
+                  <span className="composer-attachment-chip" key={item.localId} title={item.name}>
+                    <img src={item.previewUrl} alt={item.name} />
+                    <button
+                      type="button"
+                      className="composer-attachment-remove"
+                      aria-label={`移除 ${item.name}`}
+                      disabled={busy}
+                      onClick={() => setPendingAttachments((current) => {
+                        const target = current.find((entry) => entry.localId === item.localId);
+                        if (target) URL.revokeObjectURL(target.previewUrl);
+                        return current.filter((entry) => entry.localId !== item.localId);
+                      })}
+                    >
+                      <X size={11} strokeWidth={2.5} />
+                    </button>
+                  </span>
+                ))}
+                <span className="composer-attachments-meta">
+                  {pendingAttachments.length}/{MULTIMODAL_MAX_ATTACHMENTS}
+                </span>
+              </div>
+            )}
             <textarea
               ref={composerRef}
               value={prompt}
               onFocus={() => { composerFocusedAtBottomRef.current = conversationAtBottomRef.current; }}
               onBlur={() => { composerFocusedAtBottomRef.current = false; }}
               onChange={(e) => setPrompt(e.target.value)}
+              onPaste={(event) => {
+                if (roleplay || readOnly || busy) return;
+                const files = Array.from(event.clipboardData?.files ?? []).filter(isSupportedComposerImage);
+                if (!files.length) return;
+                event.preventDefault();
+                void addComposerImages(files);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                   e.preventDefault();
@@ -7334,20 +7798,63 @@ function App() {
                   ? roleplayInputMode === "director"
                     ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
                     : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
-                  : "Describe your writing task… (Ctrl+Enter to send)"}
+                  : agentSupportsMultimodal
+                    ? "写作任务…可粘贴或添加图片（Ctrl+Enter 发送）"
+                    : "写作任务…（Ctrl+Enter 发送；附图需模型开启多模态）"}
               disabled={readOnly || busy || Boolean(roleplayAutoReplyBusy)}
             />
             <div className="composer-actions">
               <span className="composer-hint">
-                {busy ? "Esc to stop" : roleplay ? `${roleplayInputMode === "director" ? "导演指示" : "角色内"} · Ctrl+Enter` : "Ctrl+Enter"}
+                {busy
+                  ? "Esc to stop"
+                  : roleplay
+                    ? `${roleplayInputMode === "director" ? "导演指示" : "角色内"} · Ctrl+Enter`
+                    : agentSupportsMultimodal
+                      ? "粘贴或添加图片 · Ctrl+Enter"
+                      : "Ctrl+Enter"}
               </span>
-              <button
-                className={`composer-send ${busy ? "stop" : "primary"}`}
-                onClick={busy ? stop : () => void sendChat()}
-                disabled={readOnly || Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim())}
-              >
-                {busy ? "Stop" : "Send"}
-              </button>
+              <div className="composer-actions-right">
+                {!roleplay && (
+                  <>
+                    <input
+                      ref={attachmentInputRef}
+                      type="file"
+                      className="composer-file-input"
+                      accept="image/jpeg,image/png,image/gif,image/webp"
+                      multiple
+                      tabIndex={-1}
+                      aria-hidden="true"
+                      onChange={(event) => {
+                        const files = event.target.files;
+                        if (files?.length) void addComposerImages(files);
+                        event.target.value = "";
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className={`composer-attach${pendingAttachments.length ? " has-files" : ""}${agentSupportsMultimodal ? "" : " muted"}`}
+                      title={agentSupportsMultimodal
+                        ? "添加图片（可多选，也可直接粘贴）"
+                        : "添加图片（当前 Agent 模型未开启多模态，将以文字占位发送）"}
+                      aria-label="添加图片"
+                      disabled={readOnly || busy || pendingAttachments.length >= MULTIMODAL_MAX_ATTACHMENTS}
+                      onClick={() => attachmentInputRef.current?.click()}
+                    >
+                      <ImagePlus size={16} strokeWidth={1.9} />
+                      {pendingAttachments.length > 0 && (
+                        <span className="composer-attach-badge">{pendingAttachments.length}</span>
+                      )}
+                    </button>
+                  </>
+                )}
+                <button
+                  className={`composer-send ${busy ? "stop" : "primary"}`}
+                  onClick={busy ? stop : () => void sendChat()}
+                  disabled={readOnly || Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim() && !pendingAttachments.length)}
+                >
+                  {busy ? "Stop" : "Send"}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -8405,30 +8912,30 @@ function App() {
                 <div className="context-graph-stats">
                   <span>活跃 {contextGraph?.stats.activeNodes ?? 0}</span>
                   <span>归档 {contextGraph?.stats.archivedNodes ?? 0}</span>
-                  <span>交接 {contextGraph?.stats.handoffCount ?? 0}</span>
-                  <span>树干 {contextGraph?.stats.trunkCount ?? contextGraph?.activeTrunks?.length ?? 0}</span>
-                  <span>边 {contextGraph?.stats.edgeCount ?? 0}</span>
+                  <span>衔接 {contextGraph?.stats.handoffCount ?? 0}</span>
+                  <span>索引 {contextGraph?.stats.trunkCount ?? contextGraph?.activeTrunks?.length ?? 0}</span>
+                  <span>关联 {contextGraph?.stats.edgeCount ?? 0}</span>
                   {(() => {
                     const summary = contextGraphCacheSummary(contextGraph?.nodes ?? []);
                     if (!summary) return null;
                     return (
                       <span
                         className="context-graph-stat-cache"
-                        title={`近 ${summary.turns} 轮实测：prompt 共 ${summary.promptTokens.toLocaleString()} tok`}
+                        title={`近 ${summary.turns} 轮：输入共 ${summary.promptTokens.toLocaleString()}`}
                       >
-                        近 {summary.turns} 轮前缀命中 {Math.round(summary.hitRate * 100)}%
+                        近 {summary.turns} 轮缓存命中 {Math.round(summary.hitRate * 100)}%
                       </span>
                     );
                   })()}
                   {contextGraph?.truncated ? (
                     <span className="context-graph-stat-truncated">
-                      已截断，仅显示最近 {contextGraph.nodes.length} / {contextGraph.stats.totalNodes} 个节点
+                      仅显示最近 {contextGraph.nodes.length} / {contextGraph.stats.totalNodes} 个节点
                     </span>
                   ) : null}
                 </div>
                 <p className="context-graph-hint">
-                  看<strong>装配 · 章/场边界</strong>节点可知 step 之间继承了什么、裁掉了什么。
-                  步骤条在 prompt 骤降处也会标「上下文裁剪」。树干只有索引——边界后仍 read_document 是按需补读，不是裁剪失效。
+                  查看<strong>章节/场次切换</strong>节点，可知步骤之间继续携带了什么、卸下了什么。
+                  步骤条在输入骤降处也会标「上下文收束」。项目索引不含全文；切换后按需再读设定属正常。
                 </p>
                 {(() => {
                   const cuts = (contextGraph?.nodes ?? [])
@@ -8438,8 +8945,8 @@ function App() {
                     .sort((a, b) => a.node.createdAt.localeCompare(b.node.createdAt));
                   if (!cuts.length) return null;
                   return (
-                    <div className="context-graph-cut-timeline" aria-label="上下文裁剪时间线">
-                      <strong>本会话裁剪</strong>
+                    <div className="context-graph-cut-timeline" aria-label="上下文收束时间线">
+                      <strong>本会话收束</strong>
                       <ol>
                         {cuts.map(({ node, transition }) => {
                           const t = transition!;
@@ -8452,7 +8959,7 @@ function App() {
                               >
                                 <span className="cut-kind">
                                   {t.kind === "scene_boundary" ? "场" : "章"}
-                                  {t.atStep != null ? ` · s${t.atStep}` : ""}
+                                  {t.atStep != null ? ` · Step ${t.atStep}` : ""}
                                 </span>
                                 <span className="cut-path" title={t.path}>{t.path ? t.path.replace(/^chapters\//, "") : "—"}</span>
                                 {t.beforeTokens != null && t.afterTokens != null ? (
@@ -8473,8 +8980,8 @@ function App() {
                     ["all", "全部"],
                     ["active", "活跃"],
                     ["epoch", "任务"],
-                    ["handoff", "交接"],
-                    ["slice", "装配"],
+                    ["handoff", "衔接"],
+                    ["slice", "装载"],
                   ] as const).map(([id, label]) => (
                     <button
                       key={id}
@@ -8549,7 +9056,7 @@ function App() {
                       });
                     })()}
                     {!contextGraphLoading && !(contextGraph?.nodes.length) && (
-                      <li className="context-graph-empty">暂无节点。跑一轮 Agent 写作任务后，这里会出现任务、交接与装配切片。</li>
+                      <li className="context-graph-empty">暂无节点。跑一轮写作任务后，这里会出现任务、衔接与装载记录。</li>
                     )}
                     {contextGraphLoading && <li className="context-graph-empty">加载上下文图…</li>}
                   </ul>

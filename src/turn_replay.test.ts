@@ -13,6 +13,7 @@ import { compactRuntimeMessages } from "./agent.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import type { AgentTurnMessage } from "./types.js";
+import { messageContentText } from "./model_compat.js";
 
 function withStore(name: string, body: (store: WriterStore, sessionId: string) => void): void {
   const root = mkdtempSync(join(tmpdir(), `writer-${name}-`));
@@ -84,14 +85,14 @@ test("merged turn context is one user message without per-turn counters", () => 
   });
   // Role is load-bearing: a system message here forfeits the whole cached prefix.
   assert.equal(merged.role, "user");
-  assert.match(merged.content ?? "", /当前任务：改稿/);
-  assert.match(merged.content ?? "", /声线证据/);
-  assert.match(merged.content ?? "", /把这段改短/);
-  assert.match(merged.content ?? "", /本轮任务工作记忆：无。/);
+  assert.match(messageContentText(merged.content), /当前任务：改稿/);
+  assert.match(messageContentText(merged.content), /声线证据/);
+  assert.match(messageContentText(merged.content), /把这段改短/);
+  assert.match(messageContentText(merged.content), /本轮任务工作记忆：无。/);
   // conversationStats / history preview are gone — they changed every turn and
   // pinned the divergence point at the very front of the tail.
-  assert.doesNotMatch(merged.content ?? "", /历史对话/);
-  assert.doesNotMatch(merged.content ?? "", /归档/);
+  assert.doesNotMatch(messageContentText(merged.content), /历史对话/);
+  assert.doesNotMatch(messageContentText(merged.content), /归档/);
 });
 
 test("replay returns frozen turns in order and stays empty for a fresh session", () => {
@@ -137,7 +138,7 @@ test("over-budget replay compacts the oldest turn and writes the shrunk form bac
     assert.equal(after.length, 2);
     assert.ok(after[0].estimatedTokens < before[0].estimatedTokens, "oldest turn must have shrunk on disk");
     assert.equal(after[1].estimatedTokens, before[1].estimatedTokens, "newest turn stays verbatim");
-    assert.match(after[0].messages[2].content ?? "", /artifact_compacted/);
+    assert.match(messageContentText(after[0].messages[2].content), /artifact_compacted/);
 
     // Compaction must not break tool_call/tool_result pairing.
     const calls = new Set(after.flatMap(block => block.messages.flatMap(message => message.tool_calls?.map(call => call.id) ?? [])));
@@ -219,7 +220,7 @@ test("compaction overshoots to the low-water mark so later turns fit untouched",
     // The newest turn's tool bodies are still the live context — never digested.
     const blocks = store.agentTurnBlocks(sessionId);
     assert.equal(blocks[2].estimatedTokens, approximateMessageTokens(heavyTurn("c")));
-    assert.doesNotMatch(blocks[2].messages[2].content ?? "", /artifact_compacted/);
+    assert.doesNotMatch(messageContentText(blocks[2].messages[2].content), /artifact_compacted/);
   });
 });
 

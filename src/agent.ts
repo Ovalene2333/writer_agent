@@ -1,4 +1,14 @@
-import type { AgentEvent, AgentTodoItem, ModelConfig, PermissionMode, RequestComponentUsage, StepUsage } from "./types.js";
+import type {
+  AgentEvent,
+  AgentTodoItem,
+  MessageAttachment,
+  MessageAttachmentInput,
+  MessageContent,
+  ModelConfig,
+  PermissionMode,
+  RequestComponentUsage,
+  StepUsage,
+} from "./types.js";
 import { createHash } from "node:crypto";
 import { chapterSceneDraftComplete, type ChapterSceneDraft } from "./scene_pipeline.js";
 import { documentSpans } from "./document_spans.js";
@@ -15,7 +25,17 @@ import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
 import { extractContinuityFacts } from "./continuity_facts.js";
 import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
-import { isDeepSeekModel, nonThinkingRequestOptions, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
+import {
+  buildMultimodalUserContent,
+  isDeepSeekModel,
+  messageContentCharCount,
+  messageContentText,
+  modelSupportsMultimodal,
+  nonThinkingRequestOptions,
+  prepareMessagesForProvider,
+  samplingRequestOptions,
+  thinkingRequestOptions,
+} from "./model_compat.js";
 import {
   agentCompletionGaps,
   completionRecoveryPrompt,
@@ -77,7 +97,7 @@ import {
 
 type ApiMessage = {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: MessageContent;
   tool_call_id?: string;
   tool_calls?: ApiToolCall[];
   reasoning_content?: string;
@@ -832,12 +852,15 @@ async function compileWritingTaskContract(
     .map(item => ({ id: item.id, title: item.title, category: item.category }))
     .slice(0, 24);
   const recentSource = history.slice(-3);
-  const recent = recentSource.map((item, index) => ({
-    role: item.role,
-    content: index === recentSource.length - 1
-      ? priorTurnContentForContext(item.content ?? "")
-      : item.content?.slice(0, item.role === "user" ? 160 : 120) ?? "",
-  }));
+  const recent = recentSource.map((item, index) => {
+    const text = messageContentText(item.content);
+    return {
+      role: item.role,
+      content: index === recentSource.length - 1
+        ? priorTurnContentForContext(text)
+        : text.slice(0, item.role === "user" ? 160 : 120),
+    };
+  });
   const planningMessages: ApiMessage[] = [{
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
@@ -1026,7 +1049,7 @@ proseGateCandidate 格式：{"id":"稳定英文短ID","instruction":"可独立�
     ? plannedCharacterIds
     : resolveRecentCharacterIds(
       characters,
-      [request, ...(continuation ? [...recent].reverse().map(item => item.content) : [])],
+      [request, ...(continuation ? [...recent].reverse().map(item => messageContentText(item.content)) : [])],
     );
   return {
     task: {
@@ -1353,16 +1376,17 @@ function historicalConversationContext(history: Array<ApiMessage & { channel?: s
     ? older.map((message) => {
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Agent" : message.role;
       const channel = message.channel === "roleplay" ? "[扮演]" : "";
-      const content = (message.content ?? "").replace(/\s+/g, " ").slice(0, 80);
+      const content = messageContentText(message.content).replace(/\s+/g, " ").slice(0, 80);
       return `${channel}${label}: ${content}`;
     }).join("\n").slice(-800)
     : "";
   const entries = recent.map((message, index) => {
     const latest = index === recent.length - 1;
     const limit = message.role === "user" ? 200 : 140;
+    const raw = messageContentText(message.content);
     const content = latest
-      ? priorTurnContentForContext(message.content ?? "")
-      : (message.content ?? "").replace(/\s+/g, " ").slice(0, limit);
+      ? priorTurnContentForContext(raw)
+      : raw.replace(/\s+/g, " ").slice(0, limit);
     return message.role === "user"
       ? { content, ...(message.channel === "roleplay" ? { channel: "roleplay" } : {}) }
       : {
@@ -1731,6 +1755,8 @@ export async function runAgent(options: {
   store: WriterStore;
   sessionId: string;
   prompt: string;
+  /** Optional user image attachments for multimodal-capable models. */
+  attachments?: MessageAttachmentInput[];
   variantGroupId?: string;
   /** Server-side job id used to correlate every provider call in model_usage. */
   jobId?: string;
@@ -1748,7 +1774,10 @@ export async function runAgent(options: {
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }): Promise<void> {
-  const { project, store, sessionId, prompt, signal } = options;
+  const { project, store, sessionId, signal } = options;
+  // Empty text is allowed only when the turn carries images; give the planner a stable default.
+  const prompt = (options.prompt ?? "").trim()
+    || (options.attachments?.length ? "请结合附图完成写作任务。" : "");
   // Mutable copy: newly created character IDs are appended so the same turn can read them.
   const characterScope = options.characterScope === undefined ? undefined : [...options.characterScope];
   const simpleCharacterScope = options.simpleCharacterScope === undefined ? undefined : [...options.simpleCharacterScope];
@@ -1863,7 +1892,18 @@ export async function runAgent(options: {
   // Capture before the current agent request is persisted, while the contiguous
   // roleplay block is still the newest conversation segment.
   const roleplayHandoffContext = recentRoleplayHandoffContext(store, sessionId);
-  const sourceMessageId = store.addMessage(sessionId, "user", prompt, "agent", options.variantGroupId);
+  const turnAttachments: MessageAttachment[] = options.attachments?.length
+    ? store.saveMessageAttachments(sessionId, options.attachments)
+    : [];
+  const sourceMessageId = store.addMessage(
+    sessionId,
+    "user",
+    prompt,
+    "agent",
+    options.variantGroupId,
+    undefined,
+    turnAttachments.length ? turnAttachments : undefined,
+  );
   emit({ type: "source_message", messageId: sourceMessageId, channel: "agent" });
   // Context graph: message + epoch. Process (L3) lives only inside this epoch;
   // active handoffs (L2) are linked as uses for assemble/debug.
@@ -2069,8 +2109,8 @@ export async function runAgent(options: {
     const trunkNode = store.ensureContextTrunk(sessionId, {
       hash: projectTrunk.hash,
       label: projectTrunk.empty
-        ? "树干 · 空"
-        : `树干 · 角色${projectTrunk.characterCount} · 大纲${projectTrunk.outlineNodeCount}`,
+        ? "索引 · 空"
+        : `索引 · 角色${projectTrunk.characterCount} · 大纲${projectTrunk.outlineNodeCount}`,
       payload: trunkPayload as unknown as Record<string, unknown>,
     });
     trunkNodeId = trunkNode.id;
@@ -2113,6 +2153,18 @@ ${managedHandoffContext}`,
       ? [mergedTurnContext(turnContextParts)]
       : buildDynamicTurnMessages({ historyText, archiveContext, ...turnContextParts })),
   ];
+  // Attach images only on this turn's final user message (stable prefix stays text).
+  if (turnAttachments.length) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role !== "user") continue;
+      const text = messageContentText(messages[index].content);
+      messages[index] = {
+        ...messages[index],
+        content: buildMultimodalUserContent(text, turnAttachments, sessionId),
+      };
+      break;
+    }
+  }
   // Everything before this turn's own context block: frozen bytes the provider has
   // already seen (plus the session trunk, which is rebuilt identically by hash).
   const trunkEnd = stableSystemPrefix.length + 1;
@@ -2132,19 +2184,19 @@ ${managedHandoffContext}`,
     const slicePayload: AssembleSlicePayload = {
       step: 0,
       layers: [
-        { id: "L0", layer: "L0", label: "稳定前缀 + 工具 schema", estimatedTokens: approximateMessageTokens(stableSystemPrefix) },
+        { id: "L0", layer: "L0", label: "写作规则与工具定义", estimatedTokens: approximateMessageTokens(stableSystemPrefix) },
         {
           id: "trunk",
           layer: "L0",
-          label: "项目树干（大纲/角色/设定路径）",
+          label: "项目索引（大纲 / 角色 / 设定路径）",
           estimatedTokens: projectTrunk.estimatedTokens,
           ...(trunkNodeId ? { nodeIds: [trunkNodeId] } : {}),
         },
-        { id: "L1", layer: "L1", label: "跨 turn 冻块 replay", estimatedTokens: approximateMessageTokens(replay.messages) },
+        { id: "L1", layer: "L1", label: "历史续写", estimatedTokens: approximateMessageTokens(replay.messages) },
         {
           id: "shelf",
           layer: "L0",
-          label: openShelfCount ? `会话材料架 ${openShelfCount} 项` : "会话材料架 · 空",
+          label: openShelfCount ? `已读材料 ${openShelfCount} 项` : "已读材料 · 空",
           estimatedTokens: openShelfPrompt
             ? Math.ceil(Buffer.byteLength(openShelfPrompt, "utf8") / 4)
             : 0,
@@ -2152,11 +2204,11 @@ ${managedHandoffContext}`,
         {
           id: "L2",
           layer: "L2",
-          label: "焦点任务 + 活跃章交接",
+          label: "当前任务与章节衔接",
           nodeIds: activeHandoffs.map(node => node.id),
           estimatedTokens: Math.ceil(Buffer.byteLength(managedHandoffContext, "utf8") / 4),
         },
-        { id: "L3", layer: "L3", label: "本 epoch 工具过程（append-only，边界后截断）", estimatedTokens: 0 },
+        { id: "L3", layer: "L3", label: "本轮过程（切换章节后卸下）", estimatedTokens: 0 },
       ],
       replay: {
         turns: replay.replayedTurns,
@@ -2171,38 +2223,38 @@ ${managedHandoffContext}`,
         afterTokens: approximateMessageTokens(messages),
         afterMessageCount: messages.length,
         kept: [
-          { id: "L0", label: "稳定前缀 + 工具 schema", detail: "跨会话产品规则" },
-          { id: "trunk", label: "项目树干", detail: projectTrunk.empty ? "空占位" : `角色${projectTrunk.characterCount} · 大纲${projectTrunk.outlineNodeCount} · lore${projectTrunk.lorePathCount}` },
+          { id: "L0", label: "写作规则与工具定义", detail: "跨任务稳定的产品规则" },
+          { id: "trunk", label: "项目索引", detail: projectTrunk.empty ? "暂无索引" : `角色 ${projectTrunk.characterCount} · 大纲 ${projectTrunk.outlineNodeCount} · 设定 ${projectTrunk.lorePathCount}` },
           {
             id: "L1",
-            label: "跨 turn 冻块 replay",
+            label: "历史续写",
             detail: replay.replayedTurns
-              ? `${replay.replayedTurns} 轮 · 约 ${replay.estimatedTokens.toLocaleString()} tok`
-              : "本会话首轮，无 replay",
+              ? `${replay.replayedTurns} 轮 · 约 ${replay.estimatedTokens.toLocaleString()}`
+              : "本会话首轮，无历史续写",
           },
           {
             id: "shelf",
             label: openShelfCount
-              ? `会话材料架 ${openShelfCount} 项（跨 job 保留）`
-              : "会话材料架为空",
+              ? `已读材料 ${openShelfCount} 项（本会话保留）`
+              : "已读材料为空",
             detail: openShelfCount
-              ? "同 session 此前读过的设定 digests；hash 未变禁止再 read 全文"
-              : "本会话尚未完整读过设定；读后会写入材料架",
+              ? "本会话已读设定的摘要；文件未改则不再整篇重读"
+              : "本会话尚未完整读过设定；读后会写入已读材料",
           },
-          { id: "L2", label: "本轮任务 + 活跃章交接", detail: "焦点任务与结果态 handoff" },
+          { id: "L2", label: "当前任务与章节衔接", detail: "焦点任务与已交付章节摘要" },
         ],
         dropped: [],
         reReadHint: openShelfCount
-          ? "材料架已有 digests 的 path 勿再全文 read；未收录或文件变更才补读。"
-          : "树干是索引不是全文；设定需工具读取一次后进入会话材料架。",
+          ? "已收录摘要的路径不必再整篇读取；未收录或文件变更时再补读。"
+          : "项目索引只有路径与骨架，不是全文；设定需读取一次后才会进入已读材料。",
       },
       materialsShelfCount: openShelfCount,
-      note: "开轮装配",
+      note: "本轮开场",
     };
     const slice = store.createContextNode({
       sessionId,
       kind: "assemble_slice",
-      label: "装配 · 开轮",
+      label: "装载 · 本轮开场",
       sourceMessageId,
       jobId: options.jobId,
       payload: slicePayload as unknown as Record<string, unknown>,
@@ -2304,21 +2356,106 @@ ${managedHandoffContext}`,
   };
 
   try {
-    // Multi-chapter plans need more steps (read + draft + reject/retry per chapter).
-    const plannedSteps = Math.max(turnTodos.length, task.todoPlan.length);
-    const turnLimit = options.maxTurns ?? Math.max(20, plannedSteps * 8);
+    // Soft budget scales with remaining work; hard cap is only a safety rail.
+    // Exhaustion (soft after converge, stall after converge, or hard) never throws —
+    // it freezes the turn and leaves the existing「续跑」channel via [生成已中断].
+    const hardCap = Math.max(1, options.maxTurns ?? AGENT_HARD_TURN_CAP);
     // A completed draft must not fail merely because scene retries consumed the
     // ordinary budget. These turns exist only while the terminal review lock is
     // active; unfinished scene chains receive no extra capacity.
     const terminalReviewTurnLimit = 2;
     let terminalReviewTurns = 0;
     let turnStart = messages.length;
+    let stallStreak = 0;
+    let lastProgressFingerprint = "";
+    let convergeMode: AgentBudgetPauseReason | undefined;
+    let convergeTurnsLeft = 0;
+    let pauseForUserResume: {
+      reason: AgentBudgetPauseReason;
+      softBudget: number;
+      hardCap: number;
+      usedSteps: number;
+    } | undefined;
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
-    for (let turn = 0;
-      turn < turnLimit || (chapterReviewRequired && terminalReviewTurns < terminalReviewTurnLimit);
-      turn += 1) {
-      if (turn >= turnLimit) terminalReviewTurns += 1;
+    for (let turn = 0; ; turn += 1) {
+      const liveTodos = store.sessionTodos(sessionId);
+      const softBudget = options.maxTurns !== undefined
+        ? hardCap
+        : Math.min(hardCap, computeSoftTurnBudget({
+          todos: liveTodos,
+          todoPlanLength: task.todoPlan.length,
+          documentDeliverables: task.documentDeliverables.length,
+          completedDocumentDeliverables,
+          documentProposalRequired: task.documentProposalRequired,
+          mutation: task.mutation,
+          scenePipelineEnabled: scenePipelineSettings.enabled && task.editScope === "document",
+          chapterSceneDraft: toolContext.chapterSceneDraft,
+        }));
+      const progressFp = agentStepProgressFingerprint(liveTodos, executionProgress, {
+        documentProposalSubmitted,
+        characterMutationSubmitted,
+        chapterReviewRequired,
+        chapterSceneVersion: toolContext.chapterSceneDraft?.version,
+        chapterScenesCompleted: toolContext.chapterSceneDraft?.completed.length,
+        completedDocumentDeliverables,
+      });
+      if (turn > 0) {
+        if (progressFp === lastProgressFingerprint) stallStreak += 1;
+        else stallStreak = 0;
+      }
+      lastProgressFingerprint = progressFp;
+
+      const reviewGrace = chapterReviewRequired && terminalReviewTurns < terminalReviewTurnLimit;
+      if (turn >= hardCap) {
+        if (!reviewGrace) {
+          pauseForUserResume = {
+            reason: "hard_cap",
+            softBudget,
+            hardCap,
+            usedSteps: turn,
+          };
+          break;
+        }
+        terminalReviewTurns += 1;
+      }
+      if (convergeMode && convergeTurnsLeft <= 0 && !reviewGrace) {
+        pauseForUserResume = {
+          reason: convergeMode,
+          softBudget,
+          hardCap,
+          usedSteps: turn,
+        };
+        break;
+      }
+      if (!convergeMode && !reviewGrace && stallStreak >= AGENT_STALL_WINDOW) {
+        convergeMode = "stall";
+        convergeTurnsLeft = AGENT_CONVERGE_TURNS;
+        messages.push({
+          role: "user",
+          content: agentBudgetConvergePrompt("stall", {
+            step: turn + 1,
+            softBudget,
+            hardCap,
+            openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
+          }),
+        });
+        stallStreak = 0;
+      } else if (!convergeMode && !reviewGrace && turn >= softBudget) {
+        convergeMode = "soft_budget";
+        convergeTurnsLeft = AGENT_CONVERGE_TURNS;
+        messages.push({
+          role: "user",
+          content: agentBudgetConvergePrompt("soft_budget", {
+            step: turn + 1,
+            softBudget,
+            hardCap,
+            openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
+          }),
+        });
+      }
+      if (convergeMode) convergeTurnsLeft -= 1;
+
       const step = turn + 1;
       currentUsageStep = step;
       emit({ type: "step_start", step });
@@ -2347,6 +2484,8 @@ ${managedHandoffContext}`,
         emit({ type: "text", text, channel: "output" });
       }, (text) => emit({ type: "text", text, channel: "reasoning" }), {
         tools: executionTools,
+        resolveAttachment: (attachmentSessionId, attachmentId) =>
+          store.resolveAttachmentBytes(attachmentSessionId, attachmentId),
         // DeepSeek isolates KV cache by user_id. Use an opaque project identity so
         // stable prefixes survive new sessions without crossing project boundaries.
         ...(isDeepSeekModel(stepModel) ? { userId: projectCacheUserId(project.root) } : {}),
@@ -2781,15 +2920,15 @@ ${managedHandoffContext}`,
             store.createContextNode({
               sessionId,
               kind: "assemble_slice",
-              label: `装配 · 场边界 · ${draft?.path ?? "scene"}`,
+              label: `装载 · 场次切换 · ${draft?.path ?? "scene"}`,
               sourceMessageId,
               jobId: options.jobId,
               payload: {
                 step,
                 layers: [
-                  { id: "L0", layer: "L0", label: "保留 · 开章 base（含 begin 前准备读）", estimatedTokens: approximateMessageTokens(messages.slice(0, contextBase)) },
-                  { id: "L2", layer: "L2", label: "新增 · 场交接 handoff", estimatedTokens: Math.max(0, afterTokens - approximateMessageTokens(messages.slice(0, contextBase))) },
-                  { id: "L3", layer: "L3", label: "丢弃 · 上一场完整正文过程", estimatedTokens: 0 },
+                  { id: "L0", layer: "L0", label: "保留 · 章内基础（含开场准备）", estimatedTokens: approximateMessageTokens(messages.slice(0, contextBase)) },
+                  { id: "L2", layer: "L2", label: "新增 · 场次衔接", estimatedTokens: Math.max(0, afterTokens - approximateMessageTokens(messages.slice(0, contextBase))) },
+                  { id: "L3", layer: "L3", label: "卸下 · 上一场过程正文", estimatedTokens: 0 },
                 ],
                 transition: {
                   kind: "scene_boundary",
@@ -2800,15 +2939,15 @@ ${managedHandoffContext}`,
                   afterMessageCount: messages.length,
                   path: draft?.path,
                   kept: [
-                    { id: "base", label: "章内 context base", detail: "begin 前准备读 + 初始 scene guide" },
-                    { id: "handoff", label: "场交接", detail: "上一段约 800 字尾 + 各场 actualState + 下一场 guide" },
+                    { id: "base", label: "章内基础上下文", detail: "开场准备与初始场次指引" },
+                    { id: "handoff", label: "场次衔接", detail: "上一段约 800 字尾 + 各场已写状态 + 下一场指引" },
                   ],
                   dropped: [
-                    { id: "L3", label: "上一场工具正文", detail: `约 ${Math.max(0, beforeTokens - afterTokens).toLocaleString()} tok 的 notes/正文/重试过程` },
+                    { id: "L3", label: "上一场过程正文", detail: `约 ${Math.max(0, beforeTokens - afterTokens).toLocaleString()} 的笔记、正文与重试过程` },
                   ],
-                  reReadHint: "已完成场的全文在内存草稿中；终审用隔离 inspect。主循环不再挂全文，故不会为了「再看上一场」而自动重注入。",
+                  reReadHint: "已完成场的全文保留在草稿中供终审；主对话不再挂全文，因此不会为「再看上一场」自动重注入。",
                 },
-                note: "场边界截断",
+                note: "场次切换",
               } as unknown as Record<string, unknown>,
             });
           } catch { /* ignore graph errors */ }
@@ -2909,27 +3048,27 @@ ${managedHandoffContext}`,
             store.createContextNode({
               sessionId,
               kind: "assemble_slice",
-              label: `装配 · 章边界 · ${latestProposal?.path ?? completedDocumentDeliverables}`,
+              label: `装载 · 章节切换 · ${latestProposal?.path ?? completedDocumentDeliverables}`,
               sourceMessageId,
               jobId: options.jobId,
               payload: {
                 step,
                 layers: [
-                  { id: "L0", layer: "L0", label: "保留 · 稳定前缀+树干+开轮动态", estimatedTokens: approximateMessageTokens(messages.slice(0, initialMessageCount)) },
+                  { id: "L0", layer: "L0", label: "保留 · 规则、索引与开场任务", estimatedTokens: approximateMessageTokens(messages.slice(0, initialMessageCount)) },
                   {
                     id: "shelf",
                     layer: "L0",
-                    label: shelfCount ? `保留 · 材料架 ${shelfCount} 项` : "材料架 · 空",
+                    label: shelfCount ? `保留 · 已读材料 ${shelfCount} 项` : "已读材料 · 空",
                     estimatedTokens: Math.max(0, keptPrefixTokens - approximateMessageTokens(messages.slice(0, initialMessageCount))),
                   },
                   {
                     id: "L2",
                     layer: "L2",
-                    label: "新增 · 章交接 handoff",
+                    label: "新增 · 章节衔接",
                     nodeIds: [handoffNode.id],
                     estimatedTokens: handoffTokens,
                   },
-                  { id: "L3", layer: "L3", label: "丢弃 · 上一章工具过程", estimatedTokens: 0 },
+                  { id: "L3", layer: "L3", label: "卸下 · 上一章过程痕迹", estimatedTokens: 0 },
                 ],
                 transition: {
                   kind: "chapter_boundary",
@@ -2940,38 +3079,38 @@ ${managedHandoffContext}`,
                   afterMessageCount,
                   path: latestProposal?.path,
                   kept: [
-                    { id: "L0", label: "稳定系统前缀 + 项目树干", detail: "跨章字节稳定，下一批 step 仍可前缀命中" },
-                    { id: "turn", label: "本轮开轮动态块", detail: "任务说明 / todos / 选区等 initial 前缀内内容" },
+                    { id: "L0", label: "写作规则与项目索引", detail: "跨章可复用，后续步骤可命中缓存" },
+                    { id: "turn", label: "本轮开场任务", detail: "任务说明、待办与选区等开场内容" },
                     {
                       id: "shelf",
                       label: shelfCount
-                        ? `会话材料架 ${shelfCount} 项（跨 job；已读 path 不再灌全文）`
-                        : "会话材料架为空",
-                      detail: "同 session 持久 digests；sourceHash 未变则 materials_shelf_hit",
+                        ? `已读材料 ${shelfCount} 项（本会话保留，已读路径不再灌全文）`
+                        : "已读材料为空",
+                      detail: "本会话已读设定摘要；文件未改则直接复用",
                     },
                     {
                       id: "L2",
-                      label: "章交接（约 800 字章尾 + 摘要 + actualState）",
+                      label: "章节衔接（约 800 字章尾 + 摘要 + 已写状态）",
                       detail: latestProposal?.path
                         ? `已交付 ${latestProposal.path}`
-                        : "上一章交付缝",
+                        : "上一章交付衔接",
                     },
                   ],
                   dropped: [
                     {
                       id: "L3",
-                      label: "上一章完整工具过程",
-                      detail: `约 ${droppedTokens.toLocaleString()} tok：propose 正文、失败重试、过程性 tool 配对等（设定 digests 已进材料架）`,
+                      label: "上一章完整过程痕迹",
+                      detail: `约 ${droppedTokens.toLocaleString()}：提案正文、失败重试与中间工具结果（设定摘要已进已读材料）`,
                     },
                   ],
                   reReadHint: shelfCount
-                    ? "会话材料架已收录设定/角色 digests（跨本 session 各 job）。同 path+hash 再 read/search → materials_shelf_hit；仅未收录或文件变更才新读。"
-                    : "会话材料架仍空：下一章可能补读。读过后会写入 session，后续 job/章可复用。",
+                    ? "本会话已读材料含设定/角色摘要。同一路径且文件未改会直接复用；仅未收录或文件变更时再读。"
+                    : "已读材料仍空：下一章可能补读。读过后会写入本会话，后续任务可复用。",
                 },
                 ...(superseded ? { supersededHandoffs: superseded } : {}),
                 ...(submittedProposalRef ? { proposalId: submittedProposalRef.id } : {}),
                 materialsShelfCount: shelfCount,
-                note: "章边界截断",
+                note: "章节切换",
               } as unknown as Record<string, unknown>,
             });
           } catch { /* ignore graph errors */ }
@@ -3019,15 +3158,18 @@ ${managedHandoffContext}`,
         const assistantParts: string[] = [];
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
-          if (msg.role === "assistant" && msg.content?.trim()) {
-            assistantParts.push(msg.content.trim());
+          if (msg.role === "assistant") {
+            const text = messageContentText(msg.content).trim();
+            if (text) assistantParts.push(text);
           }
         }
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
-          if (msg.role !== "tool" || !msg.content) continue;
+          if (msg.role !== "tool") continue;
+          const toolBody = messageContentText(msg.content);
+          if (!toolBody) continue;
           try {
-            const result = JSON.parse(msg.content) as Record<string, unknown>;
+            const result = JSON.parse(toolBody) as Record<string, unknown>;
             if (result.status === "waiting" && typeof result.displayMessage === "string" && result.displayMessage.trim()) {
               assistantParts.push(result.displayMessage.trim());
               if (typeof result.question === "string") {
@@ -3051,8 +3193,9 @@ ${managedHandoffContext}`,
       try {
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
-          if (msg.role === "assistant" && msg.content?.trim()) {
-            store.addMessage(sessionId, "assistant", msg.content.trim(), "agent", options.variantGroupId);
+          if (msg.role === "assistant") {
+            const text = messageContentText(msg.content).trim();
+            if (text) store.addMessage(sessionId, "assistant", text, "agent", options.variantGroupId);
           }
         }
       } catch { /* 消息保存失败不影响流程 */ }
@@ -3061,14 +3204,60 @@ ${managedHandoffContext}`,
       emit({ type: "done", sessionId });
       return;
     }
-    const debugContext = runtimeDebugContext(messages, {
-      task: task.label,
-      model: executionModel.model,
-      turns: turnLimit,
-      transcript,
+    // Tools finished with a satisfied contract but no pure-text final step.
+    const endTodos = store.sessionTodos(sessionId);
+    const endGaps = agentCompletionGaps(task, executionProgress, endTodos);
+    if (!pauseForUserResume && !endGaps.length) {
+      const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
+      store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+      messages.push({ role: "assistant", content: answer });
+      freezeCurrentTurn();
+      emit({ type: "done", sessionId });
+      return;
+    }
+    // Soft/stall/hard budget (or incomplete fallthrough): never throw — leave 续跑.
+    const pause = pauseForUserResume ?? {
+      reason: "hard_cap" as const,
+      softBudget: options.maxTurns ?? hardCap,
+      hardCap,
+      usedSteps: Math.max(0, (currentUsageStep ?? 1) - 1),
+    };
+    const openTodoLines = endTodos
+      .filter(todo => todo.status === "pending" || todo.status === "in_progress")
+      .map(todo => `- [${todo.status}] ${todo.content}`)
+      .slice(0, 8);
+    const reasonLabel = pause.reason === "stall"
+      ? "进度停滞（连续多步任务清单/交付状态未变化）"
+      : pause.reason === "soft_budget"
+        ? "本轮 soft 步数预算已用尽"
+        : "已达安全步数上限";
+    const pauseBody = [
+      stripDsmlText(transcript, "").trim(),
+      `已暂停：${reasonLabel}。`,
+      `已执行 ${pause.usedSteps} 步（soft ${pause.softBudget} / 安全上限 ${pause.hardCap}）。`,
+      openTodoLines.length ? `未完成清单：\n${openTodoLines.join("\n")}` : "当前无未完成清单项。",
+      endGaps.length ? `仍缺：${endGaps.join("；")}。` : "",
+      "中途上下文、任务清单与工作记忆已保留。请点击本条或上一条用户指令上的「续跑」继续，也可发送新指令。",
+      "[生成已中断]",
+    ].filter(Boolean).join("\n\n");
+    try {
+      store.addMessage(sessionId, "assistant", pauseBody, "agent", options.variantGroupId);
+      store.addSystemMessage(sessionId, runtimeDebugContext(messages, {
+        task: task.label,
+        model: executionModel.model,
+        turns: pause.usedSteps,
+        transcript,
+        pauseReason: pause.reason,
+      }));
+    } catch { /* 持久化失败不阻断可续跑结束 */ }
+    freezeCurrentTurn();
+    emit({
+      type: "waiting_for_input",
+      sessionId,
+      question: `${reasonLabel}（${pause.usedSteps} 步）。可点击「续跑」从中断处继续。`,
+      options: ["续跑"],
     });
-    store.addSystemMessage(sessionId, debugContext);
-    throw new Error("Agent 模型执行轮次达到上限；中途上下文已保存到当前会话");
+    return;
   } catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
       if (transcript.trim()) store.addMessage(sessionId, "assistant", `${transcript.trim()}\n\n[生成已中断]`, "agent", options.variantGroupId);
@@ -3098,9 +3287,109 @@ const REVIEW_PROMPT = `终审专则：降低机器生成感，不是换成另一
 改法：动作有结果；细节供判断；因果拆句；笼统判断落到可见动作/感官；勿堆修辞伪装生动；勿新增事实。
 无问题句保持原样。只审阅→有证据结论不提案；要求修复→最小 patch。`;
 
+/** Absolute per-job safety rail. Soft budget stays below this unless tests pass maxTurns. */
+export const AGENT_HARD_TURN_CAP = 100;
+/** Consecutive steps with an unchanged progress fingerprint before stall converge. */
+export const AGENT_STALL_WINDOW = 4;
+/** Extra steps after soft/stall to force a minimal deliverable or ask_user. */
+export const AGENT_CONVERGE_TURNS = 2;
+
+export type AgentBudgetPauseReason = "soft_budget" | "stall" | "hard_cap";
+
+/**
+ * Dynamic soft step budget from remaining work (todos, deliverables, scene chain).
+ * Not a hard wall: exhaustion enters a short converge window, then soft-pauses for 续跑.
+ */
+export function computeSoftTurnBudget(input: {
+  todos: AgentTodoItem[];
+  todoPlanLength: number;
+  documentDeliverables: number;
+  completedDocumentDeliverables: number;
+  documentProposalRequired: boolean;
+  mutation: AgentMutationRequirement;
+  scenePipelineEnabled: boolean;
+  chapterSceneDraft?: { scenes: readonly unknown[]; completed: readonly unknown[] } | null;
+}): number {
+  const openTodos = input.todos.filter(
+    todo => todo.status === "pending" || todo.status === "in_progress",
+  ).length;
+  const totalTodos = Math.max(input.todos.length, input.todoPlanLength, openTodos, 1);
+  const deliverableSlots = Math.max(
+    input.documentDeliverables,
+    input.documentProposalRequired ? 1 : 0,
+  );
+  const pendingDeliverables = Math.max(0, deliverableSlots - input.completedDocumentDeliverables);
+  let budget = 12;
+  budget += Math.max(openTodos, 1) * 6;
+  budget += Math.max(0, totalTodos - openTodos) * 2;
+  budget += pendingDeliverables * 8;
+  if (input.mutation === "document" || input.mutation === "mixed") budget += 10;
+  if (input.mutation === "character" || input.mutation === "mixed") budget += 4;
+  if (input.scenePipelineEnabled) budget += 12;
+  if (input.chapterSceneDraft) {
+    const remainingScenes = Math.max(
+      0,
+      input.chapterSceneDraft.scenes.length - input.chapterSceneDraft.completed.length,
+    );
+    budget += 6 + remainingScenes * 4;
+  }
+  return Math.min(80, Math.max(16, budget));
+}
+
+/** Structural progress only — not tool-name thrash or free-text heuristics. */
+export function agentStepProgressFingerprint(
+  todos: AgentTodoItem[],
+  progress: ReturnType<typeof createAgentExecutionProgress>,
+  flags: {
+    documentProposalSubmitted: boolean;
+    characterMutationSubmitted: boolean;
+    chapterReviewRequired: boolean;
+    chapterSceneVersion?: number;
+    chapterScenesCompleted?: number;
+    completedDocumentDeliverables: number;
+  },
+): string {
+  const todoSig = todos.map(todo => `${todo.id}:${todo.status}`).join(",");
+  const stages = [...progress.workflowStages].sort().join("|");
+  return [
+    todoSig,
+    progress.documentArtifactProduced ? "d1" : "d0",
+    progress.characterArtifactProduced ? "c1" : "c0",
+    progress.proseGateRuleSaved ? "g1" : "g0",
+    stages,
+    flags.documentProposalSubmitted ? "p1" : "p0",
+    flags.characterMutationSubmitted ? "m1" : "m0",
+    flags.chapterReviewRequired ? "r1" : "r0",
+    `sv${flags.chapterSceneVersion ?? 0}`,
+    `sc${flags.chapterScenesCompleted ?? 0}`,
+    `dd${flags.completedDocumentDeliverables}`,
+  ].join(";");
+}
+
+function agentBudgetConvergePrompt(
+  reason: Exclude<AgentBudgetPauseReason, "hard_cap">,
+  meta: { step: number; softBudget: number; hardCap: number; openTodos: number },
+): string {
+  const head = reason === "stall"
+    ? `运行时检测到进度停滞（连续 ${AGENT_STALL_WINDOW} 步任务清单/交付状态未变化，当前第 ${meta.step} 步）。`
+    : `本任务 soft 步数预算将尽（第 ${meta.step} 步，soft ${meta.softBudget} / 安全上限 ${meta.hardCap}）。`;
+  return [
+    head,
+    `请在 ${AGENT_CONVERGE_TURNS} 步内收敛：完成当前可验证交付、提交提案、或 ask_user 澄清不可推断的决策；不要扩大范围或重复无效读取。`,
+    meta.openTodos > 0 ? `仍有 ${meta.openTodos} 项未完成清单。` : "无未完成清单项时请直接给出可交付结果。",
+    "若本窗口内仍无法完成，运行时会暂停并保留上下文，作者可点「续跑」继续。",
+  ].join("");
+}
+
 function runtimeDebugContext(
   messages: ApiMessage[],
-  metadata: { task: string; model: string; turns: number; transcript: string },
+  metadata: {
+    task: string;
+    model: string;
+    turns: number;
+    transcript: string;
+    pauseReason?: AgentBudgetPauseReason;
+  },
 ): string {
   const entries = messages.map((message, index) => {
     const content = message.content ?? "";
@@ -3116,10 +3405,11 @@ function runtimeDebugContext(
     task: metadata.task,
     model: metadata.model,
     turns: metadata.turns,
+    pauseReason: metadata.pauseReason ?? "hard_cap",
     partialOutput: metadata.transcript,
     messages: entries,
   }, null, 2);
-  return `[Agent 调试上下文：模型执行轮次达到上限]\n${payload}`;
+  return `[Agent 调试上下文：步数预算暂停，可续跑]\n${payload}`;
 }
 
 function selectedBlocksContext(project: WriterProject, references?: Array<{ path: string; text?: string }>): string {
@@ -3944,20 +4234,21 @@ export function compactRuntimeMessages(
 ): void {
   const keepRecent = Math.max(0, options.keepRecent ?? 2);
   const toolIndexes = messages.flatMap((message, index) => message.role === "tool" ? [index] : []);
-  const totalChars = toolIndexes.reduce((sum, index) => sum + (messages[index].content?.length ?? 0), 0);
+  const totalChars = toolIndexes.reduce((sum, index) => sum + messageContentCharCount(messages[index].content), 0);
   // Earlier compact once digests stay in the transcript (no full rehydrate of all tools).
   if (!options.force && toolIndexes.length <= 4 && totalChars <= 20_000) return;
 
   // slice(0, -0) is slice(0, 0) — an empty list. keepRecent 0 must mean "all of them".
   for (const index of keepRecent > 0 ? toolIndexes.slice(0, -keepRecent) : toolIndexes) {
     const message = messages[index];
-    if (!message.content || message.content.length <= 800) continue;
+    const toolBody = messageContentText(message.content);
+    if (!toolBody || toolBody.length <= 800) continue;
     try {
-      const parsed = JSON.parse(message.content) as Record<string, unknown>;
+      const parsed = JSON.parse(toolBody) as Record<string, unknown>;
       if (parsed.status === "artifact_compacted") continue;
       // Never compact catalogs / search hit lists — losing IDs forces re-list thrashing.
       if ([...NEVER_COMPACT_KEYS].some(key => key in parsed)) continue;
-      if (parsed.reused === true && message.content.length < 8_000) continue;
+      if (parsed.reused === true && toolBody.length < 8_000) continue;
 
       const content = typeof parsed.content === "string" ? parsed.content
         : typeof parsed.markdown === "string" ? parsed.markdown : undefined;
@@ -3979,7 +4270,7 @@ export function compactRuntimeMessages(
         message: "正文已压缩为 digest；请直接基于 digest、本轮任务工作记忆与写作引导继续。禁止因压缩再次 read_document / list_outline_nodes。",
       });
     } catch {
-      if (message.content.length > 2_500) {
+      if (toolBody.length > 2_500) {
         message.content = JSON.stringify({ status: "artifact_compacted", message: "工具结果已压缩；请继续任务，不要重复调用同一工具。" });
       }
     }
@@ -4001,9 +4292,10 @@ export function rehydrateRecentToolMessages(
   const restore = new Set(toolIndexes.slice(-Math.max(0, keepRecent)));
   for (const index of restore) {
     const message = messages[index];
-    if (!message?.content) continue;
+    const toolBody = messageContentText(message?.content);
+    if (!toolBody) continue;
     try {
-      const parsed = JSON.parse(message.content) as Record<string, unknown>;
+      const parsed = JSON.parse(toolBody) as Record<string, unknown>;
       if (parsed.status !== "artifact_compacted") continue;
       const artifactId = typeof parsed.artifactId === "number" ? parsed.artifactId : undefined;
       if (artifactId === undefined) continue;
@@ -4332,6 +4624,8 @@ type CompletionRequestOptions = {
   temperature?: number;
   topP?: number;
   responseFormat?: { type: "json_object" };
+  /** Resolve writer-attachment:// refs when serializing multimodal content. */
+  resolveAttachment?: (sessionId: string, id: string) => { mimeType: string; bytes: Buffer } | undefined;
   /** Observation-only metadata. Never serialized into the provider request. */
   prefixCache?: PrefixCacheRequestContext;
 };
@@ -4345,10 +4639,16 @@ async function streamCompletion(
   options: CompletionRequestOptions = {},
 ): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean } }> {
   const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  // Expand attachment refs / strip images for text-only models only at the wire boundary.
+  // Live + frozen message arrays keep stable writer-attachment:// refs (cache-friendly size).
+  const wireMessages = prepareMessagesForProvider(messages, {
+    supportsMultimodal: modelSupportsMultimodal(model),
+    resolveAttachment: options.resolveAttachment,
+  });
   const requestBody = JSON.stringify({
     // The selected profile is frozen and project-agnostic for this job.
     model: model.model,
-    messages,
+    messages: wireMessages,
     ...(options.tools?.length ? { tools: options.tools } : {}),
     ...(options.userId ? { user_id: options.userId } : {}),
     stream: true,
@@ -4521,11 +4821,11 @@ function estimateCompletionUsage(
   toolCalls: ToolAccumulator[],
 ): { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } {
   const promptChars = messages.reduce((sum, message) => {
-    const body = message.content ?? "";
+    const body = messageContentCharCount(message.content);
     const tools = message.tool_calls
       ? message.tool_calls.map((call) => `${call.function.name}:${call.function.arguments}`).join("\n")
       : "";
-    return sum + body.length + tools.length + 16;
+    return sum + body + tools.length + 16;
   }, 0);
   const completionChars = content.length + reasoningContent.length
     + toolCalls.reduce((sum, call) => sum + call.name.length + call.arguments.length + 24, 0);

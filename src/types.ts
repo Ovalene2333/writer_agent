@@ -31,6 +31,11 @@ export interface ModelConfig {
    * and lets the provider apply its own defaults.
    */
   disableSampling?: boolean;
+  /**
+   * Model accepts OpenAI-style multimodal user content (text + image_url parts).
+   * When false/undefined, image attachments are reduced to text placeholders.
+   */
+  supportsMultimodal?: boolean;
 }
 
 /** 峰谷/分时计费：高峰时段使用 peak 单价，平时使用基础单价。 */
@@ -114,6 +119,7 @@ export interface ProviderPublicConfig {
   reasoningEffort?: ReasoningEffort;
   verbosity?: ResponseVerbosity;
   disableSampling?: boolean;
+  supportsMultimodal?: boolean;
 }
 
 export interface ProviderModelPublic {
@@ -128,6 +134,8 @@ export interface ProviderModelPublic {
   verbosity?: ResponseVerbosity;
   /** See ModelConfig.disableSampling — set per model, since this is a model capability. */
   disableSampling?: boolean;
+  /** See ModelConfig.supportsMultimodal — set per model. */
+  supportsMultimodal?: boolean;
 }
 
 export interface ProviderProfilePublic {
@@ -164,6 +172,32 @@ export interface StyleTemplate {
 /** 消息来源通道：写作 Agent 与角色扮演试演分流上下文。 */
 export type MessageChannel = "agent" | "roleplay";
 
+/** OpenAI Chat Completions multimodal content part. */
+export type MessageContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: "auto" | "low" | "high" } };
+
+/** Wire-level message content: plain text, multimodal parts, or null (assistant tool-only). */
+export type MessageContent = string | MessageContentPart[] | null;
+
+/** Persisted user image attachment metadata (bytes live under `.writer/attachments/`). */
+export interface MessageAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  /** Path relative to project privateDir, e.g. `attachments/<session>/<id>.png`. */
+  storagePath: string;
+}
+
+/** Inbound image payload from the web/API before it is written to disk. */
+export interface MessageAttachmentInput {
+  name?: string;
+  mimeType: string;
+  /** Raw base64 (no data: prefix). */
+  dataBase64: string;
+}
+
 export interface Message {
   id: number;
   sessionId: string;
@@ -178,6 +212,8 @@ export interface Message {
   variantGroupId?: string;
   /** Number of saved/live assistant answers in this regeneration group. */
   variantCount?: number;
+  /** User-attached images for this message (agent channel). */
+  attachments?: MessageAttachment[];
 }
 
 export interface CharacterTemporal { validFrom?: string; validUntil?: string }
@@ -431,7 +467,7 @@ export interface AgentTurnBlock {
 
 export interface AgentTurnMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: MessageContent;
   tool_call_id?: string;
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   reasoning_content?: string;

@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageChannel, Proposal, ProposalCharacterChange, ProseQualityReport,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageAttachment, MessageAttachmentInput, MessageChannel, MessageContent, MessageContentPart, Proposal, ProposalCharacterChange, ProseQualityReport,
   RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
   MessageStepTrail, PersistedStreamStep,
 } from "./types.js";
+import {
+  extensionForImageMime,
+  isSupportedImageMime,
+  MULTIMODAL_MAX_ATTACHMENTS,
+  MULTIMODAL_MAX_BYTES,
+  normalizeImageMime,
+} from "./model_compat.js";
 import { blockAtOffset, documentBlocks } from "./document_blocks.js";
 import { documentSpans } from "./document_spans.js";
 import {
@@ -110,10 +117,11 @@ function parseAgentTurnMessages(value: unknown): AgentTurnMessage[] | undefined 
       if (!item || typeof item !== "object") return undefined;
       const message = item as Partial<AgentTurnMessage>;
       if (message.role !== "system" && message.role !== "user" && message.role !== "assistant" && message.role !== "tool") return undefined;
-      if (typeof message.content !== "string" && message.content !== null) return undefined;
+      const content = normalizeTurnContent(message.content);
+      if (content === undefined) return undefined;
       messages.push({
         role: message.role,
-        content: message.content,
+        content,
         ...(typeof message.tool_call_id === "string" ? { tool_call_id: message.tool_call_id } : {}),
         ...(Array.isArray(message.tool_calls) ? { tool_calls: message.tool_calls } : {}),
         ...(typeof message.reasoning_content === "string" ? { reasoning_content: message.reasoning_content } : {}),
@@ -122,6 +130,57 @@ function parseAgentTurnMessages(value: unknown): AgentTurnMessage[] | undefined 
     return messages;
   } catch {
     return undefined;
+  }
+}
+
+function normalizeTurnContent(value: unknown): MessageContent | undefined {
+  if (value === null || typeof value === "string") return value;
+  if (!Array.isArray(value)) return undefined;
+  const parts: MessageContentPart[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return undefined;
+    const part = item as Partial<MessageContentPart>;
+    if (part.type === "text" && typeof part.text === "string") {
+      parts.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image_url" && part.image_url && typeof part.image_url === "object") {
+      const url = (part.image_url as { url?: unknown }).url;
+      if (typeof url !== "string" || !url) return undefined;
+      const detail = (part.image_url as { detail?: unknown }).detail;
+      parts.push({
+        type: "image_url",
+        image_url: {
+          url,
+          ...(detail === "auto" || detail === "low" || detail === "high" ? { detail } : {}),
+        },
+      });
+      continue;
+    }
+    return undefined;
+  }
+  return parts;
+}
+
+function parseMessageAttachments(value: unknown): MessageAttachment[] {
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item): MessageAttachment[] => {
+      if (!item || typeof item !== "object") return [];
+      const row = item as Partial<MessageAttachment>;
+      if (typeof row.id !== "string" || typeof row.mimeType !== "string" || typeof row.storagePath !== "string") return [];
+      return [{
+        id: row.id,
+        name: typeof row.name === "string" && row.name.trim() ? row.name.trim() : row.id,
+        mimeType: row.mimeType,
+        size: Number(row.size) || 0,
+        storagePath: row.storagePath,
+      }];
+    });
+  } catch {
+    return [];
   }
 }
 
@@ -557,6 +616,9 @@ export class WriterStore {
     }
     if (!messageColumns.some(column => column.name === "roleplay_input_mode")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN roleplay_input_mode TEXT");
+    }
+    if (!messageColumns.some(column => column.name === "attachments_json")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'");
     }
     this.database.exec(`UPDATE messages
       SET roleplay_input_mode=CASE
@@ -2047,6 +2109,7 @@ export class WriterStore {
     channel: MessageChannel = "agent",
     variantGroupId?: string,
     roleplayInputMode?: RoleplayInputMode,
+    attachments?: MessageAttachment[],
   ): number {
     const now = new Date().toISOString();
     const normalized = channel === "roleplay" ? "roleplay" : "agent";
@@ -2054,10 +2117,100 @@ export class WriterStore {
       && (roleplayInputMode === "director" || roleplayInputMode === "dialogue")
       ? roleplayInputMode
       : null;
-    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode) VALUES(?,?,?,?,?,?,?)")
-      .run(sessionId, role, content, now, normalized, variantGroupId ?? null, normalizedInputMode);
+    const attachmentsJson = attachments?.length ? JSON.stringify(attachments) : "[]";
+    const result = this.database.prepare("INSERT INTO messages(session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json) VALUES(?,?,?,?,?,?,?,?)")
+      .run(sessionId, role, content, now, normalized, variantGroupId ?? null, normalizedInputMode, attachmentsJson);
     this.database.prepare("UPDATE sessions SET updated_at=? WHERE id=?").run(now, sessionId);
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * Persist inbound base64 images under `.writer/attachments/<session>/`.
+   * Validates mime, size and count; returns metadata ready for message + model content.
+   */
+  saveMessageAttachments(sessionId: string, inputs: MessageAttachmentInput[]): MessageAttachment[] {
+    if (!inputs.length) return [];
+    if (inputs.length > MULTIMODAL_MAX_ATTACHMENTS) {
+      throw new Error(`单次最多附带 ${MULTIMODAL_MAX_ATTACHMENTS} 张图片`);
+    }
+    const attachments: MessageAttachment[] = [];
+    for (const input of inputs) {
+      const mimeType = normalizeImageMime(input.mimeType || "");
+      if (!isSupportedImageMime(mimeType)) {
+        throw new Error(`不支持的图片类型：${input.mimeType || "unknown"}（允许 jpeg/png/gif/webp）`);
+      }
+      const raw = input.dataBase64?.replace(/\s+/g, "") ?? "";
+      if (!raw) throw new Error("图片数据为空");
+      let bytes: Buffer;
+      try {
+        bytes = Buffer.from(raw, "base64");
+      } catch {
+        throw new Error("图片 base64 无效");
+      }
+      if (!bytes.length) throw new Error("图片数据为空");
+      if (bytes.length > MULTIMODAL_MAX_BYTES) {
+        throw new Error(`单张图片不能超过 ${Math.round(MULTIMODAL_MAX_BYTES / 1024 / 1024)}MB`);
+      }
+      const id = randomUUID();
+      const ext = extensionForImageMime(mimeType);
+      const storagePath = `attachments/${sessionId}/${id}.${ext}`;
+      const absolute = resolve(this.project.privateDir, storagePath);
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, bytes);
+      const name = (input.name?.trim() || `image.${ext}`).slice(0, 120);
+      attachments.push({ id, name, mimeType, size: bytes.length, storagePath });
+    }
+    return attachments;
+  }
+
+  resolveAttachmentBytes(sessionId: string, attachmentId: string): { mimeType: string; bytes: Buffer } | undefined {
+    const row = this.database.prepare(
+      `SELECT attachments_json FROM messages WHERE session_id=? AND attachments_json LIKE ? ORDER BY id DESC LIMIT 20`,
+    ).all(sessionId, `%${attachmentId}%`) as Row[];
+    for (const item of row) {
+      const list = parseMessageAttachments(item.attachments_json);
+      const match = list.find(entry => entry.id === attachmentId);
+      if (!match) continue;
+      const absolute = resolve(this.project.privateDir, match.storagePath);
+      if (!existsSync(absolute)) return undefined;
+      try {
+        return { mimeType: match.mimeType, bytes: readFileSync(absolute) };
+      } catch {
+        return undefined;
+      }
+    }
+    // Fallback: scan session attachment directory by id prefix (message may not be committed yet).
+    const dir = resolve(this.project.privateDir, "attachments", sessionId);
+    if (!existsSync(dir)) return undefined;
+    try {
+      const file = readdirSync(dir).find(name => name.startsWith(`${attachmentId}.`));
+      if (!file) return undefined;
+      const absolute = resolve(dir, file);
+      const ext = file.slice(file.lastIndexOf(".") + 1).toLowerCase();
+      const mimeType = ext === "png" ? "image/png"
+        : ext === "gif" ? "image/gif"
+          : ext === "webp" ? "image/webp"
+            : "image/jpeg";
+      return { mimeType, bytes: readFileSync(absolute) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  readAttachmentFile(storagePath: string): { mimeType: string; bytes: Buffer } | undefined {
+    if (!storagePath.startsWith("attachments/") || storagePath.includes("..")) return undefined;
+    const absolute = resolve(this.project.privateDir, storagePath);
+    if (!existsSync(absolute)) return undefined;
+    const ext = absolute.slice(absolute.lastIndexOf(".") + 1).toLowerCase();
+    const mimeType = ext === "png" ? "image/png"
+      : ext === "gif" ? "image/gif"
+        : ext === "webp" ? "image/webp"
+          : "image/jpeg";
+    try {
+      return { mimeType, bytes: readFileSync(absolute) };
+    } catch {
+      return undefined;
+    }
   }
 
   /** Persist the model-safe projection of a raw roleplay user turn. */
@@ -2112,11 +2265,11 @@ export class WriterStore {
     const channel = options?.channel;
     const rows = channel
       ? this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? AND channel=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, channel, limit)
       : this.database.prepare(`
-          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
+          SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -2150,10 +2303,10 @@ export class WriterStore {
     const afterId = Number.isInteger(options.afterId) && (options.afterId ?? 0) > 0 ? options.afterId! : 0;
     const limit = Math.max(1, Math.min(100, Math.round(options.limit ?? 40)));
     const rows = options.channel
-      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
+      ? this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? AND channel=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, options.channel, afterId, limit)
-      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
+      : this.database.prepare(`SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id>?
           ORDER BY id ASC LIMIT ?`).all(sessionId, afterId, limit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -2163,10 +2316,10 @@ export class WriterStore {
   conversationMessagesBefore(sessionId: string, beforeId?: number, limit = 50): Message[] {
     const normalizedLimit = Math.max(1, Math.min(100, Math.round(limit)));
     const rows = beforeId !== undefined && Number.isInteger(beforeId) && beforeId > 0
-      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
+      ? this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? AND role IN ('user','assistant') AND id<? ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, beforeId, normalizedLimit)
-      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode FROM messages
+      : this.database.prepare(`SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?) ORDER BY id ASC`)
           .all(sessionId, normalizedLimit);
     return rows.map((row) => this.messageFromRow(row as Row));
@@ -2334,6 +2487,7 @@ export class WriterStore {
   }
 
   private messageFromRow(row: Row): Message {
+    const attachments = parseMessageAttachments(row.attachments_json);
     return {
       id: row.id as number,
       sessionId: row.session_id as string,
@@ -2345,6 +2499,7 @@ export class WriterStore {
         ? { roleplayInputMode: row.roleplay_input_mode }
         : {}),
       ...(typeof row.variant_group_id === "string" ? { variantGroupId: row.variant_group_id } : {}),
+      ...(attachments.length ? { attachments } : {}),
     };
   }
 

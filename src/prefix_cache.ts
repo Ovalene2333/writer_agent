@@ -15,7 +15,7 @@ const DEFAULT_REPLAY_BYTES = 16 * 1024 * 1024;
 
 export type PrefixCacheMessage = {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | import("./types.js").MessageContentPart[] | null;
   tool_call_id?: string;
   tool_calls?: Array<{
     id: string;
@@ -188,9 +188,15 @@ function serializeMessage(message: PrefixCacheMessage): string {
 }
 
 function documentMetadata(message: PrefixCacheMessage): PrefixCacheAtom["document"] | undefined {
-  if (message.role !== "tool" || !message.content) return undefined;
+  if (message.role !== "tool" || message.content == null) return undefined;
+  const toolBody = typeof message.content === "string"
+    ? message.content
+    : Array.isArray(message.content)
+      ? message.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      : "";
+  if (!toolBody) return undefined;
   try {
-    const parsed = JSON.parse(message.content) as Record<string, unknown>;
+    const parsed = JSON.parse(toolBody) as Record<string, unknown>;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
     const content = typeof parsed.content === "string"
       ? parsed.content

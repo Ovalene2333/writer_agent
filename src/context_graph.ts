@@ -468,7 +468,7 @@ export function buildContextGraphView(
 }
 
 export function chapterHandoffLabel(parts: { path?: string; summary?: string; index?: number }): string {
-  if (parts.path) return `章交接 · ${parts.path}`;
-  if (parts.index != null) return `章交接 · #${parts.index}`;
-  return `章交接 · ${parts.summary?.slice(0, 40) || "未命名"}`;
+  if (parts.path) return `章节衔接 · ${parts.path}`;
+  if (parts.index != null) return `章节衔接 · #${parts.index}`;
+  return `章节衔接 · ${parts.summary?.slice(0, 40) || "未命名"}`;
 }

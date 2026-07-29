@@ -1,5 +1,6 @@
 import type { AgentTurnMessage } from "./types.js";
 import type { WriterStore } from "./store.js";
+import { messageContentText } from "./model_compat.js";
 
 /**
  * Cross-turn context replay (Codex / Claude Code shape).
@@ -103,7 +104,7 @@ export function freezeTurnBlock(messages: readonly AgentTurnMessage[], from: num
     if (message.role === "assistant" && message.tool_calls) {
       const calls = message.tool_calls.filter(call => answered.has(call.id));
       if (!calls.length) {
-        if (!message.content?.trim()) continue;
+        if (!messageContentText(message.content).trim()) continue;
         delete message.tool_calls;
         kept.push(message);
         continue;

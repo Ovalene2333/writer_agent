@@ -68,6 +68,7 @@ import { buildChapterStyleRepairMessages, CHAPTER_STYLE_REPAIR_BATCH_SIZE, parse
 import { documentSpans } from "./document_spans.js";
 import { parseDocumentLocatorResult } from "./document_locator.js";
 import { parseDocumentRevision } from "./document_revision.js";
+import { messageContentText } from "./model_compat.js";
 
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
@@ -94,12 +95,12 @@ test("isolated chapter review carries the full draft once and returns bounded st
   });
   assert.deepEqual(messages.map(message => message.role), ["system", "system", "user"]);
   assert.equal(messages[1].content, "稳定项目约束");
-  assert.match(messages[0].content, /客观事实不自动等于角色知识/u);
-  assert.match(messages[0].content, /亲历\/目击、被可信来源告知/u);
-  assert.match(messages[0].content, /voice_homogenization/u);
-  assert.match(messages[0].content, /theme_stated/u);
-  assert.match(messages[0].content, /resolution_too_smooth/u);
-  assert.match(messages[2].content, /门禁灯由绿变红/u);
+  assert.match(messageContentText(messages[0].content), /客观事实不自动等于角色知识/u);
+  assert.match(messageContentText(messages[0].content), /亲历\/目击、被可信来源告知/u);
+  assert.match(messageContentText(messages[0].content), /voice_homogenization/u);
+  assert.match(messageContentText(messages[0].content), /theme_stated/u);
+  assert.match(messageContentText(messages[0].content), /resolution_too_smooth/u);
+  assert.match(messageContentText(messages[2].content), /门禁灯由绿变红/u);
   assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 
   const review = parseChapterReview(JSON.stringify({
@@ -302,7 +303,7 @@ test("character tool JSON recovery is conservative and keeps repair requests iso
     parameterSchema: { type: "object" },
   });
   assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
-  const payload = JSON.parse(messages[1].content ?? "{}") as Record<string, unknown>;
+  const payload = JSON.parse(messageContentText(messages[1].content) || "{}") as Record<string, unknown>;
   assert.equal(payload.rawArguments, '{"id":4,"identity":{"name":"日');
 });
 
@@ -730,11 +731,11 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.ok(a.every(message => message.role === "system"));
     assert.deepEqual(a.map(m => m.content), b.map(m => m.content));
     // Placeholders/catalogs keep slot count when optional project files are absent.
-    assert.match(a[2].content ?? "", /项目指令/);
-    assert.match(a[3].content ?? "", /项目技能/);
-    assert.match(a[3].content ?? "", /chapter-planning/);
-    assert.doesNotMatch(a[3].content ?? "", /提交前验收/);
-    assert.match(a[0].content ?? "", /characterChanges/);
+    assert.match(messageContentText(a[2].content), /项目指令/);
+    assert.match(messageContentText(a[3].content), /项目技能/);
+    assert.match(messageContentText(a[3].content), /chapter-planning/);
+    assert.doesNotMatch(messageContentText(a[3].content), /提交前验收/);
+    assert.match(messageContentText(a[0].content), /characterChanges/);
     // Slot 4/5 must not flip with intensive or audit — those go in the dynamic tail.
     const intensive = buildStableSystemPrefix(project, store, "ask", { intensive: true }, "write_scene");
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
@@ -742,9 +743,9 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.equal(a[4].content, intensive[4].content);
     assert.equal(a[5].content, audit[5].content);
     assert.equal(a[5].content, intensive[5].content);
-    assert.match(a[4].content ?? "", /风格锚定/);
-    assert.match(a[5].content ?? "", /当前任务/);
-    assert.doesNotMatch(a[5].content ?? "", /终审专则/);
+    assert.match(messageContentText(a[4].content), /风格锚定/);
+    assert.match(messageContentText(a[5].content), /当前任务/);
+    assert.doesNotMatch(messageContentText(a[5].content), /终审专则/);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -792,7 +793,7 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
     // 这个数字每轮都可能变，只能待在 miss-priced 的动态块里。
     const stable = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "write_scene");
     assert.equal(stable.length, 6);
-    assert.ok(stable.every(message => !/本轮篇幅目标/u.test(message.content ?? "")));
+    assert.ok(stable.every(message => !/本轮篇幅目标/u.test(messageContentText(message.content))));
 
     // 没有解析出目标时不占位，免得给动态块加一行常量字节。
     const withoutTarget = dynamicContextPrompt(
@@ -826,9 +827,9 @@ test("dynamic turn messages always expose the same slot count", () => {
   assert.equal(full.length, 9);
   assert.equal(empty.length, 9);
   assert.equal(full.at(-1)?.role, "user");
-  assert.equal(empty.at(-1)?.content, "闲聊");
-  assert.match(empty[3].content ?? "", /动态声线/);
-  assert.match(empty[6].content ?? "", /工作记忆/);
+  assert.equal(messageContentText(empty.at(-1)?.content), "闲聊");
+  assert.match(messageContentText(empty[3].content), /动态声线/);
+  assert.match(messageContentText(empty[6].content), /工作记忆/);
 });
 
 test("cache waterfall fingerprints stable messages and tools but not dynamic content", () => {
@@ -1081,7 +1082,7 @@ test("compactCompletedToolCalls keeps only the latest propose payload", () => {
   compactCompletedToolCalls(messages as never);
   const first = JSON.parse(messages[0].tool_calls![0].function.arguments) as { content: string };
   const second = JSON.parse(messages[1].tool_calls![0].function.arguments) as { content: string };
-  assert.match(first.content, /已压缩/);
+  assert.match(messageContentText(first.content), /已压缩/);
   assert.equal(second.content, "新正文");
 });
 
@@ -1107,7 +1108,7 @@ test("turn one keeps today's 9-slot shape; later turns fold into a single user b
   const second = [...stable, ...frozen, mergedTurnContext(turnParts)];
   assert.equal(second.at(-1)?.role, "user");
   for (const body of ["当前任务：改稿", "声线", "线索", "清单", "记忆", "选区", "把这段改短"]) {
-    assert.match(second.at(-1)?.content ?? "", new RegExp(body));
+    assert.match(messageContentText(second.at(-1)?.content), new RegExp(body));
   }
 });
 
@@ -1144,7 +1145,7 @@ test("no system message ever follows an assistant or tool turn across three turn
   // Replay must be a real prefix of what was sent, not a rebuilt approximation.
   assert.deepEqual(request.slice(0, 6), stable);
   assert.equal(request.at(-1)?.role, "user");
-  assert.match(request.at(-1)?.content ?? "", /任务 3/);
+  assert.match(messageContentText(request.at(-1)?.content), /任务 3/);
 });
 
 test("cache waterfall reports replayed turns separately from the live dynamic tail", () => {

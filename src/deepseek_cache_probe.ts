@@ -17,7 +17,7 @@ import type { ModelConfig, ModelTokenUsage, ModelUsageRole } from "./types.js";
 
 type ProbeMessage = {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | import("./types.js").MessageContentPart[] | null;
   reasoning_content?: string;
   tool_call_id?: string;
   tool_calls?: ProbeToolCall[];

@@ -87,6 +87,28 @@ export function conversationMessageForWeb(store: WriterStore, message: Message):
     : message;
 }
 
+function isVisibleConversationMessage(message: Message): boolean {
+  if (message.role !== "user" && message.role !== "assistant") return false;
+  if (message.content.trim()) return true;
+  return Boolean(message.attachments?.length);
+}
+
+function normalizeChatAttachments(
+  value: unknown,
+): Array<{ name?: string; mimeType: string; dataBase64: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as { name?: unknown; mimeType?: unknown; dataBase64?: unknown };
+    if (typeof row.mimeType !== "string" || typeof row.dataBase64 !== "string") return [];
+    return [{
+      ...(typeof row.name === "string" && row.name.trim() ? { name: row.name.trim().slice(0, 120) } : {}),
+      mimeType: row.mimeType,
+      dataBase64: row.dataBase64,
+    }];
+  });
+}
+
 export type AgentJobInfo = {
   id: string;
   sessionId: string;
@@ -427,7 +449,10 @@ export async function startWriterServer(options: {
       await next();
       return;
     }
-    const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+    // img/src 无法带 Authorization；附件 GET 允许 ?token=（仅 query，不写入 body）。
+    const provided = context.req.header("authorization")?.replace(/^Bearer\s+/i, "")
+      || context.req.query("token")
+      || "";
     const localBypass = context.req.header("x-writer-local-access") ?? "";
     const ownerAccess = tokensEqual(provided, token) || tokensEqual(localBypass, localBypassToken);
     const readonlyAccess = Boolean(readonlyToken) && tokensEqual(provided, readonlyToken);
@@ -481,21 +506,21 @@ export async function startWriterServer(options: {
       sessions: options.store.listSessions(),
       sessionId,
       messages: options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, undefined, 50)
-        .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
+        .filter(isVisibleConversationMessage)
         .map(message => ({
           ...conversationMessageForWeb(options.store, message),
           content: stripDsmlText(message.content, "[工具调用已隐藏]"),
         }))),
       messagesHasMore: (() => {
         const visible = options.store.conversationMessagesBefore(sessionId, undefined, 50)
-          .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim());
+          .filter(isVisibleConversationMessage);
         const firstId = visible[0]?.id;
         const firstArchiveId = options.store.conversationStats(sessionId).firstMessageId;
         return firstId !== undefined && firstArchiveId !== undefined && firstId > firstArchiveId;
       })(),
       stepTrails: (() => {
         const visible = options.store.conversationMessagesBefore(sessionId, undefined, 50)
-          .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim());
+          .filter(isVisibleConversationMessage);
         const messageIds = visible.map(message => message.id);
         return options.store.messageStepTrails(sessionId, messageIds);
       })(),
@@ -680,6 +705,25 @@ export async function startWriterServer(options: {
     return context.json({ sessionId: options.store.createSession(body.title || "写作会话") });
   });
 
+  app.get("/api/session/:id/attachments/:attachmentId", (context) => {
+    try {
+      const sessionId = context.req.param("id");
+      const attachmentId = context.req.param("attachmentId");
+      if (!options.store.sessionExists(sessionId)) throw new Error("Session not found");
+      const resolved = options.store.resolveAttachmentBytes(sessionId, attachmentId);
+      if (!resolved) return context.json({ error: "Attachment not found" }, 404);
+      return new Response(new Uint8Array(resolved.bytes), {
+        status: 200,
+        headers: {
+          "content-type": resolved.mimeType,
+          "cache-control": "private, max-age=3600",
+        },
+      });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.get("/api/session/:id/messages", (context) => {
     try {
       const sessionId = context.req.param("id");
@@ -690,7 +734,7 @@ export async function startWriterServer(options: {
       const rawLimit = Number(context.req.query("limit") || 50);
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 50;
       const messages = options.store.withMessageVariantInfo(options.store.conversationMessagesBefore(sessionId, beforeId, limit)
-        .filter(message => (message.role === "user" || message.role === "assistant") && message.content.trim())
+        .filter(isVisibleConversationMessage)
         .map(message => ({
           ...conversationMessageForWeb(options.store, message),
           content: stripDsmlText(message.content, "[工具调用已隐藏]"),
@@ -1250,16 +1294,21 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/chat", async (context) => {
-    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }>; resumeInterrupted?: boolean }>();
+    const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }>; resumeInterrupted?: boolean; attachments?: Array<{ name?: string; mimeType: string; dataBase64: string }> }>();
     if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
     if (agentJobs.activeJob(body.sessionId)) {
       return context.json({ error: "This session already has a running Agent job" }, 409);
     }
+    const chatAttachments = normalizeChatAttachments(body.attachments);
     // Model-initiated roleplay turns legitimately carry no player prompt.
-    if (!body.prompt?.trim() && !(body.mode === "roleplay" && (body.opening || body.performerAutoReply))) {
+    // Agent turns may be image-only when attachments are present.
+    if (!body.prompt?.trim() && !chatAttachments.length && !(body.mode === "roleplay" && (body.opening || body.performerAutoReply))) {
       return context.json({ error: "写作指令不能为空" }, 400);
+    }
+    if (chatAttachments.length && (body.mode === "character" || body.mode === "roleplay")) {
+      return context.json({ error: "目前仅写作 Agent 支持附图" }, 400);
     }
     const characterScope = Array.isArray(body.characterScope)
       ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
@@ -1343,6 +1392,7 @@ export async function startWriterServer(options: {
             sessionId: body.sessionId,
             jobId: job.id,
             prompt: body.prompt,
+            ...(chatAttachments.length ? { attachments: chatAttachments } : {}),
             variantGroupId,
             selectedDocumentBlocks: body.documentSelections,
             resumeInterrupted: body.resumeInterrupted === true,

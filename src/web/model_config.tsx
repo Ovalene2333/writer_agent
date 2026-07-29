@@ -18,7 +18,7 @@ export type Pricing = {
 };
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ResponseVerbosity = "low" | "medium" | "high";
-export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean };
+export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean; supportsMultimodal?: boolean };
 export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; proxyUrl?: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
 export type ModelRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
@@ -611,6 +611,16 @@ export function ModelConfig({
               <div className="sampling-setting-control" role="group" aria-label="采样参数">
                 <button type="button" className={!model.disableSampling ? "active" : ""} aria-pressed={!model.disableSampling} onClick={() => updateModel(index, { disableSampling: false })}>发送</button>
                 <button type="button" className={model.disableSampling ? "active" : ""} aria-pressed={Boolean(model.disableSampling)} onClick={() => updateModel(index, { disableSampling: true })}>不发送</button>
+              </div>
+            </div>
+            <div className="sampling-setting">
+              <div className="sampling-setting-copy">
+                <strong>多模态输入</strong>
+                <small>开启后，写作 Agent 可把用户附图以 image_url 发给该模型（需供应商支持视觉）</small>
+              </div>
+              <div className="sampling-setting-control" role="group" aria-label="多模态输入">
+                <button type="button" className={model.supportsMultimodal ? "active" : ""} aria-pressed={Boolean(model.supportsMultimodal)} onClick={() => updateModel(index, { supportsMultimodal: true })}>支持</button>
+                <button type="button" className={!model.supportsMultimodal ? "active" : ""} aria-pressed={!model.supportsMultimodal} onClick={() => updateModel(index, { supportsMultimodal: false })}>仅文本</button>
               </div>
             </div>
           </div>
