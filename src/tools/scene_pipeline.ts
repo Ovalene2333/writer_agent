@@ -1389,7 +1389,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
       "冲突是否靠互相理解化解、代价被抹平、阻力恰好让路；有没有人付出了不可撤销的代价",
       "整章是否有人在争取一件他在乎且可能失败的事；每场结束时是否留下读者在意的未定结果，还是只增加了信息量（参考 proseDrive）",
-      "对白是不是全章都在确认与应答：有没有人回避提问、答非所问、说到一半停住、或说了一段对方没问的话（参考 proseDialogue）",
+      "对白是不是全章都在确认与应答：有没有人回避提问、答非所问、说到一半停住、或说了一段对方没问的话；有没有一个并列句式被不同人物轮流用（参考 proseDialogue 的言语动作分布与复现句式）",
     ],
     message: (
       reviewFailure?.errors.every(err => /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(err))
