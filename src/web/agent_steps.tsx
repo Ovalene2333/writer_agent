@@ -272,16 +272,25 @@ export function AgentStepContextResetBanner({
       className="agent-step-context-reset"
       title="完成一章或一场后会收束上下文：保留稳定规则、项目索引与章节衔接，丢弃上一章的过程细节。之后若再读设定或前章，属于按需补充，属正常行为。"
     >
-      <span className="agent-step-context-reset-badge">上下文收束</span>
+      <span className="agent-step-context-reset-badge">
+        <span className="agent-step-context-reset-indicator" aria-hidden="true" />
+        上下文已收束
+      </span>
       <span className="agent-step-context-reset-flow">
-        Step {reset.fromStep} → {reset.toStep}
+        <span>步骤</span>
+        <strong>{reset.fromStep} → {reset.toStep}</strong>
       </span>
       <span className="agent-step-context-reset-tokens">
-        {formatGraphTokens(reset.before)} → {formatGraphTokens(reset.after)}
-        <em>−{formatGraphTokens(saved)}</em>
+        <span>上下文</span>
+        <strong>
+          {formatGraphTokens(reset.before)} → {formatGraphTokens(reset.after)}
+        </strong>
+      </span>
+      <span className="agent-step-context-reset-saved">
+        减少 {formatGraphTokens(saved)}
       </span>
       <span className="agent-step-context-reset-hint">
-        章节切换 · 保留规则与衔接 · 清空过程痕迹
+        章节边界 · 保留规则与衔接 · 移除过程上下文
       </span>
     </div>
   );
