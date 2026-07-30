@@ -89,3 +89,15 @@ test("scene feedback withholds closing uplift — 章还没写完，收尾还不
   assert.ok(feedback.includes("AI 味计量"), feedback);
   assert.ok(!feedback.includes("收尾有"), "写作途中不该因为章尾升华提示");
 });
+
+test("事件堆叠句被单独计量（AI 网剧旁白腔）", () => {
+  const packed = Array.from({ length: 24 }, (_, i) =>
+    `他在第${i + 1}号舱看见编组、协议、等级与融合度同时亮起，并且目标身份、伤势、回收优先级以及父亲的指令一边涌进耳机一边压在胸口。`,
+  ).join("\n\n");
+  const result = analyzeAiTells(packed);
+  assert.ok(result.stats.packingRatio > 0.12, `packingRatio=${result.stats.packingRatio}`);
+  assert.ok(
+    result.issues.some(issue => issue.code === "event_packing"),
+    `codes=${result.issues.map(i => i.code).join(",")} packing=${result.stats.packingRatio}`,
+  );
+});

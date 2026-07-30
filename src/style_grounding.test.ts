@@ -22,7 +22,7 @@ describe("styleFingerprint", () => {
 });
 
 describe("naturalProseCraftPrompt", () => {
-  it("turns naturalness into positive, scene-level writing decisions", () => {
+  it("turns naturalness into scene-level craft plus anti-stacking limits", () => {
     const prompt = naturalProseCraftPrompt();
     assert.match(prompt, /注意顺序/);
     assert.match(prompt, /场景发动/);
@@ -37,10 +37,14 @@ describe("naturalProseCraftPrompt", () => {
     assert.match(prompt, /单句成段是重音/);
     assert.match(prompt, /绵延的长句/);
     assert.match(prompt, /半拍/);
-    // Pink-elephant guard: the craft baseline stays positively framed, no bad-example demos.
-    assert.ok(!prompt.includes("禁止"));
+    assert.match(prompt, /一拍一事|一个主要事件/);
+    assert.match(prompt, /反 AI 网剧|反机械|反生成感/);
+    assert.match(prompt, /burstiness|句长与段长要有起伏/);
+    assert.match(prompt, /人称/);
+    assert.match(prompt, /HUD|日志|功能清单/);
+    assert.match(prompt, /一句话塞十个概念|十个概念/);
+    // No demo "bad-example" blocks; hard density limits may use 禁止.
     assert.ok(!prompt.includes("坏例"));
-    assert.ok(!prompt.includes("不是A"));
   });
 });
 

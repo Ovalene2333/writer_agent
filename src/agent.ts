@@ -1601,8 +1601,8 @@ export function chapterContinuationPrompt(parts: {
       .slice(0, 16);
     lines.push(
       `本会话材料架已收录 ${shelf.length} 项已读材料${labels.length ? `（${labels.join("、")}）` : ""}。`
-      + "禁止对上述路径/角色再 read_document、search_project 或 get_character 拉全文；下一章直接依据材料架 digest、章末衔接与任务清单成稿。"
-      + "仅当 digest 未覆盖且文件 sourceHash 已变时，才允许最小 span 读取。",
+      + "禁止对上述路径/角色无目标整篇重读或反复 search_project；下一章直接依据材料架 digest、章末衔接与任务清单成稿。"
+      + "digest 未覆盖时：inspect 后用 block / startLine+endLine / quote 定点补读；sourceHash 已变才允许重新拉全文。",
     );
   } else {
     lines.push("材料架仍空：仅对写作必需的事实做最小读取；不要重读已交付章节全文。");
@@ -3840,8 +3840,10 @@ const DOCUMENT_BODY_READ_TOOLS = new Set(["read_document", "read_document_span",
 const READ_ATOM_CACHE_VERSION = "v2";
 /** Structural / catalog tools must stay intact so the model does not re-list after compaction. */
 const NEVER_COMPACT_KEYS = new Set(["nodes", "matches", "issues"]);
-/** Max body chars stored as a shelf digest excerpt (not full prose). */
+/** Max digest chars for short / character cards. */
 const MATERIALS_SHELF_DIGEST_CHARS = 360;
+/** Longer lore/outline digests keep section headings so later chapters need fewer re-searches. */
+const MATERIALS_SHELF_DIGEST_CHARS_SETTING = 1_200;
 /** Cap shelf entries so the cross-chapter kept block stays cheap. */
 const MATERIALS_SHELF_MAX_ENTRIES = 24;
 
@@ -3859,6 +3861,73 @@ function shouldShelfPath(path: string): boolean {
   return kind === "lore" || kind === "outline" || kind === "other";
 }
 
+/** Core setting paths that must be fully served before search thrashing is blocked. */
+function isCoreSettingPath(path: string): boolean {
+  const kind = documentKind(path);
+  return kind === "lore" || kind === "outline";
+}
+
+/**
+ * Build a materials-shelf digest. Long lore/outline docs use heading + first-line samples
+ * so Phase / section facts remain findable without re-search thrashing.
+ */
+export function buildMaterialsShelfDigest(path: string | undefined, body: string, toolName = "read"): string {
+  if (!body.trim()) return `${toolName}${path ? ` ${path}` : ""}`.trim();
+  const kind = path ? documentKind(path) : "other";
+  const max = kind === "lore" || kind === "outline"
+    ? MATERIALS_SHELF_DIGEST_CHARS_SETTING
+    : MATERIALS_SHELF_DIGEST_CHARS;
+  const flat = body.replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  if (kind !== "lore" && kind !== "outline") return `${flat.slice(0, max - 1)}…`;
+
+  const lines = body.split(/\r?\n/);
+  const parts: string[] = [flat.slice(0, 200)];
+  for (let i = 0; i < lines.length; i += 1) {
+    const heading = lines[i].trim();
+    if (!/^#{1,4}\s+\S/.test(heading)) continue;
+    let next = "";
+    for (let j = i + 1; j < Math.min(i + 8, lines.length); j += 1) {
+      const candidate = lines[j].trim();
+      if (!candidate || candidate.startsWith("#")) continue;
+      next = candidate.replace(/\s+/g, " ").slice(0, 96);
+      break;
+    }
+    parts.push(next ? `${heading}｜${next}` : heading);
+  }
+  const joined = parts.join(" ¶ ");
+  return joined.length <= max ? joined : `${joined.slice(0, max - 1)}…`;
+}
+
+/**
+ * After fullBodyServed, only block aimless whole-doc re-reads.
+ * Targeted block / line / quote / span / inspect remain allowed to fill digest gaps.
+ */
+export function isTargetedDocumentSupplement(
+  toolName: string,
+  input: Record<string, unknown>,
+): boolean {
+  if (toolName === "inspect_document" || toolName === "inspect_file") return true;
+  if (toolName === "locate_document_span" || toolName === "read_document_span") return true;
+  if (toolName === "read_document" || toolName === "read_file") {
+    if (typeof input.quote === "string" && input.quote.trim()) return true;
+    if (optionalPositiveIntegerLike(input.block) !== undefined) return true;
+    const start = optionalPositiveIntegerLike(input.startLine);
+    const end = optionalPositiveIntegerLike(input.endLine);
+    if (start !== undefined && end !== undefined) return true;
+  }
+  return false;
+}
+
+function optionalPositiveIntegerLike(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    const n = Number(value.trim());
+    return n > 0 ? n : undefined;
+  }
+  return undefined;
+}
+
 export function registerMaterialsShelfEntry(
   context: ToolExecutionContext,
   entry: Omit<MaterialsShelfEntry, "key"> & { key?: string },
@@ -3869,13 +3938,21 @@ export function registerMaterialsShelfEntry(
       ? materialsShelfKeyForCharacter(entry.characterId)
       : materialsShelfKeyForPath(entry.path ?? entry.kind));
   const prev = context.materialsShelf.get(key);
+  const digestCap = entry.path && isCoreSettingPath(entry.path)
+    ? MATERIALS_SHELF_DIGEST_CHARS_SETTING
+    : MATERIALS_SHELF_DIGEST_CHARS;
+  // Prefer the longer digest when re-registering the same path (e.g. first open was short,
+  // later block-read produced a heading map).
+  const incomingDigest = entry.digest.replace(/\s+/g, " ").trim().slice(0, digestCap);
+  const prevDigest = (prev?.digest ?? "").trim();
+  const digest = incomingDigest.length >= prevDigest.length ? incomingDigest : prevDigest.slice(0, digestCap);
   const next: MaterialsShelfEntry = {
     key,
     path: entry.path ?? prev?.path,
     characterId: entry.characterId ?? prev?.characterId,
     sourceHash: entry.sourceHash,
     kind: entry.kind,
-    digest: entry.digest.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS),
+    digest,
     bodyChars: Math.max(entry.bodyChars, prev?.bodyChars ?? 0),
     fullBodyServed: Boolean(entry.fullBodyServed || prev?.fullBodyServed),
   };
@@ -3910,9 +3987,10 @@ export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): st
     digest: item.digest,
   }));
   return [
-    "【会话材料架 · 跨任务保留】以下设定/角色已在本会话读过（sourceHash 未变则禁止再 read 全文或反复 search）。",
-    "写作直接依据 digest 与章交接；章切换后仍适用本表，禁止为下一章「重新摸底」重复 load/read/search 同路径。",
-    "仅当需要 digest 未覆盖的行号区间或文件已变更时才再读。材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
+    "【会话材料架 · 跨任务保留】以下设定/角色已在本会话读过（sourceHash 未变则禁止无目标整篇重读或反复 search）。",
+    "写作直接依据 digest 与章交接；章切换后仍适用本表，禁止为下一章「重新摸底」重复 load 同路径全文。",
+    "digest 未覆盖的段落：先 inspect_document 看 blocks/headings，再用 block 或 startLine/endLine 或 quote 定点补读；禁止用 search_project 当分页阅读。",
+    "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
     JSON.stringify({ materials: payload, count: payload.length, scope: "session" }),
   ].join("\n");
 }
@@ -3984,7 +4062,9 @@ function materialsShelfHitPayload(entry: MaterialsShelfEntry, extra?: Record<str
     kind: entry.kind,
     digest: entry.digest,
     bodyChars: entry.bodyChars,
-    message: "该材料已在会话材料架中（全文已提供过）。禁止重复 read/search 同路径；请直接依据材料架与交接续写。",
+    message: "该材料已在会话材料架中（全文已提供过）。禁止无参数整篇重读与反复 search；请直接依据 digest 续写。"
+      + "若 digests 未覆盖，请 inspect_document 后按 block / startLine+endLine / quote 定点补读。",
+    nextAction: "inspect_or_targeted_read",
     ...extra,
   });
 }
@@ -4142,11 +4222,13 @@ async function executeToolCached(
         lockedSourceHash: locked.sourceHash,
       });
     }
-    // Same lore/path already paid full body once this job → never re-inject.
+    // Same lore/path already paid full body once → block aimless whole-doc re-read only.
+    // Targeted block/line/quote/span/inspect still allowed when digests omit a section.
     if (shouldShelfPath(sourcePath)) {
       const shelfKey = materialsShelfKeyForPath(sourcePath);
       const shelf = context.materialsShelf?.get(shelfKey);
-      if (shelf && shelf.sourceHash === sourceHash && shelf.fullBodyServed) {
+      if (shelf && shelf.sourceHash === sourceHash && shelf.fullBodyServed
+        && !isTargetedDocumentSupplement(call.name, normalized)) {
         return materialsShelfHitPayload(shelf, { tool: call.name });
       }
     }
@@ -4156,28 +4238,33 @@ async function executeToolCached(
     const id = Number(normalized.id);
     if (Number.isInteger(id) && id > 0) {
       const shelf = context.materialsShelf?.get(materialsShelfKeyForCharacter(id));
-      if (shelf?.fullBodyServed) return materialsShelfHitPayload(shelf, { tool: call.name });
+      // Allow sectioned edit reads (view=edit + sections) even after full card served.
+      const targeted = typeof normalized.view === "string" && normalized.view === "edit"
+        && Array.isArray(normalized.sections) && normalized.sections.length > 0;
+      if (shelf?.fullBodyServed && !targeted) return materialsShelfHitPayload(shelf, { tool: call.name });
     }
   }
 
   // search_project: once every lore/outline file has been fully served this job,
-  // block thrashing re-scans (small projects finish prep in 1–2 passes).
+  // block thrashing re-scans (ignore loose other/ roots that never get shelved).
   if (call.name === "search_project") {
     const loreDocs = project.listDocuments()
-      .filter(path => !project.isDocumentHidden(path) && shouldShelfPath(path));
+      .filter(path => !project.isDocumentHidden(path) && isCoreSettingPath(path));
     if (loreDocs.length > 0) {
       const served = new Set(
         [...(context.materialsShelf?.values() ?? [])]
-          .filter(item => item.path && item.fullBodyServed && shouldShelfPath(item.path))
+          .filter(item => item.path && item.fullBodyServed && isCoreSettingPath(item.path))
           .map(item => materialsShelfKeyForPath(item.path!)),
       );
       const allServed = loreDocs.every(path => served.has(materialsShelfKeyForPath(path)));
       if (allServed) {
         return JSON.stringify({
           status: "materials_shelf_search_redirect",
-          message: "本 job 材料架已收录项目全部设定/大纲路径的正文。禁止再 search_project；请直接依据材料架 digests 与章交接写作。",
+          message: "本 job 材料架已收录项目全部 lore/outline 正文。禁止再 search_project 当分页阅读；"
+            + "请依据 digests 写作，缺段时对具体 path 做 inspect + block/行号定点补读。",
           shelfPaths: loreDocs.slice(0, 20),
           shelfCount: loreDocs.length,
+          nextAction: "inspect_or_targeted_read",
         });
       }
     }
@@ -4210,11 +4297,12 @@ async function executeToolCached(
         message: "相同读取已存在于本轮上下文，正文不再重复返回。",
       });
     }
-    // First restore after a chapter-boundary count clear: still do not re-pour full
-    // lore if the shelf already served that path once.
+    // First restore after a chapter-boundary count clear: do not re-pour aimless full
+    // lore if the shelf already served that path; targeted supplements still restore.
     if (DOCUMENT_BODY_READ_TOOLS.has(call.name) && sourcePath && shouldShelfPath(sourcePath)) {
       const shelf = context.materialsShelf?.get(materialsShelfKeyForPath(sourcePath));
-      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash) {
+      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash
+        && !isTargetedDocumentSupplement(call.name, normalized)) {
         return materialsShelfHitPayload(shelf, { artifactId: cached.id, tool: call.name });
       }
     }
@@ -4292,16 +4380,33 @@ function rememberMaterialsFromToolResult(
       : typeof parsed.markdown === "string" ? parsed.markdown
         : typeof parsed.excerpt === "string" ? parsed.excerpt
           : "";
+    // inspect returns opening/ending/headings — fold into digest without marking full body.
+    const inspectBits = toolName === "inspect_document" || toolName === "inspect_file"
+      ? [
+          typeof parsed.opening === "string" ? parsed.opening : "",
+          Array.isArray(parsed.headings)
+            ? parsed.headings.slice(0, 40).map((item) => {
+              if (!item || typeof item !== "object") return "";
+              const row = item as Record<string, unknown>;
+              return typeof row.text === "string" ? row.text : "";
+            }).filter(Boolean).join(" ")
+            : "",
+          typeof parsed.ending === "string" ? parsed.ending : "",
+        ].filter(Boolean).join("\n")
+      : "";
+    const digestSource = body || inspectBits;
     const isBody = DOCUMENT_BODY_READ_TOOLS.has(toolName) && body.length > 0;
-    const digest = body
-      ? body.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS)
+    // Whole-doc first body (no range params) marks fullBodyServed; block reads alone do not
+    // if shelf was empty — but once any substantial body is served we keep the flag.
+    const digest = digestSource
+      ? buildMaterialsShelfDigest(sourcePath, digestSource, toolName)
       : `${toolName} ${sourcePath}`;
     registerMaterialsShelfEntry(context, {
       path: sourcePath,
       sourceHash: typeof parsed.sourceHash === "string" ? parsed.sourceHash : sourceHash,
       kind: toolName,
       digest,
-      bodyChars: body.length,
+      bodyChars: body.length || (typeof parsed.characterCount === "number" ? parsed.characterCount : 0),
       // Only body reads mark fullBodyServed — inspect alone still allows one full read.
       fullBodyServed: isBody,
     });

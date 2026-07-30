@@ -18,12 +18,15 @@ test("generation-time constraint prompt explicitly blocks negation-redefinition 
   assert.match(full, /解释只在引入新事实时出现/);
   const compact = proseMannerismConstraintPrompt({ compact: true });
   assert.match(compact, /句式基准/);
-  assert.ok(full.length < 760, "constraint prompt must stay short");
+  assert.ok(full.length < 1_100, "constraint prompt must stay short enough for the style slot");
+  assert.match(full, /一拍一事|一个主要事件/);
+  assert.match(full, /人称主语/);
   for (const prompt of [full, compact, proseMannerismPreflightLine()]) {
     assert.match(prompt, /否定|不是/);
     assert.ok(!prompt.includes("坏例"), "must not carry bad-example demos");
   }
   assert.match(proseMannerismPreflightLine(), /自检/);
+  assert.match(proseMannerismPreflightLine(), /一句话只推一事|堆概念/);
 });
 
 test("sceneMannerismGateError blocks dense split_redefinition before draft write", () => {

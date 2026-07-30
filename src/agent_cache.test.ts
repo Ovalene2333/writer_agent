@@ -34,8 +34,10 @@ import {
   documentDeliveryRemaining,
   executionModelForTask,
   executionModelForStep,
+  buildMaterialsShelfDigest,
   formatJobMaterialsShelfPrompt,
   hydrateSessionMaterialsShelf,
+  isTargetedDocumentSupplement,
   projectCacheUserId,
   registerMaterialsShelfEntry,
   initialTodos,
@@ -116,7 +118,8 @@ test("isolated chapter review carries the full draft once and returns bounded st
   assert.equal(review.verdict, "revise");
   assert.equal(review.issues[0].kind, "knowledge_leak");
   assert.deepEqual(review.issues[0].evidence, ["门禁灯由绿变红。"]);
-  assert.throws(() => parseChapterReview(JSON.stringify({
+  // Single legal sceneId + no locatable evidence → demote to pass (avoid fake "服务不可用").
+  const demoted = parseChapterReview(JSON.stringify({
     verdict: "revise",
     chapterChange: "主角改变",
     reviewNotes: "存在问题",
@@ -124,7 +127,9 @@ test("isolated chapter review carries the full draft once and returns bounded st
       severity: "blocker", kind: "seam", sceneId: "arrival",
       evidence: ["正文中不存在的句子。"], problem: "问题", action: "修复",
     }],
-  }), new Set(["arrival"]), content), /可定位的 blocker/u);
+  }), new Set(["arrival"]), content);
+  assert.equal(demoted.verdict, "pass");
+  assert.equal(demoted.issues[0]?.severity, "warning");
 });
 
 test("isolated style repair only admits exact issue sentences", () => {
@@ -605,7 +610,7 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   assert.match(prompt, /撰写第2章/);
   assert.match(prompt, /材料架已收录/);
   assert.match(prompt, /lore\/world\.md/);
-  assert.match(prompt, /禁止对上述路径\/角色再/);
+  assert.match(prompt, /禁止对上述路径\/角色无目标整篇重读|禁止对上述路径\/角色再/);
   // Tail excerpt is bounded so the handoff stays cheap on every remaining step.
   const afterTail = prompt.split("上一章结尾")[1] ?? "";
   const tailOnly = afterTail.split("上一章末场")[0] ?? afterTail;
@@ -957,8 +962,40 @@ test("materials shelf freezes digests and format stays path-stable", () => {
   assert.match(prompt, /会话材料架|跨任务/);
   assert.match(prompt, /lore\/a\.md/);
   assert.match(prompt, /lore\/b\.md/);
+  assert.match(prompt, /定点补读|block/);
   // Sorted by path: a before b.
   assert.ok(prompt.indexOf("lore/a.md") < prompt.indexOf("lore/b.md"));
+});
+
+test("materials shelf digest keeps lore headings and targeted supplement detection", () => {
+  const body = [
+    "# 银翼计划改造规程",
+    "",
+    "项目概述段落" + "字".repeat(80),
+    "",
+    "## Phase 0 回收",
+    "回收编组优先抵达现场。",
+    "",
+    "## Phase I 置换",
+    "纳米仿生置换在隔离舱完成。",
+    "",
+    "## Phase II 校准",
+    "力量分级与感官阈值。",
+    "",
+    "## Phase III 武装",
+    "首次武装展开。",
+  ].join("\n");
+  const digest = buildMaterialsShelfDigest("lore/银翼计划改造规程.md", body);
+  assert.match(digest, /Phase 0/);
+  assert.match(digest, /Phase I/);
+  assert.match(digest, /Phase III|武装/);
+  assert.ok(digest.length > 200);
+  assert.equal(isTargetedDocumentSupplement("read_document", {}), false);
+  assert.equal(isTargetedDocumentSupplement("read_document", { block: 2 }), true);
+  assert.equal(isTargetedDocumentSupplement("read_document", { startLine: 10, endLine: 40 }), true);
+  assert.equal(isTargetedDocumentSupplement("read_document", { quote: "回收编组" }), true);
+  assert.equal(isTargetedDocumentSupplement("inspect_document", {}), true);
+  assert.equal(isTargetedDocumentSupplement("locate_document_span", { path: "lore/x.md" }), true);
 });
 
 test("session materials shelf persists and drops stale sourceHash", () => {

@@ -35,7 +35,11 @@ export type AiTellCode =
   | "tricolon_stacking"
   | "body_emotion_meter"
   | "paragraph_uniform"
-  | "idiom_flood";
+  | "idiom_flood"
+  /** 单句/单段焊多条事件与概念（AI 网剧旁白腔）。 */
+  | "event_packing"
+  /** 叙述句长过于均齐（burstiness 低）。 */
+  | "sentence_uniform";
 
 export type AiTellIssue = {
   code: AiTellCode;
@@ -66,9 +70,20 @@ export type AiTellStats = {
   paragraphLengthSpread: number;
   /** 四字套话，每万字。 */
   idiomPer10k: number;
+  /** 叙述句中「事件堆叠」句占比（顿号/多线索焊句）。 */
+  packingRatio: number;
+  /** 叙述句长 p80−p20：过低说明整章句长模子一致（低 burstiness）。 */
+  sentenceLengthSpread: number;
   /** 0–100，**越高越像 AI**（与 proseVividnessScore 方向相反）。 */
   score: number;
 };
+
+/** 叙述句中堆叠句占比超过此值即提示（一句话塞多事）。 */
+export const PACKING_RATIO_LIMIT = 0.12;
+/** 叙述句数达到此数才判句长均齐。 */
+export const MIN_NARRATIVE_SENTENCES = 36;
+/** 叙述句长 p80−p20 低于此值视为低 burstiness。 */
+export const SENTENCE_SPREAD_TARGET = 14;
 
 export type AiTells = {
   stats: AiTellStats;
@@ -150,6 +165,7 @@ export function analyzeAiTells(text: string): AiTells {
 
   const dialogue = dialogueProfile(body);
   const closing = closingUplift(body);
+  const packing = packingProfile(body);
   const tricolonMatches = collectAll(body, TRICOLON_ENUM, ...PARALLEL_FRAMES);
   const bodyMeterMatches = collectAll(body, BODY_EMOTION_METER);
   const idiomMatches = collectAll(body, STOCK_IDIOM);
@@ -168,6 +184,8 @@ export function analyzeAiTells(text: string): AiTells {
     paragraphCount: paragraphLengths.length,
     paragraphLengthSpread: spread(paragraphLengths),
     idiomPer10k: per10k(idiomMatches.length),
+    packingRatio: packing.ratio,
+    sentenceLengthSpread: packing.sentenceSpread,
     score: 0,
   };
   stats.score = compositeScore(stats);
@@ -245,6 +263,25 @@ export function analyzeAiTells(text: string): AiTells {
       examples: dedupe(idiomMatches).slice(0, 6),
     });
   }
+  if (packing.sentenceCount >= 20 && stats.packingRatio > PACKING_RATIO_LIMIT) {
+    issues.push({
+      code: "event_packing",
+      message: `约 ${Math.round(stats.packingRatio * 100)}% 的叙述句在一句话里焊多条事件/概念`
+        + `（参考上限 ${Math.round(PACKING_RATIO_LIMIT * 100)}%）。这是典型 AI 网剧旁白：设定名、关系、因果、情绪同句出清。`
+        + "拆成一拍一事：先写看见什么，下一句再写反应或后果；专名一段只新露一个。",
+      examples: packing.examples.slice(0, 5),
+    });
+  }
+  if (packing.sentenceCount >= MIN_NARRATIVE_SENTENCES
+    && stats.sentenceLengthSpread < SENTENCE_SPREAD_TARGET) {
+    issues.push({
+      code: "sentence_uniform",
+      message: `叙述句长起伏仅 ${stats.sentenceLengthSpread} 字（p80−p20，参考 ${SENTENCE_SPREAD_TARGET}）。`
+        + "低 burstiness 是检测器核心信号之一：人写会长短交错，模型常整章一个模子。"
+        + "静场拉出 35+ 字绵延句，冲突处用短句，不要每句都差不多长。",
+      examples: [],
+    });
+  }
   return { stats, issues };
 }
 
@@ -258,7 +295,8 @@ export function formatAiTellSummary(stats: AiTellStats): string {
   return `AI 味 ${stats.score}/100（越低越好）；台词 ${stats.dialogueLines} 条、长度起伏 ${stats.dialogueLengthSpread} 字、`
     + `口语标记 ${Math.round(stats.dialogueColloquialRatio * 100)}%、主题化 ${Math.round(stats.philosophicalRatio * 100)}%；`
     + `收尾升华 ${stats.thematicUpliftCount} 处；三元并列 ${stats.tricolonPer10k}/万字；`
-    + `身体读数 ${stats.bodyMeterPer10k}/万字；套话 ${stats.idiomPer10k}/万字；段长起伏 ${stats.paragraphLengthSpread} 字`;
+    + `身体读数 ${stats.bodyMeterPer10k}/万字；套话 ${stats.idiomPer10k}/万字；`
+    + `事件堆叠句 ${Math.round(stats.packingRatio * 100)}%；句长起伏 ${stats.sentenceLengthSpread} 字；段长起伏 ${stats.paragraphLengthSpread} 字`;
 }
 
 /**
@@ -286,8 +324,54 @@ function compositeScore(stats: AiTellStats): number {
     ? Math.min(12, below(stats.paragraphLengthSpread, PARAGRAPH_SPREAD_TARGET) * 12)
     : 0;
   const idiom = Math.min(10, over(stats.idiomPer10k, IDIOM_PER_10K_LIMIT) * 0.25);
-  const total = dialogue + uplift + philosophical + tricolon + bodyMeter + paragraph + idiom;
+  // 事件堆叠与低 burstiness：直接对应「一句话十个概念」与均齐句长。
+  const packing = Math.min(16, over(stats.packingRatio, PACKING_RATIO_LIMIT) * 80);
+  const sentenceFlat = Math.min(12, below(stats.sentenceLengthSpread, SENTENCE_SPREAD_TARGET) * 12);
+  const total = dialogue + uplift + philosophical + tricolon + bodyMeter + paragraph + idiom
+    + packing + sentenceFlat;
   return Math.round(Math.max(0, Math.min(100, total)) * 10) / 10;
+}
+
+/**
+ * Detect “one sentence, many events/concepts” packing and sentence-length burstiness.
+ * Heuristics: heavy顿号 lists, multi-clue welders (同时/并且/一边…), or long sentences
+ * with many parallel short chunks — common in AI-drama synopsis prose.
+ */
+function packingProfile(text: string): {
+  ratio: number;
+  sentenceCount: number;
+  sentenceSpread: number;
+  examples: string[];
+} {
+  const narrative = text
+    .replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”/gu, " ")
+    .replace(/\r\n?/g, "\n");
+  const sentences = narrative
+    .split(/(?<=[。！？!?…])\s*/u)
+    .map(item => item.trim())
+    .filter(item => item.length >= 4 && !item.startsWith("#"));
+  if (!sentences.length) {
+    return { ratio: 0, sentenceCount: 0, sentenceSpread: 0, examples: [] };
+  }
+  const lengths: number[] = [];
+  const packed: string[] = [];
+  const weld = /同时|与此同时|不仅|并且|以及|一边[^。]{0,24}一边|不仅[^。]{0,24}(?:还|而且)|先是[^。]{0,20}然后|接着又/u;
+  for (const sentence of sentences) {
+    const compact = sentence.replace(/\s/g, "");
+    lengths.push(compact.length);
+    const pauses = (compact.match(/[、，,；;]/gu) ?? []).length;
+    const isPacked = (pauses >= 4 && compact.length >= 28)
+      || (pauses >= 3 && weld.test(sentence) && compact.length >= 22)
+      || (weld.test(sentence) && pauses >= 2 && compact.length >= 36)
+      || (compact.length >= 48 && pauses >= 5);
+    if (isPacked) packed.push(sentence.length <= 72 ? sentence : `${sentence.slice(0, 69)}…`);
+  }
+  return {
+    ratio: ratio(packed.length, sentences.length),
+    sentenceCount: sentences.length,
+    sentenceSpread: spread(lengths),
+    examples: packed.slice(0, 6),
+  };
 }
 
 /** 0–1：三项声线信号里命中了多少（长度均齐、无口语、同一起头）。 */
