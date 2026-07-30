@@ -2431,6 +2431,34 @@ button.agent-orb:focus-visible {
 .agent-step-trail-total .agent-step-tokens {
   background: color-mix(in srgb, var(--surface) 70%, transparent);
 }
+.agent-step-resume {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 10px 8px;
+  border-top: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--accent-light) 40%, var(--surface));
+}
+.agent-step-resume button {
+  padding: 4px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+.agent-step-resume button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+.agent-step-resume button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .agent-step-tools {
   flex: 1 1 0;
   min-width: 0;

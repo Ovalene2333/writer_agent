@@ -17,7 +17,7 @@ export type ChapterReviewIssue = {
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
     | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "identity_relationship"
     | "telemetry_pileup" | "expository_mechanics" | "semantic_echo" | "generic_prose"
-    | "voice_homogenization" | "theme_stated" | "resolution_too_smooth"
+    | "voice_homogenization" | "theme_stated" | "resolution_too_smooth" | "dialogue_frictionless"
     | "drive_flat" | "stakes_absent";
   sceneId?: string;
   evidence: string[];
@@ -77,7 +77,9 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。事实正确性与人
 - theme_stated：叙述者或人物把本章的主题、教训或人物成长直接说出口，替读者完成判断。章尾与场尾尤其要查：「他终于明白……」「从此以后……」「一切都不一样了」「这一刻他懂得了……」，以及人物在对白里总结自己的转变。让意义由后果承担，而不是由句子宣告。
 - resolution_too_smooth：冲突靠互相理解或坦白化解，代价被抹平；阻力恰好在需要时让路；反对者在没有新证据或新压力的情况下改变立场；每个细节都恰好服务主线，没有任何东西是白费的。判定看的是"有没有人付出了不可撤销的代价"，不是"结局是否圆满"——刻意的圆满结局本身不判错。
 
-以上三类的判定尺度与前面一致：零星命中列 warning；只有当整章都成立（例如全章对白无一处可区分、章尾整段都在宣告主题、核心冲突完全无代价地消解）才判 blocker。proseSignals.aiTells 是规则层测得的参考数字（AI 味分越高越可疑），只用来提示往哪里看，不能作为判据；判 blocker 仍须逐字引用正文证据。
+以上三类的判定尺度与前面一致：零星命中列 warning；只有当整章都成立（例如章尾整段都在宣告主题、核心冲突完全无代价地消解）才判 blocker。voice_homogenization 的 blocker 门槛比其余两类低一档：不必"全章无一处可区分"，只要本章戏份最重的两人、或三个以上有名有姓的人物通篇共用同一套句长与句式，就判 blocker——个别台词碰巧可区分不足以豁免。proseSignals.aiTells 是规则层测得的参考数字（AI 味分越高越可疑），只用来提示往哪里看，不能作为判据；判 blocker 仍须逐字引用正文证据。
+
+与 voice_homogenization 相邻但不同的一类是 dialogue_frictionless：对白全程没有摩擦——每个问题都在下一句被正面回答，没有人回避、误解、拖延、说到一半停住，也没有人说一段对方没问的话；台词只负责传递信息，不负责争夺、试探、掩饰或伤人。两者的区别：那一类查"谁在说分不出来"，这一类查"说了等于没交锋"；可以同时成立，也可以各自单独成立。尺度：局部平顺列 warning；只有整章对白无一处摩擦才判 blocker，并逐字引用连续两三轮直给的问答作为证据。proseSignals.dialogue 是形式统计参考：medianLength/shortRatio/longRatio=对白长度分布（通篇 ≤6 字通常意味着只剩确认与应答）、lengthSpread=句长起伏、speakers[]=按「X说」提示语归属到的说话人及各自的长度与分句统计、voiceDistance=说话人之间的形式差异度（越低越像同一只手写的）。归属靠提示语解析，会漏掉代词与无提示语的台词，attributedLines 偏低不代表对白少。这些数字只提示往哪看，不能作为判据。对白本就该比叙述短，短本身不是问题；问题是全章只有短。
 
 最后检查两类"没有驱动力"。它们不违反事实、结构、句式或生成腔中的任何一条，前面全部检查都会放行，必须单独找；本项是判断"读者是否愿意继续读"的唯一环节：
 - drive_flat：整章没有人在争取一件他在乎、而且可能失败的事。典型形态是每场都只是"去了—问了—得知—推进"：人物始终握有主动，阻力只被动存在而从不出手，场与场之间只增加信息量。判定不看事件多少，看每一场结束时有没有一件悬而未决且读者在意的事，以及下一场是否因此更值得读。
@@ -85,7 +87,7 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。事实正确性与人
 这两类的尺度：单场平淡但整章仍有累积，列 warning；只有整章都成立（全章无人可能失败，或全章无任何不可撤销代价）才判 blocker，并必须逐字引用体现该状态的正文——阻力恰好让路、损失被补回、章尾回到出发点之类的句子。proseSignals.drive 是结构层参考数字：knowledgeOnlyStreak=连续多少场只改变了信息、scenesWithoutCost=场景卡未登记代价的场、passiveOppositionScenes=阻力方未主动出手的场、openLoopsNeverDischarged=悬念只增不减。只用来提示往哪看；数字高不等于有问题，数字低也不排除问题。不得把作者刻意的静场、铺垫章或收束章仅因平缓就判 blocker；判据是有无人在乎的未定结果，不是节奏快慢。
 
 单个准确数字、确实触发选择的测量、角色偶尔使用技术语言均可保留，不得仅因出现术语或数字判错。只有同类堆砌在一个场景内反复出现并明显遮蔽行动、关系或留白时，才把对应场景判 blocker；轻微问题列 warning。generic_prose 仅在整场都停留在泛化叙述、读者无法看见任何具体现场时才判 blocker；零星抽象句列 warning。句式符号已由独立门禁处理，不做全文润色。evidence 必须逐字引用短句。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|theme_stated|resolution_too_smooth|drive_flat|stakes_absent、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
+字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -152,7 +154,7 @@ export function parseChapterReview(
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
     "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship",
     "telemetry_pileup", "expository_mechanics", "semantic_echo", "generic_prose",
-    "voice_homogenization", "theme_stated", "resolution_too_smooth",
+    "voice_homogenization", "theme_stated", "resolution_too_smooth", "dialogue_frictionless",
     "drive_flat", "stakes_absent",
   ]);
   // Direct-document reviews only allow sceneId "document". Models often omit it or invent

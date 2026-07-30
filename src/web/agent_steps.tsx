@@ -291,10 +291,16 @@ export function AgentStepCard({
   step,
   prevStep,
   onToggle,
+  resumeAction,
 }: {
   step: StreamStep;
   prevStep?: StreamStep;
   onToggle: () => void;
+  /** Shown on the last step of a trail — continue an interrupted Agent run. */
+  resumeAction?: {
+    disabled?: boolean;
+    onClick: () => void;
+  };
 }) {
   const label =
     step.id === 0
@@ -309,7 +315,7 @@ export function AgentStepCard({
   return (
     <>
     {reset ? <AgentStepContextResetBanner reset={reset} /> : null}
-    <article className={`agent-step ${step.status}${reset ? " after-context-reset" : ""}`}>
+    <article className={`agent-step ${step.status}${reset ? " after-context-reset" : ""}${resumeAction ? " has-resume" : ""}`}>
       <button className="agent-step-summary" onClick={onToggle} type="button">
         <span className="agent-step-indicator" />
         <strong>{label}</strong>
@@ -463,6 +469,21 @@ export function AgentStepCard({
           )}
         </div>
       )}
+      {resumeAction ? (
+        <div className="agent-step-resume">
+          <button
+            type="button"
+            disabled={resumeAction.disabled}
+            onClick={(event) => {
+              event.stopPropagation();
+              resumeAction.onClick();
+            }}
+            title="从中断处继续运行 Agent"
+          >
+            续跑
+          </button>
+        </div>
+      ) : null}
     </article>
     </>
   );

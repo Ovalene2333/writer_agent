@@ -48,6 +48,8 @@ import {
   sceneProseScoreBreakdown,
 } from "../prose_metrics.js";
 import { analyzeProseVividness, formatVividnessSummary, sceneVividnessFeedback } from "../prose_vividness.js";
+import { analyzeDialogueTexture, formatDialogueSummary, sceneDialogueFeedback } from "../dialogue_texture.js";
+import { characterName } from "../characters.js";
 import { analyzeAiTells, formatAiTellSummary, sceneAiTellFeedback } from "../ai_tells.js";
 import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } from "../prose_length.js";
 import {
@@ -320,6 +322,7 @@ async function handleWriteChapterSceneIsolated({ input, project, store, sessionI
           priorChapterText: priorProseText(project, draft, context) || undefined,
         }),
         ...sceneVividnessFeedback(chapterSoFar),
+        ...sceneDialogueFeedback(chapterSoFar),
         ...sceneAiTellFeedback(chapterSoFar),
       ]
       : []),
@@ -547,6 +550,7 @@ async function acceptChapterScene(args: {
         priorChapterText: priorProseText(project, result.draft, context) || undefined,
       }),
       ...sceneVividnessFeedback(chapterSoFar),
+      ...sceneDialogueFeedback(chapterSoFar),
       ...sceneAiTellFeedback(chapterSoFar),
     ]
     : [];
@@ -1035,6 +1039,18 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
   }
 }
 
+/**
+ * Character names for dialogue attribution. Store access can throw on a project
+ * with no character files yet; an empty roster just falls back to the heuristic.
+ */
+function rosterNames(store: ToolHandlerArgs["store"]): string[] {
+  try {
+    return store.characters().map(characterName).filter(name => name.length >= 2);
+  } catch {
+    return [];
+  }
+}
+
 async function submitPassedChapterReview(
   args: ToolHandlerArgs,
   values: {
@@ -1207,6 +1223,16 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
   // Structural drive numbers: no gate of their own, they only tell the reviewer
   // where to look for drive_flat / stakes_absent.
   const drive = chapterDriveSignals(draft);
+  // Dialogue shape. Only the attribution-free numbers carry warnings; the
+  // per-speaker profiles ride along as reference for voice_homogenization.
+  // Real cast names make speaker attribution reliable; the heuristic tag parse is
+  // only a fallback for callers that have no roster (e.g. per-scene feedback).
+  const dialogue = analyzeDialogueTexture(scenesText, rosterNames(args.store));
+  const dialogueWarnings = dialogue.issues.map(issue => ({
+    code: issue.code,
+    message: issue.message,
+    examples: issue.examples.slice(0, 5),
+  }));
   let reviewFailure: { attempts: number; errors: string[] } | undefined;
   if (context.chapterReviewer) {
     const reviewer = context.chapterReviewer;
@@ -1242,6 +1268,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             aiTells: aiTells.stats,
             aiTellWarnings,
             drive,
+            dialogue: dialogue.stats,
+            dialogueWarnings,
           },
         }, reviewer.signal);
         if (reviewed.usage) {
@@ -1283,6 +1311,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             proseAiTells: formatAiTellSummary(aiTells.stats),
             ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
             proseDrive: drive,
+            proseDialogue: formatDialogueSummary(dialogue.stats),
+            ...(dialogueWarnings.length ? { dialogueWarnings } : {}),
             ledger,
             chapterReview: reviewed.review,
             targetScenes,
@@ -1332,6 +1362,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     proseAiTells: formatAiTellSummary(aiTells.stats),
     ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
     proseDrive: drive,
+    proseDialogue: formatDialogueSummary(dialogue.stats),
+    ...(dialogueWarnings.length ? { dialogueWarnings } : {}),
     ledger,
     ...(reviewFailure ? { factReviewContext: buildFactualChapterReviewContext({
       project,
@@ -1357,6 +1389,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
       "冲突是否靠互相理解化解、代价被抹平、阻力恰好让路；有没有人付出了不可撤销的代价",
       "整章是否有人在争取一件他在乎且可能失败的事；每场结束时是否留下读者在意的未定结果，还是只增加了信息量（参考 proseDrive）",
+      "对白是不是全章都在确认与应答：有没有人回避提问、答非所问、说到一半停住、或说了一段对方没问的话（参考 proseDialogue）",
     ],
     message: (
       reviewFailure?.errors.every(err => /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(err))

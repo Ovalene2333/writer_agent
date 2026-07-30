@@ -1266,6 +1266,7 @@ export function taskInstructions(
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
     ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
     : `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。`}场景卡的 readerQuestion 每场必填且各场不得逐字重复，cost 整章至少一场必填，oppositionMove 说明阻力方主动做了什么；工具会校验这三项，正文须真的兑现它们。依据真实成稿决定继续、调整未写引导或收束。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
+- 对白要有摩擦与声线：别把交锋写成一问一答的确认流水——有人回避、答非所问、打断、说到一半停住，或答一件对方没问的事；每个常出场的人物有一处别人不会有的说话方式，遮住提示语能认出是谁。句长跟处境走，可以短，但别整章都是几个字的应答。终审设有 dialogue_frictionless 驳回项，voice_homogenization 的判罚门槛也已收紧。
 - 张力由结构承担，不由句子宣告：整章须有人在争取一件他在乎且可能失败的事；阻力方要主动出手，不只是挡在那里；至少一处代价不可撤销（时间、信任、身体、机会或可选项减少）。每一场收尾留下一个此时才成立、读者会在意的未答问题，下一场不得只是补充信息。终审设有 drive_flat / stakes_absent 两类驳回项；刻意的静场或收束章不因节奏平缓判错，判据是有无人在乎的未定结果。
 - 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称；仅正文兑现且有依据的变化才进入 characterChanges。提交前：${proseMannerismPreflightLine()}
 - 单次任务只交付用户指定的正文，不规划或创建其他章节。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;

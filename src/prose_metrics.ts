@@ -310,7 +310,7 @@ function formatRhythmRepairBlock(
   return [
     head,
     `一次修订验收（须全部达标后再 propose，勿只加一两句长句应付）：均长≥${t.meanSentenceLengthMin} 字；≤6 字碎句≤${Math.round(t.shortSentenceRatioMax * 100)}%；≥30 字长句≥${Math.round(t.longSentenceRatioMin * 100)}%；4 连发碎句串≤${t.fragmentRunsMax}；≤2 字电报句≤${Math.round(t.microSentenceRatioMax * 100)}%。`,
-    "改法：①合并相邻碎句为完整自然句；②静场/情感段每 300 字至少一个 35+ 字绵延句；③恢复常用双音节（感觉/恢复/身体/冷意等），禁止为利落压成单字；④对白可短，叙述勿通篇电报体。",
+    "改法：①合并相邻碎句为完整自然句；②静场/情感段每 300 字至少一个 35+ 字绵延句；③恢复常用双音节（感觉/恢复/身体/冷意等），禁止为利落压成单字；④对白可短于叙述，但不得整章压成几个字的应答；叙述勿通篇电报体。",
     exampleLine,
   ].join("\n");
 }

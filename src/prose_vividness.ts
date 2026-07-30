@@ -20,6 +20,8 @@
  * the latter — the two never reward the same token.
  */
 
+import { substantiveDialogueParagraphRatio } from "./dialogue_texture.js";
+
 export type ProseVividnessCode =
   | "dialogue_starved"
   | "sensory_flat"
@@ -37,6 +39,13 @@ export type ProseVividnessStats = {
   characters: number;
   /** Share of paragraphs opening with a quote mark. */
   dialogueRatio: number;
+  /**
+   * Same share, counting only dialogue long enough to be an exchange. The score
+   * uses THIS one: a chapter of clipped one-liners inflates dialogueRatio at
+   * almost no cost, which made the dialogue term reward the exact telegraphic
+   * shape dialogue_texture warns about. See src/dialogue_texture.ts.
+   */
+  substantiveDialogueRatio: number;
   /** How many of the 5 sensory channels appear at all (0–5). */
   sensoryChannels: number;
   sensoryPer10k: number;
@@ -125,10 +134,12 @@ export function analyzeProseVividness(text: string): ProseVividness {
   const abstractPer10k = per10k(abstractMatches.length);
   const rhythm = narrativeRhythm(body);
   const dialogueRatio = dialogueParagraphRatio(body);
+  const substantiveDialogueRatio = substantiveDialogueParagraphRatio(body);
 
   const stats: ProseVividnessStats = {
     characters,
     dialogueRatio,
+    substantiveDialogueRatio,
     sensoryChannels,
     sensoryPer10k,
     concretePer10k,
@@ -142,10 +153,10 @@ export function analyzeProseVividness(text: string): ProseVividness {
   const issues: ProseVividnessIssue[] = [];
   if (characters < MIN_MEASURABLE_CHARACTERS) return { stats, issues };
 
-  if (dialogueRatio < DIALOGUE_RATIO_TARGET / 2) {
+  if (substantiveDialogueRatio < DIALOGUE_RATIO_TARGET / 2) {
     issues.push({
       code: "dialogue_starved",
-      message: `对白起始段仅 ${Math.round(dialogueRatio * 100)}%（参考 ${Math.round(DIALOGUE_RATIO_TARGET * 100)}%）；正文正在被转述而不是被演出。让至少一次交锋发生在人物之间——索取、遮掩、试探或拒绝，而不是由叙述者报告他们谈了什么。独角戏场景可忽略此项。`,
+      message: `成句对白起始段仅 ${Math.round(substantiveDialogueRatio * 100)}%（含短应答共 ${Math.round(dialogueRatio * 100)}%，参考 ${Math.round(DIALOGUE_RATIO_TARGET * 100)}%）；正文正在被转述而不是被演出，或对白被压成一串确认与应答。让至少一次交锋发生在人物之间——索取、遮掩、试探或拒绝，而不是由叙述者报告他们谈了什么。独角戏场景可忽略此项。`,
       examples: [],
     });
   }
@@ -190,7 +201,9 @@ export function proseVividnessScore(text: string): number {
 }
 
 function compositeScore(stats: ProseVividnessStats): number {
-  const dialogue = Math.min(18, (stats.dialogueRatio / DIALOGUE_RATIO_TARGET) * 18);
+  // Substantive share on purpose: raw dialogueRatio is cheap to inflate with
+  // one-word acknowledgements, which would pay for the very shape we warn about.
+  const dialogue = Math.min(18, (stats.substantiveDialogueRatio / DIALOGUE_RATIO_TARGET) * 18);
   const channels = (stats.sensoryChannels / SENSORY_CHANNELS.length) * 20;
   const sensory = Math.min(16, (stats.sensoryPer10k / SENSORY_PER_10K_TARGET) * 16);
   const concrete = Math.min(20, (stats.concretePer10k / CONCRETE_PER_10K_TARGET) * 20);
@@ -218,7 +231,7 @@ export function sceneVividnessFeedback(chapterSoFar: string): string[] {
 
 /** Compact one-line summary for tool results and reviewer signals. */
 export function formatVividnessSummary(stats: ProseVividnessStats): string {
-  return `生动度 ${stats.score}/100；对白段 ${Math.round(stats.dialogueRatio * 100)}%；`
+  return `生动度 ${stats.score}/100；对白段 ${Math.round(stats.dialogueRatio * 100)}%（成句 ${Math.round(stats.substantiveDialogueRatio * 100)}%）；`
     + `感官通道 ${stats.sensoryChannels}/5（${stats.sensoryPer10k}/万字）；`
     + `具体物件 ${stats.concretePer10k}/万字；泛化氛围词 ${stats.abstractPer10k}/万字；`
     + `句长起伏 ${stats.sentenceLengthSpread} 字`;

@@ -1760,7 +1760,7 @@ function App() {
               : "Agent job completed.",
           );
         } else if (terminalType === "cancelled") {
-          setNotice("已中断。可在带「生成已中断」的回复上点「续跑」。");
+          setNotice("已中断。可在最下方 step 上点「续跑」。");
         } else if (terminalType === "waiting_for_input") {
           // notice already set from the event question (budget pause / ask_user)
         }
@@ -4446,13 +4446,6 @@ function App() {
               const directorMessage = msg.role === "user" && msg.channel === "roleplay" && msg.roleplayInputMode === "director";
               const continuationMessage = msg.role === "user" && msg.channel === "roleplay"
                 && displayContent === ROLEPLAY_CONTINUATION_PLACEHOLDER;
-              const interruptedAgentMessage = msg.role === "assistant" && msg.channel !== "roleplay"
-                && displayContent.includes("[生成已中断]");
-              const resumableAgentStepAnchor = msg.role === "user" && msg.channel !== "roleplay"
-                && (
-                  (streamStepsAnchorId === msg.id && streamSteps.length > 0)
-                  || Boolean(state.stepTrails?.some((trail) => trail.sourceMessageId === msg.id && trail.steps.length > 0))
-                );
               return (
             <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}${directorMessage ? " roleplay-director-msg" : ""}${continuationMessage ? " roleplay-continuation-msg" : ""}${assistantCollapsed ? " collapsed" : ""}`}>
               {msg.role === "assistant" ? (
@@ -4575,7 +4568,6 @@ function App() {
                   </span>;
                 })()}
                 {msg.role === "user" && !continuationMessage && <button disabled={busy} onClick={() => requestRewindMessage(msg)} title="从此消息重新编辑">编辑</button>}
-                {(interruptedAgentMessage || resumableAgentStepAnchor) && <button disabled={busy || readOnly} onClick={() => void resumeInterruptedAgent(msg)} title="从中断处继续运行 Agent">续跑</button>}
                 <button disabled={busy} onClick={() => requestRerunMessage(msg)} title="重新运行这条消息所在的轮次">重新运行</button>
                 {msg.channel === "roleplay" && msg.variantGroupId && (msg.variantCount ?? 1) > 1
                   ? <button disabled={busy} onClick={() => void openRoleplayBranchTimeline(msg)} title="查看并切换这一轮保存的完整对话分支">分支</button>
@@ -4604,11 +4596,24 @@ function App() {
               if (!stepsHere.length) return null;
               return (
               <>
-                {stepsHere.map((step, index) => (
+                {stepsHere.map((step, index) => {
+                  const isLastStep = index === stepsHere.length - 1;
+                  const canResumeOnStep = isLastStep
+                    && msg.role === "user"
+                    && msg.channel !== "roleplay"
+                    && msg.id > 0
+                    && step.status !== "running";
+                  return (
                   <AgentStepCard
                     key={`${msg.id}-${step.id}`}
                     step={step}
                     prevStep={index > 0 ? stepsHere[index - 1] : undefined}
+                    resumeAction={canResumeOnStep
+                      ? {
+                          disabled: busy || readOnly,
+                          onClick: () => void resumeInterruptedAgent(msg),
+                        }
+                      : undefined}
                     onToggle={() => {
                       if (liveHere) {
                         updateStreamSteps((current) =>
@@ -4624,7 +4629,8 @@ function App() {
                       }));
                     }}
                   />
-                ))}
+                  );
+                })}
                 {(() => {
                   const total = sumStepUsage(stepsHere);
                   if (!total || stepsHere.length < 1) return null;
