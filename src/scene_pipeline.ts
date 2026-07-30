@@ -9,6 +9,17 @@ export type ChapterSceneCard = {
   obstacle: string;
   turn: string;
   outcome: string;
+  /**
+   * Pressure fields. The rest of the card describes what happens; these three
+   * describe why anyone should keep reading. Validation lives in
+   * `sceneDriveErrors` (chain-level, not per-card) so a single scene may
+   * legitimately carry no cost as long as the chapter does. All three stay
+   * optional on the type: `write_document_isolated` builds a chain-less card,
+   * and draft checkpoints saved before these fields existed must still load.
+   */
+  readerQuestion?: string;
+  cost?: string;
+  oppositionMove?: string;
   handoff: string;
   dividerBefore: boolean;
   targetCharacters?: number;
@@ -80,6 +91,8 @@ export function beginChapterSceneDraft(input: BeginChapterSceneDraftInput): Chap
   if (ids.size !== scenes.length) throw new Error("场景 id 必须唯一");
   const repeated = repeatedExactSceneFunctions(scenes);
   if (repeated.length) throw new Error(`场景链存在功能完全重复的场景：${repeated.join("、")}`);
+  const driveErrors = sceneDriveErrors(scenes);
+  if (driveErrors.length) throw new Error(driveErrors.join("；"));
   for (let index = 0; index < scenes.length - 1; index += 1) {
     if (!scenes[index].handoff) throw new Error(`scenes[${index}].handoff 不能为空；须说明如何因果交给下一场`);
   }
@@ -157,6 +170,9 @@ export function reviseChapterSceneGuide(
   if (ids.size !== scenes.length) throw new Error("已完成场景与剩余引导的 id 必须唯一");
   const repeated = repeatedExactSceneFunctions(scenes);
   if (repeated.length) throw new Error(`场景引导存在功能完全重复的场景：${repeated.join("、")}`);
+  // Whole-chain drive check: the chapter, not the remaining guide, has to carry a cost.
+  const driveErrors = sceneDriveErrors(scenes, completedCount);
+  if (driveErrors.length) throw new Error(driveErrors.join("；"));
   for (let index = 0; index < remaining.length - 1; index += 1) {
     if (!remaining[index].handoff) throw new Error(`remainingScenes[${index}].handoff 不能为空；须说明如何因果交给下一场`);
   }
@@ -269,6 +285,47 @@ export function chapterSceneLedger(draft: ChapterSceneDraft): Array<{
   }));
 }
 
+export type ChapterDriveSignals = {
+  scenesWithoutCost: string[];
+  passiveOppositionScenes: string[];
+  knowledgeOnlyStreak: number;
+  openLoopCounts: number[];
+  openLoopsNeverDischarged: boolean;
+};
+
+/**
+ * Structural drive signals derived from the cards plus each scene's recorded
+ * actualState. Numbers only — a hint for the reviewer about where to look, on the
+ * same contract as vividness / aiTells: measured, reported, never blocking.
+ */
+export function chapterDriveSignals(draft: ChapterSceneDraft): ChapterDriveSignals {
+  const scenesWithoutCost: string[] = [];
+  const passiveOppositionScenes: string[] = [];
+  const openLoopCounts: number[] = [];
+  let knowledgeOnlyStreak = 0;
+  let currentStreak = 0;
+  draft.completed.forEach((completed, index) => {
+    const card = draft.scenes[index];
+    if (card && !card.cost) scenesWithoutCost.push(completed.sceneId);
+    if (card && !card.oppositionMove) passiveOppositionScenes.push(completed.sceneId);
+    const state = completed.actualState;
+    openLoopCounts.push(state.openLoops.length);
+    const nonKnowledge = state.situation.length + state.physical.length
+      + state.relationships.length + state.goals.length;
+    currentStreak = nonKnowledge === 0 && state.knowledge.length > 0 ? currentStreak + 1 : 0;
+    knowledgeOnlyStreak = Math.max(knowledgeOnlyStreak, currentStreak);
+  });
+  const monotonic = openLoopCounts.every((count, index) => index === 0 || count >= openLoopCounts[index - 1]);
+  return {
+    scenesWithoutCost,
+    passiveOppositionScenes,
+    knowledgeOnlyStreak,
+    openLoopCounts,
+    openLoopsNeverDischarged: openLoopCounts.length > 1 && monotonic
+      && openLoopCounts[openLoopCounts.length - 1] > openLoopCounts[0],
+  };
+}
+
 export function sceneCardForTool(scene: ChapterSceneCard | undefined): ChapterSceneCard | null {
   return scene ?? null;
 }
@@ -290,6 +347,9 @@ function normalizeSceneCard(raw: unknown, index: number): ChapterSceneCard {
     obstacle: requireText(value.obstacle, `scenes[${index}].obstacle`),
     turn: requireText(value.turn, `scenes[${index}].turn`),
     outcome: requireText(value.outcome, `scenes[${index}].outcome`),
+    ...(cleanString(value.readerQuestion) ? { readerQuestion: cleanString(value.readerQuestion).slice(0, 200) } : {}),
+    ...(cleanString(value.cost) ? { cost: cleanString(value.cost).slice(0, 200) } : {}),
+    ...(cleanString(value.oppositionMove) ? { oppositionMove: cleanString(value.oppositionMove).slice(0, 200) } : {}),
     handoff: cleanString(value.handoff),
     dividerBefore: value.dividerBefore === true,
     ...(targetCharacters === undefined ? {} : { targetCharacters }),
@@ -313,6 +373,38 @@ function normalizeActualState(raw: unknown): SceneActualState {
 function hasMaterialStateChange(state: SceneActualState): boolean {
   return state.situation.length + state.physical.length + state.knowledge.length
     + state.relationships.length + state.goals.length > 0;
+}
+
+/**
+ * Structural drive validation for a whole scene chain.
+ *
+ * Every other check in this file asks "is the chain well-formed"; this one asks
+ * "is anything at stake". Deliberately structural (non-empty / exact-duplicate),
+ * never semantic: the chain is rejected only for gaps a parser can prove.
+ */
+function sceneDriveErrors(scenes: ChapterSceneCard[], editableFrom = 0): string[] {
+  const errors: string[] = [];
+  // Cards for already-written scenes cannot be edited any more, so a checkpoint
+  // restored from before these fields existed must not become unrepairable.
+  const missingQuestion = scenes.slice(editableFrom).filter(scene => !scene.readerQuestion).map(scene => scene.id);
+  if (missingQuestion.length) {
+    errors.push(`场景 ${missingQuestion.join("、")} 缺少 readerQuestion；须写出本场结束时读者最想知道什么，且答案在本场内尚未给出`);
+  }
+  const seenQuestions = new Map<string, string>();
+  for (const scene of scenes) {
+    if (!scene.readerQuestion) continue;
+    const signature = scene.readerQuestion.replace(/\s+/g, "");
+    const prior = seenQuestions.get(signature);
+    if (prior) {
+      errors.push(`场景 ${prior} 与 ${scene.id} 的 readerQuestion 逐字相同；说明其中一场没有把悬而未决的东西向前推，应合并或换一个此时才成立的问题`);
+    } else {
+      seenQuestions.set(signature, scene.id);
+    }
+  }
+  if (editableFrom < scenes.length && !scenes.some(scene => scene.cost)) {
+    errors.push("整章没有任何一场填写 cost；至少一场须有人付出不可撤销的代价（时间、信任、身体、机会、立场或选项减少），否则本章只是信息推进");
+  }
+  return errors;
 }
 
 function repeatedExactSceneFunctions(scenes: ChapterSceneCard[]): string[] {

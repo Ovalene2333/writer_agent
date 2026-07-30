@@ -290,13 +290,19 @@ Agent 可用的主要能力包括：列出与检视 Markdown 文档、按块 / �
 
 正文交付不绑定固定场景流水线。Agent 可以直接提交完整文档、按锚点局部修改、按需编译 write pack，或在长篇连续状态和逐场修订确有收益时主动启用场景草稿链；这些能力互不构成形式上的前置条件。
 
-### 正文质量的两个方向
+### 正文质量的三个方向
 
 句式门禁（`prose_quality`）、复用计量（`prose_metrics`）与整章终审（`chapter_review`）都是**减法**：它们回答"有没有 AI 腔"。一段平淡、正确、无破折号的稿子在这些关卡上全部满分通过，所以另有一层**加法**：
 
 - `prose_vividness` 测量对白起始段占比、出场的感官通道数、具体物件锚点密度、泛化氛围词密度与句长起伏，给出 0—100 的现场感分。**它从不拦截**，只在 `write_chapter_scene` 返回下一场的补位建议、在 `inspect_chapter_draft` 给出 `vividnessWarnings`，并作为终审的 `proseSignals`。
 - 整章终审新增 `generic_prose` 维度：换掉人名地点仍能原样放进别的故事的句子。只有整场都停留在泛化叙述时才判 blocker。
 - 逐场候选采样（`scenePipeline.candidateCount`，默认 2）在场景**同时干净且有现场感**时跳过；否则生成一份保事实重写稿，由 reviewer 模型按"哪一稿更值得读下去"择优，评选失败则回退到确定性打分。设为 1 可关闭，代价是平淡但无错的场景不再有第二次机会。
+
+第三层是**张力**。加法层测的是"看不看得见"，不是"有没有人在乎"，所以一场干净、有画面、无风险的戏依然会全线通过：
+
+- 场景卡带三个压力字段：`readerQuestion`（本场收尾时读者最想知道什么，每场必填且各场不得逐字重复）、`cost`（谁付出了不可撤销的代价，整章至少一场必填）、`oppositionMove`（阻力方主动做了什么）。校验在场景链层面而非单卡层面，由 `begin_chapter_draft` 与 `revise_chapter_scene_guide` 硬拦截。
+- `chapterDriveSignals` 从场景卡与各场 `actualState` 计算结构化数字：`knowledgeOnlyStreak`（连续多少场只改变了信息）、`scenesWithoutCost`、`passiveOppositionScenes`、`openLoopsNeverDischarged`。与现场感分同一契约——测量、上报、从不拦截，只作为终审的 `proseSignals.drive` 提示往哪看。
+- 整章终审据此新增 `drive_flat`（全章无人在争取一件他在乎且可能失败的事）与 `stakes_absent`（变化发生了但代价从头到尾不存在）两类驳回项。零星平淡列 warning，整章成立才判 blocker，且必须逐字引用正文证据；刻意的静场或收束章不因节奏平缓判错。快速模式下候选采样被强制关闭，这两类是唯一在读者层面判断"要不要继续读"的环节。
 
 `prose_vividness` 与 `prose_metrics` 的高频微动作词表刻意正交：后者压降"目光/呼吸/指尖"这类身体填充词，前者奖励"光线/声响/铁锈味"这类对世界的知觉，同一个词不会被两边同时计分。
 

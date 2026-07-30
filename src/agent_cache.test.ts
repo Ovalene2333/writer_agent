@@ -77,7 +77,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "5fa7836838927d43");
+  assert.equal(agentToolSchemaHash(), "b4866b9203bdc9a5");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -218,7 +218,10 @@ test("validated checkpoints restore drafts and clear with task state", () => {
     const draft = beginChapterSceneDraft({
       path: "chapters/第1章.md", mode: "create", heading: "第1章", chapterGoal: "越界",
       baseContent: "", baseHash: project.hash(""),
-      scenes: [{ id: "s1", title: "门禁", goal: "进入", obstacle: "锁门", turn: "警报", outcome: "越界", handoff: "" }],
+      scenes: [{
+        id: "s1", title: "门禁", goal: "进入", obstacle: "锁门", turn: "警报", outcome: "越界",
+        readerQuestion: "警报会把谁带来", cost: "门禁记录已留下", handoff: "",
+      }],
     });
     store.saveAgentCheckpoint(sessionId, {
       version: 1, stage: "draft_started", path: draft.path, sourceHash: draft.baseHash,
@@ -645,8 +648,14 @@ test("scene continuation handoff carries seam tail, states and next card without
     path: "chapters/第1章.md", mode: "create", heading: "第1章", chapterGoal: "关系反转",
     baseContent: "", baseHash: "empty",
     scenes: [
-      { id: "s1", title: "抵达", goal: "进入基地", obstacle: "门禁", turn: "冻结令", outcome: "违规进入", handoff: "触发警报" },
-      { id: "s2", title: "警报", goal: "处置违规", obstacle: "实弹防卫", turn: "教官担责", outcome: "秘密共担", handoff: "" },
+      {
+        id: "s1", title: "抵达", goal: "进入基地", obstacle: "门禁", turn: "冻结令", outcome: "违规进入",
+        readerQuestion: "谁下了冻结令", cost: "违规记录已留下", handoff: "触发警报",
+      },
+      {
+        id: "s2", title: "警报", goal: "处置违规", obstacle: "实弹防卫", turn: "教官担责", outcome: "秘密共担",
+        readerQuestion: "教官担下的责任要怎么偿还", handoff: "",
+      },
     ],
   });
   const sceneBody = `独属于开场的第一句钥匙句。${"她沿着通道往里走，门禁灯逐个变红。".repeat(80)}警报在头顶炸开。`;

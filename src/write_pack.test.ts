@@ -152,6 +152,9 @@ const sceneChain = [
     obstacle: "通行证被临时冻结",
     turn: "冻结命令来自主角父亲",
     outcome: "主角绕过教官独自进入",
+    readerQuestion: "父亲为什么要把她挡在训练区外",
+    cost: "主角失去了合法进入的资格，记录已经留下",
+    oppositionMove: "教官提前调走了她的通行权限",
     handoff: "违规进入触发警报，把双方送入同一场处置",
   },
   {
@@ -163,6 +166,9 @@ const sceneChain = [
     obstacle: "训练靶被警报切换成实弹防卫",
     turn: "教官为保护主角主动承担违规责任",
     outcome: "训练取消，但两人的关系由审视变成秘密共担",
+    readerQuestion: "教官替她担下的责任要用什么偿还",
+    cost: "教官的记录上多了一次不可撤销的违规担保",
+    oppositionMove: "防卫系统切换实弹，把选择时间压到最短",
     handoff: "",
     dividerBefore: true,
   },
@@ -227,6 +233,9 @@ test("side prose treats scene count and target length as guidance", async () => 
       obstacle: `形成直接阻力 ${index}`,
       turn: `产生局面转折 ${index}`,
       outcome: `留下实际结果 ${index}`,
+      readerQuestion: `留下未答问题 ${index}`,
+      cost: `付出不可撤销的代价 ${index}`,
+      oppositionMove: `阻力方主动出手 ${index}`,
       handoff: index === 3 ? "" : `结果迫使人物进入场景 ${index + 1}`,
       targetCharacters: 2_000,
     });
@@ -335,9 +344,11 @@ test("Agent can reshape the unwritten scene guide without changing completed pro
   const completedBefore = draft.completed[0];
 
   const expanded = reviseChapterSceneGuide(draft, [{
-    ...sceneChain[1], id: "argument", title: "争执", goal: "两人公开冲突", handoff: "冲突引来教官",
+    ...sceneChain[1], id: "argument", title: "争执", goal: "两人公开冲突",
+    readerQuestion: "教官会不会把这件事上报", handoff: "冲突引来教官",
   }, {
     ...sceneChain[1], id: "choice", title: "选择", goal: "主角作出选择", turn: "教官拒绝代为决定", outcome: "主角承担后果",
+    readerQuestion: "她承担后果之后还剩哪条路",
   }], 5);
   assert.equal(expanded.draft.completed[0], completedBefore);
   assert.deepEqual(expanded.addedSceneIds, ["argument", "choice"]);
@@ -436,6 +447,7 @@ test("scene pipeline rejects empty state change and repeated scene functions", (
       goal: `扩展目标 ${index + 1}`,
       turn: `扩展转折 ${index + 1}`,
       outcome: `扩展结果 ${index + 1}`,
+      readerQuestion: `扩展未答问题 ${index + 1}`,
       handoff: index === 5 ? "" : `交给扩展场景 ${index + 2}`,
     })),
   });

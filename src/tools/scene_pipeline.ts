@@ -3,6 +3,7 @@ import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
   beginChapterSceneDraft,
+  chapterDriveSignals,
   chapterSceneDraftComplete,
   chapterSceneLedger,
   nextChapterScene,
@@ -1203,6 +1204,9 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     examples: issue.examples.slice(0, 5),
   }));
   const ledger = chapterSceneLedger(draft);
+  // Structural drive numbers: no gate of their own, they only tell the reviewer
+  // where to look for drive_flat / stakes_absent.
+  const drive = chapterDriveSignals(draft);
   let reviewFailure: { attempts: number; errors: string[] } | undefined;
   if (context.chapterReviewer) {
     const reviewer = context.chapterReviewer;
@@ -1237,6 +1241,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             vividnessWarnings,
             aiTells: aiTells.stats,
             aiTellWarnings,
+            drive,
           },
         }, reviewer.signal);
         if (reviewed.usage) {
@@ -1277,6 +1282,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
             proseAiTells: formatAiTellSummary(aiTells.stats),
             ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
+            proseDrive: drive,
             ledger,
             chapterReview: reviewed.review,
             targetScenes,
@@ -1325,6 +1331,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
     proseAiTells: formatAiTellSummary(aiTells.stats),
     ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
+    proseDrive: drive,
     ledger,
     ...(reviewFailure ? { factReviewContext: buildFactualChapterReviewContext({
       project,
@@ -1349,6 +1356,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "遮住说话人后台词能否互换：每个人物是否有各自的句长、书面程度、回避方式与说话目的",
       "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
       "冲突是否靠互相理解化解、代价被抹平、阻力恰好让路；有没有人付出了不可撤销的代价",
+      "整章是否有人在争取一件他在乎且可能失败的事；每场结束时是否留下读者在意的未定结果，还是只增加了信息量（参考 proseDrive）",
     ],
     message: (
       reviewFailure?.errors.every(err => /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(err))

@@ -131,6 +131,19 @@ export function buildIsolatedSceneWriterMessages(
     `局面应在过程中被“${input.scene.turn}”推偏，最后落到“${input.scene.outcome}”。`
     + "让读者从行动、反应、证据和后果中亲眼看见这次变化，不让人物替材料作总结。",
   );
+  // Pressure fields are optional on the card (write_document_isolated builds one
+  // without them), so each clause only appears when the caller supplied it.
+  const oppositionMove = input.scene.oppositionMove?.trim();
+  const sceneCost = input.scene.cost?.trim();
+  const readerQuestion = input.scene.readerQuestion?.trim();
+  if (oppositionMove || sceneCost || readerQuestion) {
+    sections.push([
+      oppositionMove ? `阻力不是静止的：${oppositionMove}，人物必须应对，不能绕开。` : "",
+      sceneCost ? `这次变化要有人真正付出代价：${sceneCost}；代价一旦发生，不要在本场内被补回。` : "",
+      readerQuestion ? `写到收尾时，读者最想知道的应该是“${readerQuestion}”。把它留成未答的，不要在本场给出答案，也不要替读者总结。` : "",
+    ].filter(Boolean).join(""));
+  }
+
   const mustLand = compactLines(input.writePack.mustLand);
   if (mustLand.length) {
     sections.push(`正文还需要自然留下这些可被读者察觉的事实：${naturalClause(mustLand)}。尽量让一个动作同时承担事实、关系和后果。`);
