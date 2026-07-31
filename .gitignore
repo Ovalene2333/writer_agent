@@ -33,6 +33,9 @@ coverage/
 
 # Project data directory (user generated content, runtime state)
 writer-agent-data/
+project/
+projects/
+p/
 
 # Misc
 .cache/

@@ -1,6 +1,7 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
 import { samplingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import { sceneProseScore, type SceneScoreBreakdown } from "./prose_metrics.js";
 import type { ModelConfig } from "./types.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
@@ -123,8 +124,7 @@ export async function judgeSceneCandidates(request: SceneJudgeRequest): Promise<
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置 API Key");
   }
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages: buildSceneJudgeMessages(request),
     stream: false,
@@ -149,7 +149,7 @@ export async function judgeSceneCandidates(request: SceneJudgeRequest): Promise<
   const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null } }>; usage?: unknown };
   const usage = parseModelTokenUsage(payload.usage);
   if (usage) request.usageReporter?.(model, usage, { callKind: "scene_candidate_judge" });
-  return parseSceneJudgeResult(payload.choices?.[0]?.message?.content ?? "", request.candidates.length);
+  return parseSceneJudgeResult(parseProviderCompletionPayload(payload).content, request.candidates.length);
 }
 
 /** Length guard: a rewrite that balloons or collapses is not a comparable candidate. */
@@ -189,8 +189,7 @@ export async function rewriteSceneCandidate(request: SceneRewriteRequest): Promi
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置 API Key");
   }
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages: buildSceneRewriteMessages(request),
     stream: false,
@@ -219,7 +218,7 @@ export async function rewriteSceneCandidate(request: SceneRewriteRequest): Promi
   const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null } }>; usage?: unknown };
   const usage = parseModelTokenUsage(payload.usage);
   if (usage) request.usageReporter?.(model, usage, { callKind: "scene_candidate_rewrite" });
-  const content = (payload.choices?.[0]?.message?.content ?? "").trim()
+  const content = (parseProviderCompletionPayload(payload).content).trim()
     .replace(/^```(?:markdown)?\s*/i, "")
     .replace(/\s*```$/, "")
     .trim();

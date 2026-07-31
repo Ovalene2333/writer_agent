@@ -97,7 +97,7 @@ export interface ModelTokenUsage {
   cacheMissTokens: number;
 }
 
-export type ProviderId = "deepseek" | "openai-compatible";
+export type ProviderId = "deepseek" | "openai-compatible" | "openai-responses";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ResponseVerbosity = "low" | "medium" | "high";
 
@@ -158,7 +158,18 @@ export interface ProviderCatalogPublic {
 
 // "drafter" is retained for compatibility with existing providers.json files;
 // the writing pipeline no longer assigns or invokes it.
-export type ModelUsageRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
+export type ModelUsageRole =
+  | "agent"
+  | "flash"
+  | "drafter"
+  | "inline"
+  | "writer"
+  | "reviewer"
+  | "summarizer"
+  | "roleplay"
+  | "roleplay_perception"
+  | "roleplay_quality"
+  | "roleplay_memory";
 
 export interface StyleTemplate {
   id: string;
@@ -406,9 +417,13 @@ export interface ChapterSummary {
 /** Per-model-call token stats (one agent step / draft call). */
 export interface RequestComponentUsage {
   kind: "stable_system" | "replayed_turn" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
+  /** Context-graph layer assigned from the request's structural position. */
+  layer?: "L0" | "L1" | "L2" | "L3";
   label: string;
   characters: number;
   estimatedTokens: number;
+  /** Short diagnostic excerpt; never the full prompt or document body. */
+  preview?: string;
   /** Short content hash for diagnosing whether a supposedly stable prefix drifted. */
   fingerprint?: string;
   callKind?: string;

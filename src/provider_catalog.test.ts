@@ -5,7 +5,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { modelSupportsToolChoice, nonThinkingRequestOptions, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { defaultPricing } from "./pricing.js";
-import { parseProviderModelIds, PROVIDERS_BACKUP_SUFFIX, ProviderManager } from "./provider_catalog.js";
+import {
+  extractProviderContextWindow,
+  parseProviderModelEntries,
+  parseProviderModelIds,
+  PROVIDERS_BACKUP_SUFFIX,
+  ProviderManager,
+} from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
 
 test("DeepSeek Thinking omits unsupported tool_choice", () => {
@@ -33,6 +39,26 @@ test("provider model directory parser accepts compatible shapes and deduplicates
   assert.deepEqual(parseProviderModelIds({ data: "invalid" }), []);
 });
 
+test("provider model entries pick up heterogeneous context window fields", () => {
+  assert.equal(extractProviderContextWindow({ id: "x", context_length: 131_072 }), 131_072);
+  assert.equal(extractProviderContextWindow({ id: "x", max_model_len: 8192 }), 8192);
+  assert.equal(extractProviderContextWindow({ id: "x", meta: { context_window: "128k" } }), 128_000);
+  assert.equal(extractProviderContextWindow({ id: "x", max_tokens: 4096 }), undefined);
+  assert.equal(extractProviderContextWindow({ id: "x", max_tokens: 32768 }), 32768);
+  assert.deepEqual(parseProviderModelEntries({
+    data: [
+      { id: "openrouter/a", context_length: 200_000 },
+      { id: "vllm-b", max_model_len: 16_384 },
+      { id: "plain-c" },
+      { id: "openrouter/a", context_length: 1 },
+    ],
+  }), [
+    { name: "openrouter/a", contextWindow: 200_000 },
+    { name: "plain-c" },
+    { name: "vllm-b", contextWindow: 16_384 },
+  ]);
+});
+
 test("scanModels uses a saved key, returns default pricing, and does not mutate the catalog", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-provider-scan-"));
   const originalFetch = globalThis.fetch;
@@ -52,7 +78,12 @@ test("scanModels uses a saved key, returns default pricing, and does not mutate 
     globalThis.fetch = async (input, init) => {
       requestedUrl = String(input);
       authorization = new Headers(init?.headers).get("authorization") ?? "";
-      return new Response(JSON.stringify({ data: [{ id: "model-b" }, { id: "model-a" }] }), {
+      return new Response(JSON.stringify({
+        data: [
+          { id: "model-b", context_length: 200_000 },
+          { id: "model-a" },
+        ],
+      }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -65,6 +96,9 @@ test("scanModels uses a saved key, returns default pricing, and does not mutate 
     assert.equal(authorization, "Bearer sk-scan-test");
     assert.deepEqual(result.models.map(model => model.name), ["model-a", "model-b"]);
     assert.deepEqual(result.models[0].pricing, defaultPricing("openai-compatible", "model-a"));
+    assert.equal(result.models[0].contextFromProvider, undefined);
+    assert.equal(result.models[1].contextFromProvider, true);
+    assert.equal(result.models[1].pricing.contextWindow, 200_000);
     assert.deepEqual(providers.catalog(), before);
   } finally {
     globalThis.fetch = originalFetch;
@@ -256,7 +290,7 @@ test("persist writes providers.json.bak before overwrite", () => {
   }
 });
 
-test("legacy v2 catalog fills roleplay and flash assignments", () => {
+test("legacy v2 catalog fills writing roles and splits roleplay submodels compatibly", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-provider-roleplay-migration-"));
   try {
     const project = WriterProject.init(root, "角色扮演模型迁移");
@@ -274,6 +308,9 @@ test("legacy v2 catalog fills roleplay and flash assignments", () => {
     const raw = JSON.parse(readFileSync(providers.path, "utf8")) as { assignments: Record<string, unknown> };
     delete raw.assignments.roleplay;
     delete raw.assignments.flash;
+    delete raw.assignments.roleplay_perception;
+    delete raw.assignments.roleplay_quality;
+    delete raw.assignments.roleplay_memory;
     writeFileSync(providers.path, JSON.stringify(raw), "utf8");
 
     const migrated = new ProviderManager(project);
@@ -281,6 +318,9 @@ test("legacy v2 catalog fills roleplay and flash assignments", () => {
     assert.equal(migrated.modelConfig("roleplay").model, "agent-model");
     assert.deepEqual(migrated.catalog().assignments.flash, migrated.catalog().assignments.summarizer);
     assert.equal(migrated.modelConfig("flash").model, migrated.modelConfig("summarizer").model);
+    assert.deepEqual(migrated.catalog().assignments.roleplay_perception, migrated.catalog().assignments.roleplay);
+    assert.deepEqual(migrated.catalog().assignments.roleplay_quality, migrated.catalog().assignments.flash);
+    assert.deepEqual(migrated.catalog().assignments.roleplay_memory, migrated.catalog().assignments.summarizer);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

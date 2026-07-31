@@ -12,7 +12,12 @@ type ModelReference = { providerId: string; modelId: string };
 type SavedCatalog = { version: 2; activeProviderId: string; activeModelId: string; assignments: Record<ModelUsageRole, ModelReference>; providers: SavedProfile[] };
 type LegacyConfig = { provider: ProviderId; baseUrl: string; proxyUrl?: string; model: string; apiKey: string; pricing?: TokenPricing; temperature?: number; topP?: number };
 
-export type ScannedProviderModel = { name: string; pricing: TokenPricing };
+export type ScannedProviderModel = {
+  name: string;
+  pricing: TokenPricing;
+  /** True when pricing.contextWindow was taken from the provider /models payload. */
+  contextFromProvider?: boolean;
+};
 export type ScanProviderModelsInput = {
   profileId?: string;
   provider?: ProviderId;
@@ -169,9 +174,19 @@ export class ProviderManager {
     if (!response.ok) {
       throw new Error(`扫描模型失败（${response.status}）：${(await response.text()).slice(0, 300)}`);
     }
-    const names = parseProviderModelIds(await response.json());
-    if (!names.length) throw new Error("供应商未返回可用的模型列表");
-    return { models: names.map(name => ({ name, pricing: defaultPricing(provider, name) })) };
+    const entries = parseProviderModelEntries(await response.json());
+    if (!entries.length) throw new Error("供应商未返回可用的模型列表");
+    return {
+      models: entries.map(entry => {
+        const pricing = defaultPricing(provider, entry.name);
+        if (!entry.contextWindow) return { name: entry.name, pricing };
+        return {
+          name: entry.name,
+          pricing: { ...pricing, contextWindow: entry.contextWindow },
+          contextFromProvider: true,
+        };
+      }),
+    };
   }
 
   private active() { const profile = this.saved.providers.find(item => item.id === this.saved.activeProviderId) ?? this.saved.providers[0]; const model = profile.models.find(item => item.id === this.saved.activeModelId) ?? profile.models[0]; return { profile, model }; }
@@ -226,8 +241,22 @@ export class ProviderManager {
   }
 }
 
-/** 解析常见的 OpenAI 兼容模型目录响应，并稳定去重、排序。 */
+export type ParsedProviderModelEntry = {
+  name: string;
+  /** Present only when the provider advertised a usable context window. */
+  contextWindow?: number;
+};
+
+/** 解析常见的 OpenAI 兼容模型目录响应，并稳定去重、排序（仅 id）。 */
 export function parseProviderModelIds(payload: unknown): string[] {
+  return parseProviderModelEntries(payload).map(entry => entry.name);
+}
+
+/**
+ * 解析模型目录；尽力读取上下文窗口等扩展字段。
+ * 官方 OpenAI 通常只有 id；OpenRouter / vLLM / 部分中转会带 context_length 等。
+ */
+export function parseProviderModelEntries(payload: unknown): ParsedProviderModelEntry[] {
   const record = payload && typeof payload === "object" && !Array.isArray(payload)
     ? payload as Record<string, unknown>
     : undefined;
@@ -238,13 +267,99 @@ export function parseProviderModelIds(payload: unknown): string[] {
       : Array.isArray(record?.models)
         ? record.models
         : [];
-  const names = entries.flatMap((entry): string[] => {
-    if (typeof entry === "string") return entry.trim() ? [entry.trim()] : [];
-    if (!entry || typeof entry !== "object") return [];
-    const id = (entry as Record<string, unknown>).id;
-    return typeof id === "string" && id.trim() ? [id.trim()] : [];
-  });
-  return [...new Set(names)].sort((left, right) => left.localeCompare(right, "en"));
+  const parsed: ParsedProviderModelEntry[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (typeof entry === "string") {
+      const name = entry.trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      parsed.push({ name });
+      continue;
+    }
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as Record<string, unknown>;
+    const name = typeof row.id === "string" && row.id.trim()
+      ? row.id.trim()
+      : typeof row.name === "string" && row.name.trim()
+        ? row.name.trim()
+        : "";
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const contextWindow = extractProviderContextWindow(row);
+    parsed.push(contextWindow ? { name, contextWindow } : { name });
+  }
+  return parsed.sort((left, right) => left.name.localeCompare(right.name, "en"));
+}
+
+/**
+ * Best-effort context window from heterogeneous OpenAI-compatible /models payloads.
+ * Prefer explicit context fields; avoid small max_tokens that are often max-output only.
+ */
+export function extractProviderContextWindow(entry: Record<string, unknown>): number | undefined {
+  const candidates: unknown[] = [
+    entry.context_window,
+    entry.context_length,
+    entry.contextLength,
+    entry.context,
+    entry.max_context_length,
+    entry.max_context,
+    entry.max_model_len,
+    entry.max_model_length,
+    entry.max_input_tokens,
+    entry.max_input_length,
+    entry.max_seq_len,
+    entry.n_ctx,
+    entry.max_position_embeddings,
+  ];
+
+  const nestedObjects = [entry.meta, entry.limits, entry.architecture, entry.model_info, entry.capabilities]
+    .filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value)));
+  for (const nested of nestedObjects) {
+    candidates.push(
+      nested.context_window,
+      nested.context_length,
+      nested.contextLength,
+      nested.context,
+      nested.max_context_length,
+      nested.max_context,
+      nested.max_model_len,
+      nested.max_input_tokens,
+      nested.n_ctx,
+    );
+  }
+
+  for (const value of candidates) {
+    const window = normalizeContextWindowValue(value);
+    if (window) return window;
+  }
+
+  // max_tokens is ambiguous (often output cap). Only accept when clearly a full context size.
+  const maxTokens = normalizeContextWindowValue(entry.max_tokens ?? entry.max_token);
+  if (maxTokens && maxTokens >= 8_192) return maxTokens;
+  return undefined;
+}
+
+function normalizeContextWindowValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const rounded = Math.round(value);
+    return rounded >= 1_000 && rounded <= 16_000_000 ? rounded : undefined;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (!trimmed) return undefined;
+    const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([kmb])?$/i);
+    if (!match) {
+      const asNumber = Number(trimmed.replace(/[,_\s]/g, ""));
+      return normalizeContextWindowValue(asNumber);
+    }
+    const base = Number(match[1]);
+    if (!Number.isFinite(base)) return undefined;
+    const unit = match[2]?.toLowerCase();
+    const multiplier = unit === "k" ? 1_000 : unit === "m" ? 1_000_000 : unit === "b" ? 1_000_000_000 : 1;
+    return normalizeContextWindowValue(base * multiplier);
+  }
+  return undefined;
 }
 
 function resolveProvidersPath(project: WriterProject): string {
@@ -263,7 +378,13 @@ function parseCatalog(raw: string): SavedCatalog {
     parsed.assignments = parsed.assignments ?? {} as SavedCatalog["assignments"];
     const agentFallback = parsed.assignments.agent ?? fallback;
     const flashFallback = parsed.assignments.summarizer ?? parsed.assignments.inline ?? fallback;
-    for (const role of modelRoles()) parsed.assignments[role] ??= role === "roleplay" ? agentFallback : role === "flash" ? flashFallback : fallback;
+    parsed.assignments.roleplay ??= agentFallback;
+    parsed.assignments.flash ??= flashFallback;
+    // Dedicated roleplay slots preserve the exact pre-split routing on migration.
+    parsed.assignments.roleplay_perception ??= parsed.assignments.roleplay;
+    parsed.assignments.roleplay_quality ??= parsed.assignments.flash;
+    parsed.assignments.roleplay_memory ??= parsed.assignments.summarizer ?? fallback;
+    for (const role of modelRoles()) parsed.assignments[role] ??= fallback;
     for (const profile of parsed.providers) {
       profile.proxyUrl = normalizeProxyUrl(profile.proxyUrl);
       for (const model of profile.models) {
@@ -272,8 +393,12 @@ function parseCatalog(raw: string): SavedCatalog {
         model.topP = optional(model.topP, 0, 1);
         model.frequencyPenalty = optional(model.frequencyPenalty, -2, 2);
         model.presencePenalty = optional(model.presencePenalty, -2, 2);
-        model.reasoningEffort = profile.provider === "openai-compatible" ? reasoningEffort(model.reasoningEffort) : undefined;
-        model.verbosity = profile.provider === "openai-compatible" ? responseVerbosity(model.verbosity) : undefined;
+        model.reasoningEffort = supportsOpenAiAdvancedParams(profile.provider)
+          ? reasoningEffort(model.reasoningEffort)
+          : undefined;
+        model.verbosity = supportsOpenAiAdvancedParams(profile.provider)
+          ? responseVerbosity(model.verbosity)
+          : undefined;
       }
     }
     return parsed;
@@ -292,6 +417,9 @@ function parseCatalog(raw: string): SavedCatalog {
     assignments: {
       agent: fallback,
       roleplay: fallback,
+      roleplay_perception: fallback,
+      roleplay_quality: fallback,
+      roleplay_memory: fallback,
       flash: fallback,
       drafter: fallback,
       inline: fallback,
@@ -333,6 +461,9 @@ function defaultCatalog(): SavedCatalog {
     assignments: {
       agent: fallback,
       roleplay: fallback,
+      roleplay_perception: fallback,
+      roleplay_quality: flash,
+      roleplay_memory: fallback,
       flash,
       drafter: fallback,
       inline: fallback,
@@ -375,7 +506,12 @@ function defaultCatalog(): SavedCatalog {
     ],
   };
 }
-function modelRoles(): ModelUsageRole[] { return ["agent", "roleplay", "flash", "drafter", "inline", "writer", "reviewer", "summarizer"]; }
+function modelRoles(): ModelUsageRole[] {
+  return [
+    "agent", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
+    "roleplay", "roleplay_perception", "roleplay_quality", "roleplay_memory",
+  ];
+}
 function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean; supportsMultimodal?: boolean }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();
   if (!name) throw new Error("模型名称不能为空");
@@ -393,14 +529,26 @@ function normalizeModel(input: { id?: string; name: string; pricing?: Partial<To
     topP: optional(input.topP, 0, 1),
     frequencyPenalty: optional(input.frequencyPenalty, -2, 2),
     presencePenalty: optional(input.presencePenalty, -2, 2),
-    reasoningEffort: provider === "openai-compatible" ? reasoningEffort(input.reasoningEffort) : undefined,
-    verbosity: provider === "openai-compatible" ? responseVerbosity(input.verbosity) : undefined,
+    reasoningEffort: supportsOpenAiAdvancedParams(provider) ? reasoningEffort(input.reasoningEffort) : undefined,
+    verbosity: supportsOpenAiAdvancedParams(provider) ? responseVerbosity(input.verbosity) : undefined,
     ...(input.disableSampling ? { disableSampling: true } : {}),
     ...(supportsMultimodal === true ? { supportsMultimodal: true } : {}),
   };
 }
-function validateProvider(value: ProviderId) { if (value !== "deepseek" && value !== "openai-compatible") throw new Error("不支持的模型供应商"); return value; }
-function providerLabel(value: ProviderId) { return value === "deepseek" ? "DeepSeek" : "OpenAI 兼容"; }
+function supportsOpenAiAdvancedParams(provider: ProviderId): boolean {
+  return provider === "openai-compatible" || provider === "openai-responses";
+}
+function validateProvider(value: ProviderId) {
+  if (value !== "deepseek" && value !== "openai-compatible" && value !== "openai-responses") {
+    throw new Error("不支持的模型供应商");
+  }
+  return value;
+}
+function providerLabel(value: ProviderId) {
+  if (value === "deepseek") return "DeepSeek";
+  if (value === "openai-responses") return "OpenAI Responses";
+  return "OpenAI 兼容";
+}
 function optional(value: number | undefined, min: number, max: number) { return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max ? Math.round(value * 100) / 100 : undefined; }
 function reasoningEffort(value: unknown): ReasoningEffort | undefined { return value === "none" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" ? value : undefined; }
 function responseVerbosity(value: unknown): ResponseVerbosity | undefined { return value === "low" || value === "medium" || value === "high" ? value : undefined; }

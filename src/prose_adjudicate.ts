@@ -11,6 +11,7 @@ import {
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { samplingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import type { ProseGateRule } from "./prose_gate_rules.js";
 
 export type ProseVerdict = "allow" | "warn" | "block";
@@ -632,8 +633,7 @@ async function completeJsonChat(
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置 API Key");
   }
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages,
     stream: false,
@@ -659,7 +659,7 @@ async function completeJsonChat(
     choices?: Array<{ message?: { content?: string | null } }>;
     usage?: unknown;
   };
-  const content = payload.choices?.[0]?.message?.content ?? "";
+  const content = parseProviderCompletionPayload(payload).content;
   if (!content.trim()) throw new Error("句式二审无内容");
   const usage = parseModelTokenUsage(payload.usage);
   return { content, ...(usage ? { usage } : {}) };

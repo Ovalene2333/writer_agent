@@ -224,6 +224,7 @@ export function samplingRequestOptions(
   model: Partial<Pick<ModelConfig, "provider" | "baseUrl" | "temperature" | "topP" | "frequencyPenalty" | "presencePenalty" | "reasoningEffort" | "verbosity" | "disableSampling">>,
   requested: SamplingRequest = {},
 ): SamplingRequestBody {
+  // DeepSeek uses its own thinking controls; Chat Completions + Responses both accept effort/verbosity.
   const openAiOptions = model.provider === "deepseek" || (model.baseUrl && isDeepSeekModel(model as Pick<ModelConfig, "provider" | "baseUrl">))
     ? {}
     : {

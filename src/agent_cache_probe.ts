@@ -670,7 +670,10 @@ function parseOptions(args: string[]): ProbeOptions {
   let allowProjectContent = false;
   let maxTokens = 64;
   let stream = false;
-  const roles: ModelUsageRole[] = ["agent", "roleplay", "flash", "drafter", "inline", "writer", "reviewer", "summarizer"];
+  const roles: ModelUsageRole[] = [
+    "agent", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
+    "roleplay", "roleplay_perception", "roleplay_quality", "roleplay_memory",
+  ];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "-h" || arg === "--help") {

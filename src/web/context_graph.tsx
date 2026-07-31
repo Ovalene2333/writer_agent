@@ -83,11 +83,39 @@ export function humanizeContextCopy(text: string): string {
  */
 export type ContextGraphNodeMetric =
   | { kind: "layers"; segments: Array<{ layer: string; label: string; tokens: number }>; total: number }
+  | {
+      kind: "steps";
+      segments: Array<{ step: number; changeTokens: number; totalTokens: number }>;
+      addedTokens: number;
+      latestTokens: number;
+    }
   | { kind: "cache"; frozenTokens?: number; hitRate?: number; promptTokens?: number }
   | null;
 
 export function contextGraphNodeMetric(node: ContextGraphNode): ContextGraphNodeMetric {
   if (node.kind === "assemble_slice") {
+    const rawSteps = Array.isArray(node.payload?.requestSteps)
+      ? node.payload.requestSteps as Array<Record<string, unknown>>
+      : [];
+    const stepSegments = rawSteps.flatMap((row) => (
+      typeof row.step === "number"
+      && typeof row.changeTokens === "number"
+      && typeof row.estimatedTokens === "number"
+        ? [{
+            step: row.step,
+            changeTokens: row.changeTokens,
+            totalTokens: row.estimatedTokens,
+          }]
+        : []
+    ));
+    if (stepSegments.length) {
+      return {
+        kind: "steps",
+        segments: stepSegments,
+        addedTokens: stepSegments.reduce((sum, segment) => sum + Math.max(0, segment.changeTokens), 0),
+        latestTokens: stepSegments.at(-1)!.totalTokens,
+      };
+    }
     const raw = Array.isArray(node.payload?.layers) ? (node.payload.layers as Array<Record<string, unknown>>) : [];
     // Merge same layer code (e.g. L0 stable + L0 trunk) so the bar stays readable.
     const byLayer = new Map<string, { layer: string; label: string; tokens: number }>();
@@ -153,9 +181,11 @@ export function contextGraphCacheSummary(
 
 export const CONTEXT_GRAPH_NODE_H = 58;
 export const CONTEXT_GRAPH_NODE_H_TALL = 74;
+export const CONTEXT_GRAPH_NODE_H_EXPANDED = 150;
 
 /** Cards carrying a metric strip need the extra row; everything else stays compact. */
-export function contextGraphNodeHeight(node: ContextGraphNode): number {
+export function contextGraphNodeHeight(node: ContextGraphNode, expanded = false): number {
+  if (expanded && Array.isArray(node.payload?.requestSteps)) return CONTEXT_GRAPH_NODE_H_EXPANDED;
   return contextGraphNodeMetric(node) ? CONTEXT_GRAPH_NODE_H_TALL : CONTEXT_GRAPH_NODE_H;
 }
 
@@ -211,6 +241,117 @@ export function turnGroupKey(node: ContextGraphNode): string {
   if (node.sourceMessageId != null) return `msg:${node.sourceMessageId}`;
   if (node.jobId) return `job:${node.jobId}`;
   return `solo:${node.id}`;
+}
+
+/**
+ * Older request diagnostics stored one assemble node per step. Collapse those
+ * rows at read time so existing sessions get the compact growth strip too.
+ */
+export function collapseContextRequestNodes(nodes: ContextGraphNode[]): ContextGraphNode[] {
+  const boundaries = new Map<string, Array<{ atStep: number; path?: string }>>();
+  for (const node of nodes) {
+    const transition = node.payload?.transition;
+    if (!transition || typeof transition !== "object" || Array.isArray(transition)) continue;
+    const row = transition as Record<string, unknown>;
+    if (row.kind !== "chapter_boundary" || typeof row.atStep !== "number") continue;
+    const key = turnGroupKey(node);
+    const list = boundaries.get(key) ?? [];
+    list.push({
+      atStep: row.atStep,
+      ...(typeof row.path === "string" && row.path ? { path: row.path } : {}),
+    });
+    boundaries.set(key, list);
+  }
+  for (const list of boundaries.values()) list.sort((a, b) => a.atStep - b.atStep);
+
+  const groups = new Map<string, ContextGraphNode[]>();
+  const chapterPathByGroup = new Map<string, string>();
+  for (const node of nodes) {
+    if (
+      node.kind !== "assemble_slice"
+      || !Array.isArray(node.payload?.requestComponents)
+      || Array.isArray(node.payload?.requestSteps)
+      || typeof node.payload?.step !== "number"
+    ) continue;
+    const turnKey = turnGroupKey(node);
+    const cuts = boundaries.get(turnKey) ?? [];
+    const segment = cuts.filter((cut) => Number(node.payload.step) > cut.atStep).length;
+    const key = `${turnKey}:chapter:${segment}`;
+    const chapterPath = cuts[segment]?.path;
+    if (chapterPath) chapterPathByGroup.set(key, chapterPath);
+    const list = groups.get(key) ?? [];
+    list.push(node);
+    groups.set(key, list);
+  }
+
+  const replacementById = new Map<string, ContextGraphNode | null>();
+  for (const [groupKey, list] of groups) {
+    if (list.length < 2) continue;
+    const sorted = list.slice().sort((a, b) => (
+      Number(a.payload.step) - Number(b.payload.step)
+      || a.createdAt.localeCompare(b.createdAt)
+    ));
+    let previousTokens = 0;
+    const requestSteps = sorted.flatMap((node) => {
+      const request = node.payload.request && typeof node.payload.request === "object"
+        && !Array.isArray(node.payload.request)
+        ? node.payload.request as Record<string, unknown>
+        : {};
+      const estimatedTokens = typeof request.estimatedTokens === "number"
+        ? request.estimatedTokens
+        : 0;
+      const step = Number(node.payload.step);
+      const snapshot = {
+        step,
+        estimatedTokens,
+        changeTokens: estimatedTokens - previousTokens,
+        requestComponents: node.payload.requestComponents,
+        ...(typeof request.providerPromptTokens === "number"
+          ? { providerPromptTokens: request.providerPromptTokens }
+          : {}),
+        ...(typeof request.cacheHitTokens === "number" ? { cacheHitTokens: request.cacheHitTokens } : {}),
+        ...(typeof request.cacheMissTokens === "number" ? { cacheMissTokens: request.cacheMissTokens } : {}),
+        ...(request.estimatedUsage === true ? { estimatedUsage: true } : {}),
+      };
+      previousTokens = estimatedTokens;
+      return estimatedTokens > 0 ? [snapshot] : [];
+    });
+    if (!requestSteps.length) continue;
+    const first = sorted[0]!;
+    const latest = sorted.at(-1)!;
+    const firstStep = requestSteps[0]!.step;
+    const lastStep = requestSteps.at(-1)!.step;
+    const stepRange = firstStep === lastStep ? `Step ${firstStep}` : `Step ${firstStep}–${lastStep}`;
+    const chapterPath = chapterPathByGroup.get(groupKey);
+    const note = chapterPath ? `${chapterPath} · ${stepRange}` : `${stepRange} 上下文增长`;
+    const { requestComponents: _components, request: _request, ...latestPayload } = latest.payload;
+    const replacement: ContextGraphNode = {
+      ...latest,
+      label: `装载 · ${note}`,
+      payload: {
+        ...latestPayload,
+        step: lastStep,
+        requestSteps,
+        note,
+        ...(chapterPath ? { chapterPath } : {}),
+      },
+      createdAt: first.createdAt,
+    };
+    for (const node of sorted) replacementById.set(node.id, null);
+    replacementById.set(latest.id, replacement);
+  }
+
+  if (!replacementById.size) return nodes;
+  const result: ContextGraphNode[] = [];
+  for (const node of nodes) {
+    if (!replacementById.has(node.id)) {
+      result.push(node);
+      continue;
+    }
+    const replacement = replacementById.get(node.id);
+    if (replacement) result.push(replacement);
+  }
+  return result.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 /**
@@ -512,6 +653,226 @@ export function ContextTransitionDetail({ transition }: { transition: ContextTra
   );
 }
 
+export type ContextRequestComponentView = {
+  kind: string;
+  layer: "L0" | "L1" | "L2" | "L3";
+  label: string;
+  characters: number;
+  estimatedTokens: number;
+  preview?: string;
+  fingerprint?: string;
+};
+
+export type ContextRequestView = {
+  step?: number;
+  estimatedTokens: number;
+  providerPromptTokens?: number;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  estimatedUsage: boolean;
+  components: ContextRequestComponentView[];
+};
+
+export type ContextRequestSeriesView = {
+  steps: Array<ContextRequestView & { step: number; changeTokens: number }>;
+  addedTokens: number;
+  latestTokens: number;
+  chapterPath?: string;
+};
+
+export function contextRequestFromPayload(
+  payload: Record<string, unknown> | undefined,
+): ContextRequestView | null {
+  if (!payload || !Array.isArray(payload.requestComponents)) return null;
+  const components = payload.requestComponents.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    if (
+      typeof row.kind !== "string"
+      || typeof row.label !== "string"
+      || typeof row.characters !== "number"
+      || typeof row.estimatedTokens !== "number"
+      || row.estimatedTokens < 0
+    ) return [];
+    const layer: ContextRequestComponentView["layer"] =
+      row.layer === "L0" || row.layer === "L1" || row.layer === "L2" || row.layer === "L3"
+      ? row.layer
+      : "L3";
+    return [{
+      kind: row.kind,
+      layer,
+      label: row.label,
+      characters: row.characters,
+      estimatedTokens: row.estimatedTokens,
+      ...(typeof row.preview === "string" ? { preview: row.preview } : {}),
+      ...(typeof row.fingerprint === "string" ? { fingerprint: row.fingerprint } : {}),
+    }];
+  });
+  if (!components.length) return null;
+  const request = payload.request && typeof payload.request === "object" && !Array.isArray(payload.request)
+    ? payload.request as Record<string, unknown>
+    : {};
+  const componentTotal = components.reduce((sum, component) => sum + component.estimatedTokens, 0);
+  return {
+    ...(typeof payload.step === "number" ? { step: payload.step } : {}),
+    estimatedTokens: typeof request.estimatedTokens === "number"
+      ? request.estimatedTokens
+      : componentTotal,
+    ...(typeof request.providerPromptTokens === "number"
+      ? { providerPromptTokens: request.providerPromptTokens }
+      : {}),
+    ...(typeof request.cacheHitTokens === "number" ? { cacheHitTokens: request.cacheHitTokens } : {}),
+    ...(typeof request.cacheMissTokens === "number" ? { cacheMissTokens: request.cacheMissTokens } : {}),
+    estimatedUsage: request.estimatedUsage === true,
+    components,
+  };
+}
+
+export function contextRequestSeriesFromPayload(
+  payload: Record<string, unknown> | undefined,
+): ContextRequestSeriesView | null {
+  if (!payload || !Array.isArray(payload.requestSteps)) return null;
+  const steps = payload.requestSteps.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    if (
+      typeof row.step !== "number"
+      || typeof row.estimatedTokens !== "number"
+      || typeof row.changeTokens !== "number"
+      || !Array.isArray(row.requestComponents)
+    ) return [];
+    const request = contextRequestFromPayload({
+      step: row.step,
+      requestComponents: row.requestComponents,
+      request: {
+        estimatedTokens: row.estimatedTokens,
+        ...(typeof row.providerPromptTokens === "number" ? { providerPromptTokens: row.providerPromptTokens } : {}),
+        ...(typeof row.cacheHitTokens === "number" ? { cacheHitTokens: row.cacheHitTokens } : {}),
+        ...(typeof row.cacheMissTokens === "number" ? { cacheMissTokens: row.cacheMissTokens } : {}),
+        ...(row.estimatedUsage === true ? { estimatedUsage: true } : {}),
+      },
+    });
+    if (!request || request.step == null) return [];
+    return [{ ...request, step: request.step, changeTokens: row.changeTokens }];
+  });
+  if (!steps.length) return null;
+  return {
+    steps,
+    addedTokens: steps.reduce((sum, step) => sum + Math.max(0, step.changeTokens), 0),
+    latestTokens: steps.at(-1)!.estimatedTokens,
+    ...(typeof payload.chapterPath === "string" ? { chapterPath: payload.chapterPath } : {}),
+  };
+}
+
+export function ContextRequestSeriesDetail({ series }: { series: ContextRequestSeriesView }) {
+  const latestStep = series.steps.at(-1)!.step;
+  const [selectedStep, setSelectedStep] = useState(latestStep);
+  useEffect(() => {
+    if (!series.steps.some((step) => step.step === selectedStep)) setSelectedStep(latestStep);
+  }, [latestStep, selectedStep, series.steps]);
+  const selected = series.steps.find((step) => step.step === selectedStep) ?? series.steps.at(-1)!;
+  const denominator = Math.max(1, series.addedTokens);
+  return (
+    <section className="context-request-series">
+      <header>
+        <div>
+          <h4>{series.chapterPath ? "章节请求增长" : "Step 请求增长"}</h4>
+          <span>{series.steps.length} 个步骤合并展示</span>
+          {series.chapterPath ? <code title={series.chapterPath}>{series.chapterPath}</code> : null}
+        </div>
+        <strong>当前 {formatGraphTokens(series.latestTokens)} tok</strong>
+      </header>
+      <div className="context-request-growth-bar" aria-label="各步骤新增上下文">
+        {series.steps.map((step, index) => {
+          const added = Math.max(0, step.changeTokens);
+          return (
+            <button
+              key={step.step}
+              type="button"
+              className={`tone-${index % 4}${step.step === selected.step ? " active" : ""}${step.changeTokens < 0 ? " reset" : ""}`}
+              style={{
+                flexGrow: added / denominator,
+                flexBasis: added > 0 ? 18 : 4,
+                animationDelay: `${Math.min(index, 12) * 45}ms`,
+              }}
+              title={`Step ${step.step} ${step.changeTokens >= 0 ? "+" : "−"}${formatGraphTokens(Math.abs(step.changeTokens))} · 总计 ${formatGraphTokens(step.estimatedTokens)}`}
+              onClick={() => setSelectedStep(step.step)}
+            >
+              <span>Step {step.step}</span>
+              <strong>{step.changeTokens >= 0 ? "+" : "−"}{formatGraphTokens(Math.abs(step.changeTokens))}</strong>
+            </button>
+          );
+        })}
+      </div>
+      <ContextRequestDetail key={selected.step} request={selected} />
+    </section>
+  );
+}
+
+export function ContextRequestDetail({ request }: { request: ContextRequestView }) {
+  const total = Math.max(1, request.estimatedTokens);
+  const components = request.components;
+  const cacheMeasured = request.cacheHitTokens != null && request.cacheMissTokens != null
+    && request.cacheHitTokens + request.cacheMissTokens > 0;
+  const cacheHitRate = cacheMeasured
+    ? request.cacheHitTokens! / (request.cacheHitTokens! + request.cacheMissTokens!)
+    : undefined;
+  return (
+    <section className="context-request-detail">
+      <header>
+        <div>
+          <h4>{request.step != null ? `Step ${request.step} 请求上下文` : "请求上下文"}</h4>
+          <span>{components.length} 个组成项 · 按装配顺序</span>
+        </div>
+        <strong>
+          {request.providerPromptTokens != null
+            ? `${formatGraphTokens(request.providerPromptTokens)} tok`
+            : `约 ${formatGraphTokens(request.estimatedTokens)} tok`}
+        </strong>
+      </header>
+      <div className="context-request-summary">
+        <span>组成估算 {request.estimatedTokens.toLocaleString()} tok</span>
+        {request.providerPromptTokens != null ? (
+          <span>{request.estimatedUsage ? "供应商未返回用量，本项仍为估算" : "供应商输入总量"}</span>
+        ) : null}
+        {cacheHitRate != null ? <span>缓存命中 {Math.round(cacheHitRate * 100)}%</span> : null}
+      </div>
+      <ol>
+        {components.map((component, index) => {
+          const percentage = component.estimatedTokens / total;
+          return (
+            <li key={`${component.kind}-${component.label}-${index}`}>
+              <div className="context-request-row-head">
+                <span className={`context-request-layer layer-${component.layer}`}>
+                  {component.layer}
+                </span>
+                <span className="context-request-label" title={component.label}>{component.label}</span>
+                <strong>{component.estimatedTokens.toLocaleString()} tok</strong>
+                <em>{Math.round(percentage * 1000) / 10}%</em>
+              </div>
+              <div className="context-request-row-track" aria-hidden="true">
+                <span
+                  className={`layer-${component.layer}`}
+                  style={{ width: `${Math.max(0.8, percentage * 100)}%` }}
+                />
+              </div>
+              <small>
+                {component.characters.toLocaleString()} chars
+                {component.fingerprint ? ` · #${component.fingerprint}` : ""}
+              </small>
+              {component.preview ? (
+                <p className="context-request-preview" title={component.preview}>
+                  {component.preview}
+                </p>
+              ) : null}
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
 export function treeChildEdgeLabel(item: ContextGraphTreeItem): string {
   if (item.node.kind === "epoch") return "任务";
   if (item.node.kind === "handoff" || item.node.kind === "artifact") return "产出";
@@ -559,7 +920,7 @@ export type ContextGraphMeasure = {
  *
  * Turns are siblings under root so the graph grows sideways, not a diagonal staircase.
  */
-export function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraphLayout {
+export function layoutContextGraphNodes(nodes: ContextGraphNode[], expandedId?: string | null): ContextGraphLayout {
   const nodeW = 176;
   const colGap = 56; // horizontal gap between parent column and child column
   const vGap = 12;   // vertical gap between sibling cards
@@ -588,7 +949,7 @@ export function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraph
   };
 
   const measure = (item: ContextGraphTreeItem): ContextGraphMeasure => {
-    const selfH = contextGraphNodeHeight(item.node);
+    const selfH = contextGraphNodeHeight(item.node, item.node.id === expandedId);
     if (!item.children.length) {
       return { item, height: selfH, children: [] };
     }
@@ -606,7 +967,7 @@ export function layoutContextGraphNodes(nodes: ContextGraphNode[]): ContextGraph
   const measured = measure(displayRoot);
 
   const place = (m: ContextGraphMeasure, depth: number, x: number, yTop: number): void => {
-    const selfH = contextGraphNodeHeight(m.item.node);
+    const selfH = contextGraphNodeHeight(m.item.node, m.item.node.id === expandedId);
     // Parent vertically centered against the whole child block (or just itself).
     const y = yTop + Math.max(0, (m.height - selfH) / 2);
     placed.push({
@@ -751,10 +1112,10 @@ export function ContextGraphCanvas({
   nodes: ContextGraphNode[];
   edges: ContextGraphEdge[];
   selectedId: string | null;
-  onSelect: (id: string) => void;
+  onSelect: (id: string | null) => void;
 }) {
   // Layout uses only the filtered `nodes`; tree structure is rebuilt from them.
-  const layout = React.useMemo(() => layoutContextGraphNodes(nodes), [nodes]);
+  const layout = React.useMemo(() => layoutContextGraphNodes(nodes, selectedId), [nodes, selectedId]);
   const pos = React.useMemo(() => {
     const map = new Map<string, ContextGraphLayoutNode>();
     for (const node of layout.placed) map.set(node.id, node);
@@ -952,14 +1313,22 @@ export function ContextGraphCanvas({
           const pillW = Math.max(30, graphLabelUnits(pillText) * 5.4 + 10);
           const barX = 12;
           const barW = node.w - 24;
+          const requestSeries = metric?.kind === "steps"
+            ? contextRequestSeriesFromPayload(node.payload)
+            : null;
+          const requestExpanded = selected && requestSeries != null;
           const barY = node.h - 10;
+          const expandedStep = requestExpanded ? requestSeries.steps.at(-1) : undefined;
+          const expandedComponents = expandedStep
+            ? expandedStep.components.slice(0, 2)
+            : [];
           const replayTurns = node.kind === "assemble_slice" ? assembleReplayTurns(node) : undefined;
           return (
             <g
               key={node.id}
               className={`context-graph-svg-node kind-${node.kind} role-${node.treeRole} status-${node.status}${superseded ? " superseded" : ""}${selected ? " selected" : ""}${related && !selected ? " related" : ""}${dim ? " dim" : ""}`}
               transform={`translate(${node.x}, ${node.y})`}
-              onClick={() => onSelect(node.id)}
+              onClick={() => onSelect(selected ? null : node.id)}
               style={{ cursor: "pointer" }}
             >
               <title>{`${kindLabel}: ${node.label}`}</title>
@@ -967,6 +1336,11 @@ export function ContextGraphCanvas({
               <g clipPath={`url(#ctx-node-clip-${node.h})`}>
                 <rect x={0} y={0} width={3} height={node.h} className="context-graph-svg-accent" />
                 <text x={12} y={18} className="context-graph-svg-kind">{kindLabel}</text>
+                {metric?.kind === "steps" ? (
+                  <text x={node.w - 12} y={18} textAnchor="end" className="context-graph-svg-expand">
+                    {requestExpanded ? "− 收起" : "＋ 展开"}
+                  </text>
+                ) : null}
                 {node.status === "archived" ? (
                   <g transform={`translate(${node.w - pillW - 10}, 8)`}>
                     <rect width={pillW} height={12} rx={6} className="context-graph-status-pill" />
@@ -977,6 +1351,11 @@ export function ContextGraphCanvas({
                 <text x={12} y={50} className="context-graph-svg-meta">
                   {meta}{replayTurns != null && replayTurns > 0 ? ` · 历史 ${replayTurns} 轮` : ""}
                 </text>
+                {metric?.kind === "steps" ? (
+                  <text x={12} y={63} className="context-graph-svg-metric">
+                    {`${metric.segments.length} 步 · 当前 ${formatGraphTokens(metric.latestTokens)}`}
+                  </text>
+                ) : null}
                 {metric?.kind === "layers" ? (
                   <>
                     <text x={12} y={63} className="context-graph-svg-metric">
@@ -1026,6 +1405,27 @@ export function ContextGraphCanvas({
                       </rect>
                     ) : null}
                   </>
+                ) : null}
+                {requestExpanded && expandedStep ? (
+                  <g className="context-graph-node-expand">
+                    <line x1={12} y1={70} x2={node.w - 12} y2={70} className="context-graph-expand-divider" />
+                    <text x={12} y={84} className="context-graph-expand-heading">
+                      {`最近 Step ${expandedStep.step} · 主要组成`}
+                    </text>
+                    {expandedComponents.map((component, index) => {
+                      const labelY = 101 + index * 30;
+                      return (
+                        <g key={`${component.kind}-${component.label}`}>
+                          <text x={12} y={labelY} className="context-graph-expand-label">
+                            {truncateGraphLabel(`${component.label} · ${formatGraphTokens(component.estimatedTokens)}`, 24)}
+                          </text>
+                          <text x={12} y={labelY + 13} className="context-graph-expand-preview">
+                            {truncateGraphLabel(component.preview || "暂无内容预览", 28)}
+                          </text>
+                        </g>
+                      );
+                    })}
+                  </g>
                 ) : null}
               </g>
             </g>

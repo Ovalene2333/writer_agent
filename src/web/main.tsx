@@ -75,9 +75,11 @@ import {
   QUALITY_GRADE_LABEL,
   QUALITY_SOURCE_LABEL,
   ROLEPLAY_CONTINUATION_PLACEHOLDER,
+  ROLEPLAY_LENGTH_OPTIONS,
   ROLEPLAY_RERUN_DIRECTION_OPTIONS,
   ROLEPLAY_RERUN_SLIDERS,
   ROLEPLAY_SETUP_PHASE_LABELS,
+  roleplayLengthOption,
   ROLEPLAY_SETUP_STEP_LABELS,
   UI_THEMES,
   UI_THEME_IDS,
@@ -186,7 +188,7 @@ import {
   StepTokenBadge,
   STEP_TRAIL_STORAGE_KEY,
 } from "./agent_steps";
-import { Markdown, documentWordCount, markdownHeadings, loadReadingProgress, saveReadingProgress, readingProgressStorageKey, originalOffsetForNormalized, normalizeMarkdownSource, type DocumentContextSelection, type ReaderTextSelection } from "./markdown";
+import { Markdown, documentWordCount, renderedMarkdownWordCount, markdownHeadings, loadReadingProgress, saveReadingProgress, readingProgressStorageKey, originalOffsetForNormalized, normalizeMarkdownSource, type DocumentContextSelection, type ReaderTextSelection } from "./markdown";
 import { shortProviderName, formatGraphTokens } from "./format_utils";
 import {
   ContextGraphCanvas,
@@ -195,9 +197,14 @@ import {
   contextGraphNodeTitle,
   contextGraphNodeMeta,
   contextGraphStatusLabel,
+  contextRequestFromPayload,
+  contextRequestSeriesFromPayload,
   contextTransitionFromPayload,
+  ContextRequestDetail,
+  ContextRequestSeriesDetail,
   ContextTransitionDetail,
   buildContextGraphTree,
+  collapseContextRequestNodes,
   CONTEXT_GRAPH_KIND_LABEL,
   CONTEXT_GRAPH_EDGE_LABEL,
   type ContextTransitionView,
@@ -331,7 +338,7 @@ function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }
   const perceptionGroups = data ? [
     { key: "speech", label: "话语", items: data.speech },
     { key: "knowable", label: "可知事实", items: data.knowableFacts },
-    { key: "unknowable", label: "不可知事实", items: data.unknowableFacts },
+    { key: "unknowable", label: "其他事实（不优先使用）", items: data.unknowableFacts },
     { key: "sensations", label: "潜在感受", items: data.potentialSensations },
   ].filter(group => group.items.length > 0) : [];
   return (
@@ -361,7 +368,7 @@ function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }
         <div className="roleplay-perception-editor">
           <label><span>话语</span><textarea value={draft.speech.join("\n")} onChange={event => setLines("speech", event.target.value)} /></label>
           <label><span>可知事实</span><textarea value={draft.knowableFacts.join("\n")} onChange={event => setLines("knowableFacts", event.target.value)} /></label>
-          <label><span>不可知事实</span><textarea value={draft.unknowableFacts.join("\n")} onChange={event => setLines("unknowableFacts", event.target.value)} /></label>
+          <label><span>其他事实（不优先使用）</span><textarea value={draft.unknowableFacts.join("\n")} onChange={event => setLines("unknowableFacts", event.target.value)} /></label>
           <label><span>潜在感受</span><textarea value={draft.potentialSensations.join("\n")} onChange={event => setLines("potentialSensations", event.target.value)} /></label>
           <div className="roleplay-perception-actions">
             <button type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
@@ -635,6 +642,8 @@ function App() {
   const [roleplayMemoryOpen, setRoleplayMemoryOpen] = useState(false);
   const [roleplayFactDraft, setRoleplayFactDraft] = useState<RoleplayFactDraft | null>(null);
   const [roleplayInputMode, setRoleplayInputMode] = useState<RoleplayInputMode>("dialogue");
+  /** Ongoing roleplay length preference (-2..2); applies to every turn, not only reruns. */
+  const [roleplayLength, setRoleplayLength] = useState(0);
   const [directorSuggestions, setDirectorSuggestions] = useState<string[]>([]);
   const [directorSuggestionBusy, setDirectorSuggestionBusy] = useState(false);
   const [directorSuggestionError, setDirectorSuggestionError] = useState("");
@@ -1839,6 +1848,8 @@ function App() {
     return {
       ...DEFAULT_ROLEPLAY_RERUN_CONTROLS,
       ...controls,
+      // Length is a standing preference; do not let stale rerun payloads override it.
+      length: roleplayLength,
       contentRating: roleplay?.contentRating ?? "default",
     };
   }
@@ -4297,41 +4308,43 @@ function App() {
         </div>
         {roleplay && (
           <div className="roleplay-banner" role="status">
-            <div className="roleplay-banner-copy">
-              <div className="roleplay-banner-heading">
-                <span className="roleplay-banner-kicker">角色扮演</span>
-                <strong>「{roleplay.performer.name}」×「{roleplay.identity.name}」</strong>
-                {roleplay.scene && <span className="roleplay-scene-chip">
-                  {roleplay.sceneSequence.length > 1 ? `${roleplay.sceneIndex + 1}/${roleplay.sceneSequence.length} · ` : ""}{roleplay.scene.name}
-                </span>}
-              </div>
-              <details className="roleplay-session-details">
-                <summary>查看当前角色与场景设定</summary>
-                <div className="roleplay-session-body">
-                  <span>扮演者：{roleplay.performer.name}（{roleplay.performer.kind === "normal" ? "普通卡" : "简易卡"}）</span>
-                  <dl>
-                    <div><dt>身份</dt><dd>{roleplay.identity.card.identity}</dd></div>
-                    <div><dt>关系</dt><dd>{roleplay.identity.card.relationship}</dd></div>
-                    <div><dt>已知</dt><dd>{roleplay.identity.card.knowledge}</dd></div>
-                    <div><dt>场景</dt><dd>{roleplay.identity.card.scene}</dd></div>
-                    <div><dt>目标</dt><dd>{roleplay.identity.card.goal}</dd></div>
-                    {roleplay.scene && <>
-                      <div><dt>独立场景</dt><dd>{roleplay.scene.name}</dd></div>
-                      <div><dt>地点/时间</dt><dd>{roleplay.scene.setting}</dd></div>
-                      <div><dt>场景要点</dt><dd>{roleplay.scene.premise}</dd></div>
-                    </>}
-                  </dl>
+            <div className="roleplay-banner-header">
+              <div className="roleplay-banner-copy">
+                <div className="roleplay-banner-heading">
+                  <span className="roleplay-banner-kicker">角色扮演</span>
+                  <strong>「{roleplay.performer.name}」×「{roleplay.identity.name}」</strong>
+                  {roleplay.scene && <span className="roleplay-scene-chip">
+                    {roleplay.sceneSequence.length > 1 ? `${roleplay.sceneIndex + 1}/${roleplay.sceneSequence.length} · ` : ""}{roleplay.scene.name}
+                  </span>}
                 </div>
-              </details>
-            </div>
-            <div className="roleplay-banner-actions">
+                <details className="roleplay-session-details">
+                  <summary>查看当前角色与场景设定</summary>
+                  <div className="roleplay-session-body">
+                    <span>扮演者：{roleplay.performer.name}（{roleplay.performer.kind === "normal" ? "普通卡" : "简易卡"}）</span>
+                    <dl>
+                      <div><dt>身份</dt><dd>{roleplay.identity.card.identity}</dd></div>
+                      <div><dt>关系</dt><dd>{roleplay.identity.card.relationship}</dd></div>
+                      <div><dt>已知</dt><dd>{roleplay.identity.card.knowledge}</dd></div>
+                      <div><dt>场景</dt><dd>{roleplay.identity.card.scene}</dd></div>
+                      <div><dt>目标</dt><dd>{roleplay.identity.card.goal}</dd></div>
+                      {roleplay.scene && <>
+                        <div><dt>独立场景</dt><dd>{roleplay.scene.name}</dd></div>
+                        <div><dt>地点/时间</dt><dd>{roleplay.scene.setting}</dd></div>
+                        <div><dt>场景要点</dt><dd>{roleplay.scene.premise}</dd></div>
+                      </>}
+                    </dl>
+                  </div>
+                </details>
+              </div>
               <div className="roleplay-input-mode" role="group" aria-label="角色扮演输入模式">
                 <button type="button" className={roleplayInputMode === "dialogue" ? "active" : ""} onClick={() => setRoleplayInputMode("dialogue")}>角色内</button>
                 <button type="button" className={roleplayInputMode === "director" ? "active" : ""} onClick={() => setRoleplayInputMode("director")}>导演</button>
               </div>
+            </div>
+            <div className="roleplay-banner-actions">
               <div className="roleplay-action-group roleplay-action-group-primary">
                 <button type="button" disabled={busy} title={`让「${roleplay.performer.name}」根据场景先开口`} onClick={() => void requestRoleplayOpening()}>
-                  <Drama size={13} aria-hidden="true" />主动开场
+                  <Drama size={14} aria-hidden="true" /><span>主动开场</span>
                 </button>
                 <button
                   type="button"
@@ -4340,7 +4353,7 @@ function App() {
                   title={`让「${roleplay.performer.name}」在没有新玩家输入时继续演绎当前场景`}
                   onClick={() => void requestPerformerAutoReply()}
                 >
-                  <MessageSquare size={13} aria-hidden="true" />{roleplayAutoReplyBusy === "performer" ? "续演中…" : "角色续演"}
+                  <MessageSquare size={14} aria-hidden="true" /><span>{roleplayAutoReplyBusy === "performer" ? "续演中…" : "角色续演"}</span>
                 </button>
                 <button
                   type="button"
@@ -4348,52 +4361,86 @@ function App() {
                   title={`让「${roleplay.identity.name}」生成一段简短的下一轮草稿`}
                   onClick={() => void requestRoleplayAutoReply()}
                 >
-                  <WandSparkles size={13} aria-hidden="true" />{roleplayAutoReplyBusy === "identity" ? "生成中…" : "身份代答"}
+                  <WandSparkles size={14} aria-hidden="true" /><span>{roleplayAutoReplyBusy === "identity" ? "生成中…" : "身份代答"}</span>
                 </button>
                 {roleplay.identity.kind === "generated" && (
                   <button type="button" disabled={busy} onClick={() => void saveCurrentRoleplayInterlocutor()}>保存身份</button>
                 )}
               </div>
-              <div className="roleplay-action-group roleplay-action-group-secondary">
-                <button type="button" disabled={busy} onClick={() => setRoleplaySceneManagerOpen(true)} title="场景管理与场景序列">
-                  <ListOrdered size={13} aria-hidden="true" /><span>场景</span>
-                </button>
-                <details className={`roleplay-rating-menu rating-${roleplay.contentRating ?? "default"}`}>
-                  <summary title={`内容分级：${(roleplay.contentRating ?? "default") === "default" ? "默认" : (roleplay.contentRating ?? "default").toUpperCase()}`}>
-                    <ShieldCheck size={13} aria-hidden="true" /><span>分级</span>
+              <div className="roleplay-banner-footer">
+                <details className="roleplay-length-menu">
+                  <summary
+                    title={`篇幅：${roleplayLengthOption(roleplayLength).label}（推荐 ${roleplayLengthOption(roleplayLength).rangeLabel}）`}
+                  >
+                    <span>篇幅</span>
+                    <em>{roleplayLengthOption(roleplayLength).label}</em>
+                    <small>{roleplayLengthOption(roleplayLength).rangeLabel}</small>
                   </summary>
-                  <div role="menu" aria-label="角色扮演内容分级">
-                    {(["default", "sfw", "nsfw"] as RoleplayContentRating[]).map(contentRating => {
-                      const active = (roleplay.contentRating ?? "default") === contentRating;
+                  <div role="menu" aria-label="角色扮演篇幅">
+                    {ROLEPLAY_LENGTH_OPTIONS.map(option => {
+                      const active = roleplayLength === option.level;
                       return (
                         <button
-                          key={contentRating}
+                          key={option.level}
                           type="button"
                           role="menuitemradio"
                           aria-checked={active}
                           className={active ? "active" : ""}
-                          disabled={busy}
-                          title={contentRating === "default" ? "沿用角色与场景设定" : contentRating === "sfw" ? "强制非露骨内容" : "强制成人向内容；仅限明确成年角色"}
+                          disabled={busy || Boolean(roleplayAutoReplyBusy)}
+                          title={`${option.label} · 推荐 ${option.rangeLabel}`}
                           onClick={(event) => {
                             event.currentTarget.closest("details")?.removeAttribute("open");
-                            void updateRoleplayContentRating(contentRating);
+                            setRoleplayLength(option.level);
                           }}
                         >
-                          <span>{contentRating === "default" ? "默认" : contentRating.toUpperCase()}</span>
+                          <span>{option.label}</span>
+                          <small>{option.rangeLabel}</small>
                         </button>
                       );
                     })}
                   </div>
                 </details>
-                <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
-                  <History size={13} aria-hidden="true" /><span>记忆</span>
-                </button>
-                <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()} title="更换角色与场景设定">
-                  <Settings size={13} aria-hidden="true" /><span>设定</span>
-                </button>
-                <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()} title="退出角色扮演">
-                  <X size={13} aria-hidden="true" /><span>退出</span>
-                </button>
+                <div className="roleplay-action-group roleplay-action-group-secondary">
+                  <button type="button" disabled={busy} onClick={() => setRoleplaySceneManagerOpen(true)} title="场景管理与场景序列">
+                    <ListOrdered size={13} aria-hidden="true" /><span>场景</span>
+                  </button>
+                  <details className={`roleplay-rating-menu rating-${roleplay.contentRating ?? "default"}`}>
+                    <summary title={`内容分级：${(roleplay.contentRating ?? "default") === "default" ? "默认" : (roleplay.contentRating ?? "default").toUpperCase()}`}>
+                      <ShieldCheck size={13} aria-hidden="true" /><span>分级</span>
+                    </summary>
+                    <div role="menu" aria-label="角色扮演内容分级">
+                      {(["default", "sfw", "nsfw"] as RoleplayContentRating[]).map(contentRating => {
+                        const active = (roleplay.contentRating ?? "default") === contentRating;
+                        return (
+                          <button
+                            key={contentRating}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={active}
+                            className={active ? "active" : ""}
+                            disabled={busy}
+                            title={contentRating === "default" ? "沿用角色与场景设定" : contentRating === "sfw" ? "强制非露骨内容" : "强制成人向内容；仅限明确成年角色"}
+                            onClick={(event) => {
+                              event.currentTarget.closest("details")?.removeAttribute("open");
+                              void updateRoleplayContentRating(contentRating);
+                            }}
+                          >
+                            <span>{contentRating === "default" ? "默认" : contentRating.toUpperCase()}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </details>
+                  <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
+                    <History size={13} aria-hidden="true" /><span>记忆</span>
+                  </button>
+                  <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()} title="更换角色与场景设定">
+                    <Settings size={13} aria-hidden="true" /><span>设定</span>
+                  </button>
+                  <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()} title="退出角色扮演">
+                    <X size={13} aria-hidden="true" /><span>退出</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -4465,6 +4512,14 @@ function App() {
                 >
                   <span>{msg.channel === "roleplay" ? "角色" : "Assistant"}</span>
                   {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
+                  {msg.channel === "roleplay" ? (
+                    <span
+                      className="roleplay-reply-word-count"
+                      title="当前回复的实际字数；按显示文本统计，不计空白与 Markdown 标记"
+                    >
+                      {renderedMarkdownWordCount(displayContent)} 字
+                    </span>
+                  ) : null}
                   <span className="msg-chevron" aria-hidden="true">{assistantCollapsed ? "▾" : "▴"}</span>
                 </button>
               ) : !continuationMessage ? (
@@ -4726,32 +4781,28 @@ function App() {
             {roleplay && roleplayInputMode === "director" && (
               <div className="director-mode-guide" role="note">
                 <div className="director-mode-guide-title">
-                  <div>
-                    <span>导演模式</span>
-                    <small>推荐用于推进与校准剧情</small>
-                  </div>
+                  <span>导演</span>
                   <button type="button" disabled={busy || directorSuggestionBusy} onClick={() => void requestDirectorSuggestions()}>
-                    {directorSuggestionBusy ? "建议生成中…" : directorSuggestions.length ? "换一组" : "导演建议"}
+                    {directorSuggestionBusy ? "生成中…" : directorSuggestions.length ? "换一组" : "建议"}
                   </button>
                 </div>
-                <p>说明场景、时间、节奏、角色态度或新增前提；角色对白请切回「角色内」。</p>
                 {directorSuggestionError && <div className="director-mode-error">{directorSuggestionError}</div>}
-                <div className="director-mode-examples" aria-label="导演指令示例">
-                  {directorSuggestions.length
-                    ? directorSuggestions.map((suggestion, index) => (
-                        <button
-                          type="button"
-                          key={index + ":" + suggestion}
-                          onClick={() => {
-                            setPrompt(suggestion);
-                            requestAnimationFrame(() => composerRef.current?.focus());
-                          }}
-                        >
-                          {suggestion}
-                        </button>
-                      ))
-                    : <span className="director-mode-empty">由当前角色模型读取现场目标、张力与最近对话，生成三个具体的下一拍选择。</span>}
-                </div>
+                {directorSuggestions.length > 0 && (
+                  <div className="director-mode-examples" aria-label="导演指令建议">
+                    {directorSuggestions.map((suggestion, index) => (
+                      <button
+                        type="button"
+                        key={index + ":" + suggestion}
+                        onClick={() => {
+                          setPrompt(suggestion);
+                          requestAnimationFrame(() => composerRef.current?.focus());
+                        }}
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
             {!roleplay && pendingAttachments.length > 0 && (
@@ -4806,7 +4857,7 @@ function App() {
                 ? "只读分享模式不能发送消息"
                 : roleplay
                   ? roleplayInputMode === "director"
-                    ? "输入导演指示，例如：加快节奏，让冲突在三轮内升级…"
+                    ? "导演指示：场景 / 节奏 / 态度…"
                     : `以「${roleplay.identity.name}」身份对「${roleplay.performer.name}」说话…（Ctrl+Enter 发送）`
                   : agentSupportsMultimodal
                     ? "写作任务…可粘贴或添加图片（Ctrl+Enter 发送）"
@@ -4920,10 +4971,17 @@ function App() {
             <h2 id="branch-confirm-title">
               {branchConfirm.mode === "edit" ? "编辑这条消息" : "重新运行这一轮"}
             </h2>
-            <p>
-              当前回答会保存为历史版本；此消息之后的对话会撤销。
-              已接受的<strong>文档修改</strong>与<strong>角色卡修改</strong>可选择保留或回退。
-            </p>
+            {branchConfirm.message.channel === "roleplay" ? (
+              <p>
+                当前演出会保存为历史版本；此消息之后的对话会撤销，角色感知、现场记忆和来源事实会恢复到分支点。
+                项目文档与正式角色卡修改不会回退。
+              </p>
+            ) : (
+              <p>
+                当前回答会保存为历史版本；此消息之后的对话会撤销。
+                已接受的<strong>文档修改</strong>与<strong>角色卡修改</strong>可选择保留或回退。
+              </p>
+            )}
             {branchConfirm.message.channel === "roleplay" && branchConfirm.inputMode && (
               <div className="roleplay-input-mode" role="group" aria-label="重新发送的角色扮演输入模式">
                 <button
@@ -4949,6 +5007,10 @@ function App() {
             {branchConfirm.mode === "rerun" && branchConfirm.message.channel === "roleplay" && (
               <fieldset className="roleplay-rerun-directions">
                 <legend>演出调整</legend>
+                <p className="roleplay-rerun-length-note">
+                  篇幅沿用输入区设置：{roleplayLengthOption(roleplayLength).label}
+                  （推荐 {roleplayLengthOption(roleplayLength).rangeLabel}）
+                </p>
                 <div className="roleplay-rerun-sliders">
                   {ROLEPLAY_RERUN_SLIDERS.map(slider => {
                     const value = branchConfirm.rerunControls[slider.id];
@@ -5001,22 +5063,35 @@ function App() {
             )}
             <div className="modal-actions branch-confirm-actions">
               <button type="button" onClick={() => setBranchConfirm(null)}>取消</button>
-              <button
-                type="button"
-                className="danger"
-                onClick={() => void confirmBranchAction(false)}
-                title="回退该轮之后已接受的文档与角色卡修改"
-              >
-                回退更改
-              </button>
-              <button
-                type="button"
-                className="primary"
-                onClick={() => void confirmBranchAction(true)}
-                title="保留该轮之后已接受的文档与角色卡修改"
-              >
-                保留更改
-              </button>
+              {branchConfirm.message.channel === "roleplay" ? (
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void confirmBranchAction(true)}
+                  title={branchConfirm.mode === "edit" ? "撤销后续演出并编辑这条消息" : "保存当前版本并重新运行这一轮"}
+                >
+                  {branchConfirm.mode === "edit" ? "开始编辑" : "重新运行"}
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => void confirmBranchAction(false)}
+                    title="回退该轮之后已接受的文档与角色卡修改"
+                  >
+                    回退更改
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => void confirmBranchAction(true)}
+                    title="保留该轮之后已接受的文档与角色卡修改"
+                  >
+                    保留更改
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -6004,7 +6079,8 @@ function App() {
                   ))}
                 </div>
                 {(() => {
-                  const filteredNodes = (contextGraph?.nodes ?? []).filter((node) => {
+                  const graphNodes = collapseContextRequestNodes(contextGraph?.nodes ?? []);
+                  const filteredNodes = graphNodes.filter((node) => {
                     if (contextGraphFilter === "all") return true;
                     if (contextGraphFilter === "active") return node.status === "active";
                     if (contextGraphFilter === "epoch") return node.kind === "epoch";
@@ -6072,8 +6148,8 @@ function App() {
                   </ul>
                   <div className="context-graph-detail">
                     {(() => {
-                      const node = contextGraph?.nodes.find((item) => item.id === contextGraphSelectedId)
-                        ?? filteredNodes.find((item) => item.id === contextGraphSelectedId);
+                      const node = filteredNodes.find((item) => item.id === contextGraphSelectedId)
+                        ?? contextGraph?.nodes.find((item) => item.id === contextGraphSelectedId);
                       if (!node) return <p className="context-graph-empty">选择左侧节点查看详情。</p>;
                       const related = (contextGraph?.edges ?? []).filter(
                         (edge) => edge.fromId === node.id || edge.toId === node.id,
@@ -6082,6 +6158,8 @@ function App() {
                       const title = contextGraphNodeTitle(node) || node.label;
                       const statusLabel = contextGraphStatusLabel(node.status);
                       const transition = contextTransitionFromPayload(node.payload);
+                      const request = contextRequestFromPayload(node.payload);
+                      const requestSeries = contextRequestSeriesFromPayload(node.payload);
                       return (
                         <>
                           <header>
@@ -6113,6 +6191,11 @@ function App() {
                               </li>
                             </ul>
                           </header>
+                          {requestSeries
+                            ? <ContextRequestSeriesDetail series={requestSeries} />
+                            : request
+                              ? <ContextRequestDetail request={request} />
+                              : null}
                           {transition ? <ContextTransitionDetail transition={transition} /> : null}
                           {related.length > 0 && (
                             <div className="context-graph-edges">

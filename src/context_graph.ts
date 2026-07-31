@@ -98,6 +98,27 @@ export type ContextTransition = {
   path?: string;
 };
 
+export type RequestComponentSnapshot = {
+  kind: string;
+  layer?: "L0" | "L1" | "L2" | "L3";
+  label: string;
+  characters: number;
+  estimatedTokens: number;
+  preview?: string;
+  fingerprint?: string;
+};
+
+export type RequestStepSnapshot = {
+  step: number;
+  estimatedTokens: number;
+  changeTokens: number;
+  requestComponents: RequestComponentSnapshot[];
+  providerPromptTokens?: number;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  estimatedUsage?: boolean;
+};
+
 export type AssembleSlicePayload = {
   step?: number;
   layers: Array<{
@@ -131,6 +152,19 @@ export type AssembleSlicePayload = {
   proposalId?: number;
   /** Session materials shelf entry count at assemble time. */
   materialsShelfCount?: number;
+  /** Structural preflight breakdown for one provider request; token counts are estimates. */
+  requestComponents?: RequestComponentSnapshot[];
+  request?: {
+    estimatedTokens: number;
+    providerPromptTokens?: number;
+    cacheHitTokens?: number;
+    cacheMissTokens?: number;
+    estimatedUsage?: boolean;
+  };
+  /** One compact request-growth trace for all Agent steps in this turn. */
+  requestSteps?: RequestStepSnapshot[];
+  /** Delivered chapter represented by this growth segment, when known. */
+  chapterPath?: string;
 };
 
 /** Placeholder when the project has no outline/characters/lore yet — keeps the slot present. */

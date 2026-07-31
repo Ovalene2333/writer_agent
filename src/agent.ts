@@ -37,6 +37,12 @@ import {
   thinkingRequestOptions,
 } from "./model_compat.js";
 import {
+  modelCompletionEndpoint,
+  streamProviderCompletion,
+  usesResponsesApi,
+  type ProviderWireMessage,
+} from "./model_api.js";
+import {
   agentCompletionGaps,
   completionRecoveryPrompt,
   contractAllowsTool,
@@ -2452,6 +2458,8 @@ ${managedHandoffContext}`,
       hardCap: number;
       usedSteps: number;
     } | undefined;
+    let requestTraceId: string | undefined;
+    const requestTraceSteps: NonNullable<AssembleSlicePayload["requestSteps"]> = [];
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; ; turn += 1) {
@@ -2558,6 +2566,66 @@ ${managedHandoffContext}`,
         replayedMessageCount,
         1,
       );
+      const requestEstimatedTokens = requestComponents.reduce(
+        (sum, component) => sum + component.estimatedTokens,
+        0,
+      );
+      const requestLayers = (["L0", "L1", "L2", "L3"] as const).flatMap((layer) => {
+        const estimatedTokens = requestComponents
+          .filter((component) => component.layer === layer)
+          .reduce((sum, component) => sum + component.estimatedTokens, 0);
+        if (estimatedTokens <= 0) return [];
+        return [{
+          id: `request-${step}-${layer}`,
+          layer,
+          label: CONTEXT_GRAPH_LAYER_LABEL_FOR_REQUEST[layer],
+          estimatedTokens,
+        }];
+      });
+      const previousRequestTokens = requestTraceSteps.at(-1)?.estimatedTokens ?? 0;
+      const requestStepSnapshot: NonNullable<AssembleSlicePayload["requestSteps"]>[number] = {
+        step,
+        estimatedTokens: requestEstimatedTokens,
+        changeTokens: requestEstimatedTokens - previousRequestTokens,
+        requestComponents,
+      };
+      requestTraceSteps.push(requestStepSnapshot);
+      const requestTraceFirstStep = requestTraceSteps[0]!.step;
+      const requestTraceLabel = requestTraceSteps.length === 1
+        ? `Step ${step} 上下文增长`
+        : `Step ${requestTraceFirstStep}–${step} 上下文增长`;
+      const requestTracePayload = (): AssembleSlicePayload => ({
+        step,
+        layers: requestLayers,
+        requestSteps: requestTraceSteps,
+        note: requestTraceLabel,
+      });
+      try {
+        if (requestTraceId) {
+          store.updateContextNode(sessionId, requestTraceId, {
+            label: `装载 · ${requestTraceLabel}`,
+            payload: requestTracePayload() as unknown as Record<string, unknown>,
+          });
+        } else {
+          const requestTrace = store.createContextNode({
+            sessionId,
+            kind: "assemble_slice",
+            label: `装载 · ${requestTraceLabel}`,
+            sourceMessageId,
+            jobId: options.jobId,
+            payload: requestTracePayload() as unknown as Record<string, unknown>,
+          });
+          requestTraceId = requestTrace.id;
+          if (contextEpochId) {
+            store.addContextEdge({
+              sessionId,
+              fromId: requestTrace.id,
+              toId: contextEpochId,
+              kind: "includes",
+            });
+          }
+        }
+      } catch { /* graph diagnostics must not block the provider request */ }
       const result = await streamCompletion(stepModel, messages, signal, (text) => {
         transcript += text;
         emit({ type: "text", text, channel: "output" });
@@ -2580,6 +2648,19 @@ ${managedHandoffContext}`,
         },
         ...stepThinkingOptions,
       });
+      if (requestTraceId && result.usage) {
+        Object.assign(requestStepSnapshot, {
+          providerPromptTokens: result.usage.promptTokens,
+          cacheHitTokens: result.usage.cacheHitTokens,
+          cacheMissTokens: result.usage.cacheMissTokens,
+          ...(result.usage.estimated ? { estimatedUsage: true } : {}),
+        });
+        try {
+          store.updateContextNode(sessionId, requestTraceId, {
+            payload: requestTracePayload() as unknown as Record<string, unknown>,
+          });
+        } catch { /* graph diagnostics must not affect the Agent loop */ }
+      }
       const ensureThinkingTranscriptCanContinue = () => {
         if (isDeepSeekModel(stepModel) && "thinking" in stepThinkingOptions
           && stepThinkingOptions.thinking.type === "enabled"
@@ -3230,6 +3311,28 @@ ${managedHandoffContext}`,
               } as unknown as Record<string, unknown>,
             });
           } catch { /* ignore graph errors */ }
+          const completedChapterPath = latestProposal?.path;
+          if (requestTraceId) {
+            const firstTraceStep = requestTraceSteps[0]?.step ?? step;
+            const stepRange = firstTraceStep === step ? `Step ${step}` : `Step ${firstTraceStep}–${step}`;
+            const chapterTraceNote = completedChapterPath
+              ? `${completedChapterPath} · ${stepRange}`
+              : `章节段 · ${stepRange}`;
+            try {
+              store.updateContextNode(sessionId, requestTraceId, {
+                label: `装载 · ${chapterTraceNote}`,
+                payload: {
+                  ...requestTracePayload(),
+                  note: chapterTraceNote,
+                  ...(completedChapterPath ? { chapterPath: completedChapterPath } : {}),
+                } as unknown as Record<string, unknown>,
+              });
+            } catch { /* graph diagnostics must not affect chapter continuation */ }
+          }
+          // The next provider request belongs to a new chapter segment. Its first
+          // bar starts from the post-boundary baseline instead of continuing this one.
+          requestTraceId = undefined;
+          requestTraceSteps.length = 0;
           turnStart = messages.length;
           // Next chapter's scene resets truncate to here until its begin succeeds.
           contextBase = messages.length;
@@ -4731,6 +4834,52 @@ function requestComponentFingerprint(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 12);
 }
 
+const CONTEXT_GRAPH_LAYER_LABEL_FOR_REQUEST = {
+  L0: "规则、schema 与项目索引",
+  L1: "历史续写",
+  L2: "当前任务与动态上下文",
+  L3: "本轮 Agent 与工具过程",
+} as const;
+
+function requestToolResultLabel(
+  toolCallId: string | undefined,
+  index: number,
+  toolCalls: Map<string, { name: string; arguments: string }>,
+): string {
+  const call = toolCallId ? toolCalls.get(toolCallId) : undefined;
+  if (!call) return `工具结果 ${toolCallId ?? index}`;
+  let source = "";
+  try {
+    const args = JSON.parse(call.arguments) as Record<string, unknown>;
+    const value = args.path ?? args.documentPath ?? args.sourcePath;
+    if (typeof value === "string" && value.trim()) source = value.trim().slice(0, 160);
+    else if (typeof args.characterId === "number" || typeof args.characterId === "string") {
+      source = `角色 #${String(args.characterId)}`;
+    } else if (typeof args.id === "number" || typeof args.id === "string") {
+      source = `#${String(args.id)}`;
+    }
+  } catch { /* malformed tool arguments still retain the tool name */ }
+  return `工具结果 · ${call.name}${source ? ` · ${source}` : ""}`;
+}
+
+function requestComponentPreview(text: string): string {
+  return text.replace(/\s+/gu, " ").trim().slice(0, 240);
+}
+
+function requestToolResultPreview(content: string): string {
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    const candidate = parsed.content
+      ?? parsed.markdown
+      ?? parsed.preview
+      ?? parsed.digest
+      ?? parsed.summary
+      ?? parsed.message;
+    if (typeof candidate === "string") return requestComponentPreview(candidate);
+  } catch { /* plain-text tool results are previewed directly */ }
+  return requestComponentPreview(content);
+}
+
 /** Preflight-only context waterfall; provider usage remains the billing source of truth. */
 export function buildRequestComponentUsage(
   messages: ApiMessage[],
@@ -4744,17 +4893,44 @@ export function buildRequestComponentUsage(
 ): RequestComponentUsage[] {
   const components: RequestComponentUsage[] = [];
   const trunkEnd = stableMessageCount + Math.max(0, trunkMessageCount);
-  const append = (kind: RequestComponentUsage["kind"], label: string, text: string, fingerprint = false) => {
+  const toolCalls = new Map<string, { name: string; arguments: string }>();
+  for (const message of messages) {
+    for (const call of message.tool_calls ?? []) {
+      toolCalls.set(call.id, {
+        name: call.function.name,
+        arguments: call.function.arguments,
+      });
+    }
+  }
+  const append = (
+    kind: RequestComponentUsage["kind"],
+    layer: NonNullable<RequestComponentUsage["layer"]>,
+    label: string,
+    text: string,
+    fingerprint = false,
+    preview = "",
+  ) => {
     if (!text) return;
     components.push({
       kind,
+      layer,
       label,
       characters: text.length,
       estimatedTokens: approximateRequestTokens(text),
+      ...(preview ? { preview: requestComponentPreview(preview) } : {}),
       ...(fingerprint ? { fingerprint: requestComponentFingerprint(text) } : {}),
     });
   };
-  if (tools.length) append("tool_schema", `工具 schema（${tools.length}）`, JSON.stringify(tools), true);
+  if (tools.length) {
+    append(
+      "tool_schema",
+      "L0",
+      `工具 schema（${tools.length}）`,
+      JSON.stringify(tools),
+      true,
+      tools.map(tool => tool.function.name).join(" · "),
+    );
+  }
   messages.forEach((message, index) => {
     const serialized = JSON.stringify({
       role: message.role,
@@ -4763,15 +4939,24 @@ export function buildRequestComponentUsage(
       ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
       ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
     });
-    if (index < stableMessageCount) append("stable_system", `稳定 system ${index + 1}`, serialized, true);
-    else if (index < trunkEnd) append("stable_system", "项目树干", serialized, true);
-    else if (index < replayedMessageCount) append("replayed_turn", `复放历史 ${index - trunkEnd + 1}`, serialized);
-    else if (index < initialMessageCount && message.role === "user") append("user", "当前用户请求", serialized);
-    else if (index < initialMessageCount) append("dynamic_system", `动态尾部 ${index - replayedMessageCount + 1}`, serialized);
-    else if (message.role === "tool") append("tool_result", `工具结果 ${message.tool_call_id ?? index}`, serialized);
-    else if (message.role === "assistant") append("assistant", `Agent 历史 ${index - initialMessageCount + 1}`, serialized);
-    else if (message.role === "user") append("user", `用户/阶段交接 ${index - initialMessageCount + 1}`, serialized);
-    else append("other", `其他消息 ${index + 1}`, serialized);
+    const contentPreview = messageContentText(message.content);
+    if (index < stableMessageCount) append("stable_system", "L0", `稳定 system ${index + 1}`, serialized, true, contentPreview);
+    else if (index < trunkEnd) append("stable_system", "L0", "项目树干", serialized, true, contentPreview);
+    else if (index < replayedMessageCount) append("replayed_turn", "L1", `复放历史 ${index - trunkEnd + 1}`, serialized, false, contentPreview);
+    else if (index < initialMessageCount && message.role === "user") append("user", "L2", "当前用户请求", serialized, false, contentPreview);
+    else if (index < initialMessageCount) append("dynamic_system", "L2", `动态尾部 ${index - replayedMessageCount + 1}`, serialized, false, contentPreview);
+    else if (message.role === "tool") {
+      append(
+        "tool_result",
+        "L3",
+        requestToolResultLabel(message.tool_call_id, index, toolCalls),
+        serialized,
+        false,
+        requestToolResultPreview(contentPreview),
+      );
+    } else if (message.role === "assistant") append("assistant", "L3", `Agent 历史 ${index - initialMessageCount + 1}`, serialized, false, contentPreview);
+    else if (message.role === "user") append("user", "L3", `用户/阶段交接 ${index - initialMessageCount + 1}`, serialized, false, contentPreview);
+    else append("other", "L3", `其他消息 ${index + 1}`, serialized, false, contentPreview);
   });
   return components;
 }
@@ -4863,25 +5048,12 @@ async function streamCompletion(
   onReasoning: (text: string) => void,
   options: CompletionRequestOptions = {},
 ): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean } }> {
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const endpoint = modelCompletionEndpoint(model);
   // Expand attachment refs / strip images for text-only models only at the wire boundary.
-  // Live + frozen message arrays keep stable writer-attachment:// refs (cache-friendly size).
+  // Live + archived message arrays keep stable writer-attachment:// refs (cache-friendly size).
   const wireMessages = prepareMessagesForProvider(messages, {
     supportsMultimodal: modelSupportsMultimodal(model),
     resolveAttachment: options.resolveAttachment,
-  });
-  const requestBody = JSON.stringify({
-    // The selected profile is frozen and project-agnostic for this job.
-    model: model.model,
-    messages: wireMessages,
-    ...(options.tools?.length ? { tools: options.tools } : {}),
-    ...(options.userId ? { user_id: options.userId } : {}),
-    stream: true,
-    stream_options: { include_usage: true },
-    ...(options.maxCompletionTokens ? { max_tokens: options.maxCompletionTokens } : {}),
-    ...(options.thinking ? { thinking: options.thinking } : {}),
-    ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
-    ...samplingRequestOptions(model, { temperature: options.temperature, topP: options.topP }),
   });
   const prefixObservation = options.prefixCache
     ? beginPrefixCacheObservation({
@@ -4905,137 +5077,55 @@ async function streamCompletion(
           thinking: options.thinking?.type,
           responseFormat: options.responseFormat?.type,
           sampling: samplingRequestOptions(model, { temperature: options.temperature, topP: options.topP }),
+          api: usesResponsesApi(model) ? "responses" : "chat.completions",
         },
       })
     : undefined;
-  logModelRequest(endpoint, requestBody);
-  let response: Response;
+  const visibleText = createVisibleTextFilter(onText);
   try {
-    response = await modelFetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-      },
-      body: requestBody,
+    const streamed = await streamProviderCompletion({
+      model,
+      messages: wireMessages as ProviderWireMessage[],
+      tools: options.tools,
+      userId: options.userId,
+      maxTokens: options.maxCompletionTokens,
+      thinking: options.thinking,
+      responseFormat: options.responseFormat,
+      temperature: options.temperature,
+      topP: options.topP,
+    }, {
       signal,
-    }, model.proxyUrl);
+      onText: (text) => visibleText.push(text),
+      onReasoning,
+    });
+    visibleText.flush();
+    const textual = extractDsmlToolCalls(streamed.content);
+    const resolvedToolCalls = streamed.toolCalls.length ? streamed.toolCalls : textual.toolCalls;
+    const resolvedUsage = streamed.usage && (streamed.usage.promptTokens > 0 || streamed.usage.completionTokens > 0)
+      ? streamed.usage
+      : { ...estimateCompletionUsage(messages, textual.content, streamed.reasoningContent, resolvedToolCalls), estimated: true as const };
+    const completed = {
+      content: textual.content,
+      reasoningContent: streamed.reasoningContent,
+      toolCalls: resolvedToolCalls,
+      ...(streamed.finishReason ? { finishReason: streamed.finishReason } : {}),
+      usage: resolvedUsage,
+    };
+    finishPrefixCacheObservation(prefixObservation, {
+      promptTokens: resolvedUsage.promptTokens,
+      completionTokens: resolvedUsage.completionTokens,
+      cacheHitTokens: resolvedUsage.cacheHitTokens,
+      cacheMissTokens: resolvedUsage.cacheMissTokens,
+      ...("estimated" in resolvedUsage && resolvedUsage.estimated ? { estimated: true } : {}),
+      ...(streamed.finishReason ? { finishReason: streamed.finishReason } : {}),
+    });
+    return completed;
   } catch (error) {
     finishPrefixCacheObservation(prefixObservation, {
       error: error instanceof Error ? error.message.slice(0, 600) : String(error).slice(0, 600),
     });
     throw error;
   }
-  if (!response.ok) {
-    const responseBody = await response.text();
-    logModelResponse(endpoint, responseBody);
-    const detail = responseBody.slice(0, 600);
-    // The provider diagnostic may echo prompt text. Keep the dedicated prefix
-    // log content-free; the ordinary model debug channel already has the detail.
-    finishPrefixCacheObservation(prefixObservation, { error: `HTTP ${response.status}` });
-    throw new Error(`模型请求失败（${response.status}）：${detail}`);
-  }
-  if (!response.body) {
-    finishPrefixCacheObservation(prefixObservation, { error: "模型响应没有可读取的数据流" });
-    throw new Error("模型响应没有可读取的数据流");
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const calls = new Map<number, ToolAccumulator>();
-  const visibleText = createVisibleTextFilter(onText);
-  let buffer = "";
-  let content = "";
-  let reasoningContent = "";
-  let finishReason: string | undefined;
-  let usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } | undefined;
-
-  const consume = (block: string) => {
-    for (const line of block.split(/\r?\n/)) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      let chunk: any;
-      try {
-        chunk = JSON.parse(data);
-      } catch {
-        continue;
-      }
-      if (chunk.usage) usage = {
-        promptTokens: Number(chunk.usage.prompt_tokens ?? 0),
-        completionTokens: Number(chunk.usage.completion_tokens ?? 0),
-        cacheHitTokens: Number(
-          chunk.usage.prompt_cache_hit_tokens
-          ?? chunk.usage.prompt_tokens_details?.cached_tokens
-          ?? chunk.usage.input_tokens_details?.cached_tokens
-          ?? 0,
-        ),
-        cacheMissTokens: Number(
-          chunk.usage.prompt_cache_miss_tokens
-          ?? Math.max(0, Number(chunk.usage.prompt_tokens ?? 0) - Number(
-            chunk.usage.prompt_tokens_details?.cached_tokens
-            ?? chunk.usage.input_tokens_details?.cached_tokens
-            ?? chunk.usage.prompt_cache_hit_tokens
-            ?? 0,
-          )),
-        ),
-      };
-      const choice = chunk.choices?.[0];
-      if (typeof choice?.finish_reason === "string") finishReason = choice.finish_reason;
-      const delta = choice?.delta;
-      if (!delta) continue;
-      if (typeof delta.content === "string") {
-        content += delta.content;
-        visibleText.push(delta.content);
-      }
-      if (typeof delta.reasoning_content === "string") {
-        reasoningContent += delta.reasoning_content;
-        onReasoning(delta.reasoning_content);
-      }
-      for (const tool of delta.tool_calls ?? []) {
-        const index = Number(tool.index ?? 0);
-        const current = calls.get(index) ?? { id: "", name: "", arguments: "" };
-        if (tool.id) current.id += tool.id;
-        if (tool.function?.name) current.name += tool.function.name;
-        if (tool.function?.arguments) current.arguments += tool.function.arguments;
-        calls.set(index, current);
-      }
-    }
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() ?? "";
-    for (const block of blocks) consume(block);
-    if (done) break;
-  }
-  if (buffer.trim()) consume(buffer);
-  visibleText.flush();
-  const textual = extractDsmlToolCalls(content);
-  const toolCalls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
-  const resolvedToolCalls = toolCalls.length ? toolCalls : textual.toolCalls;
-  // Some providers omit stream usage; fall back so the UI can still show per-step tokens.
-  const resolvedUsage = usage && (usage.promptTokens > 0 || usage.completionTokens > 0)
-    ? usage
-    : { ...estimateCompletionUsage(messages, textual.content, reasoningContent, resolvedToolCalls), estimated: true as const };
-  const completed = {
-    content: textual.content,
-    reasoningContent,
-    toolCalls: resolvedToolCalls,
-    ...(finishReason ? { finishReason } : {}),
-    usage: resolvedUsage,
-  };
-  logModelResponse(endpoint, JSON.stringify(completed, null, 2));
-  finishPrefixCacheObservation(prefixObservation, {
-    promptTokens: resolvedUsage.promptTokens,
-    completionTokens: resolvedUsage.completionTokens,
-    cacheHitTokens: resolvedUsage.cacheHitTokens,
-    cacheMissTokens: resolvedUsage.cacheMissTokens,
-    ...("estimated" in resolvedUsage && resolvedUsage.estimated ? { estimated: true } : {}),
-    ...(finishReason ? { finishReason } : {}),
-  });
-  return completed;
 }
 
 /** Rough token estimate when the provider does not return usage in the stream. */

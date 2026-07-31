@@ -19,14 +19,17 @@ import {
   formatRoleplayAntiFormulaSlot,
   formatRoleplayMemorySlot,
   formatRoleplayOocDirective,
+  countRoleplayContinuationStreak,
   formatRoleplayPerformerAutoReplyDirective,
   formatRoleplayPerception,
   formatRoleplayPerceptionForModel,
   formatRoleplayPlayerTurn,
   formatRoleplayQualityRewrite,
+  formatRoleplayLengthGuidance,
   formatRoleplayRerunControls,
   formatRoleplayRerunDirections,
   formatRoleplaySummarySlot,
+  isRoleplayContinuationContent,
   isRoleplayExitCommand,
   isRoleplayOocInput,
   parseRoleplayPerception,
@@ -35,6 +38,8 @@ import {
   parseGeneratedRoleplayScene,
   parseStoredRoleplayPerception,
   normalizeRoleplayRerunControls,
+  roleplayLengthPreset,
+  roleplayTurnPresentationBudget,
   ROLEPLAY_RECENT_MESSAGES,
   ROLEPLAY_EPISTEMIC_MEMORY_VERSION,
   roleplayContextKey,
@@ -104,14 +109,18 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /未透露姓名的来访者/);
     assert.match(prompt, /只决定一个核心反应/);
     assert.match(prompt, /完整的小节拍/);
+    assert.match(prompt, /篇幅由最终用户消息/);
+    assert.match(prompt, /不得因为它仍是一个小节拍就压成一两个块/);
     assert.match(prompt, /不要引用、改写或概括玩家原句/);
     assert.match(prompt, /默认零解释/);
     assert.match(prompt, /解释角色为什么这样想、这样感受或这样行动/);
     assert.match(prompt, /普通回合默认零提问/);
     assert.match(prompt, /缺失的信息会立即阻塞角色已经选择的当前行动/);
     assert.match(prompt, /具体数值只能引用上下文中已有的数值/);
-    assert.match(prompt, /普通回合围绕一个核心反应自然展开/);
-    assert.match(prompt, /通常不超过 3 个块/);
+    assert.match(prompt, /长档应在同一核心反应内依次完成/);
+    assert.match(prompt, /开场同样服从本轮块数安排/);
+    assert.match(prompt, /先否定再改判/);
+    assert.match(prompt, /不是……是\/而是……/);
     assert.doesNotMatch(prompt, /字符|回复长度/);
     assert.match(prompt, /不要为了追求短而截断表达/);
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
@@ -284,11 +293,30 @@ describe("roleplay prompts", () => {
       contentRating: "nsfw",
     });
     const formatted = formatRoleplayRerunControls(controls);
-    assert.match(formatted, /增加篇幅/);
+    assert.match(formatted, /本轮演出参数/);
+    assert.match(formatted, /篇幅：展开/);
+    assert.match(formatted, /4–5 个相互连贯的演出块/);
+    assert.match(formatted, /每块尽量写到约 100–140 字/);
     assert.match(formatted, /放慢节奏/);
     assert.match(formatted, /强制 NSFW/);
-    assert.match(formatted, /成年人/);
-    assert.equal(formatRoleplayRerunControls(undefined), "");
+    assert.match(formatted, /成人向/);
+    // Length is a standing control expressed structurally through presentation blocks.
+    const defaults = formatRoleplayRerunControls(undefined);
+    assert.match(defaults, /篇幅：适中/);
+    assert.match(defaults, /2–3 个相互连贯的演出块/);
+    assert.match(defaults, /每块尽量写到约 80–110 字/);
+    assert.equal(roleplayLengthPreset(0).rangeLabel, "180–320 字");
+    assert.deepEqual(roleplayTurnPresentationBudget(-2), {
+      minBlocks: 1,
+      maxBlocks: 1,
+      preferredMinCharsPerBlock: 60,
+      preferredMaxCharsPerBlock: 100,
+    });
+    assert.equal(roleplayTurnPresentationBudget(-1).minBlocks, 2);
+    assert.equal(roleplayTurnPresentationBudget(2).maxBlocks, 5);
+    assert.equal(roleplayTurnPresentationBudget(2).minBlocks, 4);
+    assert.match(formatRoleplayLengthGuidance(1), /3–4 个相互连贯的演出块/);
+    assert.match(formatRoleplayLengthGuidance(1), /每块尽量写到约 90–120 字/);
   });
 
   test("quality review parsing and rewrite instructions stay structural", () => {
@@ -297,10 +325,11 @@ describe("roleplay prompts", () => {
       issues: ["analysis_report", "invented_fact"],
     });
     assert.deepEqual(parseRoleplayQualityReview('{"pass":true,"issues":[]}'), { pass: true, issues: [] });
-    const rewrite = formatRoleplayQualityRewrite(["analysis_report", "question_list"], ["dialogue_only"]);
+    const rewrite = formatRoleplayQualityRewrite(["analysis_report", "question_list", "contrast_frame"], ["dialogue_only"]);
     assert.match(rewrite, /不是新的剧情回合/);
     assert.match(rewrite, /删除评估、解释和报告腔/);
     assert.match(rewrite, /不要列问题/);
+    assert.match(rewrite, /先否定再改判/);
     assert.match(rewrite, /只输出一块 dialogue/);
   });
 
@@ -360,13 +389,23 @@ describe("roleplay prompts", () => {
     }));
     const displayPayload = formatRoleplayPerception(projection);
     const performerPayload = formatRoleplayPerceptionForModel(projection);
-    assert.match(displayPayload, /可听见的话语/);
+    assert.match(displayPayload, /话语：/);
     assert.match(performerPayload, /第一次见面/);
     assert.match(performerPayload, /无法辨认的东西/);
     assert.match(performerPayload, /current_perception/);
-    assert.doesNotMatch(performerPayload, /可听见的话语|可观察的动作|^- /m);
-    assert.match(displayPayload, /不可知事实/);
+    assert.doesNotMatch(performerPayload, /话语：|可知事实：|^- /m);
+    assert.match(displayPayload, /其他事实（不优先使用）/);
     assert.doesNotMatch(performerPayload, /卧底|照片里的人|unknowableFacts/);
+    const onlyOther = parseRoleplayPerception(JSON.stringify({
+      speech: [],
+      knowableFacts: [],
+      unknowableFacts: ["对话者心里认定对方已经适应"],
+      potentialSensations: [],
+    }));
+    const onlyOtherPayload = formatRoleplayPerceptionForModel(onlyOther);
+    assert.match(onlyOtherPayload, /不优先采用的附加线索/);
+    assert.match(onlyOtherPayload, /心里认定对方已经适应/);
+    assert.doesNotMatch(onlyOtherPayload, /没有接收到新的可确认/);
     const stored = serializeRoleplayPerception(projection);
     assert.match(stored, /"version":2/);
     assert.deepEqual(parseStoredRoleplayPerception(stored), projection);
@@ -390,8 +429,10 @@ describe("roleplay prompts", () => {
     assert.match(messages[0].content, /来自“角色内”输入框/);
     assert.match(messages[0].content, /按扮演角色本轮的认知权限拆入四类/);
     assert.match(messages[0].content, /knowableFacts（可知事实）/);
-    assert.match(messages[0].content, /unknowableFacts（不可知事实）/);
+    assert.match(messages[0].content, /unknowableFacts（其他事实，不优先使用）/);
     assert.match(messages[0].content, /potentialSensations（潜在感受）/);
+    assert.match(messages[0].content, /禁止把整段可传达内容只放进 unknowableFacts/);
+    assert.match(messages[0].content, /歧义时优先保证意图可达/);
     assert.match(messages[0].content, /必须且只能包含这四个键/);
     assert.deepEqual(JSON.parse(messages[1].content), {
       inputMode: "in_character",
@@ -426,9 +467,10 @@ describe("roleplay prompts", () => {
       potentialSensations: ["手臂可能逐渐放松，并出现舒适感"],
     }));
     const performerPayload = formatRoleplayPerceptionForModel(projection);
-    assert.match(performerPayload, /放松、舒适感增强/);
-    assert.match(performerPayload, /来源不明/);
-    assert.doesNotMatch(performerPayload, /调试器|多巴胺|内啡肽|override/);
+    assert.match(performerPayload, /按摩角色的手臂/);
+    assert.match(performerPayload, /放松/);
+    assert.match(performerPayload, /舒适感/);
+    assert.doesNotMatch(performerPayload, /神经递质|调试器|多巴胺|内啡肽|override/);
   });
 
   test("automatic reply writes only the player-side identity turn", () => {
@@ -621,11 +663,31 @@ describe("roleplay prompts", () => {
   });
 
   test("performer auto reply continues without inventing a player turn", () => {
-    const directive = formatRoleplayPerformerAutoReplyDirective("林千夏");
-    assert.match(directive, /当前没有新的玩家言行/);
-    assert.match(directive, /主动延续一个自然的小节拍/);
-    assert.match(directive, /不要假定对话者已经回答、移动、产生情绪或接受任何结果/);
+    const directive = formatRoleplayPerformerAutoReplyDirective("林千夏", {
+      lastPerformance: "*她把门带上，蹲在巷子里擦掉刃片上的血。*",
+    });
+    assert.match(directive, /旁观续演/);
+    assert.match(directive, /用户暂时不说话/);
+    assert.match(directive, /推进已经开始的行动链/);
+    assert.match(directive, /不要假定对方已回答/);
+    assert.match(directive, /把门带上/);
     assert.match(directive, /林千夏/);
+    assert.equal(isRoleplayContinuationContent("<续演>"), true);
+    assert.equal(isRoleplayContinuationContent("继续"), false);
+    assert.equal(countRoleplayContinuationStreak([
+      { role: "user", content: "推进" },
+      { role: "assistant", content: "第一拍" },
+      { role: "user", content: "<续演>" },
+      { role: "assistant", content: "第二拍" },
+      { role: "user", content: "<续演>" },
+      { role: "assistant", content: "第三拍" },
+    ]), 2);
+    const chained = formatRoleplayPerformerAutoReplyDirective("林千夏", { continuationStreak: 2 });
+    assert.match(chained, /连续第 3 次旁观续演/);
+    assert.match(chained, /禁止重写开场/);
+    const spectatorHints = formatRoleplayAntiFormulaSlot(["*动作。*\n\n「说。」"], { spectatorContinuation: true });
+    assert.match(spectatorHints, /旁观续演/);
+    assert.match(spectatorHints, /禁止重演已完成的动作/);
   });
 });
 

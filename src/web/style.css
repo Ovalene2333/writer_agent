@@ -1810,6 +1810,14 @@ button.agent-orb:focus-visible {
   transform: none;
   background: color-mix(in srgb, var(--accent-light) 75%, transparent);
 }
+.roleplay-reply-word-count {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-transform: none;
+}
 .conversation .assistant .msg-chevron {
   margin-left: auto;
   font-size: 11px;
@@ -2712,65 +2720,56 @@ button.agent-orb:focus-visible {
   border: 0; border-radius: 999px; background: transparent; color: var(--text-faint);
 }
 .composer-context-chip > button:hover:not(:disabled) { background: var(--warn-light); color: var(--warn); }
+.roleplay-rerun-length-note {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
 .director-mode-guide {
-  margin: 10px 10px 0;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--accent-light) 58%, var(--surface));
+  margin: 6px 10px 0;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-light) 48%, var(--surface));
   color: var(--text-muted);
 }
 .director-mode-guide-title {
-  display: flex; align-items: center; justify-content: space-between; gap: 10px;
-}
-.director-mode-guide-title > div {
-  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-height: 24px;
 }
 .director-mode-guide-title span {
-  color: var(--text); font-size: 12px; font-weight: 750;
-}
-.director-mode-guide-title small {
-  color: var(--text-faint); font-size: 11px;
+  color: var(--text-muted); font-size: 11px; font-weight: 650;
 }
 .director-mode-guide-title > button {
   flex: 0 0 auto;
-  padding: 4px 9px;
+  padding: 2px 8px;
   border-radius: 999px;
   color: var(--accent);
   font-size: 11px;
-  font-weight: 700;
-}
-.director-mode-guide p {
-  margin: 4px 0 7px; font-size: 12px; line-height: 1.55;
+  font-weight: 650;
 }
 .director-mode-error {
-  margin: -1px 0 7px;
+  margin: 3px 0 0;
   color: var(--warn);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.35;
 }
 .director-mode-examples {
-  display: flex; gap: 6px; flex-wrap: wrap;
+  display: flex; gap: 4px; flex-wrap: wrap;
+  margin-top: 4px;
 }
-.director-mode-examples button,
-.director-mode-examples span {
-  padding: 3px 7px;
+.director-mode-examples button {
+  padding: 2px 6px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--surface) 72%, transparent);
   color: var(--text-muted);
-  font-size: 11px; line-height: 1.4;
-}
-.director-mode-examples button {
+  font-size: 11px; line-height: 1.3;
   text-align: left;
 }
 .director-mode-examples button:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   color: var(--text);
-}
-.director-mode-examples .director-mode-empty {
-  padding-left: 0;
-  background: transparent;
-  color: var(--text-faint);
 }
 .composer textarea,
 .composer-shell textarea {
@@ -3581,14 +3580,22 @@ input.composer-file-input[type="file"] {
 }
 .roleplay-banner {
   display: grid;
-  gap: 9px;
+  gap: 10px;
   margin: 0 12px 8px;
   padding: 11px 12px 10px;
   border-radius: 10px;
   border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
   background: color-mix(in srgb, var(--surface2) 88%, var(--accent-light));
 }
+.roleplay-banner-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
 .roleplay-banner-copy {
+  flex: 1 1 auto;
   min-width: 0;
 }
 .roleplay-banner-heading {
@@ -3642,12 +3649,19 @@ input.composer-file-input[type="file"] {
 }
 .roleplay-banner-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
   gap: 8px;
   min-width: 0;
   padding-top: 8px;
   border-top: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border-light));
+}
+.roleplay-banner-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-width: 0;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border-light) 82%, transparent);
 }
 .roleplay-input-mode,
 .roleplay-action-group {
@@ -3656,9 +3670,7 @@ input.composer-file-input[type="file"] {
   gap: 4px;
 }
 .roleplay-input-mode {
-  grid-column: 1;
-  grid-row: 1;
-  justify-self: start;
+  flex: 0 0 auto;
   flex-wrap: nowrap;
   gap: 2px;
   padding: 2px;
@@ -3677,12 +3689,103 @@ input.composer-file-input[type="file"] {
   background: var(--accent);
   color: var(--accent-contrast, #fff);
 }
+.roleplay-length-menu {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.roleplay-length-menu summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  max-width: min(100%, 220px);
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-light));
+  background: color-mix(in srgb, var(--surface) 78%, var(--accent-light));
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.roleplay-length-menu summary::-webkit-details-marker { display: none; }
+.roleplay-length-menu summary:hover,
+.roleplay-length-menu[open] summary {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
+  color: var(--text);
+}
+.roleplay-length-menu summary > span {
+  color: var(--text-faint);
+  font-weight: 700;
+}
+.roleplay-length-menu summary > em {
+  color: var(--text);
+  font-style: normal;
+  font-weight: 750;
+}
+.roleplay-length-menu summary > small {
+  overflow: hidden;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roleplay-length-menu > div {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 12;
+  display: grid;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, .18));
+}
+.roleplay-length-menu > div button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  text-align: left;
+}
+.roleplay-length-menu > div button small {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.roleplay-length-menu > div button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--surface3) 80%, transparent);
+  color: var(--text);
+}
+.roleplay-length-menu > div button.active {
+  background: color-mix(in srgb, var(--accent-light) 58%, var(--surface));
+  color: var(--accent);
+}
+.roleplay-length-menu > div button.active small {
+  color: var(--accent);
+}
 .roleplay-action-group-primary {
   display: grid;
-  grid-column: 1 / -1;
-  grid-row: 2;
   grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
   min-width: 0;
+  gap: 6px;
 }
 .roleplay-action-group-primary button,
 .roleplay-action-group-secondary button {
@@ -3692,6 +3795,7 @@ input.composer-file-input[type="file"] {
   gap: 5px;
 }
 .roleplay-action-group-primary button {
+  min-height: 34px;
   border-color: transparent;
   background: color-mix(in srgb, var(--surface3) 72%, transparent);
   color: var(--text-dim);
@@ -3707,11 +3811,8 @@ input.composer-file-input[type="file"] {
   color: var(--accent);
 }
 .roleplay-action-group-secondary {
-  grid-column: 2;
-  grid-row: 1;
-  justify-self: end;
-  padding-left: 8px;
-  border-left: 1px solid color-mix(in srgb, var(--border-light) 76%, transparent);
+  flex: 0 0 auto;
+  justify-content: flex-end;
 }
 .roleplay-action-group-secondary button {
   min-width: 28px;
@@ -3856,9 +3957,14 @@ input.composer-file-input[type="file"] {
 }
 @media (max-width: 560px) {
   .roleplay-banner { margin-inline: 8px; padding: 11px; }
-  .roleplay-banner-heading strong { flex-basis: 100%; white-space: normal; }
+  .roleplay-banner-header { gap: 8px; }
+  .roleplay-banner-heading strong { white-space: normal; }
   .roleplay-banner-actions { align-items: stretch; }
-  .roleplay-action-group-secondary { margin-left: 0; }
+  .roleplay-banner-footer { flex-wrap: wrap; }
+  .roleplay-length-menu summary { max-width: 100%; }
+  .roleplay-length-menu summary > small { display: none; }
+  .roleplay-length-menu > div { right: auto; left: 0; min-width: 156px; }
+  .roleplay-action-group-secondary { margin-left: auto; }
 }
 .character-card {
   display: flex;
@@ -4766,6 +4872,12 @@ input.composer-file-input[type="file"] {
   to { transform: rotate(360deg); }
 }
 .section-note { margin: 8px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.55; }
+.model-role-group + .model-role-group {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-light);
+}
+.model-role-group > .section-note { margin: -4px 0 12px; }
 /* 上下排布：避免「供应商 / 模型」长名在窄侧栏被 select 截成省略号 */
 .role-card { display: grid; grid-template-columns: 1fr; align-items: stretch; gap: 8px; margin: 0 0 8px; padding: 12px 13px; border: 1px solid var(--border-light); border-radius: 12px; background: var(--surface); }
 .role-card > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
@@ -4804,6 +4916,7 @@ input.composer-file-input[type="file"] {
 .model-scan-list label.already-added { color: var(--text-faint); cursor: default; }
 .model-scan-list label > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-scan-list small { margin-left: auto; color: var(--text-faint); font-size: 10px; white-space: nowrap; }
+.model-scan-list small.model-scan-context { margin-left: 6px; color: var(--accent); font-variant-numeric: tabular-nums; }
 .model-edit-list { display: flex; flex-direction: column; gap: 12px; }
 .model-edit-card { padding: 14px 14px 12px; border: 1px solid var(--border-light); border-radius: 11px; background: var(--surface2); }
 .model-edit-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
@@ -5264,11 +5377,12 @@ header { padding-inline: 18px; }
   .agent-control-bar { padding: 6px 10px; }
 
   .roleplay-banner {
-    gap: 5px;
+    gap: 7px;
     margin: 5px 8px 6px;
     padding: 8px 9px;
     border-radius: 10px;
   }
+  .roleplay-banner-header { gap: 7px; }
   .roleplay-banner-heading { flex-wrap: nowrap; gap: 6px; }
   .roleplay-banner-heading strong {
     flex: 1 1 auto;
@@ -5281,17 +5395,27 @@ header { padding-inline: 18px; }
   .roleplay-banner .roleplay-session-details { margin-top: 1px; }
   .roleplay-session-details summary { font-size: 10px; line-height: 1.25; }
   .roleplay-banner-actions {
-    align-items: center;
     gap: 6px;
     margin-inline: 0;
     padding: 6px 0 0;
     overflow: visible;
   }
+  .roleplay-banner-footer {
+    gap: 5px 8px;
+    padding-top: 6px;
+  }
   .roleplay-input-mode,
   .roleplay-action-group { gap: 3px; }
+  .roleplay-length-menu summary {
+    min-height: 26px;
+    padding: 2px 7px;
+    font-size: 10px;
+  }
+  .roleplay-length-menu summary > small { display: none; }
+  .roleplay-length-menu > div button { min-height: 28px; font-size: 10px; }
   .roleplay-action-group-primary { grid-template-columns: repeat(auto-fit, minmax(82px, 1fr)); }
-  .roleplay-action-group-secondary { padding-left: 5px; }
   .roleplay-banner button { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+  .roleplay-action-group-primary button { min-height: 31px; }
   .roleplay-input-mode button { min-height: 24px; }
 
   .conversation { padding: 10px 10px 14px; gap: 10px; }
@@ -5333,6 +5457,23 @@ header { padding-inline: 18px; }
 
 @media (max-width: 480px) {
   .header-left h1 { max-width: 42vw; }
+  .roleplay-banner-kicker { display: none; }
+  .roleplay-action-group-secondary button,
+  .roleplay-action-group-secondary .roleplay-rating-menu summary {
+    width: 27px;
+    padding-inline: 4px;
+  }
+  .roleplay-action-group-secondary > button > span,
+  .roleplay-action-group-secondary > .roleplay-rating-menu > summary > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
   .character-grid { grid-template-columns: 1fr; }
   .management-head { gap: 8px; }
   .management-actions button { padding-inline: 9px; }
@@ -6493,16 +6634,18 @@ a:focus-visible {
     border-radius: 14px 14px 14px 4px;
   }
   .composer {
-    padding: 10px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    padding: 6px 8px calc(8px + env(safe-area-inset-bottom, 0px));
   }
   .composer-shell textarea,
   .composer textarea {
-    height: 72px;
+    height: 52px;
+    padding: 7px 10px 2px;
     font-size: 16px; /* prevent iOS zoom */
   }
   .composer-actions .composer-send {
-    min-height: 40px;
-    min-width: 92px;
+    min-height: 36px;
+    min-width: 80px;
+    padding-block: 5px;
   }
 
   .management-backdrop,
@@ -6845,6 +6988,255 @@ a:focus-visible {
   margin-bottom: 4px;
   color: var(--text);
   font-size: 12px;
+}
+
+.context-request-series {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--ctx-slice) 28%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ctx-slice) 5%, var(--surface));
+}
+.context-graph-detail .context-request-series > header {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 9px;
+}
+.context-request-series h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+.context-request-series header span {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+.context-request-series header code {
+  display: block;
+  max-width: 220px;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-request-series header > strong {
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.context-request-growth-bar {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, var(--ctx-slice) 28%, var(--border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 6%, var(--surface));
+}
+.context-request-growth-bar button {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  min-width: 42px;
+  min-height: 40px;
+  padding: 5px 7px;
+  overflow: hidden;
+  border: 0;
+  border-right: 1px solid color-mix(in srgb, var(--surface) 50%, transparent);
+  border-radius: 0;
+  color: #fff;
+  cursor: pointer;
+  transform: none;
+  animation: context-request-segment-in .3s var(--ease-out) both;
+}
+.context-request-growth-bar button:last-child {
+  border-right: 0;
+}
+.context-request-growth-bar button.tone-0 { background: color-mix(in srgb, var(--ctx-slice) 90%, var(--text)); }
+.context-request-growth-bar button.tone-1 { background: color-mix(in srgb, var(--ctx-slice) 76%, var(--text)); }
+.context-request-growth-bar button.tone-2 { background: color-mix(in srgb, var(--ctx-slice) 64%, var(--text)); }
+.context-request-growth-bar button.tone-3 { background: color-mix(in srgb, var(--ctx-slice) 52%, var(--text)); }
+.context-request-growth-bar button.reset {
+  background: color-mix(in srgb, var(--warn) 60%, var(--surface));
+}
+.context-request-growth-bar button.active {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, #fff 82%, transparent);
+}
+.context-request-growth-bar button:hover {
+  filter: brightness(1.08);
+  transform: none;
+}
+.context-request-growth-bar button span,
+.context-request-growth-bar button strong {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-request-growth-bar button span {
+  font-size: 9px;
+  opacity: .78;
+}
+.context-request-growth-bar button strong {
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.context-request-series > .context-request-detail {
+  margin: 10px 0 0;
+  border-color: color-mix(in srgb, var(--ctx-slice) 18%, var(--border));
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  animation: context-request-detail-in .22s var(--ease-out) both;
+}
+
+@keyframes context-request-segment-in {
+  from { opacity: 0; clip-path: inset(0 100% 0 0); }
+  to { opacity: 1; clip-path: inset(0 0 0 0); }
+}
+@keyframes context-request-detail-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.context-request-detail {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--ctx-slice) 28%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ctx-slice) 5%, var(--surface));
+}
+.context-graph-detail .context-request-detail > header {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 7px;
+}
+.context-request-detail header > div {
+  min-width: 0;
+}
+.context-request-detail h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+.context-request-detail header span {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+.context-request-detail header > strong {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.context-request-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-bottom: 10px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+}
+.context-request-detail ol {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.context-request-detail li {
+  min-width: 0;
+}
+.context-request-row-head {
+  display: grid;
+  grid-template-columns: 25px minmax(0, 1fr) auto 38px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.context-request-layer {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 16px;
+  border-radius: 4px;
+  color: var(--surface);
+  font-size: 9px;
+  font-weight: 750;
+}
+.context-request-layer.layer-L0 { background: var(--ctx-l0); }
+.context-request-layer.layer-L1 { background: var(--ctx-l1); }
+.context-request-layer.layer-L2 { background: var(--ctx-l2); }
+.context-request-layer.layer-L3 { background: var(--ctx-l3); }
+.context-request-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-request-row-head strong {
+  color: var(--text);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.context-request-row-head em {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.context-request-row-track {
+  display: block;
+  height: 3px;
+  margin: 4px 0 0 31px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+.context-request-row-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+}
+.context-request-row-track > .layer-L0 { background: var(--ctx-l0); }
+.context-request-row-track > .layer-L1 { background: var(--ctx-l1); }
+.context-request-row-track > .layer-L2 { background: var(--ctx-l2); }
+.context-request-row-track > .layer-L3 { background: var(--ctx-l3); }
+.context-request-detail li > small {
+  display: block;
+  margin: 2px 0 0 31px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+.context-request-preview {
+  display: -webkit-box;
+  margin: 4px 0 0 31px;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .context-graph-filters {
@@ -7419,6 +7811,12 @@ a:focus-visible {
   letter-spacing: 0.04em;
   pointer-events: none;
 }
+.context-graph-svg-expand {
+  fill: color-mix(in srgb, var(--ctx-slice) 72%, var(--text));
+  font-size: 8.5px;
+  font-weight: 700;
+  pointer-events: none;
+}
 .context-graph-svg-label {
   fill: var(--text);
   font-size: 11.5px;
@@ -7437,6 +7835,32 @@ a:focus-visible {
   font-weight: 650;
   letter-spacing: 0.02em;
   pointer-events: none;
+}
+.context-graph-node-expand {
+  animation: context-graph-expand-in .2s var(--ease-out) both;
+  pointer-events: none;
+}
+.context-graph-expand-divider {
+  stroke: color-mix(in srgb, var(--border) 78%, transparent);
+  stroke-width: 1;
+}
+.context-graph-expand-heading {
+  fill: var(--text-faint);
+  font-size: 8.5px;
+  font-weight: 700;
+}
+.context-graph-expand-label {
+  fill: var(--text);
+  font-size: 9px;
+  font-weight: 650;
+}
+.context-graph-expand-preview {
+  fill: var(--text-dim);
+  font-size: 8.5px;
+}
+@keyframes context-graph-expand-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 .context-graph-layer-seg.layer-L0 { fill: var(--ctx-l0); }
 .context-graph-layer-seg.layer-L1 { fill: var(--ctx-l1); }

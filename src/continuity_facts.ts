@@ -1,6 +1,7 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
 import { samplingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import type { ModelConfig } from "./types.js";
 
@@ -158,7 +159,7 @@ export async function extractContinuityFacts(options: {
     && !options.model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置可用的事实提取模型");
   }
-  const endpoint = `${options.model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const endpoint = modelCompletionEndpoint(options.model);
   const messages = [
     { role: "system" as const, content: FACT_EXTRACTOR_SYSTEM },
     { role: "user" as const, content: JSON.stringify({
@@ -194,5 +195,5 @@ export async function extractContinuityFacts(options: {
   };
   const usage = parseModelTokenUsage(payload.usage);
   if (usage) options.usageReporter?.(options.model, usage, { callKind: "continuity_fact_extraction" });
-  return parseContinuityFactCandidates(payload.choices?.[0]?.message?.content ?? "", options.afterContent);
+  return parseContinuityFactCandidates(parseProviderCompletionPayload(payload).content, options.afterContent);
 }

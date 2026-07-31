@@ -69,7 +69,7 @@ export class ProviderManager {
   }
 
   save(input: { provider: ProviderId; baseUrl: string; model: string; apiKey?: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number }): ProviderPublicConfig {
-    if (input.provider !== "deepseek" && input.provider !== "openai-compatible") {
+    if (input.provider !== "deepseek" && input.provider !== "openai-compatible" && input.provider !== "openai-responses") {
       throw new Error("不支持的模型供应商");
     }
     const baseUrl = normalizeBaseUrl(input.baseUrl);

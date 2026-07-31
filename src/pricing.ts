@@ -10,7 +10,7 @@ export const DEEPSEEK_PEAK_MULTIPLIER = 2;
 
 export type TokenRates = { cacheHit: number; cacheMiss: number; output: number };
 
-export function defaultPricing(provider: "deepseek" | "openai-compatible", model: string): TokenPricing {
+export function defaultPricing(provider: "deepseek" | "openai-compatible" | "openai-responses", model: string): TokenPricing {
   if (provider !== "deepseek") {
     return { cacheHit: 0, cacheMiss: 0, output: 0, currency: "CNY", contextWindow: 128_000 };
   }
@@ -33,7 +33,7 @@ export function defaultPricing(provider: "deepseek" | "openai-compatible", model
 
 /** 解析并补全计费配置；DeepSeek 缺省峰谷规则时自动补上官方默认。 */
 export function normalizePricing(
-  provider: "deepseek" | "openai-compatible",
+  provider: "deepseek" | "openai-compatible" | "openai-responses",
   model: string,
   input?: Partial<TokenPricing>,
   existing?: TokenPricing,

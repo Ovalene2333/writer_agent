@@ -1,5 +1,6 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -213,8 +214,7 @@ export async function reviewChapterDraft(
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置整章终审模型 API Key");
   }
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages: buildChapterReviewMessages(input),
     stream: false,
@@ -254,7 +254,7 @@ export async function reviewChapterDraft(
       usage,
     );
   }
-  const content = payload.choices?.[0]?.message?.content ?? "";
+  const content = parseProviderCompletionPayload(payload).content;
   let review: ChapterReviewResult;
   try {
     review = parseChapterReview(content, new Set(input.scenes.map(scene => scene.sceneId)), input.content);

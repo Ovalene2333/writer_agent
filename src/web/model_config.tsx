@@ -19,8 +19,19 @@ export type Pricing = {
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ResponseVerbosity = "low" | "medium" | "high";
 export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean; supportsMultimodal?: boolean };
-export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible"; baseUrl: string; proxyUrl?: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
-export type ModelRole = "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer";
+export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible" | "openai-responses"; baseUrl: string; proxyUrl?: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
+export type ModelRole =
+  | "agent"
+  | "flash"
+  | "drafter"
+  | "inline"
+  | "writer"
+  | "reviewer"
+  | "summarizer"
+  | "roleplay"
+  | "roleplay_perception"
+  | "roleplay_quality"
+  | "roleplay_memory";
 export type ProviderCatalog = { activeProviderId: string; activeModelId: string; assignments: Record<ModelRole, { providerId: string; modelId: string }>; providers: ProviderProfile[] };
 export type ScenePipelineSettings = {
   enabled: boolean;
@@ -42,23 +53,45 @@ export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
-type ScannedModel = { name: string; pricing: Pricing };
+type ScannedModel = { name: string; pricing: Pricing; contextFromProvider?: boolean };
 type Request = (path: string, init?: RequestInit) => Promise<any>;
 
-const ROLES: Array<{ id: Exclude<ModelRole, "drafter">; name: string; detail: string }> = [
+type VisibleModelRole = Exclude<ModelRole, "drafter">;
+type RoleDefinition = { id: VisibleModelRole; name: string; detail: string };
+
+const WRITING_ROLES: RoleDefinition[] = [
   { id: "flash", name: "通用 Flash", detail: "低延迟、低成本的推荐、提取与轻量辅助任务" },
   { id: "agent", name: "Agent 调度", detail: "理解请求、规划任务与调用工具" },
-  { id: "roleplay", name: "角色扮演", detail: "角色试演、对话者设定与沉浸式对白" },
   { id: "inline", name: "行内生成", detail: "短文本补全与局部快速修改" },
   { id: "writer", name: "正文写作", detail: "续写、重写与长篇内容生成" },
   { id: "reviewer", name: "审阅校对", detail: "质量检查、润色与修改建议；关闭「终审跟随正文模型」后才用于整章终审" },
   { id: "summarizer", name: "上下文摘要", detail: "压缩历史内容以控制上下文长度" },
 ];
 
+const ROLEPLAY_ROLES: RoleDefinition[] = [
+  { id: "roleplay", name: "角色演出", detail: "角色试演、主动开场、续演、身份代答与场景生成" },
+  { id: "roleplay_perception", name: "感知编译", detail: "把玩家输入整理为角色本轮能够听见、看见与感受到的信息" },
+  { id: "roleplay_quality", name: "演出终审", detail: "清理越权、解释腔与重复内容，输出最终角色回复" },
+  { id: "roleplay_memory", name: "现场记忆", detail: "维护角色可知的滚动摘要、现场状态与长期事实" },
+];
+
 const EMPTY_PRICING: Pricing = { cacheHit: 0, cacheMiss: 0, output: 0, currency: "CNY", contextWindow: 128000 };
 const newModel = (): ModelDraft => ({ name: "", pricing: { ...EMPTY_PRICING } });
 const emptyProfile = (): ProfileDraft => ({ name: "", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", proxyUrl: "", apiKey: "", models: [newModel()] });
 const optionalNumber = (value: string): number | undefined => value.trim() === "" ? undefined : Number(value);
+/** Compact context label for scan results, e.g. 128k / 1.05M. */
+function formatContextWindowLabel(contextWindow: number | undefined): string {
+  if (!(typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow >= 1000)) return "";
+  if (contextWindow >= 1_000_000) {
+    const millions = contextWindow / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(2).replace(/\.?0+$/, "")}M ctx`;
+  }
+  if (contextWindow >= 10_000) {
+    const thousands = contextWindow / 1_000;
+    return `${Number.isInteger(thousands) ? thousands : thousands.toFixed(1).replace(/\.0$/, "")}k ctx`;
+  }
+  return `${Math.round(contextWindow)} ctx`;
+}
 
 type TestStatus = "idle" | "testing" | "ok" | "fail";
 
@@ -246,11 +279,14 @@ export function ModelConfig({
       }) as { models: ScannedModel[] };
       const existing = new Set(editing.models.map(model => model.name.trim()).filter(Boolean));
       const available = result.models.filter(model => !existing.has(model.name));
+      const withContext = result.models.filter(model => model.contextFromProvider).length;
       setScannedModels(result.models);
       setSelectedScannedModels(new Set(available.map(model => model.name)));
       setEditorFeedback({
         error: false,
-        text: `扫描到 ${result.models.length} 个模型，其中 ${available.length} 个尚未添加`,
+        text: withContext > 0
+          ? `扫描到 ${result.models.length} 个模型（${withContext} 个含供应商上下文窗口），其中 ${available.length} 个尚未添加`
+          : `扫描到 ${result.models.length} 个模型，其中 ${available.length} 个尚未添加；供应商未返回上下文窗口，导入后使用默认值`,
       });
     } catch (cause) {
       setScannedModels([]);
@@ -472,7 +508,7 @@ export function ModelConfig({
             const batchStatus = statusOf(providerBatchKey(provider.id));
             return <article className="provider-card" key={provider.id}>
             <div className="provider-card-head">
-              <div><strong>{provider.name}</strong><span>{provider.provider === "deepseek" ? "DeepSeek" : "OpenAI 兼容"} · {provider.apiKeyConfigured ? provider.apiKeyHint : "未配置密钥"}</span></div>
+              <div><strong>{provider.name}</strong><span>{provider.provider === "deepseek" ? "DeepSeek" : provider.provider === "openai-responses" ? "OpenAI Responses" : "OpenAI 兼容"} · {provider.apiKeyConfigured ? provider.apiKeyHint : "未配置密钥"}</span></div>
               <div>
                 <button
                   className={`ghost test-action-btn status-${batchStatus}`}
@@ -519,32 +555,49 @@ export function ModelConfig({
           })}
         </div>
         <div className="role-column">
-          <h3>写作流程分工</h3>
-          <p className="section-note">不同环节可使用不同供应商下的模型。</p>
-          {ROLES.map(role => {
-            const ref = catalog.assignments[role.id];
-            const value = `${ref.providerId}:${ref.modelId}`;
-            const selectedLabel = choices.find(choice => choice.value === value)?.label ?? value;
-            return (
-              <label className="role-card" key={role.id}>
-                <span>
-                  <strong>{role.name}</strong>
-                  <small>{role.detail}</small>
-                </span>
-                <select
-                  value={value}
-                  title={selectedLabel}
-                  onChange={event => void assign(role.id, event.target.value)}
-                >
-                  {choices.map(choice => (
-                    <option value={choice.value} key={choice.value} title={choice.label}>
-                      {choice.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            );
-          })}
+          {([
+            {
+              id: "writing",
+              title: "写作流程分工",
+              note: "写作 Agent、正文、审阅与上下文处理使用的模型。",
+              roles: WRITING_ROLES,
+            },
+            {
+              id: "roleplay",
+              title: "角色扮演流程分工",
+              note: "角色演出、感知、终审和现场记忆独立配置，不再复用写作模型槽位。",
+              roles: ROLEPLAY_ROLES,
+            },
+          ] as const).map(group => (
+            <section className="model-role-group" key={group.id}>
+              <h3>{group.title}</h3>
+              <p className="section-note">{group.note}</p>
+              {group.roles.map(role => {
+                const ref = catalog.assignments[role.id];
+                const value = `${ref.providerId}:${ref.modelId}`;
+                const selectedLabel = choices.find(choice => choice.value === value)?.label ?? value;
+                return (
+                  <label className="role-card" key={role.id}>
+                    <span>
+                      <strong>{role.name}</strong>
+                      <small>{role.detail}</small>
+                    </span>
+                    <select
+                      value={value}
+                      title={selectedLabel}
+                      onChange={event => void assign(role.id, event.target.value)}
+                    >
+                      {choices.map(choice => (
+                        <option value={choice.value} key={choice.value} title={choice.label}>
+                          {choice.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                );
+              })}
+            </section>
+          ))}
         </div>
           </div>}
           {section === "writing" && <div className="scene-settings">
@@ -655,7 +708,7 @@ export function ModelConfig({
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>
       <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" title="关闭" aria-label="关闭" onClick={() => setEditing(null)}><X size={17} /></button></div>
-      <div className="character-form-grid"><label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label><span>协议类型</span><select value={editing.provider} onChange={e => updateConnection({ provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容</option><option value="deepseek">DeepSeek</option></select></label><label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => updateConnection({ baseUrl: e.target.value })}/></label><label className="wide"><span>代理 URL（可选）</span><input placeholder="http://127.0.0.1:7890" value={editing.proxyUrl ?? ""} onChange={e => updateConnection({ proxyUrl: e.target.value })}/></label><label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => updateConnection({ apiKey: e.target.value })}/></label></div>
+      <div className="character-form-grid"><label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label><span>协议类型</span><select value={editing.provider} onChange={e => updateConnection({ provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容（Chat Completions）</option><option value="openai-responses">OpenAI Responses</option><option value="deepseek">DeepSeek</option></select></label><label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => updateConnection({ baseUrl: e.target.value })} placeholder={editing.provider === "openai-responses" ? "https://api.openai.com/v1" : undefined}/></label><label className="wide"><span>代理 URL（可选）</span><input placeholder="http://127.0.0.1:7890" value={editing.proxyUrl ?? ""} onChange={e => updateConnection({ proxyUrl: e.target.value })}/></label><label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => updateConnection({ apiKey: e.target.value })}/></label></div>
       <div className="model-list-head"><h3>模型</h3><div className="model-list-actions"><button className="ghost" disabled={!canScanModels || scanning || busy} title={canScanModels ? "从供应商读取模型列表" : "请先填写 API Base URL 和 API Key"} onClick={() => void scanProviderModels()}>{scanning ? <LoaderCircle className="test-icon-spin" size={15} /> : <Radar size={15} />}{scanning ? "扫描中…" : "扫描模型"}</button><button disabled={busy || scanning} onClick={() => setEditing({ ...editing, models: [...editing.models, newModel()] })}><Plus size={15} />添加模型</button></div></div>
       {editorFeedback && <div className={editorFeedback.error ? "editor-feedback error" : "editor-feedback"}>{editorFeedback.text}</div>}
       {scannedModels.length > 0 && <section className="model-scan-results">
@@ -666,7 +719,10 @@ export function ModelConfig({
         </div>
         <div className="model-scan-list">{scannedModels.map(model => {
           const added = editingModelNames.has(model.name);
-          return <label className={added ? "already-added" : ""} key={model.name}><input type="checkbox" disabled={added} checked={!added && selectedScannedModels.has(model.name)} onChange={event => setSelectedScannedModels(current => { const next = new Set(current); if (event.target.checked) next.add(model.name); else next.delete(model.name); return next; })}/><span title={model.name}>{model.name}</span>{added && <small>已添加</small>}</label>;
+          const contextLabel = model.contextFromProvider
+            ? formatContextWindowLabel(model.pricing.contextWindow)
+            : "";
+          return <label className={added ? "already-added" : ""} key={model.name}><input type="checkbox" disabled={added} checked={!added && selectedScannedModels.has(model.name)} onChange={event => setSelectedScannedModels(current => { const next = new Set(current); if (event.target.checked) next.add(model.name); else next.delete(model.name); return next; })}/><span title={contextLabel ? `${model.name} · 上下文 ${contextLabel}` : model.name}>{model.name}</span>{contextLabel && <small className="model-scan-context">{contextLabel}</small>}{added && <small>已添加</small>}</label>;
         })}</div>
       </section>}
       <div className="model-edit-list">{editing.models.map((model, index) => {
@@ -689,7 +745,7 @@ export function ModelConfig({
             <label><span>Top P（0–1）</span><input type="number" min="0" max="1" step="0.01" placeholder="供应商默认" value={model.topP ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { topP: optionalNumber(e.target.value) })}/></label>
             <label><span>Frequency penalty（-2–2）</span><input type="number" min="-2" max="2" step="0.1" placeholder="供应商默认" value={model.frequencyPenalty ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { frequencyPenalty: optionalNumber(e.target.value) })}/></label>
             <label><span>Presence penalty（-2–2）</span><input type="number" min="-2" max="2" step="0.1" placeholder="供应商默认" value={model.presencePenalty ?? ""} disabled={model.disableSampling} onChange={e => updateModel(index, { presencePenalty: optionalNumber(e.target.value) })}/></label>
-            {editing.provider === "openai-compatible" && <>
+            {(editing.provider === "openai-compatible" || editing.provider === "openai-responses") && <>
               <label><span>Reasoning effort</span><select value={model.reasoningEffort ?? ""} onChange={e => updateModel(index, { reasoningEffort: (e.target.value || undefined) as ReasoningEffort | undefined })}><option value="">供应商默认</option><option value="none">none</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></label>
               <label><span>Verbosity</span><select value={model.verbosity ?? ""} onChange={e => updateModel(index, { verbosity: (e.target.value || undefined) as ResponseVerbosity | undefined })}><option value="">供应商默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
             </>}

@@ -452,18 +452,16 @@ export function AgentStepCard({
             <details className="agent-step-context-breakdown">
               <summary>请求上下文组成（发送前估算）</summary>
               <div className="agent-step-context-list">
-                {[...step.usage.requestComponents]
-                  .sort((a, b) => b.estimatedTokens - a.estimatedTokens)
-                  .map((component, index) => (
-                    <div className="agent-step-context-row" key={`${component.callKind ?? "call"}-${component.kind}-${index}`}>
-                      <span>
-                        {component.callKind ? `${component.callKind} · ` : ""}
-                        {component.label}
-                        {component.fingerprint ? ` · #${component.fingerprint}` : ""}
-                      </span>
-                      <span>{component.estimatedTokens.toLocaleString()} tok · {component.characters.toLocaleString()} chars</span>
-                    </div>
-                  ))}
+                {step.usage.requestComponents.map((component, index) => (
+                  <div className="agent-step-context-row" key={`${component.callKind ?? "call"}-${component.kind}-${index}`}>
+                    <span>
+                      {component.callKind ? `${component.callKind} · ` : ""}
+                      {component.label}
+                      {component.fingerprint ? ` · #${component.fingerprint}` : ""}
+                    </span>
+                    <span>{component.estimatedTokens.toLocaleString()} tok · {component.characters.toLocaleString()} chars</span>
+                  </div>
+                ))}
               </div>
             </details>
           ) : null}

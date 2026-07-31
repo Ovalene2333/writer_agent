@@ -3,6 +3,7 @@ import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import { samplingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 
 export type DocumentLocatorCandidate = {
   anchorId: string;
@@ -53,8 +54,7 @@ export async function requestDocumentLocator(
     { role: "user" as const, content: JSON.stringify({ intent: input.intent, candidates: input.candidates.slice(0, 36) }) },
   ];
   const requestCharacters = messages.reduce((sum, message) => sum + message.content.length, 0);
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages,
     stream: false,
@@ -80,7 +80,7 @@ export async function requestDocumentLocator(
   const usage = parseModelTokenUsage(payload.usage);
   if (!response.ok) throw new Error(`文档定位器请求失败（${response.status}）`);
   return {
-    matches: parseDocumentLocatorResult(payload.choices?.[0]?.message?.content ?? "", input.candidates),
+    matches: parseDocumentLocatorResult(parseProviderCompletionPayload(payload).content, input.candidates),
     ...(usage ? { usage } : {}),
     requestCharacters,
   };

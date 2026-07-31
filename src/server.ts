@@ -62,7 +62,7 @@ import { documentKind, WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate } from "./templates.js";
-import type { AgentEvent, Message, MessageStepTrail, PermissionMode, PersistedStreamStep, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StepUsage, StyleTemplate } from "./types.js";
+import type { AgentEvent, Message, MessageStepTrail, ModelUsageRole, PermissionMode, PersistedStreamStep, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StepUsage, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 import {
   loadProseGateRules,
@@ -1016,7 +1016,7 @@ export async function startWriterServer(options: {
   });
 
   app.post("/api/providers/assign", async (context) => {
-    try { const body = await context.req.json<{ role: "agent" | "roleplay" | "flash" | "drafter" | "inline" | "writer" | "reviewer" | "summarizer"; providerId: string; modelId: string }>(); return context.json({ catalog: options.providers.assign(body.role, body.providerId, body.modelId), provider: options.providers.publicConfig() }); }
+    try { const body = await context.req.json<{ role: ModelUsageRole; providerId: string; modelId: string }>(); return context.json({ catalog: options.providers.assign(body.role, body.providerId, body.modelId), provider: options.providers.publicConfig() }); }
     catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
@@ -1454,9 +1454,9 @@ export async function startWriterServer(options: {
               ? { perceptionOverride: parseRoleplayPerception(JSON.stringify(body.perceptionOverride)) }
               : {}),
             model: options.providers.modelConfig("roleplay"),
-            perceptionModel: options.providers.modelConfig("roleplay"),
-            qualityModel: options.providers.modelConfig("flash"),
-            summarizer: options.providers.summaryModelConfig(),
+            perceptionModel: options.providers.modelConfig("roleplay_perception"),
+            qualityModel: options.providers.modelConfig("roleplay_quality"),
+            summarizer: options.providers.modelConfig("roleplay_memory"),
             signal,
             onEvent,
           });

@@ -132,6 +132,14 @@ export function documentWordCount(content: string): number {
   return Array.from(content).filter(character => !/\s/u.test(character)).length;
 }
 
+/** Count the text a reader actually sees, excluding Markdown presentation markers. */
+export function renderedMarkdownWordCount(content: string): number {
+  const html = renderMarkdownHtml(content);
+  if (!html) return 0;
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  return documentWordCount(parsed.body.textContent ?? "");
+}
+
 export function originalOffsetForNormalized(source: string, normalizedOffset: number): number {
   let original = source.charCodeAt(0) === 0xFEFF ? 1 : 0;
   let normalized = 0;
@@ -184,4 +192,3 @@ export function Markdown({ content, className, headingPrefix }: { content: strin
     />
   );
 }
-

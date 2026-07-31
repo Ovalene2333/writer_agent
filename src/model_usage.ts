@@ -45,7 +45,11 @@ export function buildRecordedUsageEvent(
   const cacheMissTokens = usage.cacheMissTokens || Math.max(0, usage.promptTokens - usage.cacheHitTokens);
   const normalized = { ...usage, cacheMissTokens };
   const providerName = model.providerName?.trim()
-    || (model.provider === "deepseek" ? "DeepSeek" : "API");
+    || (model.provider === "deepseek"
+      ? "DeepSeek"
+      : model.provider === "openai-responses"
+        ? "OpenAI Responses"
+        : "API");
   const call: StepUsage = {
     model: model.model,
     providerName,

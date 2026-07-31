@@ -1,5 +1,6 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { nonThinkingRequestOptions, samplingRequestOptions, type SamplingRequestBody } from "./model_compat.js";
+import { completeProviderCompletion, buildProviderCompletionBody, modelCompletionEndpoint, parseProviderCompletionPayload } from "./model_api.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import {
@@ -237,53 +238,46 @@ export async function requestIsolatedScene(
 ): Promise<IsolatedSceneWriterResult> {
   const messages = buildIsolatedSceneWriterMessages(input);
   const requestCharacters = messageCharacters(messages);
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
-    model: model.model,
-    messages,
-    stream: false,
-    ...isolatedSceneWriterSamplingOptions(model),
-    max_tokens: isolatedSceneWriterMaxTokens(input),
-  });
-  logModelRequest(endpoint, body);
-  const response = await modelFetch(endpoint, {
-    method: "POST",
-    signal,
-    headers: {
-      "content-type": "application/json",
-      ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-    },
-    body,
-  }, model.proxyUrl);
-  const responseBody = await response.text();
-  logModelResponse(endpoint, responseBody);
-  let payload: { choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>; usage?: unknown };
   try {
-    payload = JSON.parse(responseBody) as typeof payload;
+    const completed = await completeProviderCompletion({
+      model,
+      messages,
+      maxTokens: isolatedSceneWriterMaxTokens(input),
+      temperature: model.temperature,
+      topP: model.topP,
+    }, signal);
+    const usage = completed.usage
+      ? {
+          promptTokens: completed.usage.promptTokens,
+          completionTokens: completed.usage.completionTokens,
+          cacheHitTokens: completed.usage.cacheHitTokens,
+          cacheMissTokens: completed.usage.cacheMissTokens,
+        }
+      : undefined;
+    if (completed.finishReason === "length") {
+      throw new IsolatedSceneRequestError(
+        "隔离正文 Writer 输出达到长度上限", "writer", usage, requestCharacters, "truncated",
+      );
+    }
+    const content = cleanPlainProse(completed.content);
+    if (!content) {
+      throw new IsolatedSceneRequestError(
+        "隔离正文 Writer 没有返回正文", "writer", usage, requestCharacters, "invalid_output",
+      );
+    }
+    return { content, ...(usage ? { usage } : {}), requestCharacters };
   } catch (error) {
+    if (error instanceof IsolatedSceneRequestError) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    const usage = undefined;
+    if (message.includes("模型请求失败")) {
+      throw new IsolatedSceneRequestError(message, "writer", usage, requestCharacters, "http");
+    }
     throw new IsolatedSceneRequestError(
-      "隔离正文 Writer 返回的响应不是 JSON", "writer", undefined, requestCharacters, "invalid_output", { cause: error },
+      message || "隔离正文 Writer 请求失败", "writer", usage, requestCharacters, "invalid_output",
+      { cause: error },
     );
   }
-  const usage = parseModelTokenUsage(payload.usage);
-  if (!response.ok) {
-    throw new IsolatedSceneRequestError(
-      `隔离正文 Writer 请求失败（${response.status}）：${responseBody.slice(0, 240)}`,
-      "writer", usage, requestCharacters, "http",
-    );
-  }
-  if (payload.choices?.[0]?.finish_reason === "length") {
-    throw new IsolatedSceneRequestError(
-      "隔离正文 Writer 输出达到长度上限", "writer", usage, requestCharacters, "truncated",
-    );
-  }
-  const content = cleanPlainProse(payload.choices?.[0]?.message?.content ?? "");
-  if (!content) {
-    throw new IsolatedSceneRequestError(
-      "隔离正文 Writer 没有返回正文", "writer", usage, requestCharacters, "invalid_output",
-    );
-  }
-  return { content, ...(usage ? { usage } : {}), requestCharacters };
 }
 
 export function isolatedSceneWriterSamplingOptions(
@@ -307,55 +301,44 @@ export async function requestSceneStateExtraction(
 ): Promise<SceneStateExtractionResult> {
   const messages = buildSceneStateExtractionMessages(input);
   const requestCharacters = messageCharacters(messages);
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
-    model: model.model,
-    messages,
-    stream: false,
-    ...samplingRequestOptions(model, { temperature: 0 }),
-    max_tokens: input.retryJsonOnly ? 2_400 : 1_800,
-    response_format: { type: "json_object" },
-    ...nonThinkingRequestOptions(model),
-  });
-  logModelRequest(endpoint, body);
-  const response = await modelFetch(endpoint, {
-    method: "POST",
-    signal,
-    headers: {
-      "content-type": "application/json",
-      ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-    },
-    body,
-  }, model.proxyUrl);
-  const responseBody = await response.text();
-  logModelResponse(endpoint, responseBody);
-  let payload: { choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>; usage?: unknown };
   try {
-    payload = JSON.parse(responseBody) as typeof payload;
+    const completed = await completeProviderCompletion({
+      model,
+      messages,
+      temperature: 0,
+      maxTokens: input.retryJsonOnly ? 2_400 : 1_800,
+      responseFormat: { type: "json_object" },
+      thinking: nonThinkingRequestOptions(model).thinking,
+    }, signal);
+    const usage = completed.usage
+      ? {
+          promptTokens: completed.usage.promptTokens,
+          completionTokens: completed.usage.completionTokens,
+          cacheHitTokens: completed.usage.cacheHitTokens,
+          cacheMissTokens: completed.usage.cacheMissTokens,
+        }
+      : undefined;
+    if (completed.finishReason === "length") {
+      throw new IsolatedSceneRequestError(
+        "场景状态提取输出达到长度上限", "state", usage, requestCharacters, "truncated",
+      );
+    }
+    try {
+      const actualState = parseSceneActualState(completed.content);
+      return { actualState, ...(usage ? { usage } : {}), requestCharacters };
+    } catch (error) {
+      throw new IsolatedSceneRequestError(
+        error instanceof Error ? error.message : String(error),
+        "state", usage, requestCharacters, "invalid_output", { cause: error },
+      );
+    }
   } catch (error) {
+    if (error instanceof IsolatedSceneRequestError) throw error;
+    const message = error instanceof Error ? error.message : String(error);
     throw new IsolatedSceneRequestError(
-      "场景状态提取响应不是 JSON", "state", undefined, requestCharacters, "invalid_output", { cause: error },
-    );
-  }
-  const usage = parseModelTokenUsage(payload.usage);
-  if (!response.ok) {
-    throw new IsolatedSceneRequestError(
-      `场景状态提取请求失败（${response.status}）：${responseBody.slice(0, 240)}`,
-      "state", usage, requestCharacters, "http",
-    );
-  }
-  if (payload.choices?.[0]?.finish_reason === "length") {
-    throw new IsolatedSceneRequestError(
-      "场景状态提取输出达到长度上限", "state", usage, requestCharacters, "truncated",
-    );
-  }
-  try {
-    const actualState = parseSceneActualState(payload.choices?.[0]?.message?.content ?? "");
-    return { actualState, ...(usage ? { usage } : {}), requestCharacters };
-  } catch (error) {
-    throw new IsolatedSceneRequestError(
-      error instanceof Error ? error.message : String(error),
-      "state", usage, requestCharacters, "invalid_output", { cause: error },
+      message || "场景状态提取失败", "state", undefined, requestCharacters,
+      message.includes("模型请求失败") ? "http" : "invalid_output",
+      { cause: error },
     );
   }
 }

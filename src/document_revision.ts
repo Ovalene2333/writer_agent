@@ -3,6 +3,7 @@ import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import { samplingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 
 export type DocumentRevisionInput = {
   instruction: string;
@@ -45,8 +46,7 @@ export async function requestDocumentRevision(
     { role: "user" as const, content: JSON.stringify(input) },
   ];
   const requestCharacters = messages.reduce((sum, message) => sum + message.content.length, 0);
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages,
     stream: false,
@@ -72,7 +72,7 @@ export async function requestDocumentRevision(
   const usage = parseModelTokenUsage(payload.usage);
   if (!response.ok) throw new Error(`分块修订请求失败（${response.status}）`);
   return {
-    content: parseDocumentRevision(payload.choices?.[0]?.message?.content ?? "", input.content),
+    content: parseDocumentRevision(parseProviderCompletionPayload(payload).content, input.content),
     ...(usage ? { usage } : {}),
     requestCharacters,
   };

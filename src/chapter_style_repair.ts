@@ -1,5 +1,6 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
+import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -84,8 +85,7 @@ export async function requestChapterStyleRepair(
 ): Promise<{ edits: ChapterStyleEdit[]; usage?: ModelTokenUsage; requestCharacters: number }> {
   const batch = input.issues.slice(0, CHAPTER_STYLE_REPAIR_BATCH_SIZE);
   const messages = buildChapterStyleRepairMessages({ ...input, issues: batch });
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
     messages,
     stream: false,
@@ -116,11 +116,11 @@ export async function requestChapterStyleRepair(
   if (!response.ok) {
     throw new ChapterStyleRepairRequestError(`局部风格修订请求失败（${response.status}）`, usage, requestCharacters, "http");
   }
-  if (payload.choices?.[0]?.finish_reason === "length") {
+  if (parseProviderCompletionPayload(payload).finishReason === "length") {
     throw new ChapterStyleRepairRequestError("局部风格修订输出达到长度上限", usage, requestCharacters, "truncated");
   }
   try {
-    const edits = parseChapterStyleRepair(payload.choices?.[0]?.message?.content ?? "", batch);
+    const edits = parseChapterStyleRepair(parseProviderCompletionPayload(payload).content, batch);
     return { edits, ...(usage ? { usage } : {}), requestCharacters };
   } catch (error) {
     throw new ChapterStyleRepairRequestError(

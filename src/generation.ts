@@ -13,6 +13,7 @@ import { adjudicateProseStyleForAudit } from "./prose_adjudicate.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { modelSupportsToolChoice, samplingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
+import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody, streamProviderCompletion } from "./model_api.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
 import { OutlineStore } from "./outline.js";
@@ -428,40 +429,39 @@ ${writePackDraftContractPrompt()}
       ? `原始写作要求：${options.instruction.trim()}\n当前草案：\n${revision.draft}\n\n本轮草案修改要求：${revision.revision.trim()}\n请修改草案本身，不要开始写正式正文。必要时可继续使用工具核对资料。事实与回忆须用故事内锚点，禁止「比序章里…」等文档指称。`
       : `写作动作：${options.mode}\n写作要求：${options.instruction.trim()}\n目标文档（仅定位，勿写入草案）：${options.path ?? "新文档"}\n当前必要上下文：\n${existingContext || "（无）"}\n请按合同小标题输出草案；回忆先前情节时写故事内锚点，不要写章节名。` },
   ];
-  const endpoint = `${options.draftModel.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  let endpoint = modelCompletionEndpoint(options.draftModel);
   const usage = { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 };
   let hasUsage = false;
   for (let turn = 0; turn < 7; turn += 1) {
-    const requestBody = JSON.stringify({
+    const wire = serializeProviderChatBody(options.draftModel, {
       model: options.draftModel.model, messages, tools,
       ...(modelSupportsToolChoice(options.draftModel) ? { tool_choice: "auto" } : {}),
       stream: false,
       ...samplingRequestOptions(options.draftModel),
     });
+    endpoint = wire.endpoint;
+    const requestBody = wire.body;
     logModelRequest(endpoint, requestBody);
     const response = await modelFetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody }, options.draftModel.proxyUrl);
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`草案模型请求失败（${response.status}）：${responseBody.slice(0, 500)}`);
-    const payload = JSON.parse(responseBody) as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string; tool_calls?: ToolCall[] } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; prompt_cache_hit_tokens?: number } };
-    if (payload.usage) {
+    const payload = JSON.parse(responseBody) as { usage?: unknown };
+    const parsed = parseProviderCompletionPayload(payload);
+    if (parsed.usage) {
       hasUsage = true;
-      const promptTokens = Number(payload.usage.prompt_tokens ?? 0);
-      const cacheHitTokens = Number(payload.usage.prompt_tokens_details?.cached_tokens ?? payload.usage.prompt_cache_hit_tokens ?? 0);
-      usage.promptTokens += promptTokens;
-      usage.completionTokens += Number(payload.usage.completion_tokens ?? 0);
-      usage.cacheHitTokens += cacheHitTokens;
-      usage.cacheMissTokens += Math.max(0, promptTokens - cacheHitTokens);
+      usage.promptTokens += parsed.usage.promptTokens;
+      usage.completionTokens += parsed.usage.completionTokens;
+      usage.cacheHitTokens += parsed.usage.cacheHitTokens;
+      usage.cacheMissTokens += parsed.usage.cacheMissTokens;
     }
-    const message = payload.choices?.[0]?.message;
-    if (!message) throw new Error("草案模型没有返回有效响应");
-    const calls = message.tool_calls ?? [];
+    const calls = parsed.toolCalls.map((call, index) => ({ id: call.id || `call_${index}`, type: "function" as const, function: { name: call.name, arguments: call.arguments } }));
     if (!calls.length) {
-      const draft = message.content?.trim();
+      const draft = parsed.content.trim();
       if (!draft) throw new Error("草案模型没有生成写作草案");
       return { draft, ...(hasUsage ? { usage } : {}) };
     }
-    messages.push({ role: "assistant", content: message.content ?? "", ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}), tool_calls: calls });
+    messages.push({ role: "assistant", content: parsed.content ?? "", ...(parsed.reasoningContent ? { reasoning_content: parsed.reasoningContent } : {}), tool_calls: calls });
     for (const call of calls) {
       await onTool(call.function.name);
       let result: unknown;
@@ -899,45 +899,12 @@ async function completeText(model: ModelConfig, messages: ChatMessage[], signal?
 
 async function streamText(model: ModelConfig, messages: ChatMessage[], signal: AbortSignal | undefined, onText: (text: string) => void | Promise<void>) {
   if (!model.apiKey) throw new Error("请先配置模型 API Key");
-  const endpoint = `${model.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const requestBody = JSON.stringify({ model: model.model, messages, stream: true, stream_options: { include_usage: true }, ...samplingRequestOptions(model) });
-  logModelRequest(endpoint, requestBody);
-  const response = await modelFetch(endpoint, {
-    method: "POST", signal,
-    headers: { "content-type": "application/json", authorization: `Bearer ${model.apiKey}` },
-    body: requestBody,
-  }, model.proxyUrl);
-  if (!response.ok) {
-    const responseBody = await response.text();
-    logModelResponse(endpoint, responseBody);
-    throw new Error(`模型请求失败（${response.status}）：${responseBody.slice(0, 500)}`);
-  }
-  if (!response.body) throw new Error("模型响应没有内容");
-  const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = "";
-  let usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } | undefined;
-  const consume = async (block: string) => {
-    for (const line of block.split(/\r?\n/)) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim(); if (!data || data === "[DONE]") continue;
-      const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }>; usage?: Record<string, unknown> };
-      const text = chunk.choices?.[0]?.delta?.content;
-      if (text) { content += text; await onText(text); }
-      if (chunk.usage) {
-        const cached = Number((chunk.usage.prompt_tokens_details as { cached_tokens?: number } | undefined)?.cached_tokens ?? chunk.usage.prompt_cache_hit_tokens ?? 0);
-        const prompt = Number(chunk.usage.prompt_tokens ?? 0);
-        usage = { promptTokens: prompt, completionTokens: Number(chunk.usage.completion_tokens ?? 0), cacheHitTokens: cached, cacheMissTokens: Math.max(0, prompt - cached) };
-      }
-    }
-  };
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() ?? "";
-    for (const block of blocks) await consume(block);
-    if (done) break;
-  }
-  if (buffer.trim()) await consume(buffer);
-  const completed = { content, usage };
-  logModelResponse(endpoint, JSON.stringify(completed, null, 2));
-  return completed;
+  const completed = await streamProviderCompletion({
+    model,
+    messages,
+  }, {
+    signal,
+    onText: (text) => { void onText(text); },
+  });
+  return { content: completed.content, usage: completed.usage };
 }
