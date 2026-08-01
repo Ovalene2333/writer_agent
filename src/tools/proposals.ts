@@ -269,6 +269,21 @@ export async function gateProseStyle(
   if (styleError) throw new Error(styleError);
 }
 
+export const PRIMARY_PROSE_GATE_TIMEOUT_MS = 60_000;
+export const FINAL_PROSE_GATE_TIMEOUT_MS = 180_000;
+
+/**
+ * A fast primary keeps ordinary gates responsive, while the last/only model gets
+ * enough time for full-chapter semantic review. jn3's healthy reviewer regularly
+ * needs more than 60 seconds, so applying the primary timeout to the fallback
+ * incorrectly turned normal latency into a dependency outage.
+ */
+export function proseGateReviewTimeoutMs(modelIndex: number, modelCount: number): number {
+  return modelCount > 1 && modelIndex < modelCount - 1
+    ? PRIMARY_PROSE_GATE_TIMEOUT_MS
+    : FINAL_PROSE_GATE_TIMEOUT_MS;
+}
+
 export async function proseStyleGateIssues(
   beforeContent: string,
   afterContent: string,
@@ -313,7 +328,7 @@ export async function proseStyleGateIssues(
     }
     let learnedIssues: Awaited<ReturnType<typeof adjudicateLearnedProseGates>> | undefined;
     let learnedFailure: unknown;
-    for (const adjudicatorModel of adjudicatorModels) {
+    for (const [modelIndex, adjudicatorModel] of adjudicatorModels.entries()) {
       try {
         learnedIssues = await adjudicateLearnedProseGates(
           afterContent,
@@ -323,7 +338,9 @@ export async function proseStyleGateIssues(
             signal: context.proseAdjudicator.signal,
             usageReporter: context.modelUsageReporter,
             callKind: "learned_prose_gate",
-            ...(options?.failClosed ? { timeoutMs: 60_000 } : {}),
+            ...(options?.failClosed
+              ? { timeoutMs: proseGateReviewTimeoutMs(modelIndex, adjudicatorModels.length) }
+              : {}),
             ...(options?.reviewWholeText ? {} : { beforeText: beforeContent }),
             failClosed: options?.failClosed === true,
           },

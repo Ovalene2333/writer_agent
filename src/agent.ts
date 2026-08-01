@@ -1772,8 +1772,12 @@ function proposalFailurePauseResult(
 ): Record<string, unknown> {
   const dependency = reason === "dependency";
   const exhausted = reason === "revision_exhausted";
+  const dependencyTimedOut = dependency && [result.error, result.message]
+    .some(value => typeof value === "string" && /timeout|timed out|超时|未响应/iu.test(value));
   const summary = dependency
-    ? "提案依赖的审核模型及回退模型均不可用。"
+    ? dependencyTimedOut
+      ? "提案审核依赖在允许时限内没有返回结果。"
+      : "提案依赖的审核模型及回退模型均不可用。"
     : exhausted
       ? "同一提案已达到运行时允许的修订提交上限。"
       : "提案请求本身无效，继续原样重试不会成功。";
@@ -1791,7 +1795,9 @@ function proposalFailurePauseResult(
         : "本次已停止自动提交，请检查驳回信息或给出新的处理指令。",
     ].filter(Boolean).join("\n"),
     question: dependency
-      ? "提案审核依赖暂时不可用；恢复后可续跑。"
+      ? dependencyTimedOut
+        ? "提案审核本次响应超时；正文已保留，可续跑重新提交。"
+        : "提案审核依赖暂时不可用；恢复后可续跑。"
       : "提案自动修订已停止，请检查驳回信息后决定是否续跑。",
     options: ["续跑"],
     ...(draft ? { artifactId: draft.artifactId, path: draft.path, sourceHash: draft.sourceHash } : {}),

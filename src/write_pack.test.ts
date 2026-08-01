@@ -23,13 +23,25 @@ import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { executeTool } from "./tools/execute.js";
-import { submitFullDocumentProposal } from "./tools/proposals.js";
+import {
+  FINAL_PROSE_GATE_TIMEOUT_MS,
+  PRIMARY_PROSE_GATE_TIMEOUT_MS,
+  proseGateReviewTimeoutMs,
+  submitFullDocumentProposal,
+} from "./tools/proposals.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { sceneProseScoreBreakdown } from "./prose_metrics.js";
 import { shouldSkipSceneCandidates } from "./scene_candidates.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
 import { documentSpans } from "./document_spans.js";
 import type { AgentEvent } from "./types.js";
+
+test("fail-closed prose gate gives the final reviewer a full-chapter timeout", () => {
+  assert.equal(proseGateReviewTimeoutMs(0, 2), PRIMARY_PROSE_GATE_TIMEOUT_MS);
+  assert.equal(proseGateReviewTimeoutMs(1, 2), FINAL_PROSE_GATE_TIMEOUT_MS);
+  assert.equal(proseGateReviewTimeoutMs(0, 1), FINAL_PROSE_GATE_TIMEOUT_MS);
+  assert.ok(FINAL_PROSE_GATE_TIMEOUT_MS > PRIMARY_PROSE_GATE_TIMEOUT_MS);
+});
 
 test("sanitizeDiegeticText rewrites 序章 meta into story-world phrasing", () => {
   const { text, stripped } = sanitizeDiegeticText("比序章里预估的还高了零点七。");
