@@ -245,9 +245,31 @@ test("a corrupted block truncates the chain instead of throwing", () => {
     store.appendAgentTurnBlock(sessionId, { turnIndex: 1, messages: [{ role: "user", content: "第二轮" }], estimatedTokens: 4 });
     // Simulate a truncated blob written by an older build.
     (store as unknown as { database: { prepare(sql: string): { run(...args: unknown[]): void } } })
-      .database.prepare("UPDATE agent_turn_blocks SET messages_json='[{\"role\":' WHERE turn_index=1")
-      .run();
+      .database.prepare(`UPDATE agent_replay_commits SET messages_json='[{"role":'
+        WHERE id=(SELECT head_commit_id FROM agent_replay_heads WHERE session_id=?)`)
+      .run(sessionId);
     assert.deepEqual(store.agentTurnBlocks(sessionId).map(block => block.messages), [good]);
+  });
+});
+
+test("rewind forks the replay ledger at the owning user message", () => {
+  withStore("replay-fork", (store, sessionId) => {
+    const firstMessageId = store.addMessage(sessionId, "user", "第一轮", "agent");
+    appendTurn(store, sessionId, 0, [{ role: "user", content: "第一轮" }]);
+    const secondMessageId = store.addMessage(sessionId, "user", "第二轮", "agent");
+    store.appendAgentTurnBlock(sessionId, {
+      turnIndex: 1,
+      sourceMessageId: secondMessageId,
+      messages: [{ role: "user", content: "第二轮" }],
+      estimatedTokens: 4,
+    });
+    // Give the first legacy-shaped test block precise ownership before exercising the fork.
+    const database = (store as unknown as { database: { prepare(sql: string): { run(...args: unknown[]): void } } }).database;
+    database.prepare(`UPDATE agent_replay_commits SET source_message_id=?
+      WHERE session_id=? AND parent_id IS NULL`).run(firstMessageId, sessionId);
+
+    store.rewindFromMessage(sessionId, secondMessageId, { keepChanges: true });
+    assert.deepEqual(store.agentTurnBlocks(sessionId).map(block => block.messages), [[{ role: "user", content: "第一轮" }]]);
   });
 });
 

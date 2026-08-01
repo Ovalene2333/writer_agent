@@ -137,16 +137,16 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    [tools schema]
  *    [buildStableSystemPrefix: 6 fixed system slots]
  *    [project trunk: 1 system — outline skeleton + character index + lore paths]
- *    [frozen turns 1..N-1, replayed byte-verbatim from agent_turn_blocks]
+ *    [frozen turns 1..N-1, replayed byte-verbatim from immutable replay commits]
  *    [this turn's dynamic block]
  *      turn 1 : buildDynamicTurnMessages — 8 fixed system slots + 1 user
  *      turn 2+: mergedTurnContext — ONE user message (see rule 4b)
  *    [assistant / tool turns appended during the job]
  *    Never insert optional system messages *between* stable slots; use the
  *    existing placeholder text when a block is empty so slot indices never shift.
- *    Trunk is session-level materials (not frozen into turn blocks). Same material
- *    hash ⇒ identical trunk bytes across turns so the provider prefix can hit
- *    through it; material edits roll a new hash and only miss from the trunk on.
+ *    Trunk is pinned for one replay epoch (not frozen into turn blocks). Material
+ *    edits append one authoritative update in the dynamic tail; the pinned bytes
+ *    and replay before that update keep hitting. A semantic clear rolls the trunk.
  *    Each finished turn is frozen (freezeTurnBlock) and replayed on the next turn,
  *    so the only new bytes in turn N are turn N's own block. Replay is VERBATIM —
  *    never lean-ify a block on the way out, or the common prefix ends right there.
@@ -179,10 +179,12 @@ export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/
  *    After the first streamCompletion, do not mutate earlier messages (no mid-job
  *    compactRuntimeMessages / rehydrate / stripStaleReasoning / compactCompletedToolCalls).
  *    Compactors are only for rebuilding a transcript outside an active job.
- *    Cross-turn this extends to the frozen chain: loadReplayMessages may compact
+ *    Cross-turn this extends to the immutable frozen chain: loadReplayMessages may compact
  *    or drop whole turns, but only *before* the job's first request, and it writes
- *    the shrunk form back so the shrink is paid for exactly once and then becomes
- *    the new cacheable prefix. Never rewrite replayed bytes on the fly.
+ *    and atomically publish a new head so the shrink is paid for exactly once and
+ *    then becomes the new cacheable prefix. Old commits remain an archived branch.
+ *    Never rewrite replayed bytes on the fly. Edit/rerun moves the head to the
+ *    owning source_message ancestor before deleting dialogue rows.
  *    Sole exceptions — boundary truncations (never rewrites, so the surviving
  *    prefix still cache-hits):
  *    a) Chapter boundary: after a successful proposal with further writing steps,
@@ -258,6 +260,8 @@ type PrefixCacheRequestContext = {
   stableMessageCount: number;
   initialMessageCount: number;
   replayedMessageCount?: number;
+  replayHeadCommitId?: string;
+  projectSnapshotHash?: string;
 };
 
 type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "audit" | "character" | "simple_character" | "general";
@@ -673,7 +677,7 @@ async function repairToolArgumentsWithModel(
   prefixCache?: PrefixCacheRequestContext,
 ): Promise<{
   arguments?: string;
-  usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean };
+  usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; cacheWriteTokens?: number; estimated?: boolean };
 }> {
   const messages = buildToolArgumentRepairMessages({
     toolName: call.name,
@@ -848,7 +852,7 @@ async function compileWritingTaskContract(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
   characterScope?: number[],
   selectionCharacters = 0,
-  onUsage?: (usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean }, retry: boolean) => void,
+  onUsage?: (usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; cacheWriteTokens?: number; estimated?: boolean }, retry: boolean) => void,
   prefixCache?: Omit<PrefixCacheRequestContext, "callKind" | "stableMessageCount" | "initialMessageCount">,
 ): Promise<{ task: WritingTask }> {
   const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
@@ -2110,7 +2114,7 @@ export async function runAgent(options: {
   if (!task.continuation && previousIdentity !== taskIdentity) {
     // A mode/outcome switch invalidates workflow state, not immutable reads.
     // Exact arguments + sourceHash still guard every artifact cache lookup.
-    store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true });
+    store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true, preserveMaterialsShelf: true });
   }
   // A fresh request in the same mode may keep its todo list, but must never
   // inherit an unfinished server-side draft unless the planner marked it as a continuation.
@@ -2342,7 +2346,27 @@ export async function runAgent(options: {
     // into every turn, so normalize legacy blocks before the first request too.
     normalize: stripFrozenMaterialsShelfMessages,
   });
-  const projectTrunk = buildSessionProjectTrunk(project, store);
+  const currentProjectTrunk = buildSessionProjectTrunk(project, store);
+  // Keep the epoch's trunk byte-stable in front of replay. Project edits made by
+  // an earlier turn are supplied as a dynamic authoritative update, so they no
+  // longer invalidate every cached replay byte behind this system message.
+  const pinnedProjectTrunk = replay.messages.length ? store.agentReplayTrunk(sessionId) : undefined;
+  const projectTrunk = pinnedProjectTrunk
+    ? { ...currentProjectTrunk, ...pinnedProjectTrunk }
+    : currentProjectTrunk;
+  if (!pinnedProjectTrunk) store.pinAgentReplayTrunk(sessionId, currentProjectTrunk);
+  const activeReplayBlocks = store.agentTurnBlocks(sessionId);
+  const replayHead = activeReplayBlocks.at(-1);
+  const activeReplayHasCurrentUpdate = activeReplayBlocks.some(block =>
+    block.projectUpdateIncluded && block.projectSnapshotHash === currentProjectTrunk.hash);
+  const projectTrunkUpdate = currentProjectTrunk.hash !== projectTrunk.hash && !activeReplayHasCurrentUpdate
+    ? [
+        "项目索引更新（权威，覆盖前缀中的历史项目索引）：",
+        `baseline=${projectTrunk.hash} current=${currentProjectTrunk.hash}`,
+        currentProjectTrunk.content,
+      ].join("\n")
+    : "";
+  const replayHeadCommitId = replayHead?.commitId;
   const trunkMessage: ApiMessage = { role: "system", content: projectTrunk.content };
   let trunkNodeId: string | undefined;
   try {
@@ -2381,7 +2405,7 @@ export async function runAgent(options: {
       turnProseLength,
     )}
 
-${managedHandoffContext}`,
+${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}`,
     dynamicStyleContext: dynamicStyleContext || undefined,
     bootstrapContext: bootstrapContext || undefined,
     todosPrompt,
@@ -2576,6 +2600,9 @@ ${managedHandoffContext}`,
       if (!block.length) return;
       store.appendAgentTurnBlock(sessionId, {
         turnIndex: store.nextAgentTurnIndex(sessionId),
+        sourceMessageId,
+        projectSnapshotHash: currentProjectTrunk.hash,
+        projectUpdateIncluded: Boolean(projectTrunkUpdate),
         messages: block,
         estimatedTokens: approximateMessageTokens(block),
       });
@@ -2810,7 +2837,9 @@ ${managedHandoffContext}`,
           store.resolveAttachmentBytes(attachmentSessionId, attachmentId),
         // DeepSeek isolates KV cache by user_id. Use an opaque project identity so
         // stable prefixes survive new sessions without crossing project boundaries.
-        ...(isDeepSeekModel(stepModel) ? { userId: projectCacheUserId(project.root) } : {}),
+        ...(isDeepSeekModel(stepModel) || usesResponsesApi(stepModel)
+          ? { userId: projectCacheUserId(project.root) }
+          : {}),
         prefixCache: {
           projectRoot: project.root,
           sessionId,
@@ -2820,6 +2849,8 @@ ${managedHandoffContext}`,
           stableMessageCount: 6,
           initialMessageCount,
           replayedMessageCount,
+          ...(replayHeadCommitId ? { replayHeadCommitId } : {}),
+          projectSnapshotHash: currentProjectTrunk.hash,
         },
         ...stepThinkingOptions,
       });
@@ -4343,10 +4374,13 @@ export function hydrateSessionMaterialsShelf(
 ): Map<string, MaterialsShelfEntry> {
   const map = new Map<string, MaterialsShelfEntry>();
   let dirty = false;
-  const characterIds = new Set(store.characters().map(item => item.id));
+  const characterHashes = new Map(store.characters().map(item => [
+    item.id,
+    project.hash(JSON.stringify(item)),
+  ]));
   for (const entry of store.sessionMaterialsShelf(sessionId)) {
     if (entry.characterId != null) {
-      if (!characterIds.has(entry.characterId)) {
+      if (characterHashes.get(entry.characterId) !== entry.sourceHash) {
         dirty = true;
         continue;
       }
@@ -4537,7 +4571,11 @@ async function executeToolCached(
   const path = typeof normalized.path === "string" ? normalized.path : undefined;
   const outlinePath = call.name.includes("outline") ? resolveOutlineSourcePath(project) : undefined;
   const sourcePath = path ?? (outlinePath && project.documentExists(outlinePath) ? outlinePath : undefined);
-  const sourceHash = sourcePath && project.textFileExists(sourcePath)
+  const characterId = call.name === "get_character" ? optionalPositiveIntegerLike(normalized.id) : undefined;
+  const character = characterId ? store.characters().find(item => item.id === characterId) : undefined;
+  const sourceHash = character
+    ? project.hash(JSON.stringify(character))
+    : sourcePath && project.textFileExists(sourcePath)
     ? project.hash(project.readTextFile(sourcePath))
     : call.name === "search_project"
       ? project.hash(JSON.stringify({
@@ -4579,7 +4617,9 @@ async function executeToolCached(
       // Allow sectioned edit reads (view=edit + sections) even after full card served.
       const targeted = typeof normalized.view === "string" && normalized.view === "edit"
         && Array.isArray(normalized.sections) && normalized.sections.length > 0;
-      if (shelf?.fullBodyServed && !targeted) return materialsShelfHitPayload(shelf, { tool: call.name });
+      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash && !targeted) {
+        return materialsShelfHitPayload(shelf, { tool: call.name });
+      }
     }
   }
 
@@ -4703,7 +4743,7 @@ function rememberMaterialsFromToolResult(
       registerMaterialsShelfEntry(context, {
         key: materialsShelfKeyForCharacter(id),
         characterId: id,
-        sourceHash: `character:${id}`,
+        sourceHash,
         kind: toolName,
         digest: `${name} ${summary}`.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS),
         bodyChars: result.length,
@@ -5280,7 +5320,7 @@ async function streamCompletion(
   onText: (text: string) => void,
   onReasoning: (text: string) => void,
   options: CompletionRequestOptions = {},
-): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; estimated?: boolean } }> {
+): Promise<{ content: string; reasoningContent: string; toolCalls: ToolAccumulator[]; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; cacheWriteTokens?: number; estimated?: boolean } }> {
   const endpoint = modelCompletionEndpoint(model);
   // Expand attachment refs / strip images for text-only models only at the wire boundary.
   // Live + archived message arrays keep stable writer-attachment:// refs (cache-friendly size).
@@ -5306,6 +5346,8 @@ async function streamCompletion(
         ...(options.prefixCache.replayedMessageCount !== undefined
           ? { replayedMessageCount: options.prefixCache.replayedMessageCount }
           : {}),
+        ...(options.prefixCache.replayHeadCommitId ? { replayHeadCommitId: options.prefixCache.replayHeadCommitId } : {}),
+        ...(options.prefixCache.projectSnapshotHash ? { projectSnapshotHash: options.prefixCache.projectSnapshotHash } : {}),
         requestProfile: {
           thinking: options.thinking?.type,
           responseFormat: options.responseFormat?.type,
@@ -5349,6 +5391,9 @@ async function streamCompletion(
       completionTokens: resolvedUsage.completionTokens,
       cacheHitTokens: resolvedUsage.cacheHitTokens,
       cacheMissTokens: resolvedUsage.cacheMissTokens,
+      ...("cacheWriteTokens" in resolvedUsage && resolvedUsage.cacheWriteTokens !== undefined
+        ? { cacheWriteTokens: resolvedUsage.cacheWriteTokens }
+        : {}),
       ...("estimated" in resolvedUsage && resolvedUsage.estimated ? { estimated: true } : {}),
       ...(streamed.finishReason ? { finishReason: streamed.finishReason } : {}),
     });

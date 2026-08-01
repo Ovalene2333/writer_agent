@@ -95,6 +95,8 @@ export interface ModelTokenUsage {
   completionTokens: number;
   cacheHitTokens: number;
   cacheMissTokens: number;
+  /** Provider-reported tokens written into an explicit/ephemeral prompt cache. */
+  cacheWriteTokens?: number;
 }
 
 export type ProviderId = "deepseek" | "openai-compatible" | "openai-responses";
@@ -495,7 +497,15 @@ export interface MessageStepTrail {
  * never lean-ify it in place — a rewritten body costs one extra full miss.
  */
 export interface AgentTurnBlock {
+  /** Immutable replay-ledger commit that owns this exact frozen payload. */
+  commitId?: string;
   turnIndex: number;
+  /** User message whose Agent job produced this block. Used to fork safely on edit/rerun. */
+  sourceMessageId?: number;
+  /** Project-trunk snapshot seen by the job. Diagnostic; replay bytes remain authoritative. */
+  projectSnapshotHash?: string;
+  /** This block carries the authoritative dynamic update from the pinned trunk. */
+  projectUpdateIncluded?: boolean;
   messages: AgentTurnMessage[];
   estimatedTokens: number;
   createdAt: string;

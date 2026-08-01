@@ -12,6 +12,8 @@ import { dirname, resolve } from "node:path";
 
 const PREFIX_CACHE_LOG_VERSION = 2;
 const DEFAULT_REPLAY_BYTES = 16 * 1024 * 1024;
+/** Conservative implicit-cache lease; older entries remain structural evidence only. */
+const DEFAULT_CACHE_LEASE_MS = 55 * 60 * 1000;
 
 export type PrefixCacheMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -70,6 +72,8 @@ export type PrefixCacheRequestInput = {
   /** End of the replayed frozen turns; defaults to stableMessageCount (no replay). */
   replayedMessageCount?: number;
   requestProfile?: Record<string, unknown>;
+  replayHeadCommitId?: string;
+  projectSnapshotHash?: string;
 };
 
 export type PrefixCachePrediction = {
@@ -79,6 +83,11 @@ export type PrefixCachePrediction = {
   predictedHitCharacters: number;
   predictedHitBytes: number;
   predictedHitTokens: number;
+  /** Hit estimate discounted when the last provider-confirmed request is older than its lease. */
+  leaseAdjustedHitTokens: number;
+  cacheConfidence: number;
+  cacheLeaseMs: number;
+  confirmedPrefixAgeMs?: number;
   fullRequestKnown: boolean;
   firstDivergence?: {
     atomIndex: number;
@@ -102,6 +111,7 @@ export type PrefixCacheCompletion = {
   completionTokens?: number;
   cacheHitTokens?: number;
   cacheMissTokens?: number;
+  cacheWriteTokens?: number;
   estimated?: boolean;
   finishReason?: string;
   error?: string;
@@ -111,6 +121,7 @@ type PrefixTreeNode = {
   children: Map<string, PrefixTreeNode>;
   visits: number;
   terminals: number;
+  lastConfirmedAt: number;
 };
 
 type PrefixTreeRoot = {
@@ -135,6 +146,11 @@ type StartLogRecord = {
   jobId?: string;
   callKind: string;
   step?: number;
+  manifest: {
+    hash: string;
+    replayHeadCommitId?: string;
+    projectSnapshotHash?: string;
+  };
   prediction: PrefixCachePrediction;
   totals: {
     atoms: number;
@@ -163,6 +179,13 @@ type FinishLogRecord = {
   prediction: PrefixCachePrediction;
   actual: PrefixCacheCompletion;
   predictionErrorTokens?: number;
+  cacheAssessment: {
+    eligiblePrefixTokens: number;
+    eligibleHitRate?: number;
+    confidence: number;
+    confirmedPrefixAgeMs?: number;
+    coldStartCause: "warm" | "structural_divergence" | "lease_expired" | "provider_eviction_or_routing" | "usage_unreported" | "request_error";
+  };
 };
 
 function hash(value: string, length = 16): string {
@@ -174,7 +197,7 @@ function estimatedTokens(bytes: number): number {
 }
 
 function emptyNode(): PrefixTreeNode {
-  return { children: new Map(), visits: 0, terminals: 0 };
+  return { children: new Map(), visits: 0, terminals: 0, lastConfirmedAt: 0 };
 }
 
 function serializeMessage(message: PrefixCacheMessage): string {
@@ -340,15 +363,24 @@ export class RequestPrefixForest {
     replayBytes = DEFAULT_REPLAY_BYTES,
   ) {
     const text = readRecentLog(logPath, replayBytes);
+    const pending = new Map<string, { namespaceHash: string; atoms: PrefixCacheAtom[] }>();
     for (const line of text.split(/\r?\n/)) {
       if (!line.trim()) continue;
       try {
-        const record = JSON.parse(line) as Partial<StartLogRecord>;
-        if (record.version !== PREFIX_CACHE_LOG_VERSION || record.event !== "request_start"
-          || typeof record.namespaceHash !== "string" || !Array.isArray(record.atoms)) continue;
-        const atoms = record.atoms.filter((atom): atom is PrefixCacheAtom =>
-          Boolean(atom && typeof atom.hash === "string"));
-        this.insert(record.namespaceHash, atoms);
+        const record = JSON.parse(line) as Partial<StartLogRecord> | Partial<FinishLogRecord>;
+        if (record.version !== PREFIX_CACHE_LOG_VERSION || typeof record.observationId !== "string") continue;
+        if (record.event === "request_start" && typeof record.namespaceHash === "string" && Array.isArray(record.atoms)) {
+          const atoms = record.atoms.filter((atom): atom is PrefixCacheAtom => Boolean(atom && typeof atom.hash === "string"));
+          pending.set(record.observationId, { namespaceHash: record.namespaceHash, atoms });
+          continue;
+        }
+        if (record.event === "request_finish") {
+          const started = pending.get(record.observationId);
+          if (!started) continue;
+          const actual = record.actual as PrefixCacheCompletion | undefined;
+          if (actual && !actual.error) this.insert(started.namespaceHash, started.atoms, Date.parse(String(record.at ?? "")) || Date.now());
+          pending.delete(record.observationId);
+        }
       } catch {
         // A partial final line or older log version is ignored.
       }
@@ -367,7 +399,7 @@ export class RequestPrefixForest {
     };
     const namespaceHash = hash(JSON.stringify(namespace));
     const atoms = buildPrefixCacheAtoms(input);
-    const prediction = this.query(namespaceHash, atoms);
+    const prediction = this.query(namespaceHash, atoms, Date.now(), DEFAULT_CACHE_LEASE_MS);
     const observation: PrefixCacheObservation = {
       observationId: randomUUID(),
       logPath: this.logPath,
@@ -377,6 +409,9 @@ export class RequestPrefixForest {
       startedAt,
     };
     const documentAtoms = atoms.filter(atom => atom.document);
+    const manifestHash = hash(JSON.stringify(atoms
+      .filter(atom => atom.kind === "stable_system" || atom.kind === "tool_schema")
+      .map(atom => [atom.kind, atom.hash])), 20);
     appendJsonLine(this.logPath, {
       version: PREFIX_CACHE_LOG_VERSION,
       event: "request_start",
@@ -388,6 +423,11 @@ export class RequestPrefixForest {
       ...(input.jobId ? { jobId: input.jobId } : {}),
       callKind: input.callKind,
       ...(input.step !== undefined ? { step: input.step } : {}),
+      manifest: {
+        hash: manifestHash,
+        ...(input.replayHeadCommitId ? { replayHeadCommitId: input.replayHeadCommitId } : {}),
+        ...(input.projectSnapshotHash ? { projectSnapshotHash: input.projectSnapshotHash } : {}),
+      },
       prediction,
       totals: {
         atoms: atoms.length,
@@ -400,14 +440,29 @@ export class RequestPrefixForest {
       components: componentSummary(atoms),
       atoms,
     });
-    // The request is about to reach the provider. Make it visible to concurrent
-    // observations even if the process exits before a finish record is written.
-    this.insert(namespaceHash, atoms);
     return observation;
   }
 
   finish(observation: PrefixCacheObservation, actual: PrefixCacheCompletion): void {
     const durationMs = Math.max(0, Date.now() - Date.parse(observation.startedAt));
+    // A locally constructed request is not proof that the provider retained it.
+    // Publish only completed requests; failed/in-flight calls must not warm predictions.
+    if (!actual.error) this.insert(observation.namespaceHash, observation.atoms, Date.now());
+    const eligiblePrefixTokens = observation.prediction.predictedHitTokens;
+    const eligibleHitRate = actual.cacheHitTokens !== undefined && eligiblePrefixTokens > 0
+      ? actual.cacheHitTokens / eligiblePrefixTokens
+      : undefined;
+    const coldStartCause: FinishLogRecord["cacheAssessment"]["coldStartCause"] = actual.error
+      ? "request_error"
+      : actual.cacheHitTokens === undefined
+        ? "usage_unreported"
+        : eligiblePrefixTokens === 0
+          ? "structural_divergence"
+          : observation.prediction.cacheConfidence === 0
+            ? "lease_expired"
+            : actual.cacheHitTokens < Math.max(128, observation.prediction.leaseAdjustedHitTokens * 0.25)
+              ? "provider_eviction_or_routing"
+              : "warm";
     appendJsonLine(this.logPath, {
       version: PREFIX_CACHE_LOG_VERSION,
       event: "request_finish",
@@ -417,19 +472,34 @@ export class RequestPrefixForest {
       durationMs,
       prediction: observation.prediction,
       actual,
+      cacheAssessment: {
+        eligiblePrefixTokens,
+        ...(eligibleHitRate !== undefined ? { eligibleHitRate } : {}),
+        confidence: observation.prediction.cacheConfidence,
+        ...(observation.prediction.confirmedPrefixAgeMs !== undefined
+          ? { confirmedPrefixAgeMs: observation.prediction.confirmedPrefixAgeMs }
+          : {}),
+        coldStartCause,
+      },
       ...(actual.cacheHitTokens !== undefined
         ? { predictionErrorTokens: actual.cacheHitTokens - observation.prediction.predictedHitTokens }
         : {}),
     });
   }
 
-  query(namespaceHash: string, atoms: readonly PrefixCacheAtom[]): PrefixCachePrediction {
+  query(
+    namespaceHash: string,
+    atoms: readonly PrefixCacheAtom[],
+    now = Date.now(),
+    cacheLeaseMs = DEFAULT_CACHE_LEASE_MS,
+  ): PrefixCachePrediction {
     const root = this.roots.get(namespaceHash);
     let node = root?.node;
     let matchedAtoms = 0;
     let predictedHitCharacters = 0;
     let predictedHitBytes = 0;
     let predictedHitTokens = 0;
+    let confirmedAt = 0;
     for (const atom of atoms) {
       const next = node?.children.get(atom.hash);
       if (!next) break;
@@ -438,7 +508,13 @@ export class RequestPrefixForest {
       predictedHitCharacters += atom.characters;
       predictedHitBytes += atom.bytes;
       predictedHitTokens += atom.estimatedTokens;
+      confirmedAt = confirmedAt ? Math.min(confirmedAt, next.lastConfirmedAt) : next.lastConfirmedAt;
     }
+    const confirmedPrefixAgeMs = confirmedAt ? Math.max(0, now - confirmedAt) : undefined;
+    const cacheConfidence = confirmedPrefixAgeMs === undefined ? 0
+      : confirmedPrefixAgeMs <= cacheLeaseMs ? 1
+        : confirmedPrefixAgeMs <= cacheLeaseMs * 4 ? 0.25
+          : 0;
     const divergent = atoms[matchedAtoms];
     return {
       priorRequests: root?.requests ?? 0,
@@ -447,6 +523,10 @@ export class RequestPrefixForest {
       predictedHitCharacters,
       predictedHitBytes,
       predictedHitTokens,
+      leaseAdjustedHitTokens: Math.floor(predictedHitTokens * cacheConfidence),
+      cacheConfidence,
+      cacheLeaseMs,
+      ...(confirmedPrefixAgeMs !== undefined ? { confirmedPrefixAgeMs } : {}),
       fullRequestKnown: atoms.length > 0 && matchedAtoms === atoms.length && Boolean(node?.terminals),
       ...(divergent
         ? {
@@ -461,7 +541,7 @@ export class RequestPrefixForest {
     };
   }
 
-  private insert(namespaceHash: string, atoms: readonly PrefixCacheAtom[]): void {
+  private insert(namespaceHash: string, atoms: readonly PrefixCacheAtom[], confirmedAt: number): void {
     let root = this.roots.get(namespaceHash);
     if (!root) {
       root = { node: emptyNode(), requests: 0 };
@@ -470,6 +550,7 @@ export class RequestPrefixForest {
     root.requests += 1;
     let node = root.node;
     node.visits += 1;
+    node.lastConfirmedAt = Math.max(node.lastConfirmedAt, confirmedAt);
     for (const atom of atoms) {
       let next = node.children.get(atom.hash);
       if (!next) {
@@ -477,6 +558,7 @@ export class RequestPrefixForest {
         node.children.set(atom.hash, next);
       }
       next.visits += 1;
+      next.lastConfirmedAt = Math.max(next.lastConfirmedAt, confirmedAt);
       node = next;
     }
     node.terminals += 1;

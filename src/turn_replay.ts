@@ -194,6 +194,9 @@ export function loadReplayMessages(input: {
       : block.messages;
     if (input.normalize && JSON.stringify(messages) !== JSON.stringify(block.messages)) normalized = true;
     return {
+      sourceMessageId: block.sourceMessageId,
+      projectSnapshotHash: block.projectSnapshotHash,
+      projectUpdateIncluded: block.projectUpdateIncluded,
       messages,
       estimatedTokens: normalized || input.normalize
         ? approximateMessageTokens(messages)
@@ -217,7 +220,7 @@ export function loadReplayMessages(input: {
       input.compact(candidate, { keepRecent: 0, force: true });
       const estimatedTokens = approximateMessageTokens(candidate);
       if (estimatedTokens >= block.estimatedTokens) continue; // Already compact — leave the bytes alone.
-      chain[index] = { messages: candidate, estimatedTokens };
+      chain[index] = { ...block, messages: candidate, estimatedTokens };
       compacted = true;
     }
 

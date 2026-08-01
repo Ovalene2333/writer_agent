@@ -484,6 +484,32 @@ export class WriterStore {
         UNIQUE(session_id, turn_index)
       );
       CREATE INDEX IF NOT EXISTS agent_turn_blocks_session ON agent_turn_blocks(session_id, turn_index);
+      CREATE TABLE IF NOT EXISTS agent_replay_commits (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        parent_id TEXT REFERENCES agent_replay_commits(id),
+        source_message_id INTEGER,
+        project_snapshot_hash TEXT NOT NULL DEFAULT '',
+        project_update_included INTEGER NOT NULL DEFAULT 0,
+        messages_json TEXT NOT NULL,
+        estimated_tokens INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS agent_replay_commits_session
+        ON agent_replay_commits(session_id, created_at);
+      CREATE TABLE IF NOT EXISTS agent_replay_heads (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        head_commit_id TEXT REFERENCES agent_replay_commits(id),
+        generation INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS agent_replay_trunks (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        snapshot_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        estimated_tokens INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS message_step_trails (
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         source_message_id INTEGER NOT NULL,
@@ -651,6 +677,10 @@ export class WriterStore {
     }
     if (!usageColumns.some(column => column.name === "provider_name")) {
       this.database.exec("ALTER TABLE model_usage ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''");
+    }
+    const replayCommitColumns = this.database.prepare("PRAGMA table_info(agent_replay_commits)").all() as Row[];
+    if (!replayCommitColumns.some(column => column.name === "project_update_included")) {
+      this.database.exec("ALTER TABLE agent_replay_commits ADD COLUMN project_update_included INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -928,11 +958,19 @@ export class WriterStore {
    * task workflow state. Preserve them across ordinary task switches; rewinds and
    * reruns keep the default full clear so removed dialogue cannot leak its reads.
    */
-  clearSessionTaskState(sessionId: string, options: { preserveContextArtifacts?: boolean } = {}): void {
+  clearSessionTaskState(
+    sessionId: string,
+    options: { preserveContextArtifacts?: boolean; preserveMaterialsShelf?: boolean } = {},
+  ): void {
     const now = new Date().toISOString();
-    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,agent_checkpoint_json,updated_at) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET active_document=NULL, current_intent='', todos_json='[]', agent_checkpoint_json='{}', updated_at=excluded.updated_at`)
-      .run(sessionId, null, "", "[]", "{}", now);
+    const preserveMaterialsShelf = options.preserveMaterialsShelf ?? options.preserveContextArtifacts ?? false;
+    const materialsShelf = preserveMaterialsShelf ? this.sessionMaterialsShelf(sessionId) : [];
+    this.database.prepare(`INSERT INTO session_context(
+        session_id,active_document,current_intent,todos_json,agent_checkpoint_json,materials_shelf_json,updated_at
+      ) VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+        active_document=NULL,current_intent='',todos_json='[]',agent_checkpoint_json='{}',
+        materials_shelf_json=excluded.materials_shelf_json,updated_at=excluded.updated_at`)
+      .run(sessionId, null, "", "[]", "{}", JSON.stringify(materialsShelf), now);
     if (!options.preserveContextArtifacts) {
       this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
     }
@@ -1597,20 +1635,64 @@ export class WriterStore {
   }
 
   /**
-   * The session's frozen turn chain, oldest first. A block that fails to parse is
-   * dropped along with everything after it: replay must be a contiguous prefix of
-   * what was actually sent, otherwise tool_call/tool_result pairs can straddle the gap.
+   * Lazily import the old mutable rows into an immutable replay ledger. Existing
+   * projects keep their warm chain; all new writes only append commits and move a
+   * per-session head pointer. The legacy table is retained only as migration input.
    */
+  private ensureAgentReplayLedger(sessionId: string): void {
+    if (this.database.prepare("SELECT 1 AS ok FROM agent_replay_heads WHERE session_id=?").get(sessionId)) return;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.database.prepare("SELECT 1 AS ok FROM agent_replay_heads WHERE session_id=?").get(sessionId)) {
+        const legacy = this.database.prepare(`SELECT messages_json,estimated_tokens,created_at
+          FROM agent_turn_blocks WHERE session_id=? ORDER BY turn_index`).all(sessionId) as Row[];
+        let parentId: string | null = null;
+        const insert = this.database.prepare(`INSERT INTO agent_replay_commits(
+          id,session_id,parent_id,source_message_id,project_snapshot_hash,project_update_included,messages_json,estimated_tokens,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)`);
+        for (const row of legacy) {
+          if (!parseAgentTurnMessages(row.messages_json)) break;
+          const id = randomUUID();
+          insert.run(id, sessionId, parentId, null, "", 0, String(row.messages_json), Number(row.estimated_tokens) || 0,
+            String(row.created_at ?? new Date().toISOString()));
+          parentId = id;
+        }
+        this.database.prepare(`INSERT INTO agent_replay_heads(session_id,head_commit_id,generation,updated_at)
+          VALUES(?,?,0,?)`).run(sessionId, parentId, new Date().toISOString());
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    }
+  }
+
+  /** Active immutable commit chain, oldest first. Invalid payload truncates the visible suffix. */
   agentTurnBlocks(sessionId: string): AgentTurnBlock[] {
-    const rows = this.database
-      .prepare("SELECT turn_index,messages_json,estimated_tokens,created_at FROM agent_turn_blocks WHERE session_id=? ORDER BY turn_index")
-      .all(sessionId) as Row[];
+    this.ensureAgentReplayLedger(sessionId);
+    const rows = this.database.prepare(`WITH RECURSIVE chain(
+        id,parent_id,source_message_id,project_snapshot_hash,project_update_included,messages_json,estimated_tokens,created_at,depth
+      ) AS (
+        SELECT c.id,c.parent_id,c.source_message_id,c.project_snapshot_hash,c.project_update_included,c.messages_json,c.estimated_tokens,c.created_at,0
+        FROM agent_replay_heads h JOIN agent_replay_commits c ON c.id=h.head_commit_id
+        WHERE h.session_id=?
+        UNION ALL
+        SELECT p.id,p.parent_id,p.source_message_id,p.project_snapshot_hash,p.project_update_included,p.messages_json,p.estimated_tokens,p.created_at,chain.depth+1
+        FROM agent_replay_commits p JOIN chain ON p.id=chain.parent_id
+        WHERE p.session_id=?
+      ) SELECT * FROM chain ORDER BY depth DESC`).all(sessionId, sessionId) as Row[];
     const blocks: AgentTurnBlock[] = [];
-    for (const row of rows) {
+    for (const [turnIndex, row] of rows.entries()) {
       const messages = parseAgentTurnMessages(row.messages_json);
       if (!messages) break;
+      const sourceMessageId = Number(row.source_message_id);
+      const projectSnapshotHash = String(row.project_snapshot_hash ?? "");
       blocks.push({
-        turnIndex: Number(row.turn_index) || 0,
+        commitId: String(row.id),
+        turnIndex,
+        ...(Number.isInteger(sourceMessageId) && sourceMessageId > 0 ? { sourceMessageId } : {}),
+        ...(projectSnapshotHash ? { projectSnapshotHash } : {}),
+        ...(Number(row.project_update_included) === 1 ? { projectUpdateIncluded: true } : {}),
         messages,
         estimatedTokens: Number(row.estimated_tokens) || 0,
         createdAt: String(row.created_at ?? ""),
@@ -1619,32 +1701,133 @@ export class WriterStore {
     return blocks;
   }
 
-  appendAgentTurnBlock(sessionId: string, block: { turnIndex: number; messages: AgentTurnMessage[]; estimatedTokens: number }): void {
-    if (!block.messages.length) return;
-    this.database.prepare(`INSERT INTO agent_turn_blocks(session_id,turn_index,messages_json,estimated_tokens,created_at)
-      VALUES(?,?,?,?,?) ON CONFLICT(session_id,turn_index) DO UPDATE SET
-        messages_json=excluded.messages_json,estimated_tokens=excluded.estimated_tokens,created_at=excluded.created_at`)
-      .run(sessionId, block.turnIndex, JSON.stringify(block.messages), block.estimatedTokens, new Date().toISOString());
+  agentReplayTrunk(sessionId: string): { hash: string; content: string; estimatedTokens: number } | undefined {
+    const row = this.database.prepare(`SELECT snapshot_hash,content,estimated_tokens
+      FROM agent_replay_trunks WHERE session_id=?`).get(sessionId) as Row | undefined;
+    if (!row || typeof row.snapshot_hash !== "string" || typeof row.content !== "string") return undefined;
+    return { hash: row.snapshot_hash, content: row.content, estimatedTokens: Number(row.estimated_tokens) || 0 };
   }
 
-  /** Rewrite the whole chain (boundary compaction). Turn indexes are renumbered from 0. */
-  replaceAgentTurnBlocks(sessionId: string, blocks: { messages: AgentTurnMessage[]; estimatedTokens: number }[]): void {
-    this.clearAgentTurnBlocks(sessionId);
-    blocks.forEach((block, index) => {
-      this.appendAgentTurnBlock(sessionId, { turnIndex: index, messages: block.messages, estimatedTokens: block.estimatedTokens });
-    });
+  pinAgentReplayTrunk(sessionId: string, trunk: { hash: string; content: string; estimatedTokens: number }): void {
+    this.database.prepare(`INSERT INTO agent_replay_trunks(session_id,snapshot_hash,content,estimated_tokens,updated_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET snapshot_hash=excluded.snapshot_hash,
+      content=excluded.content,estimated_tokens=excluded.estimated_tokens,updated_at=excluded.updated_at`)
+      .run(sessionId, trunk.hash, trunk.content, trunk.estimatedTokens, new Date().toISOString());
+  }
+
+  appendAgentTurnBlock(sessionId: string, block: {
+    turnIndex: number;
+    sourceMessageId?: number;
+    projectSnapshotHash?: string;
+    projectUpdateIncluded?: boolean;
+    messages: AgentTurnMessage[];
+    estimatedTokens: number;
+  }): void {
+    if (!block.messages.length) return;
+    this.ensureAgentReplayLedger(sessionId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const head = this.database.prepare("SELECT head_commit_id FROM agent_replay_heads WHERE session_id=?")
+        .get(sessionId) as Row | undefined;
+      const id = randomUUID();
+      const sourceMessageId = Number(block.sourceMessageId);
+      this.database.prepare(`INSERT INTO agent_replay_commits(
+        id,session_id,parent_id,source_message_id,project_snapshot_hash,project_update_included,messages_json,estimated_tokens,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+        id,
+        sessionId,
+        typeof head?.head_commit_id === "string" ? head.head_commit_id : null,
+        Number.isInteger(sourceMessageId) && sourceMessageId > 0 ? sourceMessageId : null,
+        block.projectSnapshotHash ?? "",
+        block.projectUpdateIncluded ? 1 : 0,
+        JSON.stringify(block.messages),
+        block.estimatedTokens,
+        new Date().toISOString(),
+      );
+      this.database.prepare("UPDATE agent_replay_heads SET head_commit_id=?,updated_at=? WHERE session_id=?")
+        .run(id, new Date().toISOString(), sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    }
+  }
+
+  /** Atomically publish a compacted chain. Old commits remain available as an archived branch. */
+  replaceAgentTurnBlocks(sessionId: string, blocks: Array<{
+    sourceMessageId?: number;
+    projectSnapshotHash?: string;
+    projectUpdateIncluded?: boolean;
+    messages: AgentTurnMessage[];
+    estimatedTokens: number;
+  }>): void {
+    this.ensureAgentReplayLedger(sessionId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      let parentId: string | null = null;
+      const insert = this.database.prepare(`INSERT INTO agent_replay_commits(
+        id,session_id,parent_id,source_message_id,project_snapshot_hash,project_update_included,messages_json,estimated_tokens,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?)`);
+      for (const block of blocks) {
+        if (!block.messages.length) continue;
+        const id = randomUUID();
+        const sourceMessageId = Number(block.sourceMessageId);
+        insert.run(
+          id, sessionId, parentId,
+          Number.isInteger(sourceMessageId) && sourceMessageId > 0 ? sourceMessageId : null,
+          block.projectSnapshotHash ?? "", block.projectUpdateIncluded ? 1 : 0,
+          JSON.stringify(block.messages), block.estimatedTokens, new Date().toISOString(),
+        );
+        parentId = id;
+      }
+      this.database.prepare(`UPDATE agent_replay_heads
+        SET head_commit_id=?,generation=generation+1,updated_at=? WHERE session_id=?`)
+        .run(parentId, new Date().toISOString(), sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    }
+  }
+
+  /** Move the active pointer to the newest ancestor strictly before targetId. */
+  truncateAgentTurnBlocksFromMessage(sessionId: string, targetId: number): void {
+    const blocks = this.agentTurnBlocks(sessionId);
+    // Legacy commits have no source ownership. A cold restart is safer than replaying
+    // one removed instruction; subsequent branches retain precise ancestry.
+    const keep = blocks.some(block => block.sourceMessageId === undefined)
+      ? undefined
+      : [...blocks].reverse().find(block => (block.sourceMessageId ?? 0) < targetId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare(`UPDATE agent_replay_heads
+        SET head_commit_id=?,generation=generation+1,updated_at=? WHERE session_id=?`)
+        .run(keep?.commitId ?? null, new Date().toISOString(), sessionId);
+      if (!keep) this.database.prepare("DELETE FROM agent_replay_trunks WHERE session_id=?").run(sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    }
   }
 
   clearAgentTurnBlocks(sessionId: string): void {
-    this.database.prepare("DELETE FROM agent_turn_blocks WHERE session_id=?").run(sessionId);
+    this.ensureAgentReplayLedger(sessionId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare(`UPDATE agent_replay_heads
+        SET head_commit_id=NULL,generation=generation+1,updated_at=? WHERE session_id=?`)
+        .run(new Date().toISOString(), sessionId);
+      this.database.prepare("DELETE FROM agent_replay_trunks WHERE session_id=?").run(sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    }
   }
 
   nextAgentTurnIndex(sessionId: string): number {
-    const row = this.database.prepare("SELECT MAX(turn_index) AS max_index FROM agent_turn_blocks WHERE session_id=?").get(sessionId) as Row | undefined;
-    // MAX over no rows is NULL, and Number(null) is 0 — an empty chain must start at 0, not 1.
-    if (row?.max_index === null || row?.max_index === undefined) return 0;
-    const max = Number(row.max_index);
-    return Number.isFinite(max) ? max + 1 : 0;
+    return this.agentTurnBlocks(sessionId).length;
   }
 
   saveRoleplayInterlocutor(input: RoleplayInterlocutor & { id?: number; targetCharacterId?: number }): SavedRoleplayInterlocutor {
@@ -3266,6 +3449,9 @@ export class WriterStore {
         }
       }
     }
+    // Fork the immutable replay ledger before removing dialogue rows. Commits on
+    // the abandoned branch stay archived, but can no longer enter live requests.
+    this.truncateAgentTurnBlocksFromMessage(sessionId, fromId);
     this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
     this.deleteMessageStepTrailsFrom(sessionId, fromId);
@@ -3321,6 +3507,7 @@ export class WriterStore {
           this.database.prepare("INSERT INTO message_variants(session_id,group_id,version_index,prompt,content,created_at) VALUES(?,?,?,?,?,?)")
             .run(sessionId, groupId, Number(max.value) + 1, "", String(target.content), new Date().toISOString());
         }
+        this.truncateAgentTurnBlocksFromMessage(sessionId, fromId);
         this.database.prepare("DELETE FROM messages WHERE session_id=? AND id>=?").run(sessionId, fromId);
         this.clearSessionTaskState(sessionId);
         this.restoreRoleplayMemoryBefore(sessionId, fromId);

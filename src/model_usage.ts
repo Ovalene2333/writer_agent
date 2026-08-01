@@ -26,12 +26,14 @@ export function parseModelTokenUsage(value: unknown): ModelTokenUsage | undefine
   const promptTokens = Number(raw.prompt_tokens ?? raw.input_tokens ?? 0);
   const completionTokens = Number(raw.completion_tokens ?? raw.output_tokens ?? 0);
   const cacheHitTokens = Number(raw.prompt_cache_hit_tokens ?? details?.cached_tokens ?? 0);
+  const cacheWriteTokens = Number(raw.cache_creation_input_tokens ?? details?.cache_write_tokens ?? 0);
   if (!(promptTokens > 0 || completionTokens > 0)) return undefined;
   return {
     promptTokens,
     completionTokens,
     cacheHitTokens,
     cacheMissTokens: Number(raw.prompt_cache_miss_tokens ?? Math.max(0, promptTokens - cacheHitTokens)),
+    ...(cacheWriteTokens > 0 ? { cacheWriteTokens } : {}),
   };
 }
 

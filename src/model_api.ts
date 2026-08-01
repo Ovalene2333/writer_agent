@@ -24,6 +24,7 @@ export type ProviderUsage = {
   completionTokens: number;
   cacheHitTokens: number;
   cacheMissTokens: number;
+  cacheWriteTokens?: number;
 };
 
 export type ProviderCompletionResult = {
@@ -219,7 +220,7 @@ export function buildProviderCompletionBody(request: ProviderCompletionRequest):
     ...(request.maxTokens ? { max_output_tokens: request.maxTokens } : {}),
     ...(request.tools?.length ? { tools: toolsToResponsesFormat(request.tools) } : {}),
     ...(request.toolChoice !== undefined ? { tool_choice: request.toolChoice } : {}),
-    ...(request.userId ? { user: request.userId } : {}),
+    ...(request.userId ? { user: request.userId, prompt_cache_key: request.userId } : {}),
     ...(sampling.temperature === undefined ? {} : { temperature: sampling.temperature }),
     ...(sampling.top_p === undefined ? {} : { top_p: sampling.top_p }),
     // Responses does not use frequency/presence penalties in the same way; omit them.
@@ -238,6 +239,7 @@ export function usageFromProviderPayload(raw: unknown): ProviderUsage | undefine
     completionTokens: parsed.completionTokens,
     cacheHitTokens: parsed.cacheHitTokens,
     cacheMissTokens: parsed.cacheMissTokens,
+    ...(parsed.cacheWriteTokens !== undefined ? { cacheWriteTokens: parsed.cacheWriteTokens } : {}),
   };
 }
 

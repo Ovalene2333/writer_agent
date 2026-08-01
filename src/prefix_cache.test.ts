@@ -45,10 +45,19 @@ test("request prefix forest finds the exact atom prefix without logging prompt b
     assert.equal(first.prediction.matchedAtoms, 0);
 
     const second = forest.begin(request(root, "different-private-request"));
-    assert.equal(second.prediction.priorRequests, 1);
-    assert.equal(second.prediction.matchedAtoms, 1, "only the stable system prefix should match");
-    assert.equal(second.prediction.firstDivergence?.kind, "user");
-    forest.finish(second, {
+    assert.equal(second.prediction.priorRequests, 0, "an unfinished request must not predict provider warmth");
+    assert.equal(second.prediction.matchedAtoms, 0);
+    forest.finish(first, {
+      promptTokens: 120,
+      completionTokens: 20,
+      cacheHitTokens: 0,
+      cacheMissTokens: 120,
+    });
+    const confirmed = forest.begin(request(root, "different-private-request"));
+    assert.equal(confirmed.prediction.priorRequests, 1);
+    assert.equal(confirmed.prediction.matchedAtoms, 1, "only the stable system prefix should match");
+    assert.equal(confirmed.prediction.firstDivergence?.kind, "user");
+    forest.finish(confirmed, {
       promptTokens: 120,
       completionTokens: 20,
       cacheHitTokens: 80,

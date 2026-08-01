@@ -78,12 +78,14 @@ test("buildProviderCompletionBody shapes chat vs responses", () => {
     ],
     stream: true,
     maxTokens: 100,
+    userId: "project-cache-key",
     responseFormat: { type: "json_object" },
   });
   assert.equal(responses.stream, true);
   assert.equal(responses.instructions, "sys");
   assert.ok(Array.isArray(responses.input));
   assert.equal(responses.max_output_tokens, 100);
+  assert.equal(responses.prompt_cache_key, "project-cache-key");
   assert.deepEqual(responses.reasoning, { effort: "medium" });
   assert.deepEqual(responses.text, { verbosity: "low", format: { type: "json_object" } });
   assert.equal(responses.messages, undefined);

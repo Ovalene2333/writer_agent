@@ -458,12 +458,14 @@ test("provider usage parsing and tagged persistence include hidden model calls",
   assert.deepEqual(parseModelTokenUsage({
     prompt_tokens: 120,
     completion_tokens: 30,
+    cache_creation_input_tokens: 12,
     prompt_tokens_details: { cached_tokens: 80 },
   }), {
     promptTokens: 120,
     completionTokens: 30,
     cacheHitTokens: 80,
     cacheMissTokens: 40,
+    cacheWriteTokens: 12,
   });
 
   const root = mkdtempSync(join(tmpdir(), "writer-usage-"));
