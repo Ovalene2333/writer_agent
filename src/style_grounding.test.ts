@@ -22,29 +22,15 @@ describe("styleFingerprint", () => {
 });
 
 describe("naturalProseCraftPrompt", () => {
-  it("turns naturalness into scene-level craft plus anti-stacking limits", () => {
+  it("grounds naturalness in positive scene-level craft without numeric recipes", () => {
     const prompt = naturalProseCraftPrompt();
-    assert.match(prompt, /注意顺序/);
-    assert.match(prompt, /场景发动/);
-    assert.match(prompt, /张力累积/);
-    assert.match(prompt, /转折余波/);
-    assert.match(prompt, /对白意图/);
-    assert.match(prompt, /具体性检查/);
-    assert.match(prompt, /篇章完整与衔接/);
-    assert.match(prompt, /阶段性结果/);
-    assert.match(prompt, /已有下一章/);
-    assert.match(prompt, /节奏与质感/);
-    assert.match(prompt, /单句成段是重音/);
-    assert.match(prompt, /绵延的长句/);
-    assert.match(prompt, /半拍/);
-    assert.match(prompt, /一拍一事|一个主要事件/);
-    assert.match(prompt, /反 AI 网剧|反机械|反生成感/);
-    assert.match(prompt, /burstiness|句长与段长要有起伏/);
-    assert.match(prompt, /人称/);
-    assert.match(prompt, /HUD|日志|功能清单/);
-    assert.match(prompt, /一句话塞十个概念|十个概念/);
-    // No demo "bad-example" blocks; hard density limits may use 禁止.
-    assert.ok(!prompt.includes("坏例"));
+    assert.match(prompt, /视角人物的注意力/);
+    assert.match(prompt, /场景从人物此刻想完成/);
+    assert.match(prompt, /对白/);
+    assert.match(prompt, /物件、环境、技术与感官/);
+    assert.match(prompt, /节奏服从现场/);
+    assert.match(prompt, /完整章节/);
+    assert.doesNotMatch(prompt, /burstiness|反 AI|每.{0,6}\d|不超过\d/u);
   });
 });
 
@@ -62,7 +48,7 @@ describe("built-in style templates", () => {
     const template = getStyleTemplate("modern-legendary");
     assert.equal(template?.name, "现代传奇叙事");
     assert.match(template?.description ?? "", /科幻.*奇幻|奇幻.*科幻/);
-    assert.match(template?.systemPromptAddition ?? "", /主动选择→代价→局势改变/);
+    assert.match(template?.systemPromptAddition ?? "", /人物目标与现实条件/);
     assert.match(template?.systemPromptAddition ?? "", /眼前异常→可操作规则→更大含义/);
     assert.match(template?.systemPromptAddition ?? "", /文明|世界秩序/);
     assert.match(template?.systemPromptAddition ?? "", /不仿写任何具体作家/);
@@ -80,10 +66,10 @@ describe("built-in style templates", () => {
     assert.ok((template?.exampleContent.length ?? 0) > 700);
   });
 
-  it("every built-in template points at anti-mechanical hygiene", () => {
+  it("every built-in template delegates shared craft to the stable grounding", () => {
     for (const template of ["webnovel-power", "literary", "marquez", "modern-commercial", "modern-legendary", "light-novel", "mystery", "xianxia"] as const) {
       const body = getStyleTemplate(template)?.systemPromptAddition ?? "";
-      assert.match(body, /全局自然叙事|反机械|堆砌/, `template ${template} should reference anti-mechanical rules`);
+      assert.match(body, /共享原则/, `template ${template} should reference shared craft rules`);
       assert.doesNotMatch(body, /破折号/, `template ${template} should not carry global punctuation gates`);
     }
   });
@@ -193,7 +179,7 @@ describe("style prompt cache boundaries", () => {
       const combined = styleGroundingPrompt(project, store, options);
       // intensive must not change the stable prefix bytes.
       assert.equal(stableA, stableB);
-      assert.ok(stableA.includes("自然叙事原则"));
+      assert.ok(stableA.includes("自然叙事核心"));
       assert.ok(dynamic.includes("雨落在铁皮屋顶"));
       assert.ok(combined.indexOf(stableA) < combined.indexOf(dynamic));
       const sessionId = store.createSession();

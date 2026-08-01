@@ -923,6 +923,8 @@ export async function startWriterServer(options: {
         kind: body.kind === "style_preference" ? "style_preference" : body.kind === "hard_gate" ? "hard_gate" : undefined,
         severity: body.severity === "warn" ? "warn" : "block",
         enabled: body.enabled !== false,
+        documentKinds: Array.isArray(body.documentKinds) ? body.documentKinds : undefined,
+        pathPrefixes: Array.isArray(body.pathPrefixes) ? body.pathPrefixes : undefined,
         sourceFeedback: typeof body.sourceFeedback === "string" ? body.sourceFeedback : "",
       });
       return context.json({ rule, rules: loadProseGateRules(options.project) });
@@ -2033,6 +2035,7 @@ async function assertWritingExamplePassesGates(
   }, {
     reviewWholeText: true,
     failClosed: true,
+    targetKind: "writing_example",
   });
   const blocked = proseStyleIssuesError(issues);
   if (blocked) throw new Error(`范文未通过正文门控：${blocked}`);

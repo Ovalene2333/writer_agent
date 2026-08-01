@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, join, resolve } from "node:path";
-import type { WriterProject } from "./project.js";
+import { DEFAULT_WRITER_INSTRUCTIONS, type WriterProject } from "./project.js";
 
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
 export type PermissionMode = "ask" | "auto" | "plan";
@@ -320,6 +320,7 @@ const INSTRUCTION_CANDIDATES = [
 ];
 
 export function loadProjectInstructions(project: WriterProject): { path: string; content: string } | undefined {
+  const untouchedScaffold = DEFAULT_WRITER_INSTRUCTIONS.trim();
   for (const relative of INSTRUCTION_CANDIDATES) {
     const absolute = resolve(project.root, relative);
     if (!existsSync(absolute)) continue;
@@ -327,6 +328,9 @@ export function loadProjectInstructions(project: WriterProject): { path: string;
       if (!statSync(absolute).isFile()) continue;
       const content = readFileSync(absolute, "utf8").trim();
       if (!content) continue;
+      // A newly initialized project contains editing hints, not author intent.
+      // Do not let those placeholders occupy a stable prompt slot as if they were rules.
+      if (relative === "WRITER.md" && content === untouchedScaffold) continue;
       return { path: relative.replace(/\\/g, "/"), content: content.slice(0, 24_000) };
     } catch {
       continue;

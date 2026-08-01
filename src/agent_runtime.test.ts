@@ -262,6 +262,16 @@ test("project instructions prefer WRITER.md", () => {
   }
 });
 
+test("untouched WRITER scaffold is not injected as author intent", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
+  try {
+    const project = WriterProject.init(root, "测试");
+    assert.equal(loadProjectInstructions(project), undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("agent settings round-trip permission, writing mode, and scene pipeline", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
   try {

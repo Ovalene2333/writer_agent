@@ -15,7 +15,7 @@ import {
   type ProseVerdictCache,
 } from "./prose_adjudicate.js";
 import { analyzeProseStyle, proseStyleIssuesError } from "./prose_quality.js";
-import type { ProseGateRule } from "./prose_gate_rules.js";
+import { proseGateRulesForTarget, type ProseGateRule } from "./prose_gate_rules.js";
 
 test("selectAdjudicationCandidates prefers warnings and skips pure speech info", () => {
   const speech = analyzeProseStyle("「你——你怎么来了？」");
@@ -35,6 +35,8 @@ test("learned gate accepts exact evidence for quoted-text count feedback", () =>
     kind: "hard_gate",
     severity: "block",
     enabled: true,
+    documentKinds: ["chapter", "side", "writing_example"],
+    pathPrefixes: [],
     sourceFeedback: "作者要求复审字数描述",
     createdAt: "2026-07-26T00:00:00.000Z",
     updatedAt: "2026-07-26T00:00:00.000Z",
@@ -56,6 +58,27 @@ test("learned gate accepts exact evidence for quoted-text count feedback", () =>
     findings: [{ ruleId: rule.id, passageId: "learned:0", evidence: "不存在的原句" }],
   }), [rule], passages);
   assert.deepEqual(fabricated, []);
+});
+
+test("project prose gates honor document kind and path scopes", () => {
+  const base: ProseGateRule = {
+    id: "chapter-voice",
+    instruction: "只复审第一卷正文。",
+    kind: "style_preference",
+    severity: "warn",
+    enabled: true,
+    documentKinds: ["chapter"],
+    pathPrefixes: ["chapters/第一卷"],
+    sourceFeedback: "",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  };
+  assert.deepEqual(
+    proseGateRulesForTarget([base], { kind: "chapter", path: "chapters/第一卷/第一章.md" }).map(rule => rule.id),
+    [base.id],
+  );
+  assert.deepEqual(proseGateRulesForTarget([base], { kind: "chapter", path: "chapters/第二卷/第一章.md" }), []);
+  assert.deepEqual(proseGateRulesForTarget([base], { kind: "writing_example" }), []);
 });
 
 test("packProseSnippets includes neighbor context", () => {
@@ -101,27 +124,27 @@ test("shouldAdjudicateForProposal when dense hard mannerisms exist", () => {
   assert.equal(shouldAdjudicateForProposal(dense, denseIssues), true);
 });
 
-test("split not-A-is-B narration is deterministic and cannot be adjudicated away", () => {
+test("split not-A-is-B narration is semantically adjudicated instead of hard-coded", () => {
   const text = "她不是被叫醒。是自己醒的。";
   const issues = analyzeProseStyle(text);
   const split = issues.find(item => item.subtype === "split_redefinition");
   assert.ok(split);
   assert.equal(shouldAdjudicateForProposal(text, issues), true);
-  assert.equal(selectAdjudicationCandidates(issues).some(item => item.id === split.id), false);
+  assert.equal(selectAdjudicationCandidates(issues).some(item => item.id === split.id), true);
 
   const blocked = applyProseVerdicts(text, issues, [{ id: split.id, verdict: "block", reason: "刻意拆句重定义" }]);
-  assert.ok(proseStyleIssuesError(blocked));
+  assert.equal(blocked.find(item => item.id === split.id)?.severity, "warning");
 
   const fresh = analyzeProseStyle(text);
   const freshSplit = fresh.find(item => item.subtype === "split_redefinition");
   assert.ok(freshSplit);
   const allowed = applyProseVerdicts(text, fresh, [{ id: freshSplit.id, verdict: "allow", reason: "必要事实排除" }]);
-  assert.ok(proseStyleIssuesError(allowed));
+  assert.equal(proseStyleIssuesError(allowed), undefined);
 
   const cache: ProseVerdictCache = new Map([
     [proseVerdictCacheKey(freshSplit), { verdict: "allow", reason: "旧缓存误放行" }],
   ]);
-  assert.ok(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)));
+  assert.equal(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)), undefined);
 });
 
 test("cached verdicts replay across gate rounds and keep re-gates deterministic", () => {

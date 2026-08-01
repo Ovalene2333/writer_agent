@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { WriterProject } from "./project.js";
+import type { DocumentKind, WriterProject } from "./project.js";
 
 export type ProseGateRuleSeverity = "block" | "warn";
 export type ProseGateRuleKind = "hard_gate" | "style_preference";
+export type ProseGateTargetKind = DocumentKind | "writing_example";
 
 export interface ProseGateRule {
   id: string;
@@ -11,6 +12,10 @@ export interface ProseGateRule {
   kind: ProseGateRuleKind;
   severity: ProseGateRuleSeverity;
   enabled: boolean;
+  /** Empty means every prose target; otherwise the rule only reviews these kinds. */
+  documentKinds: ProseGateTargetKind[];
+  /** Empty means every path; writing examples have no path and only match empty prefixes. */
+  pathPrefixes: string[];
   sourceFeedback: string;
   createdAt: string;
   updatedAt: string;
@@ -23,6 +28,8 @@ const DEFAULT_RULES: readonly ProseGateRule[] = [
     kind: "hard_gate",
     severity: "block",
     enabled: true,
+    documentKinds: ["chapter", "side", "writing_example"],
+    pathPrefixes: [],
     sourceFeedback: "作者反馈：类似“xxxx”——这三个字的数量描述容易写错，必须复审。",
     createdAt: "2026-07-26T00:00:00.000Z",
     updatedAt: "2026-07-26T00:00:00.000Z",
@@ -33,6 +40,8 @@ const DEFAULT_RULES: readonly ProseGateRule[] = [
     kind: "hard_gate",
     severity: "block",
     enabled: true,
+    documentKinds: ["chapter", "side", "writing_example"],
+    pathPrefixes: [],
     sourceFeedback: "作者反馈：限制“手机又震”“车出隧道”“雨刷继续响”式连续物件短拍，以及无法由近邻语境还原必要成分的缩句。",
     createdAt: "2026-07-31T00:00:00.000Z",
     updatedAt: "2026-07-31T00:00:00.000Z",
@@ -58,6 +67,24 @@ function normalizeId(value: unknown): string {
   return id;
 }
 
+const TARGET_KINDS = new Set<ProseGateTargetKind>([
+  "lore", "outline", "chapter", "archive", "side", "other", "writing_example",
+]);
+
+function normalizeTargetKinds(value: unknown): ProseGateTargetKind[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is ProseGateTargetKind =>
+    typeof item === "string" && TARGET_KINDS.has(item as ProseGateTargetKind)))].slice(0, TARGET_KINDS.size);
+}
+
+function normalizePathPrefixes(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((item): item is string => typeof item === "string")
+    .map(item => item.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""))
+    .filter(Boolean))].slice(0, 12);
+}
+
 function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRule {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("规则必须是对象");
   const item = value as Record<string, unknown>;
@@ -74,6 +101,8 @@ function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRul
     kind,
     severity,
     enabled: item.enabled !== false,
+    documentKinds: normalizeTargetKinds(item.documentKinds),
+    pathPrefixes: normalizePathPrefixes(item.pathPrefixes),
     sourceFeedback: typeof item.sourceFeedback === "string" ? item.sourceFeedback.trim().slice(0, 500) : "",
     createdAt: typeof item.createdAt === "string" && item.createdAt ? item.createdAt : fallbackCreatedAt ?? now,
     updatedAt: typeof item.updatedAt === "string" && item.updatedAt ? item.updatedAt : now,
@@ -87,7 +116,16 @@ export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
   try { parsed = JSON.parse(readFileSync(path, "utf8")); }
   catch { throw new Error(".writer/prose-gates.json 格式无效"); }
   if (!Array.isArray(parsed)) throw new Error(".writer/prose-gates.json 必须是规则数组");
-  const saved = parsed.slice(0, MAX_RULES).map(item => normalizeRule(item));
+  const saved = parsed.slice(0, MAX_RULES).map(item => {
+    const rule = normalizeRule(item);
+    const builtIn = DEFAULT_RULES.find(candidate => candidate.id === rule.id);
+    if (builtIn && item && typeof item === "object" && !Array.isArray(item)) {
+      const raw = item as Record<string, unknown>;
+      if (!("documentKinds" in raw)) rule.documentKinds = [...builtIn.documentKinds];
+      if (!("pathPrefixes" in raw)) rule.pathPrefixes = [...builtIn.pathPrefixes];
+    }
+    return rule;
+  });
   const merged = new Map(DEFAULT_RULES.map(rule => [rule.id, { ...rule }]));
   for (const rule of saved) merged.set(rule.id, rule);
   return [...merged.values()].slice(0, MAX_RULES);
@@ -108,7 +146,8 @@ function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): voi
 
 export function upsertProseGateRule(
   project: WriterProject,
-  input: Pick<ProseGateRule, "id" | "instruction"> & Partial<Pick<ProseGateRule, "kind" | "severity" | "enabled" | "sourceFeedback">>,
+  input: Pick<ProseGateRule, "id" | "instruction"> & Partial<Pick<ProseGateRule,
+    "kind" | "severity" | "enabled" | "documentKinds" | "pathPrefixes" | "sourceFeedback">>,
 ): ProseGateRule {
   const rules = loadProseGateRules(project);
   const id = normalizeId(input.id);
@@ -128,6 +167,20 @@ export function upsertProseGateRule(
   }
   saveProseGateRules(project, rules);
   return rule;
+}
+
+export function proseGateRulesForTarget(
+  rules: ProseGateRule[],
+  target: { kind: ProseGateTargetKind; path?: string },
+): ProseGateRule[] {
+  const normalizedPath = target.path?.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  return rules.filter(rule => {
+    if (!rule.enabled) return false;
+    if (rule.documentKinds.length && !rule.documentKinds.includes(target.kind)) return false;
+    if (!rule.pathPrefixes.length) return true;
+    if (!normalizedPath) return false;
+    return rule.pathPrefixes.some(prefix => normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`));
+  });
 }
 
 export function removeProseGateRule(project: WriterProject, idValue: unknown): boolean {

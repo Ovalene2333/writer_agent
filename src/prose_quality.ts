@@ -103,49 +103,35 @@ function hardMannerismFamily(subtype: ProseStyleSubtype): "dash" | "contrast" | 
 }
 
 /**
- * A repeated sentence frame becomes noticeable before unrelated mannerisms do.
- * Keep dashes comparatively permissive, but stop two or three abstract
- * negation/redefinition or explanatory-echo frames from hiding under one shared
- * chapter-wide allowance.
+ * Density is only a candidate signal. Limits deliberately tolerate isolated and
+ * occasional repeated forms; semantic adjudication decides whether they are
+ * actually explanatory clutter before a proposal is blocked.
  */
 function hardMannerismFamilyLimit(text: string, family: "dash" | "contrast" | "explanation"): number {
   const characters = Math.max(1, text.replace(/\s/g, "").length);
-  // 「不是…是」骨架很显眼：约 5k 字只放行 1 处叙述侧命中，再多即升 error
-  if (family === "contrast") return Math.max(1, Math.floor(characters / 5_000));
-  if (family === "explanation") return Math.max(2, 1 + Math.floor(characters / 2_500));
+  if (family === "contrast") return Math.max(3, 2 + Math.floor(characters / 3_000));
+  if (family === "explanation") return Math.max(3, 2 + Math.floor(characters / 2_500));
   return hardMannerismLimit(text);
 }
 
-/** 对白里同一骨架的免费额度（人物即时纠正可留，教学腔/连发要砍）。 */
-function dialogueContrastLimit(text: string): number {
-  const characters = Math.max(1, text.replace(/\s/g, "").length);
-  return Math.max(1, Math.floor(characters / 5_000));
-}
-
 /**
- * Generation-time guidance. The explicit negative frame is intentional: the
- * writing models otherwise reproduce it often enough that a positive-only hint
- * leaves the deterministic gate doing expensive cleanup after generation.
+ * Generation-time guidance shared by the main and isolated writing paths.
  */
 export function proseMannerismConstraintPrompt(options?: { compact?: boolean }): string {
   const lines = [
-    "句式基准（出口有机器门禁复核，按此写省返工）：",
-    "1. 叙述直接陈述成立的事实；需要纠正误解或对比时，交给人物对白或后续行动完成。",
-    "2. 叙述禁用「不是……是/而是……」及「不是……。是……。」改判句；对白里同一骨架全章最多偶发一两次（真纠正误解），技术定义与目标用直接陈述，勿写成教学腔「不是A，是B」。",
-    "3. 补充说明写成独立完整句；破折号留给对白里的拖音、中断，以及偶发的停顿—揭示。",
-    "4. 动作、对白或细节已经传达情绪与意图时，就停在那里进入下一拍；解释只在引入新事实时出现。",
-    "5. 相邻段落换句式骨架：起笔方式、句长结构、信息展开方式各不相同。",
-    "6. 节奏勿一律短促：静场与情感段用完整自然句（常 25–50 字），每数百字至少有一个 30 字以上的绵延句；紧张处才收短。禁止为「利落」把常用双音节词压成单字（如感觉→感、恢复→复、身体→体），除非是角色固定口癖或对白抢白。",
-    "7. 一拍一事：单句只推进一个主要事件或判断；勿把多条设定、编号、关系、因果与情绪焊进同一句（像预告片旁白）。",
-    "8. 叙述保留必要人称主语，写清谁在感知与行动；勿整段省略成简报/操作日志腔。",
+    "句式边界（只防止密集退化，不把自然语言改造成统一模板）：",
+    "1. 叙述优先直接写发生了什么；对比、否定、破折号和短句都可自然使用，只有连续复现并替代新信息时才需改写。",
+    "2. 动作、对白或细节已经传达的意义不再换一种说法复述；解释应带来新的事实、因果或认知变化。",
+    "3. 句子须保留理解行动所需的施事、对象与关系；上下文足以唯一还原的口语省略、紧张短句和偶发重音应保留。",
+    "4. 专名、读数和技术说明按人物当下决策所需进入正文；密集到遮蔽行动与关系时再压缩。",
   ];
   if (options?.compact) return lines.join("\n");
-  return `${lines.join("\n")}\n9. 对白保留口语的自然形态：拖音、改口、半句、口语纠正都可以；每个人物的说话方式彼此可区分。\n10. 每场提交前通读一遍：删去不新增事实的解释句与多余的「不是…是」骨架；拆开一句话里叠了三件事的长句；若连续多句都在 8 字以内，合并或拉长其中一部分。`;
+  return `${lines.join("\n")}\n5. 提交前只处理成片重复、关系含混或明显挤压现场的问题；孤立且符合人物语气、节奏或文体的表达不要为通过检查而磨平。`;
 }
 
 /** One-line checklist for pre-submit self-check in task workflows. */
 export function proseMannerismPreflightLine(): string {
-  return "提交前自检：改掉先否定再改判句；删去不新增事实的解释；相邻段落句式不同形；避免碎句连发、刻意缩词及连续物件短拍；一句话只推一事、勿堆概念清单；句长段长有起伏（勿整章均齐）；叙述保留必要成分、所指可唯一还原，勿报告体；对白自然且人物可区分。";
+  return "按「风格锚定」的句式边界复核密集复现、重复解释与关系含混；孤立且符合人物和现场的表达保留。";
 }
 
 /**
@@ -174,8 +160,7 @@ export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
 export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]): ProseStyleIssue[] {
   for (const issue of issues) {
     if (issue.severity === "error"
-      && HARD_BLOCK_SUBTYPES.has(issue.subtype)
-      && issue.subtype !== "split_redefinition") {
+      && HARD_BLOCK_SUBTYPES.has(issue.subtype)) {
       // dialogue_correction 默认从 info 起步，不在此重置
       if (issue.subtype === "dialogue_correction") continue;
       issue.severity = "warning";
@@ -198,21 +183,6 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
       if (candidates.length > limit || crowdedFamilies.has(hardMannerismFamily(issue.subtype))) {
         issue.severity = "error";
       }
-    }
-  }
-  // 对白「不是…是」：免费额度内保持 info；超额升 error，避免教学腔连发钻对白豁免
-  const dialogueBudget = dialogueContrastLimit(text);
-  const dialogueHits = issues
-    .filter(issue => issue.subtype === "dialogue_correction")
-    .sort((left, right) => left.start - right.start);
-  for (let index = 0; index < dialogueHits.length; index += 1) {
-    if (index < dialogueBudget) continue;
-    const issue = dialogueHits[index];
-    issue.severity = "error";
-    issue.confidence = Math.max(issue.confidence, 0.95);
-    issue.reason = "对白中「不是…是」骨架过密；保留最自然的一两处即时纠正，其余改直接陈述（尤其技术定义与目标说明）。";
-    if (!issue.suggestions.length) {
-      issue.suggestions = ["改成直接陈述成立的事实或要求", "若确需纠正误解，全章只保留一处最有力的对白纠正"];
     }
   }
   return issues;
@@ -268,8 +238,7 @@ export function newProseStyleIssues(before: string, after: string): ProseStyleIs
  */
 export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undefined {
   const errors = issues.filter(issue =>
-    (issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype))
-    || (issue.subtype === "split_redefinition" && issue.severity === "warning" && issue.confidence >= 0.95),
+    issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
   );
   if (!errors.length) return undefined;
   const headline = errors.some(issue => issue.subtype === "learned_rule")
@@ -418,8 +387,8 @@ function scanContrasts(text: string): ProseStyleIssue[] {
     }
     const split = /[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是/u.test(match.text);
     if (split) {
-      issues.push(makeIssue(text, match, "contrast", "split_redefinition", "error", 0.99,
-        "叙述者用句号拆开同一否定—肯定框架，形成刻意顿挫和机器化重定义。",
+      issues.push(makeIssue(text, match, "contrast", "split_redefinition", "warning", 0.99,
+        "叙述者用句号拆开同一否定—肯定框架；需要结合人物语气和上下文判断是否形成重复重定义。",
         ["直接写真正成立的动作或事实", "若确需纠正误解，让人物通过对白或后续反应完成"]));
       continue;
     }

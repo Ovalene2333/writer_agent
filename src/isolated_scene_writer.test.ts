@@ -14,6 +14,7 @@ import {
 import { nonThinkingRequestOptions } from "./model_compat.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
+import { proseCharacterCount } from "./prose_length.js";
 import { executeTool } from "./tools/index.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import type { WritePack } from "./write_pack.js";
@@ -65,7 +66,7 @@ test("isolated scene writer receives only the current prose packet", () => {
   assert.equal(messages[0].role, "system");
   assert.equal(messages[1].role, "user");
   assert.match(messages[0].content, /只写眼前正在发生的这一场戏/u);
-  assert.match(messages[0].content, /压力如何改变选择/u);
+  assert.match(messages[0].content, /注意力与压力自然变化/u);
   assert.match(messages[0].content, /对白是人物对彼此采取的行动/u);
   assert.match(messages[0].content, /环境不是布景清单/u);
   assert.match(messages[0].content, /不是待逐项改写的清单/u);
@@ -129,14 +130,14 @@ test("isolated scene writer receives the anti-self-imitation notes the standard 
   assert.match(messages[1].content, /感官通道只有 2\/5/u);
 });
 
-test("isolated scene writer explicitly suppresses narrator negation-redefinition frames", () => {
+test("isolated scene writer allows natural contrast without turning it into a template", () => {
   const messages = buildIsolatedSceneWriterMessages({
     scene,
     writePack: pack,
   });
-  assert.match(messages[0].content, /先否定、再改判/);
-  assert.match(messages[0].content, /不是……。是……。/);
-  assert.match(messages[0].content, /对白中符合人物语气的即时纠正不受此限/);
+  assert.match(messages[0].content, /否定与转折都可以使用/u);
+  assert.match(messages[0].content, /不把任何一种句式连续当作/u);
+  assert.doesNotMatch(messages[0].content, /先否定、再改判|不是……。是……。/u);
 });
 
 test("scene state extraction receives only bounded next-scene relevance fields", () => {
@@ -361,9 +362,9 @@ test("direct isolated document keeps prose generation outside the Agent transcri
       }),
     }, project, store, sessionId, () => {}, undefined, context)) as Record<string, unknown>;
     assert.equal(result.generationMode, "isolated_document");
-    assert.equal(result.generatedCharacters, prose.length);
+    assert.equal(result.generatedCharacters, proseCharacterCount(prose));
     assert.equal("content" in result, false);
-    assert.deepEqual(usageKinds, ["isolated_document_writer"]);
+    assert.deepEqual(usageKinds, ["isolated_document_writer", "isolated_document_writer_length_retry"]);
     assert.equal(store.proposals()[0].afterContent, `# 序章\n\n${prose}`);
   } finally {
     store?.close();

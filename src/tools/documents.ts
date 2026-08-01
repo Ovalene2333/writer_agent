@@ -4,6 +4,8 @@ import { requestDocumentLocator, type DocumentLocatorCandidate } from "../docume
 import { adjudicateLearnedProseGates, adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
+import { documentKind } from "../project.js";
+import { proseGateRulesForTarget } from "../prose_gate_rules.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { documentMap, optionalPositiveInteger, requireString } from "./helpers.js";
 
@@ -69,7 +71,7 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
   const issues = flash.issues;
   issues.push(...await adjudicateLearnedProseGates(
     content,
-    context.proseGateRules ?? [],
+    proseGateRulesForTarget(context.proseGateRules ?? [], { kind: documentKind(path), path }),
     context.proseAdjudicator?.model,
     {
       signal: context.proseAdjudicator?.signal,

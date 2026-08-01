@@ -4078,6 +4078,13 @@ input.composer-file-input[type="file"] {
   background: var(--surface2); color: var(--text); padding: 9px 10px; font: inherit;
 }
 .prose-gate-editor textarea { resize: vertical; line-height: 1.55; }
+.prose-gate-editor .prose-gate-scope {
+  display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 0; padding: 10px 12px;
+  border: 1px solid var(--border-light); border-radius: 9px;
+}
+.prose-gate-editor .prose-gate-scope legend { padding: 0 5px; color: var(--text-dim); font-size: 11px; font-weight: 700; }
+.prose-gate-editor .prose-gate-scope label { flex-direction: row; align-items: center; gap: 5px; font-weight: 500; }
+.prose-gate-editor .prose-gate-scope input { width: auto; }
 .prose-gate-editor input:focus,
 .prose-gate-editor select:focus,
 .prose-gate-editor textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 26%, transparent); border-color: var(--accent); }

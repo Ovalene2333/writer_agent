@@ -2,7 +2,7 @@ import type { AgentEvent } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ToolCall, ToolExecutionContext, ToolHandlerArgs } from "./types.js";
-import { ToolDependencyError } from "../tool_failure.js";
+import { isToolDependencyTimeout, ToolDependencyError } from "../tool_failure.js";
 import {
   handleAuditProseStyle,
   handleInspectDocument,
@@ -136,6 +136,14 @@ export async function executeTool(
         failureKind: error.failureKind,
         error: error.message,
         retryable: error.retryable,
+      });
+    }
+    if (isToolDependencyTimeout(error)) {
+      return JSON.stringify({
+        code: "TOOL_DEPENDENCY_TIMEOUT",
+        failureKind: "dependency",
+        error: error instanceof Error ? error.message : "工具依赖调用超时",
+        retryable: true,
       });
     }
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });

@@ -1,5 +1,5 @@
 import { orderedChapterPaths, WriterProject } from "./project.js";
-import { proseMannerismConstraintPrompt, proseMannerismPreflightLine } from "./prose_quality.js";
+import { proseMannerismConstraintPrompt } from "./prose_quality.js";
 import { WriterStore } from "./store.js";
 
 /**
@@ -58,61 +58,18 @@ export function sampleProseWindow(text: string, maxChars: number, random: () => 
 
 /**
  * Craft rules for the stable style block (cacheable project-level guidance).
- * Applies under every style template — keep genre flavor in templates, keep
- * anti-mechanical / anti-stacking hygiene here so all modes share one baseline.
- *
- * Prefer showing what good prose does; hard density limits for AI-stacking are
- * explicit because positive-only hints fail on “one sentence, ten events”.
- * Exit gates still catch residual mannerisms; this block is generation-time.
+ * Applies under every style template. Keep genre flavor in templates and the
+ * small shared craft baseline here so all writing modes start from one source.
  */
 export function naturalProseCraftPrompt(): string {
-  return `自然叙事原则（服从项目样本与激活模板；正文按此写，出口门禁复核密度，无需自我说明「我在写自然」）：
-
-【写活一场戏】
-- 注意顺序：信息按当前视角人物实际会先注意、误判、回避的顺序出现；叙述距离贴近谁，就停在谁的感知里，不因解释方便跳进他人内心。
-- 场景发动：尽早让人物为一个可辨认的眼前结果采取行动；阻力针对他的办法，每次应对都改变退路、代价、暴露、关系、信息或时间条件。
-- 张力累积：让读者看清人物在乎什么、可能失去什么、还有多少选择，同时保留结果的不确定；用期限、信息差、承诺、两难与对手的有效反制逐步收紧选择。
-- 转折余波：关键变化由此前行动招致；重大受挫或发现之后，按篇幅留出反应、权衡与决定，使人物的新决定成为下一步的原因。静场也改变理解、关系或选择。
-- 对白意图：人物说话是为了索取、隐瞒、试探、拒绝、拖延或改变关系；设定让人物在行动里试错撞出来，旁人只在关键处补一句。禁止全员讲课腔、轮流播报设定/数据。
-- 对白摩擦：不是每个问题都该被回答。让人回避、答非所问、抢在对方说完前打断、说到一半停住，或答一件对方没问的事；至少一次让说出口的和真正想说的不是同一件。连着两轮以上一问一答直给，写的就是会议纪要。
-- 对白声线：每个常出场的人物有一处别人不会有的说话方式——句子的长短习惯、爱用或回避的说法、口头禅、称呼对方的方式、说不利索的地方；遮住提示语要能认出是谁，别让人物的辨识度全落在旁白的描述里。句长跟处境走：被逼问的人话变碎，占上风的人话变长，说不出口的人半句就停。对白可以短，但别整章都短——通篇几个字的应答是电报，不是克制。
-- 细节取舍：每处细节至少承担空间、习惯、冲突、因果或伏笔之一；用此时此地才成立的物件、动作或感官，代替随处可用的气氛标签。
-- 具体性检查：一句话若换掉人名地点仍能套进多数故事，就换成本场独有的说法或后果；没有有效信息就删。
-
-【一拍一事 · 反 AI 网剧堆叠（硬约束）】
-- 一句话只推进一个主要事件或一个主要判断；下一拍再写连带后果。不要在同一句里连塞设定名、编号、关系、原因、后果与情绪（预告片旁白腔）。
-- 一段默认只服务一个场面节拍（看见→反应→行动→代价中的一两步）；不要用「同时/与此同时/一边…一边…/不仅…还…/并且」把多条线索焊进一句。
-- 专名与设定词克制出场：同一段首次需要时用一个可感锚点，不要清单式连抛组织名、计划名、等级、协议、武器名。
-- 叙述保持可读的人称与主语：谁在看、谁在动写清楚；勿为「利落」整段省略人称、压成简报或操作日志。
-- 限制把「物件/环境名词＋一个短动作」反复切成独立节拍（如手机又震、车出隧道、雨刷继续响）。环境变化要么确实改变人物的感知、行动或局面，要么并入人物反应、因果或空间变化；省略施事、受事等必要成分时，须能从紧邻上下文唯一还原。偶发重音、对白抢白和指代清楚的话题链不受此限。
-- 禁止把章节写成功能清单或 HUD（醒来→说明→测试→评分→收束；指令—执行—确认连环短段）。
-
-【反生成感（对齐常见 LLM 痕迹，生成时主动避开）】
-- 句长与段长要有起伏（burstiness）：静场绵延、冲突收短、关键处可单句成段；勿整章句长、段长像同一模子浇出来。
-- 用词要有「意外感」：优先此时此地才成立的物件、误判与口癖；少用最稳妥的通用搭配与成串四字套话（检测器最爱的低困惑度路径）。
-- 信息密度降下来：一段只让读者记住一件新事；其余背景、设定与关系推到需要时再露，勿「一句话塞十个概念」。
-- 情绪深度靠反应与选择，不靠标签与器官读数（心口一沉/喉咙发紧连打）；对白有各自目的与句长，勿全员书面同一口气。
-- 结构允许不对称与半句：有的段落只过门、只停顿、只听错一句；勿每段都「起承转合+金句收口」。
-
-【反机械感】
-1. 连续单句独立成段不得超过 3 个；默认 2—5 句成段，长短随压力变化，不要机械轮换长短句或强凑「三段式」。单句成段是重音，省着用才有力。
-2. 同一信息、情绪、感官公式、因果或主题只写一次；同类高清感官比喻一章最多 1 次；不要用同义词连打、排比金句或「气氛+眼神+决心」三件套填满段落。
-3. 精确读数、百分比、等级评分一章合计尽量 ≤3 处；其余写成可感后果（器物轻响、对方停顿、地板闷震），禁止正文变日志/状态栏。
-4. 难过、发慌、羞耻、兴奋刚起时，先给半拍体感或动作；不要立刻接设定说明、成分百分比或作者总结把情绪冲掉。
-5. 流程、测试、赶路、说明为主的段落之后，不要硬接「迈出了第一步/这就够了/新的开始」式升华；收在具体后果、关系余波或未决问题上。
-6. 勿把能力表字段写进叙述（「未解锁」「档案上还锁着」等）；本场不能用的能力直接不写，或只写人物此刻可感的限制。
-
-【篇章完整与衔接】
-- 章首接住可用前文留下的动作、压力与未决问题，保持时间、地点、人物位置、伤势、持有物、已知信息和承诺一致；用新行动承接，不复述前情。
-- 承担完整章节时，开头立住本章当前问题，中段让预期、优势、目标或关系发生实质偏转，结尾兑现这个局部问题的阶段性结果，并让结果产生新的约束、代价或选择。
-- 已有下一章时，以其开场状态为离场边界：本章铺成通往它的因果条件，把下一章的事件与决定留给下一章发生。
-- 完整收束允许谜团继续存在；章尾的牵引力来自已经发生的变化及其未完后果，而非把本章应有的结果截在发生之前。
-
-【节奏与质感】
-- 静场与情感段落里安排绵延的长句（常 25–50 字），让读者呼吸；紧张段落才收短。每数百字至少一个 30 字以上的绵延句。
-- 关键信息落地后给半拍落点（动作、停顿、环境），再推进；保留朴素功能句与不对称。
-- 恢复常用双音节（感觉/恢复/身体/冷意等），不为利落压成单字，除非是角色固定口癖或对白抢白。
-- 幽默与张力来自关系错位与现场反应，不靠段子拼贴或全员抖机灵。`;
+  return `自然叙事核心（项目原文与作者范文优先；这些原则只在没有更具体声线证据时提供方向）：
+- 贴住当前视角人物的注意力。信息按人物会看见、误会、回避和确认的顺序出现，不为解释方便越过认知边界。
+- 场景从人物此刻想完成的事情生长。行动招来阻力或回应，变化留下足以影响下一步的事实、关系或选择；静场也可以只完成理解与关系上的细微移动。
+- 选择真正参与现场的细节。物件、环境、技术与感官应被人物使用、承受或误读，而不是作为设定清单陈列。
+- 对白是人物在关系中采取的行动。直说、回避、沉默、玩笑或解释都可以，只要符合说话者的目的、知识与处境；人物差异首先来自各自在意和不愿承认的东西。
+- 节奏服从现场。叙述需要展开时让句子自然延伸，压力逼近时可以收紧；段落在动作、发现、停顿或余波真正落定时结束，不按固定长短配额排列。
+- 已经由动作、对白或后果传达的意义不必再解释。需要说明时只补充会改变理解或行动的新事实。
+- 完整章节兑现本章承担的变化，并从结果自然留下后续条件；是否需要悬问、损失、和解或平静收束，由本章目标决定。`;
 }
 
 /**
@@ -161,11 +118,6 @@ export function stableStyleGroundingPrompt(
   // Craft + full mannerism once in the stable style slot; workflows only cross-ref preflight.
   sections.push(naturalProseCraftPrompt());
   sections.push(proseMannerismConstraintPrompt());
-  sections.push(
-    `提交前自检：${proseMannerismPreflightLine()}`
-      + "关键身体/暴力/情欲不无故含蓄化（作者未要求收敛时）。"
-      + "句长与对白占比贴近动态声线证据；人物语气可区分；动作有后果后不重复解释意义。",
-  );
 
   return sections.join("\n\n");
 }
@@ -222,10 +174,10 @@ export function dynamicStyleGroundingPrompt(
  * Style constraints for the isolated scene writer.
  *
  * The prose-only call used to receive NONE of this: no active template, no craft
- * baseline — every rule the Agent path treats as mandatory was silently dropped
+ * baseline — every rule the Agent path treats as shared was silently dropped
  * on the one call that actually produces chapter text. Mannerism prohibitions are
- * deliberately still excluded: ISOLATED_WRITER_SYSTEM already carries them, and
- * re-pasting a prohibition wall raises the salience of the patterns it bans.
+ * deliberately still excluded: ISOLATED_WRITER_SYSTEM already carries its prose
+ * contract, and duplicating another checklist would distort the style signal.
  */
 export function isolatedWriterStyleDirectives(project: WriterProject): string {
   const config = project.config();
@@ -234,7 +186,6 @@ export function isolatedWriterStyleDirectives(project: WriterProject): string {
   if (template) {
     sections.push(`本作品的激活风格模板：${template.name}`, template.systemPromptAddition.trim());
   }
-  sections.push(naturalProseCraftPrompt());
   return sections.join("\n\n");
 }
 

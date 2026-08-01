@@ -433,11 +433,13 @@ export type ProseGateRule = {
   kind: "hard_gate" | "style_preference";
   severity: "block" | "warn";
   enabled: boolean;
+  documentKinds: Array<"chapter" | "side" | "lore" | "outline" | "archive" | "other" | "writing_example">;
+  pathPrefixes: string[];
   sourceFeedback: string;
   createdAt: string;
   updatedAt: string;
 };
-export type ProseGateRuleDraft = Pick<ProseGateRule, "id" | "instruction" | "kind" | "severity" | "enabled" | "sourceFeedback">
+export type ProseGateRuleDraft = Pick<ProseGateRule, "id" | "instruction" | "kind" | "severity" | "enabled" | "documentKinds" | "pathPrefixes" | "sourceFeedback">
   & { isNew: boolean };
 export type ContinuityFact = {
   id: number;

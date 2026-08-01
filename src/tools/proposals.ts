@@ -31,6 +31,7 @@ import {
   DEFAULT_SCENE_NOTES_CHARACTERS,
 } from "../agent_runtime.js";
 import type { WriterStore } from "../store.js";
+import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
 import {
   assertCreativeOutlineDesigned,
@@ -256,10 +257,13 @@ export async function gateProseStyle(
   beforeContent: string,
   afterContent: string,
   context: ToolHandlerArgs["context"],
+  targetPath?: string,
 ): Promise<void> {
   const issues = await proseStyleGateIssues(beforeContent, afterContent, context, {
     reviewWholeText: context.editScope === "document",
     failClosed: true,
+    targetPath,
+    targetKind: targetPath ? documentKind(targetPath) : "other",
   });
   const styleError = proseStyleIssuesError(issues);
   if (styleError) throw new Error(styleError);
@@ -270,10 +274,19 @@ export async function proseStyleGateIssues(
   afterContent: string,
   context: Pick<ToolHandlerArgs["context"],
     "proseAdjudicator" | "proseVerdictCache" | "proseGateRules" | "modelUsageReporter">,
-  options?: { reviewWholeText?: boolean; failClosed?: boolean },
+  options?: {
+    reviewWholeText?: boolean;
+    failClosed?: boolean;
+    targetPath?: string;
+    targetKind?: ProseGateTargetKind;
+  },
 ) {
   let issues = newProseStyleIssues(beforeContent, afterContent);
   if (context.proseAdjudicator) {
+    const applicableRules = proseGateRulesForTarget(context.proseGateRules ?? [], {
+      kind: options?.targetKind ?? "other",
+      ...(options?.targetPath ? { path: options.targetPath } : {}),
+    });
     const adjudicatorModels = [
       context.proseAdjudicator.model,
       context.proseAdjudicator.fallbackModel,
@@ -304,7 +317,7 @@ export async function proseStyleGateIssues(
       try {
         learnedIssues = await adjudicateLearnedProseGates(
           afterContent,
-          context.proseGateRules ?? [],
+          applicableRules,
           adjudicatorModel,
           {
             signal: context.proseAdjudicator.signal,
@@ -560,7 +573,7 @@ export async function submitFullDocumentProposal(
   const existed = project.documentExists(path);
   const beforeContent = existed ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
-  if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context);
+  if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context, path);
   // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
   let rhythmRevisionRequired: string | undefined;
   if (isScenePipelineDocument(path) && !proseStyleApproved) {
@@ -811,7 +824,7 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
       content = `${content.slice(0, operation.start)}${operation.replacement}${content.slice(operation.end)}`;
     }
   }
-  await gateProseStyle(beforeContent, content, context);
+  await gateProseStyle(beforeContent, content, context, path);
   // 首轮 grace 后若用 patch 抛光：同一 path 必须过硬节奏门禁。
   if (isScenePipelineDocument(path) && context.rhythmGracePaths?.has(path)) {
     const rhythmError = chapterRhythmGateError(content);

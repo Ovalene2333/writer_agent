@@ -18,3 +18,11 @@ export class ToolDependencyError extends Error {
     this.name = "ToolDependencyError";
   }
 }
+
+/** Provider/client timeout shapes differ; normalize them before retry policy sees them. */
+export function isToolDependencyTimeout(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "TimeoutError" || error.name === "AbortError") return true;
+  const message = error.message.toLowerCase();
+  return message.includes("due to timeout") || message.includes("timed out") || message.includes("timeout exceeded");
+}

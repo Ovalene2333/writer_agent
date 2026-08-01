@@ -254,9 +254,10 @@ test("side prose treats scene count and target length as guidance", async () => 
     const direct = JSON.parse(await call("propose_document", {
       path: "side/arc-08.md",
       content: "她走到城门下，守卫从阴影里抬起长枪。风卷着灰烬越过墙头，她没有停，只把通行牌放在掌心。",
+      targetCharacters: 500,
       summary: "直接交付支线片段",
     })) as Record<string, unknown>;
-    assert.equal(direct.status, "pending");
+    assert.equal(direct.status, "pending", JSON.stringify(direct));
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

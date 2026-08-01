@@ -8,6 +8,7 @@ import {
   setProseGateRuleEnabled,
   upsertProseGateRule,
 } from "../prose_gate_rules.js";
+import type { ProseGateTargetKind } from "../prose_gate_rules.js";
 
 export function handleManageProseGates({ input, project, context }: ToolHandlerArgs): string {
   const operation = requireString(input.operation, "operation");
@@ -21,6 +22,8 @@ export function handleManageProseGates({ input, project, context }: ToolHandlerA
       instruction: requireString(input.instruction, "instruction"),
       severity: input.severity === "warn" ? "warn" : "block",
       enabled: input.enabled !== false,
+      documentKinds: Array.isArray(input.documentKinds) ? input.documentKinds as ProseGateTargetKind[] : undefined,
+      pathPrefixes: Array.isArray(input.pathPrefixes) ? input.pathPrefixes as string[] : undefined,
       sourceFeedback: typeof input.sourceFeedback === "string" ? input.sourceFeedback : "",
     });
     context.proseGateRules = loadProseGateRules(project);

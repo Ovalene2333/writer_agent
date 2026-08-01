@@ -147,7 +147,7 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
       const before = project.textFileExists(file.path) ? project.readTextFile(file.path) : "";
       let after = file.content ?? before;
       for (const edit of file.edits ?? []) after = after.replace(edit.search, edit.replace);
-      await gateProseStyle(before, after, context);
+      await gateProseStyle(before, after, context, file.path);
     }
   }
   const changeSet = store.createChangeSet(

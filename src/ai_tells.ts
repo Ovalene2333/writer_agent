@@ -249,8 +249,7 @@ export function analyzeAiTells(text: string): AiTells {
     issues.push({
       code: "paragraph_uniform",
       message: `段落长度起伏仅 ${stats.paragraphLengthSpread} 字（p80−p20，参考 ${PARAGRAPH_SPREAD_TARGET}）；`
-        + "整章一个段落模子。这是 AI 检测器最稳定的判据之一。让关键转折落在一个独立短段上，"
-        + "铺陈段该长就长，不要每段都收在同一个长度。",
+        + "整章段落边界较整齐。复核段落是否都在相似位置收束；只在注意力、动作或发现真正落定处调整。",
       examples: [],
     });
   }
@@ -267,8 +266,8 @@ export function analyzeAiTells(text: string): AiTells {
     issues.push({
       code: "event_packing",
       message: `约 ${Math.round(stats.packingRatio * 100)}% 的叙述句在一句话里焊多条事件/概念`
-        + `（参考上限 ${Math.round(PACKING_RATIO_LIMIT * 100)}%）。这是典型 AI 网剧旁白：设定名、关系、因果、情绪同句出清。`
-        + "拆成一拍一事：先写看见什么，下一句再写反应或后果；专名一段只新露一个。",
+        + `（参考上限 ${Math.round(PACKING_RATIO_LIMIT * 100)}%）。复核语法关系是否清楚、信息是否按人物注意顺序进入；`
+        + "完整长句若持续增加事实且容易理解，应当保留。",
       examples: packing.examples.slice(0, 5),
     });
   }
@@ -277,8 +276,7 @@ export function analyzeAiTells(text: string): AiTells {
     issues.push({
       code: "sentence_uniform",
       message: `叙述句长起伏仅 ${stats.sentenceLengthSpread} 字（p80−p20，参考 ${SENTENCE_SPREAD_TARGET}）。`
-        + "低 burstiness 是检测器核心信号之一：人写会长短交错，模型常整章一个模子。"
-        + "静场拉出 35+ 字绵延句，冲突处用短句，不要每句都差不多长。",
+        + "复核句子是否总按同一节拍结束；只有现场注意力确实需要展开或收紧时才调整句法。",
       examples: [],
     });
   }
@@ -292,7 +290,7 @@ export function aiTellScore(text: string): number {
 
 /** 单行摘要，供工具结果与 reviewer signals。 */
 export function formatAiTellSummary(stats: AiTellStats): string {
-  return `AI 味 ${stats.score}/100（越低越好）；台词 ${stats.dialogueLines} 条、长度起伏 ${stats.dialogueLengthSpread} 字、`
+  return `表达模式风险 ${stats.score}/100（仅作定位参考）；台词 ${stats.dialogueLines} 条、长度起伏 ${stats.dialogueLengthSpread} 字、`
     + `口语标记 ${Math.round(stats.dialogueColloquialRatio * 100)}%、主题化 ${Math.round(stats.philosophicalRatio * 100)}%；`
     + `收尾升华 ${stats.thematicUpliftCount} 处；三元并列 ${stats.tricolonPer10k}/万字；`
     + `身体读数 ${stats.bodyMeterPer10k}/万字；套话 ${stats.idiomPer10k}/万字；`

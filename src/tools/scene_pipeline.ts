@@ -1,4 +1,4 @@
-import { isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
+import { documentKind, isScenePipelineDocument, orderedChapterPaths, type WriterProject } from "../project.js";
 import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
@@ -982,7 +982,10 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
     const draft = context.chapterSceneDraft;
     if (!draft) return { passed: false, attempts, blockers: [], errors: ["章节草稿已丢失"] };
     const content = assembleChapterSceneDraft(draft);
-    const issues = await proseStyleGateIssues(beforeContent, content, context);
+    const issues = await proseStyleGateIssues(beforeContent, content, context, {
+      targetPath: draft.path,
+      targetKind: documentKind(draft.path),
+    });
     const blockers = issues.filter(issue => issue.severity === "error");
     if (!blockers.length) return { passed: true, attempts, blockers: [], errors };
     if (!context.chapterStyleRepairer || attempts >= maxRequests) return { passed: false, attempts, blockers, errors };
@@ -1385,11 +1388,11 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       "是否重复使用相同意象、参数展示、沉默或总结式章尾",
       "章节开头到结尾能否用一句话说明总变化",
       "有没有换掉人名地点仍能套进多数故事的句子；现场是否只被叙述者报告、没有被人物看见听见摸到",
-      "遮住说话人后台词能否互换：每个人物是否有各自的句长、书面程度、回避方式与说话目的",
+      "主要人物的措辞、信息取舍和说话目的是否长期无法区分；不要靠固定口癖、句长或强行回避制造差异",
       "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
-      "冲突是否靠互相理解化解、代价被抹平、阻力恰好让路；有没有人付出了不可撤销的代价",
-      "整章是否有人在争取一件他在乎且可能失败的事；每场结束时是否留下读者在意的未定结果，还是只增加了信息量（参考 proseDrive）",
-      "对白是不是全章都在确认与应答：有没有人回避提问、答非所问、说到一半停住、或说了一段对方没问的话；有没有一个并列句式被不同人物轮流用（参考 proseDialogue 的言语动作分布与复现句式）",
+      "人物立场或阻力是否无新依据地改变，抹掉了正文已经建立的矛盾；圆满、理解与可挽回结果本身不判错",
+      "结合 chapterGoal 判断章节承诺的变化是否成立；静场、铺垫、过渡与收束不强制主动阻力、不可逆代价或新悬问（proseDrive 仅作定位参考）",
+      "本章需要谈判、冲突、试探或隐瞒时，对白是否回避了应有的利益差异；直接回答、解释、配合和日常交流本身有效（proseDialogue 仅作定位参考）",
     ],
     message: (
       reviewFailure?.errors.every(err => /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(err))
@@ -1397,7 +1400,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
         : "隔离终审不可用，已回退到主 Agent 通读："
     )
       + "content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
-      + "若有 styleWarnings，挑影响最大的 1—3 条用一次 revise_chapter_draft_style 局部压降（非强制，不要为凑指标全文重写）。",
+      + "若有 styleWarnings，只处理有正文证据且明显影响理解或项目声线的少量问题；统计提示不能成为改稿理由，也不要为凑指标全文重写。",
   });
 }
 

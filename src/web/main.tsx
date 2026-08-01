@@ -140,6 +140,7 @@ import {
   type Usage,
   type WorkspaceMode,
 } from "./types";
+
 import {
   loadAgentHiddenCharacterCards,
   loadUiTheme,
@@ -213,6 +214,19 @@ import {
 import type { ContextGraphNode } from "./types";
 import { WorkspaceTopbar } from "./workspace_topbar";
 import { api, apiFetch } from "./api_client";
+import "./style.css";
+
+const PROSE_GATE_DOCUMENT_KIND_OPTIONS: Array<{
+  id: ProseGateRule["documentKinds"][number]; label: string;
+}> = [
+  { id: "chapter", label: "主线正文" },
+  { id: "side", label: "支线正文" },
+  { id: "lore", label: "设定" },
+  { id: "outline", label: "大纲" },
+  { id: "archive", label: "归档" },
+  { id: "other", label: "其他文档" },
+  { id: "writing_example", label: "范文" },
+];
 
 /** Heavy management panels — code-split so first paint does not pay for them. */
 const CharacterEditor = React.lazy(async () => {
@@ -226,7 +240,6 @@ const ModelConfig = React.lazy(async () => {
 
 /** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
 const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, enforceMinimum: false };
-import "./style.css";
 
 function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
   const [open, setOpen] = useState(false);
@@ -238,7 +251,7 @@ function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
           现场感 {report.vividness.score}
         </span>
         <span className="proposal-quality-metric" title={report.aiTells.summary}>
-          AI 味 {report.aiTells.score}
+          模式风险 {report.aiTells.score}
         </span>
         {report.length
           ? <span
@@ -3467,6 +3480,8 @@ function App() {
           kind: "style_preference",
           severity: "warn",
           enabled: true,
+          documentKinds: ["chapter", "side"],
+          pathPrefixes: [],
           sourceFeedback: "",
           isNew: true,
         })}
@@ -3504,6 +3519,36 @@ function App() {
             </select>
           </label>
         </div>
+        <fieldset className="prose-gate-scope">
+          <legend>适用文档（全部不选表示全局）</legend>
+          {PROSE_GATE_DOCUMENT_KIND_OPTIONS.map(option => <label key={option.id}>
+            <input
+              type="checkbox"
+              checked={proseGateDraft.documentKinds.includes(option.id)}
+              disabled={proseGateBusy}
+              onChange={(event) => setProseGateDraft(current => current ? {
+                ...current,
+                documentKinds: event.target.checked
+                  ? [...current.documentKinds, option.id]
+                  : current.documentKinds.filter(kind => kind !== option.id),
+              } : current)}
+            />
+            {option.label}
+          </label>)}
+        </fieldset>
+        <label>
+          <span>路径前缀（每行一个；留空表示全部）</span>
+          <textarea
+            value={proseGateDraft.pathPrefixes.join("\n")}
+            disabled={proseGateBusy}
+            rows={2}
+            placeholder="例如 chapters/第一卷"
+            onChange={(event) => setProseGateDraft(current => current ? {
+              ...current,
+              pathPrefixes: event.target.value.split(/\r?\n/u).map(value => value.trim()).filter(Boolean),
+            } : current)}
+          />
+        </label>
         <label>
           <span>核验标准</span>
           <textarea
@@ -3584,6 +3629,8 @@ function App() {
                   kind: rule.kind ?? (rule.severity === "block" ? "hard_gate" : "style_preference"),
                   severity: rule.severity,
                   enabled: rule.enabled,
+                  documentKinds: rule.documentKinds ?? [],
+                  pathPrefixes: rule.pathPrefixes ?? [],
                   sourceFeedback: rule.sourceFeedback,
                   isNew: false,
                 })}
@@ -6021,6 +6068,8 @@ function App() {
                       kind: "style_preference",
                       severity: "warn",
                       enabled: true,
+                      documentKinds: ["chapter", "side"],
+                      pathPrefixes: [],
                       sourceFeedback: "",
                       isNew: true,
                     })}
@@ -6488,6 +6537,36 @@ function App() {
                         </select>
                       </label>
                     </div>
+                    <fieldset className="prose-gate-scope">
+                      <legend>适用文档（全部不选表示全局）</legend>
+                      {PROSE_GATE_DOCUMENT_KIND_OPTIONS.map(option => <label key={option.id}>
+                        <input
+                          type="checkbox"
+                          checked={proseGateDraft.documentKinds.includes(option.id)}
+                          disabled={proseGateBusy}
+                          onChange={(event) => setProseGateDraft(current => current ? {
+                            ...current,
+                            documentKinds: event.target.checked
+                              ? [...current.documentKinds, option.id]
+                              : current.documentKinds.filter(kind => kind !== option.id),
+                          } : current)}
+                        />
+                        {option.label}
+                      </label>)}
+                    </fieldset>
+                    <label>
+                      <span>路径前缀（每行一个；留空表示全部）</span>
+                      <textarea
+                        value={proseGateDraft.pathPrefixes.join("\n")}
+                        disabled={proseGateBusy}
+                        rows={2}
+                        placeholder="例如 chapters/第一卷"
+                        onChange={(event) => setProseGateDraft(current => current ? {
+                          ...current,
+                          pathPrefixes: event.target.value.split(/\r?\n/u).map(value => value.trim()).filter(Boolean),
+                        } : current)}
+                      />
+                    </label>
                     <label>
                       <span>核验标准</span>
                       <textarea
@@ -6568,6 +6647,8 @@ function App() {
                               kind: rule.kind ?? (rule.severity === "block" ? "hard_gate" : "style_preference"),
                               severity: rule.severity,
                               enabled: rule.enabled,
+                              documentKinds: rule.documentKinds ?? [],
+                              pathPrefixes: rule.pathPrefixes ?? [],
                               sourceFeedback: rule.sourceFeedback,
                               isNew: false,
                             })}

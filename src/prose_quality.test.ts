@@ -11,22 +11,20 @@ import {
   sceneMannerismGateError,
 } from "./prose_quality.js";
 
-test("generation-time constraint prompt explicitly blocks negation-redefinition frames", () => {
+test("generation-time constraint prompt targets dense repetition without banning valid syntax", () => {
   const full = proseMannerismConstraintPrompt();
-  assert.match(full, /直接陈述成立的事实/);
+  assert.match(full, /连续复现并替代新信息/u);
   assert.match(full, /破折号/);
-  assert.match(full, /解释只在引入新事实时出现/);
+  assert.match(full, /解释应带来新的事实/u);
   const compact = proseMannerismConstraintPrompt({ compact: true });
-  assert.match(compact, /句式基准/);
+  assert.match(compact, /句式边界/);
   assert.ok(full.length < 1_100, "constraint prompt must stay short enough for the style slot");
-  assert.match(full, /一拍一事|一个主要事件/);
-  assert.match(full, /人称主语/);
+  assert.match(full, /施事、对象与关系/);
   for (const prompt of [full, compact, proseMannerismPreflightLine()]) {
-    assert.match(prompt, /否定|不是/);
     assert.ok(!prompt.includes("坏例"), "must not carry bad-example demos");
   }
-  assert.match(proseMannerismPreflightLine(), /自检/);
-  assert.match(proseMannerismPreflightLine(), /一句话只推一事|堆概念/);
+  assert.match(proseMannerismPreflightLine(), /密集复现/);
+  assert.match(proseMannerismPreflightLine(), /孤立.*保留/);
 });
 
 test("sceneMannerismGateError blocks dense split_redefinition before draft write", () => {
@@ -45,16 +43,14 @@ test("sceneMannerismGateError blocks dense split_redefinition before draft write
   assert.match(blocked!, /不是/);
 });
 
-test("scene gate deterministically blocks a single split negation-redefinition", () => {
+test("scene gate leaves a single split negation-redefinition for semantic review", () => {
   const blocked = sceneMannerismGateError("母亲的手收紧。不是抱。是扣。随后地板断了。");
-  assert.ok(blocked);
-  assert.match(blocked!, /不是抱/);
+  assert.equal(blocked, undefined);
 });
 
-test("repeated factual negation frames become a hard scene error", () => {
+test("a couple of factual negation frames remain non-blocking", () => {
   const blocked = sceneMannerismGateError("走廊里不是风声，是人的脚步。门后不是护士，是一名警卫。");
-  assert.ok(blocked);
-  assert.match(blocked!, /说明式写法过密/);
+  assert.equal(blocked, undefined);
 });
 
 test("pure negative enumeration is not mistaken for a positive redefinition", () => {
@@ -153,9 +149,11 @@ test("repeated abstract contrast frames trip their own density limit", () => {
   const text = [
     "这不是愤怒，而是一种更深的恐惧。",
     "那不是退让，只是另一种形式的反抗。",
+    "这不是沉默，而是尚未作出的决定。",
+    "那不是失败，而是另一条路的开始。",
   ].join("\n");
   const contrastIssues = analyzeProseStyle(text).filter(issue => issue.subtype === "abstract_reframing");
-  assert.equal(contrastIssues.length, 2);
+  assert.equal(contrastIssues.length, 4);
   assert.ok(contrastIssues.every(issue => issue.severity === "error"));
   assert.ok(contrastStyleError(text));
 });
@@ -167,20 +165,20 @@ test("a single abstract contrast remains advisory", () => {
   assert.equal(contrastStyleError(text), undefined);
 });
 
-test("detects split not-A-is-B narration as a deterministic error", () => {
+test("reports a split not-A-is-B narration for semantic review", () => {
   const text = "她不是被叫醒。是自己醒的。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
   assert.ok(issue);
-  assert.equal(issue.severity, "error");
+  assert.equal(issue.severity, "warning");
   assert.equal(issue.sentence, text);
-  assert.ok(proseStyleIssuesError([issue]));
+  assert.equal(proseStyleIssuesError([issue]), undefined);
 });
 
-test("blocks a single factual split contrast", () => {
+test("allows a single factual split contrast pending semantic review", () => {
   const text = "他不是坏人。他是个逃兵。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
-  assert.equal(issue?.severity, "error");
-  assert.ok(contrastStyleError(text));
+  assert.equal(issue?.severity, "warning");
+  assert.equal(contrastStyleError(text), undefined);
 });
 
 test("reports only newly introduced issues for patches", () => {
