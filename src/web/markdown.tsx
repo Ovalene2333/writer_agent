@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, type MouseEvent } from "react";
 import { Marked, type Token, type Tokens } from "marked";
 import { getActiveBase } from "./connection";
 import type { MarkdownHeading } from "./types";
@@ -9,6 +9,17 @@ export function escapeHtml(text: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/** Links emitted by Agent steps may point at project documents, never the public web. */
+export function isLocalMarkdownHref(href: string): boolean {
+  const value = href.trim();
+  if (!value || value.startsWith("//")) return false;
+  return value.startsWith("#")
+    || value.startsWith("/")
+    || value.startsWith("./")
+    || value.startsWith("../")
+    || !/^[a-z][a-z\d+.-]*:/i.test(value);
 }
 
 export function normalizeMarkdownSource(content: string): string {
@@ -62,7 +73,8 @@ markdownParser.use({
       const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
       const external = /^https?:\/\//i.test(safeHref);
       const rel = external ? ' target="_blank" rel="noreferrer noopener"' : "";
-      return `<a href="${escapeHtml(safeHref)}"${titleAttr}${rel}>${text}</a>`;
+      const scope = isLocalMarkdownHref(safeHref) ? "local" : "external";
+      return `<a href="${escapeHtml(safeHref)}" data-link-scope="${scope}"${titleAttr}${rel}>${text}</a>`;
     },
     image({ href, title, text }: Tokens.Image) {
       const alt = escapeHtml(text || "");
@@ -180,14 +192,37 @@ export function saveReadingProgress(path: string, ratio: number): void {
   localStorage.setItem(readingProgressStorageKey(path), String(Math.max(0, Math.min(1, ratio))));
 }
 
-export function Markdown({ content, className, headingPrefix }: { content: string; className?: string; headingPrefix?: string }) {
+export function Markdown({
+  content,
+  className,
+  headingPrefix,
+  localLinksOnly = false,
+  onLocalLink,
+}: {
+  content: string;
+  className?: string;
+  headingPrefix?: string;
+  localLinksOnly?: boolean;
+  onLocalLink?: (href: string) => void;
+}) {
   const html = useMemo(
     () => renderMarkdownHtml(content, headingPrefix),
     [content, headingPrefix],
   );
+  const handleClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (!localLinksOnly) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const anchor = target.closest("a");
+    if (!anchor || !event.currentTarget.contains(anchor)) return;
+    event.preventDefault();
+    const href = anchor.getAttribute("href") ?? "";
+    if (isLocalMarkdownHref(href)) onLocalLink?.(href);
+  };
   return (
     <div
-      className={`markdown ${className ?? ""}`}
+      className={`markdown${localLinksOnly ? " markdown-local-links" : ""}${className ? ` ${className}` : ""}`}
+      onClick={handleClick}
       dangerouslySetInnerHTML={{ __html: html || "<p></p>" }}
     />
   );

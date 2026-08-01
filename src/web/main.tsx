@@ -143,6 +143,7 @@ import {
 
 import {
   loadAgentHiddenCharacterCards,
+  loadPerformanceMode,
   loadUiTheme,
   loadWorkspaceMode,
   readLastSessionId,
@@ -153,6 +154,7 @@ import {
   HeaderMoreMenu,
   WorkspaceShell,
   RowOverflowMenu,
+  PERFORMANCE_MODE_STORAGE_KEY,
 } from "./ui_primitives";
 import {
   ARCHIVE_ROOT,
@@ -215,6 +217,9 @@ import type { ContextGraphNode } from "./types";
 import { WorkspaceTopbar } from "./workspace_topbar";
 import { api, apiFetch } from "./api_client";
 import "./style.css";
+
+const INITIAL_PERFORMANCE_MODE = loadPerformanceMode();
+window.document.documentElement.dataset.motion = INITIAL_PERFORMANCE_MODE ? "off" : "full";
 
 const PROSE_GATE_DOCUMENT_KIND_OPTIONS: Array<{
   id: ProseGateRule["documentKinds"][number]; label: string;
@@ -550,7 +555,11 @@ function App() {
   const [reviewOpen, setReviewOpen] = useState(false);
   const prevPendingReviewRef = useRef(0);
   const [theme, setTheme] = useState<UiThemeId>(() => loadUiTheme());
+  const [performanceMode, setPerformanceMode] = useState(INITIAL_PERFORMANCE_MODE);
   const [styleBusy, setStyleBusy] = useState(false);
+  const [styleApplyingId, setStyleApplyingId] = useState<string | null>(null);
+  const [styleReviewingId, setStyleReviewingId] = useState<string | null>(null);
+  const [styleReviewMessage, setStyleReviewMessage] = useState("");
   const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
   const [proseGateDraft, setProseGateDraft] = useState<ProseGateRuleDraft | null>(null);
   const [proseGateBusy, setProseGateBusy] = useState(false);
@@ -996,14 +1005,17 @@ function App() {
   }, [state?.sessionId, state?.messages, state?.messagesHasMore, olderMessagesLoading]);
 
   const applyWritingStyle = useCallback(async (styleId: string, label?: string) => {
-    setStyleBusy(true);
+    setStyleApplyingId(styleId || "__off");
     setError("");
     try {
       await api("/api/style", {
         method: "PUT",
         body: JSON.stringify({ styleId }),
       });
-      await refresh(state?.sessionId);
+      setState(current => current ? {
+        ...current,
+        config: { ...current.config, style: styleId },
+      } : current);
       if (!styleId) {
         setNotice("已关闭写作风格模板");
       } else {
@@ -1012,9 +1024,26 @@ function App() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setStyleBusy(false);
+      setStyleApplyingId(null);
     }
-  }, [refresh, state?.sessionId]);
+  }, []);
+
+  const reviewDefaultStyleExample = useCallback(async (template: StyleTemplateInfo) => {
+    if (!template.builtIn || styleReviewingId) return;
+    setStyleReviewingId(template.id);
+    setStyleReviewMessage("");
+    try {
+      const result = await api<{ templates: StyleTemplateInfo[] }>(`/api/style/templates/${encodeURIComponent(template.id)}/review-example`, {
+        method: "POST",
+      });
+      setState(current => current ? { ...current, styleTemplates: result.templates } : current);
+      setStyleReviewMessage(`已在后台审核默认范文：${template.name}`);
+    } catch (cause) {
+      setStyleReviewMessage(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setStyleReviewingId(null);
+    }
+  }, [styleReviewingId]);
 
   /** Open editor for custom templates, or read-only viewer for built-ins. */
   const openStyleTemplate = useCallback((template?: StyleTemplateInfo) => {
@@ -1083,6 +1112,24 @@ function App() {
       unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    if (!state?.styleTemplates?.some(template => template.exampleReviewStatus === "reviewing")) return;
+    const timer = window.setInterval(() => {
+      void api<{ templates: StyleTemplateInfo[] }>("/api/style")
+        .then(result => {
+          setState(current => current ? { ...current, styleTemplates: result.templates } : current);
+          const failed = result.templates.find(template => template.exampleReviewStatus === "failed");
+          if (failed?.exampleReviewError) {
+            setStyleReviewMessage(`${failed.name}：${failed.exampleReviewError}`);
+          } else if (!result.templates.some(template => template.exampleReviewStatus === "reviewing")) {
+            setStyleReviewMessage("范文审核已完成");
+          }
+        })
+        .catch(cause => setStyleReviewMessage(cause instanceof Error ? cause.message : String(cause)));
+    }, 1_500);
+    return () => window.clearInterval(timer);
+  }, [state?.styleTemplates]);
 
   // Switching sessions: drop the live buffer. History comes from state.stepTrails.
   useEffect(() => {
@@ -1174,6 +1221,15 @@ function App() {
     const meta = window.document.querySelector('meta[name="theme-color"]');
     if (meta && active) meta.setAttribute("content", active.preview.accent);
   }, [theme]);
+
+  useEffect(() => {
+    window.document.documentElement.dataset.motion = performanceMode ? "off" : "full";
+    try {
+      localStorage.setItem(PERFORMANCE_MODE_STORAGE_KEY, String(performanceMode));
+    } catch {
+      /* private mode or a full storage quota must not block appearance changes */
+    }
+  }, [performanceMode]);
 
   useEffect(() => {
     localStorage.setItem("writer-workspace-mode", workspaceMode);
@@ -1562,8 +1618,7 @@ function App() {
       updateStreamSteps((current) => {
         const id = event.step ?? current.length + 1;
         if (current.some((s) => s.id === id)) return current;
-        // New steps stay collapsed; expand only on user click. Content still streams into state.
-        return [...current, { id, output: "", reasoning: "", tools: [], status: "running", expanded: false }];
+        return [...current, { id, output: "", reasoning: "", tools: [], status: "running", expanded: true }];
       });
     }
     if (event.type === "text" && event.text) {
@@ -1572,9 +1627,8 @@ function App() {
         const idx = activeStepIndex(current);
         if (idx < 0) return current;
         const key = event.channel === "reasoning" ? "reasoning" : "output";
-        const isDraftPreview = event.channel !== "reasoning" && event.text!.includes("草稿预览（终审仍在继续）");
         return current.map((s, i) => (i === idx
-          ? { ...s, [key]: s[key] + event.text, ...(isDraftPreview ? { expanded: true } : {}) }
+          ? { ...s, [key]: s[key] + event.text }
           : s));
       });
     }
@@ -1613,7 +1667,7 @@ function App() {
     if (event.type === "step_done") {
       updateStreamSteps((current) =>
         current.map((s) => (s.id === event.step
-          ? { ...s, status: "completed", expanded: s.output.includes("草稿预览（终审仍在继续）") }
+          ? { ...s, status: "completed", expanded: false }
           : s)),
       );
     }
@@ -2203,6 +2257,36 @@ function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
+  }
+
+  function openAgentStepLink(href: string) {
+    if (!state || href.startsWith("#")) return;
+    const rawPath = href.split(/[?#]/, 1)[0] ?? "";
+    let decodedPath = rawPath;
+    try { decodedPath = decodeURIComponent(rawPath); } catch { /* keep the original path */ }
+
+    const directPath = decodedPath.replace(/^\/+/, "");
+    const relativeParts = decodedPath.startsWith("/")
+      ? directPath.split("/")
+      : [...activePath.split("/").slice(0, -1), ...decodedPath.split("/")];
+    const resolvedParts: string[] = [];
+    for (const part of relativeParts) {
+      if (!part || part === ".") continue;
+      if (part === "..") resolvedParts.pop();
+      else resolvedParts.push(part);
+    }
+    const resolvedPath = resolvedParts.join("/");
+    const targetPath = state.documents.includes(directPath)
+      ? directPath
+      : state.documents.includes(resolvedPath)
+        ? resolvedPath
+        : "";
+    if (!targetPath) {
+      setNotice(`未找到本地文档：${decodedPath}`);
+      return;
+    }
+    setActivePath(targetPath);
+    setMobileTab("editor");
   }
 
   async function confirmBranchAction(keepChanges: boolean) {
@@ -3602,7 +3686,7 @@ function App() {
         <article className={`prose-gate-card${rule.enabled ? "" : " disabled"}`} key={rule.id}>
           <div className="prose-gate-card-head">
             <div>
-              <strong>{rule.id}</strong>
+              <strong title={rule.id}>{rule.label || rule.id}</strong>
               <span className={`prose-gate-severity ${rule.severity}`}>{rule.severity === "block" ? "阻断" : "提醒"}</span>
             </div>
             <label className="prose-gate-switch">
@@ -4750,7 +4834,11 @@ function App() {
                     && msg.role === "user"
                     && msg.channel !== "roleplay"
                     && msg.id > 0
-                    && step.status !== "running";
+                    // A persisted trail can be left at `running` when the server
+                    // process disappears before it can flush a terminal event.
+                    // The in-memory job registry is authoritative for liveness;
+                    // a stale step status must not strand an otherwise resumable turn.
+                    && !activeJobId;
                   return (
                   <AgentStepCard
                     key={`${msg.id}-${step.id}`}
@@ -4762,6 +4850,7 @@ function App() {
                           onClick: () => void resumeInterruptedAgent(msg),
                         }
                       : undefined}
+                    onLocalLink={openAgentStepLink}
                     onToggle={() => {
                       if (liveHere) {
                         updateStreamSteps((current) =>
@@ -5552,7 +5641,7 @@ function App() {
               <button
                 type="button"
                 className={`style-off${activeStyleId ? "" : " active"}`}
-                disabled={styleBusy || !activeStyleId}
+                disabled={styleBusy || styleApplyingId !== null || !activeStyleId}
                 onClick={() => void applyWritingStyle("")}
               >
                 不使用模板
@@ -5564,6 +5653,7 @@ function App() {
                 </span>
               )}
             </div>
+            {styleReviewMessage && <p className="style-review-message" role="status">{styleReviewMessage}</p>}
             <div className="theme-grid style-grid">
               {styleTemplates.length === 0 ? (
                 <div className="management-empty">暂无写作风格模板</div>
@@ -5580,7 +5670,7 @@ function App() {
                       <button
                         type="button"
                         className="style-card-select"
-                        disabled={styleBusy}
+                        disabled={styleBusy || styleApplyingId !== null}
                         onClick={() => void applyWritingStyle(item.id, item.name)}
                       >
                         <div className="theme-card-meta">
@@ -5588,6 +5678,9 @@ function App() {
                           {item.name}
                           {selected && <span className="theme-tag">使用中</span>}
                           {readOnly && <span className="theme-tag">内置</span>}
+                          {item.exampleReviewed && <span className="theme-tag reviewed">范文已审核</span>}
+                          {item.exampleReviewStatus === "reviewing" && <span className="theme-tag">审核中</span>}
+                          {item.exampleReviewStatus === "failed" && <span className="theme-tag failed">审核失败</span>}
                           {!readOnly && item.customized && <span className="theme-tag">自定义</span>}
                         </strong>
                         <small>{item.description}</small>
@@ -5596,14 +5689,30 @@ function App() {
                         )}
                         </div>
                       </button>
-                      <button
-                        type="button"
-                        className="style-card-edit"
-                        disabled={styleBusy}
-                        onClick={() => openStyleTemplate(item)}
-                      >
-                        {readOnly ? "浏览" : "编辑"}
-                      </button>
+                      <div className="style-card-actions">
+                        {item.builtIn && item.exampleContent.trim() ? (
+                          <button
+                            type="button"
+                            className="style-card-review"
+                            disabled={styleBusy || styleReviewingId === item.id || item.exampleReviewStatus === "reviewing" || item.exampleReviewed}
+                            onClick={() => void reviewDefaultStyleExample(item)}
+                          >
+                            {styleReviewingId === item.id || item.exampleReviewStatus === "reviewing"
+                              ? "审核中…"
+                              : item.exampleReviewed
+                                ? "范文已审核"
+                                : "审核范文"}
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="style-card-edit"
+                          disabled={styleBusy}
+                          onClick={() => openStyleTemplate(item)}
+                        >
+                          {readOnly ? "浏览" : "编辑"}
+                        </button>
+                      </div>
                     </div>
                   );
                 })
@@ -6620,7 +6729,7 @@ function App() {
                     <article className={`prose-gate-card${rule.enabled ? "" : " disabled"}`} key={rule.id}>
                       <div className="prose-gate-card-head">
                         <div>
-                          <strong>{rule.id}</strong>
+                          <strong title={rule.id}>{rule.label || rule.id}</strong>
                           <span className={`prose-gate-severity ${rule.severity}`}>{rule.severity === "block" ? "阻断" : "提醒"}</span>
                         </div>
                         <label className="prose-gate-switch">
@@ -6903,23 +7012,27 @@ function App() {
           {activeStyle && <button type="button" disabled={styleBusy} onClick={() => openStyleTemplate(activeStyle)}>
           {(activeStyle.readOnly || activeStyle.builtIn) ? "浏览当前模板" : "编辑当前模板"}
           </button>}
-          <button type="button" className={`style-off${activeStyleId ? "" : " active"}`} disabled={styleBusy || !activeStyleId} onClick={() => void applyWritingStyle("")}>不使用模板</button>
+          <button type="button" className={`style-off${activeStyleId ? "" : " active"}`} disabled={styleBusy || styleApplyingId !== null || !activeStyleId} onClick={() => void applyWritingStyle("")}>不使用模板</button>
           {activeStyle && <span className="style-active-hint">当前：{activeStyle.name}{(activeStyle.readOnly || activeStyle.builtIn) ? "（内置·只读）" : ""}</span>}
           </div>
+          {styleReviewMessage && <p className="style-review-message" role="status">{styleReviewMessage}</p>}
           <div className="theme-grid style-grid">
           {styleTemplates.length === 0 ? <div className="management-empty">暂无写作风格模板</div> : styleTemplates.map((item) => {
           const selected = item.id === activeStyleId;
           const readOnly = Boolean(item.readOnly || item.builtIn);
           const preview = (item.exampleContent ?? "").replace(/\s+/g, " ").trim().slice(0, 96);
           return <div key={item.id} className={`theme-card style-card${selected ? " active" : ""}`}>
-          <button type="button" className="style-card-select" disabled={styleBusy} onClick={() => void applyWritingStyle(item.id, item.name)}>
+          <button type="button" className="style-card-select" disabled={styleBusy || styleApplyingId !== null} onClick={() => void applyWritingStyle(item.id, item.name)}>
           <div className="theme-card-meta">
-          <strong>{item.name}{selected && <span className="theme-tag">使用中</span>}{readOnly && <span className="theme-tag">内置</span>}{!readOnly && item.customized && <span className="theme-tag">自定义</span>}</strong>
+          <strong>{item.name}{selected && <span className="theme-tag">使用中</span>}{readOnly && <span className="theme-tag">内置</span>}{item.exampleReviewed && <span className="theme-tag reviewed">范文已审核</span>}{item.exampleReviewStatus === "reviewing" && <span className="theme-tag">审核中</span>}{item.exampleReviewStatus === "failed" && <span className="theme-tag failed">审核失败</span>}{!readOnly && item.customized && <span className="theme-tag">自定义</span>}</strong>
           <small>{item.description}</small>
           {preview && <span className="theme-example style-example">{preview}{preview.length >= 96 ? "…" : ""}</span>}
           </div>
           </button>
+          <div className="style-card-actions">
+          {item.builtIn && item.exampleContent.trim() && <button type="button" className="style-card-review" disabled={styleBusy || styleReviewingId === item.id || item.exampleReviewStatus === "reviewing" || item.exampleReviewed} onClick={() => void reviewDefaultStyleExample(item)}>{styleReviewingId === item.id || item.exampleReviewStatus === "reviewing" ? "审核中…" : item.exampleReviewed ? "范文已审核" : "审核范文"}</button>}
           <button type="button" className="style-card-edit" disabled={styleBusy} onClick={() => openStyleTemplate(item)}>{readOnly ? "浏览" : "编辑"}</button>
+          </div>
           </div>;
           })}
           </div>
@@ -6992,7 +7105,24 @@ function App() {
           </div>
           {connectionPanelMsg && <p className="connection-panel-msg" role="status">{connectionPanelMsg}</p>}
           </div> : <div className="management-empty">当前环境只配置了单一连接通道。</div>}
-          appearanceContent={<div className="settings-section-body"><div className="theme-grid">
+          appearanceContent={<div className="settings-section-body appearance-settings">
+          <section className={`appearance-motion-card${performanceMode ? " performance" : ""}`}>
+          <div className="appearance-motion-copy">
+          <span className="appearance-motion-icon" aria-hidden="true"><Zap size={18}/></span>
+          <div><h4>性能模式</h4><p>关闭页面动画、过渡、动态光效与背景模糊，适合低功耗设备、远程桌面或大型项目。</p></div>
+          </div>
+          <button
+          type="button"
+          className="appearance-motion-toggle"
+          role="switch"
+          aria-checked={performanceMode}
+          onClick={() => setPerformanceMode(value => !value)}
+          >
+          <span aria-hidden="true"><i/></span><em>{performanceMode ? "已开启" : "已关闭"}</em>
+          </button>
+          </section>
+          <div className="appearance-theme-head"><h4>界面主题</h4><p>主题颜色与性能模式相互独立。</p></div>
+          <div className="theme-grid">
           {UI_THEMES.map((item) => <button key={item.id} type="button" className={`theme-card${theme === item.id ? " active" : ""}`} onClick={() => setTheme(item.id)}>
           <div className="theme-preview" style={{
           ["--tp-bg"]: item.preview.bg,

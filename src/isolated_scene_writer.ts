@@ -3,6 +3,7 @@ import { nonThinkingRequestOptions, samplingRequestOptions, type SamplingRequest
 import { completeProviderCompletion, buildProviderCompletionBody, modelCompletionEndpoint, parseProviderCompletionPayload } from "./model_api.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
+import { proseConstructionGenerationPrompt } from "./prose_construction_rules.js";
 import {
   proseCharacterCount,
   proseLengthAdjustmentInstruction,
@@ -80,6 +81,8 @@ const ISOLATED_WRITER_SYSTEM = `你是成熟的中文小说作者，只写眼前
 输入中的场景目标、转折和事实有主次，不是待逐项改写的清单。合并能够由同一动作完成的内容，舍弃不影响本场变化的背景，让场景沿一条清楚的欲望与阻力线生长。声线样本只用于学习叙述距离、节奏和措辞，不借用其中的人物、意象或事件。
 
 句法和段落跟随现场的注意力与压力自然变化。写清理解行动所需的人、对象和关系；短句、长句、省略、否定与转折都可以使用，不把任何一种句式连续当作制造力度的固定办法。动作或对白已经抵达的意义不再复述。
+
+${proseConstructionGenerationPrompt()}
 
 只输出可直接入稿的本场正文，不要标题、说明、清单、JSON 或代码围栏。`;
 

@@ -425,14 +425,21 @@ export type StyleTemplateInfo = {
   customized?: boolean;
   /** Built-in templates cannot be edited or overridden. */
   readOnly?: boolean;
+  /** The current default example has passed semantic review. */
+  exampleReviewed?: boolean;
+  exampleReviewStatus?: "unreviewed" | "reviewing" | "reviewed" | "failed";
+  exampleReviewError?: string;
 };
 export type StyleTemplateDraft = StyleTemplateInfo & { isNew: boolean };
 export type ProseGateRule = {
   id: string;
+  label?: string;
   instruction: string;
+  revisionIntent?: string;
   kind: "hard_gate" | "style_preference";
   severity: "block" | "warn";
   enabled: boolean;
+  builtIn?: boolean;
   documentKinds: Array<"chapter" | "side" | "lore" | "outline" | "archive" | "other" | "writing_example">;
   pathPrefixes: string[];
   sourceFeedback: string;

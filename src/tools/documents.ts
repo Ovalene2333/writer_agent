@@ -6,6 +6,7 @@ import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { documentKind } from "../project.js";
 import { proseGateRulesForTarget } from "../prose_gate_rules.js";
+import { buildProseDiagnosis } from "../prose_review.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { documentMap, optionalPositiveInteger, requireString } from "./helpers.js";
 
@@ -79,10 +80,12 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
       callKind: "learned_prose_audit",
     },
   ));
+  const sourceHash = project.hash(content);
+  const diagnosis = buildProseDiagnosis(sourceHash, issues);
   return JSON.stringify({
     path,
     source: activeDraft ? "chapter_draft" : "document",
-    sourceHash: project.hash(content),
+    sourceHash,
     summary: {
       errors: issues.filter(issue => issue.severity === "error").length,
       warnings: issues.filter(issue => issue.severity === "warning").length,
@@ -90,6 +93,7 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
       flashAdjudicated: flash.adjudicated,
       flashSkipped: flash.skipped,
     },
+    diagnosis,
     issues,
   });
 }

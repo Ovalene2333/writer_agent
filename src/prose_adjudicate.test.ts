@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   applyCachedProseVerdicts,
   applyProseVerdicts,
+  learnedGatePassagesForReview,
   materializeProseDiscoveries,
   parseLearnedProseGateFindings,
   parseProseAdjudication,
@@ -15,7 +16,14 @@ import {
   type ProseVerdictCache,
 } from "./prose_adjudicate.js";
 import { analyzeProseStyle, proseStyleIssuesError } from "./prose_quality.js";
-import { proseGateRulesForTarget, type ProseGateRule } from "./prose_gate_rules.js";
+import {
+  BUILT_IN_PROSE_GATE_RULES,
+  MAX_PROSE_GATE_RULES,
+  PROSE_GATE_PROJECT_RULE_CAPACITY,
+  proseGateRulesForTarget,
+  type ProseGateRule,
+} from "./prose_gate_rules.js";
+import { buildProseDiagnosis } from "./prose_review.js";
 
 test("selectAdjudicationCandidates prefers warnings and skips pure speech info", () => {
   const speech = analyzeProseStyle("「你——你怎么来了？」");
@@ -31,10 +39,13 @@ test("learned gate accepts exact evidence for quoted-text count feedback", () =>
   const text = "她盯着纸上的“永远等你”——这三个字，半晌没动。";
   const rule: ProseGateRule = {
     id: "quoted-text-count-consistency",
+    label: "引号文字数量一致性",
     instruction: "描述引号内文字数量时，核对实际字数。",
+    revisionIntent: "修正数量描述。",
     kind: "hard_gate",
     severity: "block",
     enabled: true,
+    builtIn: true,
     documentKinds: ["chapter", "side", "writing_example"],
     pathPrefixes: [],
     sourceFeedback: "作者要求复审字数描述",
@@ -63,10 +74,13 @@ test("learned gate accepts exact evidence for quoted-text count feedback", () =>
 test("project prose gates honor document kind and path scopes", () => {
   const base: ProseGateRule = {
     id: "chapter-voice",
+    label: "第一卷声线",
     instruction: "只复审第一卷正文。",
+    revisionIntent: "保持第一卷声线。",
     kind: "style_preference",
     severity: "warn",
     enabled: true,
+    builtIn: false,
     documentKinds: ["chapter"],
     pathPrefixes: ["chapters/第一卷"],
     sourceFeedback: "",
@@ -79,6 +93,25 @@ test("project prose gates honor document kind and path scopes", () => {
   );
   assert.deepEqual(proseGateRulesForTarget([base], { kind: "chapter", path: "chapters/第二卷/第一章.md" }), []);
   assert.deepEqual(proseGateRulesForTarget([base], { kind: "writing_example" }), []);
+});
+
+test("built-in semantic rules keep a fixed project-rule capacity and repair metadata", () => {
+  assert.equal(MAX_PROSE_GATE_RULES, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length);
+  assert.equal(PROSE_GATE_PROJECT_RULE_CAPACITY, 19);
+  assert.deepEqual(BUILT_IN_PROSE_GATE_RULES.map(rule => rule.id), [
+    "quoted-text-count-consistency",
+    "telegraphic-object-beats",
+    "characterization-proof-stacking",
+  ]);
+  for (const rule of BUILT_IN_PROSE_GATE_RULES) {
+    assert.ok(rule.label.length > 0);
+    assert.ok(rule.instruction.length > 0);
+    assert.ok(rule.revisionIntent.length > 0);
+    assert.equal(rule.builtIn, true);
+  }
+  const characterization = BUILT_IN_PROSE_GATE_RULES.find(rule => rule.id === "characterization-proof-stacking");
+  assert.match(characterization?.instruction ?? "", /行动证明.*外部背书.*点题定性/u);
+  assert.match(characterization?.revisionIntent ?? "", /具体选择.*后果/u);
 });
 
 test("packProseSnippets includes neighbor context", () => {
@@ -145,6 +178,66 @@ test("split not-A-is-B narration is semantically adjudicated instead of hard-cod
     [proseVerdictCacheKey(freshSplit), { verdict: "allow", reason: "旧缓存误放行" }],
   ]);
   assert.equal(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)), undefined);
+});
+
+test("registered construction blocks only after model verdict and density", () => {
+  const text = "走廊里不是风声，是人的脚步。门后不是护士，是一名警卫。";
+  const issues = analyzeProseStyle(text);
+  const candidates = issues.filter(item => item.constructionRuleId === "negation_redefinition");
+  assert.equal(candidates.length, 2);
+  assert.equal(shouldAdjudicateForProposal(text, issues), true);
+  assert.ok(packProseSnippets(text, candidates).every(item => item.constructionRuleId === "negation_redefinition"));
+  assert.equal(proseStyleIssuesError(issues), undefined, "regex candidates alone must not hard-block");
+
+  const blocked = applyProseVerdicts(text, issues, candidates.map(item => ({
+    id: item.id,
+    verdict: "block" as const,
+    reason: "重复使用固定对照骨架",
+  })));
+  assert.ok(proseStyleIssuesError(blocked));
+
+  const fresh = analyzeProseStyle(text);
+  const freshCandidates = fresh.filter(item => item.constructionRuleId === "negation_redefinition");
+  const mixed = applyProseVerdicts(text, fresh, [
+    { id: freshCandidates[0].id, verdict: "allow", reason: "必要客观排除" },
+    { id: freshCandidates[1].id, verdict: "block", reason: "模板化重述" },
+  ]);
+  assert.equal(proseStyleIssuesError(mixed), undefined, "one allowed use keeps the blocked occurrence within density allowance");
+});
+
+test("prose diagnosis gives Agent stable evidence and revision intent", () => {
+  const sourceHash = "source-v1";
+  const text = "暖意沿着肩甲扩散，那是缓冲层在预热，不是紧张。";
+  const issues = analyzeProseStyle(text);
+  const candidate = issues.find(item => item.constructionRuleId === "negation_redefinition");
+  assert.ok(candidate);
+  const reviewed = applyProseVerdicts(text, issues, [{
+    id: candidate.id,
+    verdict: "block",
+    reason: "事实成立后追加否定情绪标签",
+  }]);
+  const diagnosis = buildProseDiagnosis(sourceHash, reviewed);
+  assert.equal(diagnosis.status, "needs_revision");
+  assert.equal(diagnosis.sourceHash, sourceHash);
+  assert.equal(diagnosis.actionableIssues[0].ruleId, "negation_redefinition");
+  assert.equal(diagnosis.actionableIssues[0].verdict, "block");
+  assert.match(diagnosis.actionableIssues[0].evidence, /不是紧张/u);
+  assert.ok(diagnosis.actionableIssues[0].revisionIntent.length > 0);
+  assert.equal(buildProseDiagnosis(sourceHash, reviewed).reviewId, diagnosis.reviewId);
+});
+
+test("forward and postposed denial variants share one semantic density rule", () => {
+  const text = "走廊里不是风声，是人的脚步。暖意沿着肩甲扩散，那是缓冲层在预热，不是紧张。";
+  const issues = analyzeProseStyle(text);
+  const candidates = issues.filter(item => item.constructionRuleId === "negation_redefinition");
+  assert.equal(candidates.length, 2);
+  assert.equal(shouldAdjudicateForProposal(text, issues), true);
+  const blocked = applyProseVerdicts(text, issues, candidates.map(item => ({
+    id: item.id,
+    verdict: "block" as const,
+    reason: "同一否定改判骨架的正反变体重复",
+  })));
+  assert.ok(proseStyleIssuesError(blocked));
 });
 
 test("cached verdicts replay across gate rounds and keep re-gates deterministic", () => {
@@ -250,4 +343,16 @@ test("selectDiscoveryPassages combines a following explanation line with its evi
   assert.equal(passages.length, 1);
   assert.ok(passages[0].text.includes("挂上门链"));
   assert.ok(passages[0].text.includes("显然不想"));
+});
+
+test("learned prose review narrows local edits to changed passages and neighbors", () => {
+  const before = ["第一段保持不变。", "第二段原文。", "第三段保持不变。", "第四段也保持不变。"].join("\n\n");
+  const after = ["第一段保持不变。", "第二段已经修改。", "第三段保持不变。", "第四段也保持不变。"].join("\n\n");
+  const passages = learnedGatePassagesForReview(after, before);
+  assert.equal(passages.length, 3);
+  assert.ok(passages.some(item => item.text.includes("第二段已经修改")));
+  assert.ok(passages.some(item => item.text.includes("第一段保持不变")));
+  assert.ok(passages.some(item => item.text.includes("第三段保持不变")));
+  assert.ok(passages.every(item => !item.text.includes("第四段也保持不变")));
+  assert.deepEqual(learnedGatePassagesForReview(before, before), []);
 });

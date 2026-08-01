@@ -123,15 +123,38 @@ export type AgentJobInfo = {
   updatedAt: string;
 };
 
-function styleTemplatesForClient(project: WriterProject) {
+function styleTemplateExampleReviewed(store: WriterStore, template: StyleTemplate): boolean {
+  const content = template.exampleContent.trim();
+  if (!content) return false;
+  const example = store.writingExamples().find(item => item.title === `[风格模板] ${template.name}`);
+  return Boolean(example?.gatePassed && example.content.trim() === content);
+}
+
+type StyleExampleReviewState = {
+  contentHash: string;
+  status: "reviewing" | "failed";
+  error?: string;
+};
+
+function styleTemplatesForClient(
+  project: WriterProject,
+  store: WriterStore,
+  reviews?: ReadonlyMap<string, StyleExampleReviewState>,
+) {
   return project.styleTemplates().map(template => {
     const builtIn = Boolean(getStyleTemplate(template.id));
+    const review = reviews?.get(template.id);
+    const currentReview = review?.contentHash === project.hash(template.exampleContent.trim()) ? review : undefined;
+    const reviewed = styleTemplateExampleReviewed(store, template);
     return {
       ...template,
       builtIn,
       // Built-ins are never project-customized (overrides are ignored).
       customized: !builtIn,
       readOnly: builtIn,
+      exampleReviewed: reviewed,
+      exampleReviewStatus: currentReview?.status ?? (reviewed ? "reviewed" : "unreviewed"),
+      ...(currentReview?.error ? { exampleReviewError: currentReview.error } : {}),
     };
   });
 }
@@ -467,7 +490,36 @@ export async function startWriterServer(options: {
   let readonlyToken = "";
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs(options.store);
+  const styleExampleReviews = new Map<string, StyleExampleReviewState>();
   let publicOrigin: string | null | undefined;
+
+  const scheduleStyleExampleReview = (template: StyleTemplate) => {
+    const contentHash = options.project.hash(template.exampleContent.trim());
+    const running = styleExampleReviews.get(template.id);
+    if (running?.status === "reviewing" && running.contentHash === contentHash) return;
+    options.store.seedStyleExample(template, false);
+    styleExampleReviews.set(template.id, { contentHash, status: "reviewing" });
+    setImmediate(() => {
+      void assertWritingExamplePassesGates(
+        template.exampleContent,
+        options.project,
+        options.providers,
+      ).then(() => {
+        const current = options.project.styleTemplate(template.id);
+        if (!current || options.project.hash(current.exampleContent.trim()) !== contentHash) return;
+        options.store.seedStyleExample(current, true);
+        styleExampleReviews.delete(template.id);
+      }).catch((cause) => {
+        const current = options.project.styleTemplate(template.id);
+        if (!current || options.project.hash(current.exampleContent.trim()) !== contentHash) return;
+        styleExampleReviews.set(template.id, {
+          contentHash,
+          status: "failed",
+          error: errorMessage(cause),
+        });
+      });
+    });
+  };
 
   // CORS：手机页在局域网 HTTP 打开时，离开家后 API 会跨域打到 Cloudflare HTTPS。
   app.use("/api/*", async (context, next) => {
@@ -585,7 +637,7 @@ export async function startWriterServer(options: {
       })),
       activeJobs: agentJobs.activeJobs(),
       characterDirectory: "characters/",
-      styleTemplates: styleTemplatesForClient(options.project),
+      styleTemplates: styleTemplatesForClient(options.project, options.store, styleExampleReviews),
     });
   });
 
@@ -905,7 +957,7 @@ export async function startWriterServer(options: {
   app.get("/api/style", (context) => {
     const activeStyleId = options.project.config().style || "";
     const activeTemplate = activeStyleId ? options.project.styleTemplate(activeStyleId) : undefined;
-    return context.json({ templates: styleTemplatesForClient(options.project), active: activeTemplate ?? null });
+    return context.json({ templates: styleTemplatesForClient(options.project, options.store, styleExampleReviews), active: activeTemplate ?? null });
   });
 
   app.get("/api/prose-gates", (context) => {
@@ -919,7 +971,9 @@ export async function startWriterServer(options: {
       const body = await context.req.json<Partial<ProseGateRule>>();
       const rule = upsertProseGateRule(options.project, {
         id: typeof body.id === "string" ? body.id : "",
+        label: typeof body.label === "string" ? body.label : undefined,
         instruction: typeof body.instruction === "string" ? body.instruction : "",
+        revisionIntent: typeof body.revisionIntent === "string" ? body.revisionIntent : undefined,
         kind: body.kind === "style_preference" ? "style_preference" : body.kind === "hard_gate" ? "hard_gate" : undefined,
         severity: body.severity === "warn" ? "warn" : "block",
         enabled: body.enabled !== false,
@@ -977,22 +1031,35 @@ export async function startWriterServer(options: {
     try {
       const body = await context.req.json<Partial<StyleTemplate>>();
       const candidate = normalizeStyleTemplate(body);
-      if (candidate.exampleContent.trim()) {
-        await assertWritingExamplePassesGates(
-          candidate.exampleContent,
-          options.project,
-          options.providers,
-        );
-      }
+      const previous = options.project.styleTemplate(candidate.id);
+      const exampleChanged = candidate.exampleContent.trim() !== (previous?.exampleContent.trim() ?? "");
+      const requiresReview = Boolean(candidate.exampleContent.trim() && (!previous || exampleChanged));
       const template = options.project.saveStyleTemplate(candidate);
-      if (options.project.config().style === template.id) {
-        options.store.seedStyleExample(template, Boolean(template.exampleContent.trim()));
+      const reviewed = !requiresReview && Boolean(previous && styleTemplateExampleReviewed(options.store, previous));
+      options.store.seedStyleExample(template, reviewed, previous?.name);
+      if (requiresReview) scheduleStyleExampleReview(template);
+      else if (exampleChanged) styleExampleReviews.delete(template.id);
+      return context.json({
+        template,
+        templates: styleTemplatesForClient(options.project, options.store, styleExampleReviews),
+        provider: options.providers.publicConfig(),
+        catalog: options.providers.catalog(),
+      });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/style/templates/:id/review-example", async (context) => {
+    try {
+      const id = context.req.param("id").trim();
+      const template = getStyleTemplate(id);
+      if (!template) throw new Error("仅支持手动审核内置模板的默认范文");
+      if (!template.exampleContent.trim()) throw new Error("该模板没有默认范文");
+      if (!styleTemplateExampleReviewed(options.store, template)) {
+        scheduleStyleExampleReview(template);
       }
       return context.json({
         template,
-        templates: styleTemplatesForClient(options.project),
-        provider: options.providers.publicConfig(),
-        catalog: options.providers.catalog(),
+        templates: styleTemplatesForClient(options.project, options.store, styleExampleReviews),
       });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
@@ -1004,15 +1071,10 @@ export async function startWriterServer(options: {
       if (styleId) {
         const template = options.project.styleTemplate(styleId);
         if (!template) throw new Error(`未知的风格模板：${styleId}`);
-        if (template.exampleContent.trim()) {
-          await assertWritingExamplePassesGates(
-            template.exampleContent,
-            options.project,
-            options.providers,
-          );
-        }
         options.project.setStyle(styleId);
-        options.store.seedStyleExample(template, Boolean(template.exampleContent.trim()));
+        if (template.exampleContent.trim()) {
+          options.store.seedStyleExample(template, styleTemplateExampleReviewed(options.store, template));
+        }
         return context.json({
           active: template,
           provider: options.providers.publicConfig(),

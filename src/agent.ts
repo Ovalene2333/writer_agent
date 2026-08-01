@@ -545,13 +545,13 @@ export function dynamicContextPrompt(
   // 作者定的篇幅，不是模型按事件密度自己拍的。来源写出来，作者一看就知道这个数字
   // 是他这句话带来的还是项目默认档。
   const proseLengthLine = proseLength && (task.documentProposalRequired || task.mode === "write_scene" || task.mode === "rewrite")
-    ? `\n本轮篇幅目标：整章约 ${proseLength.targetCharacters} 字（${
+    ? `\n单章篇幅目标：本轮涉及的每一章都分别约 ${proseLength.targetCharacters} 字（${
       proseLength.source === "prompt_exact"
         ? "用户本轮指定"
         : proseLength.source === "prompt_relative"
           ? "用户本轮要求相对项目默认调整"
           : "项目默认篇幅档"
-    }）。propose_document 用这个数字作 targetCharacters；场景链各场之和对齐它。用户本轮另给数字时以用户为准。`
+    }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。每次 propose_document 都用这个数字作该章的 targetCharacters；场景链各场之和只对齐当前这一章的目标。用户明确为不同章节分别指定数字时，以各章指定值为准。`
     : "";
   const resumeLine = resumeInterrupted
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
@@ -1280,7 +1280,7 @@ export function taskInstructions(
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
 - ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
-- 全文目标字数以「本轮篇幅目标」为准，不擅自缩减，也不另按事件密度改判。直接 propose_document 必须传 targetCharacters（等于该目标）；场景链必须给每场 targetCharacters，且各场之和对齐该目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
+- 单章目标字数以「单章篇幅目标」为准，不擅自缩减，也不另按事件密度改判；一次任务包含多章时，每一章分别达到该目标，禁止把目标当作多章总额均分。每次直接 propose_document 必须传 targetCharacters（等于当前章目标）；场景链必须给每场 targetCharacters，且各场之和只对齐当前章目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径提交，系统会把整篇成稿记录为该文档的新版本；不要为避开同名另起副本或改写章节路径。局部修改仍用 patch，只有承接现有结尾才用 append。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
     ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
@@ -1291,12 +1291,13 @@ ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${is
 - 只交付用户本轮明确要求的正文范围；用户指定多章时逐章提交并沿用已读材料，未要求的章节不得自行扩展。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再按需读取锚点及关联上下文。
+- 用户要求修复句式、文风、解释腔或生成感时，修改前先 audit_prose_style；按 diagnosis.actionableIssues 的 evidence 定位，优先 verdict=block，revisionIntent 只规定修改目标、不当作替换句。一般修改不为展示流程调用审计。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
 - 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。point/section 用 sourceHash+anchorId+spanHash 提交最小 patch；只有 editScope=document 才 inspect 一次后调用 revise_document_isolated，禁止主 Agent 通读和拼接全文。人设变化进提案 characterChanges。提交前：${proseMannerismPreflightLine()}`;
   if (mode === "audit") return `工作流：
-- 先 audit_prose_style；优先 severity=error。
+- 先 audit_prose_style；按 diagnosis.actionableIssues 处理，优先 verdict=block；warn 只在结合上下文仍明显模板化时改。
 - 每条问题含严重度、原文证据、违反约束、最小改法；无证据不提。
 - ${documentProposalRequired ? "要求修复：用 read_document 的 quote 参数定位证据句，只改有证据处，用 propose_document_patch 最小提案。" : "只检查：不提案，只输出审阅结论。"}`;
   return documentProposalRequired
@@ -3757,7 +3758,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
  * CACHE: Keeping this out of the stable prefix lets write↔audit turns share slots 0–5.
  */
 const REVIEW_PROMPT = `终审专则：降低机器生成感，不是换成另一种统一腔调。
-先 audit_prose_style；优先 error；warning 仅明显模板化时改；info 保留。
+先 audit_prose_style；使用 diagnosis.actionableIssues，优先 verdict=block；warn 仅明显模板化时改；allow 与未列出正文保留。
 保留：对白拖音/中断/迟疑、对话纠正、停顿—揭示、短同位。见破折号就删是错。
 查：模板转折、动作后解释回声、说明性破折号与抽象「不是…而是」、标签化人物、空泛排比、过匀句段、段尾升华、全员书面语。
 改法：动作有结果；细节供判断；因果拆句；笼统判断落到可见动作/感官；勿堆修辞伪装生动；勿新增事实。

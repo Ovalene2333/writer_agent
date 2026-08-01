@@ -1,3 +1,9 @@
+import {
+  findProseConstructionMatches,
+  PROSE_CONSTRUCTION_RULES,
+  proseConstructionGenerationPrompt,
+} from "./prose_construction_rules.js";
+
 export type ProseStyleSeverity = "error" | "warning" | "info";
 export type ProseStyleSubtype =
   | "speech_extension" | "speech_interruption" | "speech_hesitation"
@@ -21,6 +27,9 @@ export interface ProseStyleIssue {
   evidence: string;
   reason: string;
   suggestions: string[];
+  /** Registered syntax candidate; requires a model verdict before density may hard-block it. */
+  constructionRuleId?: string;
+  semanticVerdict?: "allow" | "warn" | "block";
 }
 
 export interface ContrastStyleReport {
@@ -35,10 +44,7 @@ export interface ContrastStyleReport {
 
 type MatchRange = { start: number; end: number; text: string };
 const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
-const CONTRAST_PATTERNS = [
-  /(?:并)?不是[^\n。！？!?]{0,48}(?:(?:而|却|只)是|(?<!不)是)/gu,
-  /(?:并)?不是[^\n。！？!?]{1,48}[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
-  /并非[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
+const LEGACY_CONTRAST_PATTERNS = [
   /与其(?:说)?[^\n。！？!?]{0,48}不如(?:说)?/gu,
   /没有[^\n。！？!?]{0,40}只有/gu,
   /不在于[^\n。！？!?]{0,40}而在于/gu,
@@ -46,7 +52,6 @@ const CONTRAST_PATTERNS = [
 ];
 /** 仅高教学/解释口吻；日常叙事里「这/那/原来/仿佛」后接破折号很常见，不计入硬说明信号。 */
 const EXPLANATION_SIGNALS = /^(?:因为|由于|意味着|也就是|换句话说|其实|显然|说明|证明|正是|即|不过是)/u;
-const ABSTRACT_WORDS = /(?:情绪|愤怒|恐惧|悲伤|沉默|妥协|失败|成功|反抗|勇气|希望|绝望|灵魂|命运|意义|感觉|姿态|态度|选择|真相)/u;
 const SOUND_OR_INTERJECTION = /[啊呀哦噢嗯呜哎唉哈嘿嘘喂诶咦嗡轰砰嘎]/u;
 const EXPLANATORY_ANAPHORA = /^(?:这|那|这一切|这一幕|这种(?:反应|举动|沉默|态度)|如此|由此)(?:无疑|显然|恰恰)?(?:说明|意味着|表明|证明|代表|显示)/u;
 const NARRATOR_REDEFINITION = /^(?:换句话说|也就是说|说到底|归根结底|从本质上说|实质上|本质上|真正(?:重要|关键|可怕|危险|困难|残酷)的(?:是|在于))/u;
@@ -120,7 +125,8 @@ function hardMannerismFamilyLimit(text: string, family: "dash" | "contrast" | "e
 export function proseMannerismConstraintPrompt(options?: { compact?: boolean }): string {
   const lines = [
     "句式边界（只防止密集退化，不把自然语言改造成统一模板）：",
-    "1. 叙述优先直接写发生了什么；对比、否定、破折号和短句都可自然使用，只有连续复现并替代新信息时才需改写。",
+    proseConstructionGenerationPrompt(),
+    "1. 对比、否定、破折号和短句都可自然使用；除上列高辨识度骨架外，只有连续复现并替代新信息时才需改写。",
     "2. 动作、对白或细节已经传达的意义不再换一种说法复述；解释应带来新的事实、因果或认知变化。",
     "3. 句子须保留理解行动所需的施事、对象与关系；上下文足以唯一还原的口语省略、紧张短句和偶发重音应保留。",
     "4. 专名、读数和技术说明按人物当下决策所需进入正文；密集到遮蔽行动与关系时再压缩。",
@@ -149,7 +155,7 @@ export function sceneMannerismGateError(text: string): string | undefined {
 
 /** Rule scan without density escalation (for pre-model packing). */
 export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
-  return [...scanDashes(text), ...scanContrasts(text), ...scanExplanationCandidates(text)]
+  return [...scanDashes(text), ...scanRegisteredConstructions(text), ...scanLegacyContrasts(text), ...scanExplanationCandidates(text)]
     .sort((a, b) => a.start - b.start);
 }
 
@@ -171,7 +177,8 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     issue.severity === "warning"
     && issue.confidence >= 0.9
     && HARD_BLOCK_SUBTYPES.has(issue.subtype)
-    && issue.subtype !== "dialogue_correction",
+    && issue.subtype !== "dialogue_correction"
+    && !issue.constructionRuleId
   );
   const crowdedFamilies = new Set<ReturnType<typeof hardMannerismFamily>>();
   for (const family of ["dash", "contrast", "explanation"] as const) {
@@ -184,6 +191,18 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
         issue.severity = "error";
       }
     }
+  }
+  // Registered constructions are semantic gates: regex only proposes candidates.
+  // A rule becomes blocking only after Flash says block and its density allowance is exceeded.
+  const characters = Math.max(1, text.replace(/\s/g, "").length);
+  for (const rule of PROSE_CONSTRUCTION_RULES) {
+    const reviewedBlocks = issues.filter(issue =>
+      issue.constructionRuleId === rule.id
+      && issue.semanticVerdict === "block"
+      && issue.confidence >= 0.9,
+    );
+    if (reviewedBlocks.length <= rule.allowedOccurrences(characters)) continue;
+    for (const issue of reviewedBlocks) issue.severity = "error";
   }
   return issues;
 }
@@ -374,37 +393,49 @@ function scanDashes(text: string): ProseStyleIssue[] {
   return issues;
 }
 
-function scanContrasts(text: string): ProseStyleIssue[] {
+function scanRegisteredConstructions(text: string): ProseStyleIssue[] {
   const issues: ProseStyleIssue[] = [];
-  for (const match of collectMatches(text, ...CONTRAST_PATTERNS)) {
-    const inQuote = quoteDepthAt(text, match.start) > 0;
+  for (const match of findProseConstructionMatches(text)) {
     const bounds = sentenceBounds(text, match.start);
-    const sentence = text.slice(bounds.start, bounds.end);
+    const endBounds = sentenceBounds(text, Math.max(match.start, match.end - 1));
+    const sentence = text.slice(bounds.start, Math.max(bounds.end, endBounds.end)).trim();
+    const classification = match.rule.classify({
+      text,
+      matchedText: match.text,
+      start: match.start,
+      end: match.end,
+      sentence,
+      sentenceStart: bounds.start,
+      inQuote: quoteDepthAt(text, match.start) > 0,
+    });
+    issues.push(makeIssue(
+      text,
+      match,
+      "contrast",
+      classification.subtype,
+      classification.severity,
+      classification.confidence,
+      classification.reason,
+      classification.suggestions,
+      match.rule.id,
+    ));
+  }
+  return issues;
+}
+
+/** Older broad contrast candidates remain advisory until migrated into a semantic rule. */
+function scanLegacyContrasts(text: string): ProseStyleIssue[] {
+  const issues: ProseStyleIssue[] = [];
+  for (const match of collectMatches(text, ...LEGACY_CONTRAST_PATTERNS)) {
+    const inQuote = quoteDepthAt(text, match.start) > 0;
     if (inQuote) {
       issues.push(makeIssue(text, match, "contrast", "dialogue_correction", "info", 0.88,
         "结构位于对白中，优先视为人物纠正事实或反驳误解。", []));
       continue;
     }
-    const split = /[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是/u.test(match.text);
-    if (split) {
-      issues.push(makeIssue(text, match, "contrast", "split_redefinition", "warning", 0.99,
-        "叙述者用句号拆开同一否定—肯定框架；需要结合人物语气和上下文判断是否形成重复重定义。",
-        ["直接写真正成立的动作或事实", "若确需纠正误解，让人物通过对白或后续反应完成"]));
-      continue;
-    }
-    const abstract = /(?:这|那|这种|这一切|他的|她的)/u.test(sentence.slice(0, Math.max(0, match.start - bounds.start + 8)))
-      || ABSTRACT_WORDS.test(match.text);
-    if (abstract) {
-      // 抽象重定义：warning；置信 0.9 可入硬池，但需过密
-      issues.push(makeIssue(text, match, "contrast", "abstract_reframing", "warning", 0.9,
-        "叙述者先否定表象再定义抽象意义；偶发可用，过密时再改。",
-        ["直接陈述真正成立的事实", "若确有误解需要纠正，把纠正落到人物行动或对白中"]));
-    } else {
-      // 事实排除本身可能成立，但连续出现仍会形成稳定的机器句式。
-      issues.push(makeIssue(text, match, "contrast", "factual_exclusion", "warning", 0.92,
-        "叙述者使用否定—肯定框架排除事实；偶发可读，重复时应直接陈述成立事实。",
-        ["直接陈述真正成立的事实", "若确需纠正误解，让人物通过对白或观察过程完成"]));
-    }
+    issues.push(makeIssue(text, match, "contrast", "factual_exclusion", "warning", 0.88,
+      "对照结构可能用于归纳意义；单次只作候选，密集时再结合上下文复核。",
+      ["若没有增加信息，直接陈述真正成立的事实"]));
   }
   return issues;
 }
@@ -466,7 +497,7 @@ function explanationReason(subtype: ProseStyleSubtype): string {
 }
 
 function makeIssue(text: string, range: MatchRange, kind: ProseStyleIssue["kind"], subtype: ProseStyleSubtype,
-  severity: ProseStyleSeverity, confidence: number, reason: string, suggestions: string[]): ProseStyleIssue {
+  severity: ProseStyleSeverity, confidence: number, reason: string, suggestions: string[], constructionRuleId?: string): ProseStyleIssue {
   const bounds = sentenceBounds(text, range.start);
   const endBounds = sentenceBounds(text, Math.max(range.start, range.end - 1));
   const sentence = text.slice(bounds.start, Math.max(bounds.end, endBounds.end)).trim();
@@ -475,6 +506,7 @@ function makeIssue(text: string, range: MatchRange, kind: ProseStyleIssue["kind"
   return {
     id: `${kind}:${subtype}:${range.start}`, kind, subtype, severity, confidence,
     start: range.start, end: range.end, line, column, sentence, evidence, reason, suggestions,
+    ...(constructionRuleId ? { constructionRuleId } : {}),
   };
 }
 

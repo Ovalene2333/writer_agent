@@ -855,19 +855,20 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
       undefined, undefined, undefined, false,
       { targetCharacters: 4_200, source: "prompt_relative" },
     );
-    assert.match(withTarget, /本轮篇幅目标：整章约 4200 字/u);
+    assert.match(withTarget, /单章篇幅目标：本轮涉及的每一章都分别约 4200 字/u);
+    assert.match(withTarget, /不是本轮所有章节合计；不得因本轮要写多章而均分/u);
     assert.match(withTarget, /用户本轮要求相对项目默认调整/u);
 
     // 这个数字每轮都可能变，只能待在 miss-priced 的动态块里。
     const stable = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "write_scene");
     assert.equal(stable.length, 6);
-    assert.ok(stable.every(message => !/本轮篇幅目标/u.test(messageContentText(message.content))));
+    assert.ok(stable.every(message => !/单章篇幅目标/u.test(messageContentText(message.content))));
 
     // 没有解析出目标时不占位，免得给动态块加一行常量字节。
     const withoutTarget = dynamicContextPrompt(
       project, store, "写一章", task, "ask", scenePipeline, "fast", false,
     );
-    assert.doesNotMatch(withoutTarget, /本轮篇幅目标：/u);
+    assert.doesNotMatch(withoutTarget, /单章篇幅目标：/u);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

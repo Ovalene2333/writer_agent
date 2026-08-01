@@ -2235,8 +2235,16 @@ export class WriterStore {
     if (!this.database.prepare("DELETE FROM writing_examples WHERE id=?").run(id).changes) throw new Error("写作示例不存在");
   }
 
-  seedStyleExample(template: StyleTemplate, gatePassed = false): void {
-    const existing = this.writingExamples().find((item) => item.title === `[风格模板] ${template.name}`);
+  seedStyleExample(template: StyleTemplate, gatePassed = false, previousName?: string): void {
+    const titles = new Set([
+      `[风格模板] ${template.name}`,
+      ...(previousName && previousName !== template.name ? [`[风格模板] ${previousName}`] : []),
+    ]);
+    const existing = this.writingExamples().find((item) => titles.has(item.title));
+    if (!template.exampleContent.trim()) {
+      if (existing) this.database.prepare("DELETE FROM writing_examples WHERE id=?").run(existing.id);
+      return;
+    }
     const gateHash = gatePassed ? this.project.hash(template.exampleContent.trim()) : "";
     if (existing) {
       this.database.prepare("UPDATE writing_examples SET category=?, content=?, notes=?, gate_hash=?, updated_at=? WHERE id=?")

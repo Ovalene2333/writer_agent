@@ -10,10 +10,16 @@ import {
   proseStyleIssuesError,
   sceneMannerismGateError,
 } from "./prose_quality.js";
+import {
+  PROSE_CONSTRUCTION_RULES,
+  proseConstructionAdjudicationPrompt,
+  proseConstructionGenerationPrompt,
+} from "./prose_construction_rules.js";
 
 test("generation-time constraint prompt targets dense repetition without banning valid syntax", () => {
   const full = proseMannerismConstraintPrompt();
   assert.match(full, /连续复现并替代新信息/u);
+  assert.match(full, /先否定后改判/u);
   assert.match(full, /破折号/);
   assert.match(full, /解释应带来新的事实/u);
   const compact = proseMannerismConstraintPrompt({ compact: true });
@@ -27,7 +33,18 @@ test("generation-time constraint prompt targets dense repetition without banning
   assert.match(proseMannerismPreflightLine(), /孤立.*保留/);
 });
 
-test("sceneMannerismGateError blocks dense split_redefinition before draft write", () => {
+test("registered construction rules feed generation and semantic review in stable order", () => {
+  const generation = proseConstructionGenerationPrompt();
+  const adjudication = proseConstructionAdjudicationPrompt();
+  assert.ok(PROSE_CONSTRUCTION_RULES.length >= 1);
+  for (const rule of PROSE_CONSTRUCTION_RULES) {
+    assert.ok(generation.includes(rule.generationGuidance));
+    assert.ok(adjudication.includes(rule.id));
+    assert.ok(adjudication.includes(rule.adjudicationGuidance));
+  }
+});
+
+test("registered construction candidates wait for semantic review before hard blocking", () => {
   const clean = "门禁灯从绿变红。她停下脚步，掌心贴上金属门框。";
   assert.equal(sceneMannerismGateError(clean), undefined);
 
@@ -37,10 +54,11 @@ test("sceneMannerismGateError blocks dense split_redefinition before draft write
     "地面反光。不是水。是油性液体。",
     "立柱在颤。不是塌方。是预埋装药。",
   ].join("");
-  const blocked = sceneMannerismGateError(dense);
-  assert.ok(blocked);
-  assert.match(blocked!, /本场说明式写法过密/);
-  assert.match(blocked!, /不是/);
+  const issues = analyzeProseStyle(dense).filter(issue => issue.constructionRuleId === "negation_redefinition");
+  assert.equal(issues.length, 4);
+  assert.ok(issues.every(issue => issue.severity === "warning"));
+  assert.equal(sceneMannerismGateError(dense), undefined);
+  assert.equal(proseStyleIssuesError(issues), undefined);
 });
 
 test("scene gate leaves a single split negation-redefinition for semantic review", () => {
@@ -145,7 +163,7 @@ test("distinguishes dialogue correction from narrator abstract reframing", () =>
   assert.equal(contrastStyleError(narrationText), undefined);
 });
 
-test("repeated abstract contrast frames trip their own density limit", () => {
+test("repeated abstract contrast frames remain candidates until model adjudication", () => {
   const text = [
     "这不是愤怒，而是一种更深的恐惧。",
     "那不是退让，只是另一种形式的反抗。",
@@ -154,8 +172,9 @@ test("repeated abstract contrast frames trip their own density limit", () => {
   ].join("\n");
   const contrastIssues = analyzeProseStyle(text).filter(issue => issue.subtype === "abstract_reframing");
   assert.equal(contrastIssues.length, 4);
-  assert.ok(contrastIssues.every(issue => issue.severity === "error"));
-  assert.ok(contrastStyleError(text));
+  assert.ok(contrastIssues.every(issue => issue.severity === "warning"));
+  assert.ok(contrastIssues.every(issue => issue.constructionRuleId === "negation_redefinition"));
+  assert.equal(contrastStyleError(text), undefined);
 });
 
 test("a single abstract contrast remains advisory", () => {
@@ -171,6 +190,16 @@ test("reports a split not-A-is-B narration for semantic review", () => {
   assert.ok(issue);
   assert.equal(issue.severity, "warning");
   assert.equal(issue.sentence, text);
+  assert.equal(proseStyleIssuesError([issue]), undefined);
+});
+
+test("detects postposed denial after an already established fact", () => {
+  const text = "导能光从肩甲一路流到枪口，暖意贴着她夸张的胸廓亮体缓缓扩散——那是纳容缓冲在预热，不是紧张。";
+  const issue = analyzeProseStyle(text).find(item => item.constructionRuleId === "negation_redefinition");
+  assert.ok(issue);
+  assert.equal(issue.subtype, "abstract_reframing");
+  assert.equal(issue.severity, "warning");
+  assert.match(issue.evidence, /不是紧张/u);
   assert.equal(proseStyleIssuesError([issue]), undefined);
 });
 

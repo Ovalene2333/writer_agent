@@ -14,6 +14,7 @@
  *   hints injected into scene-pipeline tool results (mirrors roleplay anti-formula slot).
  */
 
+import { findProseConstructionMatches } from "./prose_construction_rules.js";
 import { analyzeProseStyle } from "./prose_quality.js";
 import { proseVividnessScore } from "./prose_vividness.js";
 
@@ -92,11 +93,6 @@ const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const SAMENESS_FRAME = /和[^，。！？；、\n]{1,12}一样/gu;
 const NUMERIC_READOUT =
   /(?:\d+(?:\.\d+)?|[零一二三四五六七八九十百千两]+(?:点[零一二三四五六七八九]+)?)\s*(?:秒|分钟|小时|毫米|厘米|米|公里|次|赫兹|分贝|度|克|公斤|吨|伏|瓦|％|%)/gu;
-const CONTRAST_FRAMES = [
-  /(?:并)?不是[^。！？!?\n]{0,24}(?:而是|——\s*是|—\s*是)/gu,
-  /(?:并)?不是[^。！？!?\n]{0,24}[。！？!?]\s*(?:也?不是[^。！？!?\n]{0,24}[。！？!?]\s*)*是[^。！？!?\n]{0,32}/gu,
-  /并非[^。！？!?\n]{0,24}(?:而是|——\s*是)/gu,
-] as const;
 /** Common micro-action / filler tokens that read templated when hammered (superset of roleplay GESTURE_RE). */
 const MICRO_ACTION_LEXICON =
   /目光|眼神|视线|呼吸|嘴角|指尖|手指|攥紧|收紧|握拳|沉默|顿了|停顿|停了一下|抬眼|低头|偏头|皱眉|眯眼|肩膀|微微|轻轻|很轻|很细|然后/gu;
@@ -652,18 +648,9 @@ function openingMonotony(text: string): { prefix: string; ratio: number } | unde
 }
 
 function collectContrastFrames(text: string): string[] {
-  const ranges: Array<{ start: number; end: number; text: string }> = [];
-  for (const pattern of CONTRAST_FRAMES) {
-    pattern.lastIndex = 0;
-    for (const match of text.matchAll(pattern)) {
-      const start = match.index ?? 0;
-      const end = start + match[0].length;
-      if (!ranges.some(range => start < range.end && end > range.start)) {
-        ranges.push({ start, end, text: match[0] });
-      }
-    }
-  }
-  return ranges.sort((a, b) => a.start - b.start).map(range => clip(range.text.trim(), 48));
+  return findProseConstructionMatches(text)
+    .filter(match => match.rule.id === "negation_redefinition")
+    .map(match => clip(match.text.trim(), 48));
 }
 
 function stripStructuralLines(text: string): string {

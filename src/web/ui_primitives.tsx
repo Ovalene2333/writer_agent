@@ -28,6 +28,16 @@ export function loadUiTheme(): UiThemeId {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
+export const PERFORMANCE_MODE_STORAGE_KEY = "writer-performance-mode";
+
+export function loadPerformanceMode(): boolean {
+  try {
+    return localStorage.getItem(PERFORMANCE_MODE_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
 export function loadWorkspaceMode(): WorkspaceMode {
   const stored = localStorage.getItem("writer-workspace-mode");
   return stored === "editor-focus" || stored === "agent-focus" ? stored : "split";
@@ -192,7 +202,7 @@ export function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onR
         <button type="button" role="menuitem" onClick={pick(onContinuityFacts)}><Library size={16} aria-hidden="true" />连续性事实</button>
         <i className="settings-menu-separator" aria-hidden="true" />
         <button type="button" role="menuitem" disabled={!connectionAvailable} onClick={pick(() => onSelect("connection"))}><Wifi size={16} aria-hidden="true" />连接设置</button>
-        <button type="button" role="menuitem" onClick={pick(() => onSelect("appearance"))}><Sun size={16} aria-hidden="true" />界面主题</button>
+        <button type="button" role="menuitem" onClick={pick(() => onSelect("appearance"))}><Sun size={16} aria-hidden="true" />外观与动效</button>
       </div>
     </div>
   );

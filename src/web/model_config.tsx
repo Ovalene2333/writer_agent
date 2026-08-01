@@ -452,7 +452,7 @@ export function ModelConfig({
     "prose-gates": { eyebrow: "Review rules", title: "作者复审规则", description: "管理项目级语义复审规则。" },
     "continuity-facts": { eyebrow: "Continuity", title: "连续性事实", description: "维护可追溯的长期事实索引。" },
     connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
-    appearance: { eyebrow: "Appearance", title: "界面主题", description: "选择工作区的明暗与配色方案。" },
+    appearance: { eyebrow: "Appearance", title: "外观与动效", description: "选择工作区主题，并按设备性能控制全局动态效果。" },
   };
   const activeMeta = sectionMeta[section];
 
@@ -488,7 +488,7 @@ export function ModelConfig({
           </button>
           <button className={section === "appearance" ? "active" : ""} aria-current={section === "appearance" ? "page" : undefined} onClick={() => selectSection("appearance")}>
             <Palette size={17}/>
-            <span><strong>界面主题</strong><small>明暗模式与工作区配色</small></span>
+            <span><strong>外观与动效</strong><small>主题、动画与性能模式</small></span>
           </button>
         </nav>
         <main className="settings-content">

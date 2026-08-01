@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
+import { RotateCw } from "lucide-react";
 import type { MessageStepTrail, StepUsage, StepUsageCall, StoredStepTrail, StreamStep, Usage } from "./types";
 import { callKindLabel } from "./types";
 import { Markdown } from "./markdown";
@@ -232,7 +233,7 @@ export function stepsFromServerTrail(trail: MessageStepTrail): StreamStep[] {
     status: step.status === "running" || step.status === "failed" || step.status === "completed"
       ? step.status
       : "completed",
-    expanded: false,
+    expanded: step.status === "running",
     ...(step.usage ? { usage: step.usage } : {}),
   }));
 }
@@ -301,6 +302,7 @@ export function AgentStepCard({
   prevStep,
   onToggle,
   resumeAction,
+  onLocalLink,
 }: {
   step: StreamStep;
   prevStep?: StreamStep;
@@ -310,6 +312,7 @@ export function AgentStepCard({
     disabled?: boolean;
     onClick: () => void;
   };
+  onLocalLink?: (href: string) => void;
 }) {
   const label =
     step.id === 0
@@ -320,41 +323,61 @@ export function AgentStepCard({
         ? `Step ${step.id} failed`
         : `Step ${step.id} done`;
   const reset = detectStepContextReset(prevStep, step);
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (step.status !== "running" || !step.expanded || !contentRef.current) return;
+    contentRef.current.scrollTop = contentRef.current.scrollHeight;
+  }, [step.status, step.expanded, step.output, step.reasoning, step.tools.length]);
 
   return (
     <>
     {reset ? <AgentStepContextResetBanner reset={reset} /> : null}
     <article className={`agent-step ${step.status}${reset ? " after-context-reset" : ""}${resumeAction ? " has-resume" : ""}`}>
-      <button className="agent-step-summary" onClick={onToggle} type="button">
-        <span className="agent-step-indicator" />
-        <strong>{label}</strong>
-        <StepTokenBadge usage={step.usage} pending={step.status === "running"} />
-        {step.tools.length > 0 && (() => {
-          const maxVisible = 2;
-          const visible = step.tools.slice(0, maxVisible);
-          const hidden = step.tools.length - visible.length;
-          const allTitle = step.tools.join(" · ");
-          return (
-            <span className="agent-step-tools" title={allTitle}>
-              {visible.map((tool, index) => (
-                <span className="tool-chip" key={`${step.id}-${index}-${tool}`} title={tool}>
-                  {tool}
-                </span>
-              ))}
-              {hidden > 0 && (
-                <span className="tool-chip tool-chip-more" title={step.tools.slice(maxVisible).join(" · ")}>
-                  +{hidden}
-                </span>
-              )}
-            </span>
-          );
-        })()}
-        <span className="agent-step-chevron" aria-hidden="true">
-          {step.expanded ? "▴" : "▾"}
-        </span>
-      </button>
+      <div className="agent-step-header">
+        <button className="agent-step-summary" onClick={onToggle} type="button" aria-expanded={step.expanded}>
+          <span className="agent-step-indicator" />
+          <strong>{label}</strong>
+          <StepTokenBadge usage={step.usage} pending={step.status === "running"} />
+          {step.tools.length > 0 && (() => {
+            const maxVisible = 2;
+            const visible = step.tools.slice(0, maxVisible);
+            const hidden = step.tools.length - visible.length;
+            const allTitle = step.tools.join(" · ");
+            return (
+              <span className="agent-step-tools" title={allTitle}>
+                {visible.map((tool, index) => (
+                  <span className="tool-chip" key={`${step.id}-${index}-${tool}`} title={tool}>
+                    {tool}
+                  </span>
+                ))}
+                {hidden > 0 && (
+                  <span className="tool-chip tool-chip-more" title={step.tools.slice(maxVisible).join(" · ")}>
+                    +{hidden}
+                  </span>
+                )}
+              </span>
+            );
+          })()}
+          <span className="agent-step-chevron" aria-hidden="true">
+            {step.expanded ? "▴" : "▾"}
+          </span>
+        </button>
+        {resumeAction ? (
+          <button
+            className="agent-step-resume"
+            type="button"
+            disabled={resumeAction.disabled}
+            onClick={resumeAction.onClick}
+            title="从中断处继续运行 Agent"
+          >
+            <RotateCw size={12} aria-hidden="true" />
+            <span>续跑</span>
+          </button>
+        ) : null}
+      </div>
       {step.expanded && (
-        <div className="agent-step-content">
+        <div className="agent-step-content" ref={contentRef}>
           {reset ? (
             <div className="agent-step-context-reset-detail">
               <strong>本章节起重新装载的上下文</strong>
@@ -467,30 +490,22 @@ export function AgentStepCard({
           ) : null}
           {step.reasoning && (
             <div className="agent-step-reasoning">
-              <Markdown content={step.reasoning} />
+              <Markdown content={step.reasoning} localLinksOnly onLocalLink={onLocalLink} />
             </div>
           )}
-          {step.output && <Markdown content={step.output} />}
+          {step.output && <Markdown content={step.output} localLinksOnly onLocalLink={onLocalLink} />}
           {!step.reasoning && !step.output && (
             <p className="agent-step-waiting">Waiting for model response…</p>
           )}
+          {step.status === "running" && (step.reasoning || step.output) ? (
+            <div className="agent-step-stream-status" role="status" aria-label="正在流式输出">
+              <span aria-hidden="true" />
+              <span aria-hidden="true" />
+              <span aria-hidden="true" />
+            </div>
+          ) : null}
         </div>
       )}
-      {resumeAction ? (
-        <div className="agent-step-resume">
-          <button
-            type="button"
-            disabled={resumeAction.disabled}
-            onClick={(event) => {
-              event.stopPropagation();
-              resumeAction.onClick();
-            }}
-            title="从中断处继续运行 Agent"
-          >
-            续跑
-          </button>
-        </div>
-      ) : null}
     </article>
     </>
   );

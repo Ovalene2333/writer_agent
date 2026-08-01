@@ -130,14 +130,15 @@ test("isolated scene writer receives the anti-self-imitation notes the standard 
   assert.match(messages[1].content, /感官通道只有 2\/5/u);
 });
 
-test("isolated scene writer allows natural contrast without turning it into a template", () => {
+test("isolated scene writer receives the shared registered construction guidance", () => {
   const messages = buildIsolatedSceneWriterMessages({
     scene,
     writePack: pack,
   });
   assert.match(messages[0].content, /否定与转折都可以使用/u);
   assert.match(messages[0].content, /不把任何一种句式连续当作/u);
-  assert.doesNotMatch(messages[0].content, /先否定、再改判|不是……。是……。/u);
+  assert.match(messages[0].content, /先否定后改判/u);
+  assert.match(messages[0].content, /必要的客观排除和人物即时纠错可以保留/u);
 });
 
 test("scene state extraction receives only bounded next-scene relevance fields", () => {

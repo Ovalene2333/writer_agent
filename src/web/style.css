@@ -2377,6 +2377,10 @@ button.agent-orb:focus-visible {
   /* Avoid global button:active scale — it visually crushes IOC + token digits. */
   transform: none;
 }
+.agent-step-header {
+  display: flex; align-items: center; min-width: 0;
+}
+.agent-step-header .agent-step-summary { flex: 1 1 auto; width: auto; }
 .agent-step-summary:hover {
   background: color-mix(in srgb, var(--accent-light) 70%, transparent);
   transform: none;
@@ -2484,30 +2488,25 @@ button.agent-orb:focus-visible {
   background: color-mix(in srgb, var(--surface) 70%, transparent);
 }
 .agent-step-resume {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 6px 10px 8px;
-  border-top: 1px solid var(--border-light);
-  background: color-mix(in srgb, var(--accent-light) 40%, var(--surface));
-}
-.agent-step-resume button {
-  padding: 4px 12px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  flex: 0 0 auto; margin-right: 10px; padding: 4px 9px;
   border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border-radius: 999px;
+  background: transparent;
   color: var(--accent);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: background var(--transition), border-color var(--transition), color var(--transition);
+  transform: none;
+  transition: background var(--transition), border-color var(--transition), color var(--transition), opacity var(--transition);
 }
-.agent-step-resume button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 22%, var(--surface));
+.agent-step-resume:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
   border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  transform: none;
 }
-.agent-step-resume button:disabled {
+.agent-step-resume:active { transform: none; }
+.agent-step-resume:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -2639,6 +2638,28 @@ button.agent-orb:focus-visible {
   content: ""; width: 8px; height: 8px; border-radius: 50%;
   background: var(--accent); animation: statusDot 1s ease-in-out infinite;
   box-shadow: 0 0 8px var(--agent-glow);
+}
+.agent-step-stream-status {
+  display: inline-flex; align-items: center; gap: 4px;
+  min-height: 10px; margin-top: 6px; color: var(--accent);
+}
+.agent-step-stream-status span {
+  width: 4px; height: 4px; border-radius: 50%; background: currentColor;
+  animation: stepStreamDot 1.05s ease-in-out infinite;
+}
+.agent-step-stream-status span:nth-child(2) { animation-delay: 140ms; }
+.agent-step-stream-status span:nth-child(3) { animation-delay: 280ms; }
+@keyframes stepStreamDot {
+  0%, 65%, 100% { opacity: .24; transform: translateY(0); }
+  32% { opacity: 1; transform: translateY(-2px); }
+}
+.agent-step-content .markdown-local-links a[data-link-scope="external"] {
+  color: var(--text-faint); text-decoration: none; cursor: default;
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-step-stream-status span,
+  .agent-step.running .agent-step-indicator { animation: none; }
+  .agent-step-stream-status span { opacity: .7; }
 }
 
 .conversation .notice {
@@ -5538,9 +5559,32 @@ header .nav-action.style-active {
   display: block; width: 100%; min-width: 0; padding: 0; border: 0;
   background: transparent; color: inherit; text-align: left; white-space: normal;
 }
-.style-card-edit {
-  align-self: flex-end; margin-top: auto; padding: 4px 10px;
+.style-card-select:disabled { opacity: 1; }
+.style-card-actions {
+  display: flex; align-items: center; justify-content: flex-end; gap: 7px;
+  margin-top: auto;
+}
+.style-card-edit,
+.style-card-review {
+  padding: 4px 10px;
   border-radius: 999px; font-size: 11px;
+}
+.style-card-review {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent-light) 45%, transparent);
+  color: var(--accent);
+}
+.style-review-message {
+  margin: -5px 4px 14px; padding: 8px 10px; border-radius: 8px;
+  background: var(--surface2); color: var(--text-dim); font-size: 12px;
+}
+.theme-tag.reviewed {
+  color: color-mix(in srgb, #2f9d6a 72%, var(--text));
+  border-color: color-mix(in srgb, #2f9d6a 28%, var(--border));
+}
+.theme-tag.failed {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 30%, var(--border));
 }
 .style-template-editor { width: min(820px, calc(100vw - 28px)); max-height: 90dvh; overflow: auto; }
 .style-template-editor > p { color: var(--text-dim); font-size: 13px; }
@@ -7975,4 +8019,170 @@ a:focus-visible {
 @media (max-width: 720px) {
   .context-graph-open-btn span { display: none; }
   .context-graph-open-btn { width: 30px; padding: 0; justify-content: center; }
+}
+
+/* ── Unified motion system ───────────────────────────────────────────────
+   Decorative motion is opt-in through data-motion="full". Performance mode
+   flips one root attribute and disables this block plus legacy transitions. */
+:root {
+  --motion-swift: 160ms;
+  --motion-base: 280ms;
+  --motion-slow: 520ms;
+  --motion-enter: cubic-bezier(.22, 1, .36, 1);
+}
+
+/* Appearance settings */
+.appearance-settings { display: grid; gap: 18px; }
+.appearance-motion-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 18px;
+  padding: 15px 16px; border: 1px solid var(--border-light); border-radius: 14px;
+  background:
+    linear-gradient(120deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 58%),
+    var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+.appearance-motion-card.performance {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: color-mix(in srgb, var(--accent-light) 48%, var(--surface));
+}
+.appearance-motion-copy { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.appearance-motion-icon {
+  display: grid; place-items: center; flex: 0 0 auto; width: 38px; height: 38px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border)); border-radius: 12px;
+  color: var(--accent); background: color-mix(in srgb, var(--accent-light) 72%, var(--surface));
+  box-shadow: 0 7px 18px -12px var(--agent-glow);
+}
+.appearance-motion-copy h4,
+.appearance-theme-head h4 { margin: 0; font-size: 13px; }
+.appearance-motion-copy p,
+.appearance-theme-head p { margin: 4px 0 0; color: var(--text-faint); font-size: 10.5px; line-height: 1.5; }
+.appearance-motion-toggle {
+  display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  padding: 5px 8px; border-color: transparent; background: transparent;
+}
+.appearance-motion-toggle:hover { border-color: transparent; background: var(--accent-light); }
+.appearance-motion-toggle > span {
+  position: relative; display: block; width: 36px; height: 20px; border-radius: 999px;
+  background: var(--surface3); box-shadow: inset 0 0 0 1px var(--border);
+  transition: background var(--motion-swift) ease, box-shadow var(--motion-swift) ease;
+}
+.appearance-motion-toggle > span i {
+  position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--text-faint); box-shadow: 0 2px 5px rgba(0,0,0,.18);
+  transition: transform var(--motion-base) var(--motion-enter), background var(--motion-swift) ease;
+}
+.appearance-motion-toggle[aria-checked="true"] > span {
+  background: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 70%, #000);
+}
+.appearance-motion-toggle[aria-checked="true"] > span i {
+  transform: translateX(16px); background: var(--accent-text);
+}
+.appearance-motion-toggle em { min-width: 3em; color: var(--text-dim); font-size: 11px; font-style: normal; }
+.appearance-theme-head { margin-bottom: -8px; }
+
+html[data-motion="full"] body::before {
+  transform-origin: center;
+  animation: ambientFloat 18s ease-in-out infinite alternate;
+  will-change: transform, opacity;
+}
+html[data-motion="full"] .workspace-topbar { position: relative; }
+html[data-motion="full"] .workspace-topbar::after {
+  content: ""; position: absolute; inset: 0 auto 0 -35%; width: 28%; pointer-events: none;
+  background: linear-gradient(105deg, transparent, color-mix(in srgb, var(--accent) 10%, transparent), transparent);
+  transform: skewX(-18deg); animation: chromeShine 9s ease-in-out infinite;
+}
+html[data-motion="full"] .documents { animation: panelEnterLeft var(--motion-slow) var(--motion-enter) both; }
+html[data-motion="full"] .editor { animation: panelEnterCenter var(--motion-slow) 70ms var(--motion-enter) both; }
+html[data-motion="full"] .agent-panel { animation: panelEnterRight var(--motion-slow) 120ms var(--motion-enter) both; }
+html[data-motion="full"] .management-backdrop,
+html[data-motion="full"] .model-config-backdrop { animation: motionFade var(--motion-base) ease both; }
+html[data-motion="full"] .management-view,
+html[data-motion="full"] .model-config-view { animation: surfaceEnter 380ms var(--motion-enter) both; }
+html[data-motion="full"] .settings-content > .settings-section-body,
+html[data-motion="full"] .settings-content > .scene-settings,
+html[data-motion="full"] .settings-content > .model-config-layout { animation: contentReveal var(--motion-base) var(--motion-enter) both; }
+html[data-motion="full"] .agent-step-content { transform-origin: top; animation: contentUnfold 220ms var(--motion-enter) both; }
+html[data-motion="full"] .reader-selection-toolbar { animation: selectionPop 220ms var(--ease-spring) both; }
+html[data-motion="full"] .conversation .notice,
+html[data-motion="full"] .conversation .error { animation: noticeEnter var(--motion-base) var(--motion-enter) both; }
+html[data-motion="full"] .agent-panel.agent-busy::before {
+  transform-origin: center; animation: agentRail 2.4s ease-in-out infinite;
+}
+html[data-motion="full"] .agent-step.running::after {
+  content: ""; position: absolute; z-index: 3; top: 0; left: -35%; width: 34%; height: 1px;
+  pointer-events: none; background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: stepRail 2.1s ease-in-out infinite;
+}
+html[data-motion="full"] .composer-shell:focus-within { animation: composerBreathe 2.8s ease-in-out infinite alternate; }
+html[data-motion="full"] .mobile-tabs button.active .tab-icon { animation: tabIconPop 260ms var(--ease-spring); }
+
+@media (hover: hover) {
+  html[data-motion="full"] .tree-row:hover,
+  html[data-motion="full"] .chapter-row:hover,
+  html[data-motion="full"] .settings-tabs button:hover { transform: translateX(3px); }
+  html[data-motion="full"] .theme-card:hover,
+  html[data-motion="full"] .session-card:hover,
+  html[data-motion="full"] .continuity-fact-card:hover,
+  html[data-motion="full"] .provider-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); }
+  html[data-motion="full"] .appearance-motion-card:hover .appearance-motion-icon { transform: rotate(-5deg) scale(1.06); }
+  html[data-motion="full"] .tree-row,
+  html[data-motion="full"] .chapter-row,
+  html[data-motion="full"] .settings-tabs button,
+  html[data-motion="full"] .theme-card,
+  html[data-motion="full"] .session-card,
+  html[data-motion="full"] .continuity-fact-card,
+  html[data-motion="full"] .provider-card,
+  html[data-motion="full"] .appearance-motion-icon {
+    transition: transform var(--motion-base) var(--motion-enter), box-shadow var(--motion-base) ease,
+      border-color var(--motion-swift) ease, background var(--motion-swift) ease;
+  }
+}
+
+@keyframes ambientFloat {
+  0% { opacity: .82; transform: scale(1) translate3d(0, 0, 0); }
+  50% { opacity: 1; transform: scale(1.025) translate3d(1.2%, -.7%, 0); }
+  100% { opacity: .9; transform: scale(1.04) translate3d(-.8%, .8%, 0); }
+}
+@keyframes chromeShine {
+  0%, 68% { opacity: 0; transform: translateX(0) skewX(-18deg); }
+  76% { opacity: .8; }
+  90%, 100% { opacity: 0; transform: translateX(510%) skewX(-18deg); }
+}
+@keyframes panelEnterLeft { from { opacity: 0; transform: translateX(-18px); } }
+@keyframes panelEnterCenter { from { opacity: 0; transform: translateY(10px) scale(.992); } }
+@keyframes panelEnterRight { from { opacity: 0; transform: translateX(18px); } }
+@keyframes motionFade { from { opacity: 0; } }
+@keyframes surfaceEnter { from { opacity: 0; transform: translateY(14px) scale(.99); } }
+@keyframes contentReveal { from { opacity: 0; transform: translateY(8px); } }
+@keyframes contentUnfold { from { opacity: 0; transform: scaleY(.96) translateY(-5px); } }
+@keyframes selectionPop { from { opacity: 0; transform: translateY(5px) scale(.94); } }
+@keyframes noticeEnter { from { opacity: 0; transform: translateX(12px); } }
+@keyframes agentRail { 0%, 100% { opacity: .35; transform: scaleX(.35); } 50% { opacity: 1; transform: scaleX(1); } }
+@keyframes stepRail { 0% { opacity: 0; transform: translateX(0); } 22% { opacity: 1; } 75%, 100% { opacity: 0; transform: translateX(410%); } }
+@keyframes composerBreathe { to { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent), 0 13px 34px -17px var(--agent-glow); } }
+@keyframes tabIconPop { 45% { transform: translateY(-2px) scale(1.12); } }
+
+/* Performance mode is intentionally global: it also catches legacy and future
+   component motion without requiring every feature to know about this setting. */
+html[data-motion="off"] *,
+html[data-motion="off"] *::before,
+html[data-motion="off"] *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+html[data-motion="off"] body::before,
+html[data-motion="off"] .workspace-topbar::after,
+html[data-motion="off"] .agent-step.running::after { display: none !important; }
+html[data-motion="off"] button:hover,
+html[data-motion="off"] button:active,
+html[data-motion="off"] .tree-row:hover,
+html[data-motion="off"] .chapter-row:hover,
+html[data-motion="off"] .theme-card:hover { transform: none !important; }
+
+@media (max-width: 560px) {
+  .appearance-motion-card { align-items: stretch; flex-direction: column; }
+  .appearance-motion-toggle { align-self: flex-end; }
 }

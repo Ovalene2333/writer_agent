@@ -323,7 +323,7 @@ export async function proseStyleGateIssues(
             signal: context.proseAdjudicator.signal,
             usageReporter: context.modelUsageReporter,
             callKind: "learned_prose_gate",
-            ...(options?.failClosed ? { timeoutMs: 30_000 } : {}),
+            ...(options?.failClosed ? { timeoutMs: 60_000 } : {}),
             ...(options?.reviewWholeText ? {} : { beforeText: beforeContent }),
             failClosed: options?.failClosed === true,
           },

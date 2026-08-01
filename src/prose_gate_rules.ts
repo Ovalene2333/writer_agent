@@ -8,10 +8,15 @@ export type ProseGateTargetKind = DocumentKind | "writing_example";
 
 export interface ProseGateRule {
   id: string;
+  /** User-facing name; IDs remain stable machine keys. */
+  label: string;
   instruction: string;
+  /** Goal for a local repair, not replacement prose. */
+  revisionIntent: string;
   kind: ProseGateRuleKind;
   severity: ProseGateRuleSeverity;
   enabled: boolean;
+  builtIn: boolean;
   /** Empty means every prose target; otherwise the rule only reviews these kinds. */
   documentKinds: ProseGateTargetKind[];
   /** Empty means every path; writing examples have no path and only match empty prefixes. */
@@ -21,13 +26,16 @@ export interface ProseGateRule {
   updatedAt: string;
 }
 
-const DEFAULT_RULES: readonly ProseGateRule[] = [
+export const BUILT_IN_PROSE_GATE_RULES: readonly ProseGateRule[] = [
   {
     id: "quoted-text-count-consistency",
+    label: "引号文字数量一致性",
     instruction: "正文用“这几个字/这N个字/几个字”等方式描述引号内文字数量时，必须按实际书写单位核对数量；数量与引号内文字不一致即违规。不要把标点计入字数。",
+    revisionIntent: "只修正数量描述，使其与引号内实际书写单位一致，不改动引文内容和无关正文。",
     kind: "hard_gate",
     severity: "block",
     enabled: true,
+    builtIn: true,
     documentKinds: ["chapter", "side", "writing_example"],
     pathPrefixes: [],
     sourceFeedback: "作者反馈：类似“xxxx”——这三个字的数量描述容易写错，必须复审。",
@@ -36,21 +44,39 @@ const DEFAULT_RULES: readonly ProseGateRule[] = [
   },
   {
     id: "telegraphic-object-beats",
+    label: "电报式物件短拍",
     instruction: "复审正文（叙述和对白）的缩句生成味。以下任一情况违规：同一段或相邻段反复把物件/环境名词加一个裸动作或状态切成独立节拍，以机械播报代替人物感知、反应、因果或局面变化；省略动作的施事、受事、对象等必要成分后，无法从紧邻上下文唯一还原；对白把后台字段、状态栏或提纲压成“名词短语＋状态”的汇报腔，词语关系含混，或不能自然承接对方的问题。不要因为句子短、没有宾语或使用汉语零形回指就单独判错；不及物句、偶发重音、紧张高潮，以及人物身份、问答关系与近邻语境足以自然补全的口语省略应放行。连续命中时 evidence 引用能呈现该模式的最短连续原文。",
+    revisionIntent: "恢复可理解的人物感知、动作关系或因果承接；合并机械短拍，但保留紧张处重音和自然口语省略。",
     kind: "hard_gate",
     severity: "block",
     enabled: true,
+    builtIn: true,
     documentKinds: ["chapter", "side", "writing_example"],
     pathPrefixes: [],
     sourceFeedback: "作者反馈：限制“手机又震”“车出隧道”“雨刷继续响”式连续物件短拍，以及无法由近邻语境还原必要成分的缩句。",
     createdAt: "2026-07-31T00:00:00.000Z",
     updatedAt: "2026-07-31T00:00:00.000Z",
   },
+  {
+    id: "characterization-proof-stacking",
+    label: "人物特质堆叠证明",
+    instruction: "逐段复审人物塑造是否在相邻一至三句中，连续用多个高光成绩或机敏动作、群体围观认可、无具体身份和目的的旁人点题对白，反复证明同一个人物特质。只有后续项没有引入新的阻力、后果、关系行动或必要事实，而主要在为同一标签加码时才违规。每项行动确实改变不同条件、人物互动有独立目的、作品明确需要简短概述或蒙太奇时应放行。命中时 evidence 引用能呈现“行动证明→外部背书→点题定性”的最短连续二至四句，不得只摘一个普通句式。",
+    revisionIntent: "保留一处最能改变现场的具体选择及其后果；删除重复的高光罗列、群体背书或点题定性，必要设定应落到有身份和目的的人物互动。",
+    kind: "hard_gate",
+    severity: "block",
+    enabled: true,
+    builtIn: true,
+    documentKinds: ["chapter", "side", "writing_example"],
+    pathPrefixes: [],
+    sourceFeedback: "作者反馈：连续用能力展示、群体认可和路人点题对白为同一人物标签盖章，会形成履历式、宣传文案式生成感。",
+    createdAt: "2026-08-02T00:00:00.000Z",
+    updatedAt: "2026-08-02T00:00:00.000Z",
+  },
 ];
 
-// The original capacity was one built-in + 19 project rules. Adding another
-// built-in must not evict the last rule from an existing full project file.
-const MAX_RULES = 21;
+/** Built-ins grow independently without reducing the long-standing project-rule capacity. */
+export const PROSE_GATE_PROJECT_RULE_CAPACITY = 19;
+export const MAX_PROSE_GATE_RULES = PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length;
 
 function rulesPath(project: WriterProject): string {
   return resolve(project.privateDir, "prose-gates.json");
@@ -97,10 +123,17 @@ function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRul
       : severity === "warn" ? "style_preference" : "hard_gate";
   return {
     id: normalizeId(item.id),
+    label: typeof item.label === "string" && item.label.trim()
+      ? item.label.trim().slice(0, 60)
+      : normalizeId(item.id),
     instruction: boundedText(item.instruction, "instruction", 500),
+    revisionIntent: typeof item.revisionIntent === "string"
+      ? item.revisionIntent.trim().slice(0, 240)
+      : "",
     kind,
     severity,
     enabled: item.enabled !== false,
+    builtIn: false,
     documentKinds: normalizeTargetKinds(item.documentKinds),
     pathPrefixes: normalizePathPrefixes(item.pathPrefixes),
     sourceFeedback: typeof item.sourceFeedback === "string" ? item.sourceFeedback.trim().slice(0, 500) : "",
@@ -111,30 +144,33 @@ function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRul
 
 export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
   const path = rulesPath(project);
-  if (!existsSync(path)) return DEFAULT_RULES.map(rule => ({ ...rule }));
+  if (!existsSync(path)) return BUILT_IN_PROSE_GATE_RULES.map(rule => ({ ...rule }));
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(path, "utf8")); }
   catch { throw new Error(".writer/prose-gates.json 格式无效"); }
   if (!Array.isArray(parsed)) throw new Error(".writer/prose-gates.json 必须是规则数组");
-  const saved = parsed.slice(0, MAX_RULES).map(item => {
+  const saved = parsed.slice(0, MAX_PROSE_GATE_RULES).map(item => {
     const rule = normalizeRule(item);
-    const builtIn = DEFAULT_RULES.find(candidate => candidate.id === rule.id);
+    const builtIn = BUILT_IN_PROSE_GATE_RULES.find(candidate => candidate.id === rule.id);
     if (builtIn && item && typeof item === "object" && !Array.isArray(item)) {
       const raw = item as Record<string, unknown>;
+      rule.builtIn = true;
+      if (!("label" in raw)) rule.label = builtIn.label;
+      if (!("revisionIntent" in raw)) rule.revisionIntent = builtIn.revisionIntent;
       if (!("documentKinds" in raw)) rule.documentKinds = [...builtIn.documentKinds];
       if (!("pathPrefixes" in raw)) rule.pathPrefixes = [...builtIn.pathPrefixes];
     }
     return rule;
   });
-  const merged = new Map(DEFAULT_RULES.map(rule => [rule.id, { ...rule }]));
+  const merged = new Map(BUILT_IN_PROSE_GATE_RULES.map(rule => [rule.id, { ...rule }]));
   for (const rule of saved) merged.set(rule.id, rule);
-  return [...merged.values()].slice(0, MAX_RULES);
+  return [...merged.values()].slice(0, MAX_PROSE_GATE_RULES);
 }
 
 function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): void {
   const target = rulesPath(project);
   const temporary = `${target}.writer-tmp-${process.pid}`;
-  const content = `${JSON.stringify(rules.slice(0, MAX_RULES), null, 2)}\n`;
+  const content = `${JSON.stringify(rules.slice(0, MAX_PROSE_GATE_RULES), null, 2)}\n`;
   writeFileSync(temporary, content, "utf8");
   try { renameSync(temporary, target); }
   catch (error) {
@@ -147,22 +183,24 @@ function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): voi
 export function upsertProseGateRule(
   project: WriterProject,
   input: Pick<ProseGateRule, "id" | "instruction"> & Partial<Pick<ProseGateRule,
-    "kind" | "severity" | "enabled" | "documentKinds" | "pathPrefixes" | "sourceFeedback">>,
+    "label" | "revisionIntent" | "kind" | "severity" | "enabled" | "documentKinds" | "pathPrefixes" | "sourceFeedback">>,
 ): ProseGateRule {
   const rules = loadProseGateRules(project);
   const id = normalizeId(input.id);
   const existing = rules.find(rule => rule.id === id);
   const now = new Date().toISOString();
+  const supplied = Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
   const rule = normalizeRule({
     ...existing,
-    ...input,
+    ...supplied,
     id,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   }, existing?.createdAt);
+  if (BUILT_IN_PROSE_GATE_RULES.some(item => item.id === id)) rule.builtIn = true;
   if (existing) rules[rules.indexOf(existing)] = rule;
   else {
-    if (rules.length >= MAX_RULES) throw new Error(`复审规则最多 ${MAX_RULES} 条；请先停用或删除旧规则`);
+    if (rules.length >= MAX_PROSE_GATE_RULES) throw new Error(`复审规则最多 ${MAX_PROSE_GATE_RULES} 条（含 ${BUILT_IN_PROSE_GATE_RULES.length} 条内置规则）；请先停用或删除旧规则`);
     rules.push(rule);
   }
   saveProseGateRules(project, rules);
