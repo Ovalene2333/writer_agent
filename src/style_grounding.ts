@@ -20,6 +20,8 @@ export type StyleGroundingOptions = {
   exampleIds?: number[];
   /** Extra prose already in hand (selection, draft context) to prefer as voice anchor. */
   preferredSample?: string;
+  /** Full rewrites use project prose for facts, never as unvalidated voice evidence. */
+  excludeProjectVoice?: boolean;
   /** RNG for exemplar window sampling (tests inject a seeded fn). Defaults to Math.random. */
   random?: () => number;
 };
@@ -82,6 +84,7 @@ export function naturalProseCraftPrompt(): string {
 - 一段默认只服务一个场面节拍（看见→反应→行动→代价中的一两步）；不要用「同时/与此同时/一边…一边…/不仅…还…/并且」把多条线索焊进一句。
 - 专名与设定词克制出场：同一段首次需要时用一个可感锚点，不要清单式连抛组织名、计划名、等级、协议、武器名。
 - 叙述保持可读的人称与主语：谁在看、谁在动写清楚；勿为「利落」整段省略人称、压成简报或操作日志。
+- 限制把「物件/环境名词＋一个短动作」反复切成独立节拍（如手机又震、车出隧道、雨刷继续响）。环境变化要么确实改变人物的感知、行动或局面，要么并入人物反应、因果或空间变化；省略施事、受事等必要成分时，须能从紧邻上下文唯一还原。偶发重音、对白抢白和指代清楚的话题链不受此限。
 - 禁止把章节写成功能清单或 HUD（醒来→说明→测试→评分→收束；指令—执行—确认连环短段）。
 
 【反生成感（对齐常见 LLM 痕迹，生成时主动避开）】
@@ -186,14 +189,19 @@ export function dynamicStyleGroundingPrompt(
   const config = project.config();
   const template = config.style ? project.styleTemplate(config.style) : undefined;
   const random = options.random ?? Math.random;
-  const projectSample = pickProjectVoiceSample(project, options.targetPath, options.preferredSample);
+  const projectSample = pickProjectVoiceSample(
+    project,
+    options.targetPath,
+    options.preferredSample,
+    options.excludeProjectVoice,
+  );
   const catalogExamples = pickStyleExamples(store, template?.name, options.exampleIds, random);
   const selectedExamples = pickExplicitStyleExamples(store, options.exampleIds);
   // Prefer task-specified examples; otherwise default catalog / template seed (bodies only here).
   const examples = selectedExamples.length
     ? selectedExamples
     : catalogExamples.map(item => ({ title: item.title, content: item.content, notes: item.notes }));
-  if (!projectSample && !examples.length && !template?.exampleContent) return "";
+  if (!projectSample && !examples.length) return "";
 
   const sections = ["本轮动态声线证据（只学句法、节奏与叙述姿态，不复述其中内容）："];
   if (examples.length) {
@@ -203,11 +211,6 @@ export function dynamicStyleGroundingPrompt(
       const notes = item.notes.trim() ? `（${item.notes.trim().slice(0, 120)}）` : "";
       return `［范文 ${index + 1}·《${item.title}》${notes}］\n${body}`;
     }).join("\n\n"));
-  } else if (template?.exampleContent) {
-    const body = sampleProseWindow(template.exampleContent, 1_500, random);
-    sections.push(
-      `［模板范例${template.exampleNotes ? `（${template.exampleNotes.trim().slice(0, 120)}）` : ""}］\n${body}`,
-    );
   }
   if (projectSample) {
     sections.push(`［紧接本次写作之前的正文（来源：${projectSample.source}）——新正文从这里的声线自然续下去，句法与节奏保持同一支笔的手感］\n${projectSample.text}`);
@@ -261,14 +264,20 @@ export function isolatedWriterVoiceEvidence(
   store: WriterStore,
   targetPath?: string,
   random: () => number = Math.random,
+  options?: { excludeProjectVoice?: boolean },
 ): IsolatedWriterVoiceEvidence {
   const config = project.config();
   const template = config.style ? project.styleTemplate(config.style) : undefined;
   const example = pickStyleExamples(store, template?.name, undefined, random)[0];
   const exemplar = example
     ? sampleProseWindow(example.content, 1_200, random)
-    : template?.exampleContent ? sampleProseWindow(template.exampleContent, 1_200, random) : "";
-  const projectSample = pickProjectVoiceSample(project, targetPath);
+    : "";
+  const projectSample = pickProjectVoiceSample(
+    project,
+    targetPath,
+    undefined,
+    options?.excludeProjectVoice,
+  );
   return { exemplar, continuation: projectSample ? projectSample.text.slice(-1_200) : "" };
 }
 
@@ -334,7 +343,7 @@ function pickStyleExamples(
   exampleIds?: number[],
   random: () => number = Math.random,
 ): Array<{ title: string; category: string; content: string; notes: string }> {
-  const all = store.writingExamples().filter(item => !isPlaceholderStyleExample(item));
+  const all = store.writingExamples().filter(item => item.gatePassed && !isPlaceholderStyleExample(item));
   const wanted = new Set(exampleIds ?? []);
   const selected: typeof all = [];
 
@@ -375,7 +384,7 @@ function pickExplicitStyleExamples(
   if (!exampleIds?.length) return [];
   const wanted = new Set(exampleIds);
   return store.writingExamples()
-    .filter(item => wanted.has(item.id) && !item.title.startsWith("[风格模板]"))
+    .filter(item => item.gatePassed && wanted.has(item.id) && !item.title.startsWith("[风格模板]"))
     .slice(0, 2)
     .map(item => ({ title: item.title, content: item.content, notes: item.notes }));
 }
@@ -384,9 +393,11 @@ function pickProjectVoiceSample(
   project: WriterProject,
   targetPath?: string,
   preferredSample?: string,
+  excludeProjectVoice = false,
 ): { text: string; source: string } | undefined {
   const preferred = extractProseSample(preferredSample ?? "", 1_200);
   if (preferred) return { text: preferred, source: "本轮上下文/选区" };
+  if (excludeProjectVoice) return undefined;
 
   const candidates: string[] = [];
   if (targetPath && project.documentExists(targetPath) && !project.isDocumentHidden(targetPath)) {

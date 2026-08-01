@@ -916,9 +916,7 @@ header {
   box-shadow: inset 0 0 0 1.5px var(--accent);
 }
 
-.tree-node.agent-hidden .tree-row {
-  opacity: .55;
-}
+.tree-node.agent-hidden .tree-row > :not(.tree-actions) { opacity: .55; }
 .tree-node.agent-hidden .tree-name {
   text-decoration: line-through; font-style: italic;
 }
@@ -991,6 +989,11 @@ header {
   transition: opacity .12s ease, transform .12s ease;
 }
 .tree-row:hover .tree-actions, .tree-row:focus-within .tree-actions { opacity: 1; transform: none; }
+/* Keep an expanded row menu above following tree rows and their connector line. */
+.tree-row:focus-within {
+  position: relative;
+  z-index: 2;
+}
 
 .tree-action-btn {
   width: 22px; height: 24px; padding: 0;
@@ -6789,6 +6792,13 @@ a:focus-visible {
     animation-duration: .01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
+  }
+  /* Keep generation progress visibly alive even when decorative motion is reduced. */
+  .roleplay-progress-spinner {
+    animation: roleplay-progress-spin 1.4s linear infinite !important;
+  }
+  .roleplay-progress-track span {
+    animation: roleplay-progress-slide 2.2s ease-in-out infinite !important;
   }
 }
 

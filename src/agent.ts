@@ -59,6 +59,7 @@ import {
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
+import { decideProposalFailure } from "./proposal_retry.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
   buildProjectTrunk,
@@ -113,6 +114,13 @@ type ApiToolCall = {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+};
+
+type SubmittedProposalRef = {
+  id: number;
+  path: string;
+  summary: string;
+  afterContent: string;
 };
 
 export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/index.js";
@@ -854,6 +862,7 @@ async function compileWritingTaskContract(
   const activeStyle = activeStyleId ? project.styleTemplate(activeStyleId) : undefined;
   // Slim catalogs: paths / id+name only — full notes/examples inflate the miss-priced user payload.
   const examples = store.writingExamples()
+    .filter(item => item.gatePassed)
     .filter(item => !item.title.startsWith("[风格模板]") || item.title === `[风格模板] ${activeStyle?.name}`)
     .map(item => ({ id: item.id, title: item.title, category: item.category }))
     .slice(0, 24);
@@ -1314,7 +1323,7 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
     : [];
   // Writing tasks: only ids/fingerprints here — full example bodies live in dynamic style evidence.
   const writing = isIntensiveWritingMode(task.mode) || task.documentProposalRequired;
-  const rankedExamples = store.writingExamples().map((item) => {
+  const rankedExamples = store.writingExamples().filter(item => item.gatePassed).map((item) => {
     let score = task.exampleIds.includes(item.id) ? 3 : 0;
     if (writing && item.title.startsWith("[风格模板]")) score = Math.max(score, 1);
     if (writing && !item.title.startsWith("[风格模板]") && score === 0) score = 1;
@@ -1620,6 +1629,160 @@ export function chapterContinuationPrompt(parts: {
     parts.todosText,
   );
   return lines.join("\n");
+}
+
+function persistChapterHandoff(
+  store: WriterStore,
+  input: {
+    sessionId: string;
+    sourceMessageId: number;
+    jobId?: string;
+    contextEpochId?: string;
+    proposal?: SubmittedProposalRef;
+    handoff?: CompletedChapterHandoff;
+    index: number;
+  },
+): { nodeId: string; superseded: number } {
+  const chapterKey = chapterHandoffKey({
+    path: input.proposal?.path,
+    index: input.index,
+  });
+  const payload: ChapterHandoffPayload = {
+    kind: "chapter",
+    ...(chapterKey ? { chapterKey } : {}),
+    ...(input.proposal ? {
+      path: input.proposal.path,
+      summary: input.proposal.summary,
+      tail: input.proposal.afterContent.trimEnd().slice(-800),
+    } : {}),
+    ...(input.handoff?.finalActualState != null
+      ? { finalActualState: input.handoff.finalActualState }
+      : {}),
+  };
+  const node = store.createContextNode({
+    sessionId: input.sessionId,
+    kind: "handoff",
+    label: chapterHandoffLabel({
+      path: input.proposal?.path,
+      summary: input.proposal?.summary,
+      index: input.index,
+    }),
+    sourceMessageId: input.sourceMessageId,
+    jobId: input.jobId,
+    payload: payload as unknown as Record<string, unknown>,
+  });
+  if (input.contextEpochId) {
+    store.addContextEdge({
+      sessionId: input.sessionId,
+      fromId: input.contextEpochId,
+      toId: node.id,
+      kind: "produces",
+    });
+  }
+  return {
+    nodeId: node.id,
+    superseded: store.supersedeContextHandoffs(input.sessionId, chapterKey, node.id),
+  };
+}
+
+function completedJobHandoffPrompt(
+  proposal: SubmittedProposalRef,
+  handoff?: CompletedChapterHandoff,
+): string {
+  const lines = [
+    "本 job 已完成交付；完整提案参数、门禁重试与工具过程已卸下，后续任务以持久化章节和本交接为准。",
+    `已交付：${proposal.path} — ${proposal.summary.replace(/\s+/g, " ").slice(0, 240)}`,
+  ];
+  const tail = proposal.afterContent.trimEnd().slice(-800).trimStart();
+  if (tail) lines.push(`章末衔接：\n…${tail}`);
+  if (handoff?.finalActualState != null) {
+    lines.push(`末场状态：${JSON.stringify(handoff.finalActualState)}`);
+  }
+  lines.push("需要全文时只读取已交付文档的必要片段；禁止依赖或复原本 job 的旧提案重试链。");
+  return lines.join("\n");
+}
+
+function saveProposalRevisionDraft(
+  call: ToolAccumulator,
+  project: WriterProject,
+  store: WriterStore,
+  sessionId: string,
+): { artifactId: number; path?: string; sourceHash: string } | undefined {
+  try {
+    const input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+    const content = typeof input.content === "string" ? input.content : "";
+    if (!content.trim()) return undefined;
+    const path = typeof input.path === "string" ? input.path : undefined;
+    const sourceHash = project.hash(content);
+    const artifactId = store.saveContextArtifact(sessionId, {
+      cacheKey: `proposal_revision_draft:${sourceHash}`,
+      kind: "proposal_revision_draft",
+      path,
+      sourceHash,
+      content,
+      digest: `${path ?? "当前文档"} 待修订稿 ${content.length} 字符`,
+    });
+    return { artifactId, path, sourceHash };
+  } catch {
+    return undefined;
+  }
+}
+
+const PROPOSAL_SUBMISSION_TOOLS = new Set([
+  "propose_document",
+  "write_document_isolated",
+  "propose_document_patch",
+  "revise_document_isolated",
+  "propose_chapter_draft",
+  "propose_outline_patch",
+  "propose_change_set",
+]);
+
+function proposalRevisionBoundaryPrompt(
+  prompt: string,
+  draft?: { artifactId: number; path?: string; sourceHash: string },
+): string {
+  if (!draft) return prompt;
+  return [
+    prompt,
+    `最新版待修订正文已保存为工作记忆 artifactId=${draft.artifactId}`
+      + `${draft.path ? `（${draft.path}）` : ""}，sourceHash=${draft.sourceHash.slice(0, 12)}。`,
+    "旧版完整提案与驳回工具链已卸下。先用 read_context_artifact 分页读取该 artifact，"
+      + "只按上述驳回点修订，然后重新提交；禁止重读设定或从头另写。",
+  ].join("\n");
+}
+
+function proposalFailurePauseResult(
+  result: Record<string, unknown>,
+  reason: "dependency" | "invalid_request" | "revision_exhausted",
+  draft?: { artifactId: number; path?: string; sourceHash: string },
+): Record<string, unknown> {
+  const dependency = reason === "dependency";
+  const exhausted = reason === "revision_exhausted";
+  const summary = dependency
+    ? "提案依赖的审核模型及回退模型均不可用。"
+    : exhausted
+      ? "同一提案已达到运行时允许的修订提交上限。"
+      : "提案请求本身无效，继续原样重试不会成功。";
+  return {
+    ...result,
+    status: "waiting",
+    displayMessage: [
+      summary,
+      typeof result.error === "string" ? result.error : typeof result.message === "string" ? result.message : "",
+      draft
+        ? `当前正文已保存为工作记忆 artifactId=${draft.artifactId}，未丢失。`
+        : "当前正文仍保留在本轮工作记忆中。",
+      dependency
+        ? "本次已停止自动提交；审核依赖恢复后可续跑。"
+        : "本次已停止自动提交，请检查驳回信息或给出新的处理指令。",
+    ].filter(Boolean).join("\n"),
+    question: dependency
+      ? "提案审核依赖暂时不可用；恢复后可续跑。"
+      : "提案自动修订已停止，请检查驳回信息后决定是否续跑。",
+    options: ["续跑"],
+    ...(draft ? { artifactId: draft.artifactId, path: draft.path, sourceHash: draft.sourceHash } : {}),
+  };
 }
 
 /** After propose_* is blocked by gate/review — force minimal repair, not a full rewrite loop. */
@@ -2038,6 +2201,7 @@ export async function runAgent(options: {
     targetPath: task.targetPath ?? continuationPath,
     exampleIds: task.exampleIds,
     preferredSample: preferredSample || undefined,
+    excludeProjectVoice: task.mode === "rewrite",
   };
   // Direct drafting remains available even when the optional scene chain is
   // configured for isolated writing, so the parent Agent always needs voice evidence.
@@ -2047,6 +2211,12 @@ export async function runAgent(options: {
     ?? options.models?.summarizer
     ?? options.models?.reviewer
     ?? model;
+  const adjudicatorFallbackModel = [
+    options.models?.summarizer,
+    options.models?.reviewer,
+    model,
+  ].find(candidate => candidate
+    && (candidate.baseUrl !== adjudicatorModel.baseUrl || candidate.model !== adjudicatorModel.model));
   // 终审与候选评判默认跟正文走同一个模型：判「这章像不像人写的」靠的是语感，
   // 一个比正文便宜的模型评自己写不出来的文字，只会把标准降到它自己的水平。
   // 「审阅校对」角色仍在，作为显式覆盖 —— 关掉 reviewFollowsProseModel 即回到它。
@@ -2094,6 +2264,7 @@ export async function runAgent(options: {
     },
     proseAdjudicator: {
       model: adjudicatorModel,
+      ...(adjudicatorFallbackModel ? { fallbackModel: adjudicatorFallbackModel } : {}),
       signal,
     },
     ...(runtimeSettings.continuityFactsEnabled ? { continuityExtractor: {
@@ -2167,6 +2338,9 @@ export async function runAgent(options: {
     sessionId,
     budgetTokens: replayBudgetTokens,
     compact: compactRuntimeMessages,
+    // The shelf is session state assembled once below. Older builds froze a copy
+    // into every turn, so normalize legacy blocks before the first request too.
+    normalize: stripFrozenMaterialsShelfMessages,
   });
   const projectTrunk = buildSessionProjectTrunk(project, store);
   const trunkMessage: ApiMessage = { role: "system", content: projectTrunk.content };
@@ -2362,13 +2536,10 @@ ${managedHandoffContext}`,
   let documentProposalSubmitted = false;
   /** Consecutive blocked propose_* attempts in this job (reset on success). */
   let proposalRevisionAttempts = 0;
+  /** Cached prefix immediately before the first full-body proposal in a retry chain. */
+  let proposalRetryBase: number | undefined;
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
-  let submittedProposalRef: {
-    id: number;
-    path: string;
-    summary: string;
-    afterContent: string;
-  } | undefined;
+  let submittedProposalRef: SubmittedProposalRef | undefined;
   let completedDocumentDeliverables = 0;
   let characterMutationSubmitted = false;
   let characterMutationName = "";
@@ -2397,7 +2568,11 @@ ${managedHandoffContext}`,
   const freezeCurrentTurn = () => {
     try {
       persistSessionMaterialsShelf(store, sessionId, toolContext);
-      const block = freezeTurnBlock(messages, replayedMessageCount);
+      // Session materials are assembled once at the next open turn; freezing them
+      // into every turn duplicates the same digest table across the replay chain.
+      const block = stripFrozenMaterialsShelfMessages(
+        freezeTurnBlock(messages, replayedMessageCount),
+      );
       if (!block.length) return;
       store.appendAgentTurnBlock(sessionId, {
         turnIndex: store.nextAgentTurnIndex(sessionId),
@@ -2727,6 +2902,10 @@ ${managedHandoffContext}`,
       }
 
       turnStart = messages.length;
+      if (proposalRetryBase === undefined
+        && result.toolCalls.some(call => PROPOSAL_SUBMISSION_TOOLS.has(call.name))) {
+        proposalRetryBase = messages.length;
+      }
       messages.push({
         role: "assistant",
         content: stripDsmlText(result.content || "", "[工具调用已隐藏]"),
@@ -2748,6 +2927,8 @@ ${managedHandoffContext}`,
       const chapterReviewRejectedTools: string[] = [];
       /** Injected after all tool results of this step (never between tool rows). */
       let pendingProposalRevisionPrompt: string | undefined;
+      let pendingProposalRevisionDraft:
+        { artifactId: number; path?: string; sourceHash: string } | undefined;
       for (const call of result.toolCalls) {
         let effectiveCall = call;
         emit({ type: "tool", name: call.name });
@@ -2912,7 +3093,7 @@ ${managedHandoffContext}`,
         // Only count tools that actually created a proposal / change set. Final-review
         // blocks return structured JSON without `error` but also without proposalId —
         // treating them as success used to fire false chapter boundaries (jn3 林千夏).
-        if (call.name === "propose_document" || call.name === "write_document_isolated" || call.name === "propose_document_patch" || call.name === "revise_document_isolated" || call.name === "propose_chapter_draft" || call.name === "propose_outline_patch" || call.name === "propose_change_set") {
+        if (PROPOSAL_SUBMISSION_TOOLS.has(call.name)) {
           try {
             const parsed = JSON.parse(toolResult) as Record<string, unknown>;
             if (isSuccessfulDocumentSubmission(call.name, parsed)) {
@@ -2920,12 +3101,24 @@ ${managedHandoffContext}`,
                 || parsed.code === "RHYTHM_POLISH_REQUIRED";
               if (needsRhythmPolish) {
                 // 首轮情节场面已落提案，但不算交付完成：强制一次句式抛光。
+                const nextAttempt = Math.max(1, proposalRevisionAttempts + 1);
+                const decision = decideProposalFailure(parsed, nextAttempt);
+                const draft = saveProposalRevisionDraft(
+                  effectiveCall, project, store, sessionId,
+                );
                 documentProposalSubmitted = false;
-                proposalRevisionAttempts = Math.max(1, proposalRevisionAttempts + 1);
-                pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(parsed, proposalRevisionAttempts);
+                if (decision.action === "pause") {
+                  waitingForUser = true;
+                  toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
+                } else {
+                  proposalRevisionAttempts = decision.attempt;
+                  pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(parsed, decision.attempt);
+                  pendingProposalRevisionDraft = draft;
+                }
               } else {
                 documentProposalSubmitted = true;
                 proposalRevisionAttempts = 0;
+                proposalRetryBase = undefined;
               }
               const proposalId = proposalIdFromToolResult(parsed);
               if (proposalId !== undefined) {
@@ -2942,14 +3135,24 @@ ${managedHandoffContext}`,
                 } catch { /* ignore missing proposal row */ }
               }
             } else if (!("error" in parsed) || typeof parsed.error === "string") {
-              // Gate/review blocks or tool errors: converge retries instead of open-ended rewrite loops.
-              proposalRevisionAttempts += 1;
-              pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(
-                "error" in parsed && typeof parsed.error === "string"
-                  ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
-                  : parsed,
-                proposalRevisionAttempts,
+              const nextAttempt = proposalRevisionAttempts + 1;
+              const decision = decideProposalFailure(parsed, nextAttempt);
+              const draft = saveProposalRevisionDraft(
+                effectiveCall, project, store, sessionId,
               );
+              if (decision.action === "pause") {
+                waitingForUser = true;
+                toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
+              } else {
+                proposalRevisionAttempts = decision.attempt;
+                pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(
+                  "error" in parsed && typeof parsed.error === "string"
+                    ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
+                    : parsed,
+                  decision.attempt,
+                );
+                pendingProposalRevisionDraft = draft;
+              }
             }
           } catch { /* 无效工具结果不能视为已提交。 */ }
         }
@@ -2962,7 +3165,20 @@ ${managedHandoffContext}`,
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
       if (pendingProposalRevisionPrompt && !documentProposalSubmitted && !waitingForUser) {
-        messages.push({ role: "user", content: pendingProposalRevisionPrompt });
+        // Proposal retry boundary: keep the cached preparation prefix, unload all
+        // complete draft arguments and gate tool rows, then point at the newest
+        // draft artifact. This is truncation, not an in-place prefix rewrite.
+        if (pendingProposalRevisionDraft && proposalRetryBase !== undefined) {
+          messages.length = proposalRetryBase;
+        }
+        messages.push({
+          role: "user",
+          content: proposalRevisionBoundaryPrompt(
+            pendingProposalRevisionPrompt,
+            pendingProposalRevisionDraft,
+          ),
+        });
+        turnStart = messages.length;
       }
       // Persist session shelf after any reads this step so the next user turn can reload.
       persistSessionMaterialsShelf(store, sessionId, toolContext);
@@ -3207,38 +3423,15 @@ ${managedHandoffContext}`,
           const afterMessageCount = messages.length;
           const shelfCount = toolContext.materialsShelf?.size ?? 0;
           try {
-            const chapterKey = chapterHandoffKey({
-              path: latestProposal?.path,
-              index: completedDocumentDeliverables,
-            });
-            const handoffPayload: ChapterHandoffPayload = {
-              kind: "chapter",
-              ...(chapterKey ? { chapterKey } : {}),
-              ...(latestProposal ? {
-                path: latestProposal.path,
-                summary: latestProposal.summary,
-                tail: latestProposal.afterContent.trimEnd().slice(-800),
-              } : {}),
-              ...(handoff?.finalActualState != null ? { finalActualState: handoff.finalActualState } : {}),
-            };
-            const handoffNode = store.createContextNode({
+            const recordedHandoff = persistChapterHandoff(store, {
               sessionId,
-              kind: "handoff",
-              label: chapterHandoffLabel({
-                path: latestProposal?.path,
-                summary: latestProposal?.summary,
-                index: completedDocumentDeliverables,
-              }),
               sourceMessageId,
               jobId: options.jobId,
-              payload: handoffPayload as unknown as Record<string, unknown>,
+              contextEpochId,
+              proposal: latestProposal,
+              handoff,
+              index: completedDocumentDeliverables,
             });
-            if (contextEpochId) {
-              store.addContextEdge({ sessionId, fromId: contextEpochId, toId: handoffNode.id, kind: "produces" });
-            }
-            // A rewrite of the same chapter must retire the previous seam, or the
-            // L2 block hands the model two competing tails for one chapter.
-            const superseded = store.supersedeContextHandoffs(sessionId, chapterKey, handoffNode.id);
             const keptPrefixTokens = approximateMessageTokens(messages.slice(0, materialsBase));
             const handoffTokens = Math.max(0, afterTokens - keptPrefixTokens);
             const droppedTokens = Math.max(0, beforeTokens - afterTokens + handoffTokens);
@@ -3262,7 +3455,7 @@ ${managedHandoffContext}`,
                     id: "L2",
                     layer: "L2",
                     label: "新增 · 章节衔接",
-                    nodeIds: [handoffNode.id],
+                    nodeIds: [recordedHandoff.nodeId],
                     estimatedTokens: handoffTokens,
                   },
                   { id: "L3", layer: "L3", label: "卸下 · 上一章过程痕迹", estimatedTokens: 0 },
@@ -3304,7 +3497,9 @@ ${managedHandoffContext}`,
                     ? "本会话已读材料含设定/角色摘要。同一路径且文件未改会直接复用；仅未收录或文件变更时再读。"
                     : "已读材料仍空：下一章可能补读。读过后会写入本会话，后续任务可复用。",
                 },
-                ...(superseded ? { supersededHandoffs: superseded } : {}),
+                ...(recordedHandoff.superseded
+                  ? { supersededHandoffs: recordedHandoff.superseded }
+                  : {}),
                 ...(submittedProposalRef ? { proposalId: submittedProposalRef.id } : {}),
                 materialsShelfCount: shelfCount,
                 note: "章节切换",
@@ -3342,6 +3537,7 @@ ${managedHandoffContext}`,
           toolCallCounts.clear();
           documentProposalSubmitted = false;
           submittedProposalRef = undefined;
+          proposalRetryBase = undefined;
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
           toolContext.lastWritePack = undefined;
@@ -3418,7 +3614,37 @@ ${managedHandoffContext}`,
           }
         }
       } catch { /* 消息保存失败不影响流程 */ }
-      // Last proposal with no further writing steps — checklist already advanced.
+      // Last proposal with no further writing steps: persist the same compact
+      // continuity handoff as an in-job chapter boundary, then replace the raw
+      // cross-job tool chain with one compact terminal block.
+      let terminalHandoffPersisted = false;
+      const terminalHandoff = toolContext.completedChapterHandoff;
+      if (submittedProposalRef) {
+        try {
+          persistChapterHandoff(store, {
+            sessionId,
+            sourceMessageId,
+            jobId: options.jobId,
+            contextEpochId,
+            proposal: submittedProposalRef,
+            handoff: terminalHandoff,
+            index: completedDocumentDeliverables,
+          });
+          terminalHandoffPersisted = true;
+        } catch { /* keep the raw replay chain if the durable handoff failed */ }
+      }
+      if (terminalHandoffPersisted && submittedProposalRef) {
+        messages.length = initialMessageCount;
+        messages.push({
+          role: "user",
+          content: completedJobHandoffPrompt(submittedProposalRef, terminalHandoff),
+        });
+        messages.push({
+          role: "assistant",
+          content: `已交付 ${submittedProposalRef.path}。`,
+        });
+        store.clearAgentTurnBlocks(sessionId);
+      }
       freezeCurrentTurn();
       emit({ type: "done", sessionId });
       return;
@@ -3951,6 +4177,13 @@ const MATERIALS_SHELF_DIGEST_CHARS = 360;
 const MATERIALS_SHELF_DIGEST_CHARS_SETTING = 1_200;
 /** Cap shelf entries so the cross-chapter kept block stays cheap. */
 const MATERIALS_SHELF_MAX_ENTRIES = 24;
+const MATERIALS_SHELF_PROMPT_PREFIX = "【会话材料架 · 跨任务保留】";
+
+function stripFrozenMaterialsShelfMessages(messages: ApiMessage[]): ApiMessage[] {
+  return messages.filter(message =>
+    message.role !== "user"
+    || !messageContentText(message.content).startsWith(MATERIALS_SHELF_PROMPT_PREFIX));
+}
 
 function materialsShelfKeyForPath(path: string): string {
   return path.trim().replace(/\\/g, "/").replace(/^\.\//, "");
@@ -4092,7 +4325,7 @@ export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): st
     digest: item.digest,
   }));
   return [
-    "【会话材料架 · 跨任务保留】以下设定/角色已在本会话读过（sourceHash 未变则禁止无目标整篇重读或反复 search）。",
+    `${MATERIALS_SHELF_PROMPT_PREFIX}以下设定/角色已在本会话读过（sourceHash 未变则禁止无目标整篇重读或反复 search）。`,
     "写作直接依据 digest 与章交接；章切换后仍适用本表，禁止为下一章「重新摸底」重复 load 同路径全文。",
     "digest 未覆盖的段落：先 inspect_document 看 blocks/headings，再用 block 或 startLine/endLine 或 quote 定点补读；禁止用 search_project 当分页阅读。",
     "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",

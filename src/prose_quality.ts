@@ -145,7 +145,7 @@ export function proseMannerismConstraintPrompt(options?: { compact?: boolean }):
 
 /** One-line checklist for pre-submit self-check in task workflows. */
 export function proseMannerismPreflightLine(): string {
-  return "提交前自检：改掉先否定再改判句；删去不新增事实的解释；相邻段落句式不同形；避免碎句连发与刻意缩词；一句话只推一事、勿堆概念清单；句长段长有起伏（勿整章均齐）；叙述保留人称主语、勿报告体；对白自然且人物可区分。";
+  return "提交前自检：改掉先否定再改判句；删去不新增事实的解释；相邻段落句式不同形；避免碎句连发、刻意缩词及连续物件短拍；一句话只推一事、勿堆概念清单；句长段长有起伏（勿整章均齐）；叙述保留必要成分、所指可唯一还原，勿报告体；对白自然且人物可区分。";
 }
 
 /**

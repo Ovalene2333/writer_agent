@@ -120,6 +120,8 @@ export type ToolExecutionContext = {
    */
   proseAdjudicator?: {
     model: ModelConfig;
+    /** Distinct provider/model used only after the primary adjudicator fails. */
+    fallbackModel?: ModelConfig;
     signal?: AbortSignal;
   };
   /**

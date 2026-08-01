@@ -3,6 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import {
+  decideProposalFailure,
+  MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW,
+} from "./proposal_retry.js";
 /**
  * Cache / prompt-assembly guards. When changing agent prompts, keep the contract
  * documented at the top of agent.ts (PROMPT / PREFIX-CACHE CONTRACT) and extend
@@ -641,6 +645,26 @@ test("proposal revision converge prompt escalates after repeated blocks", () => 
   }, 2);
   assert.match(last, /最后一轮/);
   assert.match(last, /manage_todos|ask_user/);
+});
+
+test("proposal retry policy separates dependency outages from bounded prose revisions", () => {
+  assert.deepEqual(decideProposalFailure({
+    code: "PROSE_GATE_UNAVAILABLE",
+    failureKind: "dependency",
+    retryable: true,
+  }, 1), { action: "pause", reason: "dependency", attempt: 1 });
+
+  assert.deepEqual(decideProposalFailure({
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    status: "final_review_revision_required",
+  }, 1), { action: "revise", attempt: 1 });
+
+  assert.deepEqual(decideProposalFailure({ status: "rejected" },
+    MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW), {
+    action: "pause",
+    reason: "revision_exhausted",
+    attempt: MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW,
+  });
 });
 
 test("scene continuation handoff carries seam tail, states and next card without full prose", () => {

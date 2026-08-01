@@ -177,6 +177,8 @@ export function loadReplayMessages(input: {
   sessionId: string;
   budgetTokens: number;
   compact: ReplayCompactor;
+  /** Remove session-level blocks that are assembled separately on every open turn. */
+  normalize?: (messages: AgentTurnMessage[]) => AgentTurnMessage[];
   /** Shrink down to this fraction of the budget once the budget is exceeded. */
   lowWaterRatio?: number;
 }): ReplayLoadResult {
@@ -185,9 +187,21 @@ export function loadReplayMessages(input: {
     return { messages: [], compacted: false, droppedTurns: 0, replayedTurns: 0, estimatedTokens: 0 };
   }
 
-  let chain = blocks.map(block => ({ messages: block.messages, estimatedTokens: block.estimatedTokens || approximateMessageTokens(block.messages) }));
+  let normalized = false;
+  let chain = blocks.map((block) => {
+    const messages = input.normalize
+      ? input.normalize(block.messages.map(message => ({ ...message })))
+      : block.messages;
+    if (input.normalize && JSON.stringify(messages) !== JSON.stringify(block.messages)) normalized = true;
+    return {
+      messages,
+      estimatedTokens: normalized || input.normalize
+        ? approximateMessageTokens(messages)
+        : block.estimatedTokens || approximateMessageTokens(messages),
+    };
+  });
   const total = () => chain.reduce((sum, block) => sum + block.estimatedTokens, 0);
-  let compacted = false;
+  let compacted = normalized;
   let droppedTurns = 0;
 
   if (total() > input.budgetTokens) {
@@ -220,8 +234,8 @@ export function loadReplayMessages(input: {
       chain = [];
       droppedTurns += 1;
     }
-    if (compacted || droppedTurns) input.store.replaceAgentTurnBlocks(input.sessionId, chain);
   }
+  if (compacted || droppedTurns) input.store.replaceAgentTurnBlocks(input.sessionId, chain);
 
   return {
     messages: chain.flatMap(block => block.messages),

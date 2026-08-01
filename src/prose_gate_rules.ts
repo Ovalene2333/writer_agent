@@ -16,18 +16,32 @@ export interface ProseGateRule {
   updatedAt: string;
 }
 
-const DEFAULT_RULES: readonly ProseGateRule[] = [{
-  id: "quoted-text-count-consistency",
-  instruction: "正文用“这几个字/这N个字/几个字”等方式描述引号内文字数量时，必须按实际书写单位核对数量；数量与引号内文字不一致即违规。不要把标点计入字数。",
-  kind: "hard_gate",
-  severity: "block",
-  enabled: true,
-  sourceFeedback: "作者反馈：类似“xxxx”——这三个字的数量描述容易写错，必须复审。",
-  createdAt: "2026-07-26T00:00:00.000Z",
-  updatedAt: "2026-07-26T00:00:00.000Z",
-}];
+const DEFAULT_RULES: readonly ProseGateRule[] = [
+  {
+    id: "quoted-text-count-consistency",
+    instruction: "正文用“这几个字/这N个字/几个字”等方式描述引号内文字数量时，必须按实际书写单位核对数量；数量与引号内文字不一致即违规。不要把标点计入字数。",
+    kind: "hard_gate",
+    severity: "block",
+    enabled: true,
+    sourceFeedback: "作者反馈：类似“xxxx”——这三个字的数量描述容易写错，必须复审。",
+    createdAt: "2026-07-26T00:00:00.000Z",
+    updatedAt: "2026-07-26T00:00:00.000Z",
+  },
+  {
+    id: "telegraphic-object-beats",
+    instruction: "复审正文（叙述和对白）的缩句生成味。以下任一情况违规：同一段或相邻段反复把物件/环境名词加一个裸动作或状态切成独立节拍，以机械播报代替人物感知、反应、因果或局面变化；省略动作的施事、受事、对象等必要成分后，无法从紧邻上下文唯一还原；对白把后台字段、状态栏或提纲压成“名词短语＋状态”的汇报腔，词语关系含混，或不能自然承接对方的问题。不要因为句子短、没有宾语或使用汉语零形回指就单独判错；不及物句、偶发重音、紧张高潮，以及人物身份、问答关系与近邻语境足以自然补全的口语省略应放行。连续命中时 evidence 引用能呈现该模式的最短连续原文。",
+    kind: "hard_gate",
+    severity: "block",
+    enabled: true,
+    sourceFeedback: "作者反馈：限制“手机又震”“车出隧道”“雨刷继续响”式连续物件短拍，以及无法由近邻语境还原必要成分的缩句。",
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+  },
+];
 
-const MAX_RULES = 20;
+// The original capacity was one built-in + 19 project rules. Adding another
+// built-in must not evict the last rule from an existing full project file.
+const MAX_RULES = 21;
 
 function rulesPath(project: WriterProject): string {
   return resolve(project.privateDir, "prose-gates.json");
@@ -73,7 +87,10 @@ export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
   try { parsed = JSON.parse(readFileSync(path, "utf8")); }
   catch { throw new Error(".writer/prose-gates.json 格式无效"); }
   if (!Array.isArray(parsed)) throw new Error(".writer/prose-gates.json 必须是规则数组");
-  return parsed.slice(0, MAX_RULES).map(item => normalizeRule(item));
+  const saved = parsed.slice(0, MAX_RULES).map(item => normalizeRule(item));
+  const merged = new Map(DEFAULT_RULES.map(rule => [rule.id, { ...rule }]));
+  for (const rule of saved) merged.set(rule.id, rule);
+  return [...merged.values()].slice(0, MAX_RULES);
 }
 
 function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): void {

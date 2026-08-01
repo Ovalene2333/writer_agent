@@ -329,6 +329,7 @@ export class WriterStore {
         category TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
         notes TEXT NOT NULL DEFAULT '',
+        gate_hash TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS roleplay_interlocutors (
@@ -586,6 +587,10 @@ export class WriterStore {
     }
     if (!proposalColumns.some(column => column.name === "quality_report_json")) {
       this.database.exec("ALTER TABLE proposals ADD COLUMN quality_report_json TEXT NOT NULL DEFAULT ''");
+    }
+    const writingExampleColumns = this.database.prepare("PRAGMA table_info(writing_examples)").all() as Row[];
+    if (!writingExampleColumns.some(column => column.name === "gate_hash")) {
+      this.database.exec("ALTER TABLE writing_examples ADD COLUMN gate_hash TEXT NOT NULL DEFAULT ''");
     }
     const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as Row[];
     if (!sessionColumns.some(column => column.name === "auto_title_done")) {
@@ -1423,6 +1428,74 @@ export class WriterStore {
     return character;
   }
 
+  importCharacterCards(input: { characters?: unknown[]; simpleCharacters?: unknown[] }): {
+    characters: Character[];
+    simpleCharacters: SavedRoleplayInterlocutor[];
+  } {
+    const rawCharacters = input.characters ?? [];
+    const rawSimpleCharacters = input.simpleCharacters ?? [];
+    if (!Array.isArray(rawCharacters) || !Array.isArray(rawSimpleCharacters)) throw new Error("角色卡导入内容必须是数组");
+    if (rawCharacters.length > 200 || rawSimpleCharacters.length > 200) throw new Error("单次最多导入各 200 张角色卡");
+    if (!rawCharacters.length && !rawSimpleCharacters.length) throw new Error("导入文件中没有角色卡");
+
+    const existingCharacters = this.characters();
+    const existingSimpleCharacters = this.roleplayInterlocutors();
+    const normalizedCharacters = rawCharacters.map((value, index) => {
+      try { return this.normalizeCharacter(value); }
+      catch (error) { throw new Error(`普通角色卡 #${index + 1}：${error instanceof Error ? error.message : String(error)}`); }
+    });
+    const sourceCharacterIds = new Set<number>();
+    for (const character of normalizedCharacters) {
+      if (sourceCharacterIds.has(character.id)) throw new Error(`导入包中的普通角色 ID ${character.id} 重复`);
+      sourceCharacterIds.add(character.id);
+    }
+
+    let nextCharacterId = Math.max(0, ...existingCharacters.map(character => character.id)) + 1;
+    const characterIdMap = new Map(normalizedCharacters.map(character => [character.id, nextCharacterId++]));
+    const importedAt = new Date().toISOString();
+    const importedCharacters = normalizedCharacters.map(character => ({
+      ...character,
+      id: characterIdMap.get(character.id)!,
+      relationships: character.relationships.map(relationship => ({
+        ...relationship,
+        characterId: characterIdMap.get(relationship.characterId) ?? relationship.characterId,
+      })),
+      updatedAt: importedAt,
+    }));
+    const nextCharacters = [...existingCharacters, ...importedCharacters];
+    validateCharacters(nextCharacters, this.outlineNodeIds());
+
+    const normalizedSimpleCharacters = rawSimpleCharacters.map((value, index) => {
+      try { return normalizeSavedSimpleCharacter(value); }
+      catch (error) { throw new Error(`简易角色卡 #${index + 1}：${error instanceof Error ? error.message : String(error)}`); }
+    });
+    const sourceSimpleIds = new Set<number>();
+    for (const card of normalizedSimpleCharacters) {
+      if (sourceSimpleIds.has(card.id)) throw new Error(`导入包中的简易角色 ID ${card.id} 重复`);
+      sourceSimpleIds.add(card.id);
+    }
+    let nextSimpleId = Math.max(0, ...existingSimpleCharacters.map(card => card.id)) + 1;
+    const importedSimpleCharacters = normalizedSimpleCharacters.map(card => ({
+      ...card,
+      id: nextSimpleId++,
+      ...(card.targetCharacterId
+        ? { targetCharacterId: characterIdMap.get(card.targetCharacterId) ?? card.targetCharacterId }
+        : {}),
+      createdAt: importedAt,
+      updatedAt: importedAt,
+    }));
+    const knownCharacterIds = new Set(nextCharacters.map(character => character.id));
+    for (const card of importedSimpleCharacters) {
+      if (card.targetCharacterId && !knownCharacterIds.has(card.targetCharacterId)) {
+        throw new Error(`简易角色卡“${card.name}”关联的普通角色不存在`);
+      }
+    }
+
+    this.writeCharacters(nextCharacters);
+    this.writeSimpleCharacters([...existingSimpleCharacters, ...importedSimpleCharacters]);
+    return { characters: importedCharacters, simpleCharacters: importedSimpleCharacters };
+  }
+
   /**
    * Apply semantic character evolution ops (unlock, personality, experiences, …)
    * then persist through the normal validation path.
@@ -1957,17 +2030,20 @@ export class WriterStore {
       .map(row => this.exampleFromRow(row as Row));
   }
 
-  saveWritingExample(input: Omit<WritingExample, "id" | "updatedAt"> & { id?: number }): WritingExample {
+  saveWritingExample(
+    input: Omit<WritingExample, "id" | "updatedAt" | "gatePassed"> & { id?: number; gatePassed?: boolean },
+  ): WritingExample {
     const title = input.title.trim();
     const content = input.content.trim();
     if (!title || !content) throw new Error("示例标题和正文不能为空");
-    const values = [title, input.category.trim(), content, input.notes.trim(), new Date().toISOString()];
+    const gateHash = input.gatePassed === true ? this.project.hash(content) : "";
+    const values = [title, input.category.trim(), content, input.notes.trim(), gateHash, new Date().toISOString()];
     let id = input.id;
     if (id) {
-      const result = this.database.prepare("UPDATE writing_examples SET title=?, category=?, content=?, notes=?, updated_at=? WHERE id=?").run(...values, id);
+      const result = this.database.prepare("UPDATE writing_examples SET title=?, category=?, content=?, notes=?, gate_hash=?, updated_at=? WHERE id=?").run(...values, id);
       if (!result.changes) throw new Error("写作示例不存在");
     } else {
-      id = Number(this.database.prepare("INSERT INTO writing_examples(title,category,content,notes,updated_at) VALUES(?,?,?,?,?)").run(...values).lastInsertRowid);
+      id = Number(this.database.prepare("INSERT INTO writing_examples(title,category,content,notes,gate_hash,updated_at) VALUES(?,?,?,?,?,?)").run(...values).lastInsertRowid);
     }
     return this.writingExample(id);
   }
@@ -1976,14 +2052,15 @@ export class WriterStore {
     if (!this.database.prepare("DELETE FROM writing_examples WHERE id=?").run(id).changes) throw new Error("写作示例不存在");
   }
 
-  seedStyleExample(template: StyleTemplate): void {
+  seedStyleExample(template: StyleTemplate, gatePassed = false): void {
     const existing = this.writingExamples().find((item) => item.title === `[风格模板] ${template.name}`);
+    const gateHash = gatePassed ? this.project.hash(template.exampleContent.trim()) : "";
     if (existing) {
-      this.database.prepare("UPDATE writing_examples SET category=?, content=?, notes=?, updated_at=? WHERE id=?")
-        .run(template.name, template.exampleContent, template.exampleNotes, new Date().toISOString(), existing.id);
+      this.database.prepare("UPDATE writing_examples SET category=?, content=?, notes=?, gate_hash=?, updated_at=? WHERE id=?")
+        .run(template.name, template.exampleContent, template.exampleNotes, gateHash, new Date().toISOString(), existing.id);
     } else {
-      this.database.prepare("INSERT INTO writing_examples(title,category,content,notes,updated_at) VALUES(?,?,?,?,?)")
-        .run(`[风格模板] ${template.name}`, template.name, template.exampleContent, template.exampleNotes, new Date().toISOString());
+      this.database.prepare("INSERT INTO writing_examples(title,category,content,notes,gate_hash,updated_at) VALUES(?,?,?,?,?,?)")
+        .run(`[风格模板] ${template.name}`, template.name, template.exampleContent, template.exampleNotes, gateHash, new Date().toISOString());
     }
   }
 
@@ -2064,9 +2141,12 @@ export class WriterStore {
   }
 
   private exampleFromRow(row: Row): WritingExample {
+    const content = row.content as string;
     return {
       id: row.id as number, title: row.title as string, category: row.category as string,
-      content: row.content as string, notes: row.notes as string, updatedAt: row.updated_at as string,
+      content, notes: row.notes as string,
+      gatePassed: Boolean(row.gate_hash) && row.gate_hash === this.project.hash(content),
+      updatedAt: row.updated_at as string,
     };
   }
 
@@ -2151,24 +2231,25 @@ export class WriterStore {
     this.database.prepare("DELETE FROM sessions WHERE id=?").run(id);
   }
 
-  /** Batch-delete sessions; always keep at least one. Returns remaining session id (prefer keepId if still present). */
-  deleteSessions(ids: string[], keepId?: string): { deleted: string[]; remainingSessionId: string } {
+  /** Batch-delete sessions; selecting every session replaces them with one new empty session. */
+  deleteSessions(ids: string[], keepId?: string): { deleted: string[]; remainingSessionId: string; createdNewSession: boolean } {
     const unique = [...new Set(ids.filter((id) => this.sessionExists(id)))];
     if (unique.length === 0) throw new Error("没有可删除的会话");
     const all = this.listSessions();
-    if (all.length - unique.length < 1) {
-      throw new Error("至少保留一个会话，请取消勾选部分会话后再删除");
-    }
     const deleteSet = new Set(unique);
+    const deletesEverySession = all.every(session => deleteSet.has(session.id));
+    // Create the replacement first, so the store never temporarily has zero sessions
+    // and a partial deletion failure still leaves a usable destination.
+    const replacementSessionId = deletesEverySession ? this.createSession() : undefined;
     for (const id of unique) {
       this.database.prepare("DELETE FROM sessions WHERE id=?").run(id);
     }
     const remaining = this.listSessions();
     const remainingSessionId = (keepId && remaining.some((s) => s.id === keepId))
       ? keepId
-      : remaining[0]?.id;
+      : replacementSessionId ?? remaining[0]?.id;
     if (!remainingSessionId) throw new Error("删除后没有可用会话");
-    return { deleted: unique, remainingSessionId };
+    return { deleted: unique, remainingSessionId, createdNewSession: Boolean(replacementSessionId) };
   }
 
   addMessage(

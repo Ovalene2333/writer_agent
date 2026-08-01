@@ -39,6 +39,8 @@ export const ROLEPLAY_RECENT_MESSAGES = 8;
 export const ROLEPLAY_SUMMARY_BATCH = 8;
 /** Refresh working-state via model every N assistant replies when no batch summary is needed. */
 export const ROLEPLAY_STATE_REFRESH_EVERY = 4;
+/** Best-effort post-turn memory must never leave an otherwise completed reply running forever. */
+const ROLEPLAY_MEMORY_REFRESH_TIMEOUT_MS = 20_000;
 /** Bump when persisted memory semantics change; old domains remain inspectable but are not injected. */
 export const ROLEPLAY_EPISTEMIC_MEMORY_VERSION = 4;
 
@@ -1502,9 +1504,6 @@ export async function runRoleplayChat(options: {
     let reply = (finalized.length ? finalized : fallbackBlocks)
       .map(renderRoleplayPresentationBlock).filter(Boolean).join("\n\n");
     if (!reply) reply = `*${participant.name} 沉默了一会儿。*`;
-    emit({ type: "text", text: reply, channel: "output" });
-    const assistantMessageId = options.store.addMessage(options.sessionId, "assistant", reply, "roleplay", options.variantGroupId);
-
     // Lightweight post-turn bookkeeping (no extra model call).
     // Spectator continuations are still the same action chain when state.beat is stale;
     // do not inflate sameBeatTurns into a forced "换话题" pressure between continues.
@@ -1525,6 +1524,10 @@ export async function runRoleplayChat(options: {
     // Refresh rolling summary / working-state now that the reply is out (best-effort).
     if (needsSummary || dueStateRefresh) {
       try {
+        const timeoutSignal = AbortSignal.timeout(ROLEPLAY_MEMORY_REFRESH_TIMEOUT_MS);
+        const memorySignal = options.signal
+          ? AbortSignal.any([options.signal, timeoutSignal])
+          : timeoutSignal;
         memory = await refreshRoleplayMemory({
           store: options.store,
           sessionId: options.sessionId,
@@ -1532,7 +1535,7 @@ export async function runRoleplayChat(options: {
           prior: memoryPrior,
           firstRecentId,
           model: options.summarizer ?? options.model,
-          signal: options.signal,
+          signal: memorySignal,
           forceStateOnly: !needsSummary && dueStateRefresh,
           usageReporter: reportInternalUsage,
         });
@@ -1545,8 +1548,12 @@ export async function runRoleplayChat(options: {
         }
       }
     }
+    // Persist and expose the completed reply only after bounded bookkeeping, so a
+    // page refresh cannot show the reply beside a stale active/Stop state.
+    const assistantMessageId = options.store.addMessage(options.sessionId, "assistant", reply, "roleplay", options.variantGroupId);
     options.store.saveRoleplayMemorySnapshot(options.sessionId, assistantMessageId, memory);
 
+    emit({ type: "text", text: reply, channel: "output" });
     emit({ type: "step_done", step: 1 });
     emit({ type: "done", sessionId: options.sessionId });
   } catch (error) {

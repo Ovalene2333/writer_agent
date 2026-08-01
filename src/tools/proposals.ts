@@ -1,4 +1,4 @@
-import type { AgentEvent, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
+import type { AgentEvent, ModelConfig, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
 import {
   applyCharacterChanges,
   characterChangeOpsHint,
@@ -257,7 +257,10 @@ export async function gateProseStyle(
   afterContent: string,
   context: ToolHandlerArgs["context"],
 ): Promise<void> {
-  const issues = await proseStyleGateIssues(beforeContent, afterContent, context);
+  const issues = await proseStyleGateIssues(beforeContent, afterContent, context, {
+    reviewWholeText: context.editScope === "document",
+    failClosed: true,
+  });
   const styleError = proseStyleIssuesError(issues);
   if (styleError) throw new Error(styleError);
 }
@@ -265,36 +268,63 @@ export async function gateProseStyle(
 export async function proseStyleGateIssues(
   beforeContent: string,
   afterContent: string,
-  context: ToolHandlerArgs["context"],
+  context: Pick<ToolHandlerArgs["context"],
+    "proseAdjudicator" | "proseVerdictCache" | "proseGateRules" | "modelUsageReporter">,
+  options?: { reviewWholeText?: boolean; failClosed?: boolean },
 ) {
   let issues = newProseStyleIssues(beforeContent, afterContent);
   if (context.proseAdjudicator) {
+    const adjudicatorModels = [
+      context.proseAdjudicator.model,
+      context.proseAdjudicator.fallbackModel,
+    ].filter((model, index, all): model is ModelConfig => Boolean(model)
+      && all.findIndex(candidate => candidate?.baseUrl === model?.baseUrl
+        && candidate?.model === model?.model) === index);
     // Verdicts persist across gate rounds so repeat inspects stay deterministic
     // and only genuinely new sentences spend another Flash call.
     context.proseVerdictCache ??= new Map();
-    const flash = await adjudicateProseStyleForProposal(
-      afterContent,
-      issues,
-      context.proseAdjudicator.model,
-      {
-        signal: context.proseAdjudicator.signal,
-        verdictCache: context.proseVerdictCache,
-        usageReporter: context.modelUsageReporter,
-        callKind: "prose_gate",
-      },
-    );
-    issues = flash.issues;
-    issues.push(...await adjudicateLearnedProseGates(
-      afterContent,
-      context.proseGateRules ?? [],
-      context.proseAdjudicator.model,
-      {
-        signal: context.proseAdjudicator.signal,
-        usageReporter: context.modelUsageReporter,
-        callKind: "learned_prose_gate",
-        beforeText: beforeContent,
-      },
-    ));
+    for (const adjudicatorModel of adjudicatorModels) {
+      const flash = await adjudicateProseStyleForProposal(
+        afterContent,
+        issues,
+        adjudicatorModel,
+        {
+          signal: context.proseAdjudicator.signal,
+          verdictCache: context.proseVerdictCache,
+          usageReporter: context.modelUsageReporter,
+          callKind: "prose_gate",
+        },
+      );
+      issues = flash.issues;
+      if (!flash.skipped?.startsWith("model_error:")) break;
+    }
+    let learnedIssues: Awaited<ReturnType<typeof adjudicateLearnedProseGates>> | undefined;
+    let learnedFailure: unknown;
+    for (const adjudicatorModel of adjudicatorModels) {
+      try {
+        learnedIssues = await adjudicateLearnedProseGates(
+          afterContent,
+          context.proseGateRules ?? [],
+          adjudicatorModel,
+          {
+            signal: context.proseAdjudicator.signal,
+            usageReporter: context.modelUsageReporter,
+            callKind: "learned_prose_gate",
+            ...(options?.failClosed ? { timeoutMs: 30_000 } : {}),
+            ...(options?.reviewWholeText ? {} : { beforeText: beforeContent }),
+            failClosed: options?.failClosed === true,
+          },
+        );
+        break;
+      } catch (error) {
+        learnedFailure = error;
+      }
+    }
+    if (learnedIssues) {
+      issues.push(...learnedIssues);
+    } else if (learnedFailure) {
+      throw learnedFailure;
+    }
   }
   return issues;
 }
@@ -404,7 +434,9 @@ export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promis
     dividerBefore: false,
     targetCharacters,
   };
-  const evidence = isolatedWriterVoiceEvidence(project, store, path);
+  const evidence = isolatedWriterVoiceEvidence(project, store, path, Math.random, {
+    excludeProjectVoice: mode === "replace",
+  });
   const writer = context.isolatedSceneWriter;
   const runner = writer.run ?? requestIsolatedScene;
   const maximumCharacters = Math.floor(targetCharacters * (
@@ -673,6 +705,8 @@ async function reviewDirectNarrativeProposal(
   return JSON.stringify({
     status: "final_review_unavailable",
     code: parseOnly ? "DIRECT_CHAPTER_REVIEW_INVALID" : "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    failureKind: parseOnly ? "invalid_output" : "dependency",
+    retryable: !parseOnly,
     path,
     proposalCreated: false,
     errors,

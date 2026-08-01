@@ -61,7 +61,7 @@ import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.
 import { documentKind, WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
 import { WriterStore } from "./store.js";
-import { getStyleTemplate } from "./templates.js";
+import { getStyleTemplate, normalizeStyleTemplate } from "./templates.js";
 import type { AgentEvent, Message, MessageStepTrail, ModelUsageRole, PermissionMode, PersistedStreamStep, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StepUsage, StyleTemplate } from "./types.js";
 import type { CharacterInput } from "./characters.js";
 import {
@@ -71,6 +71,8 @@ import {
   upsertProseGateRule,
   type ProseGateRule,
 } from "./prose_gate_rules.js";
+import { proseStyleIssuesError } from "./prose_quality.js";
+import { proseStyleGateIssues } from "./tools/proposals.js";
 import { extractContinuityFacts, type ContinuityFact } from "./continuity_facts.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
@@ -835,6 +837,30 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.post("/api/characters/import", async (context) => {
+    try {
+      const body = await context.req.json<{
+        format?: unknown;
+        version?: unknown;
+        characters?: unknown;
+        simpleCharacters?: unknown;
+      }>();
+      if (body.format !== "writer-agent-character-cards" || body.version !== 1) {
+        throw new Error("不支持的角色卡文件格式或版本");
+      }
+      const result = options.store.importCharacterCards({
+        characters: Array.isArray(body.characters) ? body.characters : [],
+        simpleCharacters: Array.isArray(body.simpleCharacters) ? body.simpleCharacters : [],
+      });
+      return context.json({
+        imported: {
+          characters: result.characters.length,
+          simpleCharacters: result.simpleCharacters.length,
+        },
+      });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.post("/api/characters/competencies/summarize", async (context) => {
     try {
       const body = await context.req.json<{ sessionId?: string; competency?: {
@@ -948,9 +974,17 @@ export async function startWriterServer(options: {
   app.post("/api/style/templates", async (context) => {
     try {
       const body = await context.req.json<Partial<StyleTemplate>>();
-      const template = options.project.saveStyleTemplate(body);
+      const candidate = normalizeStyleTemplate(body);
+      if (candidate.exampleContent.trim()) {
+        await assertWritingExamplePassesGates(
+          candidate.exampleContent,
+          options.project,
+          options.providers,
+        );
+      }
+      const template = options.project.saveStyleTemplate(candidate);
       if (options.project.config().style === template.id) {
-        options.store.seedStyleExample(template);
+        options.store.seedStyleExample(template, Boolean(template.exampleContent.trim()));
       }
       return context.json({
         template,
@@ -968,8 +1002,15 @@ export async function startWriterServer(options: {
       if (styleId) {
         const template = options.project.styleTemplate(styleId);
         if (!template) throw new Error(`未知的风格模板：${styleId}`);
+        if (template.exampleContent.trim()) {
+          await assertWritingExamplePassesGates(
+            template.exampleContent,
+            options.project,
+            options.providers,
+          );
+        }
         options.project.setStyle(styleId);
-        options.store.seedStyleExample(template);
+        options.store.seedStyleExample(template, Boolean(template.exampleContent.trim()));
         return context.json({
           active: template,
           provider: options.providers.publicConfig(),
@@ -987,9 +1028,14 @@ export async function startWriterServer(options: {
       const body = await context.req.json<{ id?: number; title: string; category?: string; content: string; notes?: string }>();
       if (body.title?.length > 160) throw new Error("示例标题过长");
       if (body.content?.length > 50_000) throw new Error("单个写作示例不能超过 50000 字符");
+      await assertWritingExamplePassesGates(
+        body.content ?? "",
+        options.project,
+        options.providers,
+      );
       return context.json({ example: options.store.saveWritingExample({
         id: body.id, title: body.title ?? "", category: body.category ?? "",
-        content: body.content ?? "", notes: body.notes ?? "",
+        content: body.content ?? "", notes: body.notes ?? "", gatePassed: true,
       }) });
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
@@ -1412,11 +1458,19 @@ export async function startWriterServer(options: {
         );
       }
       try {
-        // Defer terminal success events until auto-title finishes so /api/state refresh sees the new title.
+        // Writing/character turns defer terminal success until auto-title finishes so
+        // /api/state refresh sees the new title. Roleplay releases its deferred final
+        // output before the cosmetic title call below.
+        // Roleplay currently emits its reply as one complete output event (not token chunks),
+        // followed by best-effort memory bookkeeping. Keep that final output beside `done`
+        // so the composer cannot remain on Stop after the entire visible reply has arrived.
         const deferred: AgentEvent[] = [];
         const onEvent = (event: AgentEvent) => {
           stepDebug.onEvent(event);
-          if (event.type === "done" || event.type === "waiting_for_input") {
+          const finalRoleplayOutput = body.mode === "roleplay"
+            && event.type === "text"
+            && event.channel === "output";
+          if (finalRoleplayOutput || event.type === "done" || event.type === "waiting_for_input") {
             deferred.push(event);
             return;
           }
@@ -1484,14 +1538,24 @@ export async function startWriterServer(options: {
             onEvent,
           });
         }
+        const completedTurn = deferred.length > 0;
+        // Roleplay title generation is cosmetic and must not keep the composer in
+        // Stop after the reply and its bounded memory bookkeeping are complete.
+        if (body.mode === "roleplay") {
+          for (const event of deferred.splice(0)) {
+            stepDebug.onEvent(event);
+            emit(event);
+          }
+        }
         // Auto-title once after a successful turn (never overwrites custom titles; only runs once).
-        if (!signal.aborted && deferred.length > 0) {
+        if (!signal.aborted && completedTurn) {
           try {
+            const titleSignal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
             await maybeAutoTitleSession({
               store: options.store,
               model: options.providers.summaryModelConfig(),
               sessionId: body.sessionId,
-              signal,
+              signal: titleSignal,
               usageReporter: (callModel, callUsage, meta) => {
                 emit(buildRecordedUsageEvent(options.store, body.sessionId, callModel, callUsage, {
                   ...meta,
@@ -1954,6 +2018,24 @@ function errorMessage(error: unknown): string {
     : "";
   const detail = code && !causeMessage.includes(code) ? `${code}: ${causeMessage}` : causeMessage;
   return detail && !error.message.includes(detail) ? `${error.message}（${detail}）` : error.message;
+}
+
+async function assertWritingExamplePassesGates(
+  content: string,
+  project: WriterProject,
+  providers: ProviderManager,
+): Promise<void> {
+  const prose = content.trim();
+  if (!prose) throw new Error("范文正文不能为空");
+  const issues = await proseStyleGateIssues("", prose, {
+    proseAdjudicator: { model: providers.modelConfig("inline") },
+    proseGateRules: loadProseGateRules(project),
+  }, {
+    reviewWholeText: true,
+    failClosed: true,
+  });
+  const blocked = proseStyleIssuesError(issues);
+  if (blocked) throw new Error(`范文未通过正文门控：${blocked}`);
 }
 
 function usageReporterForSession(store: WriterStore, sessionId?: string): ModelUsageReporter | undefined {

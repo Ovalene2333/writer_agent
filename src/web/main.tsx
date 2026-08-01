@@ -580,6 +580,7 @@ function App() {
   const [roleplayBranchBusy, setRoleplayBranchBusy] = useState(false);
   const [agentHiddenCharacterCards, setAgentHiddenCharacterCards] = useState<Set<string>>(loadAgentHiddenCharacterCards);
   const [characterDraft, setCharacterDraft] = useState<CharacterDraft | null>(null);
+  const [characterImportBusy, setCharacterImportBusy] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
     try {
       return new Set(JSON.parse(localStorage.getItem("writer-expanded-folders") || "[]") as string[]);
@@ -661,6 +662,7 @@ function App() {
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [connectionPanelMsg, setConnectionPanelMsg] = useState("");
   const abortRef = useRef<AbortController | undefined>(undefined);
+  const characterImportInputRef = useRef<HTMLInputElement | null>(null);
   const currentJobRef = useRef<string | undefined>(undefined);
   const streamOutputRef = useRef("");
   const streamStepsRef = useRef<StreamStep[]>([]);
@@ -2616,6 +2618,44 @@ function App() {
     await refresh(state?.sessionId);
   }
 
+  function exportCharacterCards() {
+    if (!state) return;
+    const bundle = {
+      format: "writer-agent-character-cards",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      characters: state.characters,
+      simpleCharacters: state.roleplayInterlocutors,
+    };
+    downloadBlob(
+      new Blob([`${JSON.stringify(bundle, null, 2)}\n`], { type: "application/json;charset=utf-8" }),
+      `角色卡-${new Date().toISOString().slice(0, 10)}.json`,
+    );
+    setNotice(`已导出 ${state.characters.length} 张普通角色卡、${state.roleplayInterlocutors.length} 张简易角色卡`);
+  }
+
+  async function importCharacterCards(file: File) {
+    if (characterImportBusy) return;
+    setCharacterImportBusy(true);
+    setError("");
+    try {
+      if (file.size > 10 * 1024 * 1024) throw new Error("角色卡导入文件不能超过 10MB");
+      let bundle: unknown;
+      try { bundle = JSON.parse(await file.text()) as unknown; }
+      catch { throw new Error("角色卡文件不是有效的 JSON"); }
+      const result = await api<{ imported: { characters: number; simpleCharacters: number } }>("/api/characters/import", {
+        method: "POST",
+        body: JSON.stringify(bundle),
+      });
+      await refresh(state?.sessionId);
+      setNotice(`已导入 ${result.imported.characters} 张普通角色卡、${result.imported.simpleCharacters} 张简易角色卡`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setCharacterImportBusy(false);
+    }
+  }
+
   async function summarizeCharacter(kind: CharacterSummaryKind, source: unknown): Promise<string> {
     const result = await api<{ summary: string }>("/api/characters/summarize", {
       method: "POST",
@@ -3326,15 +3366,21 @@ function App() {
 
   async function batchDeleteSessions(ids: string[]) {
     if (ids.length === 0) return;
-    if (!confirm(`删除选中的 ${ids.length} 个会话？此操作不可撤销。`)) return;
+    const deletesAll = Boolean(state && ids.length === state.sessions.length);
+    if (!confirm(deletesAll
+      ? `删除全部 ${ids.length} 个会话？此操作不可撤销，删除后会创建一个新的空会话。`
+      : `删除选中的 ${ids.length} 个会话？此操作不可撤销。`)) return;
     try {
-      const result = await api<{ remainingSessionId: string }>("/api/sessions/batch-delete", {
+      const result = await api<{ deleted: string[]; remainingSessionId: string; createdNewSession: boolean }>("/api/sessions/batch-delete", {
         method: "POST",
         body: JSON.stringify({ ids, keepSessionId: state?.sessionId }),
       });
       setSelectedSessionIds(new Set());
       setSessionBatchMode(false);
       await refresh(result.remainingSessionId);
+      setNotice(result.createdNewSession
+        ? `已删除 ${result.deleted.length} 个会话，并创建新的空会话。`
+        : `已删除 ${result.deleted.length} 个会话。`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -5917,6 +5963,29 @@ function App() {
                   </button>
                 ) : managementView === "characters" ? (
                   <>
+                    <input
+                      ref={characterImportInputRef}
+                      type="file"
+                      className="composer-file-input"
+                      accept="application/json,.json"
+                      tabIndex={-1}
+                      aria-hidden="true"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) void importCharacterCards(file);
+                        event.target.value = "";
+                      }}
+                    />
+                    <button className="ghost" disabled={characterImportBusy} onClick={() => characterImportInputRef.current?.click()}>
+                      <FolderInput size={15} />{characterImportBusy ? "导入中…" : "导入"}
+                    </button>
+                    <button
+                      className="ghost"
+                      disabled={characterImportBusy || (state.characters.length === 0 && state.roleplayInterlocutors.length === 0)}
+                      onClick={exportCharacterCards}
+                    >
+                      <Download size={15} />导出
+                    </button>
                     <button className="ghost" onClick={() => setSimpleCardDraft({ name: "", identity: "", relationship: "", knowledge: "", scene: "", goal: "" })}><Plus size={15} />简易角色</button>
                     <button className="primary" onClick={() => setCharacterDraft({ ...EMPTY_CHARACTER })}><Plus size={15} />普通角色</button>
                   </>
@@ -6323,8 +6392,8 @@ function App() {
                     <span className="session-batch-count">已选 {selectedSessionIds.size}</span>
                     <button
                       className="danger primary"
-                      disabled={selectedSessionIds.size === 0 || selectedSessionIds.size >= state.sessions.length}
-                      title={selectedSessionIds.size >= state.sessions.length ? "至少保留一个会话" : "删除选中会话"}
+                      disabled={selectedSessionIds.size === 0}
+                      title="删除选中会话；若全部删除，将自动创建新的空会话"
                       onClick={() => void batchDeleteSessions([...selectedSessionIds])}
                     >
                       删除选中

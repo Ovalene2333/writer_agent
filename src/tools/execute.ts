@@ -2,6 +2,7 @@ import type { AgentEvent } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ToolCall, ToolExecutionContext, ToolHandlerArgs } from "./types.js";
+import { ToolDependencyError } from "../tool_failure.js";
 import {
   handleAuditProseStyle,
   handleInspectDocument,
@@ -129,6 +130,14 @@ export async function executeTool(
   try {
     return await handler({ input, project, store, sessionId, emit, characterScope, context });
   } catch (error) {
+    if (error instanceof ToolDependencyError) {
+      return JSON.stringify({
+        code: error.code,
+        failureKind: error.failureKind,
+        error: error.message,
+        retryable: error.retryable,
+      });
+    }
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   }
 }

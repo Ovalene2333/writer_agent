@@ -273,6 +273,8 @@ export interface WritingExample {
   category: string;
   content: string;
   notes: string;
+  /** Only gate-passed content may be injected as voice evidence. */
+  gatePassed: boolean;
   updatedAt: string;
 }
 
