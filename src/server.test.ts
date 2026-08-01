@@ -54,6 +54,17 @@ test("agent event snapshot keeps events emitted during replay", async () => {
   ]);
 });
 
+test("agent job synthesizes an error terminal event when runner returns silently", async () => {
+  const jobs = new BackgroundAgentJobs();
+  const job = jobs.start("session-silent", async () => undefined);
+  await waitForImmediate();
+  const snapshot = jobs.snapshotAndSubscribe(job.id, () => undefined);
+  assert.ok(snapshot);
+  assert.equal(snapshot.status, "failed");
+  assert.equal(snapshot.events.at(-1)?.type, "error");
+  assert.match(String((snapshot.events.at(-1) as { message?: string }).message), /未产生终态事件/);
+});
+
 test("accepted continuity indexing starts after the approval response turn", async () => {
   let started = false;
   scheduleAcceptedContinuityIndexing(async () => { started = true; });

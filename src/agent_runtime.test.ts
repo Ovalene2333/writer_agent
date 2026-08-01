@@ -181,6 +181,54 @@ test("advanceTodosAfterProposal keeps multi-chapter pending open and continues",
   assert.equal(todos.find(item => item.id === "t4")?.status, "pending");
 });
 
+test("advanceTodosAfterProposal projects a remaining obligation when planner combined todos", () => {
+  const { todos, shouldContinue } = advanceTodosAfterProposal([
+    { id: "t1", content: "创作并写入前两章", status: "in_progress" },
+  ], true, ["第二章"]);
+  assert.equal(shouldContinue, true);
+  assert.equal(todos[0]?.status, "completed");
+  assert.deepEqual(todos.at(-1), {
+    id: "runtime-document-2",
+    content: "继续交付：第二章",
+    status: "in_progress",
+  });
+});
+
+test("agent run completion constraints persist independently from todos and checkpoints", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-run-state-"));
+  try {
+    const project = WriterProject.init(root, "run state");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("run-state");
+    store.saveAgentRunState(sessionId, {
+      version: 1,
+      originalRequest: "写两章",
+      documentObligations: [
+        {
+          id: "document-1",
+          label: "第一章",
+          evidence: {
+            toolName: "propose_document",
+            proposalId: 7,
+            path: "chapters/01.md",
+            recordedAt: "2026-08-02T00:00:00.000Z",
+          },
+        },
+        { id: "document-2", label: "第二章" },
+      ],
+      terminalState: "interrupted",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    });
+    assert.equal(store.agentRunState(sessionId)?.documentObligations[0]?.evidence?.proposalId, 7);
+    assert.equal(store.agentRunState(sessionId)?.terminalState, "interrupted");
+    store.clearAgentRunState(sessionId);
+    assert.equal(store.agentRunState(sessionId), undefined);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("advanceTodosAfterProposal closes single-scene soft checklist and stops", () => {
   const { todos, shouldContinue } = advanceTodosAfterProposal([
     { id: "t1", content: "核对大纲、人设与衔接", status: "completed" },

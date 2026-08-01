@@ -472,6 +472,7 @@ export class WriterStore {
         active_document TEXT,
         current_intent TEXT NOT NULL DEFAULT '',
         agent_checkpoint_json TEXT NOT NULL DEFAULT '{}',
+        agent_run_state_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS agent_turn_blocks (
@@ -628,6 +629,9 @@ export class WriterStore {
     }
     if (!contextColumns.some(column => column.name === "agent_checkpoint_json")) {
       this.database.exec("ALTER TABLE session_context ADD COLUMN agent_checkpoint_json TEXT NOT NULL DEFAULT '{}'");
+    }
+    if (!contextColumns.some(column => column.name === "agent_run_state_json")) {
+      this.database.exec("ALTER TABLE session_context ADD COLUMN agent_run_state_json TEXT NOT NULL DEFAULT '{}'");
     }
     if (!contextColumns.some(column => column.name === "materials_shelf_json")) {
       this.database.exec("ALTER TABLE session_context ADD COLUMN materials_shelf_json TEXT NOT NULL DEFAULT '[]'");
@@ -966,11 +970,11 @@ export class WriterStore {
     const preserveMaterialsShelf = options.preserveMaterialsShelf ?? options.preserveContextArtifacts ?? false;
     const materialsShelf = preserveMaterialsShelf ? this.sessionMaterialsShelf(sessionId) : [];
     this.database.prepare(`INSERT INTO session_context(
-        session_id,active_document,current_intent,todos_json,agent_checkpoint_json,materials_shelf_json,updated_at
-      ) VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
-        active_document=NULL,current_intent='',todos_json='[]',agent_checkpoint_json='{}',
+        session_id,active_document,current_intent,todos_json,agent_checkpoint_json,agent_run_state_json,materials_shelf_json,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+        active_document=NULL,current_intent='',todos_json='[]',agent_checkpoint_json='{}',agent_run_state_json='{}',
         materials_shelf_json=excluded.materials_shelf_json,updated_at=excluded.updated_at`)
-      .run(sessionId, null, "", "[]", "{}", JSON.stringify(materialsShelf), now);
+      .run(sessionId, null, "", "[]", "{}", "{}", JSON.stringify(materialsShelf), now);
     if (!options.preserveContextArtifacts) {
       this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
     }
@@ -1665,6 +1669,30 @@ export class WriterStore {
       try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
       throw error;
     }
+  }
+
+  agentRunState(sessionId: string): import("./types.js").AgentRunState | undefined {
+    const row = this.database.prepare("SELECT agent_run_state_json FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
+    if (typeof row?.agent_run_state_json !== "string" || !row.agent_run_state_json.trim() || row.agent_run_state_json === "{}") return undefined;
+    try {
+      const value = JSON.parse(row.agent_run_state_json) as import("./types.js").AgentRunState;
+      return value?.version === 1 && Array.isArray(value.documentObligations) ? value : undefined;
+    } catch { return undefined; }
+  }
+
+  saveAgentRunState(sessionId: string, state: import("./types.js").AgentRunState): void {
+    const now = new Date().toISOString();
+    const next = { ...state, updatedAt: now };
+    this.database.prepare(`INSERT INTO session_context(
+        session_id,active_document,current_intent,todos_json,agent_run_state_json,updated_at
+      ) VALUES(?,NULL,'','[]',?,?) ON CONFLICT(session_id) DO UPDATE SET
+        agent_run_state_json=excluded.agent_run_state_json,updated_at=excluded.updated_at`)
+      .run(sessionId, JSON.stringify(next), now);
+  }
+
+  clearAgentRunState(sessionId: string): void {
+    this.database.prepare("UPDATE session_context SET agent_run_state_json='{}',updated_at=? WHERE session_id=?")
+      .run(new Date().toISOString(), sessionId);
   }
 
   /** Active immutable commit chain, oldest first. Invalid payload truncates the visible suffix. */

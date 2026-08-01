@@ -599,6 +599,7 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   const tail = "走廊尽头的灯灭了。".repeat(200);
   const prompt = chapterContinuationPrompt({
     todosText: "- [x] t1: 撰写第1章 (completed)\n- [>] t2: 撰写第2章 (in_progress)",
+    remainingDeliverables: ["第二章"],
     proposal: { path: "chapters/第1章.md", summary: "主角违规进入训练区", afterContent: tail },
     handoff: {
       path: "chapters/第1章.md",
@@ -626,7 +627,7 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   assert.ok(tailOnly.length < 1_200, `tail block too long: ${tailOnly.length}`);
 
   const minimal = chapterContinuationPrompt({ todosText: "（空）" });
-  assert.match(minimal, /任务清单仍有未完成的写作步骤/);
+  assert.match(minimal, /完成约束已经满足/);
   assert.doesNotMatch(minimal, /已交付：/);
   assert.match(minimal, /材料架仍空/);
 });
@@ -659,6 +660,11 @@ test("proposal retry policy separates dependency outages from bounded prose revi
   assert.deepEqual(decideProposalFailure({
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
     status: "final_review_revision_required",
+  }, 1), { action: "revise", attempt: 1 });
+
+  assert.deepEqual(decideProposalFailure({
+    code: "INVALID_TOOL_ARGUMENTS_JSON",
+    error: "工具参数不是有效 JSON",
   }, 1), { action: "revise", attempt: 1 });
 
   assert.deepEqual(decideProposalFailure({ status: "rejected" },

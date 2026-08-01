@@ -627,6 +627,53 @@ export function isSuccessfulDocumentSubmission(
   return false;
 }
 
+export type AgentToolOutcome =
+  | { kind: "success" }
+  | { kind: "retryable_error"; message: string }
+  | { kind: "interruption"; message: string }
+  | { kind: "fatal_error"; message: string };
+
+const DOCUMENT_SUBMISSION_TOOL_NAMES = new Set([
+  "propose_document",
+  "write_document_isolated",
+  "propose_document_patch",
+  "revise_document_isolated",
+  "propose_chapter_draft",
+  "propose_outline_patch",
+  "propose_change_set",
+  "inspect_chapter_draft",
+]);
+
+/** One model-visible outcome vocabulary shared by progress, retry and completion. */
+export function classifyAgentToolOutcome(
+  toolName: string,
+  result: Record<string, unknown> | undefined,
+): AgentToolOutcome {
+  if (!result) return { kind: "fatal_error", message: "工具没有返回可验证结果" };
+  const message = typeof result.error === "string"
+    ? result.error
+    : typeof result.message === "string"
+      ? result.message
+      : typeof result.status === "string" ? result.status : "工具调用失败";
+  if (result.status === "waiting" || result.failureKind === "dependency") {
+    return { kind: "interruption", message };
+  }
+  if (DOCUMENT_SUBMISSION_TOOL_NAMES.has(toolName)) {
+    if (result.rhythmRevisionRequired === true || result.code === "RHYTHM_POLISH_REQUIRED") {
+      return { kind: "retryable_error", message };
+    }
+    if (isSuccessfulDocumentSubmission(toolName, result)) return { kind: "success" };
+    if (result.code === "CONTRACT_MUTATION_DENIED") return { kind: "fatal_error", message };
+    return { kind: "retryable_error", message };
+  }
+  if ("error" in result || result.status === "error" || result.status === "failed") {
+    return result.retryable === false
+      ? { kind: "fatal_error", message }
+      : { kind: "retryable_error", message };
+  }
+  return { kind: "success" };
+}
+
 /** Best-effort proposal id from a successful document tool payload. */
 export function proposalIdFromToolResult(result: Record<string, unknown>): number | undefined {
   if (typeof result.proposalId === "number" && result.proposalId > 0) return result.proposalId;
@@ -671,6 +718,7 @@ export function protectDocumentWritingTodos(
 export function advanceTodosAfterProposal(
   todos: AgentTodoItem[],
   allowFurtherDocumentDelivery = true,
+  remainingDeliverables: readonly string[] = [],
 ): {
   todos: AgentTodoItem[];
   changed: boolean;
@@ -701,6 +749,18 @@ export function advanceTodosAfterProposal(
       if (item.status === "in_progress") item.status = "pending";
     }
     furtherPending[0].status = "in_progress";
+    changed = true;
+    return { todos: next, changed, shouldContinue: true };
+  }
+  if (allowFurtherDocumentDelivery && remainingDeliverables.length) {
+    const usedIds = new Set(next.map(item => item.id));
+    let suffix = next.length + 1;
+    while (usedIds.has(`runtime-document-${suffix}`)) suffix += 1;
+    next.push({
+      id: `runtime-document-${suffix}`,
+      content: `继续交付：${remainingDeliverables[0]}`,
+      status: "in_progress",
+    });
     changed = true;
     return { todos: next, changed, shouldContinue: true };
   }
@@ -775,12 +835,14 @@ export function persistAdvancedTodosAfterProposal(
   sessionId: string,
   emit?: (event: { type: "todos"; todos: AgentTodoItem[] }) => void,
   allowFurtherDocumentDelivery = true,
+  remainingDeliverables: readonly string[] = [],
 ): { todos: AgentTodoItem[]; shouldContinue: boolean } {
   const current = store.sessionTodos(sessionId);
   if (!current.length) return { todos: current, shouldContinue: false };
   const { todos, changed, shouldContinue } = advanceTodosAfterProposal(
     current,
     allowFurtherDocumentDelivery,
+    remainingDeliverables,
   );
   if (changed) {
     store.saveSessionTodos(sessionId, todos);

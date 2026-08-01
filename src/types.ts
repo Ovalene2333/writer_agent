@@ -538,6 +538,33 @@ export interface AgentCheckpoint {
   updatedAt: string;
 }
 
+export interface AgentRunDocumentEvidence {
+  toolName: string;
+  proposalId?: number;
+  changeSetId?: number;
+  path?: string;
+  recordedAt: string;
+}
+
+/**
+ * Durable, path-agnostic completion constraints for one autonomous Agent task.
+ * The model remains free to choose its actions; this state only records what the
+ * user asked to receive and the concrete tool evidence already produced.
+ */
+export interface AgentRunState {
+  version: 1;
+  originalRequest: string;
+  sourceMessageId?: number;
+  documentObligations: Array<{
+    id: string;
+    label: string;
+    evidence?: AgentRunDocumentEvidence;
+  }>;
+  terminalState: "running" | "interrupted" | "completed" | "failed" | "cancelled";
+  terminalReason?: string;
+  updatedAt: string;
+}
+
 export interface AgentTodoItem {
   id: string;
   content: string;

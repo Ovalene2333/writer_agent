@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  AgentRunDocumentEvidence,
   AgentTodoItem,
   MessageAttachment,
   MessageAttachmentInput,
@@ -44,12 +45,15 @@ import {
 } from "./model_api.js";
 import {
   agentCompletionGaps,
+  agentRunPendingDocumentLabels,
   completionRecoveryPrompt,
   contractAllowsTool,
+  createAgentRunState,
   createAgentExecutionProgress,
   inferWritingQualityProfile,
   inferWritingWorkflowKind,
   recordAgentToolResult,
+  recordAgentRunDocumentEvidence,
   resolveAgentPlanningStrategy,
   type AgentCapability,
   type AgentEvidenceRequirement,
@@ -1589,6 +1593,7 @@ export function buildDynamicTurnMessages(parts: {
  */
 export function chapterContinuationPrompt(parts: {
   todosText: string;
+  remainingDeliverables?: readonly string[];
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
   isolatedWriter?: boolean;
@@ -1630,7 +1635,10 @@ export function chapterContinuationPrompt(parts: {
     lines.push("材料架仍空：仅对写作必需的事实做最小读取；不要重读已交付章节全文。");
   }
   lines.push(
-    "任务清单仍有未完成的写作步骤，请立即继续下一项。根据下一项正文的篇幅、连续性风险和现有材料重新选择直接成稿、局部 patch、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
+    parts.remainingDeliverables?.length
+      ? `完成约束仍缺：${parts.remainingDeliverables.join("、")}。立即选择其中一项继续交付；任务清单仅供规划，不代表交付已经完成。`
+      : "完成约束已经满足；仅在确有必要时处理剩余计划。",
+    "根据下一份正文的篇幅、连续性风险和现有材料重新选择直接成稿、局部 patch、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
     parts.todosText,
   );
   return lines.join("\n");
@@ -2051,6 +2059,7 @@ export async function runAgent(options: {
       .map((message) => ({ role: message.role, content: message.content, channel: message.channel })),
   );
   const previousTaskState = store.sessionContext(sessionId);
+  const previousRunState = store.agentRunState(sessionId);
   // Contract compilation declares outcome/evidence/mutation obligations, but
   // never freezes the execution path. Prefer Flash and keep the call tool-free.
   const plannerModel = options.models?.summarizer ?? options.models?.inline ?? model;
@@ -2147,6 +2156,25 @@ export async function runAgent(options: {
     turnAttachments.length ? turnAttachments : undefined,
   );
   emit({ type: "source_message", messageId: sourceMessageId, channel: "agent" });
+  let agentRunState = createAgentRunState(
+    prompt,
+    task.documentDeliverables,
+    options.resumeInterrupted ? previousRunState : undefined,
+  );
+  agentRunState = { ...agentRunState, sourceMessageId };
+  store.saveAgentRunState(sessionId, agentRunState);
+  const persistRunTerminal = (
+    terminalState: "interrupted" | "completed" | "failed" | "cancelled",
+    terminalReason?: string,
+  ) => {
+    agentRunState = {
+      ...agentRunState,
+      terminalState,
+      ...(terminalReason ? { terminalReason } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    store.saveAgentRunState(sessionId, agentRunState);
+  };
   // Context graph: message + epoch. Process (L3) lives only inside this epoch;
   // active handoffs (L2) are linked as uses for assemble/debug.
   let contextEpochId: string | undefined;
@@ -2565,7 +2593,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   let proposalRetryBase: number | undefined;
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
   let submittedProposalRef: SubmittedProposalRef | undefined;
-  let completedDocumentDeliverables = 0;
+  let submittedDocumentEvidence: AgentRunDocumentEvidence | undefined;
+  let completedDocumentDeliverables = agentRunState.documentObligations.filter(item => item.evidence).length;
   let characterMutationSubmitted = false;
   let characterMutationName = "";
   let lastCharacterMutationDiagnostic = "";
@@ -2578,6 +2607,15 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       || (task.continuation && artifactContext)
       || toolContext.chapterSceneDraft,
   ));
+  for (const obligation of agentRunState.documentObligations) {
+    const evidence = obligation.evidence;
+    if (!evidence) continue;
+    const key = evidence.proposalId !== undefined
+      ? `proposal:${evidence.proposalId}`
+      : evidence.changeSetId !== undefined ? `change-set:${evidence.changeSetId}` : undefined;
+    if (key) executionProgress.documentArtifactKeys.add(key);
+  }
+  executionProgress.documentArtifactProduced = executionProgress.documentArtifactKeys.size > 0;
   const replannedFailures = new Set<string>();
   let thinkingContinuationDisabled = false;
   // Measured prefix-cache usage for this turn, summed over its agent_step calls.
@@ -2929,6 +2967,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         // tool result with no answer after it.
         messages.push({ role: "assistant", content: answer });
         freezeCurrentTurn();
+        persistRunTerminal("completed");
         emit({ type: "done", sessionId });
         return;
       }
@@ -3097,6 +3136,13 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             if (isSuccessfulDocumentSubmission(call.name, parsed)) {
               documentProposalSubmitted = true;
               const proposalId = proposalIdFromToolResult(parsed);
+              submittedDocumentEvidence = {
+                toolName: call.name,
+                ...(proposalId !== undefined ? { proposalId } : {}),
+                ...(typeof parsed.changeSetId === "number" ? { changeSetId: parsed.changeSetId } : {}),
+                ...(typeof parsed.path === "string" ? { path: parsed.path } : {}),
+                recordedAt: new Date().toISOString(),
+              };
               if (proposalId !== undefined) {
                 try {
                   const proposal = store.proposal(proposalId);
@@ -3149,6 +3195,14 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 }
               } else {
                 documentProposalSubmitted = true;
+                const proposalId = proposalIdFromToolResult(parsed);
+                submittedDocumentEvidence = {
+                  toolName: call.name,
+                  ...(proposalId !== undefined ? { proposalId } : {}),
+                  ...(typeof parsed.changeSetId === "number" ? { changeSetId: parsed.changeSetId } : {}),
+                  ...(typeof parsed.path === "string" ? { path: parsed.path } : {}),
+                  recordedAt: new Date().toISOString(),
+                };
                 proposalRevisionAttempts = 0;
                 proposalRetryBase = undefined;
               }
@@ -3242,6 +3296,12 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           if (isSuccessfulDocumentSubmission("inspect_chapter_draft", parsedAutomaticReview)) {
             documentProposalSubmitted = true;
             const proposalId = proposalIdFromToolResult(parsedAutomaticReview);
+            submittedDocumentEvidence = {
+              toolName: "inspect_chapter_draft",
+              ...(proposalId !== undefined ? { proposalId } : {}),
+              ...(typeof parsedAutomaticReview.path === "string" ? { path: parsedAutomaticReview.path } : {}),
+              recordedAt: new Date().toISOString(),
+            };
             if (proposalId !== undefined) {
               try {
                 const proposal = store.proposal(proposalId);
@@ -3282,6 +3342,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           const answer = stripDsmlText(transcript, "").trim()
             || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
           store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+          persistRunTerminal("completed");
           emit({ type: "done", sessionId });
           return;
         }
@@ -3389,19 +3450,23 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         continue;
       }
       if (documentProposalSubmitted) {
-        // Advance checklist: keep multi-chapter pending items open and continue the job.
-        completedDocumentDeliverables += 1;
-        const hasIndependentDocumentRemaining = documentDeliveryRemaining(
-          task.documentDeliverables,
-          completedDocumentDeliverables,
-        );
+        // Concrete proposal evidence satisfies one unordered completion
+        // obligation. The Agent still chooses the next action and writing path.
+        if (submittedDocumentEvidence) {
+          agentRunState = recordAgentRunDocumentEvidence(agentRunState, submittedDocumentEvidence);
+          store.saveAgentRunState(sessionId, agentRunState);
+        }
+        completedDocumentDeliverables = agentRunState.documentObligations.filter(item => item.evidence).length;
+        const remainingDocumentDeliverables = agentRunPendingDocumentLabels(agentRunState);
+        const hasIndependentDocumentRemaining = remainingDocumentDeliverables.length > 0;
         const advanced = persistAdvancedTodosAfterProposal(
           store,
           sessionId,
           emit,
           hasIndependentDocumentRemaining,
+          remainingDocumentDeliverables,
         );
-        if (advanced.shouldContinue && hasIndependentDocumentRemaining && !waitingForUser) {
+        if (hasIndependentDocumentRemaining && !waitingForUser) {
           // Per-chapter context reset: drop the finished chapter's tool transcript
           // and restart from the byte-stable initial prefix (still a cache hit), so
           // the next chapter stops paying the previous chapter's prose on every step.
@@ -3432,6 +3497,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             role: "user",
             content: chapterContinuationPrompt({
               todosText: formatTodosForPrompt(advanced.todos),
+              remainingDeliverables: remainingDocumentDeliverables,
               isolatedWriter: scenePipelineSettings.isolatedWriter,
               ...(latestProposal
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
@@ -3569,6 +3635,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           toolCallCounts.clear();
           documentProposalSubmitted = false;
           submittedProposalRef = undefined;
+          submittedDocumentEvidence = undefined;
           proposalRetryBase = undefined;
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
@@ -3630,7 +3697,12 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         }
         if (assistantParts.length) store.addMessage(sessionId, "assistant", assistantParts.join("\n\n"), "agent", options.variantGroupId);
       } catch { /* 消息保存失败不影响流程 */ }
-      if (waitingEvent) emit({ type: "waiting_for_input", sessionId, ...waitingEvent });
+      const terminalWaitingEvent = waitingEvent ?? {
+        question: "Agent 已暂停并保留当前状态，可续跑继续。",
+        options: ["续跑"],
+      };
+      persistRunTerminal("interrupted", terminalWaitingEvent.question);
+      emit({ type: "waiting_for_input", sessionId, ...terminalWaitingEvent });
       // The answer arrives as the next turn — replaying this one is exactly what
       // makes「接着刚才那个问题」cheap instead of a full rebuild.
       freezeCurrentTurn();
@@ -3678,6 +3750,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         store.clearAgentTurnBlocks(sessionId);
       }
       freezeCurrentTurn();
+      persistRunTerminal("completed");
       emit({ type: "done", sessionId });
       return;
     }
@@ -3689,6 +3762,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
       messages.push({ role: "assistant", content: answer });
       freezeCurrentTurn();
+      persistRunTerminal("completed");
       emit({ type: "done", sessionId });
       return;
     }
@@ -3728,6 +3802,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       }));
     } catch { /* 持久化失败不阻断可续跑结束 */ }
     freezeCurrentTurn();
+    persistRunTerminal("interrupted", reasonLabel);
     emit({
       type: "waiting_for_input",
       sessionId,
@@ -3741,6 +3816,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       // Resuming after a cancel should not re-pay the work already done; freezeTurnBlock
       // drops the dangling tool_calls the abort left behind.
       freezeCurrentTurn();
+      persistRunTerminal("cancelled", "用户取消或请求中止");
       emit({ type: "cancelled", sessionId });
       return;
     }
@@ -3748,6 +3824,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     try {
       store.addSystemMessage(sessionId, "Agent 任务异常结束：" + message);
     } catch { /* 错误持久化失败不遮蔽原始错误。 */ }
+    persistRunTerminal("failed", message);
     emit({ type: "error", message });
     throw error;
   }

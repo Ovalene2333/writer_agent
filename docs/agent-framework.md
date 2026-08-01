@@ -36,7 +36,9 @@ flowchart LR
 - 是否允许修改文件；
 - 适合直接写全文、局部修改还是使用场景链。
 
-Agent 根据任务动态维护 todos 和 checkpoint。工具执行结果会反过来更新任务进度；尚未满足交付条件时，Agent 会继续下一步，而不是因为完成一次工具调用就提前结束。
+Agent 根据工具结果自主决定下一步，并动态维护 todos。todos 只是可视计划，不参与完成判定，也不规定必须按什么顺序行动。
+
+运行时另外保存一份很薄的 `AgentRunState`：其中的 document obligations 只记录用户要求的独立文档产物，以及每项对应的 proposal/change set 证据。它不是工作流；Agent 仍可自由选择直接成稿、局部修改、资料检索或场景链。模型准备结束时，完成守卫只核验这些要求是否都有真实工具证据，多章任务不会因一个合并 todo 被勾完而提前结束。
 
 相关代码主要在 `src/agentic_runtime.ts`、`src/agent_runtime.ts` 和 `src/agent.ts`。
 
@@ -133,7 +135,9 @@ Web 端把 Agent 任务作为后台 job 执行，并通过 SSE 推送：
 - token 使用量；
 - proposal、todos 和终止状态。
 
-step trail 会持久化到数据库，页面刷新后仍可查看。任务因步数预算、人工停止或异常中断时，当前 todos、checkpoint、材料架和已完成工具结果会尽量保留。续跑会重新使用原始用户请求，并以 `resumeInterrupted` 标记要求 Agent 从最小未完成步骤继续。
+step trail 会持久化到数据库，页面刷新后仍可查看。任务因步数预算、人工停止或异常中断时，当前 RunState、todos、checkpoint、材料架和已完成工具结果会保留。续跑恢复同一份未完成约束及其已有提案证据，不再仅靠 todo 文案推断进度。
+
+后台任务只允许 `completed / interrupted / failed / cancelled` 四类终态。运行函数如果没有发出终态就直接返回，后台会生成错误终态，避免 SSE、step 和前端活跃状态彼此不一致。
 
 后台 job 和 step trail 位于 `src/server.ts`，续跑状态恢复位于 `src/agent.ts`、`src/store.ts` 和 `src/web/main.tsx`。
 

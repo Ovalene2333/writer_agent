@@ -1,4 +1,5 @@
-import type { AgentTodoItem, PermissionMode } from "./types.js";
+import type { AgentRunDocumentEvidence, AgentRunState, AgentTodoItem, PermissionMode } from "./types.js";
+import { classifyAgentToolOutcome, isSuccessfulDocumentSubmission, proposalIdFromToolResult } from "./agent_runtime.js";
 import {
   inferWritingQualityProfile,
   inferWritingWorkflowKind,
@@ -34,6 +35,8 @@ export interface AgentTaskContract {
   qualityProfile?: WritingQualityProfile;
   /** A semantic planner decision that must be persisted before the turn can finish. */
   proseGateRequired?: boolean;
+  /** Unordered user-visible document outputs. It constrains completion, never action order. */
+  documentDeliverables?: readonly string[];
 }
 
 export interface AgentExecutionProgress {
@@ -41,6 +44,7 @@ export interface AgentExecutionProgress {
   failedTools: Map<string, number>;
   reusableEvidence: boolean;
   documentArtifactProduced: boolean;
+  documentArtifactKeys: Set<string>;
   characterArtifactProduced: boolean;
   proseGateRuleSaved: boolean;
   workflowStages: Set<WritingWorkflowStage>;
@@ -79,6 +83,7 @@ export function createAgentExecutionProgress(reusableEvidence = false): AgentExe
     failedTools: new Map(),
     reusableEvidence,
     documentArtifactProduced: false,
+    documentArtifactKeys: new Set(),
     characterArtifactProduced: false,
     proseGateRuleSaved: false,
     workflowStages: new Set(),
@@ -102,17 +107,24 @@ export function recordAgentToolResult(
   toolName: string,
   result: Record<string, unknown> | undefined,
 ): void {
-  const failed = !result || "error" in result || result.status === "error" || result.status === "failed";
-  if (failed) {
+  const outcome = classifyAgentToolOutcome(toolName, result);
+  if (outcome.kind !== "success") {
     progress.failedTools.set(toolName, (progress.failedTools.get(toolName) ?? 0) + 1);
     return;
   }
+  if (!result) return;
   progress.successfulTools.add(toolName);
   progress.failedTools.delete(toolName);
-  if (["propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set", "revise_document_isolated", "propose_chapter_draft"].includes(toolName)) {
-    progress.documentArtifactProduced = true;
-  }
-  if (toolName === "inspect_chapter_draft" && result.proposalSubmitted === true) {
+  if (result && isSuccessfulDocumentSubmission(toolName, result)) {
+    const proposalId = proposalIdFromToolResult(result);
+    const changeSetId = typeof result.changeSetId === "number" && result.changeSetId > 0 ? result.changeSetId : undefined;
+    const fallback = typeof result.path === "string" && result.path
+      ? `${toolName}:path:${result.path}:${typeof result.sourceHash === "string" ? result.sourceHash : ""}`
+      : undefined;
+    const key = proposalId !== undefined
+      ? `proposal:${proposalId}`
+      : changeSetId !== undefined ? `change-set:${changeSetId}` : fallback;
+    if (key) progress.documentArtifactKeys.add(key);
     progress.documentArtifactProduced = true;
   }
   if (["save_character", "save_simple_character"].includes(toolName)
@@ -140,7 +152,7 @@ function hasEvidence(contract: AgentTaskContract, progress: AgentExecutionProgre
 export function agentCompletionGaps(
   contract: AgentTaskContract,
   progress: AgentExecutionProgress,
-  todos: AgentTodoItem[],
+  _todos: AgentTodoItem[],
 ): string[] {
   const gaps: string[] = [];
   if (!hasEvidence(contract, progress)) {
@@ -150,8 +162,14 @@ export function agentCompletionGaps(
         ? "尚未定位并读取目标资料"
         : "尚未取得可承接的正文末尾或工作记忆");
   }
-  if ((contract.mutation === "document" || contract.mutation === "mixed") && !progress.documentArtifactProduced) {
-    gaps.push("尚未成功提交文档提案或 change set");
+  if (contract.mutation === "document" || contract.mutation === "mixed") {
+    const required = Math.max(1, contract.documentDeliverables?.length ?? 0);
+    const completed = progress.documentArtifactKeys.size;
+    if (completed < required) {
+      gaps.push(required === 1
+        ? "尚未成功提交文档提案或 change set"
+        : `文档交付尚未完成：要求 ${required} 份，已有 ${completed} 份可验证提案`);
+    }
   }
   if ((contract.mutation === "character" || contract.mutation === "mixed") && !progress.characterArtifactProduced) {
     gaps.push("尚未成功保存或更新角色卡");
@@ -160,11 +178,54 @@ export function agentCompletionGaps(
     gaps.push("尚未把 planning 识别出的可复用作者反馈保存为复审规则");
   }
   gaps.push(...writingWorkflowCompletionGaps(contract, progress.workflowStages));
-  if (contract.planning === "adaptive" && todos.length
-    && todos.some(todo => todo.status === "pending" || todo.status === "in_progress")) {
-    gaps.push("动态任务清单仍有未完成步骤");
-  }
   return gaps;
+}
+
+export function createAgentRunState(
+  originalRequest: string,
+  documentDeliverables: readonly string[],
+  previous?: AgentRunState,
+): AgentRunState {
+  const resumable = previous?.version === 1
+    && previous.originalRequest === originalRequest
+    && previous.terminalState !== "completed";
+  return {
+    version: 1,
+    originalRequest,
+    documentObligations: resumable
+      ? previous.documentObligations.map(item => ({ ...item, ...(item.evidence ? { evidence: { ...item.evidence } } : {}) }))
+      : documentDeliverables.map((label, index) => ({ id: `document-${index + 1}`, label })),
+    terminalState: "running",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export function recordAgentRunDocumentEvidence(
+  state: AgentRunState,
+  evidence: AgentRunDocumentEvidence,
+): AgentRunState {
+  const evidenceKey = evidence.proposalId !== undefined
+    ? `proposal:${evidence.proposalId}`
+    : evidence.changeSetId !== undefined ? `change-set:${evidence.changeSetId}` : undefined;
+  if (evidenceKey && state.documentObligations.some(item => {
+    const current = item.evidence;
+    return current && (current.proposalId !== undefined
+      ? `proposal:${current.proposalId}`
+      : current.changeSetId !== undefined ? `change-set:${current.changeSetId}` : undefined) === evidenceKey;
+  })) return state;
+  const index = state.documentObligations.findIndex(item => !item.evidence);
+  if (index < 0) return state;
+  return {
+    ...state,
+    documentObligations: state.documentObligations.map((item, itemIndex) => (
+      itemIndex === index ? { ...item, evidence: { ...evidence } } : item
+    )),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export function agentRunPendingDocumentLabels(state: AgentRunState): string[] {
+  return state.documentObligations.filter(item => !item.evidence).map(item => item.label);
 }
 
 export function completionRecoveryPrompt(gaps: string[], progress: AgentExecutionProgress): string {

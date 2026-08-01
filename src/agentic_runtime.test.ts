@@ -4,7 +4,10 @@ import {
   agentCompletionGaps,
   completionRecoveryPrompt,
   contractAllowsTool,
+  createAgentRunState,
   createAgentExecutionProgress,
+  agentRunPendingDocumentLabels,
+  recordAgentRunDocumentEvidence,
   recordAgentToolResult,
   resolveAgentPlanningStrategy,
   type AgentTaskContract,
@@ -19,17 +22,16 @@ const documentContract: AgentTaskContract = {
   capabilities: ["research", "documents", "review"],
 };
 
-test("completion gates require evidence, artifact and a closed adaptive plan", () => {
+test("completion gates require evidence and artifact, while todos remain advisory", () => {
   const progress = createAgentExecutionProgress();
   const todos = [{ id: "t1", content: "读取并修改", status: "in_progress" as const }];
   assert.deepEqual(agentCompletionGaps(documentContract, progress, todos), [
     "尚未定位并读取目标资料",
     "尚未成功提交文档提案或 change set",
-    "动态任务清单仍有未完成步骤",
   ]);
 
   recordAgentToolResult(progress, "read_document", { status: "ok" });
-  recordAgentToolResult(progress, "propose_document_patch", { status: "proposed" });
+  recordAgentToolResult(progress, "propose_document_patch", { status: "proposed", proposalId: 12 });
   assert.deepEqual(agentCompletionGaps(documentContract, progress, [
     { ...todos[0], status: "completed" },
   ]), []);
@@ -103,8 +105,52 @@ test("self-contained document creation only requires a delivered artifact", () =
   assert.deepEqual(agentCompletionGaps(contract, progress, []), [
     "尚未成功提交文档提案或 change set",
   ]);
-  recordAgentToolResult(progress, "propose_document", { status: "pending" });
+  recordAgentToolResult(progress, "propose_document", { status: "pending", proposalId: 9 });
   assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
+test("multi-document completion uses concrete proposal evidence, not a combined todo", () => {
+  const progress = createAgentExecutionProgress();
+  const contract: AgentTaskContract = {
+    mode: "write_scene",
+    outcome: "document",
+    evidence: "none",
+    mutation: "document",
+    planning: "adaptive",
+    capabilities: ["documents", "scenes"],
+    documentDeliverables: ["第一章", "第二章"],
+  };
+  const combinedTodo = [{ id: "t1", content: "创作并写入前两章", status: "completed" as const }];
+  recordAgentToolResult(progress, "propose_document", { status: "accepted", proposalId: 21 });
+  assert.deepEqual(agentCompletionGaps(contract, progress, combinedTodo), [
+    "文档交付尚未完成：要求 2 份，已有 1 份可验证提案",
+  ]);
+  recordAgentToolResult(progress, "propose_document", { status: "accepted", proposalId: 22 });
+  assert.deepEqual(agentCompletionGaps(contract, progress, combinedTodo), []);
+});
+
+test("blocked proposal results cannot become document evidence", () => {
+  const progress = createAgentExecutionProgress();
+  recordAgentToolResult(progress, "propose_document", {
+    status: "final_review_revision_required",
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+  });
+  assert.equal(progress.documentArtifactProduced, false);
+  assert.equal(progress.documentArtifactKeys.size, 0);
+  assert.equal(progress.failedTools.get("propose_document"), 1);
+});
+
+test("durable run state resumes unfinished unordered obligations", () => {
+  let state = createAgentRunState("写两章", ["第一章", "第二章"]);
+  state = recordAgentRunDocumentEvidence(state, {
+    toolName: "propose_document",
+    proposalId: 31,
+    path: "chapters/01.md",
+    recordedAt: "2026-08-02T00:00:00.000Z",
+  });
+  state = { ...state, terminalState: "interrupted" };
+  const resumed = createAgentRunState("写两章", ["第一章", "第二章"], state);
+  assert.deepEqual(agentRunPendingDocumentLabels(resumed), ["第二章"]);
 });
 
 test("chapter workflow stage gaps require review after a scene chain starts", () => {
@@ -122,11 +168,15 @@ test("chapter workflow stage gaps require review after a scene chain starts", ()
   };
   recordAgentToolResult(progress, "begin_chapter_draft", { status: "started" });
   recordAgentToolResult(progress, "write_chapter_scene", { status: "written", complete: true });
-  recordAgentToolResult(progress, "propose_document", { status: "pending" });
+  recordAgentToolResult(progress, "propose_document", { status: "pending", proposalId: 41 });
   assert.deepEqual(agentCompletionGaps(contract, progress, []), [
     "章节场景链已启动但尚未完成整章终审",
   ]);
-  recordAgentToolResult(progress, "inspect_chapter_draft", { status: "review_passed", proposalSubmitted: true });
+  recordAgentToolResult(progress, "inspect_chapter_draft", {
+    status: "review_passed",
+    proposalSubmitted: true,
+    proposal: { proposalId: 41 },
+  });
   assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
 });
 

@@ -15,8 +15,9 @@ export function decideProposalFailure(
   if (result.failureKind === "dependency") {
     return { action: "pause", reason: "dependency", attempt: nextAttempt };
   }
-  if (result.code === "INVALID_TOOL_ARGUMENTS_JSON"
-    || result.code === "CONTRACT_MUTATION_DENIED") {
+  // Malformed model arguments are recoverable model behavior: return the
+  // structured error to the Agent and let it emit one smaller, valid call.
+  if (result.code === "CONTRACT_MUTATION_DENIED") {
     return { action: "pause", reason: "invalid_request", attempt: nextAttempt };
   }
   if (nextAttempt >= MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW) {

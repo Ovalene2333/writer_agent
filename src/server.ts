@@ -269,7 +269,15 @@ export class BackgroundAgentJobs {
     // Defer so callers can finish `const job = start(...)` before the runner touches `job`.
     queueMicrotask(() => {
       void run(job.controller.signal, emit).then(() => {
-        if (job.status === "running") this.finish(job, "completed");
+        if (job.status === "running") {
+          // A runner that returns without a terminal event violated the Agent
+          // protocol. Emit a real terminal event so SSE subscribers and persisted
+          // step trails cannot be stranded in `running`.
+          this.emit(job.id, {
+            type: "error",
+            message: "Agent 运行函数未产生终态事件，任务已安全终止，可从原指令续跑。",
+          });
+        }
       }).catch((error) => {
         if (job.status === "running") {
           this.emit(job.id, { type: "error", message: errorMessage(error) });
