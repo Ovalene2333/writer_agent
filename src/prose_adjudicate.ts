@@ -487,6 +487,9 @@ export async function adjudicateLearnedProseGates(
 ): Promise<ProseStyleIssue[]> {
   const activeRules = rules.filter(rule => rule.enabled).slice(0, MAX_PROSE_GATE_RULES);
   if (!activeRules.length) return [];
+  const deterministicIssues = deterministicLearnedProseGateIssues(text, activeRules, options?.beforeText);
+  const semanticRules = activeRules.filter(rule => rule.id !== QUOTED_TEXT_COUNT_RULE_ID);
+  if (!semanticRules.length) return deterministicIssues;
   if (!model) {
     if (options?.failClosed) {
       throw new ToolDependencyError("PROSE_GATE_UNAVAILABLE", "语义正文门控没有可用模型");
@@ -510,7 +513,7 @@ evidence 必须逐字复制自对应 passage：单句足以证明时只引一句
       {
         role: "user",
         content: JSON.stringify({
-          rules: activeRules.map(rule => ({
+          rules: semanticRules.map(rule => ({
             id: rule.id,
             label: rule.label,
             instruction: rule.instruction,
@@ -525,16 +528,16 @@ evidence 必须逐字复制自对应 passage：单句足以证明时只引一句
     if (completed.usage) {
       options?.usageReporter?.(model, completed.usage, { callKind: options.callKind ?? "learned_prose_gate" });
     }
-    const parsed = parseLearnedProseGateFindings(completed.content, activeRules, passages)
+    const parsed = parseLearnedProseGateFindings(completed.content, semanticRules, passages)
       .filter(finding => {
         if (options?.beforeText === undefined) return true;
         const beforeCount = options.beforeText.split(finding.evidence).length - 1;
         const afterCount = text.split(finding.evidence).length - 1;
         return afterCount > beforeCount;
       });
-    return parsed.map(finding => {
+    return [...deterministicIssues, ...parsed.map(finding => {
       const passage = passages.find(item => item.id === finding.passageId)!;
-      const rule = activeRules.find(item => item.id === finding.ruleId)!;
+      const rule = semanticRules.find(item => item.id === finding.ruleId)!;
       const start = text.indexOf(finding.evidence, passage.start);
       const prefix = text.slice(0, start);
       return {
@@ -552,7 +555,7 @@ evidence 必须逐字复制自对应 passage：单句足以证明时只引一句
         reason: `作者复审规则「${rule.id}」：${finding.reason}`,
         suggestions: [finding.suggestion],
       };
-    });
+    })];
   } catch (error) {
     if (options?.signal?.aborted) throw error;
     if (options?.failClosed) {
@@ -564,8 +567,77 @@ evidence 必须逐字复制自对应 passage：单句足以证明时只引一句
         { cause: error },
       );
     }
-    return [];
+    return deterministicIssues;
   }
+}
+
+const QUOTED_TEXT_COUNT_RULE_ID = "quoted-text-count-consistency";
+const CHINESE_DIGITS = new Map([
+  ["零", 0], ["一", 1], ["二", 2], ["两", 2], ["三", 3], ["四", 4],
+  ["五", 5], ["六", 6], ["七", 7], ["八", 8], ["九", 9],
+]);
+
+function parseWrittenCount(value: string): number | undefined {
+  if (/^\d+$/u.test(value)) return Number(value);
+  if (value === "十") return 10;
+  const parts = value.split("十");
+  if (parts.length === 2) {
+    const tens = parts[0] ? CHINESE_DIGITS.get(parts[0]) : 1;
+    const ones = parts[1] ? CHINESE_DIGITS.get(parts[1]) : 0;
+    if (tens !== undefined && ones !== undefined) return tens * 10 + ones;
+  }
+  return value.length === 1 ? CHINESE_DIGITS.get(value) : undefined;
+}
+
+function formatWrittenCount(value: number, original: string): string {
+  if (/^\d+$/u.test(original)) return String(value);
+  const digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+  if (value < 10) return digits[value] ?? String(value);
+  if (value < 20) return value === 10 ? "十" : `十${digits[value - 10]}`;
+  if (value < 100) return `${digits[Math.floor(value / 10)]}十${value % 10 ? digits[value % 10] : ""}`;
+  return String(value);
+}
+
+/** Exact built-in checks stay deterministic instead of asking a model to count. */
+export function deterministicLearnedProseGateIssues(
+  text: string,
+  rules: ProseGateRule[],
+  beforeText?: string,
+): ProseStyleIssue[] {
+  const rule = rules.find(item => item.id === QUOTED_TEXT_COUNT_RULE_ID && item.enabled);
+  if (!rule) return [];
+  const pattern = /(?:“([^”\n]{1,40})”|「([^」\n]{1,40})」|『([^』\n]{1,40})』)([^\n]{0,40}?)(?:这|那)(\d+|[零一二两三四五六七八九十]+)个字/gu;
+  const issues: ProseStyleIssue[] = [];
+  for (const match of text.matchAll(pattern)) {
+    const quoted = match[1] ?? match[2] ?? match[3] ?? "";
+    const declaredText = match[5] ?? "";
+    const declared = parseWrittenCount(declaredText);
+    const actual = [...quoted].filter(character => !/[\s\p{P}\p{S}]/u.test(character)).length;
+    if (declared === undefined || actual === 0 || declared === actual) continue;
+    const evidence = match[0];
+    const beforeCount = beforeText === undefined ? 0 : beforeText.split(evidence).length - 1;
+    const afterCount = text.split(evidence).length - 1;
+    if (beforeText !== undefined && afterCount <= beforeCount) continue;
+    const start = match.index ?? 0;
+    const prefix = text.slice(0, start);
+    const replacement = formatWrittenCount(actual, declaredText);
+    issues.push({
+      id: `learned:${rule.id}:${start}`,
+      kind: "learned",
+      subtype: "learned_rule",
+      severity: rule.severity === "block" ? "error" : "warning",
+      confidence: 1,
+      start,
+      end: start + evidence.length,
+      line: prefix.split("\n").length,
+      column: start - prefix.lastIndexOf("\n"),
+      sentence: evidence,
+      evidence: evidence.length <= 120 ? evidence : `${evidence.slice(0, 117)}…`,
+      reason: `作者复审规则「${rule.id}」：引号内为 ${actual} 个书写单位，正文写成 ${declared} 个。`,
+      suggestions: [`将“${declaredText}个字”改为“${replacement}个字”。`],
+    });
+  }
+  return issues;
 }
 
 export function parseLearnedProseGateFindings(

@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  adjudicateLearnedProseGates,
   applyCachedProseVerdicts,
   applyProseVerdicts,
+  deterministicLearnedProseGateIssues,
   learnedGatePassagesForReview,
   materializeProseDiscoveries,
   parseLearnedProseGateFindings,
@@ -69,6 +71,27 @@ test("learned gate accepts exact evidence for quoted-text count feedback", () =>
     findings: [{ ruleId: rule.id, passageId: "learned:0", evidence: "不存在的原句" }],
   }), [rule], passages);
   assert.deepEqual(fabricated, []);
+});
+
+test("quoted-text count gate is deterministic and ignores unquoted cross-paragraph guesses", async () => {
+  const rule = BUILT_IN_PROSE_GATE_RULES.find(item => item.id === "quoted-text-count-consistency")!;
+  const mismatch = "她盯着纸上的“永远等你”——这三个字，半晌没动。";
+  const issues = deterministicLearnedProseGateIssues(mismatch, [rule]);
+  assert.equal(issues.length, 1);
+  assert.match(issues[0].reason, /引号内为 4 个/u);
+  assert.match(issues[0].suggestions[0], /四个字/u);
+
+  assert.deepEqual(
+    deterministicLearnedProseGateIssues("她盯着纸上的“永远等你”——这四个字，半晌没动。", [rule]),
+    [],
+  );
+  assert.deepEqual(
+    deterministicLearnedProseGateIssues("她把注意撕到最深处那三个字旁边。\n\n活下去。", [rule]),
+    [],
+  );
+
+  const withoutModel = await adjudicateLearnedProseGates(mismatch, [rule], undefined, { failClosed: true });
+  assert.equal(withoutModel.length, 1);
 });
 
 test("project prose gates honor document kind and path scopes", () => {
