@@ -106,14 +106,18 @@ export function formatStepCost(usage: StepUsage): string | null {
 
 export function stepUsageTitle(usage: StepUsage): string {
   const multi = (usage.callBreakdown?.length ?? 0) > 1 || usage.model === "多个模型";
+  const cache = stepCacheRates(usage);
   const parts = [
     usage.estimated ? "估算" : null,
     multi ? "多模型合计" : usage.model ?? null,
     `输入 ${usage.promptTokens.toLocaleString()}`,
     `输出 ${usage.completionTokens.toLocaleString()}`,
     `缓存命中 ${usage.cacheHitTokens.toLocaleString()}`,
-    usage.cacheHitRate !== undefined
-      ? `${multi ? "合计命中率" : "命中率"} ${(usage.cacheHitRate * 100).toFixed(1)}%`
+    cache.primary !== undefined && multi
+      ? `Agent 主步命中率 ${(cache.primary * 100).toFixed(1)}%`
+      : null,
+    cache.total !== undefined
+      ? `${multi ? "全调用合计命中率" : "命中率"} ${(cache.total * 100).toFixed(1)}%`
       : null,
     usage.cost > 0
       ? `费用 ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`
@@ -131,6 +135,21 @@ export function stepUsageTitle(usage: StepUsage): string {
   return parts.join(" · ");
 }
 
+function stepCacheRates(usage: StepUsage): { primary?: number; total?: number } {
+  const measured = (usage.callBreakdown ?? []).filter(call => !call.estimated);
+  const primary = measured.filter(call => call.callKind === "agent_step");
+  const primaryHit = primary.reduce((sum, call) => sum + call.cacheHitTokens, 0);
+  const primaryMiss = primary.reduce((sum, call) => sum + call.cacheMissTokens, 0);
+  const totalHit = Math.max(0, usage.cacheHitTokens);
+  const totalMiss = Math.max(0, usage.cacheMissTokens);
+  return {
+    ...(primaryHit + primaryMiss > 0 ? { primary: primaryHit / (primaryHit + primaryMiss) } : {}),
+    ...(totalHit + totalMiss > 0
+      ? { total: totalHit / (totalHit + totalMiss) }
+      : usage.cacheHitRate !== undefined ? { total: usage.cacheHitRate } : {}),
+  };
+}
+
 /** Compact per-step usage: in · out · cache · cost (no Σ total). */
 export function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?: boolean }) {
   if (!usage) {
@@ -141,6 +160,12 @@ export function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?
     );
   }
   const cost = formatStepCost(usage);
+  const cache = stepCacheRates(usage);
+  const visibleCacheRate = cache.primary ?? cache.total;
+  const cacheTitle = cache.primary !== undefined && cache.total !== undefined
+    && Math.abs(cache.primary - cache.total) > 0.0005
+    ? `Agent 主步命中 ${(cache.primary * 100).toFixed(1)}%；全调用合计 ${(cache.total * 100).toFixed(1)}%`
+    : `缓存命中 ${usage.cacheHitTokens.toLocaleString()}${visibleCacheRate !== undefined ? `（${(visibleCacheRate * 100).toFixed(1)}%）` : ""}`;
   return (
     <span
       className={`agent-step-tokens${usage.estimated ? " estimated" : ""}`}
@@ -154,9 +179,9 @@ export function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?
         <span className="tok-ico" aria-hidden="true">O</span>
         {formatTokenCount(usage.completionTokens)}
       </span>
-      <span className="tok-metric tok-cache" title={`缓存命中 ${usage.cacheHitTokens.toLocaleString()}`}>
+      <span className="tok-metric tok-cache" title={cacheTitle}>
         <span className="tok-ico" aria-hidden="true">C</span>
-        {formatTokenCount(usage.cacheHitTokens)}
+        {visibleCacheRate !== undefined ? `${Math.round(visibleCacheRate * 100)}%` : formatTokenCount(usage.cacheHitTokens)}
       </span>
       {cost && <span className="tok-metric tok-cost">{cost}</span>}
       {usage.estimated && <em className="est">估</em>}

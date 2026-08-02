@@ -1,6 +1,7 @@
 import {
   findProseConstructionMatches,
   PROSE_CONSTRUCTION_RULES,
+  proseConstructionRule,
   proseConstructionGenerationPrompt,
 } from "./prose_construction_rules.js";
 
@@ -27,9 +28,11 @@ export interface ProseStyleIssue {
   evidence: string;
   reason: string;
   suggestions: string[];
-  /** Registered syntax candidate; requires a model verdict before density may hard-block it. */
+  /** Registered syntax candidate; semantic verdict and deterministic family density are independent. */
   constructionRuleId?: string;
   semanticVerdict?: "allow" | "warn" | "block";
+  /** Semantic validity and family density are independent; only true quotations/metadata should opt out. */
+  countsTowardFamilyBudget?: boolean;
 }
 
 export interface ContrastStyleReport {
@@ -45,9 +48,6 @@ export interface ContrastStyleReport {
 type MatchRange = { start: number; end: number; text: string };
 const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const LEGACY_CONTRAST_PATTERNS = [
-  /与其(?:说)?[^\n。！？!?]{0,48}不如(?:说)?/gu,
-  /没有[^\n。！？!?]{0,40}只有/gu,
-  /不在于[^\n。！？!?]{0,40}而在于/gu,
   /(?:仿佛|好像)[^\n。！？!?]{0,36}又(?:仿佛|好像)/gu,
 ];
 /** 仅高教学/解释口吻；日常叙事里「这/那/原来/仿佛」后接破折号很常见，不计入硬说明信号。 */
@@ -150,7 +150,10 @@ export function sceneMannerismGateError(text: string): string | undefined {
     issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
   );
   if (!errors.length) return undefined;
-  return formatProseStyleBlockError(errors, "本场说明式写法过密，尚未写入草稿");
+  const headline = errors.some(issue => issue.constructionRuleId)
+    ? "本场句式家族预算超限，尚未写入草稿"
+    : "本场说明式写法过密，尚未写入草稿";
+  return formatProseStyleBlockError(errors, headline);
 }
 
 /** Rule scan without density escalation (for pre-model packing). */
@@ -165,6 +168,10 @@ export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
  */
 export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]): ProseStyleIssue[] {
   for (const issue of issues) {
+    if (issue.constructionRuleId) {
+      issue.severity = issue.subtype === "dialogue_correction" ? "info" : "warning";
+      continue;
+    }
     if (issue.severity === "error"
       && HARD_BLOCK_SUBTYPES.has(issue.subtype)) {
       // dialogue_correction 默认从 info 起步，不在此重置
@@ -192,19 +199,41 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
       }
     }
   }
-  // Registered constructions are semantic gates: regex only proposes candidates.
-  // A rule becomes blocking only after Flash says block and its density allowance is exceeded.
+  // Registered constructions have two independent axes. Flash decides whether an
+  // occurrence is semantically justified; the deterministic family budget decides
+  // whether the same skeleton has monopolised the chapter. An `allow` therefore
+  // receives preservation priority but does not disappear from the count.
   const characters = Math.max(1, text.replace(/\s/g, "").length);
-  for (const rule of PROSE_CONSTRUCTION_RULES) {
-    const reviewedBlocks = issues.filter(issue =>
-      issue.constructionRuleId === rule.id
-      && issue.semanticVerdict === "block"
-      && issue.confidence >= 0.9,
+  const familyRules = new Map(PROSE_CONSTRUCTION_RULES.map(rule => [rule.familyId, rule]));
+  for (const [familyId, budgetRule] of familyRules) {
+    const familyRuleIds = new Set(PROSE_CONSTRUCTION_RULES.filter(rule => rule.familyId === familyId).map(rule => rule.id));
+    const counted = issues.filter(issue =>
+      issue.constructionRuleId !== undefined
+      && familyRuleIds.has(issue.constructionRuleId as typeof budgetRule.id)
+      && issue.countsTowardFamilyBudget !== false,
     );
-    if (reviewedBlocks.length <= rule.allowedOccurrences(characters)) continue;
-    for (const issue of reviewedBlocks) issue.severity = "error";
+    const allowed = budgetRule.allowedOccurrences(characters);
+    if (counted.length <= allowed) continue;
+    const keep = new Set(counted
+      .slice()
+      .sort((left, right) => constructionKeepPriority(right) - constructionKeepPriority(left) || left.start - right.start)
+      .slice(0, allowed)
+      .map(issue => issue.id));
+    for (const issue of counted) {
+      if (keep.has(issue.id)) continue;
+      issue.severity = "error";
+      issue.confidence = Math.max(issue.confidence, 0.95);
+      issue.reason = `${issue.reason}（句式家族 ${counted.length}/${allowed}，语义成立也不豁免密度）`;
+      issue.suggestions = ["保留更不可替代的少数实例；本句改为直接事实、动作、感受或人物特有说法", ...issue.suggestions].slice(0, 4);
+    }
   }
   return issues;
+}
+
+function constructionKeepPriority(issue: ProseStyleIssue): number {
+  const semantic = issue.semanticVerdict === "allow" ? 30 : issue.semanticVerdict === "warn" ? 10 : issue.semanticVerdict === "block" ? 0 : 15;
+  const contextual = issue.subtype === "dialogue_correction" ? 8 : issue.subtype === "factual_exclusion" ? 4 : 0;
+  return semantic + contextual;
 }
 
 /** Context-aware scanner for explanatory dashes and formulaic redefinition frames. */
@@ -238,16 +267,42 @@ export function contrastStyleError(text: string): string | undefined {
 
 /** Return only issues introduced by `after`, using a multiset so duplicate mannerisms are detected. */
 export function newProseStyleIssues(before: string, after: string): ProseStyleIssue[] {
+  const beforeIssues = analyzeProseStyle(before);
+  const afterIssues = analyzeProseStyle(after);
   const remaining = new Map<string, number>();
-  for (const issue of analyzeProseStyle(before)) {
+  for (const issue of beforeIssues) {
     const key = issueFingerprint(issue);
     remaining.set(key, (remaining.get(key) ?? 0) + 1);
   }
-  return analyzeProseStyle(after).filter(issue => {
+  const familyIncreased = new Set<string>();
+  const familyOverBudget = new Set<string>();
+  for (const familyId of new Set(PROSE_CONSTRUCTION_RULES.map(rule => rule.familyId))) {
+    const familyRules = PROSE_CONSTRUCTION_RULES.filter(rule => rule.familyId === familyId);
+    const ruleIds = new Set(familyRules.map(rule => rule.id));
+    const beforeCount = beforeIssues.filter(issue => issue.constructionRuleId !== undefined
+      && ruleIds.has(issue.constructionRuleId as typeof familyRules[number]["id"])
+      && issue.countsTowardFamilyBudget !== false).length;
+    const afterCount = afterIssues.filter(issue => issue.constructionRuleId !== undefined
+      && ruleIds.has(issue.constructionRuleId as typeof familyRules[number]["id"])
+      && issue.countsTowardFamilyBudget !== false).length;
+    if (afterCount > beforeCount) familyIncreased.add(familyId);
+    const characters = Math.max(1, after.replace(/\s/gu, "").length);
+    if (afterCount > familyRules[0].allowedOccurrences(characters)) familyOverBudget.add(familyId);
+  }
+  return afterIssues.filter(issue => {
     const key = issueFingerprint(issue);
     const count = remaining.get(key) ?? 0;
     if (count > 0) { remaining.set(key, count - 1); return false; }
     return true;
+  }).map(issue => {
+    const rule = proseConstructionRule(issue.constructionRuleId);
+    if (rule && issue.severity === "error" && !familyIncreased.has(rule.familyId)) {
+      issue.severity = issue.subtype === "dialogue_correction" ? "info" : "warning";
+    } else if (rule && familyIncreased.has(rule.familyId) && familyOverBudget.has(rule.familyId)) {
+      issue.severity = "error";
+      issue.confidence = Math.max(issue.confidence, 0.95);
+    }
+    return issue;
   });
 }
 
@@ -262,6 +317,8 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
   if (!errors.length) return undefined;
   const headline = errors.some(issue => issue.subtype === "learned_rule")
     ? "本次修改违反作者沉淀的复审规则"
+    : errors.some(issue => issue.constructionRuleId)
+      ? "本次修改新增超出预算的句式家族用法"
     : "本次修改新增过密的高置信度说明式写法";
   return formatProseStyleBlockError(errors, headline);
 }
@@ -419,6 +476,7 @@ function scanRegisteredConstructions(text: string): ProseStyleIssue[] {
       classification.suggestions,
       match.rule.id,
     ));
+    issues.at(-1)!.countsTowardFamilyBudget = true;
   }
   return issues;
 }

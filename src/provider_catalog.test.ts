@@ -181,7 +181,7 @@ test("default catalog seeds OpenAI and DeepSeek with latest defaults", () => {
 
     assert.equal(openAi!.provider, "openai-compatible");
     assert.equal(openAi!.baseUrl, "https://api.openai.com/v1");
-    assert.deepEqual(openAi!.models.map((m) => m.name), ["gpt-4.1-mini"]);
+    assert.deepEqual(openAi!.models.map((m) => m.name), ["gpt-4.1-mini", "gpt-image-2"]);
     assert.equal(catalog.activeProviderId, openAi!.id);
     assert.equal(catalog.activeModelId, openAi!.models[0].id);
 
@@ -196,6 +196,7 @@ test("default catalog seeds OpenAI and DeepSeek with latest defaults", () => {
     assert.deepEqual(flash.pricing, defaultPricing("deepseek", "deepseek-v4-flash"));
     assert.deepEqual(pro.pricing, defaultPricing("deepseek", "deepseek-v4-pro"));
     assert.equal(providers.modelConfig("agent").model, "gpt-4.1-mini");
+    assert.equal(providers.imageModelConfig().model, "gpt-image-2");
     assert.equal(providers.modelConfig("flash").model, "deepseek-v4-flash");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -307,6 +308,7 @@ test("legacy v2 catalog fills writing roles and splits roleplay submodels compat
 
     const raw = JSON.parse(readFileSync(providers.path, "utf8")) as { assignments: Record<string, unknown> };
     delete raw.assignments.roleplay;
+    delete raw.assignments.image;
     delete raw.assignments.flash;
     delete raw.assignments.roleplay_perception;
     delete raw.assignments.roleplay_quality;
@@ -315,6 +317,7 @@ test("legacy v2 catalog fills writing roles and splits roleplay submodels compat
 
     const migrated = new ProviderManager(project);
     assert.deepEqual(migrated.catalog().assignments.roleplay, migrated.catalog().assignments.agent);
+    assert.deepEqual(migrated.catalog().assignments.image, migrated.catalog().assignments.agent);
     assert.equal(migrated.modelConfig("roleplay").model, "agent-model");
     assert.deepEqual(migrated.catalog().assignments.flash, migrated.catalog().assignments.summarizer);
     assert.equal(migrated.modelConfig("flash").model, migrated.modelConfig("summarizer").model);

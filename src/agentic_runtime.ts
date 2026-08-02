@@ -14,7 +14,7 @@ export type AgentTaskOutcome = "answer" | "document" | "character" | "review" | 
 export type AgentEvidenceRequirement = "none" | "project" | "target" | "continuation";
 export type AgentMutationRequirement = "none" | "document" | "character" | "mixed";
 export type AgentPlanningStrategy = "direct" | "adaptive";
-export type AgentCapability = "research" | "documents" | "files" | "outline" | "scenes" | "characters" | "review";
+export type AgentCapability = "research" | "documents" | "files" | "outline" | "scenes" | "characters" | "review" | "images";
 
 /**
  * A semantic contract, not a fixed workflow. The executor may revise its plan and
@@ -46,6 +46,7 @@ export interface AgentExecutionProgress {
   documentArtifactProduced: boolean;
   documentArtifactKeys: Set<string>;
   characterArtifactProduced: boolean;
+  imageArtifactProduced: boolean;
   proseGateRuleSaved: boolean;
   workflowStages: Set<WritingWorkflowStage>;
 }
@@ -77,6 +78,8 @@ const CHARACTER_MUTATION_TOOLS = new Set([
   "save_character", "apply_character_changes", "save_simple_character",
 ]);
 
+const IMAGE_MUTATION_TOOLS = new Set(["generate_image"]);
+
 export function createAgentExecutionProgress(reusableEvidence = false): AgentExecutionProgress {
   return {
     successfulTools: new Set(),
@@ -85,6 +88,7 @@ export function createAgentExecutionProgress(reusableEvidence = false): AgentExe
     documentArtifactProduced: false,
     documentArtifactKeys: new Set(),
     characterArtifactProduced: false,
+    imageArtifactProduced: false,
     proseGateRuleSaved: false,
     workflowStages: new Set(),
   };
@@ -131,6 +135,7 @@ export function recordAgentToolResult(
     || (toolName === "apply_character_changes" && Array.isArray(result.applied) && result.applied.length > 0)) {
     progress.characterArtifactProduced = true;
   }
+  if (toolName === "generate_image" && result.status === "generated") progress.imageArtifactProduced = true;
   if (toolName === "manage_prose_gates" && result.status === "saved") {
     progress.proseGateRuleSaved = true;
   }
@@ -173,6 +178,9 @@ export function agentCompletionGaps(
   }
   if ((contract.mutation === "character" || contract.mutation === "mixed") && !progress.characterArtifactProduced) {
     gaps.push("尚未成功保存或更新角色卡");
+  }
+  if (contract.capabilities.includes("images") && !progress.imageArtifactProduced) {
+    gaps.push("尚未成功生成用户要求的图片");
   }
   if (contract.proseGateRequired && !progress.proseGateRuleSaved) {
     gaps.push("尚未把 planning 识别出的可复用作者反馈保存为复审规则");
@@ -247,9 +255,10 @@ export function contractAllowsTool(
   permissionMode: PermissionMode,
   toolName: string,
 ): boolean {
-  if (permissionMode === "plan" && (DOCUMENT_MUTATION_TOOLS.has(toolName) || CHARACTER_MUTATION_TOOLS.has(toolName))) {
+  if (permissionMode === "plan" && (DOCUMENT_MUTATION_TOOLS.has(toolName) || CHARACTER_MUTATION_TOOLS.has(toolName) || IMAGE_MUTATION_TOOLS.has(toolName))) {
     return false;
   }
+  if (IMAGE_MUTATION_TOOLS.has(toolName)) return contract.capabilities.includes("images");
   if (DOCUMENT_MUTATION_TOOLS.has(toolName)) {
     return contract.mutation === "document" || contract.mutation === "mixed";
   }

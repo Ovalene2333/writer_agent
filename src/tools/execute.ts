@@ -44,6 +44,7 @@ import {
   handleSearchFiles,
 } from "./files.js";
 import { handleCompileWritePack } from "./write_pack.js";
+import { handleGenerateImage } from "./images.js";
 import {
   handleBeginChapterDraft,
   handleInspectChapterDraft,
@@ -108,6 +109,7 @@ const HANDLERS: Record<string, Handler> = {
   load_skill: handleLoadSkill,
   read_context_artifact: handleReadContextArtifact,
   manage_prose_gates: handleManageProseGates,
+  generate_image: handleGenerateImage,
 };
 
 export async function executeTool(

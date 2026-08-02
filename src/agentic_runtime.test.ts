@@ -64,6 +64,24 @@ test("universal visibility is separated from contract side-effect authorization"
   assert.equal(contractAllowsTool(documentContract, "ask", "propose_document_patch"), true);
   assert.equal(contractAllowsTool(documentContract, "ask", "apply_character_changes"), true);
   assert.equal(contractAllowsTool(documentContract, "plan", "propose_document_patch"), false);
+  assert.equal(contractAllowsTool(answerContract, "ask", "generate_image"), false);
+  assert.equal(contractAllowsTool({ ...answerContract, capabilities: ["images"] }, "ask", "generate_image"), true);
+  assert.equal(contractAllowsTool({ ...answerContract, capabilities: ["images"] }, "plan", "generate_image"), false);
+});
+
+test("image capability requires a successful generated attachment", () => {
+  const progress = createAgentExecutionProgress();
+  const contract: AgentTaskContract = {
+    mode: "general",
+    outcome: "answer",
+    evidence: "none",
+    mutation: "none",
+    planning: "direct",
+    capabilities: ["images"],
+  };
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), ["尚未成功生成用户要求的图片"]);
+  recordAgentToolResult(progress, "generate_image", { status: "generated", attachmentId: "image-1" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
 });
 
 test("reusable grounded context satisfies an evidence obligation", () => {

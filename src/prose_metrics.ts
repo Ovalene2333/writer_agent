@@ -61,7 +61,7 @@ export type ChapterProseMetrics = {
 
 /** Dash units per 10k non-space chars ("——" counts once). Reference: hand-written baseline ≈100–130. */
 export const DASH_PER_10K_LIMIT = 150;
-/** 「不是A…是B」-family frames per 10k chars, dialogue included (skeleton monopoly flattens voices). */
+/** 否定—改判 family frames per 10k chars, dialogue included (skeleton monopoly flattens voices). */
 export const CONTRAST_PER_10K_LIMIT = 4;
 /** 「和X一样」 frames per 10k chars. */
 export const SAMENESS_PER_10K_LIMIT = 12;
@@ -158,8 +158,8 @@ export function analyzeChapterProseMetrics(
   if (contrastPer10k > CONTRAST_PER_10K_LIMIT) {
     issues.push({
       code: "contrast_density",
-      severity: "warning",
-      message: `「不是A…是B」骨架 ${contrastMatches.length} 次（${contrastPer10k}/万字，上限 ${CONTRAST_PER_10K_LIMIT}/万字，对白一并计数）；叙述禁用，对白也勿连发教学腔，改为直接陈述或人物各自的说话方式。`,
+      severity: "error",
+      message: `否定—改判句式家族 ${contrastMatches.length} 次（${contrastPer10k}/万字，硬上限 ${CONTRAST_PER_10K_LIMIT}/万字，对白与“没有A只有B”等衍生式一并计数）；只保留不可替代的少数实例，其余改为直接事实、动作或人物各自的说话方式。`,
       examples: contrastMatches.slice(0, 5),
     });
   }
@@ -431,7 +431,7 @@ export function sceneAntiFormulaFeedback(options: {
   const numericPer10k = per10k(countMatches(body, NUMERIC_READOUT));
   const contrastBudget = Math.max(1, Math.round((CONTRAST_PER_10K_LIMIT * characters) / 10_000));
   lines.push(
-    `本章至今：破折号 ${dashPer10k}/万字（上限 ${DASH_PER_10K_LIMIT}）；「不是A…是B」骨架 ${contrastCount} 次（全章额度约 ${contrastBudget}）；「和X一样」${samenessCount} 次；数值读数 ${numericPer10k}/万字（上限 ${NUMERIC_PER_10K_LIMIT}）。已超或将超的项在下一场必须压降。`,
+    `本章至今：破折号 ${dashPer10k}/万字（上限 ${DASH_PER_10K_LIMIT}）；否定—改判句式家族 ${contrastCount} 次（全章额度约 ${contrastBudget}，含“没有A只有B”等衍生式）；「和X一样」${samenessCount} 次；数值读数 ${numericPer10k}/万字（上限 ${NUMERIC_PER_10K_LIMIT}）。已超或将超的项在下一场必须压降。`,
   );
 
   const openings = repeatedParagraphOpenings(body, 3);
@@ -649,7 +649,7 @@ function openingMonotony(text: string): { prefix: string; ratio: number } | unde
 
 function collectContrastFrames(text: string): string[] {
   return findProseConstructionMatches(text)
-    .filter(match => match.rule.id === "negation_redefinition")
+    .filter(match => match.rule.familyId === "negation_redefinition")
     .map(match => clip(match.text.trim(), 48));
 }
 

@@ -180,14 +180,14 @@ test("split not-A-is-B narration is semantically adjudicated instead of hard-cod
   assert.equal(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)), undefined);
 });
 
-test("registered construction blocks only after model verdict and density", () => {
+test("semantic allow and deterministic construction-family budget stay independent", () => {
   const text = "走廊里不是风声，是人的脚步。门后不是护士，是一名警卫。";
   const issues = analyzeProseStyle(text);
   const candidates = issues.filter(item => item.constructionRuleId === "negation_redefinition");
   assert.equal(candidates.length, 2);
   assert.equal(shouldAdjudicateForProposal(text, issues), true);
   assert.ok(packProseSnippets(text, candidates).every(item => item.constructionRuleId === "negation_redefinition"));
-  assert.equal(proseStyleIssuesError(issues), undefined, "regex candidates alone must not hard-block");
+  assert.ok(proseStyleIssuesError(issues), "family density must execute even before semantic review");
 
   const blocked = applyProseVerdicts(text, issues, candidates.map(item => ({
     id: item.id,
@@ -202,12 +202,12 @@ test("registered construction blocks only after model verdict and density", () =
     { id: freshCandidates[0].id, verdict: "allow", reason: "必要客观排除" },
     { id: freshCandidates[1].id, verdict: "block", reason: "模板化重述" },
   ]);
-  assert.equal(proseStyleIssuesError(mixed), undefined, "one allowed use keeps the blocked occurrence within density allowance");
+  assert.ok(proseStyleIssuesError(mixed), "semantic allow receives keep priority but does not exempt the family count");
 });
 
 test("prose diagnosis gives Agent stable evidence and revision intent", () => {
   const sourceHash = "source-v1";
-  const text = "暖意沿着肩甲扩散，那是缓冲层在预热，不是紧张。";
+  const text = "暖意沿着肩甲扩散，那是缓冲层在预热，不是紧张。门后不是护士，是一名警卫。";
   const issues = analyzeProseStyle(text);
   const candidate = issues.find(item => item.constructionRuleId === "negation_redefinition");
   assert.ok(candidate);
@@ -216,14 +216,16 @@ test("prose diagnosis gives Agent stable evidence and revision intent", () => {
     verdict: "block",
     reason: "事实成立后追加否定情绪标签",
   }]);
-  const diagnosis = buildProseDiagnosis(sourceHash, reviewed);
+  const diagnosis = buildProseDiagnosis(sourceHash, reviewed, text);
   assert.equal(diagnosis.status, "needs_revision");
   assert.equal(diagnosis.sourceHash, sourceHash);
   assert.equal(diagnosis.actionableIssues[0].ruleId, "negation_redefinition");
   assert.equal(diagnosis.actionableIssues[0].verdict, "block");
   assert.match(diagnosis.actionableIssues[0].evidence, /不是紧张/u);
   assert.ok(diagnosis.actionableIssues[0].revisionIntent.length > 0);
-  assert.equal(buildProseDiagnosis(sourceHash, reviewed).reviewId, diagnosis.reviewId);
+  assert.equal(diagnosis.familyBudgets[0].excess, 1);
+  assert.equal(diagnosis.familyBudgets[0].reviseIssueIds.length, 1);
+  assert.equal(buildProseDiagnosis(sourceHash, reviewed, text).reviewId, diagnosis.reviewId);
 });
 
 test("forward and postposed denial variants share one semantic density rule", () => {
@@ -323,7 +325,7 @@ test("parseProseAdjudication accepts verdict and active discovery object", () =>
     text: "她挂上门链。她根本不想让他进来。", reason: "test",
   };
   const parsed = parseProseAdjudication(JSON.stringify({
-    verdicts: [{ id: "contrast:0", verdict: "allow", reason: "事实纠正" }],
+    verdicts: [{ id: "contrast:0", verdict: "allow", countsTowardFamilyBudget: true, reason: "事实纠正" }],
     discoveries: [{
       passageId: passage.id,
       sentence: "她根本不想让他进来。",
@@ -333,6 +335,7 @@ test("parseProseAdjudication accepts verdict and active discovery object", () =>
     }],
   }), new Set(["contrast:0"]), new Map([[passage.id, passage]]));
   assert.equal(parsed.verdicts.length, 1);
+  assert.equal(parsed.verdicts[0].countsTowardFamilyBudget, true);
   assert.equal(parsed.discoveries.length, 1);
   assert.equal(parsed.discoveries[0].subtype, "semantic_echo");
 });

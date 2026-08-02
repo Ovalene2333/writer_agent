@@ -19,6 +19,7 @@ import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleGetCharacter, handleListCharacters, handleSaveCharacter } from "./tools/characters.js";
 import type { Character, OutlineNode } from "./types.js";
+import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
 
 test("competency unlock state is normalized and defaults to locked", () => {
   const base = emptyCharacter("Tester");
@@ -160,6 +161,38 @@ test("saveCharacter upserts arrays and supports replaceSections", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("writer/reviewer constraint packet keeps executable character boundaries stable", () => {
+  const card = normalizeV3Character({ ...emptyCharacter("林千夏"), id: 7, updatedAt: "" });
+  card.competencies = [{
+    id: "spinal-core",
+    name: "脊柱超算核心",
+    summary: "高阶自主计算",
+    level: "",
+    unlocked: false,
+    description: "",
+    resources: [],
+    limitations: ["融合完成前不可调用"],
+    costs: [],
+  }];
+  card.storyStates = [{
+    id: "state-1",
+    unanchored: true,
+    location: "手术舱",
+    physical: "融合度68%",
+    emotion: "",
+    knowledge: [{ id: "k1", label: "当前延迟", description: "应保持1—3ms" }],
+    beliefs: [],
+    intentions: [],
+    temporaryGoals: [],
+    notes: "",
+  }];
+  const writer = characterConstraintView(card);
+  const reviewer = characterConstraintView(card);
+  assert.equal(writer.competencies[0].unlocked, false);
+  assert.deepEqual(writer, reviewer);
+  assert.equal(characterConstraintHash(writer), characterConstraintHash(reviewer));
 });
 
 test("features persist separately from competencies and first-pass view exposes summaries only", () => {

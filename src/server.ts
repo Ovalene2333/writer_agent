@@ -1602,7 +1602,7 @@ export async function startWriterServer(options: {
             permissionMode,
             scenePipelineSettings: runtimeSettings.scenePipeline,
             models: {
-              agent: options.providers.modelConfig("agent"), writer: options.providers.modelConfig("writer"),
+              agent: options.providers.modelConfig("agent"), image: options.providers.imageModelConfig(), writer: options.providers.modelConfig("writer"),
               inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
               summarizer: options.providers.summaryModelConfig(),
             },

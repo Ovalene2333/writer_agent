@@ -265,7 +265,7 @@ function parseOptions(args: string[]): ProbeOptions {
   let json = false;
   let allowProjectContent = false;
   const roles: ModelUsageRole[] = [
-    "agent", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
+    "agent", "image", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
     "roleplay", "roleplay_perception", "roleplay_quality", "roleplay_memory",
   ];
   for (let index = 0; index < args.length; index += 1) {

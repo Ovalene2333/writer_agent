@@ -5,6 +5,14 @@ export type ProposalFailureDecision =
   | { action: "pause"; reason: "dependency" | "invalid_request" | "revision_exhausted"; attempt: number };
 
 /**
+ * The direct-document rhythm grace is an expected draft -> polish transition,
+ * not a failed semantic review. It must not consume the bounded failure window.
+ */
+export function isExpectedRhythmPolish(result: Record<string, unknown>): boolean {
+  return result.rhythmRevisionRequired === true || result.code === "RHYTHM_POLISH_REQUIRED";
+}
+
+/**
  * Deterministic proposal retry policy. Prompt wording may guide a repair, but it
  * never decides whether another submission is allowed.
  */

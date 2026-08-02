@@ -484,15 +484,19 @@ describe("roleplay prompts", () => {
       ],
     });
     assert.deepEqual(messages.map(message => message.role), ["system", "user"]);
-    assert.match(messages[0].content, /不扮演对面的 performer/);
-    assert.match(messages[0].content, /不得替 performer 或其他角色决定/);
+    assert.match(messages[0].content, /playerIdentity 是用户在本场对话中使用的身份/u);
+    assert.match(messages[0].content, /绝不能代替 performedCharacter 回复/u);
+    assert.match(messages[0].content, /role=user 的历史消息属于 playerIdentity/u);
+    assert.match(messages[0].content, /不得替 performedCharacter 或其他角色决定/);
     assert.match(messages[0].content, /必须始终采用第一人称主观视角/);
-    assert.match(messages[0].content, /不得用 identity 的姓名、“他”“她”或“TA”指代 identity 自己/);
+    assert.match(messages[0].content, /不得用 playerIdentity 的姓名、“他”“她”或“TA”指代自己/);
     assert.match(messages[0].content, /角色卡即使以第三人称描述，也不能改变 reply 的第一人称视角/);
     assert.match(messages[0].content, /30–100 个汉字/);
     const payload = JSON.parse(messages[1].content) as Record<string, unknown>;
-    assert.equal(payload.identity, "苏远");
-    assert.equal(payload.performer, "林千夏");
+    assert.equal(payload.playerIdentity, "苏远");
+    assert.equal(payload.performedCharacter, "林千夏");
+    assert.deepEqual(payload.playerIdentityCard, identity.card);
+    assert.deepEqual(payload.performedCharacterCard, performer.card);
     assert.deepEqual(payload.recentTranscript, [
       { role: "assistant", content: "<dialogue>「我没事。」</dialogue>" },
     ]);

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   decideProposalFailure,
+  isExpectedRhythmPolish,
   MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW,
 } from "./proposal_retry.js";
 /**
@@ -81,7 +82,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "1c5e9b417a1ba6fe");
+  assert.equal(agentToolSchemaHash(), "b2a4cf2b4e7f161d");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -642,6 +643,35 @@ test("proposal revision converge prompt escalates after repeated blocks", () => 
   assert.match(first, /修订窗口第 1 次/);
   assert.match(first, /最小修订/);
   assert.doesNotMatch(first, /最后一轮/);
+  const withStructuredBlocker = proposalRevisionConvergePrompt({
+    status: "final_review_revision_required",
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    path: "chapters/a.md",
+    message: "终审未通过",
+  }, 1, {
+    revisionCaseId: "revision:test",
+    path: "chapters/a.md",
+    draftArtifactId: 10,
+    draftSourceHash: "draft-hash",
+    reviewArtifactId: 11,
+    attempt: 1,
+    unresolvedIssues: [{
+      id: "issue:ability",
+      severity: "blocker",
+      kind: "fact_conflict",
+      evidence: ["她把循环交给脊柱超算"],
+      problem: "超算核心尚未解锁",
+      action: "改用已解锁纳米核心",
+    }],
+    resolvedIssueIds: [],
+    stillPresentIssueIds: [],
+    newlyIntroducedIssueIds: ["issue:ability"],
+    status: "blocked",
+    retention: "executable",
+  });
+  assert.match(withStructuredBlocker, /issue:ability/);
+  assert.match(withStructuredBlocker, /脊柱超算/);
+  assert.match(withStructuredBlocker, /已解锁纳米核心/);
   const last = proposalRevisionConvergePrompt({
     status: "error",
     message: "句式门禁",
@@ -651,6 +681,14 @@ test("proposal revision converge prompt escalates after repeated blocks", () => 
 });
 
 test("proposal retry policy separates dependency outages from bounded prose revisions", () => {
+  assert.equal(isExpectedRhythmPolish({
+    code: "RHYTHM_POLISH_REQUIRED",
+    rhythmRevisionRequired: true,
+  }), true);
+  assert.equal(isExpectedRhythmPolish({
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+  }), false);
+
   assert.deepEqual(decideProposalFailure({
     code: "PROSE_GATE_UNAVAILABLE",
     failureKind: "dependency",
@@ -980,6 +1018,8 @@ test("materials shelf freezes digests and format stays path-stable", () => {
     digest: "设定乙",
     bodyChars: 100,
     fullBodyServed: true,
+    coveredSections: ["能力边界"],
+    exactEvidenceRanges: [{ startLine: 10, endLine: 20 }],
   });
   registerMaterialsShelfEntry(context, {
     path: "lore/a.md",
@@ -1005,6 +1045,8 @@ test("materials shelf freezes digests and format stays path-stable", () => {
   assert.match(prompt, /lore\/a\.md/);
   assert.match(prompt, /lore\/b\.md/);
   assert.match(prompt, /定点补读|block/);
+  assert.match(prompt, /coveredSections/);
+  assert.match(prompt, /exactEvidenceRanges/);
   // Sorted by path: a before b.
   assert.ok(prompt.indexOf("lore/a.md") < prompt.indexOf("lore/b.md"));
 });

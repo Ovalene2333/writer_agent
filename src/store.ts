@@ -1389,6 +1389,30 @@ export class WriterStore {
           digest: rowItem.digest,
           bodyChars: typeof rowItem.bodyChars === "number" ? rowItem.bodyChars : 0,
           fullBodyServed: rowItem.fullBodyServed === true,
+          ...(Array.isArray(rowItem.coveredSections)
+            ? { coveredSections: rowItem.coveredSections.filter((value): value is string => typeof value === "string") }
+            : {}),
+          ...(Array.isArray(rowItem.coveredFields)
+            ? { coveredFields: rowItem.coveredFields.filter((value): value is string => typeof value === "string") }
+            : {}),
+          ...(Array.isArray(rowItem.exactEvidenceRanges)
+            ? { exactEvidenceRanges: rowItem.exactEvidenceRanges.flatMap(value => {
+                if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+                const range = value as Record<string, unknown>;
+                return typeof range.startLine === "number" && typeof range.endLine === "number"
+                  ? [{ startLine: range.startLine, endLine: range.endLine }]
+                  : [];
+              }) }
+            : {}),
+          ...(Array.isArray(rowItem.artifactIds)
+            ? { artifactIds: rowItem.artifactIds.filter((value): value is number => typeof value === "number" && Number.isInteger(value)) }
+            : {}),
+          ...(rowItem.hardConstraints && typeof rowItem.hardConstraints === "object" && !Array.isArray(rowItem.hardConstraints)
+            ? { hardConstraints: rowItem.hardConstraints as import("./character_constraints.js").CharacterConstraintView }
+            : {}),
+          ...(rowItem.retention === "executable" || rowItem.retention === "coverage" || rowItem.retention === "recoverable"
+            ? { retention: rowItem.retention }
+            : {}),
         }];
       });
     } catch {
@@ -1411,6 +1435,12 @@ export class WriterStore {
       digest: item.digest,
       bodyChars: item.bodyChars,
       fullBodyServed: item.fullBodyServed,
+      ...(item.coveredSections?.length ? { coveredSections: item.coveredSections } : {}),
+      ...(item.coveredFields?.length ? { coveredFields: item.coveredFields } : {}),
+      ...(item.exactEvidenceRanges?.length ? { exactEvidenceRanges: item.exactEvidenceRanges } : {}),
+      ...(item.artifactIds?.length ? { artifactIds: item.artifactIds } : {}),
+      ...(item.hardConstraints ? { hardConstraints: item.hardConstraints } : {}),
+      ...(item.retention ? { retention: item.retention } : {}),
     })));
     const existing = this.database.prepare("SELECT 1 AS ok FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
     if (existing) {
@@ -2530,6 +2560,26 @@ export class WriterStore {
       attachments.push({ id, name, mimeType, size: bytes.length, storagePath });
     }
     return attachments;
+  }
+
+  /** Persist one trusted model output using the same private attachment layout as uploads. */
+  saveGeneratedImageAttachment(
+    sessionId: string,
+    input: { name?: string; mimeType: string; bytes: Buffer },
+  ): MessageAttachment {
+    const mimeType = normalizeImageMime(input.mimeType || "");
+    if (!isSupportedImageMime(mimeType)) throw new Error(`生图模型返回了不支持的图片类型：${input.mimeType || "unknown"}`);
+    if (!input.bytes.length) throw new Error("生图模型返回了空图片");
+    const maxGeneratedBytes = 20 * 1024 * 1024;
+    if (input.bytes.length > maxGeneratedBytes) throw new Error("生成图片超过 20MB，已拒绝保存");
+    const id = randomUUID();
+    const ext = extensionForImageMime(mimeType);
+    const storagePath = `attachments/${sessionId}/${id}.${ext}`;
+    const absolute = resolve(this.project.privateDir, storagePath);
+    mkdirSync(dirname(absolute), { recursive: true });
+    writeFileSync(absolute, input.bytes);
+    const name = (input.name?.trim() || `generated-image.${ext}`).slice(0, 120);
+    return { id, name, mimeType, size: input.bytes.length, storagePath };
   }
 
   resolveAttachmentBytes(sessionId: string, attachmentId: string): { mimeType: string; bytes: Buffer } | undefined {

@@ -44,7 +44,7 @@ test("registered construction rules feed generation and semantic review in stabl
   }
 });
 
-test("registered construction candidates wait for semantic review before hard blocking", () => {
+test("registered construction family budget blocks dense repetition before scene acceptance", () => {
   const clean = "门禁灯从绿变红。她停下脚步，掌心贴上金属门框。";
   assert.equal(sceneMannerismGateError(clean), undefined);
 
@@ -56,9 +56,9 @@ test("registered construction candidates wait for semantic review before hard bl
   ].join("");
   const issues = analyzeProseStyle(dense).filter(issue => issue.constructionRuleId === "negation_redefinition");
   assert.equal(issues.length, 4);
-  assert.ok(issues.every(issue => issue.severity === "warning"));
-  assert.equal(sceneMannerismGateError(dense), undefined);
-  assert.equal(proseStyleIssuesError(issues), undefined);
+  assert.equal(issues.filter(issue => issue.severity === "error").length, 3);
+  assert.ok(sceneMannerismGateError(dense));
+  assert.ok(proseStyleIssuesError(issues));
 });
 
 test("scene gate leaves a single split negation-redefinition for semantic review", () => {
@@ -66,9 +66,9 @@ test("scene gate leaves a single split negation-redefinition for semantic review
   assert.equal(blocked, undefined);
 });
 
-test("a couple of factual negation frames remain non-blocking", () => {
+test("a couple of factual negation frames share the short-scene family budget", () => {
   const blocked = sceneMannerismGateError("走廊里不是风声，是人的脚步。门后不是护士，是一名警卫。");
-  assert.equal(blocked, undefined);
+  assert.match(blocked ?? "", /句式家族/u);
 });
 
 test("pure negative enumeration is not mistaken for a positive redefinition", () => {
@@ -163,7 +163,7 @@ test("distinguishes dialogue correction from narrator abstract reframing", () =>
   assert.equal(contrastStyleError(narrationText), undefined);
 });
 
-test("repeated abstract contrast frames remain candidates until model adjudication", () => {
+test("repeated abstract contrast frames exceed a shared deterministic budget", () => {
   const text = [
     "这不是愤怒，而是一种更深的恐惧。",
     "那不是退让，只是另一种形式的反抗。",
@@ -172,9 +172,9 @@ test("repeated abstract contrast frames remain candidates until model adjudicati
   ].join("\n");
   const contrastIssues = analyzeProseStyle(text).filter(issue => issue.subtype === "abstract_reframing");
   assert.equal(contrastIssues.length, 4);
-  assert.ok(contrastIssues.every(issue => issue.severity === "warning"));
+  assert.equal(contrastIssues.filter(issue => issue.severity === "error").length, 3);
   assert.ok(contrastIssues.every(issue => issue.constructionRuleId === "negation_redefinition"));
-  assert.equal(contrastStyleError(text), undefined);
+  assert.ok(contrastStyleError(text));
 });
 
 test("a single abstract contrast remains advisory", () => {
@@ -201,6 +201,28 @@ test("detects postposed denial after an already established fact", () => {
   assert.equal(issue.severity, "warning");
   assert.match(issue.evidence, /不是紧张/u);
   assert.equal(proseStyleIssuesError([issue]), undefined);
+});
+
+test("derivative negation-redefinition forms share the registered family", () => {
+  const text = [
+    "屏幕上没有女儿的脸，只有数字、波形、温控曲线。",
+    "远端没有手指，没有脚趾，只有一阵沿着神经爬升的麻意。",
+    "这算不上撤退，只是把阵地让给下一班人。",
+  ].join("\n");
+  const issues = analyzeProseStyle(text).filter(issue => issue.constructionRuleId === "negation_redefinition");
+  assert.equal(issues.length, 3);
+  assert.equal(issues.filter(issue => issue.severity === "error").length, 2);
+  assert.ok(issues.every(issue => issue.countsTowardFamilyBudget === true));
+});
+
+test("unrelated local patches do not inherit a pre-existing family-budget failure", () => {
+  const before = "不是掉线。是往上跳。\n不是慢慢降，是断崖。\n不是下降，是横住。";
+  const after = `${before}\n窗外的雨停了。`;
+  assert.equal(newProseStyleIssues(before, after).some(issue => issue.severity === "error"), false);
+
+  const increased = `${after}\n没有回声，只有泵机稳定的低鸣。`;
+  assert.ok(newProseStyleIssues(after, increased).some(issue =>
+    issue.constructionRuleId === "negation_redefinition" && issue.severity === "error"));
 });
 
 test("allows a single factual split contrast pending semantic review", () => {

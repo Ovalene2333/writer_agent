@@ -22,6 +22,7 @@ export type ProviderModel = { id: string; name: string; pricing: Pricing; temper
 export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible" | "openai-responses"; baseUrl: string; proxyUrl?: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
 export type ModelRole =
   | "agent"
+  | "image"
   | "flash"
   | "drafter"
   | "inline"
@@ -66,6 +67,7 @@ const WRITING_ROLES: RoleDefinition[] = [
   { id: "writer", name: "正文写作", detail: "续写、重写与长篇内容生成" },
   { id: "reviewer", name: "审阅校对", detail: "质量检查、润色与修改建议；关闭「终审跟随正文模型」后才用于整章终审" },
   { id: "summarizer", name: "上下文摘要", detail: "压缩历史内容以控制上下文长度" },
+  { id: "image", name: "图片生成", detail: "生成封面、插图与视觉参考；OpenAI 可分配 gpt-image-2" },
 ];
 
 const ROLEPLAY_ROLES: RoleDefinition[] = [

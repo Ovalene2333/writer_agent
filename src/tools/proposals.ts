@@ -607,7 +607,10 @@ export async function submitFullDocumentProposal(
       context.rhythmGracePaths.delete(path);
     }
   }
-  if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
+  // A rhythm-grace draft is guaranteed to change before delivery. Reviewing it
+  // now creates a cold full-chapter call and stale blockers that the polished
+  // draft must pay to review again. Semantic review starts only after rhythm passes.
+  if (!rhythmRevisionRequired && !semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
     const blocked = await reviewDirectNarrativeProposal(args, path, meta.content, summary);
     if (blocked) return blocked;
   }

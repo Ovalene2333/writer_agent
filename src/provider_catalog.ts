@@ -46,9 +46,15 @@ export class ProviderManager {
   }
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
-    const { profile, model } = this.assigned(role); const baseUrl = process.env.WRITER_BASE_URL || profile.baseUrl;
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: process.env.WRITER_BASE_URL ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: process.env.WRITER_API_KEY || profile.apiKey, model: process.env.WRITER_MODEL || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP, frequencyPenalty: model.frequencyPenalty, presencePenalty: model.presencePenalty, reasoningEffort: model.reasoningEffort, verbosity: model.verbosity, disableSampling: model.disableSampling, supportsMultimodal: model.supportsMultimodal };
+    const { profile, model } = this.assigned(role);
+    const imageRole = role === "image";
+    const baseUrl = (imageRole ? process.env.WRITER_IMAGE_BASE_URL : undefined) || process.env.WRITER_BASE_URL || profile.baseUrl;
+    const environmentConfigured = imageRole
+      ? Boolean(process.env.WRITER_IMAGE_BASE_URL || process.env.WRITER_IMAGE_API_KEY || process.env.WRITER_IMAGE_MODEL)
+      : Boolean(process.env.WRITER_BASE_URL || process.env.WRITER_API_KEY || process.env.WRITER_MODEL);
+    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: environmentConfigured ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: (imageRole ? process.env.WRITER_IMAGE_PROXY_URL : undefined) || process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: (imageRole ? process.env.WRITER_IMAGE_API_KEY : undefined) || process.env.WRITER_API_KEY || profile.apiKey, model: (imageRole ? process.env.WRITER_IMAGE_MODEL : process.env.WRITER_MODEL) || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP, frequencyPenalty: model.frequencyPenalty, presencePenalty: model.presencePenalty, reasoningEffort: model.reasoningEffort, verbosity: model.verbosity, disableSampling: model.disableSampling, supportsMultimodal: model.supportsMultimodal };
   }
+  imageModelConfig(): ModelConfig { return this.modelConfig("image"); }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {
     const { profile, model } = this.active(); const config = this.modelConfig();
@@ -378,6 +384,7 @@ function parseCatalog(raw: string): SavedCatalog {
     parsed.assignments = parsed.assignments ?? {} as SavedCatalog["assignments"];
     const agentFallback = parsed.assignments.agent ?? fallback;
     const flashFallback = parsed.assignments.summarizer ?? parsed.assignments.inline ?? fallback;
+    parsed.assignments.image ??= fallback;
     parsed.assignments.roleplay ??= agentFallback;
     parsed.assignments.flash ??= flashFallback;
     // Dedicated roleplay slots preserve the exact pre-split routing on migration.
@@ -416,6 +423,7 @@ function parseCatalog(raw: string): SavedCatalog {
     activeModelId: modelId,
     assignments: {
       agent: fallback,
+      image: fallback,
       roleplay: fallback,
       roleplay_perception: fallback,
       roleplay_quality: fallback,
@@ -449,10 +457,12 @@ function parseCatalog(raw: string): SavedCatalog {
 function defaultCatalog(): SavedCatalog {
   const openAiId = randomUUID();
   const openAiModelId = randomUUID();
+  const openAiImageModelId = randomUUID();
   const deepseekId = randomUUID();
   const deepseekFlashId = randomUUID();
   const deepseekProId = randomUUID();
   const fallback = { providerId: openAiId, modelId: openAiModelId };
+  const image = { providerId: openAiId, modelId: openAiImageModelId };
   const flash = { providerId: deepseekId, modelId: deepseekFlashId };
   return {
     version: 2,
@@ -460,6 +470,7 @@ function defaultCatalog(): SavedCatalog {
     activeModelId: openAiModelId,
     assignments: {
       agent: fallback,
+      image,
       roleplay: fallback,
       roleplay_perception: fallback,
       roleplay_quality: flash,
@@ -478,11 +489,18 @@ function defaultCatalog(): SavedCatalog {
         provider: "openai-compatible",
         baseUrl: "https://api.openai.com/v1",
         apiKey: "",
-        models: [{
-          id: openAiModelId,
-          name: "gpt-4.1-mini",
-          pricing: defaultPricing("openai-compatible", "gpt-4.1-mini"),
-        }],
+        models: [
+          {
+            id: openAiModelId,
+            name: "gpt-4.1-mini",
+            pricing: defaultPricing("openai-compatible", "gpt-4.1-mini"),
+          },
+          {
+            id: openAiImageModelId,
+            name: "gpt-image-2",
+            pricing: defaultPricing("openai-compatible", "gpt-image-2"),
+          },
+        ],
       },
       {
         id: deepseekId,
@@ -508,7 +526,7 @@ function defaultCatalog(): SavedCatalog {
 }
 function modelRoles(): ModelUsageRole[] {
   return [
-    "agent", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
+    "agent", "image", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
     "roleplay", "roleplay_perception", "roleplay_quality", "roleplay_memory",
   ];
 }

@@ -23,6 +23,7 @@
 - **风格模板**：内置网文爽文、传统文学、轻小说、悬疑推理、玄幻仙侠等
 - **现场感计量**：句式门禁与复用计量之外的加法层，测量对白占比、感官通道、具体物件锚点与句长起伏；只提示不拦截，并参与候选择优
 - **多模型分工**：可为 agent / roleplay / writer / reviewer 等角色配置不同供应商与模型
+- **图片生成**：可为图片生成分配独立模型（如 `gpt-image-2`），由 Agent 生成封面、插图和视觉参考并直接附到回复
 - **导出**：按章节顺序导出完整作品为 Markdown 或纯文本
 
 ## 环境要求
@@ -244,6 +245,10 @@ style: ""   # 可设为风格模板 id，如 light-novel
 | `WRITER_API_KEY` | API Key |
 | `WRITER_BASE_URL` | API Base URL，如 `https://api.deepseek.com` |
 | `WRITER_MODEL` | 模型名 |
+| `WRITER_IMAGE_BASE_URL` | 可选；生图 API Base URL，默认复用供应商或 `WRITER_BASE_URL` |
+| `WRITER_IMAGE_API_KEY` | 可选；生图 API Key，默认复用供应商或 `WRITER_API_KEY` |
+| `WRITER_IMAGE_MODEL` | 可选；生图模型名，覆盖“图片生成”角色分配 |
+| `WRITER_IMAGE_PROXY_URL` | 可选；仅生图请求使用的 HTTP(S) 代理 |
 | `WRITER_PROVIDERS_FILE` | 供应商配置文件路径（默认 `.writer/providers.json`；可指向共享文件以便跨项目迁移） |
 | `WRITER_DEBUG` | 设为 `1` / `true` 时打印 **step 内容** 与模型请求/原始返回 |
 | `WRITER_DEBUG_STEPS` | 设为 `1` / `true` 时**仅**打印 Agent step（reasoning / tools / output），不含模型 HTTP 原文 |

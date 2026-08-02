@@ -346,6 +346,49 @@ test("direct chapter proposal blocks factual knowledge leaks before creating a p
   }
 });
 
+test("rhythm-grace draft defers the cold semantic review until the polished submission", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-rhythm-review-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "节奏分阶段终审");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("节奏分阶段终审");
+    let reviewCalls = 0;
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      rhythmGracePaths: new Set(),
+      chapterReviewer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "reviewer-test" },
+        run: async () => {
+          reviewCalls += 1;
+          return {
+            review: {
+              verdict: "pass" as const,
+              chapterChange: "完成短句草稿",
+              reviewNotes: "通过",
+              issues: [],
+            },
+          };
+        },
+      },
+    };
+    const args = {
+      input: {}, project, store, sessionId, emit: (_event: AgentEvent) => {}, context,
+    };
+    const shortDraft = `# 第一章\n\n${"雨停了。风又起。灯还亮。门没开。\n\n".repeat(80)}`;
+    const result = JSON.parse(await submitFullDocumentProposal(
+      args, "chapters/第一章.md", shortDraft, "短句节奏草稿", undefined,
+    )) as Record<string, unknown>;
+
+    assert.equal(result.code, "RHYTHM_POLISH_REQUIRED");
+    assert.equal(reviewCalls, 0);
+    assert.equal(store.proposals().length, 1);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Agent can reshape the unwritten scene guide without changing completed prose", () => {
   let draft = beginChapterSceneDraft({
     path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
@@ -753,12 +796,12 @@ test("scene gate applies sparse sentence repairs before asking for a rewrite", a
     const activeStore = store;
     const sessionId = activeStore.createSession("逐句修订");
     let repairCalls = 0;
-    const replacements = [
-      "走廊尽头传来逃跑的脚步声。",
-      "悬浮颗粒让空气发涩。",
-      "油性液体在地面反光。",
-      "预埋装药震得立柱发颤。",
-    ];
+    const replacements = new Map([
+      ["不是埋伏。是逃跑。", "走廊尽头传来逃跑的脚步声。"],
+      ["不是气体。是悬浮颗粒。", "悬浮颗粒让空气发涩。"],
+      ["不是水。是油性液体。", "油性液体在地面反光。"],
+      ["不是塌方。是预埋装药。", "预埋装药震得立柱发颤。"],
+    ]);
     const context: ToolExecutionContext = {
       permissionMode: "ask",
       chapterStyleRepairer: {
@@ -768,7 +811,7 @@ test("scene gate applies sparse sentence repairs before asking for a rewrite", a
           return {
             edits: input.issues.map((issue, index) => ({
               search: issue.sentence,
-              replace: replacements[index] ?? `门禁句已按原事实改为直接陈述${index + 1}。`,
+              replace: replacements.get(issue.sentence) ?? `门禁句已按原事实改为直接陈述${index + 1}。`,
             })),
             requestCharacters: 300,
           };
@@ -802,7 +845,9 @@ test("scene gate applies sparse sentence repairs before asking for a rewrite", a
     };
     assert.ok(autoFixes.sceneStyleEdits.length > 0);
     assert.equal(autoFixes.sceneStyleRepairAttempts, 1);
-    assert.doesNotMatch(context.chapterSceneDraft?.completed[0].content ?? "", /不是/u);
+    const repairedContent = context.chapterSceneDraft?.completed[0].content ?? "";
+    assert.equal((repairedContent.match(/不是/gu) ?? []).length, 1, "家族预算内可保留一个不可替代实例");
+    assert.match(repairedContent, /悬浮颗粒让空气发涩/u);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

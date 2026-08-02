@@ -102,18 +102,17 @@ export const DEFAULT_ROLEPLAY_RERUN_CONTROLS: RoleplayRerunControls = {
   contentRating: "default",
 };
 export const ROLEPLAY_CONTINUATION_PLACEHOLDER = "<续演>";
-/** Ongoing length preference with approximate ranges produced through block guidance. */
+/** Ongoing qualitative length preference. Numeric budgets remain an internal implementation detail. */
 export type RoleplayLengthLevel = -2 | -1 | 0 | 1 | 2;
 export const ROLEPLAY_LENGTH_OPTIONS: Array<{
   level: RoleplayLengthLevel;
   label: string;
-  rangeLabel: string;
 }> = [
-  { level: -2, label: "极简", rangeLabel: "60–100 字" },
-  { level: -1, label: "精简", rangeLabel: "120–200 字" },
-  { level: 0, label: "适中", rangeLabel: "180–320 字" },
-  { level: 1, label: "充分", rangeLabel: "300–480 字" },
-  { level: 2, label: "展开", rangeLabel: "450–700 字" },
+  { level: -2, label: "极简" },
+  { level: -1, label: "精简" },
+  { level: 0, label: "适中" },
+  { level: 1, label: "充分" },
+  { level: 2, label: "展开" },
 ];
 export function roleplayLengthOption(level: number) {
   const normalized = Math.max(-2, Math.min(2, Math.round(level || 0))) as RoleplayLengthLevel;

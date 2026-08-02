@@ -354,11 +354,11 @@ export async function recommendRoleplayDirectorActions(options: {
   return [...new Set(suggestions)].slice(0, 3);
 }
 
-const ROLEPLAY_AUTO_REPLY_SYSTEM = `你为角色对戏生成“当前身份”的下一条角色内回复。你不是导演，也不扮演对面的 performer。
+const ROLEPLAY_AUTO_REPLY_SYSTEM = `你只为与 AI 扮演者对话的用户身份（playerIdentity）生成下一条角色内回复。playerIdentity 是用户在本场对话中使用的身份；performedCharacter 是对面的 AI 扮演者。你不是导演，绝不能代替 performedCharacter 回复。
 规则：
-1. reply 会作为 identity 本人撰写的玩家输入直接填入输入框，必须始终采用第一人称主观视角。动作、感受和内心用“我”或省略主语来写；不得用 identity 的姓名、“他”“她”或“TA”指代 identity 自己，也不得使用小说旁白式的第三人称叙述。
-2. 直接承接 recentTranscript 中 performer 最新的演出，结合 identityCard、performerCard 和 scene 中已经给出的设定；不得发明新经历、能力、物件、数值或场景结果。
-3. 只写 identity 自己此刻会说出口的话、外显动作和必要的内心；不得替 performer 或其他角色决定言行、感受和结果。保持 identity 的身份、关系、知识、目标和声线，角色卡即使以第三人称描述，也不能改变 reply 的第一人称视角。
+1. reply 会作为 playerIdentity 本人撰写的用户输入直接填入输入框，必须始终采用第一人称主观视角。动作、感受和内心用“我”或省略主语来写；不得用 playerIdentity 的姓名、“他”“她”或“TA”指代自己，也不得使用小说旁白式的第三人称叙述。
+2. recentTranscript 中 role=user 的历史消息属于 playerIdentity，role=assistant 的历史消息属于 performedCharacter。直接承接 performedCharacter 最新的演出，结合 playerIdentityCard、performedCharacterCard 和 scene 中已经给出的设定；不得发明新经历、能力、物件、数值或场景结果。
+3. 只写 playerIdentity 自己此刻会说出口的话、外显动作和必要的内心；不得替 performedCharacter 或其他角色决定言行、感受和结果。保持 playerIdentity 的身份、关系、知识、目标和声线，角色卡即使以第三人称描述，也不能改变 reply 的第一人称视角。
 4. 可以混合动作与台词；台词用引号清楚标示，内心不得伪装成说出口的话。动作只写 identity 自己的尝试，不确认对方反应。不要使用 <action>、<dialogue>、<ooc> 标签或 Markdown。
 5. 选择一个核心反应，写成自然的玩家角色内输入，不分析、不解释、不复述对方整段内容，也不使用 OOC 或导演指令。默认写 30–100 个汉字，至多一个简短动作和两句短台词；只在承接现场确有必要时略微超出。
 6. 禁用「不是……是/而是……」及「不是……。是……。」先否定再改判；直接写要做的事或要说的话。
@@ -376,10 +376,10 @@ export function buildRoleplayAutoReplyMessages(options: {
     {
       role: "user",
       content: JSON.stringify({
-        performer: options.performer.name,
-        performerCard: options.performer.card,
-        identity: options.identity.name,
-        identityCard: options.identity.card,
+        performedCharacter: options.performer.name,
+        performedCharacterCard: options.performer.card,
+        playerIdentity: options.identity.name,
+        playerIdentityCard: options.identity.card,
         scene: options.scene ? {
           name: options.scene.name,
           setting: options.scene.setting,

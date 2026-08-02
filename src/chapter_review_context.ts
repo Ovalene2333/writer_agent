@@ -2,6 +2,7 @@ import type { Character } from "./types.js";
 import type { WriterProject } from "./project.js";
 import type { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
+import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
 
 const REVIEW_CONTEXT_CHARACTER_LIMIT = 8;
 const REVIEW_CONTEXT_EXCERPT_LIMIT = 5_000;
@@ -43,6 +44,15 @@ export function buildFactualChapterReviewContext(options: {
         || character.identity.aliases.some(alias => factCharacterNames.has(alias)))
     .slice(0, REVIEW_CONTEXT_CHARACTER_LIMIT)
     .map(characterReviewView);
+  const constraintMismatches = characters.flatMap(character => {
+    const writerHash = context.writerCharacterConstraintHashes?.get(character.id);
+    return writerHash && writerHash !== character.constraintHash
+      ? [{ characterId: character.id, writerHash, reviewerHash: character.constraintHash }]
+      : [];
+  });
+  if (constraintMismatches.length) {
+    throw new Error(`Writer/Reviewer 角色硬约束不一致：${JSON.stringify(constraintMismatches)}`);
+  }
 
   const excerpts: Array<{ path: string; startLine: number; endLine: number; content: string }> = [];
   let excerptCharacters = 0;
@@ -71,7 +81,8 @@ export function buildFactualChapterReviewContext(options: {
   return [options.baseContext?.trim(), evidencePacket].filter(Boolean).join("\n\n");
 }
 
-function characterReviewView(character: Character) {
+export function characterReviewView(character: Character) {
+  const constraints = characterConstraintView(character);
   const relationships = character.relationships.slice(0, 12).map(item => ({
     characterId: item.characterId,
     type: item.type,
@@ -86,25 +97,10 @@ function characterReviewView(character: Character) {
     aliases: character.identity.aliases,
     identity: character.identity.summary,
     background: character.profile.backgroundSummary,
+    constraints,
+    constraintHash: characterConstraintHash(constraints),
     relationships,
-    competencies: character.competencies.slice(0, 12).map(item => ({
-      name: item.name,
-      unlocked: item.unlocked,
-      summary: item.summary,
-      limitations: item.limitations,
-      costs: item.costs,
-      validity: { from: item.validFrom, until: item.validUntil },
-    })),
-    storyStates: character.storyStates.slice(-4).map(state => ({
-      anchor: state.outlineNodeId ?? (state.unanchored ? "unanchored" : ""),
-      validity: { from: state.validFrom, until: state.validUntil },
-      location: state.location,
-      physical: state.physical,
-      knowledge: state.knowledge.map(item => item.description || item.label),
-      beliefs: state.beliefs.map(item => item.description || item.label),
-      intentions: state.intentions,
-      notes: state.notes,
-    })),
+    intentions: character.storyStates.slice(-4).flatMap(state => state.intentions),
     experiences: character.experiences.slice(-8).map(item => ({
       fact: item.description || item.label,
       validity: { from: item.validFrom, until: item.validUntil },

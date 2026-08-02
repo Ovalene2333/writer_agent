@@ -25,6 +25,7 @@ import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
 import { extractContinuityFacts } from "./continuity_facts.js";
+import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
 import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
 import {
   buildMultimodalUserContent,
@@ -63,7 +64,7 @@ import {
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
-import { decideProposalFailure } from "./proposal_retry.js";
+import { decideProposalFailure, isExpectedRhythmPolish } from "./proposal_retry.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
   buildProjectTrunk,
@@ -272,7 +273,7 @@ type WritingTaskMode = "brainstorm" | "outline" | "write_scene" | "rewrite" | "a
 type DocumentContextMode = "none" | "search" | "target" | "continuation";
 type CreativeDepth = "explore" | "shape" | "deliver";
 export type EditScope = "point" | "section" | "document";
-type AgentRoleModels = Partial<Record<"agent" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
+type AgentRoleModels = Partial<Record<"agent" | "image" | "inline" | "writer" | "reviewer" | "summarizer", ModelConfig>>;
 
 export interface PlannedProseGateCandidate {
   id: string;
@@ -889,7 +890,7 @@ async function compileWritingTaskContract(
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
 JSON 总长度不超过 1600 字符；字符串保持简短，todoPlan 每项不超过 40 字。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出对象，否则省略)。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出对象，否则省略)。
 契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
 正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
@@ -899,6 +900,7 @@ documentContext 判定（关键，勿默认 none）：
 - target：用户指定或语义可确定单篇文档要读/改。
 - continuation：承接上一轮正文续写。
 纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件或多文件原子变更时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；非 Markdown 文件不必出现在 documents 目录，执行阶段先用 list_files 定位，再用 propose_change_set。
+图片产物：用户明确要求生成封面、插图、概念图或视觉参考时 capabilities 必须含 images；单独生图用 outcome=answer、mutation=none，若还要求文档/角色写入则保留相应 outcome 与 mutation。只讨论画面或撰写生图提示词时不要加入 images。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
 连续对话中，若 recentHistory 已明确当前操作对象是角色卡，当前 user 用“修复/调整/删除/改成”等省略说法继续修改该对象，仍用 character、outcome=character、mutation=character；除非当前 user 明确改为正文、大纲或 resource/ 文档任务。不得仅因动作是“修改”就判为 rewrite；rewrite 的交付对象必须是文档正文。
 用户要求创作/设计一个具体人物，并主要描述其身份、外貌、性格、能力或关系时，即使没有说“角色卡”，也使用 character，outcome=character、mutation=character；只有明确要求“一段/片段/场景/章节/正文”来表现该人物时才使用 write_scene。
@@ -1046,7 +1048,7 @@ proseGateCandidate 格式：{"id":"稳定英文短ID","instruction":"可独立�
     && (mode === "rewrite" || mode === "audit")) {
     evidence = "target";
   }
-  const capabilityValues: AgentCapability[] = ["research", "documents", "files", "outline", "scenes", "characters", "review"];
+  const capabilityValues: AgentCapability[] = ["research", "documents", "files", "outline", "scenes", "characters", "review", "images"];
   const requestedCapabilities = Array.isArray(parsed.capabilities)
     ? parsed.capabilities.filter((item): item is AgentCapability => capabilityValues.includes(item as AgentCapability))
     : [];
@@ -1309,7 +1311,7 @@ ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${is
     : "先判断构思/规划/写作/改写/审校再执行。改正文须先读原文并提案；待批准变化→characterChanges；已确认→apply_character_changes。";
 }
 
-function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[], simpleCharacterScope?: number[]): string {
+function scopedCharacterConstraintPackets(store: WriterStore, task: WritingTask, characterScope?: number[]) {
   const rankedCharacters = store.characters().map((item) => ({
     item, score: task.characterIds.includes(item.id) ? 1 : 0,
   })).sort((a, b) => b.score - a.score || a.item.identity.name.localeCompare(b.item.identity.name, "zh-CN"));
@@ -1317,9 +1319,28 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
   const selectedCharacters = scopedIds
     ? rankedCharacters.filter(entry => scopedIds.has(entry.item.id))
     : rankedCharacters.filter((entry) => entry.score > 0).slice(0, 4);
-  const characters = selectedCharacters.map(({ item }) => ({
-    id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary,
-  }));
+  return selectedCharacters.map(({ item }) => {
+    const constraints = characterConstraintView(item);
+    return {
+      item,
+      constraints,
+      constraintHash: characterConstraintHash(constraints),
+    };
+  });
+}
+
+function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[], simpleCharacterScope?: number[]): string {
+  const characters = scopedCharacterConstraintPackets(store, task, characterScope).map(({ item, constraints, constraintHash }) => {
+    return {
+      id: item.id,
+      name: item.identity.name,
+      aliases: item.identity.aliases,
+      narrativeRole: item.identity.narrativeRole,
+      identity: item.identity.summary,
+      constraints,
+      constraintHash,
+    };
+  });
   // Simple cards are rarely needed outside simple_character / scoped roleplay — avoid dumping 20 cards every turn.
   const simpleScopedIds = simpleCharacterScope === undefined ? undefined : new Set(simpleCharacterScope);
   const includeSimple = task.mode === "simple_character" || simpleCharacterScope !== undefined;
@@ -1741,6 +1762,177 @@ function saveProposalRevisionDraft(
   }
 }
 
+export type ProposalRevisionIssue = {
+  id: string;
+  severity: string;
+  kind: string;
+  evidence: string[];
+  problem: string;
+  action: string;
+};
+
+export type ProposalRevisionCase = {
+  revisionCaseId: string;
+  path?: string;
+  draftArtifactId: number;
+  draftSourceHash: string;
+  reviewArtifactId: number;
+  attempt: number;
+  unresolvedIssues: ProposalRevisionIssue[];
+  resolvedIssueIds: string[];
+  stillPresentIssueIds: string[];
+  newlyIntroducedIssueIds: string[];
+  status: "blocked" | "resolved";
+  retention: "executable";
+};
+
+type ProposalRevisionDraftRef = {
+  artifactId: number;
+  path?: string;
+  sourceHash: string;
+  revisionCase?: ProposalRevisionCase;
+};
+
+function proposalRevisionIssues(result: Record<string, unknown>): ProposalRevisionIssue[] {
+  const review = result.chapterReview;
+  const rawIssues = review && typeof review === "object" && !Array.isArray(review)
+    && Array.isArray((review as Record<string, unknown>).issues)
+    ? (review as Record<string, unknown>).issues as unknown[]
+    : [];
+  const issues = rawIssues.flatMap(raw => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const value = raw as Record<string, unknown>;
+    const evidence = Array.isArray(value.evidence)
+      ? value.evidence.filter((item): item is string => typeof item === "string").slice(0, 3)
+      : [];
+    const problem = typeof value.problem === "string" ? value.problem.trim() : "";
+    const action = typeof value.action === "string" ? value.action.trim() : "";
+    if (!problem && !action && !evidence.length) return [];
+    const kind = typeof value.kind === "string" ? value.kind : "review";
+    const identity = JSON.stringify([
+      kind,
+      evidence.length ? evidence.map(item => item.replace(/\s+/g, " ").trim()) : problem.replace(/\s+/g, " ").trim(),
+    ]);
+    return [{
+      id: `issue:${createHash("sha256").update(identity).digest("hex").slice(0, 12)}`,
+      severity: typeof value.severity === "string" ? value.severity : "blocker",
+      kind,
+      evidence,
+      problem,
+      action,
+    }];
+  });
+  if (issues.length) return issues.slice(0, 8);
+  const fallback = [result.message, result.error, result.rhythmGate]
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  if (!fallback) return [];
+  const problem = fallback.replace(/\s+/g, " ").trim().slice(0, 1_200);
+  return [{
+    id: `issue:${createHash("sha256").update(problem).digest("hex").slice(0, 12)}`,
+    severity: "blocker",
+    kind: typeof result.code === "string" ? result.code : "proposal_gate",
+    evidence: [],
+    problem,
+    action: "按门禁原因做最小修订后重新提交。",
+  }];
+}
+
+function saveProposalRevisionCase(
+  draft: { artifactId: number; path?: string; sourceHash: string },
+  result: Record<string, unknown>,
+  attempt: number,
+  store: WriterStore,
+  sessionId: string,
+  previous?: ProposalRevisionCase,
+): ProposalRevisionDraftRef {
+  if (previous?.path !== draft.path) previous = undefined;
+  const unresolvedIssues = proposalRevisionIssues(result);
+  const previousIds = new Set(previous?.unresolvedIssues.map(issue => issue.id) ?? []);
+  const currentIds = new Set(unresolvedIssues.map(issue => issue.id));
+  const revisionCaseId = previous?.revisionCaseId
+    ?? `revision:${createHash("sha256").update(`${draft.path ?? "document"}:${draft.sourceHash}`).digest("hex").slice(0, 16)}`;
+  const base = {
+    revisionCaseId,
+    path: draft.path,
+    draftArtifactId: draft.artifactId,
+    draftSourceHash: draft.sourceHash,
+    attempt,
+    unresolvedIssues,
+    resolvedIssueIds: [...previousIds].filter(id => !currentIds.has(id)),
+    stillPresentIssueIds: [...currentIds].filter(id => previousIds.has(id)),
+    newlyIntroducedIssueIds: [...currentIds].filter(id => !previousIds.has(id)),
+    status: "blocked" as const,
+    retention: "executable" as const,
+  };
+  const sourceHash = createHash("sha256").update(JSON.stringify(base)).digest("hex");
+  const reviewArtifactId = store.saveContextArtifact(sessionId, {
+    cacheKey: `proposal_revision_case:${revisionCaseId}:${attempt}:${sourceHash}`,
+    kind: "proposal_revision_case",
+    path: draft.path,
+    sourceHash,
+    content: JSON.stringify(base),
+    digest: `${draft.path ?? "当前文档"} 修订案例第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
+  });
+  const revisionCase: ProposalRevisionCase = { ...base, reviewArtifactId };
+  const revisionCaseSourceHash = createHash("sha256").update(JSON.stringify(revisionCase)).digest("hex");
+  store.saveContextArtifact(sessionId, {
+    cacheKey: `proposal_revision_case:${revisionCaseId}:${attempt}:${sourceHash}`,
+    kind: "proposal_revision_case",
+    path: draft.path,
+    sourceHash: revisionCaseSourceHash,
+    content: JSON.stringify(revisionCase),
+    digest: `${draft.path ?? "当前文档"} 修订案例第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
+  });
+  return { ...draft, revisionCase };
+}
+
+function closeProposalRevisionCase(
+  current: ProposalRevisionCase,
+  store: WriterStore,
+  sessionId: string,
+): void {
+  const closed: ProposalRevisionCase = {
+    ...current,
+    reviewArtifactId: current.reviewArtifactId,
+    unresolvedIssues: [],
+    resolvedIssueIds: [...new Set([...current.resolvedIssueIds, ...current.unresolvedIssues.map(issue => issue.id)])],
+    stillPresentIssueIds: [],
+    newlyIntroducedIssueIds: [],
+    status: "resolved",
+  };
+  const sourceHash = createHash("sha256").update(JSON.stringify(closed)).digest("hex");
+  store.saveContextArtifact(sessionId, {
+    cacheKey: `proposal_revision_case:${current.revisionCaseId}:resolved:${sourceHash}`,
+    kind: "proposal_revision_case",
+    path: current.path,
+    sourceHash,
+    content: JSON.stringify(closed),
+    digest: `${current.path ?? "当前文档"} 修订案例已解决`,
+  });
+}
+
+function restoreActiveProposalRevisionCase(
+  store: WriterStore,
+  sessionId: string,
+  targetPath?: string,
+): ProposalRevisionCase | undefined {
+  const seen = new Set<string>();
+  for (const metadata of store.recentContextArtifacts(sessionId, 32)) {
+    if (metadata.kind !== "proposal_revision_case") continue;
+    const artifact = store.contextArtifactById(sessionId, metadata.id);
+    if (!artifact) continue;
+    try {
+      const value = JSON.parse(artifact.content) as ProposalRevisionCase;
+      if (!value.revisionCaseId || seen.has(value.revisionCaseId)) continue;
+      seen.add(value.revisionCaseId);
+      if (value.status !== "blocked" || !Array.isArray(value.unresolvedIssues)) continue;
+      if (targetPath && value.path && value.path !== targetPath) continue;
+      return value;
+    } catch { /* ignore invalid legacy work-memory artifacts */ }
+  }
+  return undefined;
+}
+
 const PROPOSAL_SUBMISSION_TOOLS = new Set([
   "propose_document",
   "write_document_isolated",
@@ -1753,13 +1945,16 @@ const PROPOSAL_SUBMISSION_TOOLS = new Set([
 
 function proposalRevisionBoundaryPrompt(
   prompt: string,
-  draft?: { artifactId: number; path?: string; sourceHash: string },
+  draft?: ProposalRevisionDraftRef,
 ): string {
   if (!draft) return prompt;
   return [
     prompt,
     `最新版待修订正文已保存为工作记忆 artifactId=${draft.artifactId}`
       + `${draft.path ? `（${draft.path}）` : ""}，sourceHash=${draft.sourceHash.slice(0, 12)}。`,
+    draft.revisionCase
+      ? `修订案例 ${draft.revisionCase.revisionCaseId} 已持久化为 reviewArtifactId=${draft.revisionCase.reviewArtifactId}；未解决项必须逐项闭合。`
+      : "",
     "旧版完整提案与驳回工具链已卸下。先用 read_context_artifact 分页读取该 artifact，"
       + "只按上述驳回点修订，然后重新提交；禁止重读设定或从头另写。",
   ].join("\n");
@@ -1768,7 +1963,7 @@ function proposalRevisionBoundaryPrompt(
 function proposalFailurePauseResult(
   result: Record<string, unknown>,
   reason: "dependency" | "invalid_request" | "revision_exhausted",
-  draft?: { artifactId: number; path?: string; sourceHash: string },
+  draft?: ProposalRevisionDraftRef,
 ): Record<string, unknown> {
   const dependency = reason === "dependency";
   const exhausted = reason === "revision_exhausted";
@@ -1800,7 +1995,16 @@ function proposalFailurePauseResult(
         : "提案审核依赖暂时不可用；恢复后可续跑。"
       : "提案自动修订已停止，请检查驳回信息后决定是否续跑。",
     options: ["续跑"],
-    ...(draft ? { artifactId: draft.artifactId, path: draft.path, sourceHash: draft.sourceHash } : {}),
+    ...(draft ? {
+      artifactId: draft.artifactId,
+      path: draft.path,
+      sourceHash: draft.sourceHash,
+      ...(draft.revisionCase ? {
+        revisionCaseId: draft.revisionCase.revisionCaseId,
+        reviewArtifactId: draft.revisionCase.reviewArtifactId,
+        unresolvedIssues: draft.revisionCase.unresolvedIssues,
+      } : {}),
+    } : {}),
   };
 }
 
@@ -1808,6 +2012,7 @@ function proposalFailurePauseResult(
 export function proposalRevisionConvergePrompt(
   result: Record<string, unknown>,
   attempt: number,
+  revisionCase?: ProposalRevisionCase,
 ): string {
   const status = typeof result.status === "string" ? result.status : "rejected";
   const code = typeof result.code === "string" ? result.code : "";
@@ -1825,16 +2030,21 @@ export function proposalRevisionConvergePrompt(
   const hardLimit = attempt >= 2;
   const rhythmBlock = /节奏硬拦截|碎句|缩词|连发碎句|电报句|RHYTHM_POLISH/.test(rawMessage + code);
   const firstRoundPolish = result.rhythmRevisionRequired === true || code === "RHYTHM_POLISH_REQUIRED";
+  const blockerPacket = revisionCase?.unresolvedIssues.length
+    ? `不可压缩 blocker（ID/evidence/problem/action）：${JSON.stringify(revisionCase.unresolvedIssues)}`
+    : "";
   if (firstRoundPolish) {
     return [
       `首轮情节/场面草稿已接收（${path || "当前文档"}），句式节奏尚未达标——这是预期中的第二步，不是失败。`,
       message ? `验收与样例：${message}` : "",
+      blockerPacket,
       "请在保留情节、场面与人物选择的前提下，按验收线通读合并碎句、恢复双音节用词并补静场绵延句，然后 propose_document 覆盖修订；禁止重读已读设定、禁止另起大纲或重写剧情。",
     ].filter(Boolean).join("\n");
   }
   return [
     `文档提案未创建（${status}${code ? `/${code}` : ""}，修订窗口第 ${attempt} 次${path ? `，路径 ${path}` : ""}）。`,
     message ? `原因：${message}` : "",
+    blockerPacket,
     rhythmBlock
       ? (hardLimit
         ? "节奏最后一轮：按原因里的验收线通读全章合并碎句、恢复双音节用词并补绵延句后重新提交一次；禁止只改样例三句或另起大纲。若仍不达标，manage_todos 标明阻塞或 ask_user。"
@@ -2092,6 +2302,7 @@ export async function runAgent(options: {
     task.proseGateRequired = false;
     task.workflow = "free";
     task.qualityProfile = "fast";
+    task.capabilities = task.capabilities.filter(capability => capability !== "images");
   }
   emit({
     type: "task_contract",
@@ -2283,6 +2494,7 @@ export async function runAgent(options: {
   };
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    ...(options.models?.image ? { imageGenerator: { model: options.models.image, signal } } : {}),
     sourceMessageId,
     editScope: task.editScope,
     ...(selectedEditLock ? { editTargetLocked: selectedEditLock } : {}),
@@ -2293,6 +2505,10 @@ export async function runAgent(options: {
     materialsShelf: hydrateSessionMaterialsShelf(store, sessionId, project),
     simpleCharacterScope,
     reviewCharacterIds: [...new Set([...task.characterIds, ...(characterScope ?? [])])],
+    writerCharacterConstraintHashes: new Map(
+      scopedCharacterConstraintPackets(store, task, characterScope)
+        .map(({ item, constraintHash }) => [item.id, constraintHash]),
+    ),
     characterEvolutionEnabled: runtimeSettings.characterEvolutionEnabled,
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
     ...(restoredChapterDraft ? { chapterSceneDraft: restoredChapterDraft } : {}),
@@ -2366,6 +2582,18 @@ export async function runAgent(options: {
           },
         }
       : {}),
+  };
+  const persistAssistantMessage = (content: string): number => {
+    const attachments = toolContext.generatedAttachments?.splice(0);
+    return store.addMessage(
+      sessionId,
+      "assistant",
+      content,
+      "agent",
+      options.variantGroupId,
+      undefined,
+      attachments?.length ? attachments : undefined,
+    );
   };
   // Assemble per PROMPT / PREFIX-CACHE CONTRACT (top of this file):
   // stable 6 + project trunk + replayed frozen turns + this turn's context block,
@@ -2594,7 +2822,11 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   let transcript = "";
   let documentProposalSubmitted = false;
   /** Consecutive blocked propose_* attempts in this job (reset on success). */
-  let proposalRevisionAttempts = 0;
+  let activeProposalRevisionCase = restoreActiveProposalRevisionCase(
+    store, sessionId, task.targetPath ?? continuationPath,
+  );
+  let proposalRevisionAttempts = activeProposalRevisionCase?.attempt ?? 0;
+  /** Non-compressible blocker state for the active proposal retry chain. */
   /** Cached prefix immediately before the first full-body proposal in a retry chain. */
   let proposalRetryBase: number | undefined;
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
@@ -2967,7 +3199,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           continue;
         }
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
-        store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+        persistAssistantMessage(answer);
         // This step's reply was never pushed into `messages` (the loop returns here),
         // so close the transcript before freezing — otherwise the next turn replays a
         // tool result with no answer after it.
@@ -3004,8 +3236,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       const chapterReviewRejectedTools: string[] = [];
       /** Injected after all tool results of this step (never between tool rows). */
       let pendingProposalRevisionPrompt: string | undefined;
-      let pendingProposalRevisionDraft:
-        { artifactId: number; path?: string; sourceHash: string } | undefined;
+      let pendingProposalRevisionDraft: ProposalRevisionDraftRef | undefined;
       for (const call of result.toolCalls) {
         let effectiveCall = call;
         emit({ type: "tool", name: call.name });
@@ -3089,6 +3320,9 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         } else {
           toolResult = await executeToolCached(effectiveCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
+        // Proposal control flow must read the complete structured review before a
+        // large tool result is archived/previewed; otherwise nested issues vanish.
+        const proposalControlResult = PROPOSAL_SUBMISSION_TOOLS.has(call.name) ? toolResult : undefined;
         toolResult = boundToolResultForModel(effectiveCall, toolResult, project, store, sessionId);
         let structuredToolResult: Record<string, unknown> | undefined;
         try {
@@ -3179,28 +3413,26 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         // treating them as success used to fire false chapter boundaries (jn3 林千夏).
         if (PROPOSAL_SUBMISSION_TOOLS.has(call.name)) {
           try {
-            const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+            const parsed = JSON.parse(proposalControlResult ?? toolResult) as Record<string, unknown>;
             if (isSuccessfulDocumentSubmission(call.name, parsed)) {
-              const needsRhythmPolish = parsed.rhythmRevisionRequired === true
-                || parsed.code === "RHYTHM_POLISH_REQUIRED";
+              const needsRhythmPolish = isExpectedRhythmPolish(parsed);
               if (needsRhythmPolish) {
                 // 首轮情节场面已落提案，但不算交付完成：强制一次句式抛光。
-                const nextAttempt = Math.max(1, proposalRevisionAttempts + 1);
-                const decision = decideProposalFailure(parsed, nextAttempt);
-                const draft = saveProposalRevisionDraft(
+                // This is an expected two-stage transition, so it neither creates
+                // a blocker case nor consumes the semantic failure budget.
+                const savedDraft = saveProposalRevisionDraft(
                   effectiveCall, project, store, sessionId,
                 );
+                const draft: ProposalRevisionDraftRef | undefined = savedDraft;
                 documentProposalSubmitted = false;
-                if (decision.action === "pause") {
-                  waitingForUser = true;
-                  toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
-                } else {
-                  proposalRevisionAttempts = decision.attempt;
-                  pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(parsed, decision.attempt);
-                  pendingProposalRevisionDraft = draft;
-                }
+                pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(parsed, 1);
+                pendingProposalRevisionDraft = draft;
               } else {
                 documentProposalSubmitted = true;
+                if (activeProposalRevisionCase) {
+                  closeProposalRevisionCase(activeProposalRevisionCase, store, sessionId);
+                  activeProposalRevisionCase = undefined;
+                }
                 const proposalId = proposalIdFromToolResult(parsed);
                 submittedDocumentEvidence = {
                   toolName: call.name,
@@ -3229,19 +3461,25 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             } else if (!("error" in parsed) || typeof parsed.error === "string") {
               const nextAttempt = proposalRevisionAttempts + 1;
               const decision = decideProposalFailure(parsed, nextAttempt);
-              const draft = saveProposalRevisionDraft(
+              const savedDraft = saveProposalRevisionDraft(
                 effectiveCall, project, store, sessionId,
               );
+              const reviewResult = "error" in parsed && typeof parsed.error === "string"
+                ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
+                : parsed;
+              const draft = savedDraft
+                ? saveProposalRevisionCase(savedDraft, reviewResult, decision.attempt, store, sessionId, activeProposalRevisionCase)
+                : undefined;
+              activeProposalRevisionCase = draft?.revisionCase ?? activeProposalRevisionCase;
               if (decision.action === "pause") {
                 waitingForUser = true;
                 toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
               } else {
                 proposalRevisionAttempts = decision.attempt;
                 pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(
-                  "error" in parsed && typeof parsed.error === "string"
-                    ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
-                    : parsed,
+                  reviewResult,
                   decision.attempt,
+                  draft?.revisionCase,
                 );
                 pendingProposalRevisionDraft = draft;
               }
@@ -3347,7 +3585,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         if (!gaps.length) {
           const answer = stripDsmlText(transcript, "").trim()
             || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
-          store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+          persistAssistantMessage(answer);
           persistRunTerminal("completed");
           emit({ type: "done", sessionId });
           return;
@@ -3701,7 +3939,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             }
           } catch { /* 非 ask_user 工具结果无需保存为对话。 */ }
         }
-        if (assistantParts.length) store.addMessage(sessionId, "assistant", assistantParts.join("\n\n"), "agent", options.variantGroupId);
+        if (assistantParts.length) persistAssistantMessage(assistantParts.join("\n\n"));
+        else if (toolContext.generatedAttachments?.length) persistAssistantMessage("图片已生成，Agent 正在等待你的输入。");
       } catch { /* 消息保存失败不影响流程 */ }
       const terminalWaitingEvent = waitingEvent ?? {
         question: "Agent 已暂停并保留当前状态，可续跑继续。",
@@ -3720,9 +3959,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           const msg = messages[i];
           if (msg.role === "assistant") {
             const text = messageContentText(msg.content).trim();
-            if (text) store.addMessage(sessionId, "assistant", text, "agent", options.variantGroupId);
+            if (text) persistAssistantMessage(text);
           }
         }
+        if (toolContext.generatedAttachments?.length) persistAssistantMessage("图片已生成。");
       } catch { /* 消息保存失败不影响流程 */ }
       // Last proposal with no further writing steps: persist the same compact
       // continuity handoff as an in-job chapter boundary, then replace the raw
@@ -3765,7 +4005,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     const endGaps = agentCompletionGaps(task, executionProgress, endTodos);
     if (!pauseForUserResume && !endGaps.length) {
       const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
-      store.addMessage(sessionId, "assistant", answer, "agent", options.variantGroupId);
+      persistAssistantMessage(answer);
       messages.push({ role: "assistant", content: answer });
       freezeCurrentTurn();
       persistRunTerminal("completed");
@@ -3798,7 +4038,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       "[生成已中断]",
     ].filter(Boolean).join("\n\n");
     try {
-      store.addMessage(sessionId, "assistant", pauseBody, "agent", options.variantGroupId);
+      persistAssistantMessage(pauseBody);
       store.addSystemMessage(sessionId, runtimeDebugContext(messages, {
         task: task.label,
         model: executionModel.model,
@@ -3818,7 +4058,9 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     return;
   } catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
-      if (transcript.trim()) store.addMessage(sessionId, "assistant", `${transcript.trim()}\n\n[生成已中断]`, "agent", options.variantGroupId);
+      if (transcript.trim() || toolContext.generatedAttachments?.length) {
+        persistAssistantMessage(`${stripDsmlText(transcript, "").trim() || "图片已生成。"}\n\n[生成已中断]`);
+      }
       // Resuming after a cancel should not re-pay the work already done; freezeTurnBlock
       // drops the dangling tool_calls the abort left behind.
       freezeCurrentTurn();
@@ -3827,6 +4069,9 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
+    if (toolContext.generatedAttachments?.length) {
+      try { persistAssistantMessage("图片已生成，但后续任务异常中断。"); } catch { /* retain original error */ }
+    }
     try {
       store.addSystemMessage(sessionId, "Agent 任务异常结束：" + message);
     } catch { /* 错误持久化失败不遮蔽原始错误。 */ }
@@ -4072,6 +4317,9 @@ function recentArtifactsContext(
   })) : [];
   let artifacts = store.recentContextArtifacts(sessionId, 12)
     .filter((artifact) => {
+      // Generated work-memory artifacts own their content hash and need not have
+      // an on-disk document yet. Source-backed reads still validate against disk.
+      if (artifact.kind === "proposal_revision_draft" || artifact.kind === "proposal_revision_case") return true;
       if (!artifact.path) return true;
       if (project.isDocumentHidden(artifact.path)) return false;
       if (!project.textFileExists(artifact.path)) return false;
@@ -4134,12 +4382,26 @@ function recentArtifactsContext(
   const catalog = artifacts
     .filter(item => item.kind === "read_document" || item.kind === "read_document_span" || item.kind === "locate_document_span" || item.kind === "inspect_document"
       || item.kind === "read_file" || item.kind === "inspect_file"
-      || item.kind === "get_outline_node" || item.kind === "list_outline_nodes")
+      || item.kind === "get_outline_node" || item.kind === "list_outline_nodes"
+      || item.kind === "proposal_revision_draft" || item.kind === "proposal_revision_case")
     .map(({ id, kind, path, sourceHash, digest }) => ({
       id, kind, path, sourceHash,
       digest: digest.replace(/\s+/g, " ").slice(0, 240),
     }));
-  if (!catalog.length && !restored.length && !checkpoint && !continuityFacts.length) return "";
+  const revisionCases = artifacts
+    .filter(item => item.kind === "proposal_revision_case")
+    .flatMap(item => {
+      const artifact = store.contextArtifactById(sessionId, item.id);
+      if (!artifact) return [];
+      try {
+        const value = JSON.parse(artifact.content) as ProposalRevisionCase;
+        return Array.isArray(value.unresolvedIssues) ? [{ artifactId: item.id, ...value }] : [];
+      } catch { return []; }
+    })
+    .filter((item, index, all) => all.findIndex(candidate => candidate.revisionCaseId === item.revisionCaseId) === index)
+    .filter(item => item.status === "blocked")
+    .slice(0, 2);
+  if (!catalog.length && !restored.length && !checkpoint && !continuityFacts.length && !revisionCases.length) return "";
   const scopeNote = task.continuation
     ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
     : "同会话已验证且未变化的读取索引；有目标路径时仅列目标。先按 digest 判断是否足够，正文不足再按需读取；相同 path+参数+sourceHash 会直接复用已有工具结果";
@@ -4147,6 +4409,7 @@ function recentArtifactsContext(
     state: { activeDocument: state.activeDocument, currentIntent: state.currentIntent.slice(0, 160) },
     ...(checkpoint ? { checkpoint } : {}),
     continuityFacts,
+    revisionCases,
     artifacts: catalog,
     restoredReads: restored,
   })}`;
@@ -4399,6 +4662,12 @@ export function registerMaterialsShelfEntry(
   const incomingDigest = entry.digest.replace(/\s+/g, " ").trim().slice(0, digestCap);
   const prevDigest = (prev?.digest ?? "").trim();
   const digest = incomingDigest.length >= prevDigest.length ? incomingDigest : prevDigest.slice(0, digestCap);
+  const coveredSections = [...new Set([...(prev?.coveredSections ?? []), ...(entry.coveredSections ?? [])])].slice(0, 48);
+  const coveredFields = [...new Set([...(prev?.coveredFields ?? []), ...(entry.coveredFields ?? [])])].slice(0, 48);
+  const exactEvidenceRanges = [...(prev?.exactEvidenceRanges ?? []), ...(entry.exactEvidenceRanges ?? [])]
+    .filter((range, index, all) => all.findIndex(item => item.startLine === range.startLine && item.endLine === range.endLine) === index)
+    .slice(0, 48);
+  const artifactIds = [...new Set([...(prev?.artifactIds ?? []), ...(entry.artifactIds ?? [])])].slice(-12);
   const next: MaterialsShelfEntry = {
     key,
     path: entry.path ?? prev?.path,
@@ -4408,14 +4677,24 @@ export function registerMaterialsShelfEntry(
     digest,
     bodyChars: Math.max(entry.bodyChars, prev?.bodyChars ?? 0),
     fullBodyServed: Boolean(entry.fullBodyServed || prev?.fullBodyServed),
+    ...(coveredSections.length ? { coveredSections } : {}),
+    ...(coveredFields.length ? { coveredFields } : {}),
+    ...(exactEvidenceRanges.length ? { exactEvidenceRanges } : {}),
+    ...(artifactIds.length ? { artifactIds } : {}),
+    ...(entry.hardConstraints ?? prev?.hardConstraints
+      ? { hardConstraints: entry.hardConstraints ?? prev?.hardConstraints }
+      : {}),
+    retention: entry.hardConstraints || prev?.hardConstraints ? "executable" : entry.retention ?? prev?.retention ?? "coverage",
   };
-  // Bound size: drop oldest non-full-body entries first, then oldest.
+  // Bound recoverable/coverage entries only. Executable constraints are selected
+  // by semantic importance and must never disappear merely because they are old.
   if (!context.materialsShelf.has(key) && context.materialsShelf.size >= MATERIALS_SHELF_MAX_ENTRIES) {
-    const removable = [...context.materialsShelf.values()]
-      .filter(item => !item.fullBodyServed)
-      .slice(0, 1);
-    const drop = removable[0] ?? [...context.materialsShelf.values()][0];
+    const drop = [...context.materialsShelf.values()].find(item =>
+      !item.hardConstraints && item.retention !== "executable" && !item.fullBodyServed)
+      ?? [...context.materialsShelf.values()].find(item =>
+        !item.hardConstraints && item.retention !== "executable");
     if (drop) context.materialsShelf.delete(drop.key);
+    else if (!next.hardConstraints && next.retention !== "executable") return next;
   }
   context.materialsShelf.set(key, next);
   return next;
@@ -4437,12 +4716,19 @@ export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): st
     sourceHash: item.sourceHash.slice(0, 12),
     bodyChars: item.bodyChars,
     fullBodyServed: item.fullBodyServed,
+    retention: item.retention ?? (item.hardConstraints ? "executable" : "coverage"),
+    ...(item.coveredSections?.length ? { coveredSections: item.coveredSections } : {}),
+    ...(item.coveredFields?.length ? { coveredFields: item.coveredFields } : {}),
+    ...(item.exactEvidenceRanges?.length ? { exactEvidenceRanges: item.exactEvidenceRanges } : {}),
+    ...(item.artifactIds?.length ? { artifactIds: item.artifactIds } : {}),
+    ...(item.hardConstraints ? { hardConstraints: item.hardConstraints } : {}),
     digest: item.digest,
   }));
   return [
     `${MATERIALS_SHELF_PROMPT_PREFIX}以下设定/角色已在本会话读过（sourceHash 未变则禁止无目标整篇重读或反复 search）。`,
-    "写作直接依据 digest 与章交接；章切换后仍适用本表，禁止为下一章「重新摸底」重复 load 同路径全文。",
-    "digest 未覆盖的段落：先 inspect_document 看 blocks/headings，再用 block 或 startLine/endLine 或 quote 定点补读；禁止用 search_project 当分页阅读。",
+    "hardConstraints 是不可压缩执行态，角色能力 unlocked、限制、身体与知识边界以它为准；digest 只是可恢复摘要。",
+    "写作优先复用 coveredSections/coveredFields；请求字段未覆盖时允许 get_character sections 或文档定点补读。",
+    "文档缺口先 inspect 看 blocks/headings，再用 block 或 startLine/endLine 或 quote 定点补读；禁止用 search_project 当分页阅读。",
     "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
     JSON.stringify({ materials: payload, count: payload.length, scope: "session" }),
   ].join("\n");
@@ -4518,8 +4804,14 @@ function materialsShelfHitPayload(entry: MaterialsShelfEntry, extra?: Record<str
     kind: entry.kind,
     digest: entry.digest,
     bodyChars: entry.bodyChars,
+    retention: entry.retention ?? (entry.hardConstraints ? "executable" : "coverage"),
+    ...(entry.coveredSections?.length ? { coveredSections: entry.coveredSections } : {}),
+    ...(entry.coveredFields?.length ? { coveredFields: entry.coveredFields } : {}),
+    ...(entry.exactEvidenceRanges?.length ? { exactEvidenceRanges: entry.exactEvidenceRanges } : {}),
+    ...(entry.artifactIds?.length ? { artifactIds: entry.artifactIds } : {}),
+    ...(entry.hardConstraints ? { hardConstraints: entry.hardConstraints } : {}),
     message: "该材料已在会话材料架中（全文已提供过）。禁止无参数整篇重读与反复 search；请直接依据 digest 续写。"
-      + "若 digests 未覆盖，请 inspect_document 后按 block / startLine+endLine / quote 定点补读。",
+      + "hardConstraints 仍是权威执行态；若请求字段或段落未在 coverage 中，请定点补读。",
     nextAction: "inspect_or_targeted_read",
     ...extra,
   });
@@ -4698,10 +4990,17 @@ async function executeToolCached(
     const id = Number(normalized.id);
     if (Number.isInteger(id) && id > 0) {
       const shelf = context.materialsShelf?.get(materialsShelfKeyForCharacter(id));
-      // Allow sectioned edit reads (view=edit + sections) even after full card served.
-      const targeted = typeof normalized.view === "string" && normalized.view === "edit"
-        && Array.isArray(normalized.sections) && normalized.sections.length > 0;
-      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash && !targeted) {
+      const requestedSections = Array.isArray(normalized.sections)
+        ? normalized.sections.filter((value): value is string => typeof value === "string")
+        : [];
+      const requestedFields = requestedSections.length
+        ? requestedSections
+        : normalized.view === "edit"
+          ? ["identity", "profile", "psychology", "motivations", "voice", "features", "competencies", "relationships", "storyState", "experiences", "notes"]
+          : ["identity", "appearance", "features", "competencies", "voice"];
+      const coverage = new Set(shelf?.coveredFields ?? []);
+      const requestCovered = requestedFields.every(field => coverage.has(field));
+      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash && requestCovered) {
         return materialsShelfHitPayload(shelf, { tool: call.name });
       }
     }
@@ -4774,13 +5073,13 @@ async function executeToolCached(
         : "相同读取已执行过且文档未变；以下从工作记忆恢复完整结果，请直接使用，禁止再次调用。",
       cached.id);
     const admitted = sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, restored, context) : restored;
-    rememberMaterialsFromToolResult(call.name, admitted, sourcePath, sourceHash, context);
+    rememberMaterialsFromToolResult(call.name, admitted, sourcePath, sourceHash, context, store);
     return admitted;
   }
   const result = await executeTool(call, project, store, sessionId, emit, characterScope, context);
   const admitted = sourcePath ? admitReadAtom(call.name, sourcePath, sourceHash, result, context) : result;
   if (admitted !== result) {
-    rememberMaterialsFromToolResult(call.name, admitted, sourcePath, sourceHash, context);
+    rememberMaterialsFromToolResult(call.name, admitted, sourcePath, sourceHash, context, store);
     return admitted;
   }
   let digest = `${call.name} 已完成`;
@@ -4796,7 +5095,7 @@ async function executeToolCached(
   } catch { digest = `${call.name} 返回了非 JSON 结果`; }
   const artifactId = store.saveContextArtifact(sessionId, { cacheKey, kind: call.name, path: sourcePath, sourceHash, content: result, digest });
   const attached = attachArtifactId(result, artifactId);
-  rememberMaterialsFromToolResult(call.name, attached, sourcePath, sourceHash, context);
+  rememberMaterialsFromToolResult(call.name, attached, sourcePath, sourceHash, context, store);
   return attached;
 }
 
@@ -4807,6 +5106,7 @@ function rememberMaterialsFromToolResult(
   sourcePath: string | undefined,
   sourceHash: string,
   context: ToolExecutionContext,
+  store: WriterStore,
 ): void {
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
@@ -4824,6 +5124,10 @@ function rememberMaterialsFromToolResult(
         : typeof (parsed.identity as { summary?: unknown } | undefined)?.summary === "string"
           ? String((parsed.identity as { summary: string }).summary)
           : "";
+      const character = store.characters().find(item => item.id === id);
+      const hardConstraints = character ? characterConstraintView(character) : undefined;
+      const coveredFields = Object.keys(parsed).filter(key => !["artifactId", "reused", "message"].includes(key));
+      const artifactId = typeof parsed.artifactId === "number" ? parsed.artifactId : undefined;
       registerMaterialsShelfEntry(context, {
         key: materialsShelfKeyForCharacter(id),
         characterId: id,
@@ -4832,6 +5136,10 @@ function rememberMaterialsFromToolResult(
         digest: `${name} ${summary}`.replace(/\s+/g, " ").slice(0, MATERIALS_SHELF_DIGEST_CHARS),
         bodyChars: result.length,
         fullBodyServed: true,
+        coveredFields,
+        ...(artifactId !== undefined ? { artifactIds: [artifactId] } : {}),
+        ...(hardConstraints ? { hardConstraints } : {}),
+        retention: hardConstraints ? "executable" : "coverage",
       });
       return;
     }
@@ -4858,6 +5166,11 @@ function rememberMaterialsFromToolResult(
       : "";
     const digestSource = body || inspectBits;
     const isBody = DOCUMENT_BODY_READ_TOOLS.has(toolName) && body.length > 0;
+    const exactEvidenceRanges = readResultRanges(parsed);
+    const coveredSections = [parsed.heading, parsed.section, parsed.block]
+      .filter((value): value is string | number => typeof value === "string" || typeof value === "number")
+      .map(String);
+    const artifactId = typeof parsed.artifactId === "number" ? parsed.artifactId : undefined;
     // Whole-doc first body (no range params) marks fullBodyServed; block reads alone do not
     // if shelf was empty — but once any substantial body is served we keep the flag.
     const digest = digestSource
@@ -4871,6 +5184,10 @@ function rememberMaterialsFromToolResult(
       bodyChars: body.length || (typeof parsed.characterCount === "number" ? parsed.characterCount : 0),
       // Only body reads mark fullBodyServed — inspect alone still allows one full read.
       fullBodyServed: isBody,
+      coveredSections,
+      exactEvidenceRanges,
+      ...(artifactId !== undefined ? { artifactIds: [artifactId] } : {}),
+      retention: "coverage",
     });
   } catch { /* ignore non-JSON */ }
 }

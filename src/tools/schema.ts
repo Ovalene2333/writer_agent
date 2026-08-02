@@ -981,6 +981,24 @@ export const TOOLS = deepFreeze([
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "generate_image",
+      description: "调用独立生图模型生成一张图片，并将图片附到本轮回复；仅在用户明确要求图片产物时调用",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "完整、可独立执行的视觉提示词" },
+          name: { type: "string", description: "可选文件名，如 chapter-cover.png" },
+          size: { type: "string", enum: ["auto", "1024x1024", "1536x1024", "1024x1536"] },
+          quality: { type: "string", enum: ["auto", "low", "medium", "high"] },
+        },
+        required: ["prompt"],
+        additionalProperties: false,
+      },
+    },
+  },
 ] as const) as unknown as readonly ToolDefinition[];
 
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
@@ -991,6 +1009,7 @@ const WRITE_TOOLS = new Set([
   "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
   "manage_prose_gates",
+  "generate_image",
 ]);
 
 /**

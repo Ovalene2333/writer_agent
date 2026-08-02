@@ -4547,11 +4547,10 @@ function App() {
               <div className="roleplay-banner-footer">
                 <details className="roleplay-length-menu">
                   <summary
-                    title={`篇幅：${roleplayLengthOption(roleplayLength).label}（推荐 ${roleplayLengthOption(roleplayLength).rangeLabel}）`}
+                    title={`篇幅：${roleplayLengthOption(roleplayLength).label}`}
                   >
                     <span>篇幅</span>
                     <em>{roleplayLengthOption(roleplayLength).label}</em>
-                    <small>{roleplayLengthOption(roleplayLength).rangeLabel}</small>
                   </summary>
                   <div role="menu" aria-label="角色扮演篇幅">
                     {ROLEPLAY_LENGTH_OPTIONS.map(option => {
@@ -4564,14 +4563,13 @@ function App() {
                           aria-checked={active}
                           className={active ? "active" : ""}
                           disabled={busy || Boolean(roleplayAutoReplyBusy)}
-                          title={`${option.label} · 推荐 ${option.rangeLabel}`}
+                          title={option.label}
                           onClick={(event) => {
                             event.currentTarget.closest("details")?.removeAttribute("open");
                             setRoleplayLength(option.level);
                           }}
                         >
                           <span>{option.label}</span>
-                          <small>{option.rangeLabel}</small>
                         </button>
                       );
                     })}
@@ -4714,40 +4712,40 @@ function App() {
                   ) : null}
                 </div>
               ) : null}
+              {msg.attachments?.length ? (
+                <div className="message-attachments" aria-label="附图">
+                  {msg.attachments.map((item) => {
+                    const localPreview = item.storagePath.startsWith("blob:") || item.storagePath.startsWith("data:");
+                    const src = msg.id > 0
+                      ? attachmentImageUrl(state.sessionId, item.id)
+                      : localPreview
+                        ? item.storagePath
+                        : "";
+                    return (
+                      <a
+                        key={item.id}
+                        className="message-attachment-thumb"
+                        href={src || "#"}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={item.name}
+                      >
+                        {src ? (
+                          <img src={src} alt={item.name} loading="lazy" />
+                        ) : (
+                          <span className="message-attachment-fallback">{item.name}</span>
+                        )}
+                      </a>
+                    );
+                  })}
+                </div>
+              ) : null}
               {msg.role === "assistant" ? (
                 assistantCollapsed
                   ? <p className="msg-preview">{messagePreview(displayContent)}</p>
                   : <Markdown content={displayContent} />
               ) : (
                 <>
-                  {msg.attachments?.length ? (
-                    <div className="message-attachments" aria-label="附图">
-                      {msg.attachments.map((item) => {
-                        const localPreview = item.storagePath.startsWith("blob:") || item.storagePath.startsWith("data:");
-                        const src = msg.id > 0
-                          ? attachmentImageUrl(state.sessionId, item.id)
-                          : localPreview
-                            ? item.storagePath
-                            : "";
-                        return (
-                          <a
-                            key={item.id}
-                            className="message-attachment-thumb"
-                            href={src || "#"}
-                            target="_blank"
-                            rel="noreferrer"
-                            title={item.name}
-                          >
-                            {src ? (
-                              <img src={src} alt={item.name} loading="lazy" />
-                            ) : (
-                              <span className="message-attachment-fallback">{item.name}</span>
-                            )}
-                          </a>
-                        );
-                      })}
-                    </div>
-                  ) : null}
                   {msg.channel === "roleplay"
                     ? continuationMessage
                       ? <div className="roleplay-continuation-placeholder">
@@ -5191,7 +5189,6 @@ function App() {
                 <legend>演出调整</legend>
                 <p className="roleplay-rerun-length-note">
                   篇幅沿用输入区设置：{roleplayLengthOption(roleplayLength).label}
-                  （推荐 {roleplayLengthOption(roleplayLength).rangeLabel}）
                 </p>
                 <div className="roleplay-rerun-sliders">
                   {ROLEPLAY_RERUN_SLIDERS.map(slider => {

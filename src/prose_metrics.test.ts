@@ -77,7 +77,7 @@ test("analyzeChapterProseMetrics blocks adjacent duplicates and heavy recycling"
   assert.match(blocked, /复读|重合/);
 });
 
-test("analyzeChapterProseMetrics blocks dash overload and warns on contrast density", () => {
+test("analyzeChapterProseMetrics blocks dash overload and construction-family density", () => {
   const text = [
     "她看着屏幕——数据在跳——然后停住——像被掐断。",
     "不是伏击。是撤退。",
@@ -93,8 +93,8 @@ test("analyzeChapterProseMetrics blocks dash overload and warns on contrast dens
   const contrast = metrics.issues.find(issue => issue.code === "contrast_density");
   assert.equal(dash?.severity, "error");
   assert.ok(dash?.examples.some(example => example.includes("——")));
-  assert.equal(contrast?.severity, "warning");
-  assert.match(chapterMetricsBlockError(metrics) ?? "", /破折号/);
+  assert.equal(contrast?.severity, "error");
+  assert.match(chapterMetricsBlockError(metrics) ?? "", /破折号|句式家族/u);
 });
 
 test("analyzeChapterProseMetrics hard-blocks flat staccato rhythm at chapter scale", () => {
@@ -137,7 +137,7 @@ test("sceneAntiFormulaFeedback reports budgets, banned openings and exhausted mo
   ].join("\n\n");
   const lines = sceneAntiFormulaFeedback({ chapterSoFar: scene });
   assert.ok(lines.length >= 3);
-  assert.match(lines[0], /破折号.*不是A…是B.*和X一样/u);
+  assert.match(lines[0], /破折号.*否定—改判句式家族.*和X一样/u);
   assert.ok(lines.some(line => line.includes("千夏") && line.includes("段首")));
   assert.ok(lines.some(line => line.includes("脚掌外侧先落地")));
 });

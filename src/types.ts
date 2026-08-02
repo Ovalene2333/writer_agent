@@ -162,6 +162,7 @@ export interface ProviderCatalogPublic {
 // the writing pipeline no longer assigns or invokes it.
 export type ModelUsageRole =
   | "agent"
+  | "image"
   | "flash"
   | "drafter"
   | "inline"

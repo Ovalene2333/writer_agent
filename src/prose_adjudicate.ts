@@ -37,6 +37,7 @@ export type ProseAdjudicationVerdict = {
   id: string;
   verdict: ProseVerdict;
   reason?: string;
+  countsTowardFamilyBudget?: boolean;
 };
 
 export type ProseDiscoveryPassage = {
@@ -71,7 +72,7 @@ export type LearnedProseGateFinding = {
   suggestion: string;
 };
 
-export type ProseVerdictCacheEntry = { verdict: ProseVerdict; reason?: string };
+export type ProseVerdictCacheEntry = { verdict: ProseVerdict; reason?: string; countsTowardFamilyBudget?: boolean };
 
 /** Cross-round verdict memory: same sentence + subtype must keep the same verdict across gate rounds. */
 export type ProseVerdictCache = Map<string, ProseVerdictCacheEntry>;
@@ -95,7 +96,12 @@ export function applyCachedProseVerdicts(
   const verdicts: ProseAdjudicationVerdict[] = [];
   for (const issue of issues) {
     const hit = cache.get(proseVerdictCacheKey(issue));
-    if (hit) verdicts.push({ id: issue.id, verdict: hit.verdict, ...(hit.reason ? { reason: hit.reason } : {}) });
+    if (hit) verdicts.push({
+      id: issue.id,
+      verdict: hit.verdict,
+      ...(hit.reason ? { reason: hit.reason } : {}),
+      ...(hit.countsTowardFamilyBudget !== undefined ? { countsTowardFamilyBudget: hit.countsTowardFamilyBudget } : {}),
+    });
   }
   if (!verdicts.length) return issues;
   return applyProseVerdicts(text, issues, verdicts);
@@ -219,7 +225,10 @@ export function applyProseVerdicts(
   for (const issue of issues) {
     const hit = byId.get(issue.id);
     if (!hit) continue;
-    if (issue.constructionRuleId) issue.semanticVerdict = hit.verdict;
+    if (issue.constructionRuleId) {
+      issue.semanticVerdict = hit.verdict;
+      if (hit.countsTowardFamilyBudget !== undefined) issue.countsTowardFamilyBudget = hit.countsTowardFamilyBudget;
+    }
     if (hit.verdict === "allow") {
       issue.severity = "info";
       issue.confidence = Math.min(issue.confidence, 0.55);
@@ -287,6 +296,9 @@ export async function adjudicateProseStyleForAudit(
           cache.set(proseVerdictCacheKey(issue), {
             verdict: verdict.verdict,
             ...(verdict.reason ? { reason: verdict.reason } : {}),
+            ...(verdict.countsTowardFamilyBudget !== undefined
+              ? { countsTowardFamilyBudget: verdict.countsTowardFamilyBudget }
+              : {}),
           });
         }
       }
@@ -606,8 +618,9 @@ ${proseConstructionAdjudicationPrompt()}
 - allow：应放行（对白拖音/中断、停顿—揭示、短同位、列举、表格/元数据、口语纠正、客观事实排除等）
 - warn：略模板化但不必拦截
 - block：明确的重复解释，建议局部改写
+若 candidate 属于注册句式，再独立给 countsTowardFamilyBudget。语义 allow 不等于免计数：人物对白、必要纠错和客观排除仍写 true；只有正文在引用/讨论该句式本身、代码或元数据而非实际使用时才写 false。非注册候选可省略。
 对 passages 主动检查：若后一完整句没有增加新事实，只给前文动作/对白贴情绪、意图、因果或主题标签，写入 discoveries。必要概述、转场、新因果事实、人物特色评论应放行。sentence 必须逐字复制段落中的一个完整句子；不要把整段当 sentence。
-只输出 JSON 对象：{"verdicts":[{"id":"...","verdict":"allow|warn|block","reason":"不超过40字"}],"discoveries":[{"passageId":"...","sentence":"逐字原句","subtype":"semantic_echo|emotion_label|intent_translation|thematic_summary|causal_gloss|narrator_redefinition","verdict":"warn|block","reason":"不超过40字"}]}。不要 Markdown 围栏。`;
+只输出 JSON 对象：{"verdicts":[{"id":"...","verdict":"allow|warn|block","countsTowardFamilyBudget":true,"reason":"不超过40字"}],"discoveries":[{"passageId":"...","sentence":"逐字原句","subtype":"semantic_echo|emotion_label|intent_translation|thematic_summary|causal_gloss|narrator_redefinition","verdict":"warn|block","reason":"不超过40字"}]}。不要 Markdown 围栏。`;
 
   const user = JSON.stringify({ candidates: items, passages }, null, 0);
   const completed = await completeJsonChat(model, [
@@ -666,7 +679,15 @@ export function parseProseAdjudication(
             : undefined;
     if (!verdict) continue;
     const reason = typeof item.reason === "string" ? item.reason.trim().slice(0, 80) : undefined;
-    out.push({ id, verdict, ...(reason ? { reason } : {}) });
+    const countsTowardFamilyBudget = typeof item.countsTowardFamilyBudget === "boolean"
+      ? item.countsTowardFamilyBudget
+      : undefined;
+    out.push({
+      id,
+      verdict,
+      ...(reason ? { reason } : {}),
+      ...(countsTowardFamilyBudget !== undefined ? { countsTowardFamilyBudget } : {}),
+    });
   }
   const discoveryRows = !Array.isArray(parsed) && parsed && typeof parsed === "object"
     && Array.isArray((parsed as Record<string, unknown>).discoveries)

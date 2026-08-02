@@ -28,6 +28,7 @@ export type ProseConstructionClassification = {
 export type ProseConstructionRule = {
   id: string;
   label: string;
+  familyId: string;
   patterns: readonly RegExp[];
   generationGuidance: string;
   adjudicationGuidance: string;
@@ -53,16 +54,21 @@ export const PROSE_CONSTRUCTION_RULES = [
   {
     id: "negation_redefinition",
     label: "否定—改判对照",
+    familyId: "negation_redefinition",
     patterns: [
       /(?:并)?不是[^\n。！？!?]{0,48}(?:(?:而|却|只)是|(?<!不)是)/gu,
       /(?:并)?不是[^\n。！？!?]{1,48}[。！？!?]\s*(?:(?:这|那|他|她|它|其|自己|真正|实际|反而|却|只)\s*)?是[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
       /并非[^\n。！？!?]{0,48}(?:而|却|只)?是/gu,
       /[^\n。！？!?]{1,64}[，,]\s*(?:并)?不是[^\n。！？!?]{1,32}(?:[。！？!?]|$)/gu,
+      /没有[^\n。！？!?]{1,48}(?:只有|而是)[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
+      /与其(?:说)?[^\n。！？!?]{1,48}不如(?:说)?[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
+      /不在于[^\n。！？!?]{1,48}而在于[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
+      /(?:不能|算不上|谈不上|称不上)[^\n。！？!?]{1,40}(?:只是|不过是|更像)[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
     ],
-    generationGuidance: "叙述不要反复用先否定后改判，或在成立事实后补一句否定标签来制造力度；优先让动作、感受或事实自行成立。必要的客观排除和人物即时纠错可以保留。",
-    adjudicationGuidance: "判断候选是否在重新命名同一事实，或先写成立事实再追加“不是某种情绪/判断”的否定补注；人物即时纠错、必要客观排除及确有语境作用者 allow，轻微模板化者 warn，重复解释者 block。",
+    generationGuidance: "叙述不要反复用先否定后改判、“没有A只有B”等同功能变体，或在成立事实后补一句否定标签来制造力度；优先让动作、感受或事实自行成立。必要的客观排除和人物即时纠错可以保留，但仍占句式家族额度。",
+    adjudicationGuidance: "判断候选是否在重新命名同一事实，或先写成立事实再追加否定补注；人物即时纠错、必要客观排除及确有语境作用者 allow，轻微模板化者 warn，重复解释者 block。语义 allow 与句式家族计数彼此独立。",
     reviewAtCount: 2,
-    allowedOccurrences: characters => Math.max(1, Math.floor(characters / 5_000)),
+    allowedOccurrences: characters => Math.max(1, Math.floor((characters * 4) / 10_000)),
     classify: context => {
       if (context.inQuote) {
         return {

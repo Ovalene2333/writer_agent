@@ -81,7 +81,7 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
     },
   ));
   const sourceHash = project.hash(content);
-  const diagnosis = buildProseDiagnosis(sourceHash, issues);
+  const diagnosis = buildProseDiagnosis(sourceHash, issues, content);
   return JSON.stringify({
     path,
     source: activeDraft ? "chapter_draft" : "document",

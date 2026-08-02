@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ProseStyleIssue } from "./prose_quality.js";
+import { PROSE_CONSTRUCTION_RULES, proseConstructionRule } from "./prose_construction_rules.js";
 
 export type ProseDiagnosticIssue = {
   issueId: string;
@@ -18,6 +19,15 @@ export type ProseDiagnosis = {
   status: "clean" | "review" | "needs_revision";
   guidance: string;
   actionableIssues: ProseDiagnosticIssue[];
+  familyBudgets: Array<{
+    familyId: string;
+    label: string;
+    count: number;
+    allowed: number;
+    excess: number;
+    keepEvidence: string[];
+    reviseIssueIds: string[];
+  }>;
 };
 
 function shortHash(value: string): string {
@@ -34,8 +44,8 @@ function issueRuleId(issue: ProseStyleIssue): string {
 }
 
 function issueVerdict(issue: ProseStyleIssue): ProseDiagnosticIssue["verdict"] {
-  if (issue.semanticVerdict) return issue.semanticVerdict;
   if (issue.severity === "error") return "block";
+  if (issue.semanticVerdict) return issue.semanticVerdict;
   if (issue.severity === "warning") return "warn";
   return "allow";
 }
@@ -52,14 +62,14 @@ function fallbackRevisionIntent(issue: ProseStyleIssue): string {
  * available for compatibility; this view supplies stable snapshot-scoped IDs
  * and revision intent without asking the review model to rewrite prose.
  */
-export function buildProseDiagnosis(sourceHash: string, issues: ProseStyleIssue[]): ProseDiagnosis {
+export function buildProseDiagnosis(sourceHash: string, issues: ProseStyleIssue[], sourceText?: string): ProseDiagnosis {
   const actionableIssues = issues
     .filter(issue => issue.severity !== "info" || issue.semanticVerdict === "block")
     .map(issue => {
       const ruleId = issueRuleId(issue);
       const verdict = issueVerdict(issue);
       return {
-        issueId: `prose:${shortHash(`${sourceHash}|${ruleId}|${issue.start}|${issue.evidence}`)}`,
+        issueId: diagnosticIssueId(sourceHash, issue, ruleId),
         ruleId,
         severity: issue.severity,
         verdict,
@@ -81,11 +91,42 @@ export function buildProseDiagnosis(sourceHash: string, issues: ProseStyleIssue[
       ? "review" as const
       : "clean" as const;
   const reviewId = `review:${shortHash(`${sourceHash}|${actionableIssues.map(issue => issue.issueId).join("|")}`)}`;
+  const actionableIds = new Set(actionableIssues.map(issue => issue.issueId));
+  const characters = Math.max(1, sourceText?.replace(/\s/gu, "").length
+    ?? issues.reduce((largest, issue) => Math.max(largest, issue.end), 0));
+  const familyBudgets = [...new Set(PROSE_CONSTRUCTION_RULES.map(rule => rule.familyId))].flatMap(familyId => {
+    const rules = PROSE_CONSTRUCTION_RULES.filter(rule => rule.familyId === familyId);
+    const ruleIds = new Set(rules.map(rule => rule.id));
+    const counted = issues.filter(issue =>
+      issue.constructionRuleId !== undefined
+      && ruleIds.has(issue.constructionRuleId as typeof rules[number]["id"])
+      && issue.countsTowardFamilyBudget !== false,
+    );
+    if (!counted.length) return [];
+    const allowed = rules[0].allowedOccurrences(characters);
+    return [{
+      familyId,
+      label: rules[0].label,
+      count: counted.length,
+      allowed,
+      excess: Math.max(0, counted.length - allowed),
+      keepEvidence: counted.filter(issue => issue.severity !== "error").map(issue => issue.evidence).slice(0, allowed),
+      reviseIssueIds: counted
+        .filter(issue => issue.severity === "error")
+        .map(issue => diagnosticIssueId(sourceHash, issue, proseConstructionRule(issue.constructionRuleId)?.id ?? issue.subtype))
+        .filter(issueId => actionableIds.has(issueId)),
+    }];
+  });
   return {
     reviewId,
     sourceHash,
     status,
-    guidance: "优先局部修正 verdict=block；warn 只在结合上下文仍明显模板化时修改；不要改写 allow 或未列出的正文。修改后的提案会由同一审核引擎自动复检。",
+    guidance: "优先局部修正 verdict=block 和 familyBudgets.reviseIssueIds；语义 allow 仍可能占用句式家族预算。warn 只在结合上下文仍明显模板化时修改；不要改写未列出的正文。修改后的提案会由同一审核引擎自动复检。",
     actionableIssues,
+    familyBudgets,
   };
+}
+
+function diagnosticIssueId(sourceHash: string, issue: ProseStyleIssue, ruleId = issueRuleId(issue)): string {
+  return `prose:${shortHash(`${sourceHash}|${ruleId}|${issue.start}|${issue.evidence}`)}`;
 }

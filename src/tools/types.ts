@@ -1,4 +1,4 @@
-import type { AgentEvent, ModelConfig, PermissionMode } from "../types.js";
+import type { AgentEvent, MessageAttachment, ModelConfig, PermissionMode } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ChapterSceneDraft, SceneActualState } from "../scene_pipeline.js";
@@ -12,6 +12,7 @@ import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document
 import type { DocumentRevisionInput } from "../document_revision.js";
 import type { ProseGateRule } from "../prose_gate_rules.js";
 import type { ContinuityFact, ContinuityFactCandidate } from "../continuity_facts.js";
+import type { CharacterConstraintView } from "../character_constraints.js";
 import type {
   IsolatedSceneWriterInput,
   IsolatedSceneWriterResult,
@@ -40,6 +41,14 @@ export type MaterialsShelfEntry = {
   digest: string;
   bodyChars: number;
   fullBodyServed: boolean;
+  /** Semantic coverage survives compaction; the full body remains recoverable by artifact. */
+  coveredSections?: string[];
+  coveredFields?: string[];
+  exactEvidenceRanges?: Array<{ startLine: number; endLine: number }>;
+  artifactIds?: number[];
+  /** Executable state: never replace this with the descriptive digest. */
+  hardConstraints?: CharacterConstraintView;
+  retention?: "executable" | "coverage" | "recoverable";
 };
 
 export type ToolCall = {
@@ -50,6 +59,9 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Dedicated Images API model and generated assets owned by this Agent turn. */
+  imageGenerator?: { model: ModelConfig; signal?: AbortSignal };
+  generatedAttachments?: MessageAttachment[];
   /** Whether narrative tasks may append experiences and story state to character cards. */
   characterEvolutionEnabled?: boolean;
   /** User message that owns mutations made by this Agent job. */
@@ -80,6 +92,8 @@ export type ToolExecutionContext = {
   simpleCharacterScope?: number[];
   /** Planner/UI-selected characters whose factual state should be supplied to final review. */
   reviewCharacterIds?: number[];
+  /** Hashes of the exact constraint packets supplied to the writing context. */
+  writerCharacterConstraintHashes?: Map<number, string>;
   /**
    * When true (outline mode), propose_document / propose_document_patch targeting
    * outline paths require a successful design_creative_outline earlier in this run.
