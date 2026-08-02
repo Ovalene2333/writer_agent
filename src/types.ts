@@ -321,6 +321,9 @@ export interface OutlineSnapshot {
 export interface Proposal {
   id: number;
   sessionId: string;
+  sourceMessageId?: number;
+  /** False for persisted intermediate drafts that still must pass a blocking gate. */
+  deliveryReady: boolean;
   path: string;
   summary: string;
   beforeContent: string;
@@ -381,6 +384,7 @@ export interface ChangeSetFileChange {
 export interface ChangeSet {
   id: number;
   sessionId: string;
+  sourceMessageId?: number;
   summary: string;
   status: "pending" | "accepted" | "rejected" | "stale";
   undone: boolean;

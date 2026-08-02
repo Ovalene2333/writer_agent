@@ -2,6 +2,7 @@ export const MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW = 3;
 
 export type ProposalFailureDecision =
   | { action: "revise"; attempt: number }
+  | { action: "correct_call"; attempt: number }
   | { action: "pause"; reason: "dependency" | "invalid_request" | "revision_exhausted"; attempt: number };
 
 /**
@@ -18,16 +19,21 @@ export function isExpectedRhythmPolish(result: Record<string, unknown>): boolean
  */
 export function decideProposalFailure(
   result: Record<string, unknown>,
-  nextAttempt: number,
+  currentAttempt: number,
 ): ProposalFailureDecision {
   if (result.failureKind === "dependency") {
-    return { action: "pause", reason: "dependency", attempt: nextAttempt };
+    return { action: "pause", reason: "dependency", attempt: currentAttempt };
   }
-  // Malformed model arguments are recoverable model behavior: return the
-  // structured error to the Agent and let it emit one smaller, valid call.
   if (result.code === "CONTRACT_MUTATION_DENIED") {
-    return { action: "pause", reason: "invalid_request", attempt: nextAttempt };
+    return { action: "pause", reason: "invalid_request", attempt: currentAttempt };
   }
+  // Tool selection, arguments and recoverable project-state errors are not
+  // prose review verdicts. Let the Agent correct the call without spending the
+  // bounded semantic revision window.
+  if ("error" in result && result.failureKind !== "semantic_revision") {
+    return { action: "correct_call", attempt: currentAttempt };
+  }
+  const nextAttempt = currentAttempt + 1;
   if (nextAttempt >= MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW) {
     return { action: "pause", reason: "revision_exhausted", attempt: nextAttempt };
   }

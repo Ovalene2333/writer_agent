@@ -291,6 +291,8 @@ OpenAI 兼容模型还可逐模型配置 `reasoning_effort` 与 `verbosity`；�
 4. **运行时完成检查**：事实、目标读取、提案、角色保存和动态清单等必要条件未满足时禁止提前结束
 5. **提案、审批与追问**：修改以提案交付；仅在缺少不可推断的关键决策时暂停并询问用户
 
+每次任务同时写入追加式 `agent_runs` / `agent_run_events`。恢复、完成判定和多文档交付均由事件 reducer 生成的唯一快照决定，todos 只用于模型规划。提案应用采用 `prepared -> committed` 记录，进程在文件写入后中断时可按内容 hash 继续提交数据库状态。
+
 Agent 可用的主要能力包括：列出与检视 Markdown 文档、按块 / 节 / 行读取、全文检索、大纲节点读写与校验、通用纯文本文件读取，以及通过 change set 整组提议文件创建 / 补丁 / 移动 / 删除与角色演进。
 
 正文交付不绑定固定场景流水线。Agent 可以直接提交完整文档、按锚点局部修改、按需编译 write pack，或在长篇连续状态和逐场修订确有收益时主动启用场景草稿链；这些能力互不构成形式上的前置条件。
@@ -351,7 +353,9 @@ npm test                    # 编译并跑测试
 | 路径 | 说明 |
 |------|------|
 | `src/cli.ts` | 命令行入口（web / run / init / export） |
-| `src/agent.ts` | 写作 Agent 与工具 |
+| `src/agent.ts` | 写作 Agent 的提示词、模型消息与缓存边界 |
+| `src/agent_loop.ts` | 薄 Agent 执行循环入口 |
+| `src/agent_run_*` | 运行事件、reducer、持久化、恢复与不变量 |
 | `src/server.ts` | Web API（Hono + SSE） |
 | `src/project.ts` | 项目文件与安全路径 |
 | `src/store.ts` | SQLite 会话 / 提案 / 用量 |

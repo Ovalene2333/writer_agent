@@ -57,7 +57,15 @@ export async function handleProposeOutlinePatch({ input, project, store, session
   const content = project.read(outline.sourcePath);
   const occurrences = countOccurrences(content, search);
   if (occurrences !== 1) throw new Error(`search 在大纲中出现 ${occurrences} 次，必须唯一`);
-  const proposal = store.createProposal(sessionId, outline.sourcePath, content.replace(search, replace), requireString(input.summary, "summary"));
+  const proposal = store.createProposal(
+    sessionId,
+    outline.sourcePath,
+    content.replace(search, replace),
+    requireString(input.summary, "summary"),
+    [],
+    undefined,
+    context.sourceMessageId,
+  );
   emit({ type: "proposal", proposal });
   return JSON.stringify({ nodeId: id, ...await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context) });
 }

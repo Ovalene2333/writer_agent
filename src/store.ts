@@ -277,6 +277,8 @@ export class WriterStore {
       CREATE TABLE IF NOT EXISTS proposals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_message_id INTEGER,
+        delivery_ready INTEGER NOT NULL DEFAULT 1,
         path TEXT NOT NULL,
         summary TEXT NOT NULL,
         before_content TEXT NOT NULL,
@@ -303,6 +305,7 @@ export class WriterStore {
       CREATE TABLE IF NOT EXISTS change_sets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_message_id INTEGER,
         summary TEXT NOT NULL,
         character_changes_json TEXT NOT NULL DEFAULT '[]',
         character_revisions_json TEXT NOT NULL DEFAULT '[]',
@@ -496,6 +499,23 @@ export class WriterStore {
         estimated_tokens INTEGER NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS proposal_applications (
+        proposal_id INTEGER PRIMARY KEY REFERENCES proposals(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        before_content TEXT NOT NULL,
+        after_hash TEXT NOT NULL,
+        created_file INTEGER NOT NULL,
+        character_revisions_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS change_set_applications (
+        change_set_id INTEGER PRIMARY KEY REFERENCES change_sets(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        character_revisions_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS agent_replay_commits_session
         ON agent_replay_commits(session_id, created_at);
       CREATE TABLE IF NOT EXISTS agent_replay_heads (
@@ -521,6 +541,30 @@ export class WriterStore {
       );
       CREATE INDEX IF NOT EXISTS message_step_trails_session
         ON message_step_trails(session_id, source_message_id);
+      CREATE TABLE IF NOT EXISTS agent_runs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_message_id INTEGER NOT NULL,
+        original_request TEXT NOT NULL,
+        status TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS agent_runs_session
+        ON agent_runs(session_id, created_at);
+      CREATE TABLE IF NOT EXISTS agent_run_events (
+        run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        event_key TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, sequence),
+        UNIQUE(run_id, event_key)
+      );
+      CREATE INDEX IF NOT EXISTS agent_run_events_type
+        ON agent_run_events(run_id, type, sequence);
       CREATE TABLE IF NOT EXISTS context_nodes (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -608,12 +652,21 @@ export class WriterStore {
     if (!changeSetColumns.some(column => column.name === "after_config")) {
       this.database.exec("ALTER TABLE change_sets ADD COLUMN after_config TEXT NOT NULL DEFAULT ''");
     }
+    if (!changeSetColumns.some(column => column.name === "source_message_id")) {
+      this.database.exec("ALTER TABLE change_sets ADD COLUMN source_message_id INTEGER");
+    }
     const proposalColumns = this.database.prepare("PRAGMA table_info(proposals)").all() as Row[];
     if (!proposalColumns.some(column => column.name === "character_changes_json")) {
       this.database.exec("ALTER TABLE proposals ADD COLUMN character_changes_json TEXT NOT NULL DEFAULT '[]'");
     }
     if (!proposalColumns.some(column => column.name === "quality_report_json")) {
       this.database.exec("ALTER TABLE proposals ADD COLUMN quality_report_json TEXT NOT NULL DEFAULT ''");
+    }
+    if (!proposalColumns.some(column => column.name === "source_message_id")) {
+      this.database.exec("ALTER TABLE proposals ADD COLUMN source_message_id INTEGER");
+    }
+    if (!proposalColumns.some(column => column.name === "delivery_ready")) {
+      this.database.exec("ALTER TABLE proposals ADD COLUMN delivery_ready INTEGER NOT NULL DEFAULT 1");
     }
     const writingExampleColumns = this.database.prepare("PRAGMA table_info(writing_examples)").all() as Row[];
     if (!writingExampleColumns.some(column => column.name === "gate_hash")) {
@@ -2957,6 +3010,7 @@ export class WriterStore {
       edits?: Array<{ search: string; replace: string }>;
     }>,
     characterChanges: ProposalCharacterChange[] = [],
+    sourceMessageId?: number,
   ): ChangeSet {
     if (!fileInputs.length && !characterChanges.length) throw new Error("change set 至少需要一个文件或角色变化");
     if (fileInputs.length > 20) throw new Error("单个 change set 最多包含 20 个文件操作");
@@ -3014,9 +3068,9 @@ export class WriterStore {
     try {
       const now = new Date().toISOString();
       const result = this.database.prepare(`
-        INSERT INTO change_sets(session_id,summary,character_changes_json,before_config,status,created_at)
-        VALUES(?,?,?,?,'pending',?)
-      `).run(sessionId, summary, JSON.stringify(characterChanges), this.project.readRaw("writer.yaml"), now);
+        INSERT INTO change_sets(session_id,source_message_id,summary,character_changes_json,before_config,status,created_at)
+        VALUES(?,?,?,?,?,'pending',?)
+      `).run(sessionId, sourceMessageId ?? null, summary, JSON.stringify(characterChanges), this.project.readRaw("writer.yaml"), now);
       const changeSetId = Number(result.lastInsertRowid);
       const insert = this.database.prepare(`
         INSERT INTO change_set_files(change_set_id,operation,path,target_path,before_content,after_content,base_hash,target_base_hash)
@@ -3045,6 +3099,11 @@ export class WriterStore {
       .map(row => this.changeSetFromRow(row as Row));
   }
 
+  changeSetsForSession(sessionId: string): ChangeSet[] {
+    return (this.database.prepare("SELECT * FROM change_sets WHERE session_id=? ORDER BY id").all(sessionId) as Row[])
+      .map(row => this.changeSetFromRow(row));
+  }
+
   private changeSetFromRow(row: Row): ChangeSet {
     const files = this.database.prepare("SELECT * FROM change_set_files WHERE change_set_id=? ORDER BY id").all(Number(row.id))
       .map(raw => {
@@ -3061,7 +3120,9 @@ export class WriterStore {
         } satisfies ChangeSetFileChange;
       });
     return {
-      id: Number(row.id), sessionId: String(row.session_id), summary: String(row.summary),
+      id: Number(row.id), sessionId: String(row.session_id),
+      ...(typeof row.source_message_id === "number" ? { sourceMessageId: row.source_message_id } : {}),
+      summary: String(row.summary),
       status: String(row.status) as ChangeSet["status"], undone: Number(row.undone) === 1,
       createdAt: String(row.created_at), files,
       characterChanges: parseProposalCharacterChanges(row.character_changes_json),
@@ -3070,36 +3131,73 @@ export class WriterStore {
 
   acceptChangeSet(id: number): ChangeSet {
     const changeSet = this.changeSet(id);
+    if (changeSet.status === "accepted") return changeSet;
     if (changeSet.status !== "pending") throw new Error("该 change set 已处理");
-    try { this.assertChangeSetForwardState(changeSet); }
-    catch (error) {
-      this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
-      throw error;
+    let application = this.database.prepare("SELECT * FROM change_set_applications WHERE change_set_id=?").get(id) as Row | undefined;
+    if (!application) {
+      try { this.assertChangeSetForwardState(changeSet); }
+      catch (error) {
+        this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
+        throw error;
+      }
+      const evolved = this.evolveCharactersForProposal(changeSet.characterChanges);
+      const preparedAt = new Date().toISOString();
+      this.database.prepare(`INSERT INTO change_set_applications(
+        change_set_id,status,character_revisions_json,created_at,updated_at
+      ) VALUES(?,'prepared',?,?,?)`).run(id, JSON.stringify(evolved.revisions), preparedAt, preparedAt);
+      application = this.database.prepare("SELECT * FROM change_set_applications WHERE change_set_id=?").get(id) as Row;
     }
-    const evolved = this.evolveCharactersForProposal(changeSet.characterChanges);
+    let filesAlreadyApplied = false;
+    try {
+      this.assertChangeSetForwardState(changeSet);
+    } catch {
+      try {
+        this.assertChangeSetAppliedState(changeSet);
+        filesAlreadyApplied = true;
+      } catch (error) {
+        this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
+        throw error;
+      }
+    }
+    const characterRevisions = parseProposalCharacterRevisions(application.character_revisions_json);
     const snapshots = this.captureManagedFiles(changeSet.files);
     const originalCharacters = this.characters();
     const originalConfig = this.project.readRaw("writer.yaml");
     const outlineSnapshot = this.captureOutlineSnapshot();
     try {
+      if (!filesAlreadyApplied) this.applyChangeSetFiles(changeSet.files);
+      {
+        let characters = this.characters();
+        for (const revision of characterRevisions) {
+          const current = characters.find(item => item.id === revision.characterId);
+          const before = this.normalizeCharacter(revision.before);
+          const after = this.normalizeCharacter(revision.after);
+          if (!current || (JSON.stringify(current) !== JSON.stringify(before)
+            && JSON.stringify(current) !== JSON.stringify(after))) {
+            throw new Error(`角色卡 ${revision.characterId} 已在 change set 应用过程中发生冲突`);
+          }
+          characters = [...characters.filter(item => item.id !== revision.characterId), after];
+        }
+        validateCharacters(characters, this.outlineNodeIds());
+        if (characterRevisions.length) this.writeCharacters(characters);
+      }
       this.database.exec("BEGIN IMMEDIATE");
-      this.applyChangeSetFiles(changeSet.files);
-      validateCharacters(evolved.characters, this.outlineNodeIds());
-      if (evolved.revisions.length) this.writeCharacters(evolved.characters);
       this.database.prepare("UPDATE change_sets SET status='accepted',undone=0,character_revisions_json=?,after_config=? WHERE id=?")
-        .run(JSON.stringify(evolved.revisions), this.project.readRaw("writer.yaml"), id);
-      this.refreshContinuityFactsForChangeSet(changeSet.files, true);
-      this.reindex();
+        .run(String(application.character_revisions_json ?? "[]"), this.project.readRaw("writer.yaml"), id);
+      this.database.prepare("UPDATE change_set_applications SET status='committed',updated_at=? WHERE change_set_id=?")
+        .run(new Date().toISOString(), id);
       this.database.exec("COMMIT");
-      return this.changeSet(id);
     } catch (error) {
       try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
       this.restoreManagedFiles(snapshots);
       this.project.writeRaw("writer.yaml", originalConfig);
       this.restoreOutlineSnapshot(outlineSnapshot);
-      if (evolved.revisions.length) this.writeCharacters(originalCharacters);
+      if (characterRevisions.length) this.writeCharacters(originalCharacters);
       throw error;
     }
+    this.refreshContinuityFactsForChangeSet(changeSet.files, true);
+    this.reindex();
+    return this.changeSet(id);
   }
 
   undoChangeSet(id: number): ChangeSet {
@@ -3290,15 +3388,17 @@ export class WriterStore {
     summary: string,
     characterChanges: ProposalCharacterChange[] = [],
     qualityReport?: ProseQualityReport,
+    sourceMessageId?: number,
+    deliveryReady = true,
   ): Proposal {
     const exists = this.project.documentExists(path);
     const before = exists ? this.project.read(path) : "";
     this.evolveCharactersForProposal(characterChanges);
     const now = new Date().toISOString();
     const result = this.database.prepare(`
-      INSERT INTO proposals(session_id,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
-      VALUES(?,?,?,?,?,?,?,?,'pending',?)
-    `).run(sessionId, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
+      INSERT INTO proposals(session_id,source_message_id,delivery_ready,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)
+    `).run(sessionId, sourceMessageId ?? null, deliveryReady ? 1 : 0, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
     return this.proposal(Number(result.lastInsertRowid));
   }
 
@@ -3337,11 +3437,18 @@ export class WriterStore {
     return rows.map((row) => this.proposalFromRow(row as Row));
   }
 
+  proposalsForSession(sessionId: string): Proposal[] {
+    const rows = this.database.prepare("SELECT * FROM proposals WHERE session_id=? ORDER BY id").all(sessionId) as Row[];
+    return rows.map(row => this.proposalFromRow(row));
+  }
+
   private proposalFromRow(row: Row): Proposal {
     const qualityReport = parseProposalQualityReport(row.quality_report_json);
     return {
       id: row.id as number,
       sessionId: row.session_id as string,
+      ...(typeof row.source_message_id === "number" ? { sourceMessageId: row.source_message_id } : {}),
+      deliveryReady: Number(row.delivery_ready) !== 0,
       path: row.path as string,
       summary: row.summary as string,
       beforeContent: row.before_content as string,
@@ -3358,31 +3465,78 @@ export class WriterStore {
     const proposal = this.proposal(id);
     if (proposal.status === "accepted") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
-    const intendedCreate = proposal.baseHash === "__missing__";
+    const expectedAfterHash = this.project.hash(proposal.afterContent);
+    let application = this.database.prepare("SELECT * FROM proposal_applications WHERE proposal_id=?").get(id) as Row | undefined;
+    if (!application) {
+      const intendedCreate = proposal.baseHash === "__missing__";
+      const exists = this.project.documentExists(proposal.path);
+      const current = exists ? this.project.read(proposal.path) : "";
+      const unchanged = intendedCreate
+        ? !exists
+        : exists && this.project.hash(current) === proposal.baseHash;
+      if (!unchanged) {
+        this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
+        throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
+      }
+      const evolved = this.evolveCharactersForProposal(proposal.characterChanges);
+      const preparedAt = new Date().toISOString();
+      this.database.prepare(`INSERT INTO proposal_applications(
+        proposal_id,status,before_content,after_hash,created_file,character_revisions_json,created_at,updated_at
+      ) VALUES(?,'prepared',?,?,?,?,?,?)`).run(
+        id, current, expectedAfterHash, intendedCreate ? 1 : 0,
+        JSON.stringify(evolved.revisions), preparedAt, preparedAt,
+      );
+      application = this.database.prepare("SELECT * FROM proposal_applications WHERE proposal_id=?").get(id) as Row;
+    }
+
     const exists = this.project.documentExists(proposal.path);
     const current = exists ? this.project.read(proposal.path) : "";
-    // File present with content → always treat as update so history chains
-    // (e.g. keep-changes re-run rewriting 第一章.md after the first draft stayed).
-    const createdFile = intendedCreate && !exists;
-    const unchanged = intendedCreate
-      ? !exists
-      : exists && this.project.hash(current) === proposal.baseHash;
-    if (!unchanged) {
+    const currentHash = exists ? this.project.hash(current) : "__missing__";
+    const beforeContent = String(application.before_content ?? "");
+    const beforeHash = proposal.baseHash === "__missing__" ? "__missing__" : this.project.hash(beforeContent);
+    if (currentHash !== expectedAfterHash && currentHash !== beforeHash) {
       this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
-      throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
+      throw new Error("文档已在提案应用过程中发生冲突，未覆盖当前内容");
     }
-    const evolved = this.evolveCharactersForProposal(proposal.characterChanges);
-    this.project.writeRaw(proposal.path, proposal.afterContent);
-    if (evolved.revisions.length) this.writeCharacters(evolved.characters);
+    if (currentHash !== expectedAfterHash) this.project.writeRaw(proposal.path, proposal.afterContent);
+
+    const characterRevisions = parseProposalCharacterRevisions(application.character_revisions_json);
+    if (characterRevisions.length) {
+      let characters = this.characters();
+      for (const revision of characterRevisions) {
+        const currentCharacter = characters.find(item => item.id === revision.characterId);
+        const before = this.normalizeCharacter(revision.before);
+        const after = this.normalizeCharacter(revision.after);
+        if (!currentCharacter || (JSON.stringify(currentCharacter) !== JSON.stringify(before)
+          && JSON.stringify(currentCharacter) !== JSON.stringify(after))) {
+          throw new Error(`角色卡 ${revision.characterId} 已在提案应用过程中发生冲突`);
+        }
+        characters = [...characters.filter(item => item.id !== revision.characterId), after];
+      }
+      validateCharacters(characters, this.outlineNodeIds());
+      this.writeCharacters(characters);
+    }
+
     const now = new Date().toISOString();
-    this.database.prepare(`
-      INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_file,character_revisions_json,created_at)
-      VALUES(?,?,?,?,?,?,?,?)
-    `).run(
-      id, proposal.path, current, proposal.afterContent, this.project.hash(proposal.afterContent), createdFile ? 1 : 0,
-      JSON.stringify(evolved.revisions), now,
-    );
-    this.database.prepare("UPDATE proposals SET status='accepted' WHERE id=?").run(id);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existingRevision = this.database.prepare("SELECT 1 AS ok FROM revisions WHERE proposal_id=?").get(id);
+      if (!existingRevision) {
+        this.database.prepare(`
+          INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_file,character_revisions_json,created_at)
+          VALUES(?,?,?,?,?,?,?,?)
+        `).run(
+          id, proposal.path, beforeContent, proposal.afterContent, expectedAfterHash, Number(application.created_file) ? 1 : 0,
+          String(application.character_revisions_json ?? "[]"), now,
+        );
+      }
+      this.database.prepare("UPDATE proposals SET status='accepted' WHERE id=?").run(id);
+      this.database.prepare("UPDATE proposal_applications SET status='committed',updated_at=? WHERE proposal_id=?").run(now, id);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    }
     this.refreshContinuityFactsForDocument(proposal.path, proposal.afterContent);
     this.reindex();
     return this.proposal(id);

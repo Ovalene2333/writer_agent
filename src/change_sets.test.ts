@@ -175,3 +175,30 @@ test("chapter file operations use filesystem paths without rewriting writer.yaml
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("change set application resumes after files were written before database commit", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-change-set-resume-"));
+  try {
+    const project = WriterProject.init(root, "change set resume");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("resume");
+    const changeSet = store.createChangeSet(sessionId, "write recovery note", [
+      { operation: "write", path: "notes/recovery.txt", content: "applied before crash\n" },
+    ]);
+    const at = "2026-08-02T00:00:00.000Z";
+    store.database.prepare(`INSERT INTO change_set_applications(
+      change_set_id,status,character_revisions_json,created_at,updated_at
+    ) VALUES(?,'prepared','[]',?,?)`).run(changeSet.id, at, at);
+    project.writeTextFile("notes/recovery.txt", "applied before crash\n");
+
+    const accepted = store.acceptChangeSet(changeSet.id);
+    assert.equal(accepted.status, "accepted");
+    assert.equal(project.readTextFile("notes/recovery.txt"), "applied before crash\n");
+    const application = store.database.prepare("SELECT status FROM change_set_applications WHERE change_set_id=?")
+      .get(changeSet.id) as { status: string };
+    assert.equal(application.status, "committed");
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

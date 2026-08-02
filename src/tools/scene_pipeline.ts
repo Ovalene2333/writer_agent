@@ -128,6 +128,9 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, cont
   const baseContent = target.beforeContent;
   const scenes = Array.isArray(input.scenes) ? input.scenes : [];
   const draft = beginChapterSceneDraft({
+    ...(typeof input.deliverableId === "string" && input.deliverableId.trim()
+      ? { deliverableId: input.deliverableId.trim() }
+      : {}),
     path,
     mode,
     heading: typeof input.heading === "string" ? input.heading : undefined,
@@ -1441,8 +1444,13 @@ async function submitChapterDraftProposal(
     true,
     true,
   );
+  let returnedResult = result;
   try {
     const parsed = JSON.parse(result) as Record<string, unknown>;
+    if (draft.deliverableId) {
+      parsed.deliverableId = draft.deliverableId;
+      returnedResult = JSON.stringify(parsed);
+    }
     if (!("error" in parsed)) {
       const proposalId = typeof parsed.proposalId === "number" ? parsed.proposalId : undefined;
       saveDraftCheckpoint(args, "proposal_submitted", draft, { proposalId });
@@ -1454,5 +1462,5 @@ async function submitChapterDraftProposal(
       context.chapterSceneDraft = undefined;
     }
   } catch { /* submitFullDocumentProposal always returns JSON; preserve draft on unexpected output. */ }
-  return result;
+  return returnedResult;
 }

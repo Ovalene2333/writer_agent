@@ -155,6 +155,7 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
     requireString(input.summary, "summary"),
     files,
     preparedCharacterChanges.changes,
+    context.sourceMessageId,
   );
   emit({ type: "change_set", changeSet });
   if (context.permissionMode !== "auto") {

@@ -25,6 +25,7 @@ import { documentKind, isScenePipelineDocument } from "../project.js";
 import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
 import { chapterRhythmGateError } from "../prose_metrics.js";
 import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
+import { ToolRevisionRequiredError } from "../tool_failure.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
   DEFAULT_ISOLATED_WRITER_MAX_RATIO,
@@ -266,7 +267,7 @@ export async function gateProseStyle(
     targetKind: targetPath ? documentKind(targetPath) : "other",
   });
   const styleError = proseStyleIssuesError(issues);
-  if (styleError) throw new Error(styleError);
+  if (styleError) throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", styleError);
 }
 
 export const PRIMARY_PROSE_GATE_TIMEOUT_MS = 60_000;
@@ -383,7 +384,7 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
       assessProseLength(targetCharacters, body),
       context.proseLength?.enforceMinimum === true,
     );
-    if (outcome.blocked) throw new Error(outcome.message);
+    if (outcome.blocked) throw new ToolRevisionRequiredError("PROSE_LENGTH_REVISION_REQUIRED", outcome.message);
     lengthNotice = outcome.notice;
   }
   return submitFullDocumentProposal(
@@ -599,7 +600,7 @@ export async function submitFullDocumentProposal(
     const rhythmError = chapterRhythmGateError(meta.content, { phase: usedGrace ? "hard" : "first" });
     if (rhythmError) {
       if (usedGrace) {
-        throw new Error(rhythmError);
+        throw new ToolRevisionRequiredError("RHYTHM_REVISION_REQUIRED", rhythmError);
       }
       context.rhythmGracePaths.add(path);
       rhythmRevisionRequired = rhythmError;
@@ -630,6 +631,8 @@ export async function submitFullDocumentProposal(
     summary,
     preparedCharacterChanges.changes,
     qualityReport,
+    context.sourceMessageId,
+    !rhythmRevisionRequired,
   );
   emit({ type: "proposal", proposal });
   // 首轮节奏未达标：不自动落盘，等句式修订提案通过后再写。
@@ -761,6 +764,17 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  if (!project.documentExists(path)) {
+    return JSON.stringify({
+      status: "recoverable_state_error",
+      code: "TARGET_DOCUMENT_MISSING",
+      failureKind: "invalid_request",
+      retryable: true,
+      path,
+      error: `${path} 尚不存在，不能使用 propose_document_patch；新建文档的修订稿必须继续用 propose_document 提交`,
+      nextAllowedActions: ["read_context_artifact", "propose_document"],
+    });
+  }
   assertCreativeOutlineDesigned(context, path, "propose_document_patch");
   const beforeContent = project.read(path);
   const sourceHash = project.hash(beforeContent);
@@ -848,13 +862,15 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   // 首轮 grace 后若用 patch 抛光：同一 path 必须过硬节奏门禁。
   if (isScenePipelineDocument(path) && context.rhythmGracePaths?.has(path)) {
     const rhythmError = chapterRhythmGateError(content);
-    if (rhythmError) throw new Error(rhythmError);
+    if (rhythmError) throw new ToolRevisionRequiredError("RHYTHM_REVISION_REQUIRED", rhythmError);
     context.rhythmGracePaths.delete(path);
   }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId, path, content, requireString(input.summary, "summary"),
     preparedCharacterChanges.changes,
+    undefined,
+    context.sourceMessageId,
   );
   emit({ type: "proposal", proposal });
   const uniqueStripped = [...new Set(strippedMeta)];

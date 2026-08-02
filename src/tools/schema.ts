@@ -265,6 +265,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           id: { type: "string", description: "节点 ID" },
           search: { type: "string", description: "唯一原文" },
           replace: { type: "string", description: "替换 Markdown" },
@@ -321,6 +322,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
           mode: { type: "string", enum: ["create", "replace", "append"] },
           heading: { type: "string", description: "create/replace 时的正文标题（不含 #）" },
@@ -364,6 +366,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
           mode: { type: "string", enum: ["create", "replace", "append"] },
           sourceHash: { type: "string", description: "replace/append 时必传当前文档哈希" },
@@ -551,6 +554,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           summary: { type: "string", description: "修改摘要" },
           chapterChange: { type: "string", description: "一句话说明全文开头到结尾的总变化" },
           reviewNotes: { type: "string", description: "接缝、重复功能与转折多样性审阅结论" },
@@ -579,6 +583,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "文档路径" },
           content: { type: "string", description: "完整 Markdown" },
           targetCharacters: { type: "number", description: `正文目标字数 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS}；章节/支线正文须传，用本轮篇幅目标，按 ${PROSE_TARGET_BAND_TEXT} 验收（不计首行标题）：超上限拒收，不足下限只提示` },
@@ -610,6 +615,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "文档路径" },
           sourceHash: { type: "string", description: "锚点 patch 必填；文档变化时拒绝" },
           edits: {
@@ -656,6 +662,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "目标文档路径" },
           sourceHash: { type: "string", description: "inspect_document 返回的快照哈希" },
           instruction: { type: "string", description: "适用于全文的明确修改要求" },
@@ -684,6 +691,7 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
+          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           summary: { type: "string", description: "整组变更摘要" },
           files: {
             type: "array", maxItems: 20,

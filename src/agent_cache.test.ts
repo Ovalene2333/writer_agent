@@ -82,7 +82,7 @@ test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "b2a4cf2b4e7f161d");
+  assert.equal(agentToolSchemaHash(), "b26768172ab1cd26");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -693,20 +693,26 @@ test("proposal retry policy separates dependency outages from bounded prose revi
     code: "PROSE_GATE_UNAVAILABLE",
     failureKind: "dependency",
     retryable: true,
-  }, 1), { action: "pause", reason: "dependency", attempt: 1 });
+  }, 0), { action: "pause", reason: "dependency", attempt: 0 });
 
   assert.deepEqual(decideProposalFailure({
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
     status: "final_review_revision_required",
-  }, 1), { action: "revise", attempt: 1 });
+  }, 0), { action: "revise", attempt: 1 });
 
   assert.deepEqual(decideProposalFailure({
     code: "INVALID_TOOL_ARGUMENTS_JSON",
     error: "工具参数不是有效 JSON",
-  }, 1), { action: "revise", attempt: 1 });
+  }, 0), { action: "correct_call", attempt: 0 });
+
+  assert.deepEqual(decideProposalFailure({
+    code: "TARGET_DOCUMENT_MISSING",
+    failureKind: "invalid_request",
+    error: "目标文件不存在",
+  }, 2), { action: "correct_call", attempt: 2 });
 
   assert.deepEqual(decideProposalFailure({ status: "rejected" },
-    MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW), {
+    MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW - 1), {
     action: "pause",
     reason: "revision_exhausted",
     attempt: MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW,

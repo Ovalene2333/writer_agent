@@ -46,6 +46,7 @@ export type ChapterSceneGuideRevision = {
 };
 
 export type ChapterSceneDraft = {
+  deliverableId?: string;
   path: string;
   mode: ChapterDraftMode;
   heading: string;
@@ -59,6 +60,7 @@ export type ChapterSceneDraft = {
 };
 
 export type BeginChapterSceneDraftInput = {
+  deliverableId?: string;
   path: string;
   mode: ChapterDraftMode;
   heading?: string;
@@ -88,6 +90,7 @@ export function beginChapterSceneDraft(input: BeginChapterSceneDraftInput): Chap
     if (!scenes[index].handoff) throw new Error(`scenes[${index}].handoff 不能为空；须说明如何因果交给下一场`);
   }
   return {
+    ...(input.deliverableId ? { deliverableId: input.deliverableId } : {}),
     path: input.path,
     mode: input.mode,
     heading,

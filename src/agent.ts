@@ -1,6 +1,5 @@
 import type {
   AgentEvent,
-  AgentRunDocumentEvidence,
   AgentTodoItem,
   MessageAttachment,
   MessageAttachmentInput,
@@ -45,16 +44,11 @@ import {
   type ProviderWireMessage,
 } from "./model_api.js";
 import {
-  agentCompletionGaps,
-  agentRunPendingDocumentLabels,
   completionRecoveryPrompt,
   contractAllowsTool,
-  createAgentRunState,
   createAgentExecutionProgress,
   inferWritingQualityProfile,
   inferWritingWorkflowKind,
-  recordAgentToolResult,
-  recordAgentRunDocumentEvidence,
   resolveAgentPlanningStrategy,
   type AgentCapability,
   type AgentEvidenceRequirement,
@@ -63,6 +57,7 @@ import {
   type AgentTaskContract,
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
+import { AgentLoopRuntime } from "./agent_loop.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
 import { decideProposalFailure, isExpectedRhythmPolish } from "./proposal_retry.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
@@ -499,6 +494,7 @@ export function dynamicContextPrompt(
   simpleCharacterScope?: number[],
   resumeInterrupted?: boolean,
   proseLength?: TurnProseLength,
+  runDeliverables?: ReadonlyArray<{ id: string; label: string }>,
 ): string {
   const explicitReferences = explicitReferencePaths(project, request);
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
@@ -519,7 +515,7 @@ export function dynamicContextPrompt(
     ? "开启。可按现有规则调用 apply_character_changes，或在文档提案中附 characterChanges。"
     : "关闭。不得调用 apply_character_changes，不得在文档提案或 change set 中附 characterChanges；显式新建或编辑角色卡仍可使用 save_character。";
   const documentInstruction = task.documentProposalRequired
-    ? `必须成功提交文档提案或 change set 后结束，禁止用最终回复代替文件交付。根据作品与修改范围自主选择完整文档、局部 patch、隔离通篇修订${scenePipeline.enabled ? "或场景草稿链" : ""}；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接继续。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+    ? `必须成功提交文档提案或 change set 后结束，禁止用最终回复代替文件交付。根据作品与修改范围自主选择完整文档、局部 patch、隔离通篇修订${scenePipeline.enabled ? "或场景草稿链" : ""}；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接继续。${runDeliverables && runDeliverables.length > 1 ? `本轮独立交付项：${JSON.stringify(runDeliverables)}。每次提交必须在 deliverableId 中绑定对应 ID。` : ""}${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
     : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
   const proseGateInstruction = task.proseGateCandidate
     ? permissionMode === "plan"
@@ -562,7 +558,7 @@ export function dynamicContextPrompt(
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
     : "";
   return `当前任务：${task.label}
-任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile })}
+任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile, deliverables: runDeliverables })}
 mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后用 manage_todos 修订剩余计划。
 ${writingWorkflowPrompt(task.workflow ?? "free", task.qualityProfile ?? "fast")}
 ${resumeLine}
@@ -1943,6 +1939,18 @@ const PROPOSAL_SUBMISSION_TOOLS = new Set([
   "propose_change_set",
 ]);
 
+function deliverableIdFromToolCall(call: ToolCall): string | undefined {
+  if (!PROPOSAL_SUBMISSION_TOOLS.has(call.name) && call.name !== "inspect_chapter_draft") return undefined;
+  try {
+    const input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+    return typeof input.deliverableId === "string" && input.deliverableId.trim()
+      ? input.deliverableId.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function proposalRevisionBoundaryPrompt(
   prompt: string,
   draft?: ProposalRevisionDraftRef,
@@ -1958,6 +1966,46 @@ function proposalRevisionBoundaryPrompt(
     "旧版完整提案与驳回工具链已卸下。先用 read_context_artifact 分页读取该 artifact，"
       + "只按上述驳回点修订，然后重新提交；禁止重读设定或从头另写。",
   ].join("\n");
+}
+
+function proposalRevisionTargetConstraint(
+  project: WriterProject,
+  draft?: ProposalRevisionDraftRef,
+): string {
+  if (!draft?.path || project.documentExists(draft.path)) return "";
+  return `目标 ${draft.path} 尚未创建：本修订链只能用 propose_document 提交完整正文，禁止 propose_document_patch。`;
+}
+
+function proposalDraftRefFromCase(revisionCase?: ProposalRevisionCase): ProposalRevisionDraftRef | undefined {
+  if (!revisionCase) return undefined;
+  return {
+    artifactId: revisionCase.draftArtifactId,
+    path: revisionCase.path,
+    sourceHash: revisionCase.draftSourceHash,
+    revisionCase,
+  };
+}
+
+function proposalCallCorrectionPrompt(
+  result: Record<string, unknown>,
+  draft?: ProposalRevisionDraftRef,
+): string {
+  const code = typeof result.code === "string" ? result.code : "PROPOSAL_CALL_INVALID";
+  const message = typeof result.error === "string"
+    ? result.error
+    : typeof result.message === "string" ? result.message : "提案工具调用与当前项目状态不匹配。";
+  const nextAllowedActions = Array.isArray(result.nextAllowedActions)
+    ? result.nextAllowedActions.filter((item): item is string => typeof item === "string")
+    : [];
+  return [
+    `提案工具调用未执行（${code}）；这不是正文审核驳回，不消耗修订次数。`,
+    `原因：${message.replace(/\s+/g, " ").slice(0, 500)}`,
+    nextAllowedActions.length ? `允许的下一步：${nextAllowedActions.join("、")}。` : "",
+    code === "TARGET_DOCUMENT_MISSING"
+      ? "目标文件尚未创建，禁止 propose_document_patch；读取已保存的完整草稿后，必须用 propose_document 重新提交。"
+      : "修正工具名或参数后重新调用；不要为了修正调用而改写正文或重读项目材料。",
+    draft ? `继续使用 artifactId=${draft.artifactId} 的完整正文，不要丢弃当前修订成果。` : "",
+  ].filter(Boolean).join("\n");
 }
 
 function proposalFailurePauseResult(
@@ -2373,24 +2421,25 @@ export async function runAgent(options: {
     turnAttachments.length ? turnAttachments : undefined,
   );
   emit({ type: "source_message", messageId: sourceMessageId, channel: "agent" });
-  let agentRunState = createAgentRunState(
-    prompt,
-    task.documentDeliverables,
-    options.resumeInterrupted ? previousRunState : undefined,
-  );
-  agentRunState = { ...agentRunState, sourceMessageId };
-  store.saveAgentRunState(sessionId, agentRunState);
+  const agentLoop = AgentLoopRuntime.open({
+    store,
+    sessionId,
+    sourceMessageId,
+    originalRequest: prompt,
+    task,
+    permissionMode,
+    reusableEvidence: Boolean(
+      options.selectedDocumentBlocks?.some(block => Boolean(block.text?.trim()) && block.text!.trim().length <= 800)
+        || task.continuation,
+    ),
+    resumeInterrupted: options.resumeInterrupted === true,
+    legacyState: previousRunState,
+  });
   const persistRunTerminal = (
     terminalState: "interrupted" | "completed" | "failed" | "cancelled",
     terminalReason?: string,
   ) => {
-    agentRunState = {
-      ...agentRunState,
-      terminalState,
-      ...(terminalReason ? { terminalReason } : {}),
-      updatedAt: new Date().toISOString(),
-    };
-    store.saveAgentRunState(sessionId, agentRunState);
+    agentLoop.terminate(terminalState, terminalReason);
   };
   // Context graph: message + epoch. Process (L3) lives only inside this epoch;
   // active handoffs (L2) are linked as uses for assemble/debug.
@@ -2666,6 +2715,7 @@ export async function runAgent(options: {
       simpleCharacterScope,
       options.resumeInterrupted === true,
       turnProseLength,
+      agentLoop.deliverables.map(({ id, label }) => ({ id, label })),
     )}
 
 ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}`,
@@ -2825,14 +2875,20 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   let activeProposalRevisionCase = restoreActiveProposalRevisionCase(
     store, sessionId, task.targetPath ?? continuationPath,
   );
-  let proposalRevisionAttempts = activeProposalRevisionCase?.attempt ?? 0;
+  // The persisted revision case is authoritative when present: it is created
+  // only after a real content verdict and therefore also repairs older runs
+  // whose generic tool errors were historically recorded as proposal gates.
+  let proposalRevisionAttempts = activeProposalRevisionCase?.attempt ?? Math.max(
+    agentLoop.snapshot.progress.gateAttempts.semantic_review ?? 0,
+    agentLoop.snapshot.progress.gateAttempts.style ?? 0,
+    agentLoop.snapshot.progress.gateAttempts.proposal ?? 0,
+  );
   /** Non-compressible blocker state for the active proposal retry chain. */
   /** Cached prefix immediately before the first full-body proposal in a retry chain. */
   let proposalRetryBase: number | undefined;
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
   let submittedProposalRef: SubmittedProposalRef | undefined;
-  let submittedDocumentEvidence: AgentRunDocumentEvidence | undefined;
-  let completedDocumentDeliverables = agentRunState.documentObligations.filter(item => item.evidence).length;
+  let completedDocumentDeliverables = agentLoop.completedDocumentDeliverables;
   let characterMutationSubmitted = false;
   let characterMutationName = "";
   let lastCharacterMutationDiagnostic = "";
@@ -2840,20 +2896,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   const toolCallCounts = new Map<string, number>();
   const requiresCharacterMutation = permissionMode !== "plan"
     && (task.mutation === "character" || task.mutation === "mixed");
-  const executionProgress = createAgentExecutionProgress(Boolean(
-    options.selectedDocumentBlocks?.some(block => Boolean(block.text?.trim()) && block.text!.trim().length <= 800)
-      || (task.continuation && artifactContext)
-      || toolContext.chapterSceneDraft,
-  ));
-  for (const obligation of agentRunState.documentObligations) {
-    const evidence = obligation.evidence;
-    if (!evidence) continue;
-    const key = evidence.proposalId !== undefined
-      ? `proposal:${evidence.proposalId}`
-      : evidence.changeSetId !== undefined ? `change-set:${evidence.changeSetId}` : undefined;
-    if (key) executionProgress.documentArtifactKeys.add(key);
-  }
-  executionProgress.documentArtifactProduced = executionProgress.documentArtifactKeys.size > 0;
+  let executionProgress = agentLoop.executionProgress();
   const replannedFailures = new Set<string>();
   let thinkingContinuationDisabled = false;
   // Measured prefix-cache usage for this turn, summed over its agent_step calls.
@@ -3024,6 +3067,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
 
       const step = turn + 1;
       currentUsageStep = step;
+      agentLoop.recordStep(step);
       emit({ type: "step_start", step });
       const stepModel = executionModelForStep(
         task.mode,
@@ -3182,7 +3226,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           ensureThinkingTranscriptCanContinue();
           continue;
         }
-        const gaps = agentCompletionGaps(task, executionProgress, store.sessionTodos(sessionId));
+        const gaps = agentLoop.completionGaps(store.sessionTodos(sessionId));
         if (gaps.length) {
           messages.push({
             role: "assistant",
@@ -3320,9 +3364,14 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         } else {
           toolResult = await executeToolCached(effectiveCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
         }
+        // Workflow state consumes the complete result before model-facing bounding.
+        const workflowControlResult = toolResult;
+        const deliverableId = deliverableIdFromToolCall(effectiveCall);
+        agentLoop.observeTool(call.name, workflowControlResult, `tool:${sourceMessageId}:${step}:${call.id}`, deliverableId);
+        executionProgress = agentLoop.executionProgress();
         // Proposal control flow must read the complete structured review before a
         // large tool result is archived/previewed; otherwise nested issues vanish.
-        const proposalControlResult = PROPOSAL_SUBMISSION_TOOLS.has(call.name) ? toolResult : undefined;
+        const proposalControlResult = PROPOSAL_SUBMISSION_TOOLS.has(call.name) ? workflowControlResult : undefined;
         toolResult = boundToolResultForModel(effectiveCall, toolResult, project, store, sessionId);
         let structuredToolResult: Record<string, unknown> | undefined;
         try {
@@ -3331,7 +3380,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             structuredToolResult = parsed as Record<string, unknown>;
           }
         } catch { /* 非 JSON 工具结果仍会作为失败/不可验证观察记录。 */ }
-        recordAgentToolResult(executionProgress, call.name, structuredToolResult);
         try {
           const parsed = JSON.parse(toolResult) as Record<string, unknown>;
           if (call.name === "save_character" || call.name === "save_simple_character" || call.name === "apply_character_changes") {
@@ -3376,13 +3424,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             if (isSuccessfulDocumentSubmission(call.name, parsed)) {
               documentProposalSubmitted = true;
               const proposalId = proposalIdFromToolResult(parsed);
-              submittedDocumentEvidence = {
-                toolName: call.name,
-                ...(proposalId !== undefined ? { proposalId } : {}),
-                ...(typeof parsed.changeSetId === "number" ? { changeSetId: parsed.changeSetId } : {}),
-                ...(typeof parsed.path === "string" ? { path: parsed.path } : {}),
-                recordedAt: new Date().toISOString(),
-              };
               if (proposalId !== undefined) {
                 try {
                   const proposal = store.proposal(proposalId);
@@ -3425,7 +3466,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 );
                 const draft: ProposalRevisionDraftRef | undefined = savedDraft;
                 documentProposalSubmitted = false;
-                pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(parsed, 1);
+                pendingProposalRevisionPrompt = [
+                  proposalRevisionConvergePrompt(parsed, 1),
+                  proposalRevisionTargetConstraint(project, draft),
+                ].filter(Boolean).join("\n");
                 pendingProposalRevisionDraft = draft;
               } else {
                 documentProposalSubmitted = true;
@@ -3434,13 +3478,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                   activeProposalRevisionCase = undefined;
                 }
                 const proposalId = proposalIdFromToolResult(parsed);
-                submittedDocumentEvidence = {
-                  toolName: call.name,
-                  ...(proposalId !== undefined ? { proposalId } : {}),
-                  ...(typeof parsed.changeSetId === "number" ? { changeSetId: parsed.changeSetId } : {}),
-                  ...(typeof parsed.path === "string" ? { path: parsed.path } : {}),
-                  recordedAt: new Date().toISOString(),
-                };
                 proposalRevisionAttempts = 0;
                 proposalRetryBase = undefined;
               }
@@ -3459,29 +3496,41 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 } catch { /* ignore missing proposal row */ }
               }
             } else if (!("error" in parsed) || typeof parsed.error === "string") {
-              const nextAttempt = proposalRevisionAttempts + 1;
-              const decision = decideProposalFailure(parsed, nextAttempt);
+              const decision = decideProposalFailure(parsed, proposalRevisionAttempts);
               const savedDraft = saveProposalRevisionDraft(
                 effectiveCall, project, store, sessionId,
               );
-              const reviewResult = "error" in parsed && typeof parsed.error === "string"
-                ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
-                : parsed;
-              const draft = savedDraft
-                ? saveProposalRevisionCase(savedDraft, reviewResult, decision.attempt, store, sessionId, activeProposalRevisionCase)
-                : undefined;
-              activeProposalRevisionCase = draft?.revisionCase ?? activeProposalRevisionCase;
-              if (decision.action === "pause") {
+              if (decision.action === "correct_call") {
+                const draft = savedDraft ?? proposalDraftRefFromCase(activeProposalRevisionCase);
+                pendingProposalRevisionPrompt = proposalCallCorrectionPrompt(parsed, draft);
+                pendingProposalRevisionDraft = draft;
+              } else if (decision.action === "pause" && decision.reason !== "revision_exhausted") {
                 waitingForUser = true;
+                const draft = savedDraft ?? proposalDraftRefFromCase(activeProposalRevisionCase);
                 toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
               } else {
-                proposalRevisionAttempts = decision.attempt;
-                pendingProposalRevisionPrompt = proposalRevisionConvergePrompt(
-                  reviewResult,
-                  decision.attempt,
-                  draft?.revisionCase,
-                );
-                pendingProposalRevisionDraft = draft;
+                const reviewResult = "error" in parsed && typeof parsed.error === "string"
+                  ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
+                  : parsed;
+                const draft = savedDraft
+                  ? saveProposalRevisionCase(savedDraft, reviewResult, decision.attempt, store, sessionId, activeProposalRevisionCase)
+                  : undefined;
+                activeProposalRevisionCase = draft?.revisionCase ?? activeProposalRevisionCase;
+                if (decision.action === "pause") {
+                  waitingForUser = true;
+                  toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
+                } else {
+                  proposalRevisionAttempts = decision.attempt;
+                  pendingProposalRevisionPrompt = [
+                    proposalRevisionConvergePrompt(
+                      reviewResult,
+                      decision.attempt,
+                      draft?.revisionCase,
+                    ),
+                    proposalRevisionTargetConstraint(project, draft),
+                  ].filter(Boolean).join("\n");
+                  pendingProposalRevisionDraft = draft;
+                }
               }
             }
           } catch { /* 无效工具结果不能视为已提交。 */ }
@@ -3525,6 +3574,13 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         let automaticReviewResult = await executeToolCached(
           automaticReviewCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext,
         );
+        const automaticReviewControlResult = automaticReviewResult;
+        agentLoop.observeTool(
+          automaticReviewCall.name,
+          automaticReviewControlResult,
+          `tool:${sourceMessageId}:${step}:${automaticReviewCall.id}`,
+        );
+        executionProgress = agentLoop.executionProgress();
         automaticReviewResult = boundToolResultForModel(
           automaticReviewCall, automaticReviewResult, project, store, sessionId,
         );
@@ -3535,17 +3591,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             parsedAutomaticReview = parsed as Record<string, unknown>;
           }
         } catch { /* malformed automatic review keeps the ordinary terminal lock */ }
-        recordAgentToolResult(executionProgress, automaticReviewCall.name, parsedAutomaticReview);
         if (parsedAutomaticReview && chapterReviewCompleted(parsedAutomaticReview)) {
           if (isSuccessfulDocumentSubmission("inspect_chapter_draft", parsedAutomaticReview)) {
             documentProposalSubmitted = true;
             const proposalId = proposalIdFromToolResult(parsedAutomaticReview);
-            submittedDocumentEvidence = {
-              toolName: "inspect_chapter_draft",
-              ...(proposalId !== undefined ? { proposalId } : {}),
-              ...(typeof parsedAutomaticReview.path === "string" ? { path: parsedAutomaticReview.path } : {}),
-              recordedAt: new Date().toISOString(),
-            };
             if (proposalId !== undefined) {
               try {
                 const proposal = store.proposal(proposalId);
@@ -3581,7 +3630,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       }
       if (characterMutationSubmitted && task.mutation === "character") {
         persistCompletedCharacterTaskTodos(store, sessionId, emit);
-        const gaps = agentCompletionGaps(task, executionProgress, store.sessionTodos(sessionId));
+        const gaps = agentLoop.completionGaps(store.sessionTodos(sessionId));
         if (!gaps.length) {
           const answer = stripDsmlText(transcript, "").trim()
             || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
@@ -3694,14 +3743,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         continue;
       }
       if (documentProposalSubmitted) {
-        // Concrete proposal evidence satisfies one unordered completion
-        // obligation. The Agent still chooses the next action and writing path.
-        if (submittedDocumentEvidence) {
-          agentRunState = recordAgentRunDocumentEvidence(agentRunState, submittedDocumentEvidence);
-          store.saveAgentRunState(sessionId, agentRunState);
-        }
-        completedDocumentDeliverables = agentRunState.documentObligations.filter(item => item.evidence).length;
-        const remainingDocumentDeliverables = agentRunPendingDocumentLabels(agentRunState);
+        // The controller already persisted concrete proposal evidence while
+        // interpreting the tool result. Everything below derives from its snapshot.
+        completedDocumentDeliverables = agentLoop.completedDocumentDeliverables;
+        const remainingDocumentDeliverables = agentLoop.pendingDocumentLabels();
         const hasIndependentDocumentRemaining = remainingDocumentDeliverables.length > 0;
         const advanced = persistAdvancedTodosAfterProposal(
           store,
@@ -3879,7 +3924,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           toolCallCounts.clear();
           documentProposalSubmitted = false;
           submittedProposalRef = undefined;
-          submittedDocumentEvidence = undefined;
           proposalRetryBase = undefined;
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
@@ -3896,7 +3940,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           ensureThinkingTranscriptCanContinue();
           continue;
         }
-        const gaps = agentCompletionGaps(task, executionProgress, advanced.todos);
+        const gaps = agentLoop.completionGaps(advanced.todos);
         if (gaps.length && !waitingForUser) {
           documentProposalSubmitted = false;
           submittedProposalRef = undefined;
@@ -4002,7 +4046,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     }
     // Tools finished with a satisfied contract but no pure-text final step.
     const endTodos = store.sessionTodos(sessionId);
-    const endGaps = agentCompletionGaps(task, executionProgress, endTodos);
+    const endGaps = agentLoop.completionGaps(endTodos);
     if (!pauseForUserResume && !endGaps.length) {
       const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
       persistAssistantMessage(answer);

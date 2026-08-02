@@ -1,5 +1,5 @@
 /** Stable machine-readable failure kinds shared by model-backed tool handlers. */
-export type ToolFailureKind = "dependency" | "invalid_output" | "validation";
+export type ToolFailureKind = "dependency" | "invalid_output" | "validation" | "semantic_revision";
 
 /**
  * A tool dependency failed before it could produce a domain verdict.
@@ -16,6 +16,21 @@ export class ToolDependencyError extends Error {
   ) {
     super(message, options);
     this.name = "ToolDependencyError";
+  }
+}
+
+/** A domain gate rejected submitted content and requires a prose revision. */
+export class ToolRevisionRequiredError extends Error {
+  readonly failureKind = "semantic_revision" as const;
+  readonly retryable = true;
+
+  constructor(
+    readonly code: string,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ToolRevisionRequiredError";
   }
 }
 

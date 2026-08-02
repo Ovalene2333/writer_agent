@@ -38,6 +38,8 @@ for (const r of rows) console.log(JSON.stringify(r));
 | `messages` | 对话消息。`channel`：`agent`（写作）/ `roleplay`（扮演）；`role`：user/assistant/system |
 | `message_variants` | 同一条用户指令重跑产生的多版本回答（按 `group_id` 分组） |
 | `session_context` | 每会话一行：活动文档、当前意图、`todos_json`（任务清单快照） |
+| `agent_runs` | AgentRun v2 当前快照与语义终态（running/suspended/completed/failed/cancelled） |
+| `agent_run_events` | AgentRun v2 追加式状态事件；按 `(run_id, sequence)` 重放 |
 
 **关键行为**：Agent 任务的 assistant 消息**在 run 结束时才落库**——正在运行的任务在 `messages` 里只能看到 user 指令；「撤销用户指令」会连带删除该指令之后的消息与修订（`ON DELETE CASCADE` + 撤销逻辑），所以被撤销的 run 在库里搜不到。
 
@@ -45,7 +47,9 @@ for (const r of rows) console.log(JSON.stringify(r));
 
 | 表 | 说明 |
 |---|---|
-| `proposals` | 文档提案（`status`：pending/accepted/rejected；含 before/after 全文） |
+| `proposals` | 文档提案（`status`：pending/accepted/rejected；含 `source_message_id`、before/after 全文） |
+| `proposal_applications` | 提案落盘意图（prepared/committed），用于进程中断后按 hash 恢复 |
+| `change_set_applications` | 多文件 change set 的应用意图；文件已写但事务未提交时用于恢复 |
 | `revisions` | 已应用的文件修订（`undone=1` 表示已被撤销） |
 | `character_revisions` | 角色卡修订历史 |
 | `writing_examples` | 范文库 |
@@ -89,6 +93,28 @@ order by id;
 - `prompt_tokens` 相比上一步**下降** → 发生了场景/章节边界截断；
 - 截断后一步的 `cache_miss_tokens` 应约等于交接消息大小（1.5–3k）。若接近全量 miss，说明缓存前缀被破坏（历史教训：中途注入 system 角色消息会让 DeepSeek 整体换模板渲染，见 agent.ts 缓存合同 §4）；
 - `completion_tokens` 3–5k 的是写场步（thinking 模型含 reasoning），几十的是纯工具调用步（如 inspect）。
+
+### 2.1 查看真正的工作流终态与未完成交付物
+
+```sql
+select id, session_id, source_message_id, status, updated_at,
+       json_extract(snapshot_json, '$.terminalReason') as reason,
+       json_extract(snapshot_json, '$.nextAction') as next_action,
+       json_extract(snapshot_json, '$.deliverables') as deliverables
+from agent_runs
+order by created_at desc limit 20;
+```
+
+某次运行的完整状态转换：
+
+```sql
+select sequence, type, event_key, created_at, payload_json
+from agent_run_events
+where run_id = '<runId>'
+order by sequence;
+```
+
+`waiting_for_input` 会结束本次 HTTP/SSE job，但 `agent_runs.status` 是 `suspended`；二者分别表示传输任务结束和语义工作流尚可恢复，不应混为一次成功完成。
 
 ### 3. 按时间聚合各 run 的成本（间隔 >5 分钟视为新 run）
 
