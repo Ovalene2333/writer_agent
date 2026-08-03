@@ -445,6 +445,80 @@ test("direct chapter proposal rejects a document modified while final review is 
   }
 });
 
+test("direct proposal repairs sparse hard style blockers before creating the proposal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-proposal-style-repair-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "提案局部句式修订");
+    store = new WriterStore(project);
+    const activeStore = store;
+    const sessionId = activeStore.createSession("提案局部句式修订");
+    let repairCalls = 0;
+    const replacements = new Map([
+      ["这不是训练。是处决。", "训练场已经成了处决台。"],
+      ["那不是撤退。是蓄力。", "撤退把队伍带到下一道防线。"],
+      ["这不是失败。是延期。", "失败被记进延期表。"],
+      ["那不是命令。是诱导。", "命令在扩音器里绕成诱导。"],
+      ["这不是回应。是噪声。", "回应被噪声吞没。"],
+      ["那不是终点。是入口。", "终点后面露出新的入口。"],
+    ]);
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      editScope: "document",
+      chapterStyleRepairer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "repair-test" },
+        run: async (_model, input) => {
+          repairCalls += 1;
+          assert.equal(input.issues.length, 6);
+          return {
+            edits: input.issues.map(issue => ({
+              search: issue.sentence,
+              replace: replacements.get(issue.sentence) ?? issue.sentence,
+            })),
+            requestCharacters: 500,
+          };
+        },
+      },
+    };
+    const content = [
+      "# 样章",
+      "",
+      "这不是训练。是处决。",
+      "那不是撤退。是蓄力。",
+      "这不是失败。是延期。",
+      "那不是命令。是诱导。",
+      "这不是回应。是噪声。",
+      "那不是终点。是入口。",
+    ].join("\n");
+
+    const result = JSON.parse(await submitFullDocumentProposal(
+      {
+        input: {}, project, store: activeStore, sessionId,
+        emit: (_event: AgentEvent) => {}, context,
+      },
+      "lore/style.md",
+      content,
+      "验证提案前局部句式修订",
+      undefined,
+    )) as Record<string, unknown>;
+
+    assert.equal(result.status, "pending");
+    assert.equal(repairCalls, 1);
+    assert.deepEqual(result.styleAutoRepaired, {
+      attempts: 1,
+      edits: 6,
+      initialBlockers: 6,
+    });
+    const proposal = activeStore.proposal(Number(result.proposalId));
+    assert.doesNotMatch(proposal.afterContent, /这不是训练|那不是撤退|这不是失败|那不是命令|这不是回应|那不是终点/u);
+    assert.match(proposal.afterContent, /训练场已经成了处决台/u);
+    assert.match(proposal.afterContent, /终点后面露出新的入口/u);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rhythm-grace draft defers the cold semantic review until the polished submission", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-rhythm-review-"));
   let store: WriterStore | undefined;

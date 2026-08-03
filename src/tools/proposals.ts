@@ -7,11 +7,23 @@ import {
   validateCharacters,
 } from "../characters.js";
 import { adjudicateLearnedProseGates, adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
-import { newProseStyleIssues, proseStyleRepairPacket, proseStyleIssuesError } from "../prose_quality.js";
+import {
+  isHardBlockSubtype,
+  newProseStyleIssues,
+  proseStyleRepairPacket,
+  proseStyleIssuesError,
+  type ProseStyleIssue,
+} from "../prose_quality.js";
 import { compileWritePack, findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
 import { documentSpans } from "../document_spans.js";
 import { documentBlocks } from "../document_blocks.js";
 import { requestDocumentRevision } from "../document_revision.js";
+import {
+  ChapterStyleRepairRequestError,
+  requestChapterStyleRepair,
+  type ChapterStyleEdit,
+  type ChapterStyleRepairIssue,
+} from "../chapter_style_repair.js";
 import {
   IsolatedSceneRequestError,
   proseCharacterCount,
@@ -285,6 +297,170 @@ export async function gateProseStyle(
       repairPacket: proseStyleRepairPacket(afterContent, issues, { path: targetPath, sourceHash }),
     });
   }
+}
+
+const PROPOSAL_STYLE_AUTO_REPAIR_LIMIT = 8;
+const PROPOSAL_STYLE_AUTO_REPAIR_MAX_ATTEMPTS = 2;
+
+function proposalStyleHardErrors(issues: readonly ProseStyleIssue[]): ProseStyleIssue[] {
+  return issues.filter(issue => issue.severity === "error" && isHardBlockSubtype(issue.subtype));
+}
+
+function proposalStyleRepairIssues(issues: readonly ProseStyleIssue[]): ChapterStyleRepairIssue[] {
+  return issues.slice(0, PROPOSAL_STYLE_AUTO_REPAIR_LIMIT).map(issue => ({
+    id: issue.id,
+    code: `${issue.kind}:${issue.subtype}`,
+    sentence: issue.sentence,
+    before: issue.evidence,
+    after: issue.suggestions[0] ?? "",
+    instruction: issue.suggestions[0] ?? issue.reason,
+  }));
+}
+
+function applyExactProposalStyleEdits(
+  content: string,
+  blockers: readonly ProseStyleIssue[],
+  edits: readonly ChapterStyleEdit[],
+): { content: string; edits: ChapterStyleEdit[] } {
+  const allowed = new Set(blockers.map(issue => issue.sentence.trim()).filter(Boolean));
+  const replacements: Array<ChapterStyleEdit & { start: number; end: number }> = [];
+  const seen = new Set<string>();
+  for (const edit of edits.slice(0, PROPOSAL_STYLE_AUTO_REPAIR_LIMIT)) {
+    const search = edit.search.trim();
+    const replace = edit.replace.trim();
+    if (!allowed.has(search) || seen.has(search) || !replace || replace === search) continue;
+    if (replace.length > Math.max(500, search.length * 3) || /^#{1,6}\s/mu.test(replace)) continue;
+    const start = content.indexOf(search);
+    if (start < 0 || content.indexOf(search, start + search.length) >= 0) continue;
+    seen.add(search);
+    replacements.push({ search, replace, start, end: start + search.length });
+  }
+  replacements.sort((a, b) => b.start - a.start);
+  let revised = content;
+  let previousStart = content.length;
+  const applied: ChapterStyleEdit[] = [];
+  for (const edit of replacements) {
+    if (edit.end > previousStart) continue;
+    revised = `${revised.slice(0, edit.start)}${edit.replace}${revised.slice(edit.end)}`;
+    previousStart = edit.start;
+    applied.push({ search: edit.search, replace: edit.replace });
+  }
+  return { content: revised, edits: applied.reverse() };
+}
+
+async function gateProseStyleWithSparseAutoRepair(
+  beforeContent: string,
+  content: string,
+  context: ToolHandlerArgs["context"],
+  project: { hash(content: string): string },
+  path: string,
+  summary: string,
+  recordDraft?: (content: string, sourceHash: string) => void,
+): Promise<{ content: string; sourceHash: string; stripped: string[]; autoRepair?: { attempts: number; edits: number; initialBlockers: number } }> {
+  let current = content;
+  const stripped: string[] = [];
+  const repairer = context.chapterStyleRepairer;
+  const errors: string[] = [];
+  let appliedEdits = 0;
+  let initialBlockers = 0;
+  for (let attempt = 0; attempt <= PROPOSAL_STYLE_AUTO_REPAIR_MAX_ATTEMPTS; attempt += 1) {
+    const sourceHash = project.hash(current);
+    const issues = await proseStyleGateIssues(beforeContent, current, context, {
+      reviewWholeText: context.editScope === "document",
+      failClosed: true,
+      targetPath: path,
+      targetKind: documentKind(path),
+    });
+    const styleError = proseStyleIssuesError(issues);
+    if (!styleError) {
+      return {
+        content: current,
+        sourceHash,
+        stripped,
+        ...(attempt > 0 ? {
+          autoRepair: {
+            attempts: attempt,
+            edits: appliedEdits,
+            initialBlockers,
+          },
+        } : {}),
+      };
+    }
+    const blockers = proposalStyleHardErrors(issues);
+    if (attempt === 0) initialBlockers = blockers.length;
+    const repairable = blockers.length > 0
+      && blockers.length <= PROPOSAL_STYLE_AUTO_REPAIR_LIMIT
+      && blockers.every(issue => issue.sentence.trim()
+        && current.indexOf(issue.sentence.trim()) >= 0
+        && current.indexOf(issue.sentence.trim(), current.indexOf(issue.sentence.trim()) + issue.sentence.trim().length) < 0);
+    if (!repairer || !repairable || attempt >= PROPOSAL_STYLE_AUTO_REPAIR_MAX_ATTEMPTS) {
+      const packet = proseStyleRepairPacket(current, issues, { path, sourceHash });
+      const suffix = errors.length ? `；自动局部修订未完成：${errors.slice(-2).join("；")}` : "";
+      throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", `${styleError}${suffix}`, {
+        repairPacket: packet,
+      });
+    }
+    const runRepair = repairer.run ?? requestChapterStyleRepair;
+    const models = [repairer.model, repairer.fallbackModel]
+      .filter((model): model is NonNullable<typeof model> => Boolean(model))
+      .filter((model, index, all) => all.findIndex(candidate =>
+        candidate.baseUrl === model.baseUrl && candidate.model === model.model) === index);
+    let applied = false;
+    for (const model of models) {
+      try {
+        const repaired = await runRepair(model, {
+          issues: proposalStyleRepairIssues(blockers),
+          chapterGoal: summary,
+        }, repairer.signal);
+        if (repaired.usage) context.modelUsageReporter?.(model, repaired.usage, {
+          callKind: "proposal_style_repair",
+          requestComponents: [{
+            kind: "other",
+            label: "提案稀疏句式自动修订",
+            characters: repaired.requestCharacters,
+            estimatedTokens: Math.ceil(repaired.requestCharacters * 0.75),
+            callKind: "proposal_style_repair",
+          }],
+        });
+        const exact = applyExactProposalStyleEdits(current, blockers, repaired.edits);
+        if (!exact.edits.length) {
+          errors.push("局部修订没有提供可安全应用的唯一精确替换");
+          continue;
+        }
+        const cleaned = gateProseMetaLeaks(exact.content, path);
+        current = cleaned.content;
+        stripped.push(...cleaned.stripped);
+        appliedEdits += exact.edits.length;
+        recordDraft?.(current, project.hash(current));
+        applied = true;
+        break;
+      } catch (error) {
+        if (error instanceof ChapterStyleRepairRequestError && error.usage) {
+          context.modelUsageReporter?.(model, error.usage, {
+            callKind: "proposal_style_repair_failed",
+            requestComponents: [{
+              kind: "other",
+              label: "失败的提案稀疏句式自动修订",
+              characters: error.requestCharacters,
+              estimatedTokens: Math.ceil(error.requestCharacters * 0.75),
+              callKind: "proposal_style_repair_failed",
+            }],
+          });
+        }
+        errors.push(error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240));
+      }
+    }
+    if (!applied) {
+      const sourceHashAfterFailure = project.hash(current);
+      throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", `${styleError}；自动局部修订未完成：${errors.slice(-2).join("；")}`, {
+        repairPacket: proseStyleRepairPacket(current, issues, { path, sourceHash: sourceHashAfterFailure }),
+      });
+    }
+  }
+  const finalSourceHash = project.hash(current);
+  throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", "句式自动修订达到运行时上限后仍未通过", {
+    repairPacket: proseStyleRepairPacket(current, newProseStyleIssues(beforeContent, current), { path, sourceHash: finalSourceHash }),
+  });
 }
 
 function directReviewRepairPacket(
@@ -649,16 +825,22 @@ export async function submitFullDocumentProposal(
   assertCreativeOutlineDesigned(context, path, context.fileMutationTool ?? "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
   const meta = gateProseMetaLeaks(proposedContent, path);
-  const draftSourceHash = project.hash(meta.content);
+  const strippedMeta = [...meta.stripped];
+  let proposedBody = meta.content;
+  let draftSourceHash = project.hash(proposedBody);
   const deliverableId = typeof args.input.deliverableId === "string" && args.input.deliverableId.trim()
     ? args.input.deliverableId.trim()
     : undefined;
-  context.latestProposalDraft = {
-    path,
-    ...(deliverableId ? { deliverableId } : {}),
-    content: meta.content,
-    sourceHash: draftSourceHash,
+  const recordLatestProposalDraft = (content: string, sourceHash: string) => {
+    context.latestProposalDraft = {
+      path,
+      ...(deliverableId ? { deliverableId } : {}),
+      content,
+      sourceHash,
+    };
   };
+  recordLatestProposalDraft(proposedBody, draftSourceHash);
+  let styleAutoRepair: { attempts: number; edits: number; initialBlockers: number } | undefined;
   const expectedDocumentBase = context.proposalExpectedDocumentBase?.path === path
     && context.proposalExpectedDocumentBase.deliverableId === deliverableId
     ? context.proposalExpectedDocumentBase
@@ -700,13 +882,28 @@ export async function submitFullDocumentProposal(
       nextAllowedActions: ["read_file", "edit_file", "write_file"],
     });
   }
-  if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context, path, draftSourceHash);
+  if (!proseStyleApproved) {
+    const styleGate = await gateProseStyleWithSparseAutoRepair(
+      beforeContent,
+      proposedBody,
+      context,
+      project,
+      path,
+      summary,
+      recordLatestProposalDraft,
+    );
+    proposedBody = styleGate.content;
+    draftSourceHash = styleGate.sourceHash;
+    strippedMeta.push(...styleGate.stripped);
+    styleAutoRepair = styleGate.autoRepair;
+    recordLatestProposalDraft(proposedBody, draftSourceHash);
+  }
   // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
   let rhythmRevisionRequired: string | undefined;
   if (isScenePipelineDocument(path) && !proseStyleApproved) {
     context.rhythmGracePaths ??= new Set();
     const usedGrace = context.rhythmGracePaths.has(path);
-    const rhythmError = chapterRhythmGateError(meta.content, { phase: usedGrace ? "hard" : "first" });
+    const rhythmError = chapterRhythmGateError(proposedBody, { phase: usedGrace ? "hard" : "first" });
     if (rhythmError) {
       if (usedGrace) {
         throw new ToolRevisionRequiredError("RHYTHM_REVISION_REQUIRED", rhythmError);
@@ -721,7 +918,7 @@ export async function submitFullDocumentProposal(
   // now creates a cold full-chapter call and stale blockers that the polished
   // draft must pay to review again. Semantic review starts only after rhythm passes.
   if (!rhythmRevisionRequired && !semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
-    const blocked = await reviewDirectNarrativeProposal(args, path, meta.content, summary);
+    const blocked = await reviewDirectNarrativeProposal(args, path, proposedBody, summary);
     if (blocked) return blocked;
   }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
@@ -729,7 +926,7 @@ export async function submitFullDocumentProposal(
   // author sees the same quality picture in the review dock no matter how it was written.
   // Advisory: the report never blocks — everything that blocks已在上面 gate 掉了。
   const qualityReport = isScenePipelineDocument(path)
-    ? buildProseQualityReport(meta.content, context.proseLength
+    ? buildProseQualityReport(proposedBody, context.proseLength
       ? { lengthTarget: context.proseLength.targetCharacters }
       : undefined)
     : undefined;
@@ -738,7 +935,7 @@ export async function submitFullDocumentProposal(
     proposal = store.createProposal(
       sessionId,
       path,
-      meta.content,
+      proposedBody,
       summary,
       preparedCharacterChanges.changes,
       qualityReport,
@@ -766,7 +963,8 @@ export async function submitFullDocumentProposal(
     ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
-    ...(meta.stripped.length ? { metaSanitized: meta.stripped } : {}),
+    ...(styleAutoRepair ? { styleAutoRepaired: styleAutoRepair } : {}),
+    ...(strippedMeta.length ? { metaSanitized: [...new Set(strippedMeta)] } : {}),
     ...(rhythmRevisionRequired
       ? {
           rhythmRevisionRequired: true,
