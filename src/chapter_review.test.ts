@@ -93,6 +93,28 @@ test("直接文档终审可回填 document sceneId，并容忍引号空白差异
   assert.ok((parsed.issues[0]?.evidence.length ?? 0) > 0);
 });
 
+test("终审只保留全文中唯一的可直接替换 oldText", () => {
+  const source = "她从录音里听见答案。门禁灯随即熄灭。";
+  const parsed = parseChapterReview(review([{
+    severity: "blocker", kind: "knowledge_leak", sceneId: "s1",
+    evidence: ["她从录音里听见答案。"],
+    oldText: "她从录音里听见答案。",
+    problem: "录音尚未出现，角色没有获知路径",
+    action: "改成当下可见的迹象或补足录音来源",
+  }]), SCENES, source);
+  assert.equal(parsed.issues[0]?.oldText, "她从录音里听见答案。");
+
+  const duplicate = "她从录音里听见答案。她从录音里听见答案。";
+  const ambiguous = parseChapterReview(review([{
+    severity: "blocker", kind: "knowledge_leak", sceneId: "s1",
+    evidence: ["她从录音里听见答案。"],
+    oldText: "她从录音里听见答案。",
+    problem: "录音尚未出现，角色没有获知路径",
+    action: "改成当下可见的迹象或补足录音来源",
+  }]), SCENES, duplicate);
+  assert.equal(ambiguous.issues[0]?.oldText, undefined);
+});
+
 test("有可定位 blocker 时，不完整 sibling 不拖垮整次 revise", () => {
   const parsed = parseChapterReview(review([
     {

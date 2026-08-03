@@ -719,6 +719,38 @@ test("proposal revision converge prompt carries the scoped blocker packet", () =
   assert.match(withStructuredBlocker, /read_file/);
   assert.match(withStructuredBlocker, /edit_file/);
   assert.doesNotMatch(withStructuredBlocker, /artifactId/);
+  const directPacket = proposalRevisionConvergePrompt({
+    status: "revision_required",
+    code: "PROSE_STYLE_REVISION_REQUIRED",
+    path: "chapters/a.md",
+    repairPacket: {
+      path: "chapters/a.md",
+      sourceHash: "working-hash",
+      issueCount: 2,
+      issues: [
+        {
+          id: "style:early",
+          kind: "contrast:split_redefinition",
+          line: 12,
+          oldText: "这不是训练。是处决。",
+          evidence: "这不是训练。是处决。",
+          suggestion: "直接写出训练场的实际用途",
+        },
+        {
+          id: "style:late",
+          kind: "contrast:split_redefinition",
+          line: 263,
+          oldText: "这不是撤退。是蓄力。",
+          evidence: "这不是撤退。是蓄力。",
+          suggestion: "改成可观察行动",
+        },
+      ],
+    },
+  }, 1);
+  assert.match(directPacket, /立即用一次 edit_file/);
+  assert.match(directPacket, /style:late/);
+  assert.match(directPacket, /不要先 read_file/);
+  assert.doesNotMatch(directPacket, /下一步用 read_file/);
   const last = proposalRevisionConvergePrompt({
     status: "error",
     message: "句式门禁",
@@ -849,6 +881,7 @@ test("correct_call keeps the newest scoped draft without replacing semantic base
       severity: "blocker",
       kind: "knowledge_leak",
       evidence: ["她已经知道答案。"],
+      oldText: "她已经知道答案。",
       problem: "正文没有给出获知路径",
       action: "补足获知路径",
     };
@@ -903,6 +936,9 @@ test("correct_call keeps the newest scoped draft without replacing semantic base
     assert.equal(latest.revisionCase.draftArtifactId, correctedArtifactId);
     assert.equal(latest.revisionCase.semanticDraftArtifactId, rejectedArtifactId);
     assert.deepEqual(latest.revisionCase.unresolvedIssues, [issue]);
+    assert.equal(first.revisionCase.repairPacket?.sourceHash, rejectedHash);
+    assert.equal(first.revisionCase.repairPacket?.issues[0]?.oldText, issue.oldText);
+    assert.equal(latest.revisionCase.repairPacket, undefined, "stale direct anchors must not survive a changed draft");
     assert.deepEqual(latest.revisionCase.retryState, first.revisionCase.retryState);
     assert.equal(latest.revisionCase.attempt, first.revisionCase.attempt);
     assert.deepEqual({

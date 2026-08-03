@@ -75,6 +75,7 @@ import {
   type ProposalRevisionCase,
   type ProposalRevisionIssue,
 } from "./proposal_retry.js";
+import { boundedRepairPacket, normalizeRepairPacket, type RepairPacket } from "./repair_packet.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
   buildProjectTrunk,
@@ -1909,11 +1910,15 @@ function proposalRevisionIssues(
       || value.origin === "pre_existing_unrelated"
       ? value.origin
       : undefined;
+    const oldText = typeof value.oldText === "string" && value.oldText.trim()
+      ? value.oldText.trim().slice(0, 1_200)
+      : undefined;
     return [{
       id: priorIssueId ?? proposalRevisionIssueId({ kind, evidence, problem }),
       severity: "blocker",
       kind,
       evidence,
+      ...(oldText ? { oldText } : {}),
       problem,
       action,
       ...(priorIssueId ? { priorIssueId } : {}),
@@ -1921,6 +1926,38 @@ function proposalRevisionIssues(
     }];
   });
   return issues.slice(0, 8);
+}
+
+function semanticRepairPacket(
+  draft: { path?: string; sourceHash: string },
+  issues: readonly ProposalRevisionIssue[] | undefined,
+): RepairPacket | undefined {
+  if (!issues?.length) return undefined;
+  return boundedRepairPacket({
+    ...(draft.path ? { path: draft.path } : {}),
+    sourceHash: draft.sourceHash,
+    issueCount: issues.length,
+    issues: issues.map(issue => ({
+      id: issue.id,
+      kind: issue.kind,
+      ...(issue.oldText ? { oldText: issue.oldText } : {}),
+      ...(issue.evidence[0] ? { evidence: issue.evidence[0] } : {}),
+      problem: issue.problem,
+      action: issue.action,
+    })),
+  });
+}
+
+function repairPacketForDraft(
+  packet: RepairPacket | undefined,
+  draft: { path?: string; sourceHash: string },
+): RepairPacket | undefined {
+  if (!packet || (packet.sourceHash && packet.sourceHash !== draft.sourceHash)) return undefined;
+  return boundedRepairPacket({
+    ...packet,
+    ...(draft.path ? { path: draft.path } : {}),
+    sourceHash: draft.sourceHash,
+  });
 }
 
 export function saveProposalRevisionCase(
@@ -1934,7 +1971,7 @@ export function saveProposalRevisionCase(
   store: WriterStore,
   sessionId: string,
   previous?: ProposalRevisionCase,
-  options?: { rhythmPolishPending?: boolean; semanticVerdict?: boolean },
+  options?: { rhythmPolishPending?: boolean; semanticVerdict?: boolean; repairPacket?: RepairPacket },
 ): ProposalRevisionDraftRef & { revisionCase: ProposalRevisionCase } {
   if (retryState.deliverableId !== draft.deliverableId || retryState.path !== draft.path) {
     throw new Error("提案修订稿与重试状态作用域不匹配");
@@ -1963,6 +2000,11 @@ export function saveProposalRevisionCase(
   const unresolvedIssues = semanticVerdict
     ? semanticIssues ?? []
     : previous?.unresolvedIssues ?? [];
+  const repairPacket = repairPacketForDraft(
+    options?.repairPacket ? normalizeRepairPacket(options.repairPacket) : undefined,
+    draft,
+  ) ?? (semanticVerdict ? semanticRepairPacket(draft, unresolvedIssues) : undefined)
+    ?? repairPacketForDraft(previous?.repairPacket, draft);
   const revisionCaseId = previous?.revisionCaseId
     ?? `revision:${createHash("sha256").update(JSON.stringify([
       retryState.runId,
@@ -1994,6 +2036,7 @@ export function saveProposalRevisionCase(
     lastGate: gate,
     retryState,
     unresolvedIssues,
+    ...(repairPacket ? { repairPacket } : {}),
     resolvedIssueIds: semanticVerdict ? transition?.resolvedIssueIds ?? [] : previous?.resolvedIssueIds ?? [],
     stillPresentIssueIds: semanticVerdict ? transition?.stillPresentIssueIds ?? [] : previous?.stillPresentIssueIds ?? [],
     newlyIntroducedIssueIds: semanticVerdict
@@ -2039,6 +2082,7 @@ function closeProposalRevisionCase(
     status: "resolved",
   };
   delete closed.rhythmPolishPending;
+  delete closed.repairPacket;
   const sourceHash = createHash("sha256").update(JSON.stringify(closed)).digest("hex");
   store.saveContextArtifact(sessionId, {
     cacheKey: `proposal_revision_case:${current.runId}:${current.deliverableId ?? "document"}:${current.revisionCaseId}:resolved:${sourceHash}`,
@@ -2157,8 +2201,9 @@ function proposalRevisionBoundaryPrompt(
     draft.revisionCase
       ? "修订状态已由运行时持久化；未解决 blocker 必须逐项闭合。"
       : "",
-    `需要正文时直接 read_file(${JSON.stringify({ path: draft.path })}) 读取当前工作副本，`
-      + "然后用 edit_file 只改上述驳回点；禁止重读设定、改动落盘旧版或从头另写。",
+    `修订包含 oldText 时，直接用一次 edit_file 批量修改当前工作副本；仅对缺 oldText、`
+      + `或替换返回不存在/不唯一的条目，才用 read_file(${JSON.stringify({ path: draft.path })}) 定点核对。`
+      + "禁止重读设定、改动落盘旧版或从头另写。",
   ].join("\n");
 }
 
@@ -2318,6 +2363,46 @@ export function proposalFailurePauseResult(
   };
 }
 
+function repairPacketForConvergePrompt(
+  result: Record<string, unknown>,
+  revisionCase?: ProposalRevisionCase,
+): RepairPacket | undefined {
+  const fromResult = normalizeRepairPacket(result.repairPacket);
+  if (fromResult && (!revisionCase?.draftSourceHash
+    || !fromResult.sourceHash || fromResult.sourceHash === revisionCase.draftSourceHash)) return fromResult;
+  if (!revisionCase) return undefined;
+  const draft = { path: revisionCase.path, sourceHash: revisionCase.draftSourceHash };
+  return repairPacketForDraft(revisionCase.repairPacket, draft)
+    ?? semanticRepairPacket(draft, revisionCase.unresolvedIssues);
+}
+
+function repairPacketInstructions(
+  packet: RepairPacket | undefined,
+  revisionCase?: ProposalRevisionCase,
+): string {
+  if (!packet) {
+    return revisionCase
+      ? "下一步用 read_file 对当前工作副本的 blocker evidence 定点定位，只做最小修订，再用 edit_file 提交；禁止重读已读材料或全文重写。"
+      : "下一步必须用 edit_file 对驳回点做最小修订；禁止为同一章重新检索已读材料，禁止全文重写。";
+  }
+  const anchored = packet.issues.filter(issue => Boolean(issue.oldText));
+  const unanchored = packet.issues.length - anchored.length;
+  const sourceMatches = !revisionCase?.draftSourceHash || !packet.sourceHash
+    || packet.sourceHash === revisionCase.draftSourceHash;
+  if (anchored.length && sourceMatches) {
+    return [
+      `立即用一次 edit_file 批量处理修订包内 ${anchored.length} 条带 oldText 的最小替换；使用包内 path/sourceHash，逐条改写后保留原有情节与事实。`,
+      unanchored
+        ? `其余 ${unanchored} 条缺少唯一 oldText：仅对它们用 read_file({path, quote:evidence}) 定点读取后补改。`
+        : "不要先 read_file、search_files 或重读设定；只有 edit_file 报 oldText 不存在、不唯一或快照变化时才定点读取。",
+      packet.omittedIssueCount
+        ? `本包还有 ${packet.omittedIssueCount} 条因安全上限未展开；先完成当前批次并重新提交，门禁会返回剩余条目。`
+        : "",
+    ].filter(Boolean).join("\n");
+  }
+  return "修订包没有可安全直替的 oldText，逐条用 read_file({path, quote:evidence}) 定点读取后再 edit_file；禁止整篇重读、重检索设定或全文重写。";
+}
+
 /** After a file submission is blocked by gate/review: force a minimal working-copy repair. */
 export function proposalRevisionConvergePrompt(
   result: Record<string, unknown>,
@@ -2343,8 +2428,9 @@ export function proposalRevisionConvergePrompt(
     : attempt >= 2;
   const rhythmBlock = /节奏硬拦截|碎句|缩词|连发碎句|电报句|RHYTHM_POLISH/.test(rawMessage + code);
   const firstRoundPolish = result.rhythmRevisionRequired === true || code === "RHYTHM_POLISH_REQUIRED";
-  const blockerPacket = revisionCase?.unresolvedIssues.length
-    ? `不可压缩 blocker（ID/evidence/problem/action）：${JSON.stringify(revisionCase.unresolvedIssues)}`
+  const repairPacket = repairPacketForConvergePrompt(result, revisionCase);
+  const blockerPacket = repairPacket
+    ? `可执行修订包（ID/oldText/evidence/problem/action）：${JSON.stringify(repairPacket)}`
     : "";
   if (firstRoundPolish) {
     return [
@@ -2364,9 +2450,7 @@ export function proposalRevisionConvergePrompt(
         : "节奏修订：不要只改命中样例三句。按验收线处理全章碎句串与缩词，静场补 35+ 字绵延句，然后用 edit_file 提交当前工作副本；禁止重读已读设定、禁止另起大纲。")
       : hardLimit
         ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
-        : revisionCase
-          ? "下一步用 read_file 查看当前工作副本，只做针对 blocker 的最小修订，再用 edit_file 提交；禁止重读已读材料或全文重写。"
-          : "下一步必须用 edit_file 对驳回点做最小修订；禁止为同一章重新检索已读材料，禁止全文重写。",
+        : repairPacketInstructions(repairPacket, revisionCase),
   ].filter(Boolean).join("\n");
 }
 
@@ -3992,6 +4076,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 });
               const gate = proposalFailureGate(parsed);
               const reviewResult = parsed;
+              const repairPacket = normalizeRepairPacket(reviewResult.repairPacket);
               const semanticIssues = gate === "semantic_review"
                 ? proposalRevisionIssues(reviewResult, proposalRevisionBeforeCall?.unresolvedIssues)
                 : undefined;
@@ -4035,7 +4120,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                     proposalRevisionBeforeCall,
                     { rhythmPolishPending: Boolean(
                       scopePath && toolContext.rhythmGracePaths?.has(scopePath),
-                    ), semanticVerdict: gate === "semantic_review" },
+                    ), semanticVerdict: gate === "semantic_review", ...(repairPacket ? { repairPacket } : {}) },
                   )
                 : undefined;
               if (caseDraft?.revisionCase && deliverableId) {

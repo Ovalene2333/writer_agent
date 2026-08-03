@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { RepairPacket } from "./repair_packet.js";
 
 /** Compatibility name for the old scalar window; no longer used as a mixed-gate budget. */
 export const MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW = 3;
@@ -14,6 +15,8 @@ export type ProposalRevisionIssue = {
   severity: string;
   kind: string;
   evidence: string[];
+  /** Optional exact, unique source text supplied by the isolated reviewer. */
+  oldText?: string;
   problem: string;
   action: string;
   priorIssueId?: string;
@@ -60,6 +63,8 @@ export type ProposalRevisionCase = {
   lastGate: ProposalRetryGate;
   retryState: ProposalRetryState;
   unresolvedIssues: ProposalRevisionIssue[];
+  /** Latest deterministic/semantic repair instructions for direct retry or resume. */
+  repairPacket?: RepairPacket;
   resolvedIssueIds: string[];
   stillPresentIssueIds: string[];
   newlyIntroducedIssueIds: string[];

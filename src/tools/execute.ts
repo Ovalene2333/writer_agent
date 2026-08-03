@@ -152,6 +152,7 @@ export async function executeTool(
         failureKind: error.failureKind,
         error: error.message,
         retryable: error.retryable,
+        ...(error.repairPacket ? { repairPacket: error.repairPacket } : {}),
       });
     }
     if (error instanceof ToolDependencyError) {

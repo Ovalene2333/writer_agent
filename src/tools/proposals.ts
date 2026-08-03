@@ -7,7 +7,7 @@ import {
   validateCharacters,
 } from "../characters.js";
 import { adjudicateLearnedProseGates, adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
-import { newProseStyleIssues, proseStyleIssuesError } from "../prose_quality.js";
+import { newProseStyleIssues, proseStyleRepairPacket, proseStyleIssuesError } from "../prose_quality.js";
 import { compileWritePack, findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
 import { documentSpans } from "../document_spans.js";
 import { documentBlocks } from "../document_blocks.js";
@@ -29,8 +29,14 @@ import {
   ChapterReviewRequestError,
   constrainChapterRevisionReview,
   reviewChapterDraft,
+  type ChapterReviewResult,
 } from "../chapter_review.js";
-import { proposalRevisionScopeKey } from "../proposal_retry.js";
+import {
+  proposalRevisionIssueId,
+  proposalRevisionScopeKey,
+  type ProposalRevisionIssue,
+} from "../proposal_retry.js";
+import { boundedRepairPacket, type RepairPacket } from "../repair_packet.js";
 import { ToolRevisionRequiredError } from "../tool_failure.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
@@ -265,6 +271,7 @@ export async function gateProseStyle(
   afterContent: string,
   context: ToolHandlerArgs["context"],
   targetPath?: string,
+  sourceHash?: string,
 ): Promise<void> {
   const issues = await proseStyleGateIssues(beforeContent, afterContent, context, {
     reviewWholeText: context.editScope === "document",
@@ -273,7 +280,54 @@ export async function gateProseStyle(
     targetKind: targetPath ? documentKind(targetPath) : "other",
   });
   const styleError = proseStyleIssuesError(issues);
-  if (styleError) throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", styleError);
+  if (styleError) {
+    throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", styleError, {
+      repairPacket: proseStyleRepairPacket(afterContent, issues, { path: targetPath, sourceHash }),
+    });
+  }
+}
+
+function directReviewRepairPacket(
+  path: string,
+  sourceHash: string,
+  issues: readonly Pick<ProposalRevisionIssue, "id" | "kind" | "evidence" | "oldText" | "problem" | "action">[],
+): RepairPacket | undefined {
+  if (!issues.length) return undefined;
+  return boundedRepairPacket({
+    path,
+    sourceHash,
+    issueCount: issues.length,
+    issues: issues.map(issue => ({
+      id: issue.id,
+      kind: issue.kind,
+      ...(issue.oldText ? { oldText: issue.oldText } : {}),
+      ...(issue.evidence[0] ? { evidence: issue.evidence[0] } : {}),
+      problem: issue.problem,
+      action: issue.action,
+    })),
+  });
+}
+
+function chapterReviewRepairPacket(
+  path: string,
+  sourceHash: string,
+  review: ChapterReviewResult,
+): RepairPacket | undefined {
+  const blockers = review.issues
+    .filter(issue => issue.severity === "blocker")
+    .map(issue => ({
+      id: issue.priorIssueId ?? proposalRevisionIssueId({
+        kind: issue.kind,
+        evidence: issue.evidence,
+        problem: issue.problem,
+      }),
+      kind: issue.kind,
+      evidence: issue.evidence,
+      ...(issue.oldText ? { oldText: issue.oldText } : {}),
+      problem: issue.problem,
+      action: issue.action,
+    }));
+  return directReviewRepairPacket(path, sourceHash, blockers);
 }
 
 export const PRIMARY_PROSE_GATE_TIMEOUT_MS = 60_000;
@@ -595,6 +649,7 @@ export async function submitFullDocumentProposal(
   assertCreativeOutlineDesigned(context, path, context.fileMutationTool ?? "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
   const meta = gateProseMetaLeaks(proposedContent, path);
+  const draftSourceHash = project.hash(meta.content);
   const deliverableId = typeof args.input.deliverableId === "string" && args.input.deliverableId.trim()
     ? args.input.deliverableId.trim()
     : undefined;
@@ -602,7 +657,7 @@ export async function submitFullDocumentProposal(
     path,
     ...(deliverableId ? { deliverableId } : {}),
     content: meta.content,
-    sourceHash: project.hash(meta.content),
+    sourceHash: draftSourceHash,
   };
   const expectedDocumentBase = context.proposalExpectedDocumentBase?.path === path
     && context.proposalExpectedDocumentBase.deliverableId === deliverableId
@@ -645,7 +700,7 @@ export async function submitFullDocumentProposal(
       nextAllowedActions: ["read_file", "edit_file", "write_file"],
     });
   }
-  if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context, path);
+  if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context, path, draftSourceHash);
   // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
   let rhythmRevisionRequired: string | undefined;
   if (isScenePipelineDocument(path) && !proseStyleApproved) {
@@ -744,6 +799,11 @@ async function reviewDirectNarrativeProposal(
     : undefined;
   const contentSourceHash = args.project.hash(content);
   if (revisionContext && revisionContext.previousSourceHash === contentSourceHash) {
+    const repairPacket = directReviewRepairPacket(
+      path,
+      contentSourceHash,
+      revisionContext.unresolvedIssues,
+    );
     return JSON.stringify({
       status: "final_review_revision_required",
       code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
@@ -755,6 +815,7 @@ async function reviewDirectNarrativeProposal(
         reviewNotes: "未检测到可闭合既有 blocker 的正文变化；复用上一轮终审结论。",
         issues: revisionContext.unresolvedIssues,
       },
+      ...(repairPacket ? { repairPacket } : {}),
       message: "正文与上一轮语义驳回稿相同，未重复调用终审。请按既有 blocker 做最小修订后再提交。",
     });
   }
@@ -818,6 +879,7 @@ async function reviewDirectNarrativeProposal(
           )
         : reviewed.review;
       if (constrainedReview.verdict === "pass") return undefined;
+      const repairPacket = chapterReviewRepairPacket(path, contentSourceHash, constrainedReview);
       return JSON.stringify({
         status: "final_review_revision_required",
         code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
@@ -825,6 +887,7 @@ async function reviewDirectNarrativeProposal(
         // Keep explicit so callers never treat this as a created proposal.
         proposalCreated: false,
         chapterReview: constrainedReview,
+        ...(repairPacket ? { repairPacket } : {}),
         message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
       });
     } catch (error) {
@@ -980,13 +1043,14 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
   const deliverableId = typeof input.deliverableId === "string" && input.deliverableId.trim()
     ? input.deliverableId.trim()
     : undefined;
+  const draftSourceHash = project.hash(content);
   context.latestProposalDraft = {
     path,
     ...(deliverableId ? { deliverableId } : {}),
     content,
-    sourceHash: project.hash(content),
+    sourceHash: draftSourceHash,
   };
-  await gateProseStyle(beforeContent, content, context, path);
+  await gateProseStyle(beforeContent, content, context, path, draftSourceHash);
   // 首轮 grace 后若用 patch 抛光：同一 path 必须过硬节奏门禁。
   if (isScenePipelineDocument(path) && context.rhythmGracePaths?.has(path)) {
     const rhythmError = chapterRhythmGateError(content);

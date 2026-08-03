@@ -7,6 +7,7 @@ import {
   newProseStyleIssues,
   proseMannerismConstraintPrompt,
   proseMannerismPreflightLine,
+  proseStyleRepairPacket,
   proseStyleIssuesError,
   sceneMannerismGateError,
 } from "./prose_quality.js";
@@ -263,6 +264,32 @@ test("dense hard mannerisms still escalate to error", () => {
   const errors = analyzeProseStyle(lines).filter(issue => issue.severity === "error");
   assert.ok(errors.length >= 6, `expected hard errors, got ${errors.length}`);
   assert.ok(contrastStyleError(lines));
+});
+
+test("style repair packet keeps every unique late blocker executable", () => {
+  const lines = [
+    "他停住——因为身后无人。",
+    "她转身——因为门开了。",
+    "雨下了——因为云压得很低。",
+    "灯灭了——因为线路老化。",
+    "他沉默——因为无话可说。",
+    "她离开——因为不想再争。",
+  ].join("\n");
+  const packet = proseStyleRepairPacket(lines, analyzeProseStyle(lines), {
+    path: "chapters/第一章.md",
+    sourceHash: "working-hash",
+  });
+  assert.equal(packet?.issueCount, 6);
+  assert.equal(packet?.issues.length, 6);
+  assert.equal(packet?.omittedIssueCount, undefined);
+  assert.equal(packet?.path, "chapters/第一章.md");
+  assert.equal(packet?.sourceHash, "working-hash");
+  const late = packet?.issues.find(issue => issue.oldText?.includes("她离开"));
+  assert.ok(late, "the final gate issue must remain in the direct repair packet");
+  for (const issue of packet?.issues ?? []) {
+    assert.ok(issue.oldText, `missing oldText for ${issue.id}`);
+    assert.equal(lines.indexOf(issue.oldText!), lines.lastIndexOf(issue.oldText!));
+  }
 });
 
 test("typical chapter snippet with mixed dashes does not block", () => {

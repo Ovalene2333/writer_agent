@@ -1,4 +1,6 @@
 /** Stable machine-readable failure kinds shared by model-backed tool handlers. */
+import type { RepairPacket } from "./repair_packet.js";
+
 export type ToolFailureKind = "dependency" | "invalid_output" | "validation" | "semantic_revision";
 
 /**
@@ -23,14 +25,16 @@ export class ToolDependencyError extends Error {
 export class ToolRevisionRequiredError extends Error {
   readonly failureKind = "semantic_revision" as const;
   readonly retryable = true;
+  readonly repairPacket?: RepairPacket;
 
   constructor(
     readonly code: string,
     message: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { repairPacket?: RepairPacket },
   ) {
     super(message, options);
     this.name = "ToolRevisionRequiredError";
+    this.repairPacket = options?.repairPacket;
   }
 }
 

@@ -4,6 +4,7 @@ import {
   proseConstructionRule,
   proseConstructionGenerationPrompt,
 } from "./prose_construction_rules.js";
+import { boundedRepairPacket, type RepairPacket, type RepairPacketIssue } from "./repair_packet.js";
 
 export type ProseStyleSeverity = "error" | "warning" | "info";
 export type ProseStyleSubtype =
@@ -311,9 +312,7 @@ export function newProseStyleIssues(before: string, after: string): ProseStyleIs
  * 普通 warning（含多数破折号）不拦截提交。
  */
 export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undefined {
-  const errors = issues.filter(issue =>
-    issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype),
-  );
+  const errors = hardProseStyleErrors(issues);
   if (!errors.length) return undefined;
   const headline = errors.some(issue => issue.subtype === "learned_rule")
     ? "本次修改违反作者沉淀的复审规则"
@@ -321,6 +320,72 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
       ? "本次修改新增超出预算的句式家族用法"
     : "本次修改新增过密的高置信度说明式写法";
   return formatProseStyleBlockError(errors, headline);
+}
+
+function hardProseStyleErrors(issues: readonly ProseStyleIssue[]): ProseStyleIssue[] {
+  return issues.filter(issue => issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype));
+}
+
+/**
+ * Preserve exact repair targets beside the human-readable gate error. A sentence
+ * is only offered as oldText when it is unique in the working copy, so the Agent
+ * can batch edit_file calls without first paging through the full document.
+ */
+export function proseStyleRepairPacket(
+  text: string,
+  issues: readonly ProseStyleIssue[],
+  source?: { path?: string; sourceHash?: string },
+): RepairPacket | undefined {
+  const errors = hardProseStyleErrors(issues);
+  if (!errors.length) return undefined;
+  const grouped = new Map<string, RepairPacketIssue>();
+  for (const issue of errors) {
+    const oldText = uniqueRepairOldText(text, issue);
+    const key = oldText ? `text:${oldText}` : `issue:${issue.id}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      const relatedIssueIds = [...new Set([existing.id, ...(existing.relatedIssueIds ?? []), issue.id])];
+      existing.relatedIssueIds = relatedIssueIds;
+      if (!existing.suggestion && issue.suggestions[0]) existing.suggestion = issue.suggestions[0];
+      continue;
+    }
+    grouped.set(key, {
+      id: issue.id,
+      kind: `${issue.kind}:${issue.subtype}`,
+      line: issue.line,
+      ...(oldText ? { oldText } : {}),
+      ...(issue.evidence ? { evidence: issue.evidence } : {}),
+      suggestion: issue.suggestions[0] ?? rewriteTipForSubtype(issue.subtype),
+      problem: issue.reason,
+    });
+  }
+  return boundedRepairPacket({
+    ...(source?.path ? { path: source.path } : {}),
+    ...(source?.sourceHash ? { sourceHash: source.sourceHash } : {}),
+    issueCount: errors.length,
+    issues: [...grouped.values()],
+  });
+}
+
+function uniqueRepairOldText(text: string, issue: ProseStyleIssue): string | undefined {
+  const sentence = issue.sentence.trim();
+  if (sentence && sentence.length <= 1_200 && occurrencesOf(text, sentence) === 1) return sentence;
+  const lineStart = text.lastIndexOf("\n", Math.max(0, issue.start - 1)) + 1;
+  const lineEnd = text.indexOf("\n", issue.end);
+  const line = text.slice(lineStart, lineEnd < 0 ? text.length : lineEnd).trim();
+  return line && line.length <= 1_200 && occurrencesOf(text, line) === 1 ? line : undefined;
+}
+
+function occurrencesOf(text: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let offset = text.indexOf(needle);
+  while (offset >= 0) {
+    count += 1;
+    if (count > 1) return count;
+    offset = text.indexOf(needle, offset + needle.length);
+  }
+  return count;
 }
 
 /** Actionable block message so one local rewrite can pass re-submit. */

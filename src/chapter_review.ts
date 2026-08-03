@@ -27,6 +27,8 @@ export type ChapterReviewIssue = {
     | "drive_flat" | "stakes_absent";
   sceneId?: string;
   evidence: string[];
+  /** Exact unique source text an Agent may replace without another broad read. */
+  oldText?: string;
   /** Revision-only evidence quoted from the changed before/after text. */
   changeEvidence?: string[];
   problem: string;
@@ -104,8 +106,8 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 
 分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。风格、声线、主题直陈、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
 
-单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
+单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
+字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -159,6 +161,12 @@ function evidenceInSource(sourceText: string | undefined, quote: string): boolea
   if (sourceText.includes(quote)) return true;
   const needle = normalizeEvidenceNeedle(quote);
   return needle.length > 0 && normalizeEvidenceNeedle(sourceText).includes(needle);
+}
+
+function uniqueSourceText(sourceText: string | undefined, quote: string): boolean {
+  if (!sourceText || !quote) return false;
+  const first = sourceText.indexOf(quote);
+  return first >= 0 && sourceText.indexOf(quote, first + quote.length) < 0;
 }
 
 export function parseChapterReview(
@@ -215,6 +223,12 @@ export function parseChapterReview(
         .filter(item => Boolean(item) && evidenceInSource(sourceText, item))
         .slice(0, 3)
       : [];
+    const candidateOldText = boundedString(issue.oldText, 1_200);
+    const oldText = candidateOldText
+      && evidence.some(item => normalizeEvidenceNeedle(candidateOldText).includes(normalizeEvidenceNeedle(item)))
+      && uniqueSourceText(sourceText, candidateOldText)
+      ? candidateOldText
+      : undefined;
     const changeEvidence = Array.isArray(issue.changeEvidence)
       ? issue.changeEvidence.map(item => boundedString(item, 180))
         .filter(Boolean)
@@ -231,6 +245,7 @@ export function parseChapterReview(
       kind,
       ...(sceneId ? { sceneId } : {}),
       evidence,
+      ...(oldText ? { oldText } : {}),
       ...(changeEvidence.length ? { changeEvidence } : {}),
       problem,
       action,
