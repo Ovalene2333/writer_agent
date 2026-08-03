@@ -44,6 +44,20 @@ test("text workspace stays inside resource and reads non-Markdown files", () => 
     assert.equal(inspected.lineCount, 2);
     const read = JSON.parse(handleReadFile(args({ path: "notes/research.txt", sourceHash: project.hash(project.readTextFile("notes/research.txt")), startLine: 2, endLine: 3 }))) as { content: string };
     assert.equal(read.content, "beta\ngamma");
+    project.writeTextFile("notes/long.txt", Array.from({ length: 180 }, (_, index) => `line ${index + 1}`).join("\n"));
+    const longRead = JSON.parse(handleReadFile(args({ path: "notes/long.txt", startLine: 1, endLine: 180 }))) as {
+      content: string;
+      endLine: number;
+      requestedEndLine: number;
+      truncated: boolean;
+      nextStartLine: number;
+    };
+    assert.equal(longRead.endLine, 120);
+    assert.equal(longRead.requestedEndLine, 180);
+    assert.equal(longRead.truncated, true);
+    assert.equal(longRead.nextStartLine, 121);
+    assert.match(longRead.content, /line 120/);
+    assert.doesNotMatch(longRead.content, /line 121/);
     assert.throws(() => handleReadFile(args({ path: "notes/research.txt", sourceHash: "stale", block: 1 })), /快照已变化/);
     assert.throws(() => project.readTextFile("../outside.txt"), /resource|相对路径|范围外/);
     assert.throws(() => project.readTextFile("assets/fake.txt"), /纯文本|UTF-8/);

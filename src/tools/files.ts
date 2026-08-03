@@ -245,12 +245,27 @@ export function handleReadFile(args: ToolHandlerArgs): string {
   if (startLine !== undefined && endLine !== undefined) {
     if (startLine > endLine) throw new Error("startLine 不能大于 endLine");
     if (startLine > lines.length) throw new Error(`startLine 超出范围；文件共 ${lines.length} 行`);
-    if (endLine - startLine + 1 > 120) throw new Error("单次最多读取 120 行");
-    const actualEnd = Math.min(endLine, lines.length);
-    const selected = lines.slice(startLine - 1, actualEnd).join("\n");
-    if (selected.length > MAX_READ_CHARACTERS) throw new Error(`读取范围超过 ${MAX_READ_CHARACTERS} 字符，请缩小范围`);
+    const requestedEndLine = endLine;
+    let actualEnd = Math.min(endLine, lines.length, startLine + 119);
+    let selected = lines.slice(startLine - 1, actualEnd).join("\n");
+    while (selected.length > MAX_READ_CHARACTERS && actualEnd > startLine) {
+      actualEnd -= 1;
+      selected = lines.slice(startLine - 1, actualEnd).join("\n");
+    }
+    let characterTruncated = false;
+    if (selected.length > MAX_READ_CHARACTERS) {
+      selected = selected.slice(0, MAX_READ_CHARACTERS);
+      actualEnd = startLine + (selected.match(/\n/g)?.length ?? 0);
+      characterTruncated = true;
+    }
+    const truncated = actualEnd < Math.min(requestedEndLine, lines.length) || characterTruncated;
     return JSON.stringify({ path: snapshot.path, sourceHash, workingCopy: snapshot.workingCopy,
-      startLine, endLine: actualEnd, lineCount: lines.length, content: selected });
+      startLine, endLine: actualEnd, requestedEndLine, lineCount: lines.length, content: selected,
+      truncated,
+      ...(truncated && actualEnd < lines.length ? { nextStartLine: actualEnd + 1 } : {}),
+      message: truncated
+        ? `读取范围已自动裁剪为最多 120 行 / ${MAX_READ_CHARACTERS} 字符；需要后续内容请从 nextStartLine 继续。`
+        : "读取完成" });
   }
   const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   const block = optionalPositiveInteger(input.block, "block") ?? 1;
