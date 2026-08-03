@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from "react";
-import { RotateCw } from "lucide-react";
+import { ChevronDown, ChevronUp, RotateCw } from "lucide-react";
 import type { MessageStepTrail, StepUsage, StepUsageCall, StoredStepTrail, StreamStep, Usage } from "./types";
 import { callKindLabel } from "./types";
 import { Markdown } from "./markdown";
@@ -189,6 +189,52 @@ export function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?
   );
 }
 
+const TOOL_LABELS: Record<string, string> = {
+  list_documents: "文档",
+  inspect_document: "检查文档",
+  locate_document_span: "定位",
+  read_document: "读文档",
+  read_document_span: "读片段",
+  search_project: "搜索项目",
+  list_files: "文件",
+  inspect_file: "检查文件",
+  read_file: "读文件",
+  search_files: "搜索文件",
+  write_file: "写入",
+  edit_file: "编辑",
+  move_file: "移动",
+  delete_file: "删除",
+  design_creative_outline: "构思",
+  audit_prose_style: "审文风",
+  list_outline_nodes: "大纲",
+  get_outline_node: "读大纲",
+  propose_outline_patch: "改大纲",
+  validate_outline: "校验大纲",
+  compare_outline_with_draft: "对照大纲",
+  compile_write_pack: "写作包",
+  begin_chapter_draft: "开章",
+  write_document_isolated: "隔离写作",
+  write_chapter_scene: "写场景",
+  write_chapter_scene_notes: "场景备注",
+  revise_chapter_scene_guide: "修场纲",
+  revise_chapter_draft_style: "修文风",
+  inspect_chapter_draft: "审章节",
+  manage_todos: "任务",
+};
+
+function toolLabel(tool: string): string {
+  return TOOL_LABELS[tool] ?? tool.replace(/_/g, " ");
+}
+
+function toolSummary(tools: string[]): { label: string; title: string } | null {
+  if (!tools.length) return null;
+  const labels = tools.map(toolLabel);
+  return {
+    label: tools.length === 1 ? labels[0] : `工具 ${tools.length}`,
+    title: labels.map((label, index) => `${label} · ${tools[index]}`).join("\n"),
+  };
+}
+
 export function sumStepUsage(steps: StreamStep[]): StepUsage | undefined {
   const withUsage = steps.filter((step) => step.usage);
   if (!withUsage.length) return undefined;
@@ -275,7 +321,7 @@ export function detectStepContextReset(
   if (after >= before * 0.62) return null;
   // Prefer cuts after a document delivery / scene write.
   const prevTools = prev.tools.join(" ");
-  const likelyBoundary = /propose_document|propose_chapter|write_chapter_scene|write_document/.test(prevTools)
+  const likelyBoundary = /write_file|edit_file|propose_chapter|write_chapter_scene/.test(prevTools)
     || before - after > 12_000;
   if (!likelyBoundary) return null;
   return {
@@ -293,32 +339,30 @@ export function AgentStepContextResetBanner({
   reset: { fromStep: number; toStep: number; before: number; after: number; ratio: number };
 }) {
   const saved = reset.before - reset.after;
+  const stepLabel = `${reset.fromStep} → ${reset.toStep}`;
+  const tokenLabel = `${formatGraphTokens(reset.before)} → ${formatGraphTokens(reset.after)}`;
   return (
-    <div
-      className="agent-step-context-reset"
-      title="完成一章或一场后会收束上下文：保留稳定规则、项目索引与章节衔接，丢弃上一章的过程细节。之后若再读设定或前章，属于按需补充，属正常行为。"
+    <article
+      className="agent-step completed context-reset"
+      title="上下文收束：保留规则、索引和衔接；卸下过程细节。"
+      aria-label={`上下文已收束，步骤 ${stepLabel}，上下文 ${tokenLabel}，减少 ${formatGraphTokens(saved)}`}
     >
-      <span className="agent-step-context-reset-badge">
-        <span className="agent-step-context-reset-indicator" aria-hidden="true" />
-        上下文已收束
-      </span>
-      <span className="agent-step-context-reset-flow">
-        <span>步骤</span>
-        <strong>{reset.fromStep} → {reset.toStep}</strong>
-      </span>
-      <span className="agent-step-context-reset-tokens">
-        <span>上下文</span>
-        <strong>
-          {formatGraphTokens(reset.before)} → {formatGraphTokens(reset.after)}
-        </strong>
-      </span>
-      <span className="agent-step-context-reset-saved">
-        减少 {formatGraphTokens(saved)}
-      </span>
-      <span className="agent-step-context-reset-hint">
-        章节边界 · 保留规则与衔接 · 移除过程上下文
-      </span>
-    </div>
+      <div className="agent-step-header">
+        <div className="agent-step-summary agent-step-context-reset-summary" role="status">
+          <span className="agent-step-indicator" aria-hidden="true" />
+          <strong>收束</strong>
+          <span className="agent-step-context-reset-flow" title={`步骤 ${stepLabel}`}>
+            {stepLabel}
+          </span>
+          <span className="agent-step-context-reset-tokens" title={`上下文 ${tokenLabel}`}>
+            {tokenLabel}
+          </span>
+          <span className="agent-step-context-reset-saved" title={`减少 ${formatGraphTokens(saved)}`}>
+            -{formatGraphTokens(saved)}
+          </span>
+        </div>
+      </div>
+    </article>
   );
 }
 
@@ -342,12 +386,9 @@ export function AgentStepCard({
   const label =
     step.id === 0
       ? "Planning"
-      : step.status === "running"
-      ? `Step ${step.id}`
-      : step.status === "failed"
-        ? `Step ${step.id} failed`
-        : `Step ${step.id} done`;
+      : `Step ${step.id}`;
   const reset = detectStepContextReset(prevStep, step);
+  const tools = toolSummary(step.tools);
   const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -364,28 +405,13 @@ export function AgentStepCard({
           <span className="agent-step-indicator" />
           <strong>{label}</strong>
           <StepTokenBadge usage={step.usage} pending={step.status === "running"} />
-          {step.tools.length > 0 && (() => {
-            const maxVisible = 2;
-            const visible = step.tools.slice(0, maxVisible);
-            const hidden = step.tools.length - visible.length;
-            const allTitle = step.tools.join(" · ");
-            return (
-              <span className="agent-step-tools" title={allTitle}>
-                {visible.map((tool, index) => (
-                  <span className="tool-chip" key={`${step.id}-${index}-${tool}`} title={tool}>
-                    {tool}
-                  </span>
-                ))}
-                {hidden > 0 && (
-                  <span className="tool-chip tool-chip-more" title={step.tools.slice(maxVisible).join(" · ")}>
-                    +{hidden}
-                  </span>
-                )}
-              </span>
-            );
-          })()}
+          {tools ? (
+            <span className="agent-step-tools" title={tools.title}>
+              <span className="tool-chip">{tools.label}</span>
+            </span>
+          ) : null}
           <span className="agent-step-chevron" aria-hidden="true">
-            {step.expanded ? "▴" : "▾"}
+            {step.expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
           </span>
         </button>
         {resumeAction ? (
@@ -405,18 +431,9 @@ export function AgentStepCard({
         <div className="agent-step-content" ref={contentRef}>
           {reset ? (
             <div className="agent-step-context-reset-detail">
-              <strong>本章节起重新装载的上下文</strong>
-              <ul>
-                <li>写作规则与项目索引（跨章可复用）</li>
-                <li>当前任务说明与上一章/场的衔接摘要</li>
-                <li>
-                  已卸下约 {formatGraphTokens(reset.before - reset.after)} 的过程痕迹
-                  （草稿全文、重试与中间工具结果）
-                </li>
-                <li>
-                  若随后仍读取设定或前章：索引不含全文细节，按需补充属正常
-                </li>
-              </ul>
+              <strong>重新装载</strong>
+              <span>保留规则、索引、衔接</span>
+              <span>卸下约 {formatGraphTokens(reset.before - reset.after)} 过程上下文</span>
             </div>
           ) : null}
           <div className="agent-step-usage-detail">

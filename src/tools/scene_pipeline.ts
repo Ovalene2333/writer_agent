@@ -115,7 +115,7 @@ function saveDraftCheckpoint(
 export function handleBeginChapterDraft({ input, project, store, sessionId, context }: ToolHandlerArgs): string {
   assertWritableMode(context.permissionMode, "begin_chapter_draft");
   if (context.scenePipelineSettings?.enabled === false) {
-    throw new Error("场景链当前已关闭；请直接使用 propose_document、propose_document_patch 或可用的隔离正文工具完成文档");
+    throw new Error("场景链当前已关闭；请直接使用 write_file 或 edit_file 完成文档");
   }
   if (context.chapterSceneDraft) throw new Error("已有章节场景草稿正在进行；请完成提案后再开始下一章");
   const path = requireString(input.path, "path");
@@ -1100,7 +1100,7 @@ async function submitPassedChapterReview(
       reviewCompleted: true,
       chapterReview,
       error: error instanceof Error ? error.message : String(error),
-      message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
+      message: "终审已通过，但文件提交创建失败；工作副本仍保留，请再次调用 inspect_chapter_draft 由运行时重试。",
     });
   }
   const proposal = JSON.parse(proposalResult) as Record<string, unknown>;
@@ -1110,7 +1110,7 @@ async function submitPassedChapterReview(
       reviewCompleted: true,
       chapterReview,
       error: proposal.error,
-      message: "终审已通过，但提案创建失败；修正参数后使用 propose_chapter_draft 重试，勿重新 inspect。",
+      message: "终审已通过，但文件提交创建失败；工作副本仍保留，请再次调用 inspect_chapter_draft 由运行时重试。",
     });
   }
   return JSON.stringify({
@@ -1135,7 +1135,7 @@ async function submitPassedChapterReview(
       ? { characterChangeWarnings: preparedCharacterChanges.warnings }
       : {}),
     ...(characterEvolutionSkipped ? { characterEvolutionSkipped: true } : {}),
-    message: "整章终审已完成且提案已创建；不要再调用 propose_chapter_draft。",
+    message: "整章终审已完成且文件变更已提交。",
   });
 }
 
@@ -1402,7 +1402,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
         ? "隔离终审已响应但结论无法解析或缺少可定位证据，已回退到主 Agent 通读（非服务故障）。"
         : "隔离终审不可用，已回退到主 Agent 通读："
     )
-      + "content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则直接调用 propose_chapter_draft，并把结论写入 reviewNotes/chapterChange 参数。"
+      + `content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则调用 write_file(${JSON.stringify({ path: draft.path })})，省略 content 提交已终审的当前工作副本。`
       + "若有 styleWarnings，只处理有正文证据且明显影响理解或项目声线的少量问题；统计提示不能成为改稿理由，也不要为凑指标全文重写。",
   });
 }

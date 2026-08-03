@@ -1,30 +1,195 @@
 import { documentBlocks } from "../document_blocks.js";
-import { documentKind } from "../project.js";
+import { isScenePipelineDocument } from "../project.js";
+import { chapterSceneDraftComplete } from "../scene_pipeline.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
-import { captureAcceptedContinuityFacts, gateProseStyle, prepareDeferredCharacterChanges } from "./proposals.js";
-import type { ToolHandlerArgs } from "./types.js";
+import {
+  captureAcceptedContinuityFacts,
+  handleProposeDocument,
+  prepareDeferredCharacterChanges,
+} from "./proposals.js";
+import { handleProposeChapterDraft } from "./scene_pipeline.js";
+import type { ToolHandlerArgs, WorkingTextFile } from "./types.js";
 
 const READ_BLOCK_TARGET_CHARACTERS = 3_000;
 const MAX_READ_CHARACTERS = 4_000;
+const MISSING_TEXT_FILE_HASH = "__missing__";
+
+function normalizeTextPath(path: string): string {
+  return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
+    .replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "");
+}
+
+function workingTextFile(args: Pick<ToolHandlerArgs, "context">, path: string): WorkingTextFile | undefined {
+  return args.context.workingTextFiles?.get(normalizeTextPath(path));
+}
+
+function readableTextFile(
+  args: Pick<ToolHandlerArgs, "project" | "context">,
+  path: string,
+): { path: string; content: string; sourceHash: string; workingCopy: boolean } {
+  const normalized = normalizeTextPath(path);
+  if (!normalized) throw new Error("path 不能为空");
+  if (args.project.isDocumentHidden(normalized)) throw new Error("文件已对 Agent 屏蔽");
+  const working = workingTextFile(args, normalized);
+  if (working) {
+    return {
+      path: normalized,
+      content: working.content,
+      sourceHash: working.sourceHash,
+      workingCopy: true,
+    };
+  }
+  const content = args.project.readTextFile(normalized);
+  return {
+    path: normalized,
+    content,
+    sourceHash: args.project.hash(content),
+    workingCopy: false,
+  };
+}
+
+function stageWorkingTextFile(
+  args: ToolHandlerArgs,
+  path: string,
+  content: string,
+): WorkingTextFile {
+  if (content.includes("\0")) throw new Error("纯文本内容不能包含 NUL 字节");
+  const normalized = normalizeTextPath(path);
+  if (!normalized) throw new Error("path 不能为空");
+  // Resolve eagerly so traversal, internal paths and symlink targets fail before
+  // the body enters the overlay or an approval record.
+  args.project.resolveTextFileSafe(normalized);
+  if (args.project.isDocumentHidden(normalized)) throw new Error("文件已对 Agent 屏蔽");
+  args.context.workingTextFiles ??= new Map();
+  const previous = args.context.workingTextFiles.get(normalized);
+  const baseExists = previous?.baseExists ?? args.project.textFileExists(normalized);
+  const baseSourceHash = previous?.baseSourceHash ?? (baseExists
+    ? args.project.hash(args.project.readTextFile(normalized))
+    : MISSING_TEXT_FILE_HASH);
+  const deliverableId = typeof args.input.deliverableId === "string" && args.input.deliverableId.trim()
+    ? args.input.deliverableId.trim()
+    : previous?.deliverableId;
+  const staged: WorkingTextFile = {
+    path: normalized,
+    content,
+    sourceHash: args.project.hash(content),
+    baseExists,
+    baseSourceHash,
+    ...(deliverableId ? { deliverableId } : {}),
+    ...(previous?.revisionCaseId ? { revisionCaseId: previous.revisionCaseId } : {}),
+  };
+  args.context.workingTextFiles.set(normalized, staged);
+  // A successful overlay mutation starts a new readable snapshot. The old lock
+  // protected the persisted base and must not make the run reject its own edit.
+  args.context.readSnapshots?.delete(normalized);
+  // Proposal retry persistence captures this even when edit_file only carried a
+  // small exact replacement instead of the complete body.
+  args.context.latestProposalDraft = {
+    path: normalized,
+    ...(deliverableId ? { deliverableId } : {}),
+    content,
+    sourceHash: staged.sourceHash,
+  };
+  return staged;
+}
+
+function fileMutationSummary(
+  input: Record<string, unknown>,
+  path: string,
+  verb: "write" | "edit" | "move" | "delete",
+): string {
+  if (typeof input.summary === "string" && input.summary.trim()) return input.summary.trim();
+  const label = verb === "write" ? "写入" : verb === "edit" ? "编辑" : verb === "move" ? "移动" : "删除";
+  return `${label} ${path}`;
+}
+
+async function submitWorkingTextFile(
+  args: ToolHandlerArgs,
+  staged: WorkingTextFile,
+  verb: "write" | "edit",
+): Promise<string> {
+  const summary = fileMutationSummary(args.input, staged.path, verb);
+  const internalInput = {
+    path: staged.path,
+    content: staged.content,
+    summary,
+    ...(staged.deliverableId ? { deliverableId: staged.deliverableId } : {}),
+    ...(isScenePipelineDocument(staged.path) && args.context.proseLength
+      ? { targetCharacters: args.context.proseLength.targetCharacters }
+      : {}),
+  };
+  const previousMutationTool = args.context.fileMutationTool;
+  args.context.fileMutationTool = verb === "write" ? "write_file" : "edit_file";
+  let raw: string;
+  try {
+    raw = staged.path.toLowerCase().endsWith(".md")
+      ? await handleProposeDocument({ ...args, input: internalInput })
+      : await handleProposeChangeSet({
+          ...args,
+          input: {
+            summary,
+            ...(staged.deliverableId ? { deliverableId: staged.deliverableId } : {}),
+            files: [{ operation: "write", path: staged.path, content: staged.content }],
+          },
+        });
+  } finally {
+    args.context.fileMutationTool = previousMutationTool;
+  }
+  const normalizedDraft = args.context.latestProposalDraft;
+  if (normalizedDraft?.path === staged.path && normalizedDraft.sourceHash !== staged.sourceHash) {
+    staged.content = normalizedDraft.content;
+    staged.sourceHash = normalizedDraft.sourceHash;
+    args.context.workingTextFiles?.set(staged.path, staged);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    parsed = value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : { error: "文件工具返回了不可验证结果" };
+  } catch {
+    parsed = { error: "文件工具返回了不可验证结果" };
+  }
+  const submitted = (typeof parsed.proposalId === "number" && parsed.proposalId > 0)
+    || (typeof parsed.changeSetId === "number" && parsed.changeSetId > 0);
+  const deliveryReady = submitted
+    && parsed.rhythmRevisionRequired !== true
+    && parsed.code !== "RHYTHM_POLISH_REQUIRED";
+  if (deliveryReady && parsed.status === "accepted") {
+    args.context.workingTextFiles?.delete(staged.path);
+  }
+  return JSON.stringify({
+    ...parsed,
+    path: staged.path,
+    ...(staged.deliverableId ? { deliverableId: staged.deliverableId } : {}),
+    workingCopy: !deliveryReady || parsed.status !== "accepted",
+    workingSourceHash: staged.sourceHash,
+  });
+}
 
 function assertExpectedSourceHash(input: Record<string, unknown>, sourceHash: string): void {
   if (input.sourceHash === undefined) return;
   if (typeof input.sourceHash !== "string" || !input.sourceHash.trim()) {
-    throw new Error("sourceHash 必须是 inspect_file 返回的非空字符串");
+    throw new Error("sourceHash 必须是 read_file 返回的非空字符串");
   }
   if (input.sourceHash.trim() !== sourceHash) {
-    throw new Error(`文件快照已变化；期望 ${input.sourceHash.trim()}，当前 ${sourceHash}。请重新 inspect 后按新快照读取`);
+    throw new Error(`文件快照已变化；期望 ${input.sourceHash.trim()}，当前 ${sourceHash}。请重新 read_file 后按新快照操作`);
   }
 }
 
-export function handleListFiles({ input, project }: ToolHandlerArgs): string {
+export function handleListFiles(args: ToolHandlerArgs): string {
+  const { input, project, context } = args;
   const prefix = typeof input.pathPrefix === "string"
     ? input.pathPrefix.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
     : "";
   const cursor = typeof input.cursor === "string" ? input.cursor : "";
   const limit = Math.max(1, Math.min(200, optionalPositiveInteger(input.limit, "limit") ?? 100));
-  const all = project.listTextFiles()
+  const all = [...new Set([
+    ...project.listTextFiles(),
+    ...(context.workingTextFiles?.keys() ?? []),
+  ])]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     .filter(path => !project.isDocumentHidden(path))
     .filter(path => !prefix || path === prefix || path.startsWith(`${prefix}/`))
     .filter(path => !cursor || path.localeCompare(cursor, undefined, { numeric: true }) > 0);
@@ -32,17 +197,18 @@ export function handleListFiles({ input, project }: ToolHandlerArgs): string {
   return JSON.stringify({ files, count: files.length, hasMore: all.length > files.length, nextCursor: all.length > files.length ? files.at(-1) : undefined });
 }
 
-export function handleInspectFile({ input, project }: ToolHandlerArgs): string {
+export function handleInspectFile(args: ToolHandlerArgs): string {
+  const { input } = args;
   const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文件已对 Agent 屏蔽");
-  const content = project.readTextFile(path);
-  const sourceHash = project.hash(content);
+  const snapshot = readableTextFile(args, path);
+  const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
   const lines = content.split(/\r?\n/);
   const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   return JSON.stringify({
-    path,
+    path: snapshot.path,
     sourceHash,
+    workingCopy: snapshot.workingCopy,
     lineCount: lines.length,
     characterCount: content.length,
     blockCount: blocks.length,
@@ -52,22 +218,24 @@ export function handleInspectFile({ input, project }: ToolHandlerArgs): string {
   });
 }
 
-export function handleReadFile({ input, project }: ToolHandlerArgs): string {
+export function handleReadFile(args: ToolHandlerArgs): string {
+  const { input } = args;
   const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文件已对 Agent 屏蔽");
-  const content = project.readTextFile(path);
-  const sourceHash = project.hash(content);
+  const snapshot = readableTextFile(args, path);
+  const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
   const lines = content.split(/\r?\n/);
   const quote = typeof input.quote === "string" ? input.quote.trim() : "";
   if (quote) {
     const offset = content.indexOf(quote);
-    if (offset < 0) return JSON.stringify({ path, quote: quote.slice(0, 120), occurrences: 0, matches: [] });
+    if (offset < 0) return JSON.stringify({ path: snapshot.path, sourceHash, workingCopy: snapshot.workingCopy,
+      quote: quote.slice(0, 120), occurrences: 0, matches: [] });
     const startLine = content.slice(0, offset).split(/\r?\n/).length;
     const endLine = content.slice(0, offset + quote.length).split(/\r?\n/).length;
     const contextStart = Math.max(1, startLine - 2);
     const contextEnd = Math.min(lines.length, endLine + 2);
-    return JSON.stringify({ path, sourceHash, quote: quote.slice(0, 120), startLine, endLine,
+    return JSON.stringify({ path: snapshot.path, sourceHash, workingCopy: snapshot.workingCopy,
+      quote: quote.slice(0, 120), startLine, endLine,
       contextStartLine: contextStart, contextEndLine: contextEnd,
       content: lines.slice(contextStart - 1, contextEnd).join("\n").slice(0, 3_000) });
   }
@@ -81,21 +249,24 @@ export function handleReadFile({ input, project }: ToolHandlerArgs): string {
     const actualEnd = Math.min(endLine, lines.length);
     const selected = lines.slice(startLine - 1, actualEnd).join("\n");
     if (selected.length > MAX_READ_CHARACTERS) throw new Error(`读取范围超过 ${MAX_READ_CHARACTERS} 字符，请缩小范围`);
-    return JSON.stringify({ path, sourceHash, startLine, endLine: actualEnd, lineCount: lines.length, content: selected });
+    return JSON.stringify({ path: snapshot.path, sourceHash, workingCopy: snapshot.workingCopy,
+      startLine, endLine: actualEnd, lineCount: lines.length, content: selected });
   }
   const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
   const block = optionalPositiveInteger(input.block, "block") ?? 1;
   if (block > blocks.length) throw new Error(`block 超出范围；文件共 ${blocks.length} 块`);
   const selected = blocks[block - 1];
   const bounded = selected.content.slice(0, MAX_READ_CHARACTERS);
-  return JSON.stringify({ path, sourceHash, block, blockCount: blocks.length,
+  return JSON.stringify({ path: snapshot.path, sourceHash, workingCopy: snapshot.workingCopy,
+    block, blockCount: blocks.length,
     startLine: selected.startLine,
     endLine: Math.min(selected.endLine, selected.startLine + (bounded.match(/\n/g)?.length ?? 0)),
     truncated: bounded.length < selected.content.length,
     hasPrevious: block > 1, hasNext: block < blocks.length, content: bounded });
 }
 
-export function handleSearchFiles({ input, project }: ToolHandlerArgs): string {
+export function handleSearchFiles(args: ToolHandlerArgs): string {
+  const { input, project, context } = args;
   const query = requireString(input.query, "query");
   const prefix = typeof input.pathPrefix === "string"
     ? input.pathPrefix.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
@@ -103,10 +274,14 @@ export function handleSearchFiles({ input, project }: ToolHandlerArgs): string {
   const limit = Math.max(1, Math.min(20, optionalPositiveInteger(input.limit, "limit") ?? 8));
   const needle = query.toLocaleLowerCase();
   const matches: Array<{ path: string; line: number; excerpt: string }> = [];
-  for (const path of project.listTextFiles()) {
+  const paths = [...new Set([
+    ...project.listTextFiles(),
+    ...(context.workingTextFiles?.keys() ?? []),
+  ])].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  for (const path of paths) {
     if (matches.length >= limit) break;
     if (project.isDocumentHidden(path) || (prefix && path !== prefix && !path.startsWith(`${prefix}/`))) continue;
-    const content = project.readTextFile(path);
+    const content = context.workingTextFiles?.get(path)?.content ?? project.readTextFile(path);
     const offset = content.toLocaleLowerCase().indexOf(needle);
     if (offset < 0) continue;
     const line = content.slice(0, offset).split(/\r?\n/).length;
@@ -114,6 +289,114 @@ export function handleSearchFiles({ input, project }: ToolHandlerArgs): string {
     matches.push({ path, line, excerpt: lines.slice(Math.max(0, line - 2), Math.min(lines.length, line + 1)).join("\n").slice(0, 1_500) });
   }
   return JSON.stringify({ query, matches });
+}
+
+export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
+  assertWritableMode(args.context.permissionMode, "write_file");
+  const path = requireString(args.input.path, "path");
+  const existing = workingTextFile(args, path);
+  const chapterDraft = args.context.chapterSceneDraft;
+  const inspectedChapterDraft = !existing
+    && typeof args.input.content !== "string"
+    && chapterDraft
+    && normalizeTextPath(chapterDraft.path) === normalizeTextPath(path)
+    && chapterSceneDraftComplete(chapterDraft)
+    && chapterDraft.inspectedVersion === chapterDraft.version;
+  if (inspectedChapterDraft) {
+    const summary = fileMutationSummary(args.input, normalizeTextPath(path), "write");
+    return handleProposeChapterDraft({
+      ...args,
+      input: {
+        ...args.input,
+        summary,
+        chapterChange: "主 Agent 已按终审清单确认章节目标变化成立",
+        reviewNotes: "主 Agent 已通读 inspect_chapter_draft 返回的当前工作副本并确认可以提交",
+      },
+    });
+  }
+  if (typeof args.input.content !== "string" && !existing) {
+    throw new Error("新建或完整替换文件时 content 必须是字符串；只有已有工作副本或已终审场景草稿才能省略 content 重新验证");
+  }
+  const staged = stageWorkingTextFile(args, path, typeof args.input.content === "string"
+    ? args.input.content
+    : existing!.content);
+  return submitWorkingTextFile(args, staged, "write");
+}
+
+export async function handleEditFile(args: ToolHandlerArgs): Promise<string> {
+  assertWritableMode(args.context.permissionMode, "edit_file");
+  const path = requireString(args.input.path, "path");
+  const snapshot = readableTextFile(args, path);
+  assertExpectedSourceHash(args.input, snapshot.sourceHash);
+  if (!Array.isArray(args.input.edits) || !args.input.edits.length) {
+    throw new Error("edits 至少需要一个精确文本编辑");
+  }
+  if (args.input.edits.length > 20) throw new Error("单次 edit_file 最多包含 20 个编辑");
+  let content = snapshot.content;
+  for (const [index, raw] of args.input.edits.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`edits[${index}] 格式无效`);
+    const edit = raw as Record<string, unknown>;
+    const operation = typeof edit.operation === "string" ? edit.operation : "replace";
+    if (!["replace", "delete", "insert_before", "insert_after"].includes(operation)) {
+      throw new Error(`edits[${index}].operation 无效`);
+    }
+    const oldText = requireString(edit.oldText, `edits[${index}].oldText`);
+    const offset = content.indexOf(oldText);
+    if (offset < 0) throw new Error(`edits[${index}].oldText 在当前工作副本中不存在`);
+    if (offset !== content.lastIndexOf(oldText)) {
+      throw new Error(`edits[${index}].oldText 在当前工作副本中不唯一；请提供更长的上下文`);
+    }
+    const replacement = operation === "delete"
+      ? ""
+      : typeof edit.content === "string"
+        ? edit.content
+        : (() => { throw new Error(`edits[${index}].content 必须是字符串`); })();
+    const next = operation === "insert_before"
+      ? `${replacement}${oldText}`
+      : operation === "insert_after"
+        ? `${oldText}${replacement}`
+        : replacement;
+    content = `${content.slice(0, offset)}${next}${content.slice(offset + oldText.length)}`;
+  }
+  const staged = stageWorkingTextFile(args, snapshot.path, content);
+  return submitWorkingTextFile(args, staged, "edit");
+}
+
+export async function handleMoveFile(args: ToolHandlerArgs): Promise<string> {
+  assertWritableMode(args.context.permissionMode, "move_file");
+  const path = normalizeTextPath(requireString(args.input.path, "path"));
+  const targetPath = normalizeTextPath(requireString(args.input.targetPath, "targetPath"));
+  const snapshot = readableTextFile(args, path);
+  assertExpectedSourceHash(args.input, snapshot.sourceHash);
+  args.project.resolveTextFileSafe(targetPath);
+  if (args.project.isDocumentHidden(targetPath)) throw new Error("目标文件已对 Agent 屏蔽");
+  const raw = await handleProposeChangeSet({
+    ...args,
+    input: {
+      summary: fileMutationSummary(args.input, path, "move"),
+      ...(typeof args.input.deliverableId === "string" ? { deliverableId: args.input.deliverableId } : {}),
+      files: [{ operation: "move", path, targetPath }],
+    },
+  });
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  return JSON.stringify({ ...parsed, path, targetPath });
+}
+
+export async function handleDeleteFile(args: ToolHandlerArgs): Promise<string> {
+  assertWritableMode(args.context.permissionMode, "delete_file");
+  const path = normalizeTextPath(requireString(args.input.path, "path"));
+  const snapshot = readableTextFile(args, path);
+  assertExpectedSourceHash(args.input, snapshot.sourceHash);
+  const raw = await handleProposeChangeSet({
+    ...args,
+    input: {
+      summary: fileMutationSummary(args.input, path, "delete"),
+      ...(typeof args.input.deliverableId === "string" ? { deliverableId: args.input.deliverableId } : {}),
+      files: [{ operation: "delete", path }],
+    },
+  });
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  return JSON.stringify({ ...parsed, path });
 }
 
 export async function handleProposeChangeSet({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
@@ -137,18 +420,43 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
       ...(edits ? { edits } : {}),
     };
   });
+  const activeRevisionFile = files.find(file => context.activeProposalRevisionPaths?.has(file.path)
+    || (file.targetPath && context.activeProposalRevisionPaths?.has(file.targetPath)));
+  if (activeRevisionFile) {
+    return JSON.stringify({
+      status: "recoverable_state_error",
+      code: "ACTIVE_REVISION_REQUIRES_FULL_DRAFT",
+      failureKind: "invalid_request",
+      retryable: true,
+      path: activeRevisionFile.path,
+      error: "批量变更不能修改有活动工作副本的路径；请用 read_file 查看并用 edit_file 做最小修改。",
+      nextAllowedActions: ["read_file", "edit_file", "write_file"],
+    });
+  }
+  const narrativeWrite = files.find(file => (
+    (file.operation === "write" || file.operation === "patch")
+      && isScenePipelineDocument(file.path)
+  ) || (
+    file.operation === "move"
+      && file.targetPath !== undefined
+      && isScenePipelineDocument(file.targetPath)
+      && !isScenePipelineDocument(file.path)
+  ));
+  if (narrativeWrite) {
+    return JSON.stringify({
+      status: "recoverable_state_error",
+      code: "NARRATIVE_CHANGE_SET_REQUIRES_DOCUMENT_PROPOSAL",
+      failureKind: "invalid_request",
+      retryable: true,
+      path: narrativeWrite.targetPath ?? narrativeWrite.path,
+      error: "章节正文必须通过统一文件入口执行样式、节奏与终审，不能放入普通批量变更。请改用 write_file/edit_file。",
+      nextAllowedActions: ["write_file", "edit_file"],
+    });
+  }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
   if (!files.length && !preparedCharacterChanges.changes.length) {
     if (preparedCharacterChanges.skipped) throw new Error("角色演进已关闭；不能创建仅含角色演进的 change set");
     throw new Error("change set 至少需要 files 或 characterChanges");
-  }
-  for (const file of files) {
-    if ((file.operation === "write" || file.operation === "patch") && documentKind(file.path) === "chapter") {
-      const before = project.textFileExists(file.path) ? project.readTextFile(file.path) : "";
-      let after = file.content ?? before;
-      for (const edit of file.edits ?? []) after = after.replace(edit.search, edit.replace);
-      await gateProseStyle(before, after, context, file.path);
-    }
   }
   const changeSet = store.createChangeSet(
     sessionId,

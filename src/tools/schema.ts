@@ -28,7 +28,7 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-export const TOOLS = deepFreeze([
+const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
@@ -167,12 +167,12 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "read_file",
-      description: "按引用、3k 字符块或行范围读取一个 UTF-8 文件快照；单次正文最多 4k 字符",
+      description: "读取 resource/ 内 UTF-8 文本；优先返回本轮工作副本，支持引用、3k 字符块或行范围，单次最多 4k 字符",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "resource/ 内相对路径" },
-          sourceHash: { type: "string", description: "可选；inspect 返回的快照哈希，文件变化时拒绝读取" },
+          sourceHash: { type: "string", description: "可选；上次 read_file 返回的快照哈希，文件变化时拒绝读取" },
           quote: { type: "string", description: "精确原文定位" },
           block: { type: "number", description: "块号，从 1 起" },
           startLine: { type: "number", description: "起始行，与 endLine 同用" },
@@ -186,7 +186,7 @@ export const TOOLS = deepFreeze([
     type: "function",
     function: {
       name: "search_files",
-      description: "在 resource/ 的纯文本文件中做精确文本检索；语义问题仍用 search_project",
+      description: "在 resource/ 的所有可见 UTF-8 文本中检索原文，返回路径、行号和上下文",
       parameters: {
         type: "object",
         properties: {
@@ -195,6 +195,83 @@ export const TOOLS = deepFreeze([
           limit: { type: "number", description: "结果数 1-20，默认 8" },
         },
         required: ["query"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description: "新建或完整替换 resource/ 内 UTF-8 文本工作副本；已有工作副本或已终审场景草稿时可省略 content 重新验证",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "resource/ 内相对路径" },
+          content: { type: "string", description: "完整文件内容" },
+        },
+        required: ["path"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description: "精确编辑 resource/ 内当前工作副本；驳回稿无需重传全文，oldText 必须唯一",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "resource/ 内相对路径" },
+          sourceHash: { type: "string", description: "可选；read_file 返回的当前工作副本哈希" },
+          edits: {
+            type: "array", minItems: 1, maxItems: 20,
+            items: {
+              type: "object",
+              properties: {
+                operation: {
+                  type: "string",
+                  enum: ["replace", "delete", "insert_before", "insert_after"],
+                  description: "默认 replace",
+                },
+                oldText: { type: "string", description: "当前工作副本中的唯一原文" },
+                content: { type: "string", description: "新文本；delete 可省略" },
+              },
+              required: ["oldText"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["path", "edits"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "move_file",
+      description: "移动 resource/ 内文本文件；变更经 CAS 与审批，不能把未审核文本移入正文目录",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "源文件相对路径" },
+          targetPath: { type: "string", description: "目标相对路径" },
+          sourceHash: { type: "string", description: "可选；read_file 返回的源文件哈希" },
+        },
+        required: ["path", "targetPath"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_file",
+      description: "删除 resource/ 内文本文件；变更经 CAS 与审批",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文件相对路径" },
+          sourceHash: { type: "string", description: "可选；read_file 返回的文件哈希" },
+        },
+        required: ["path"], additionalProperties: false,
       },
     },
   },
@@ -322,7 +399,6 @@ export const TOOLS = deepFreeze([
       parameters: {
         type: "object",
         properties: {
-          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
           mode: { type: "string", enum: ["create", "replace", "append"] },
           heading: { type: "string", description: "create/replace 时的正文标题（不含 #）" },
@@ -1009,11 +1085,33 @@ export const TOOLS = deepFreeze([
   },
 ] as const) as unknown as readonly ToolDefinition[];
 
+// Historical handlers remain executable for replay/resume compatibility, but
+// new model requests receive one coherent resource-file interface.
+const LEGACY_MODEL_FILE_TOOLS = new Set([
+  "list_documents",
+  "inspect_document",
+  "locate_document_span",
+  "read_document",
+  "read_document_span",
+  "search_project",
+  "inspect_file",
+  "propose_outline_patch",
+  "propose_document",
+  "write_document_isolated",
+  "propose_document_patch",
+  "revise_document_isolated",
+  "propose_change_set",
+  "propose_chapter_draft",
+]);
+
+export const TOOLS = deepFreeze(
+  TOOL_DEFINITIONS.filter(tool => !LEGACY_MODEL_FILE_TOOLS.has(tool.function.name)),
+) as readonly ToolDefinition[];
+
 export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name));
 
 const WRITE_TOOLS = new Set([
-  "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set",
-  "revise_document_isolated",
+  "write_file", "edit_file", "move_file", "delete_file",
   "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
   "manage_prose_gates",

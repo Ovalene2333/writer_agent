@@ -6,8 +6,18 @@ import test from "node:test";
 import { emptyCharacter } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { orderedChapterPaths, WriterProject } from "./project.js";
+import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterStore } from "./store.js";
-import { handleInspectFile, handleListFiles, handleReadFile } from "./tools/files.js";
+import {
+  handleDeleteFile,
+  handleEditFile,
+  handleInspectFile,
+  handleListFiles,
+  handleMoveFile,
+  handleProposeChangeSet,
+  handleReadFile,
+  handleWriteFile,
+} from "./tools/files.js";
 import type { ToolHandlerArgs } from "./tools/types.js";
 
 test("text workspace stays inside resource and reads non-Markdown files", () => {
@@ -170,6 +180,184 @@ test("chapter file operations use filesystem paths without rewriting writer.yaml
     store.undoChangeSet(changeSet.id);
     assert.equal(project.readRaw("writer.yaml"), beforeConfig);
     assert.deepEqual(orderedChapterPaths(project), ["chapters/chapter-001.md", "chapters/chapter-002.md"]);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unified file tools edit a visible working copy and route all text through approval", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-unified-files-"));
+  try {
+    const project = WriterProject.init(root, "unified file tools");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("unified");
+    project.writeRaw("lore/rule.md", "# 规则\n\n旧规则。\n");
+    const context: ToolHandlerArgs["context"] = {
+      permissionMode: "ask",
+      workingTextFiles: new Map(),
+      readSnapshots: new Map(),
+    };
+    const args = (input: Record<string, unknown>): ToolHandlerArgs => ({
+      input, project, store, sessionId, emit: () => undefined, context,
+    });
+
+    const edited = JSON.parse(await handleEditFile(args({
+      path: "lore/rule.md",
+      edits: [{ operation: "replace", oldText: "旧规则。", content: "新规则。" }],
+    }))) as Record<string, unknown>;
+    assert.equal(edited.status, "pending");
+    assert.equal(typeof edited.proposalId, "number");
+    assert.match(project.read("lore/rule.md"), /旧规则/u, "ask mode must not overwrite the persisted file");
+    const working = JSON.parse(handleReadFile(args({ path: "lore/rule.md" }))) as Record<string, unknown>;
+    assert.equal(working.workingCopy, true);
+    assert.match(String(working.content), /新规则/u);
+
+    const revalidated = JSON.parse(await handleWriteFile(args({ path: "lore/rule.md" }))) as Record<string, unknown>;
+    assert.equal(typeof revalidated.proposalId, "number", "an existing working copy can be revalidated without retransmitting it");
+
+    const autoContext: ToolHandlerArgs["context"] = { permissionMode: "auto", workingTextFiles: new Map() };
+    const autoArgs = (input: Record<string, unknown>): ToolHandlerArgs => ({
+      input, project, store, sessionId, emit: () => undefined, context: autoContext,
+    });
+    const written = JSON.parse(await handleWriteFile(autoArgs({
+      path: "notes/research.txt",
+      content: "alpha\nbeta\n",
+    }))) as Record<string, unknown>;
+    assert.equal(written.status, "accepted");
+    assert.equal(project.readTextFile("notes/research.txt"), "alpha\nbeta\n");
+
+    const moved = JSON.parse(await handleMoveFile(autoArgs({
+      path: "notes/research.txt",
+      targetPath: "notes/archive/research.txt",
+    }))) as Record<string, unknown>;
+    assert.equal(moved.status, "accepted");
+    assert.equal(project.textFileExists("notes/research.txt"), false);
+    assert.equal(project.readTextFile("notes/archive/research.txt"), "alpha\nbeta\n");
+
+    const deleted = JSON.parse(await handleDeleteFile(autoArgs({
+      path: "notes/archive/research.txt",
+    }))) as Record<string, unknown>;
+    assert.equal(deleted.status, "accepted");
+    assert.equal(project.textFileExists("notes/archive/research.txt"), false);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("write_file submits an inspected scene draft without exposing a proposal-only tool", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-scene-file-submit-"));
+  try {
+    const project = WriterProject.init(root, "scene file submit");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("scene file submit");
+    const started = beginChapterSceneDraft({
+      path: "chapters/第二章.md",
+      mode: "create",
+      heading: "第二章",
+      chapterGoal: "越过门禁",
+      baseContent: "",
+      baseHash: project.hash(""),
+      scenes: [{
+        id: "gate",
+        title: "门禁",
+        goal: "进入训练区",
+        entryState: [],
+        characterIntent: [],
+        obstacle: "门禁转红",
+        turn: "仍然进入",
+        outcome: "留下违规记录",
+        handoff: "",
+        dividerBefore: false,
+      }],
+    });
+    const written = writeChapterScene(
+      started,
+      "gate",
+      "门禁灯从绿转红，她没有退回走廊，而是贴着即将闭合的门缝侧身挤了进去。鞋底擦过金属轨道，警报声随即追进训练区，她回头看见自己的编号已经留在屏幕上，值班室的方向也亮起一盏白灯。",
+      {
+        situation: ["已违规进入训练区"],
+        physical: [],
+        knowledge: ["知道门禁记录了自己的编号"],
+        relationships: [],
+        goals: [],
+        openLoops: ["警报会引来谁"],
+        usedMotifs: ["红灯"],
+      },
+    ).draft;
+    const context: ToolHandlerArgs["context"] = {
+      permissionMode: "ask",
+      chapterSceneDraft: { ...written, inspectedVersion: written.version },
+    };
+    const submitted = JSON.parse(await handleWriteFile({
+      input: { path: "chapters/第二章.md" },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      context,
+    })) as Record<string, unknown>;
+    assert.equal(submitted.status, "pending");
+    assert.equal(typeof submitted.proposalId, "number");
+    assert.equal(context.chapterSceneDraft, undefined);
+    assert.equal(project.documentExists("chapters/第二章.md"), false);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("change set cannot bypass the full narrative proposal review path", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-change-set-narrative-"));
+  try {
+    const project = WriterProject.init(root, "narrative change set guard");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("guard");
+    const result = JSON.parse(await handleProposeChangeSet({
+      input: {
+        summary: "写第一章",
+        files: [{ operation: "write", path: "chapters/第一章.md", content: "# 第一章\n\n正文。" }],
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      context: { permissionMode: "ask" },
+    })) as Record<string, unknown>;
+    assert.equal(result.code, "NARRATIVE_CHANGE_SET_REQUIRES_DOCUMENT_PROPOSAL");
+    assert.deepEqual(result.nextAllowedActions, ["write_file", "edit_file"]);
+    assert.equal(project.documentExists("chapters/第一章.md"), false);
+
+    const sideResult = JSON.parse(await handleProposeChangeSet({
+      input: {
+        summary: "写支线",
+        files: [{ operation: "write", path: "side/支线.md", content: "# 支线\n\n正文。" }],
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      context: { permissionMode: "ask" },
+    })) as Record<string, unknown>;
+    assert.equal(sideResult.code, "NARRATIVE_CHANGE_SET_REQUIRES_DOCUMENT_PROPOSAL");
+    assert.equal(project.documentExists("side/支线.md"), false);
+
+    const movedIntoChapter = JSON.parse(await handleProposeChangeSet({
+      input: {
+        summary: "把未审核草稿移入章节目录",
+        files: [{ operation: "move", path: "lore/world.md", targetPath: "chapters/导入稿.md" }],
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      context: { permissionMode: "ask" },
+    })) as Record<string, unknown>;
+    assert.equal(movedIntoChapter.code, "NARRATIVE_CHANGE_SET_REQUIRES_DOCUMENT_PROPOSAL");
+    assert.equal(movedIntoChapter.path, "chapters/导入稿.md");
+    assert.equal(project.documentExists("lore/world.md"), true);
+    assert.equal(project.documentExists("chapters/导入稿.md"), false);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

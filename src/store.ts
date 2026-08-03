@@ -31,6 +31,7 @@ import {
   type SkippedCharacterChange,
 } from "./characters.js";
 import { OutlineStore } from "./outline.js";
+import { comparePathNames } from "./path_sort.js";
 import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
 import {
@@ -53,6 +54,15 @@ import {
 
 type Row = Record<string, unknown>;
 type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
+
+export class ProposalDocumentBaseChangedError extends Error {
+  readonly code = "PROPOSAL_DOCUMENT_BASE_CHANGED";
+
+  constructor(readonly path: string) {
+    super(`终审期间目标文档已变化：${path}`);
+    this.name = "ProposalDocumentBaseChangedError";
+  }
+}
 
 export interface RoleplayBranchSummary {
   id: string;
@@ -3390,15 +3400,26 @@ export class WriterStore {
     qualityReport?: ProseQualityReport,
     sourceMessageId?: number,
     deliveryReady = true,
+    expectedBaseHash?: string,
   ): Proposal {
     const exists = this.project.documentExists(path);
-    const before = exists ? this.project.read(path) : "";
+    let before: string;
+    try {
+      before = exists ? this.project.read(path) : "";
+    } catch (error) {
+      if (expectedBaseHash !== undefined) throw new ProposalDocumentBaseChangedError(path);
+      throw error;
+    }
+    const baseHash = exists ? this.project.hash(before) : "__missing__";
+    if (expectedBaseHash !== undefined && baseHash !== expectedBaseHash) {
+      throw new ProposalDocumentBaseChangedError(path);
+    }
     this.evolveCharactersForProposal(characterChanges);
     const now = new Date().toISOString();
     const result = this.database.prepare(`
       INSERT INTO proposals(session_id,source_message_id,delivery_ready,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)
-    `).run(sessionId, sourceMessageId ?? null, deliveryReady ? 1 : 0, path, summary, before, content, exists ? this.project.hash(before) : "__missing__", JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
+    `).run(sessionId, sourceMessageId ?? null, deliveryReady ? 1 : 0, path, summary, before, content, baseHash, JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
     return this.proposal(Number(result.lastInsertRowid));
   }
 
@@ -3463,6 +3484,9 @@ export class WriterStore {
 
   acceptProposal(id: number): Proposal {
     const proposal = this.proposal(id);
+    if (!proposal.deliveryReady) {
+      throw new Error("该提案仍是门禁修订中的中间草稿，尚未达到可交付状态，不能接受");
+    }
     if (proposal.status === "accepted") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
     const expectedAfterHash = this.project.hash(proposal.afterContent);
@@ -4046,7 +4070,7 @@ export class WriterStore {
           updatedAt: revision?.updatedAt ?? "",
         };
       })
-      .sort((a, b) => a.path.localeCompare(b.path, "zh-CN", { numeric: true }));
+      .sort((a, b) => comparePathNames(a.path, b.path) || comparePathNames(a.title, b.title));
   }
 
   /**

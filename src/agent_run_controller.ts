@@ -12,11 +12,13 @@ import {
 } from "./agent_run_reducer.js";
 import { AgentRunStore } from "./agent_run_store.js";
 import type {
+  AgentRunDeliverableV2,
   AgentRunContractRecord,
   AgentRunSnapshotV2,
 } from "./agent_run_types.js";
 import type { AgentRunDocumentEvidence, AgentRunState, AgentTodoItem, PermissionMode } from "./types.js";
 import type { WritingWorkflowStage } from "./writing_workflow.js";
+import type { ProposalRevisionCase } from "./proposal_retry.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -73,15 +75,20 @@ export class AgentRunController {
         sourceMessageId: input.sourceMessageId,
       });
     } else {
+      const documentDeliverableLabels = input.task.documentDeliverables?.length
+        ? input.task.documentDeliverables
+        : input.task.mutation === "document" || input.task.mutation === "mixed"
+          ? ["文件交付"]
+          : [];
       snapshot = runStore.start({
         sessionId: input.sessionId,
         sourceMessageId: input.sourceMessageId,
         originalRequest: input.originalRequest,
         contract: contractRecord(input.task, input.permissionMode),
-        deliverables: input.task.documentDeliverables?.map((label, index) => ({
+        deliverables: documentDeliverableLabels.map((label, index) => ({
           id: `document-${index + 1}`,
           label,
-        })) ?? [],
+        })),
         reusableEvidence: input.reusableEvidence,
       });
     }
@@ -117,8 +124,81 @@ export class AgentRunController {
     return pendingAgentRunDeliverables(this.snapshotValue).map(item => item.label);
   }
 
-  recordStep(step: number): void {
-    this.append(`step:${this.snapshotValue.sourceMessageId}:${step}`, { type: "step_started", at: now(), step });
+  activeDocumentDeliverable(): AgentRunDeliverableV2 | undefined {
+    const pending = pendingAgentRunDeliverables(this.snapshotValue);
+    return pending.find(item => Boolean(item.proposalRevision))
+      ?? pending.find(item => item.state === "revision_required")
+      ?? pending[0];
+  }
+
+  proposalDeliverableId(requestedId?: string): string | undefined {
+    if (requestedId) {
+      return this.snapshotValue.deliverables.some(item => item.id === requestedId)
+        ? requestedId
+        : undefined;
+    }
+    return this.snapshotValue.deliverables.find(item => !item.evidence)?.id;
+  }
+
+  proposalRevision(deliverableId: string | undefined): ProposalRevisionCase | undefined {
+    if (!deliverableId) return undefined;
+    return this.snapshotValue.deliverables.find(item => item.id === deliverableId)?.proposalRevision;
+  }
+
+  setProposalRevision(
+    deliverableId: string,
+    revision: ProposalRevisionCase,
+    eventKey: string,
+  ): void {
+    if (revision.runId !== this.runId || revision.deliverableId !== deliverableId
+      || revision.retryState.runId !== revision.runId
+      || revision.retryState.deliverableId !== revision.deliverableId
+      || revision.retryState.path !== revision.path) {
+      throw new Error("提案修订状态与当前 AgentRun 交付项不匹配");
+    }
+    const pathOwner = revision.path
+      ? this.snapshotValue.deliverables.find(item => item.id !== deliverableId
+        && item.proposalRevision?.status === "blocked"
+        && item.proposalRevision.path === revision.path)
+      : undefined;
+    if (pathOwner) {
+      throw new Error(`提案修订路径 ${revision.path} 已绑定交付项 ${pathOwner.id}`);
+    }
+    this.append(eventKey, {
+      type: "proposal_revision_set",
+      at: now(),
+      deliverableId,
+      revision,
+    });
+  }
+
+  clearProposalRevision(deliverableId: string, eventKey: string): void {
+    if (!this.proposalRevision(deliverableId)) return;
+    this.append(eventKey, { type: "proposal_revision_cleared", at: now(), deliverableId });
+  }
+
+  recordStep(step: number, deliverableId = this.activeDocumentDeliverable()?.id): void {
+    this.append(`step:${this.snapshotValue.sourceMessageId}:${step}`, {
+      type: "step_started",
+      at: now(),
+      step,
+      ...(deliverableId ? { deliverableId } : {}),
+    });
+  }
+
+  useDeliverableReviewReserve(
+    deliverableId: string,
+    step: number,
+    reason: "terminal_review" | "proposal_revision",
+    eventKey: string,
+  ): void {
+    this.append(eventKey, {
+      type: "deliverable_review_reserve_used",
+      at: now(),
+      deliverableId,
+      step,
+      reason,
+    });
   }
 
   observeTool(
@@ -169,11 +249,25 @@ export class AgentRunController {
   ): void {
     const key = artifactKey(evidence);
     if (!key) return;
+    let resolvedDeliverableId = deliverableId;
+    if (!resolvedDeliverableId && this.snapshotValue.deliverables.length) {
+      resolvedDeliverableId = this.snapshotValue.deliverables.find(item => {
+        if (item.evidence) return false;
+        if (!item.proposalRevision) return true;
+        return Boolean(evidence.path && item.proposalRevision.path === evidence.path);
+      })?.id;
+      if (!resolvedDeliverableId) return;
+    }
+    const target = resolvedDeliverableId
+      ? this.snapshotValue.deliverables.find(item => item.id === resolvedDeliverableId)
+      : undefined;
+    if (target?.proposalRevision
+      && (!evidence.path || target.proposalRevision.path !== evidence.path)) return;
     const proposalStatus = status === "accepted" ? "accepted" as const : "pending" as const;
     this.append(eventKey, {
       type: "deliverable_recorded",
       at: now(),
-      ...(deliverableId ? { deliverableId } : {}),
+      ...(resolvedDeliverableId ? { deliverableId: resolvedDeliverableId } : {}),
       evidence: { ...evidence, artifactKey: key, proposalStatus },
     });
   }
@@ -199,7 +293,7 @@ export class AgentRunController {
   completionGaps(task: AgentTaskContract, todos: AgentTodoItem[]): string[] {
     const gaps = agentCompletionGaps(task, this.executionProgress(), todos);
     const pending = pendingAgentRunDeliverables(this.snapshotValue);
-    if (pending.length && !gaps.some(gap => gap.includes("文档交付") || gap.includes("文档提案"))) {
+    if (pending.length && !gaps.some(gap => gap.includes("文件交付") || gap.includes("文档交付") || gap.includes("文档提案"))) {
       gaps.push(`文档交付尚未达到所需状态：${pending.map(item => item.label).join("、")}`);
     }
     return gaps;

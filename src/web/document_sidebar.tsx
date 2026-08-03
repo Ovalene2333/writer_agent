@@ -3,6 +3,7 @@ import {
   Archive, ArchiveRestore, BookOpenText, ChevronRight, Copy, Eye, EyeOff,
   FileText, Folder, FolderInput, FolderOpen, FolderPlus, History, Pencil, Plus, Trash2,
 } from "lucide-react";
+import { comparePathNames } from "../path_sort";
 import type { ChapterSummary, TreeNode } from "./types";
 import { IconButton, RowOverflowMenu } from "./ui_primitives";
 
@@ -76,7 +77,8 @@ export function buildTree(docs: string[], folders: string[], hiddenDocs: string[
   const sortNodes = (nodes: TreeNode[]) => {
     nodes.sort((a, b) => {
       if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
-      return a.name.localeCompare(b.name);
+      // Chinese chapter numerals + Arabic digits (第一章 < 第二章 < 第10章).
+      return comparePathNames(a.name, b.name) || comparePathNames(a.path, b.path);
     });
     for (const node of nodes) sortNodes(node.children);
   };
@@ -118,13 +120,16 @@ export function buildChapterGroups(chapters: ChapterSummary[], folders: string[]
     .sort((a, b) => {
       if (!a) return -1;
       if (!b) return 1;
-      return a.localeCompare(b, "zh-CN", { numeric: true });
+      return comparePathNames(a, b);
     })
     .map(volume => ({
       id: volume || "__ungrouped__",
       label: volume || "未分卷",
       folderPath: volume ? `chapters/${volume}` : "chapters",
-      chapters: chapters.filter(chapter => chapter.volume === volume),
+      chapters: chapters
+        .filter(chapter => chapter.volume === volume)
+        .slice()
+        .sort((a, b) => comparePathNames(a.title, b.title) || comparePathNames(a.path, b.path)),
     }));
 }
 

@@ -125,6 +125,7 @@ test("built-in semantic rules keep a fixed project-rule capacity and repair meta
     "quoted-text-count-consistency",
     "telegraphic-object-beats",
     "characterization-proof-stacking",
+    "manufactured-precision-staccato",
   ]);
   for (const rule of BUILT_IN_PROSE_GATE_RULES) {
     assert.ok(rule.label.length > 0);
@@ -135,6 +136,27 @@ test("built-in semantic rules keep a fixed project-rule capacity and repair meta
   const characterization = BUILT_IN_PROSE_GATE_RULES.find(rule => rule.id === "characterization-proof-stacking");
   assert.match(characterization?.instruction ?? "", /行动证明.*外部背书.*点题定性/u);
   assert.match(characterization?.revisionIntent ?? "", /具体选择.*后果/u);
+
+  const precisionStaccato = BUILT_IN_PROSE_GATE_RULES.find(rule => rule.id === "manufactured-precision-staccato");
+  assert.equal(precisionStaccato?.kind, "style_preference");
+  assert.equal(precisionStaccato?.severity, "warn");
+  assert.match(precisionStaccato?.instruction ?? "", /极短句.*高确定性细节/u);
+  assert.match(precisionStaccato?.instruction ?? "", /语法完整.*不能.*自动放行/u);
+  assert.match(precisionStaccato?.instruction ?? "", /自然问答.*紧急指令.*精确信息.*偶发重音.*放行/u);
+  assert.match(precisionStaccato?.instruction ?? "", /完整相邻句组/u);
+  assert.match(precisionStaccato?.revisionIntent ?? "", /保留必要事实和精度.*只调整命中句组/u);
+});
+
+test("manufactured precision staccato review keeps complete adjacent evidence", () => {
+  const text = [
+    "别装。你昨晚把行李单改了三遍。",
+    "一份他签过字的护航名单。精确到分钟。",
+  ].join("\n\n");
+  const passages = learnedGatePassagesForReview(text);
+  assert.deepEqual(passages.map(passage => passage.text), [
+    "别装。你昨晚把行李单改了三遍。",
+    "一份他签过字的护航名单。精确到分钟。",
+  ]);
 });
 
 test("packProseSnippets includes neighbor context", () => {

@@ -72,6 +72,21 @@ export const BUILT_IN_PROSE_GATE_RULES: readonly ProseGateRule[] = [
     createdAt: "2026-08-02T00:00:00.000Z",
     updatedAt: "2026-08-02T00:00:00.000Z",
   },
+  {
+    id: "manufactured-precision-staccato",
+    label: "精确信息断拍重音",
+    instruction: "复审相邻句是否用极短句强行断拍，再紧接次数、时间、签字、名单或其他高确定性细节，把普通信息包装成冷峻、悬疑、权威或影视化揭示。包括语法完整的短喝止后立刻抛出精确指控，以及名词短语后另起一句追加精度标签；不能因单句语法完整就自动放行。只有这组断拍主要在摆姿态或制造重音，没有体现人物特有声线、现场反应、信息阻力或行动变化时才违规。不得仅因句子短、出现数字或省略成分判错；自然问答、紧急指令、确实影响判断与行动的精确信息及偶发重音应放行。evidence 引用能证明该节拍的最短完整相邻句组。",
+    revisionIntent: "保留必要事实和精度，恢复自然的对白、动作或叙述承接；只调整命中句组，不删除无关事实或全文改写。",
+    kind: "style_preference",
+    severity: "warn",
+    enabled: true,
+    builtIn: true,
+    documentKinds: ["chapter", "side", "writing_example"],
+    pathPrefixes: [],
+    sourceFeedback: "作者反馈：“别装。你昨晚把行李单改了三遍。”与“一份他签过字的护航名单。精确到分钟。”这类短句断拍加精确信息重锤的表达生成感过重。",
+    createdAt: "2026-08-03T00:00:00.000Z",
+    updatedAt: "2026-08-03T00:00:00.000Z",
+  },
 ];
 
 /** Built-ins grow independently without reducing the long-standing project-rule capacity. */

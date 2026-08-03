@@ -91,8 +91,9 @@ export function assertCreativeOutlineDesigned(
 ): void {
   if (!context.requireCreativeOutlineDesign || context.creativeOutlineDesigned) return;
   if (documentKind(path) !== "outline") return;
+  if (toolName === "edit_file") return;
   throw new Error(
     `${toolName} 写入大纲文档前须先成功调用 design_creative_outline 一次（本轮 outline 模式硬约束）。` +
-    `局部节点字段修补请改用 propose_outline_patch，不受此限。`,
+    `局部节点字段修补请改用 edit_file，不受此限。`,
   );
 }

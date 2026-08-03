@@ -68,4 +68,6 @@ test("assertCreativeOutlineDesigned gates outline paths only when required", () 
     assertCreativeOutlineDesigned({ requireCreativeOutlineDesign: false }, "outline/outline.md", "propose_document"));
   assert.doesNotThrow(() =>
     assertCreativeOutlineDesigned({}, "story/outline.md", "propose_document_patch"));
+  assert.doesNotThrow(() =>
+    assertCreativeOutlineDesigned({ requireCreativeOutlineDesign: true }, "outline/outline.md", "edit_file"));
 });

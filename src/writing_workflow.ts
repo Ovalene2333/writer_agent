@@ -37,12 +37,12 @@ export function inferWritingQualityProfile(task: WritingWorkflowTaskLike): Writi
 
 export function writingWorkflowPrompt(kind: WritingWorkflowKind, quality: WritingQualityProfile): string {
   const qualityText: Record<WritingQualityProfile, string> = {
-    fast: "快速：可直接成稿或局部提案；只做必要证据读取和出口复审。",
+    fast: "快速：可直接写入工作副本或做局部编辑；只做必要证据读取和出口复审。",
     standard: "标准：完整正文须先取得承接/目标依据，成稿后做必要审阅或语义复审，再提交。",
     strict: "严格：审阅优先证据和可定位问题；修复只处理明确问题，不扩大改写范围。",
   };
   if (kind === "free") {
-    return `阶段图：free。${qualityText[quality]}Agent 可按工具结果自主选路；完成条件仍由任务契约和提案/保存结果判定。`;
+    return `阶段图：free。${qualityText[quality]}Agent 可按工具结果自主选路；完成条件仍由任务契约和文件提交结果判定。`;
   }
   if (kind === "scene_graph") {
     return `阶段图：scene_graph。参考阶段 gather_context → shape_scene_chain → draft_unit → inspect_unit → submit_artifact。${qualityText[quality]}场景链只在能降低连续性风险时使用；可根据工具结果跳过或回退。`;
@@ -57,9 +57,9 @@ export function writingWorkflowStagesForTool(
   if (!result || "error" in result || result.status === "error" || result.status === "failed") return [];
   const stages: WritingWorkflowStage[] = [];
   if ([
-    "search_project", "read_document", "read_document_span", "get_outline_node", "get_character",
-    "get_simple_character", "read_file", "read_conversation", "read_context_artifact", "inspect_document",
-    "inspect_file", "list_outline_nodes", "validate_outline", "compare_outline_with_draft",
+    "read_file", "search_files", "get_outline_node", "get_character",
+    "get_simple_character", "read_conversation", "read_context_artifact",
+    "list_outline_nodes", "validate_outline", "compare_outline_with_draft",
   ].includes(toolName)) {
     stages.push("gather_context");
   }
@@ -67,6 +67,7 @@ export function writingWorkflowStagesForTool(
     stages.push("shape_scene_chain");
   }
   if ([
+    "write_file", "edit_file", "move_file", "delete_file",
     "write_chapter_scene", "write_chapter_scene_notes", "write_document_isolated",
     "revise_document_isolated", "propose_document", "propose_document_patch", "propose_change_set",
   ].includes(toolName)) {
@@ -80,6 +81,7 @@ export function writingWorkflowStagesForTool(
     stages.push("repair_targeted");
   }
   if ([
+    "write_file", "edit_file", "move_file", "delete_file",
     "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch",
     "propose_change_set", "revise_document_isolated", "propose_chapter_draft",
   ].includes(toolName) || (toolName === "inspect_chapter_draft" && result.proposalSubmitted === true)) {

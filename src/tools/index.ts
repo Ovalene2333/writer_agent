@@ -3,6 +3,7 @@ export { executeTool, registeredToolNames } from "./execute.js";
 export type {
   CompletedChapterHandoff,
   MaterialsShelfEntry,
+  WorkingTextFile,
   ToolCall,
   ToolDefinition,
   ToolExecutionContext,

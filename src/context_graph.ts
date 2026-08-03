@@ -93,7 +93,7 @@ export type ContextTransition = {
   afterMessageCount?: number;
   kept: Array<{ id: string; label: string; detail?: string }>;
   dropped: Array<{ id: string; label: string; detail?: string }>;
-  /** Why the model may still call read_document / search_project after the cut. */
+  /** Why the model may still call read_file / search_files after the cut. */
   reReadHint?: string;
   path?: string;
 };
@@ -298,7 +298,7 @@ export function buildProjectTrunk(input: ProjectTrunkBuildInput): ProjectTrunkBu
 
   const content = [
     "【项目树干 · 跨章共享】以下材料跨任务字节稳定（大纲/角色/设定变更后换新版本）。",
-    "这是索引与骨架，不是已读正文；需要细节时用 get_outline_node / get_character / read_document 按 id 或路径读取。",
+    "这是索引与骨架，不是已读正文；需要细节时用 get_outline_node / get_character / read_file 按 id 或路径读取。",
     "禁止因树干存在而重复 list_outline_nodes 或通读整本大纲。",
     serialized,
   ].join("\n");
@@ -432,7 +432,7 @@ export function formatActiveHandoffsForPrompt(
     header,
     ...kept,
     ...(omitted > 0
-      ? [`- 更早交付共 ${omitted} 章，未在此展开；需要时用 list_documents / read_document 按路径读取。`]
+      ? [`- 更早交付共 ${omitted} 章，未在此展开；需要时用 list_files / read_file 按路径读取。`]
       : []),
   ].join("\n");
 }

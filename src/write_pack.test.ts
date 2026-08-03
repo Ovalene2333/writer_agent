@@ -33,6 +33,7 @@ import type { ToolExecutionContext } from "./tools/types.js";
 import { sceneProseScoreBreakdown } from "./prose_metrics.js";
 import { shouldSkipSceneCandidates } from "./scene_candidates.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
+import { proposalRevisionIssueId, proposalRevisionScopeKey } from "./proposal_retry.js";
 import { documentSpans } from "./document_spans.js";
 import type { AgentEvent } from "./types.js";
 
@@ -292,13 +293,19 @@ test("direct chapter proposal blocks factual knowledge leaks before creating a p
       sourceEvidence: "",
     });
     let shouldBlock = true;
+    let reviewCalls = 0;
+    let sawRevisionReview = false;
     const context: ToolExecutionContext = {
       permissionMode: "ask",
+      runId: "run-direct-review",
+      proposalReviewRevisions: new Map(),
       readSnapshots: new Map(),
       chapterReviewer: {
         model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "reviewer-test" },
         context: "项目终审约束",
         run: async (_model, input) => {
+          reviewCalls += 1;
+          sawRevisionReview ||= Boolean(input.revisionReview);
           assert.match(input.context ?? "", /character_knowledge/u);
           assert.match(input.context ?? "", /守塔人/u);
           return {
@@ -319,6 +326,12 @@ test("direct chapter proposal blocks factual knowledge leaks before creating a p
               chapterChange: "来客从试探转为撤退",
               reviewNotes: "事实与认知路径一致",
               issues: [],
+              ...(input.revisionReview ? {
+                priorBlockerDispositions: input.revisionReview.priorBlockers.map(item => ({
+                  priorIssueId: item.id,
+                  status: "resolved" as const,
+                })),
+              } : {}),
             },
           };
         },
@@ -334,12 +347,98 @@ test("direct chapter proposal blocks factual knowledge leaks before creating a p
     assert.equal(blocked.code, "DIRECT_CHAPTER_REVIEW_BLOCKED");
     assert.equal(store.proposals().length, 0);
 
-    shouldBlock = false;
-    const passed = JSON.parse(await submitFullDocumentProposal(
+    const blockedReview = blocked.chapterReview as { issues: Array<Record<string, unknown>> };
+    const blocker = blockedReview.issues[0];
+    const issue = {
+      id: proposalRevisionIssueId({
+        kind: String(blocker.kind),
+        evidence: blocker.evidence as string[],
+        problem: String(blocker.problem),
+      }),
+      severity: "blocker",
+      kind: String(blocker.kind),
+      evidence: blocker.evidence as string[],
+      problem: String(blocker.problem),
+      action: String(blocker.action),
+    };
+    context.proposalReviewRevisions!.set(proposalRevisionScopeKey({
+      runId: context.runId!, path: "chapters/第一章.md",
+    }), {
+      runId: context.runId!,
+      path: "chapters/第一章.md",
+      previousContent: content,
+      previousSourceHash: project.hash(content),
+      unresolvedIssues: [issue],
+    });
+    const unchanged = JSON.parse(await submitFullDocumentProposal(
       args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+    )) as Record<string, unknown>;
+    assert.equal(unchanged.code, "DIRECT_CHAPTER_REVIEW_BLOCKED");
+    assert.equal(reviewCalls, 1, "identical rejected body must reuse the prior blockers");
+
+    shouldBlock = false;
+    const revisedContent = "# 第一章\n\n来客只问钟摆是否需要检修。";
+    const passed = JSON.parse(await submitFullDocumentProposal(
+      args, "chapters/第一章.md", revisedContent, "来客试探北塔", undefined, true,
     )) as Record<string, unknown>;
     assert.equal(passed.status, "pending");
     assert.equal(store.proposals().length, 1);
+    assert.equal(reviewCalls, 2);
+    assert.equal(sawRevisionReview, true);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("direct chapter proposal rejects a document modified while final review is running", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-review-base-race-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "终审基线竞态");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("终审基线竞态");
+    const path = "chapters/chapter-001.md";
+    const externallyModified = "# 第一章\n\n另一任务在终审期间写入的正文。";
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      chapterReviewer: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "reviewer-test" },
+        run: async () => {
+          project.writeRaw(path, externallyModified);
+          return {
+            review: {
+              verdict: "pass" as const,
+              chapterChange: "完成正文",
+              reviewNotes: "通过",
+              issues: [],
+            },
+          };
+        },
+      },
+    };
+    const result = JSON.parse(await submitFullDocumentProposal(
+      {
+        input: {}, project, store, sessionId,
+        emit: (_event: AgentEvent) => {}, context,
+      },
+      path,
+      "# 第一章\n\n来客在雨里推开门，向昏暗的走廊深处走去。",
+      "来客进入走廊",
+      undefined,
+      true,
+    )) as Record<string, unknown>;
+
+    assert.deepEqual(result, {
+      status: "recoverable_state_error",
+      code: "PROPOSAL_DOCUMENT_BASE_CHANGED",
+      failureKind: "invalid_request",
+      retryable: false,
+      path,
+      error: "终审期间目标文档已变化，未创建提案。请重新读取当前文档并基于最新版本处理。",
+    });
+    assert.equal(store.proposals().length, 0);
+    assert.equal(project.read(path), externallyModified);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

@@ -7,6 +7,7 @@ import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
 import type { IsolatedWriterVoiceEvidence } from "../style_grounding.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
+import type { ProposalReviewRevisionContext } from "../proposal_retry.js";
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
 import type { DocumentRevisionInput } from "../document_revision.js";
@@ -51,6 +52,20 @@ export type MaterialsShelfEntry = {
   retention?: "executable" | "coverage" | "recoverable";
 };
 
+/**
+ * Run-scoped overlay for a text file. Agent reads and edits this body while the
+ * persisted project version remains unchanged until proposal approval.
+ */
+export type WorkingTextFile = {
+  path: string;
+  content: string;
+  sourceHash: string;
+  baseExists: boolean;
+  baseSourceHash: string;
+  deliverableId?: string;
+  revisionCaseId?: string;
+};
+
 export type ToolCall = {
   id: string;
   name: string;
@@ -59,6 +74,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** AgentRun owning workflow-scoped proposal state. */
+  runId?: string;
   /** Dedicated Images API model and generated assets owned by this Agent turn. */
   imageGenerator?: { model: ModelConfig; signal?: AbortSignal };
   generatedAttachments?: MessageAttachment[];
@@ -95,9 +112,9 @@ export type ToolExecutionContext = {
   /** Hashes of the exact constraint packets supplied to the writing context. */
   writerCharacterConstraintHashes?: Map<number, string>;
   /**
-   * When true (outline mode), propose_document / propose_document_patch targeting
+   * When true (outline mode), write_file / edit_file targeting
    * outline paths require a successful design_creative_outline earlier in this run.
-   * Local propose_outline_patch is never gated.
+   * Local edit_file is never gated by creative-outline design.
    */
   requireCreativeOutlineDesign?: boolean;
   /** Set true after design_creative_outline succeeds this run. */
@@ -124,7 +141,7 @@ export type ToolExecutionContext = {
    */
   priorProseContext?: { forPath: string; text: string };
   /**
-   * Set by propose_chapter_draft on success (before clearing the draft) so the
+   * Set when a reviewed chapter draft is submitted (before clearing the draft) so the
    * agent loop can reset per-chapter context while keeping continuity facts.
    */
   completedChapterHandoff?: CompletedChapterHandoff;
@@ -172,6 +189,29 @@ export type ToolExecutionContext = {
       input: ChapterReviewInput,
       signal?: AbortSignal,
     ) => Promise<{ review: ChapterReviewResult; usage?: import("../types.js").ModelTokenUsage }>;
+  };
+  /** Semantic repair baselines, keyed by run + deliverable + path. */
+  proposalReviewRevisions?: Map<string, ProposalReviewRevisionContext>;
+  /** Paths whose latest blocked full draft is not the persisted project version. */
+  activeProposalRevisionPaths?: Set<string>;
+  /** Current run's file overlay; read_file resolves this before persisted files. */
+  workingTextFiles?: Map<string, WorkingTextFile>;
+  /** Public file mutation currently being routed through legacy proposal internals. */
+  fileMutationTool?: "write_file" | "edit_file";
+  /** Pre-call document base; proposal creation rechecks it after asynchronous review. */
+  proposalExpectedDocumentBase?: {
+    path: string;
+    deliverableId?: string;
+    exists: boolean;
+    sourceHash: string;
+    revisionCaseId?: string;
+  };
+  /** Exact normalized body most recently submitted, including isolated-writer output. */
+  latestProposalDraft?: {
+    path: string;
+    deliverableId?: string;
+    content: string;
+    sourceHash: string;
   };
   /** Isolated sentence-level repair; full chapter prose never enters the parent loop. */
   chapterStyleRepairer?: {

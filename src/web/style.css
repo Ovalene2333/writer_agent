@@ -2233,26 +2233,27 @@ button.agent-orb:focus-visible {
 
 /* Agent step timeline */
 .conversation .agent-step {
-  border: 1px solid var(--border); border-radius: 12px;
-  background: color-mix(in srgb, var(--surface) 92%, var(--accent-light));
+  border: 1px solid var(--border); border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 96%, var(--bg));
   overflow: hidden;
-  box-shadow: var(--shadow-sm); flex-shrink: 0;
+  box-shadow: none; flex-shrink: 0;
   position: relative;
   margin-left: 6px;
-  transition: border-color var(--transition), box-shadow var(--transition);
+  transition: border-color var(--transition), background var(--transition), box-shadow var(--transition);
 }
 .conversation .agent-step:not(:last-child)::before {
   content: "";
-  position: absolute; left: 18px; top: 34px; bottom: -14px; width: 1px;
+  position: absolute; left: 16px; top: 30px; bottom: -14px; width: 1px;
   background: linear-gradient(180deg, var(--step-line), transparent);
-  opacity: .5; pointer-events: none;
+  opacity: .42; pointer-events: none;
 }
 .conversation .agent-step.running {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), 0 8px 28px -12px var(--agent-glow);
+  background: color-mix(in srgb, var(--accent-light) 28%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent);
 }
 .conversation .agent-step.completed {
-  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-color: color-mix(in srgb, var(--accent) 16%, var(--border));
 }
 .conversation .agent-step.failed {
   border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
@@ -2262,116 +2263,92 @@ button.agent-orb:focus-visible {
 }
 
 /* Mid-job chapter/scene cut between consecutive steps (e.g. 53k → 16k). */
-.agent-step-context-reset {
-  display: grid;
-  grid-template-columns: auto auto auto auto;
-  align-items: center;
-  justify-content: start;
-  gap: 0 18px;
-  margin: 2px 6px 6px;
-  padding: 10px 14px 9px 16px;
-  border-radius: 8px;
-  border: 1px solid color-mix(in srgb, var(--ctx-handoff) 24%, var(--border));
-  background: color-mix(in srgb, var(--ctx-handoff) 4%, var(--surface));
-  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--ctx-handoff) 78%, transparent);
-  font-size: 12px;
-  color: var(--text-dim);
-  line-height: 1.4;
+.conversation .agent-step.context-reset {
+  border-color: color-mix(in srgb, var(--ctx-handoff) 28%, var(--border));
+  background: color-mix(in srgb, var(--ctx-handoff) 5%, var(--surface));
+  box-shadow: none;
 }
-.agent-step-context-reset-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-weight: 700;
-  font-size: 12px;
-  color: var(--text);
-  white-space: nowrap;
-}
-.agent-step-context-reset-indicator {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+.conversation .agent-step.context-reset .agent-step-indicator {
   background: var(--ctx-handoff);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ctx-handoff) 14%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ctx-handoff) 36%, transparent);
 }
-.agent-step-context-reset-flow {
+.agent-step-summary.agent-step-context-reset-summary {
+  cursor: default;
+}
+.agent-step-summary.agent-step-context-reset-summary:hover,
+.agent-step-summary.agent-step-context-reset-summary:active {
+  background: transparent;
+  transform: none;
+}
+.agent-step-context-reset-flow,
+.agent-step-context-reset-tokens {
   display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .agent-step-context-reset-tokens {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-  white-space: nowrap;
-}
-.agent-step-context-reset-flow > span,
-.agent-step-context-reset-tokens > span {
-  color: var(--text-faint);
-  font-size: 10.5px;
-}
-.agent-step-context-reset-flow strong,
-.agent-step-context-reset-tokens strong {
-  font-variant-numeric: tabular-nums;
-  font-weight: 680;
+  padding: 2px 7px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface2) 78%, transparent);
+  font-family: var(--font-mono);
   color: var(--text);
 }
 .agent-step-context-reset-saved {
-  padding-left: 18px;
-  border-left: 1px solid var(--border);
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ctx-handoff) 10%, transparent);
   color: var(--ctx-handoff);
-  font-weight: 680;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.agent-step-context-reset-hint {
-  grid-column: 1 / -1;
-  margin-top: 8px;
-  padding-top: 7px;
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-  color: var(--text-faint);
-  font-size: 11px;
-}
-@media (max-width: 560px) {
-  .agent-step-context-reset {
-    grid-template-columns: auto 1fr;
-    gap: 7px 14px;
-  }
-  .agent-step-context-reset-flow,
-  .agent-step-context-reset-tokens {
-    justify-self: start;
-  }
-  .agent-step-context-reset-saved {
-    padding-left: 0;
-    border-left: 0;
-  }
-}
 .agent-step-context-reset-detail {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 10px;
   margin: 0 0 10px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: color-mix(in srgb, #2f9d6a 8%, var(--surface));
-  border: 1px solid color-mix(in srgb, #2f9d6a 22%, var(--border));
-  font-size: 12.5px;
-  line-height: 1.5;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ctx-handoff) 5%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--ctx-handoff) 18%, var(--border));
+  font-size: 12px;
+  line-height: 1.45;
   color: var(--text-dim);
 }
 .agent-step-context-reset-detail strong {
-  display: block;
-  margin-bottom: 6px;
+  display: inline-flex;
+  margin: 0;
   color: var(--text);
   font-size: 12px;
 }
-.agent-step-context-reset-detail ul {
-  margin: 0;
-  padding-left: 1.15em;
+.agent-step-context-reset-detail span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
-.agent-step-context-reset-detail li { margin: 3px 0; }
+.agent-step-context-reset-detail span + span::before {
+  content: "";
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
 
 .agent-step-summary {
-  display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 11px 14px; border: 0; border-radius: 0; background: transparent;
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  min-height: 38px;
+  padding: 8px 11px; border: 0; border-radius: 0; background: transparent;
   min-width: 0; box-sizing: border-box;
   justify-content: flex-start; text-align: left; cursor: pointer;
   /* Avoid global button:active scale — it visually crushes IOC + token digits. */
@@ -2382,27 +2359,27 @@ button.agent-orb:focus-visible {
 }
 .agent-step-header .agent-step-summary { flex: 1 1 auto; width: auto; }
 .agent-step-summary:hover {
-  background: color-mix(in srgb, var(--accent-light) 70%, transparent);
+  background: color-mix(in srgb, var(--accent-light) 36%, transparent);
   transform: none;
 }
 .agent-step-summary:active {
   transform: none;
-  background: color-mix(in srgb, var(--accent-light) 85%, transparent);
+  background: color-mix(in srgb, var(--accent-light) 50%, transparent);
 }
 .agent-step-indicator {
-  width: 11px; height: 11px; flex-shrink: 0; border-radius: 50%;
+  width: 8px; height: 8px; flex-shrink: 0; border-radius: 50%;
   background: var(--text-faint);
-  border: 2px solid var(--surface);
-  box-shadow: 0 0 0 1px var(--border);
+  border: 0;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--border) 72%, transparent);
   position: relative; z-index: 1;
 }
 .agent-step.completed .agent-step-indicator {
   background: var(--accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent), 0 0 10px var(--agent-glow);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 .agent-step.running .agent-step-indicator {
-  background: var(--accent); border-color: var(--surface);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent), 0 0 14px var(--agent-glow);
+  background: var(--accent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
   animation: stepPulse 1.2s ease-in-out infinite;
 }
 .agent-step.failed .agent-step-indicator {
@@ -2411,7 +2388,7 @@ button.agent-orb:focus-visible {
 }
 @keyframes stepPulse { 50% { opacity: .55; transform: scale(1.12); } }
 .agent-step-summary strong {
-  font-size: 12px; font-weight: 650; color: var(--text); flex-shrink: 0;
+  font-size: 12px; font-weight: 680; color: var(--text); flex-shrink: 0;
   font-variant-numeric: tabular-nums;
 }
 .agent-step-model {
@@ -2419,14 +2396,14 @@ button.agent-orb:focus-visible {
   color: var(--text-dim); font-family: var(--font-mono); font-size: 10px;
 }
 .agent-step-tokens {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 5px;
   flex: 0 1 auto; min-width: 0; overflow: hidden;
-  padding: 2px 8px; border-radius: 999px;
-  background: color-mix(in srgb, var(--surface2) 88%, var(--accent-light));
+  padding: 2px 7px; border-radius: 999px;
+  background: color-mix(in srgb, var(--surface2) 72%, transparent);
   border: 1px solid var(--border-light);
   color: var(--text-dim);
-  font-family: var(--font-mono); font-size: 10.5px; font-weight: 550;
-  font-variant-numeric: tabular-nums; letter-spacing: .01em; white-space: nowrap;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 550;
+  font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap;
 }
 .agent-step-tokens.pending { opacity: .7; font-style: italic; }
 .agent-step-tokens.estimated { border-style: dashed; }
@@ -2439,10 +2416,10 @@ button.agent-orb:focus-visible {
 .agent-step-tokens .tok-ico {
   display: inline-flex; align-items: center; justify-content: center;
   flex: 0 0 auto;
-  width: 14px; height: 14px;
+  width: 12px; height: 12px;
   padding: 0;
-  border-radius: 4px;
-  font-size: 9.5px; font-weight: 700; line-height: 1;
+  border-radius: 3px;
+  font-size: 8.5px; font-weight: 700; line-height: 1;
   letter-spacing: 0;
   font-style: normal;
   box-sizing: border-box;
@@ -2511,53 +2488,49 @@ button.agent-orb:focus-visible {
   cursor: not-allowed;
 }
 .agent-step-tools {
-  flex: 1 1 0;
+  flex: 0 1 auto;
   min-width: 0;
   display: flex;
   flex-wrap: nowrap;
   gap: 4px;
   align-items: center;
   overflow: hidden;
+  margin-left: auto;
   font-size: 11px;
   color: var(--text-dim);
 }
 .agent-step-tools:empty { display: none; }
 .agent-step-tools .tool-chip,
 .agent-step-tools:not(:has(.tool-chip)) {
-  font-family: var(--font-mono); font-size: 10px;
+  font-family: inherit;
+  font-size: 10.5px;
 }
 .tool-chip {
   display: inline-flex;
   align-items: center;
   flex: 0 1 auto;
   min-width: 0;
-  padding: 2px 7px;
+  padding: 2px 6px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface2));
-  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border));
-  color: var(--text-dim);
-  font-family: var(--font-mono);
-  font-size: 10px;
+  background: transparent;
+  border: 1px solid var(--border-light);
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 10.5px;
   line-height: 1.35;
-  max-width: 11.5em;
+  max-width: 7em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.tool-chip-more {
-  flex: 0 0 auto;
-  max-width: none;
-  min-width: auto;
-  padding-inline: 6px;
-  font-weight: 650;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, var(--surface2));
-}
 .agent-step-chevron {
   margin-left: auto; font-size: 11px; color: var(--text-faint);
   width: 18px; height: 18px; display: grid; place-items: center;
-  border-radius: 5px; background: var(--surface2);
-  border: 1px solid var(--border-light); flex-shrink: 0;
+  border-radius: 5px; background: transparent;
+  border: 0; flex-shrink: 0;
+}
+.agent-step-summary:has(.agent-step-tools) .agent-step-chevron {
+  margin-left: 0;
 }
 .agent-step-context-breakdown {
   margin: -3px 0 10px; padding: 6px 10px; border-radius: 8px;

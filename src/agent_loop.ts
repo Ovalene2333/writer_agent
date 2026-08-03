@@ -3,6 +3,7 @@ import { AgentRunController } from "./agent_run_controller.js";
 import type { AgentExecutionProgress, AgentTaskContract } from "./agentic_runtime.js";
 import type { InterpretedAgentToolResult } from "./agent_tool_outcome.js";
 import type { AgentRunState, AgentTodoItem, PermissionMode } from "./types.js";
+import type { ProposalRevisionCase } from "./proposal_retry.js";
 
 /**
  * Thin host loop facade. Model transcript/cache code stays outside; all durable
@@ -49,8 +50,37 @@ export class AgentLoopRuntime {
     return this.controller.pendingDocumentLabels();
   }
 
-  recordStep(step: number): void {
-    this.controller.recordStep(step);
+  activeDocumentDeliverable() {
+    return this.controller.activeDocumentDeliverable();
+  }
+
+  proposalDeliverableId(requestedId?: string): string | undefined {
+    return this.controller.proposalDeliverableId(requestedId);
+  }
+
+  proposalRevision(deliverableId: string | undefined): ProposalRevisionCase | undefined {
+    return this.controller.proposalRevision(deliverableId);
+  }
+
+  setProposalRevision(deliverableId: string, revision: ProposalRevisionCase, eventKey: string): void {
+    this.controller.setProposalRevision(deliverableId, revision, eventKey);
+  }
+
+  clearProposalRevision(deliverableId: string, eventKey: string): void {
+    this.controller.clearProposalRevision(deliverableId, eventKey);
+  }
+
+  recordStep(step: number, deliverableId?: string): void {
+    this.controller.recordStep(step, deliverableId);
+  }
+
+  useDeliverableReviewReserve(
+    deliverableId: string,
+    step: number,
+    reason: "terminal_review" | "proposal_revision",
+    eventKey: string,
+  ): void {
+    this.controller.useDeliverableReviewReserve(deliverableId, step, reason, eventKey);
   }
 
   observeTool(

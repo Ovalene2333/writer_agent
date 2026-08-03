@@ -1,17 +1,28 @@
 import type { AgentRunDocumentEvidence } from "./types.js";
+import type { ProposalRevisionCase } from "./proposal_retry.js";
 
 export type AgentRunStatus = "running" | "suspended" | "completed" | "failed" | "cancelled";
 
 export type AgentRunDeliverableState = "pending" | "revision_required" | "submitted" | "applied";
 
+export interface AgentRunDeliverableExecutionV2 {
+  startedAtStep?: number;
+  lastStep?: number;
+  usedSteps: number;
+  reviewReserveUsed: number;
+  gateAttempts: Record<string, number>;
+}
+
 export interface AgentRunDeliverableV2 {
   id: string;
   label: string;
   state: AgentRunDeliverableState;
+  execution: AgentRunDeliverableExecutionV2;
   evidence?: AgentRunDocumentEvidence & {
     artifactKey: string;
     proposalStatus?: "pending" | "accepted";
   };
+  proposalRevision?: ProposalRevisionCase;
 }
 
 export interface AgentRunContractRecord {
@@ -75,7 +86,7 @@ export type AgentRunEventV2 =
       reusableEvidence: boolean;
     }
   | { type: "run_resumed"; at: string; sourceMessageId: number }
-  | { type: "step_started"; at: string; step: number }
+  | { type: "step_started"; at: string; step: number; deliverableId?: string }
   | { type: "tool_observed"; at: string; observation: AgentRunToolObservation }
   | {
       type: "deliverable_recorded";
@@ -85,6 +96,15 @@ export type AgentRunEventV2 =
     }
   | { type: "gate_blocked"; at: string; gate: string; message?: string; deliverableId?: string }
   | { type: "gate_cleared"; at: string; gate: string; deliverableId?: string }
+  | {
+      type: "deliverable_review_reserve_used";
+      at: string;
+      deliverableId: string;
+      step: number;
+      reason: "terminal_review" | "proposal_revision";
+    }
+  | { type: "proposal_revision_set"; at: string; deliverableId: string; revision: ProposalRevisionCase }
+  | { type: "proposal_revision_cleared"; at: string; deliverableId: string }
   | { type: "run_suspended"; at: string; reason: string; nextAction: string }
   | { type: "run_completed"; at: string }
   | { type: "run_failed"; at: string; reason: string }

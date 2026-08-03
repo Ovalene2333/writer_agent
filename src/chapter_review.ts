@@ -3,6 +3,11 @@ import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.j
 import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
+import { documentSpans, type DocumentSpan } from "./document_spans.js";
+import {
+  proposalRevisionIssueId,
+  type ProposalRevisionIssue,
+} from "./proposal_retry.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 
 export type ChapterReviewScene = {
@@ -22,8 +27,12 @@ export type ChapterReviewIssue = {
     | "drive_flat" | "stakes_absent";
   sceneId?: string;
   evidence: string[];
+  /** Revision-only evidence quoted from the changed before/after text. */
+  changeEvidence?: string[];
   problem: string;
   action: string;
+  priorIssueId?: string;
+  origin?: "unresolved_prior" | "introduced_by_revision" | "pre_existing_unrelated";
 };
 
 export type ChapterReviewResult = {
@@ -31,6 +40,12 @@ export type ChapterReviewResult = {
   chapterChange: string;
   reviewNotes: string;
   issues: ChapterReviewIssue[];
+  priorBlockerDispositions?: ChapterReviewPriorBlockerDisposition[];
+};
+
+export type ChapterReviewPriorBlockerDisposition = {
+  priorIssueId: string;
+  status: "resolved" | "still_present";
 };
 
 export type ChapterReviewInput = {
@@ -39,6 +54,25 @@ export type ChapterReviewInput = {
   scenes: ChapterReviewScene[];
   context?: string;
   proseSignals?: unknown;
+  revisionReview?: ChapterReviewRevisionContext;
+  /** Local enforcement baseline; deliberately omitted from provider messages. */
+  revisionBaselineContent?: string;
+};
+
+export type ChapterReviewRevisionChange = {
+  before: string;
+  after: string;
+  beforeStart: number;
+  beforeEnd: number;
+  afterStart: number;
+  afterEnd: number;
+};
+
+export type ChapterReviewRevisionContext = {
+  mode: "bounded_repair";
+  previousSourceHash: string;
+  priorBlockers: ProposalRevisionIssue[];
+  changes: ChapterReviewRevisionChange[];
 };
 
 export class ChapterReviewRequestError extends Error {
@@ -89,6 +123,22 @@ export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ r
         scenes: input.scenes,
         fullChapter: input.content,
         ...(input.proseSignals ? { proseSignals: input.proseSignals } : {}),
+        ...(input.revisionReview ? {
+          revisionReview: {
+            mode: input.revisionReview.mode,
+            previousSourceHash: input.revisionReview.previousSourceHash,
+            priorBlockers: input.revisionReview.priorBlockers,
+            changes: input.revisionReview.changes,
+            blockerPolicy: [
+              "只复核 priorBlockers 是否仍存在，以及本轮 changes 直接引入的严重问题。",
+              "不得把本轮修改范围外首次发现的既存问题升级为 blocker；此类问题至多 warning。",
+              "旧 blocker 仍存在时填写 priorIssueId 并令 origin=unresolved_prior。",
+              "本轮修改直接引入的新 blocker 令 origin=introduced_by_revision。",
+              "若本轮删除或改变了前文因果、事实前提或获知路径，导致未改正文出现新问题：evidence 仍逐字引用当前 fullChapter 的问题表现，另填 changeEvidence（最多3条）逐字引用 changes.before/after 中直接造成问题的修改。",
+              "当 priorBlockers 非空时，必须输出顶层 priorBlockerDispositions：对每个 priorBlockers.id 恰好一项 {priorIssueId,status}，status 只能是 resolved 或 still_present。still_present 必须同时输出同 priorIssueId、同 kind 的 blocker；resolved 不得仍输出对应 blocker。",
+            ],
+          },
+        } : {}),
       }),
     },
   ];
@@ -165,7 +215,28 @@ export function parseChapterReview(
         .filter(item => Boolean(item) && evidenceInSource(sourceText, item))
         .slice(0, 3)
       : [];
-    issues.push({ severity, kind, ...(sceneId ? { sceneId } : {}), evidence, problem, action });
+    const changeEvidence = Array.isArray(issue.changeEvidence)
+      ? issue.changeEvidence.map(item => boundedString(item, 180))
+        .filter(Boolean)
+        .slice(0, 3)
+      : [];
+    const priorIssueId = boundedString(issue.priorIssueId, 96);
+    const origin = issue.origin === "unresolved_prior"
+      || issue.origin === "introduced_by_revision"
+      || issue.origin === "pre_existing_unrelated"
+      ? issue.origin
+      : undefined;
+    issues.push({
+      severity,
+      kind,
+      ...(sceneId ? { sceneId } : {}),
+      evidence,
+      ...(changeEvidence.length ? { changeEvidence } : {}),
+      problem,
+      action,
+      ...(priorIssueId ? { priorIssueId } : {}),
+      ...(origin ? { origin } : {}),
+    });
   }
   // Incomplete blockers must not invalidate sibling locatable blockers (old `.some` did that).
   const locatableBlockers = issues.filter(
@@ -177,16 +248,431 @@ export function parseChapterReview(
     }
     return issue;
   });
+  const priorBlockerDispositions = parsePriorBlockerDispositions(value.priorBlockerDispositions);
   if (verdict === "revise" && locatableBlockers.length === 0) {
     // Model claimed revise but substantiated nothing. Direct-doc (single scene) demotes to
     // pass so we do not mis-report "终审服务不可用" and empty-retry the same draft. Multi-scene
     // structural review still requires a locatable target scene.
     if (soleSceneId) {
-      return { verdict: "pass", chapterChange, reviewNotes, issues: normalizedIssues };
+      return {
+        verdict: "pass",
+        chapterChange,
+        reviewNotes,
+        issues: normalizedIssues,
+        ...(priorBlockerDispositions ? { priorBlockerDispositions } : {}),
+      };
     }
     throw new Error("整章终审要求 revise，但没有提供可定位的 blocker 证据");
   }
-  return { verdict, chapterChange, reviewNotes, issues: normalizedIssues };
+  return {
+    verdict,
+    chapterChange,
+    reviewNotes,
+    issues: normalizedIssues,
+    ...(priorBlockerDispositions ? { priorBlockerDispositions } : {}),
+  };
+}
+
+function parsePriorBlockerDispositions(
+  value: unknown,
+): ChapterReviewPriorBlockerDisposition[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error("修订终审缺少有效 priorBlockerDispositions：顶层字段不是数组");
+  }
+  const dispositions: ChapterReviewPriorBlockerDisposition[] = [];
+  for (const row of value) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error("修订终审缺少有效 priorBlockerDispositions：存在无效条目");
+    }
+    const disposition = row as Record<string, unknown>;
+    const priorIssueId = boundedString(disposition.priorIssueId, 96);
+    const status = disposition.status === "resolved" || disposition.status === "still_present"
+      ? disposition.status
+      : undefined;
+    if (!priorIssueId || !status) {
+      throw new Error("修订终审缺少有效 priorBlockerDispositions：条目缺少 priorIssueId 或 status");
+    }
+    dispositions.push({ priorIssueId, status });
+  }
+  return dispositions;
+}
+
+const MAX_REVISION_CHANGE_EXCERPTS = 24;
+const MAX_REVISION_EXCERPT_CHARACTERS = 700;
+
+/**
+ * Build a bounded repair packet without sending the previous full chapter a
+ * second time. Normal chapters use the existing readable diff; pathological
+ * single-line bodies fall back to a linear common-prefix/suffix range.
+ */
+export function buildChapterReviewRevisionContext(input: {
+  previousContent: string;
+  content: string;
+  previousSourceHash: string;
+  priorBlockers: ProposalRevisionIssue[];
+}): ChapterReviewRevisionContext {
+  const changes = revisionChangesFromDiff(input.previousContent, input.content)
+    .slice(0, MAX_REVISION_CHANGE_EXCERPTS);
+  return {
+    mode: "bounded_repair",
+    previousSourceHash: input.previousSourceHash,
+    priorBlockers: input.priorBlockers.slice(0, 8),
+    changes,
+  };
+}
+
+/** Enforce the repair-chain scope even if an isolated reviewer drifts. */
+export function constrainChapterRevisionReview(
+  review: ChapterReviewResult,
+  revision: ChapterReviewRevisionContext,
+  previousContent: string,
+  content = "",
+): ChapterReviewResult {
+  const priorById = new Map(revision.priorBlockers.map(issue => [issue.id, issue]));
+  // The provider packet is intentionally bounded, but local enforcement must cover every
+  // changed range. Recompute from the two authoritative bodies instead of trusting excerpts.
+  const allChanges = revisionChangesFromDiff(previousContent, content);
+  const normalizedPreviousContent = normalizedSourceOffsets(previousContent);
+  const normalizedContent = normalizedSourceOffsets(content);
+  const issues = review.issues.map(issue => {
+    const explicitPrior = issue.priorIssueId ? priorById.get(issue.priorIssueId) : undefined;
+    const explicitPriorId = explicitPrior?.kind === issue.kind
+      ? explicitPrior.id
+      : undefined;
+    if (issue.severity !== "blocker") {
+      if (!issue.priorIssueId || explicitPriorId) return issue;
+      const { priorIssueId: _unmatchedPriorIssueId, ...withoutUnmatchedPriorIssueId } = issue;
+      return withoutUnmatchedPriorIssueId;
+    }
+    const generatedId = proposalRevisionIssueId(issue);
+    const sameKindPrior = issue.origin === "unresolved_prior"
+      ? revision.priorBlockers.filter(prior => prior.kind === issue.kind)
+      : [];
+    const matchedPriorId = issue.priorIssueId
+      ? explicitPriorId
+      : (priorById.has(generatedId) ? generatedId : undefined)
+        ?? (sameKindPrior.length === 1 ? sameKindPrior[0].id : undefined);
+    const touchesRevision = issue.evidence.some(evidence => evidenceTouchesChanges(
+      content,
+      normalizedContent,
+      evidence,
+      allChanges,
+      "after",
+    ));
+    const inferredIntroduction = touchesRevision && issue.evidence.some(evidence =>
+      !normalizedContains(previousContent, evidence));
+    const validatedChangeEvidence = issue.changeEvidence?.filter(evidence =>
+      evidenceTouchesChanges(
+        previousContent,
+        normalizedPreviousContent,
+        evidence,
+        allChanges,
+        "before",
+      ) || evidenceTouchesChanges(
+        content,
+        normalizedContent,
+        evidence,
+        allChanges,
+        "after",
+      )) ?? [];
+    const introducedByRevision = (touchesRevision
+      && (issue.origin === "introduced_by_revision" || inferredIntroduction))
+      || (issue.origin === "introduced_by_revision" && validatedChangeEvidence.length > 0);
+    const {
+      priorIssueId: _claimedPriorIssueId,
+      changeEvidence: _unvalidatedChangeEvidence,
+      ...baseIssue
+    } = issue;
+    const withValidatedChangeEvidence = validatedChangeEvidence.length
+      ? { ...baseIssue, changeEvidence: validatedChangeEvidence }
+      : baseIssue;
+    if (matchedPriorId) {
+      return { ...withValidatedChangeEvidence, priorIssueId: matchedPriorId, origin: "unresolved_prior" as const };
+    }
+    if (introducedByRevision) {
+      return { ...withValidatedChangeEvidence, origin: "introduced_by_revision" as const };
+    }
+    return {
+      ...withValidatedChangeEvidence,
+      severity: "warning" as const,
+      origin: "pre_existing_unrelated" as const,
+    };
+  });
+  validatePriorBlockerDispositions(review.priorBlockerDispositions, revision.priorBlockers, issues);
+  return {
+    ...review,
+    verdict: issues.some(issue => issue.severity === "blocker") ? "revise" : "pass",
+    issues,
+  };
+}
+
+function validatePriorBlockerDispositions(
+  dispositions: readonly ChapterReviewPriorBlockerDisposition[] | undefined,
+  priorBlockers: readonly ProposalRevisionIssue[],
+  issues: readonly ChapterReviewIssue[],
+): void {
+  const priorById = new Map(priorBlockers.map(issue => [issue.id, issue]));
+  const dispositionById = new Map<string, ChapterReviewPriorBlockerDisposition>();
+  for (const disposition of dispositions ?? []) {
+    if (!priorById.has(disposition.priorIssueId)) {
+      throw new Error(
+        `修订终审缺少有效 priorBlockerDispositions：包含未知 priorIssueId ${disposition.priorIssueId}`,
+      );
+    }
+    if (dispositionById.has(disposition.priorIssueId)) {
+      throw new Error(
+        `修订终审缺少有效 priorBlockerDispositions：priorIssueId ${disposition.priorIssueId} 重复`,
+      );
+    }
+    dispositionById.set(disposition.priorIssueId, disposition);
+  }
+  const missing = priorBlockers.filter(issue => !dispositionById.has(issue.id));
+  if (missing.length) {
+    throw new Error(
+      `修订终审缺少有效 priorBlockerDispositions：未覆盖 ${missing.map(issue => issue.id).join(", ")}`,
+    );
+  }
+  for (const prior of priorBlockers) {
+    const disposition = dispositionById.get(prior.id)!;
+    const matchingBlocker = issues.some(issue => issue.severity === "blocker"
+      && issue.priorIssueId === prior.id
+      && issue.kind === prior.kind);
+    if (disposition.status === "still_present" && !matchingBlocker) {
+      throw new Error(
+        `修订终审缺少有效 priorBlockerDispositions：${prior.id} 标为 still_present 但无同 ID、同 kind blocker`,
+      );
+    }
+    if (disposition.status === "resolved" && matchingBlocker) {
+      throw new Error(
+        `修订终审缺少有效 priorBlockerDispositions：${prior.id} 标为 resolved 但仍有对应 blocker`,
+      );
+    }
+  }
+}
+
+function revisionChangesFromDiff(
+  before: string,
+  after: string,
+): ChapterReviewRevisionChange[] {
+  if (before === after) return [];
+  const beforeSpans = documentSpans(before, "revision-before");
+  const afterSpans = documentSpans(after, "revision-after");
+  const queues = new Map<string, { values: number[]; cursor: number }>();
+  beforeSpans.forEach((span, index) => {
+    const key = revisionSpanKey(span);
+    const queue = queues.get(key) ?? { values: [], cursor: 0 };
+    queue.values.push(index);
+    queues.set(key, queue);
+  });
+  const pairs = afterSpans.flatMap((span, afterIndex) => {
+    const queue = queues.get(revisionSpanKey(span));
+    if (!queue || queue.cursor >= queue.values.length) return [];
+    const beforeIndex = queue.values[queue.cursor++];
+    return [{ beforeIndex, afterIndex }];
+  });
+  const stableAfter = longestIncreasingPairPositions(pairs);
+  const stableBefore = new Set(
+    pairs.filter(pair => stableAfter.has(pair.afterIndex)).map(pair => pair.beforeIndex),
+  );
+  const changedBefore = beforeSpans.filter((_span, index) => !stableBefore.has(index));
+  const changedAfter = afterSpans.filter((_span, index) => !stableAfter.has(index));
+  if (!changedBefore.length && !changedAfter.length) {
+    return [fallbackRevisionChange(before, after)];
+  }
+  const changes: ChapterReviewRevisionChange[] = [];
+  const count = Math.max(changedBefore.length, changedAfter.length);
+  for (let index = 0; index < count; index += 1) {
+    const beforeSpan = changedBefore[index];
+    const afterSpan = changedAfter[index];
+    const narrowed = narrowRevisionPair(beforeSpan, afterSpan);
+    changes.push({
+      beforeStart: narrowed.beforeStart,
+      beforeEnd: narrowed.beforeEnd,
+      afterStart: narrowed.afterStart,
+      afterEnd: narrowed.afterEnd,
+      before: revisionExcerpt(before, narrowed.beforeStart, narrowed.beforeEnd),
+      after: revisionExcerpt(after, narrowed.afterStart, narrowed.afterEnd),
+    });
+  }
+  return changes;
+}
+
+function revisionExcerpt(text: string, start: number, end: number): string {
+  if (!text) return "";
+  const padding = Math.floor(MAX_REVISION_EXCERPT_CHARACTERS / 2);
+  let from = Math.max(0, start - padding);
+  let to = Math.min(text.length, Math.max(end, start) + padding);
+  const left = text.slice(from, start);
+  const leftBoundary = Math.max(left.lastIndexOf("\n"), left.lastIndexOf("。"), left.lastIndexOf("！"), left.lastIndexOf("？"));
+  if (leftBoundary >= 0) from += leftBoundary + 1;
+  const right = text.slice(end, to);
+  const candidates = [right.indexOf("\n"), right.indexOf("。"), right.indexOf("！"), right.indexOf("？")]
+    .filter(index => index >= 0);
+  if (candidates.length) to = end + Math.min(...candidates) + 1;
+  if (to - from > MAX_REVISION_EXCERPT_CHARACTERS) {
+    const center = Math.max(start, Math.min(end, Math.floor((start + end) / 2)));
+    from = Math.max(0, center - padding);
+    to = Math.min(text.length, from + MAX_REVISION_EXCERPT_CHARACTERS);
+  }
+  return text.slice(from, to);
+}
+
+function normalizedContains(haystack: string, needle: string): boolean {
+  const normalizedNeedle = normalizeEvidenceNeedle(needle);
+  return Boolean(normalizedNeedle) && normalizeEvidenceNeedle(haystack).includes(normalizedNeedle);
+}
+
+function revisionSpanKey(span: DocumentSpan): string {
+  return `${span.kind}\u0000${span.content}`;
+}
+
+function longestIncreasingPairPositions(
+  pairs: Array<{ beforeIndex: number; afterIndex: number }>,
+): Set<number> {
+  if (!pairs.length) return new Set();
+  const tails: number[] = [];
+  const tailPairIndexes: number[] = [];
+  const previous = new Int32Array(pairs.length);
+  previous.fill(-1);
+  for (let pairIndex = 0; pairIndex < pairs.length; pairIndex += 1) {
+    const value = pairs[pairIndex].beforeIndex;
+    let low = 0;
+    let high = tails.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (tails[middle] < value) low = middle + 1;
+      else high = middle;
+    }
+    tails[low] = value;
+    if (low > 0) previous[pairIndex] = tailPairIndexes[low - 1];
+    tailPairIndexes[low] = pairIndex;
+  }
+  const stable = new Set<number>();
+  let pairIndex = tailPairIndexes[tails.length - 1] ?? -1;
+  while (pairIndex >= 0) {
+    stable.add(pairs[pairIndex].afterIndex);
+    pairIndex = previous[pairIndex];
+  }
+  return stable;
+}
+
+function narrowRevisionPair(
+  beforeSpan: DocumentSpan | undefined,
+  afterSpan: DocumentSpan | undefined,
+): { beforeStart: number; beforeEnd: number; afterStart: number; afterEnd: number } {
+  if (!beforeSpan) {
+    const point = afterSpan?.startOffset ?? 0;
+    return {
+      beforeStart: point,
+      beforeEnd: point,
+      afterStart: afterSpan?.startOffset ?? 0,
+      afterEnd: afterSpan?.endOffset ?? 0,
+    };
+  }
+  if (!afterSpan) {
+    return {
+      beforeStart: beforeSpan.startOffset,
+      beforeEnd: beforeSpan.endOffset,
+      afterStart: beforeSpan.startOffset,
+      afterEnd: beforeSpan.startOffset,
+    };
+  }
+  let prefix = 0;
+  const prefixLimit = Math.min(beforeSpan.content.length, afterSpan.content.length);
+  while (prefix < prefixLimit && beforeSpan.content[prefix] === afterSpan.content[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < beforeSpan.content.length - prefix && suffix < afterSpan.content.length - prefix
+    && beforeSpan.content[beforeSpan.content.length - 1 - suffix]
+      === afterSpan.content[afterSpan.content.length - 1 - suffix]) suffix += 1;
+  return {
+    beforeStart: beforeSpan.startOffset + prefix,
+    beforeEnd: beforeSpan.endOffset - suffix,
+    afterStart: afterSpan.startOffset + prefix,
+    afterEnd: afterSpan.endOffset - suffix,
+  };
+}
+
+function fallbackRevisionChange(before: string, after: string): ChapterReviewRevisionChange {
+  let prefix = 0;
+  const prefixLimit = Math.min(before.length, after.length);
+  while (prefix < prefixLimit && before[prefix] === after[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < before.length - prefix && suffix < after.length - prefix
+    && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix += 1;
+  const beforeEnd = before.length - suffix;
+  const afterEnd = after.length - suffix;
+  return {
+    beforeStart: prefix,
+    beforeEnd,
+    afterStart: prefix,
+    afterEnd,
+    before: revisionExcerpt(before, prefix, beforeEnd),
+    after: revisionExcerpt(after, prefix, afterEnd),
+  };
+}
+
+function evidenceTouchesChanges(
+  source: string,
+  normalizedSource: ReturnType<typeof normalizedSourceOffsets>,
+  evidence: string,
+  changes: readonly ChapterReviewRevisionChange[],
+  side: "before" | "after",
+): boolean {
+  if (!evidence) return false;
+  const ranges = changes.flatMap(change => {
+    const start = side === "before" ? change.beforeStart : change.afterStart;
+    const end = side === "before" ? change.beforeEnd : change.afterEnd;
+    return end > start ? [{ start, end }] : [];
+  });
+  if (!ranges.length) return false;
+  let offset = source.indexOf(evidence);
+  while (offset >= 0) {
+    const end = offset + evidence.length;
+    if (ranges.some(range => offset < range.end && end > range.start)) return true;
+    offset = source.indexOf(evidence, offset + 1);
+  }
+
+  const needle = normalizeEvidenceNeedle(evidence);
+  if (!needle) return false;
+  let normalizedOffset = normalizedSource.text.indexOf(needle);
+  while (normalizedOffset >= 0) {
+    const normalizedEnd = normalizedOffset + needle.length - 1;
+    const rawStart = normalizedSource.starts[normalizedOffset];
+    const rawEnd = normalizedSource.ends[normalizedEnd];
+    if (ranges.some(range => rawStart < range.end && rawEnd > range.start)) return true;
+    normalizedOffset = normalizedSource.text.indexOf(needle, normalizedOffset + 1);
+  }
+  return false;
+}
+
+function normalizedSourceOffsets(source: string): {
+  text: string;
+  starts: number[];
+  ends: number[];
+} {
+  let text = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (let offset = 0; offset < source.length;) {
+    const codePoint = source.codePointAt(offset);
+    if (codePoint === undefined) break;
+    const character = String.fromCodePoint(codePoint);
+    const end = offset + character.length;
+    let replacement = character;
+    if (/\s/u.test(character)) replacement = "";
+    else if (/[“”「」『』]/u.test(character)) replacement = "\"";
+    else if (/[‘’]/u.test(character)) replacement = "'";
+    else if (character === "…") replacement = "...";
+    else if (/[—–]/u.test(character)) replacement = "-";
+    text += replacement;
+    for (let index = 0; index < replacement.length; index += 1) {
+      starts.push(offset);
+      ends.push(end);
+    }
+    offset = end;
+  }
+  return { text, starts, ends };
 }
 
 export async function reviewChapterDraft(
@@ -241,6 +727,14 @@ export async function reviewChapterDraft(
   let review: ChapterReviewResult;
   try {
     review = parseChapterReview(content, new Set(input.scenes.map(scene => scene.sceneId)), input.content);
+    if (input.revisionReview) {
+      review = constrainChapterRevisionReview(
+        review,
+        input.revisionReview,
+        input.revisionBaselineContent ?? "",
+        input.content,
+      );
+    }
   } catch (error) {
     throw new ChapterReviewRequestError(
       error instanceof Error ? error.message : String(error),

@@ -24,14 +24,20 @@ import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "..
 import { documentKind, isScenePipelineDocument } from "../project.js";
 import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
 import { chapterRhythmGateError } from "../prose_metrics.js";
-import { ChapterReviewRequestError, reviewChapterDraft } from "../chapter_review.js";
+import {
+  buildChapterReviewRevisionContext,
+  ChapterReviewRequestError,
+  constrainChapterRevisionReview,
+  reviewChapterDraft,
+} from "../chapter_review.js";
+import { proposalRevisionScopeKey } from "../proposal_retry.js";
 import { ToolRevisionRequiredError } from "../tool_failure.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
   DEFAULT_ISOLATED_WRITER_MAX_RATIO,
   DEFAULT_SCENE_NOTES_CHARACTERS,
 } from "../agent_runtime.js";
-import type { WriterStore } from "../store.js";
+import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
 import {
@@ -586,11 +592,59 @@ export async function submitFullDocumentProposal(
 ): Promise<string> {
   const { project, store, sessionId, emit, context, characterScope } = args;
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  assertCreativeOutlineDesigned(context, path, "propose_document");
+  assertCreativeOutlineDesigned(context, path, context.fileMutationTool ?? "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
-  const existed = project.documentExists(path);
-  const beforeContent = existed ? project.read(path) : "";
   const meta = gateProseMetaLeaks(proposedContent, path);
+  const deliverableId = typeof args.input.deliverableId === "string" && args.input.deliverableId.trim()
+    ? args.input.deliverableId.trim()
+    : undefined;
+  context.latestProposalDraft = {
+    path,
+    ...(deliverableId ? { deliverableId } : {}),
+    content: meta.content,
+    sourceHash: project.hash(meta.content),
+  };
+  const expectedDocumentBase = context.proposalExpectedDocumentBase?.path === path
+    && context.proposalExpectedDocumentBase.deliverableId === deliverableId
+    ? context.proposalExpectedDocumentBase
+    : undefined;
+  const baseChangedResult = () => JSON.stringify({
+    status: "recoverable_state_error",
+    code: expectedDocumentBase?.revisionCaseId
+      ? "PROPOSAL_REVISION_BASE_CHANGED"
+      : "PROPOSAL_DOCUMENT_BASE_CHANGED",
+    failureKind: "invalid_request",
+    retryable: false,
+    path,
+    error: expectedDocumentBase?.revisionCaseId
+      ? "活动修订期间目标文档已变化，旧修订稿不能自动覆盖当前文档。请由用户确认后重新基于当前文档开始修订。"
+      : "终审期间目标文档已变化，未创建提案。请重新读取当前文档并基于最新版本处理。",
+  });
+  const existed = project.documentExists(path);
+  let beforeContent: string;
+  try {
+    beforeContent = existed ? project.read(path) : "";
+  } catch (error) {
+    if (expectedDocumentBase) return baseChangedResult();
+    throw error;
+  }
+  const liveBaseHash = existed ? project.hash(beforeContent) : "__missing__";
+  if (expectedDocumentBase
+    && (expectedDocumentBase.exists !== existed || expectedDocumentBase.sourceHash !== liveBaseHash)) {
+    return baseChangedResult();
+  }
+  const expectedBaseHash = expectedDocumentBase?.sourceHash ?? liveBaseHash;
+  if (semanticReviewApproved && context.activeProposalRevisionPaths?.has(path)) {
+    return JSON.stringify({
+      status: "recoverable_state_error",
+      code: "ACTIVE_REVISION_REQUIRES_FULL_DRAFT",
+      failureKind: "invalid_request",
+      retryable: true,
+      path,
+      error: "该路径有活动工作副本；不能复用其他流程的旧终审结论。请用 read_file 查看当前草稿，并用 edit_file 做最小修改。",
+      nextAllowedActions: ["read_file", "edit_file", "write_file"],
+    });
+  }
   if (!proseStyleApproved) await gateProseStyle(beforeContent, meta.content, context, path);
   // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
   let rhythmRevisionRequired: string | undefined;
@@ -624,16 +678,23 @@ export async function submitFullDocumentProposal(
       ? { lengthTarget: context.proseLength.targetCharacters }
       : undefined)
     : undefined;
-  const proposal = store.createProposal(
-    sessionId,
-    path,
-    meta.content,
-    summary,
-    preparedCharacterChanges.changes,
-    qualityReport,
-    context.sourceMessageId,
-    !rhythmRevisionRequired,
-  );
+  let proposal: Proposal;
+  try {
+    proposal = store.createProposal(
+      sessionId,
+      path,
+      meta.content,
+      summary,
+      preparedCharacterChanges.changes,
+      qualityReport,
+      context.sourceMessageId,
+      !rhythmRevisionRequired,
+      expectedBaseHash,
+    );
+  } catch (error) {
+    if (!(error instanceof ProposalDocumentBaseChangedError)) throw error;
+    return baseChangedResult();
+  }
   emit({ type: "proposal", proposal });
   // 首轮节奏未达标：不自动落盘，等句式修订提案通过后再写。
   const accept = rhythmRevisionRequired
@@ -657,7 +718,7 @@ export async function submitFullDocumentProposal(
           code: "RHYTHM_POLISH_REQUIRED",
           path,
           rhythmGate: rhythmRevisionRequired,
-          message: "首轮创作已抓情节与场面；句式节奏/缩词未达标，须按 rhythmGate 验收线修订一次后重新 propose_document。",
+          message: "首轮创作已抓情节与场面；句式节奏/缩词未达标，须按 rhythmGate 验收线用 edit_file 修订当前工作副本。",
         }
       : {}),
   });
@@ -671,6 +732,40 @@ async function reviewDirectNarrativeProposal(
 ): Promise<string | undefined> {
   const reviewer = args.context.chapterReviewer!;
   const runReview = reviewer.run ?? reviewChapterDraft;
+  const deliverableId = typeof args.input.deliverableId === "string" && args.input.deliverableId.trim()
+    ? args.input.deliverableId.trim()
+    : undefined;
+  const revisionContext = args.context.runId
+    ? args.context.proposalReviewRevisions?.get(proposalRevisionScopeKey({
+        runId: args.context.runId,
+        ...(deliverableId ? { deliverableId } : {}),
+        path,
+      }))
+    : undefined;
+  const contentSourceHash = args.project.hash(content);
+  if (revisionContext && revisionContext.previousSourceHash === contentSourceHash) {
+    return JSON.stringify({
+      status: "final_review_revision_required",
+      code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+      path,
+      proposalCreated: false,
+      chapterReview: {
+        verdict: "revise",
+        chapterChange: "正文与上一轮语义驳回稿相同",
+        reviewNotes: "未检测到可闭合既有 blocker 的正文变化；复用上一轮终审结论。",
+        issues: revisionContext.unresolvedIssues,
+      },
+      message: "正文与上一轮语义驳回稿相同，未重复调用终审。请按既有 blocker 做最小修订后再提交。",
+    });
+  }
+  const revisionReview = revisionContext
+    ? buildChapterReviewRevisionContext({
+        previousContent: revisionContext.previousContent,
+        content,
+        previousSourceHash: revisionContext.previousSourceHash,
+        priorBlockers: revisionContext.unresolvedIssues,
+      })
+    : undefined;
   const models = [reviewer.model, reviewer.fallbackModel]
     .filter((model): model is NonNullable<typeof model> => Boolean(model))
     .filter((model, index, all) => all.findIndex(candidate =>
@@ -683,7 +778,8 @@ async function reviewDirectNarrativeProposal(
     characterScope: args.characterScope,
     baseContext: reviewer.context,
   });
-  const requestCharacters = content.length + reviewContext.length + summary.length + 1_200;
+  const requestCharacters = content.length + reviewContext.length + summary.length
+    + (revisionReview ? JSON.stringify(revisionReview).length : 0) + 1_200;
   const errors: string[] = [];
   for (const model of models) {
     try {
@@ -691,6 +787,10 @@ async function reviewDirectNarrativeProposal(
         chapterGoal: summary,
         content,
         context: reviewContext,
+        ...(revisionReview ? {
+          revisionReview,
+          revisionBaselineContent: revisionContext!.previousContent,
+        } : {}),
         scenes: [{
           sceneId: "document",
           title: path,
@@ -709,14 +809,22 @@ async function reviewDirectNarrativeProposal(
           callKind: "direct_chapter_review",
         }],
       });
-      if (reviewed.review.verdict === "pass") return undefined;
+      const constrainedReview = revisionReview
+        ? constrainChapterRevisionReview(
+            reviewed.review,
+            revisionReview,
+            revisionContext!.previousContent,
+            content,
+          )
+        : reviewed.review;
+      if (constrainedReview.verdict === "pass") return undefined;
       return JSON.stringify({
         status: "final_review_revision_required",
         code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
         path,
         // Keep explicit so callers never treat this as a created proposal.
         proposalCreated: false,
-        chapterReview: reviewed.review,
+        chapterReview: constrainedReview,
         message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
       });
     } catch (error) {
@@ -761,6 +869,17 @@ function isChapterReviewParseFailure(message: string): boolean {
 export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document_patch");
   const path = requireString(input.path, "path");
+  if (context.activeProposalRevisionPaths?.has(path)) {
+    return JSON.stringify({
+      status: "recoverable_state_error",
+      code: "ACTIVE_REVISION_REQUIRES_FULL_DRAFT",
+      failureKind: "invalid_request",
+      retryable: true,
+      path,
+      error: "该路径有活动工作副本；旧 patch 只能修改落盘版本。请改用 read_file/edit_file 处理当前草稿。",
+      nextAllowedActions: ["read_file", "edit_file", "write_file"],
+    });
+  }
   const edits = Array.isArray(input.edits) ? input.edits.slice(0, 20) : [];
   if (!edits.length) throw new Error("局部修改至少需要一条 edit");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
@@ -771,8 +890,8 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
       failureKind: "invalid_request",
       retryable: true,
       path,
-      error: `${path} 尚不存在，不能使用 propose_document_patch；新建文档的修订稿必须继续用 propose_document 提交`,
-      nextAllowedActions: ["read_context_artifact", "propose_document"],
+      error: `${path} 尚不存在，不能使用旧 patch；请用 write_file 新建，或继续 edit_file 修改工作副本`,
+      nextAllowedActions: ["write_file", "edit_file"],
     });
   }
   assertCreativeOutlineDesigned(context, path, "propose_document_patch");
@@ -858,6 +977,15 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
       content = `${content.slice(0, operation.start)}${operation.replacement}${content.slice(operation.end)}`;
     }
   }
+  const deliverableId = typeof input.deliverableId === "string" && input.deliverableId.trim()
+    ? input.deliverableId.trim()
+    : undefined;
+  context.latestProposalDraft = {
+    path,
+    ...(deliverableId ? { deliverableId } : {}),
+    content,
+    sourceHash: project.hash(content),
+  };
   await gateProseStyle(beforeContent, content, context, path);
   // 首轮 grace 后若用 patch 抛光：同一 path 必须过硬节奏门禁。
   if (isScenePipelineDocument(path) && context.rhythmGracePaths?.has(path)) {

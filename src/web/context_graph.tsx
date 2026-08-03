@@ -590,12 +590,11 @@ export function ContextTransitionDetail({ transition }: { transition: ContextTra
     : undefined;
   return (
     <div className="context-transition-detail">
-      <h4>装载对照 · {kindLabel}</h4>
+      <h4>上下文收束 · {kindLabel}</h4>
       {transition.atStep != null ? (
         <p className="context-transition-step">
-          发生在 Step {transition.atStep} 结束时
+          Step {transition.atStep}
           {transition.path ? ` · ${transition.path}` : ""}
-          {" → 下一步只携带收束后的上下文"}
         </p>
       ) : null}
       {transition.beforeTokens != null && transition.afterTokens != null ? (
@@ -613,7 +612,9 @@ export function ContextTransitionDetail({ transition }: { transition: ContextTra
             <span>后 {formatGraphTokens(transition.afterTokens)}</span>
           </div>
           {saved != null && saved > 0 ? (
-            <em className="context-transition-saved">省 {formatGraphTokens(saved)}</em>
+            <em className="context-transition-saved" title={`减少 ${formatGraphTokens(saved)}`}>
+              -{formatGraphTokens(saved)}
+            </em>
           ) : null}
         </div>
       ) : null}
@@ -645,7 +646,7 @@ export function ContextTransitionDetail({ transition }: { transition: ContextTra
       ) : null}
       {transition.reReadHint ? (
         <p className="context-transition-reread">
-          <strong>之后仍会读文件？</strong>
+          <strong>按需补读</strong>
           {humanizeContextCopy(transition.reReadHint)}
         </p>
       ) : null}

@@ -1,4 +1,5 @@
 import type {
+  AgentRunDeliverableExecutionV2,
   AgentRunDeliverableV2,
   AgentRunEventV2,
   AgentRunSnapshotV2,
@@ -6,6 +7,24 @@ import type {
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
+}
+
+function emptyDeliverableExecution(): AgentRunDeliverableExecutionV2 {
+  return {
+    usedSteps: 0,
+    reviewReserveUsed: 0,
+    gateAttempts: {},
+  };
+}
+
+function deliverableExecution(
+  deliverable: AgentRunDeliverableV2,
+): AgentRunDeliverableExecutionV2 {
+  return {
+    ...emptyDeliverableExecution(),
+    ...(deliverable.execution ?? {}),
+    gateAttempts: { ...(deliverable.execution?.gateAttempts ?? {}) },
+  };
 }
 
 function initialSnapshot(
@@ -20,7 +39,11 @@ function initialSnapshot(
     originalRequest: event.originalRequest,
     sourceMessageId: event.sourceMessageId,
     contract: event.contract,
-    deliverables: event.deliverables.map(item => ({ ...item, state: "pending" })),
+    deliverables: event.deliverables.map(item => ({
+      ...item,
+      state: "pending",
+      execution: emptyDeliverableExecution(),
+    })),
     progress: {
       successfulTools: [],
       failedTools: {},
@@ -72,7 +95,26 @@ export function reduceAgentRunEvent(
         nextAction: undefined,
       };
     case "step_started":
-      return { ...next, step: Math.max(current.step, event.step) };
+      return {
+        ...next,
+        step: Math.max(current.step, event.step),
+        ...(event.deliverableId
+          ? {
+              deliverables: updateDeliverable(current, event.deliverableId, item => {
+                const execution = deliverableExecution(item);
+                return {
+                  ...item,
+                  execution: {
+                    ...execution,
+                    startedAtStep: execution.startedAtStep ?? event.step,
+                    lastStep: event.step,
+                    usedSteps: execution.usedSteps + 1,
+                  },
+                };
+              }),
+            }
+          : {}),
+      };
     case "tool_observed": {
       const observation = event.observation;
       const failedTools = { ...current.progress.failedTools };
@@ -108,6 +150,7 @@ export function reduceAgentRunEvent(
           ...item,
           state: evidence.proposalStatus === "accepted" ? "applied" : "submitted",
           evidence,
+          proposalRevision: undefined,
         })),
       };
     }
@@ -117,7 +160,16 @@ export function reduceAgentRunEvent(
       return {
         ...next,
         progress: { ...current.progress, gateAttempts },
-        deliverables: updateDeliverable(current, event.deliverableId, item => ({ ...item, state: "revision_required" })),
+        deliverables: updateDeliverable(current, event.deliverableId, item => {
+          const execution = deliverableExecution(item);
+          const deliverableGateAttempts = { ...execution.gateAttempts };
+          deliverableGateAttempts[event.gate] = (deliverableGateAttempts[event.gate] ?? 0) + 1;
+          return {
+            ...item,
+            state: "revision_required",
+            execution: { ...execution, gateAttempts: deliverableGateAttempts },
+          };
+        }),
       };
     }
     case "gate_cleared":
@@ -126,6 +178,39 @@ export function reduceAgentRunEvent(
         deliverables: updateDeliverable(current, event.deliverableId, item => (
           item.state === "revision_required" ? { ...item, state: "pending" } : item
         )),
+      };
+    case "deliverable_review_reserve_used":
+      return {
+        ...next,
+        deliverables: updateDeliverable(current, event.deliverableId, item => {
+          const execution = deliverableExecution(item);
+          return {
+            ...item,
+            execution: {
+              ...execution,
+              lastStep: event.step,
+              reviewReserveUsed: execution.reviewReserveUsed + 1,
+            },
+          };
+        }),
+      };
+    case "proposal_revision_set":
+      return {
+        ...next,
+        deliverables: updateDeliverable(current, event.deliverableId, item => ({
+          ...item,
+          state: "revision_required",
+          proposalRevision: event.revision,
+        })),
+      };
+    case "proposal_revision_cleared":
+      return {
+        ...next,
+        deliverables: updateDeliverable(current, event.deliverableId, item => ({
+          ...item,
+          proposalRevision: undefined,
+          state: item.state === "revision_required" ? "pending" : item.state,
+        })),
       };
     case "run_suspended":
       return { ...next, status: "suspended", terminalReason: event.reason, nextAction: event.nextAction };

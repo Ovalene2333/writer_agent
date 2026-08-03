@@ -59,7 +59,22 @@ import {
 } from "./agentic_runtime.js";
 import { AgentLoopRuntime } from "./agent_loop.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
-import { decideProposalFailure, isExpectedRhythmPolish } from "./proposal_retry.js";
+import {
+  createProposalRetryState,
+  decideProposalFailure,
+  isExpectedRhythmPolish,
+  PROPOSAL_REVISION_MISSING_DOCUMENT_HASH,
+  proposalFailureGate,
+  proposalIssueTransition,
+  proposalRetryStateAtGate,
+  proposalRevisionIssueId,
+  proposalRevisionScopeKey,
+  type ProposalIssueTransition,
+  type ProposalRetryGate,
+  type ProposalRetryState,
+  type ProposalRevisionCase,
+  type ProposalRevisionIssue,
+} from "./proposal_retry.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
   buildProjectTrunk,
@@ -124,6 +139,7 @@ type SubmittedProposalRef = {
 };
 
 export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/index.js";
+export type { ProposalRevisionCase, ProposalRevisionIssue } from "./proposal_retry.js";
 
 /**
  * =============================================================================
@@ -398,7 +414,7 @@ function extractDsmlToolCalls(content: string): { content: string; toolCalls: To
       const paramAttrs = parseDsmlAttributes(param[1] ?? "");
       const paramName = paramAttrs.name;
       if (!paramName) continue;
-      const key = name === "propose_document" && paramName === "payload" ? "content" : paramName;
+      const key = name === "write_file" && paramName === "payload" ? "content" : paramName;
       input[key] = decodeDsmlValue(param[2] ?? "");
     }
     toolCalls.push({
@@ -443,7 +459,7 @@ function writingSystemPrompt(project: WriterProject): string {
 2. 动作有结果；因果可拆句；保留对白拖音/中断/迟疑。
 3. 对白服从身份与目的；场景落在动作、决定、发现或未决问题上。
 4. 不得把未支撑设定冒充既有事实；区分项目事实 / 推断 / 候选。
-5. 角色演进须有正文/大纲/用户依据。待批准文本→提案 characterChanges；已确认事实→apply_character_changes。伏笔/传闻/失败尝试不得解锁。新建或大改用 save_character。
+5. 角色演进须有正文/大纲/用户依据。正文落盘后的确认事实→apply_character_changes；伏笔/传闻/失败尝试不得解锁。新建或大改用 save_character。
 6. 句式硬约束与声线自检见「风格锚定」（勿在此重复粘贴）。
 `;
 }
@@ -455,21 +471,21 @@ function writingSystemPrompt(project: WriterProject): string {
  */
 function executionRulesPrompt(mode: PermissionMode): string {
   const modeRule = mode === "plan"
-    ? "3. plan：只检索/构思/塑形；禁止 propose_*（含 propose_change_set）/ save_character / apply_character_changes / save_simple_character。默认短而开放，勿自动扩成完整交付。"
+    ? "3. plan：只检索/构思/塑形；禁止 write_file / edit_file / move_file / delete_file / save_character / apply_character_changes / save_simple_character。默认短而开放，勿自动扩成完整交付。"
     : mode === "auto"
-      ? "3. auto：正文/续写/改写必须提案（自动落盘），禁止用最终回复代替正文。清单若仍有未完成的章节/正文步骤则继续写并再次提案；仅当清单无后续写作项时停止。"
-      : "3. 正文/续写/改写必须提案，禁止用最终回复代替。清单若仍有未完成的章节/正文步骤则继续写并再次提案；仅当清单无后续写作项时停止等待审批。";
+      ? "3. auto：正文/续写/改写必须用 write_file/edit_file 交付（通过门禁后自动落盘），禁止用最终回复代替正文。清单若仍有未完成的章节/正文步骤则继续写；仅当清单无后续写作项时停止。"
+      : "3. 正文/续写/改写必须用 write_file/edit_file 交付，禁止用最终回复代替。清单若仍有未完成的章节/正文步骤则继续写；仅当清单无后续写作项时停止等待审批。";
   return `执行规则：
-1. 需项目事实时先 search_project（lore/outline/chapters），再读最小片段；每轮最多搜索 2 次。区分事实与推测。
-2. 保持人物/世界观/视角与 Markdown。局部→补丁；大纲节点→大纲补丁；新建或全文重写→完整文档。设定→lore/，大纲→outline/，正文→chapters/。
+1. 需项目事实时先 search_files，再用 read_file 读最小片段；每轮最多搜索 2 次。区分事实与推测。
+2. 保持人物/世界观/视角与文件格式。局部修改→edit_file；新建或全文重写→write_file。设定→lore/，大纲→outline/，正文→chapters/。
 ${modeRule}
 4. 完整/长对话或扮演史：注入历史仅为预览。须 inspect_conversation，再 read_conversation 从 afterId=0 分页至 hasMore=false。简易卡用 list/get_simple_characters，与普通卡分离。
 5. 仅当缺少目标文档/关键事实且无法推断时 ask_user；可逆创作选择自行决定。询问后立即停止。
 6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，不足再用 view=sections；明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。情节演进→apply_character_changes；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
-7. 只复用本轮工作记忆、本轮工具结果与 reused 标记；禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
+7. read_file 默认读取本轮最新工作副本；只复用本轮工作记忆、本轮工具结果与 reused 标记，禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
 8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
 9. 技能描述与当前任务明确匹配时，必须先 load_skill 并遵循其方法；勿编造技能。Skill 只增强判断，不自动构成固定工具流程。
-10. resource/ 内纯文本工作区：Markdown 继续用 document 工具；其他 UTF-8 文本用 list/inspect/read/search_files。创建、修改、移动、删除多个文件及其角色演进统一用 propose_change_set，禁止绕过审批直接改文件；路径只能在 resource/ 内。
+10. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
 11. 作者明确把某类正文问题概括为今后持续检查/避免的规则时，用 manage_prose_gates upsert 沉淀；只改当前一句、含糊抱怨或一次性创作选择不要自动学习。删除、停用规则须按作者明确要求。
 12. 不泄露内部参数；对话简洁；文档适量 Markdown。
 模式：${permissionModeLabel(mode)}`;
@@ -512,35 +528,35 @@ export function dynamicContextPrompt(
       ? `可读简易卡 ID：${simpleCharacterScope.join("、")}。`
       : "不加载已有简易卡；仍可新建。";
   const characterEvolutionInstruction = characterEvolutionEnabled
-    ? "开启。可按现有规则调用 apply_character_changes，或在文档提案中附 characterChanges。"
-    : "关闭。不得调用 apply_character_changes，不得在文档提案或 change set 中附 characterChanges；显式新建或编辑角色卡仍可使用 save_character。";
+    ? "开启。正文落盘后可按现有规则调用 apply_character_changes。"
+    : "关闭。不得调用 apply_character_changes；显式新建或编辑角色卡仍可使用 save_character。";
   const documentInstruction = task.documentProposalRequired
-    ? `必须成功提交文档提案或 change set 后结束，禁止用最终回复代替文件交付。根据作品与修改范围自主选择完整文档、局部 patch、隔离通篇修订${scenePipeline.enabled ? "或场景草稿链" : ""}；多文件/移动/删除/角色联动用 propose_change_set。工作记忆已有目标原文且未变时可直接继续。${runDeliverables && runDeliverables.length > 1 ? `本轮独立交付项：${JSON.stringify(runDeliverables)}。每次提交必须在 deliverableId 中绑定对应 ID。` : ""}${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
-    : "不强制文档提案；文件管理任务按需使用 propose_change_set，按用户意图执行。";
+    ? `必须成功调用 write_file、edit_file、move_file 或 delete_file 完成请求后结束，禁止用最终回复代替文件交付。完整新建/替换用 write_file，局部修改和驳回修订用 edit_file；运行时自动绑定交付项、篇幅目标、审查与审批。工作副本已有目标原文且未变时直接继续。${runDeliverables && runDeliverables.length > 1 ? `本轮独立交付项：${JSON.stringify(runDeliverables)}。按目标路径依次交付，交付项 ID 由运行时绑定。` : ""}${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+    : "不强制文件写入；需要修改 resource/ 文本时按用户意图使用 write_file/edit_file。";
   const proseGateInstruction = task.proseGateCandidate
     ? permissionMode === "plan"
       ? `planning 已识别出可复用的作者复审候选；plan 只读模式不得保存。向作者说明拟沉淀规则，不要声称已经生效。候选：${JSON.stringify(task.proseGateCandidate)}`
       : `planning 已确认当前反馈是可复用的作者正文约束。结束前必须调用 manage_prose_gates(operation=upsert) 保存下列候选；当前文档的修改不能替代规则沉淀：${JSON.stringify(task.proseGateCandidate)}`
     : "planning 未识别到需要沉淀的作者复审候选；不要把一次性改稿偏好自动保存。";
   const editScopeInstruction: Record<EditScope, string> = {
-    point: "局部修改：有原句/选区就优先 locate/read 锚点；根据修改所需事实按需补读上下文，并用 sourceHash+anchorId+spanHash 提交 patch。",
-    section: "分节修改：按标题或语义 locate，读取目标锚点范围与必要接缝；只 patch 命中范围，不读取无关章节。",
+    point: "局部修改：用 read_file 的 quote 或行范围读取原句与必要上下文，再用 edit_file 对唯一 oldText 做最小修改。",
+    section: "分节修改：用 search_files/read_file 定位目标范围与必要接缝，再用 edit_file 只修改命中范围，不读取无关章节。",
     document: task.mode === "rewrite"
-      ? "通篇修改：inspect 一次取得 sourceHash 后可调用 revise_document_isolated；若局部读取已足以完成用户目标，也可选择可验证的 patch。"
+      ? "通篇修改：读取完成任务所需的原文后用 write_file 提交完整工作副本；若局部修改已足够，优先用 edit_file。"
       : scenePipeline.enabled
         ? "完整交付：根据篇幅、连续性风险和现有材料，自主选择直接成稿或场景草稿链；不要为了遵循流程而拆场。"
-        : "完整交付：场景链已关闭，直接成稿并提交文档提案；不要调用章节场景链工具。",
+        : "完整交付：场景链已关闭，直接成稿并用 write_file 交付；不要调用章节场景链工具。",
   };
   const contextInstruction: Record<DocumentContextMode, string> = {
     // Soft none: pure craft may skip tools, but never invent lore when the user names project entities.
-    none: "默认不读文档。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，先 search_project（优先 scope=lore），再按结果读取必要资料。禁止把推测写成既有设定。",
+    none: "默认不读文件。泛化技巧/闲聊可直接答；若用户点名项目专名、组织、势力、世界观实体，且历史未给出可核对事实，先 search_files（优先 lore/），再按结果读取必要资料。禁止把推测写成既有设定。",
     search: task.mode === "simple_character"
-      ? `建简易卡：先 list_characters 查同名，必要时 get_character；search_project(lore/outline) 查询：${task.searchQuery || request.slice(0, 120)}；不足再 inspect/read 最小片段；最后 save_simple_character。`
+      ? `建简易卡：先 list_characters 查同名，必要时 get_character；search_files 查询 lore/outline：${task.searchQuery || request.slice(0, 120)}；不足再 read_file 最小片段；最后 save_simple_character。`
       : task.mode === "character"
-        ? `处理普通角色卡：先 list_characters 查同名并查看分区目录；已有同名卡若修改范围明确，直接 get_character(view=edit, sections=[待修改分区])，跨分区重做才用不带 sections 的 view=edit，禁止先读 summary；保存时携带原 id 与读取所得 expectedUpdatedAt。禁止另建简易卡或同名普通卡。按需 search_project(lore/outline)：${task.searchQuery || request.slice(0, 120)}；只读最小必要资料。`
-      : `先 search_project（设定/组织/专名优先 scope=lore）：${task.searchQuery || request.slice(0, 120)}。不足再 inspect/read；同路径只读一次最小范围。不得用推测冒充项目事实。`,
-    target: `需目标文档。${references.length ? `候选：${references.join("、")}。` : "先定位路径。"}记忆已有且未变则复用；否则 inspect 一次 + read 一次，禁止重复读。`,
-    continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/提案确定路径。"}记忆有末尾且未变则续写；否则 inspect 一次 + read(lastSection=true)。`,
+        ? `处理普通角色卡：先 list_characters 查同名并查看分区目录；已有同名卡若修改范围明确，直接 get_character(view=edit, sections=[待修改分区])，跨分区重做才用不带 sections 的 view=edit，禁止先读 summary；保存时携带原 id 与读取所得 expectedUpdatedAt。禁止另建简易卡或同名普通卡。按需 search_files 查询 lore/outline：${task.searchQuery || request.slice(0, 120)}；只读最小必要资料。`
+      : `先 search_files（设定/组织/专名优先 lore/）：${task.searchQuery || request.slice(0, 120)}。不足再 read_file；同路径只读一次最小范围。不得用推测冒充项目事实。`,
+    target: `需目标文件。${references.length ? `候选：${references.join("、")}。` : "先定位路径。"}工作记忆已有且未变则复用；否则 read_file 一次最小范围，禁止重复读。`,
+    continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/文件结果确定路径。"}记忆有末尾且未变则续写；否则 read_file 读取末尾必要范围。`,
   };
   const reviewBlock = task.mode === "audit" ? `\n\n${REVIEW_PROMPT}` : "";
   // 作者定的篇幅，不是模型按事件密度自己拍的。来源写出来，作者一看就知道这个数字
@@ -552,7 +568,7 @@ export function dynamicContextPrompt(
         : proseLength.source === "prompt_relative"
           ? "用户本轮要求相对项目默认调整"
           : "项目默认篇幅档"
-    }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。每次 propose_document 都用这个数字作该章的 targetCharacters；场景链各场之和只对齐当前这一章的目标。用户明确为不同章节分别指定数字时，以各章指定值为准。`
+    }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。write_file/edit_file 会由运行时自动绑定该章目标；场景链各场之和只对齐当前这一章。用户明确为不同章节分别指定数字时，以各章指定值为准。`
     : "";
   const resumeLine = resumeInterrupted
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
@@ -583,8 +599,8 @@ ${taskInstructions(
 角色演进：${characterEvolutionInstruction}
 写入：${documentInstruction}
 修改范围：${editScopeInstruction[task.editScope]}${proseLengthLine}
-写作模式：${writingMode === "fast" ? "快速模式；沿用传统单 Agent 链路，由当前 Agent 完成检索、编排与直接提案，不调用正文 Writer。" : "分工模式；Agent 负责检索与编排，实际正文可交给隔离 Writer。"}
-场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场。链内正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer" : "主 Agent"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、write_chapter_scene_notes、revise_chapter_scene_guide、inspect_chapter_draft 或 propose_chapter_draft，直接使用普通文档交付路径。"}
+写作模式：${writingMode === "fast" ? "快速模式；沿用传统单 Agent 链路，由当前 Agent 完成检索、编排与直接交付，不调用正文 Writer。" : "分工模式；Agent 负责检索与编排，实际正文可交给隔离 Writer。"}
+场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场。链内正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer" : "主 Agent"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、write_chapter_scene_notes、revise_chapter_scene_guide 或 inspect_chapter_draft，直接使用普通文件交付路径。"}
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
@@ -777,6 +793,15 @@ function isChapterSceneWriteTool(name: string): boolean {
   return name === "write_chapter_scene" || name === "write_chapter_scene_notes";
 }
 
+const CHAPTER_SCENE_CONTINUATION_TOOLS = new Set([
+  "write_chapter_scene",
+  "write_chapter_scene_notes",
+  "revise_chapter_scene_guide",
+  "revise_chapter_draft_style",
+  "inspect_chapter_draft",
+  "propose_chapter_draft",
+]);
+
 function characterMutationDiagnostic(result: Record<string, unknown>): string {
   const diagnostic = {
     ...(typeof result.code === "string" ? { code: result.code } : {}),
@@ -895,7 +920,7 @@ documentContext 判定（关键，勿默认 none）：
 - search：用户讨论、分析、推演项目内设定/组织/实体/专名/关系/军政势力，或答案正确性依赖 lore/outline 中未在对话里写清的事实（即使 mode=brainstorm/general 也要用 search）。searchQuery 填核心专名。
 - target：用户指定或语义可确定单篇文档要读/改。
 - continuation：承接上一轮正文续写。
-纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件或多文件原子变更时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；非 Markdown 文件不必出现在 documents 目录，执行阶段先用 list_files 定位，再用 propose_change_set。
+纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；执行阶段统一使用 list_files/read_file/write_file/edit_file/move_file/delete_file。
 图片产物：用户明确要求生成封面、插图、概念图或视觉参考时 capabilities 必须含 images；单独生图用 outcome=answer、mutation=none，若还要求文档/角色写入则保留相应 outcome 与 mutation。只讨论画面或撰写生图提示词时不要加入 images。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
 连续对话中，若 recentHistory 已明确当前操作对象是角色卡，当前 user 用“修复/调整/删除/改成”等省略说法继续修改该对象，仍用 character、outcome=character、mutation=character；除非当前 user 明确改为正文、大纲或 resource/ 文档任务。不得仅因动作是“修改”就判为 rewrite；rewrite 的交付对象必须是文档正文。
@@ -1255,12 +1280,12 @@ export function taskInstructions(
 - 不要调用 save_simple_character；不得因现有卡内容为空、简略或不完整而新建同名角色。
 - 新建或大改用 save_character；有依据的情节演进优先 apply_character_changes。只填写用户提供或项目材料支持的内容，未知处留空。
 - 更新已有卡时保留原 id，传入最近读取返回的 expectedUpdatedAt，优先只提交实际修改的分区；需要核对关联信息时可以继续读取相关分区或项目资料。数组条目沿用已有 ASCII id，新增条目提供唯一 ASCII id。
-- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试。角色保存成功即完成本任务，禁止再提交文档提案或 change set。`;
+- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试。角色保存成功即完成本任务，禁止再写入无关文件。`;
   if (mode === "simple_character") return `本次工作流：
 - 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终调用 save_simple_character 保存。
 - 先调用 list_characters 检查同名或相关普通角色卡；若存在相关角色，先用 get_character(id) 读取必要字段摘要，再按需用 sections 选读其他字段。
 - 按上下文决策检索相关 lore/ 与 outline/，只读取最小必要片段。
-- 将项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定处留空或标为“未明确”。可按需继续检查同名角色和项目资料，工具报错时修正后继续保存。角色保存成功即完成本任务，禁止再提交文档提案或 change set。`;
+- 将项目事实压缩为 name、identity、relationship、knowledge、scene、goal 六个字段；不确定处留空或标为“未明确”。可按需继续检查同名角色和项目资料，工具报错时修正后继续保存。角色保存成功即完成本任务，禁止再写入无关文件。`;
   if (mode === "brainstorm") return `本次工作流：
 - ${pacing}
 - 候选应具体到画面、人物选择或关系变化，不必把每个火花都补成完整因果链。
@@ -1275,36 +1300,36 @@ export function taskInstructions(
 - 修改或承接既有大纲时再 list_outline_nodes，并用 get_outline_node 读取最小目标节点；新建大纲不要为了形式完整读取空目录。
 - 先区分已核实依据、创作候选与待定缺口，再用一句主线和阶段因果链收束；内部核对后只写精简成品。
 - 每个场景维护前因、行动、结果、状态变化，以及必要的人物弧、信息释放和伏笔回收。
-- 修改既有节点用 propose_outline_patch；新建或大幅重构写入 outline/，不得写入 chapters/ 或 lore/。
+- 修改既有节点用 edit_file；新建或大幅重构用 write_file 写入 outline/，不得写入 chapters/ 或 lore/。
 - 落盘字段仅使用：摘要、前因、行动、结果、状态变化、角色ID、地点、时间、情节线、伏笔、回收、状态、文档、正文章节。`;
   if (mode === "write_scene") return `正文创作原则（内部执行，不输出分析过程）：
 - 主 Agent 对成品负责，自主决定先读什么、是否构思、是否分场、何时修订；不要为了展示流程而调用工具或创建清单。
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
-- ${fastWritingMode ? `快速模式沿用传统单 Agent 链路：你完成检索、编排与直接提案${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
-- 根据任务选择最小有效路径：能够整体把握时可直接用 propose_document；${isolatedWriter ? "若希望由配置的 Writer 写一篇 500—5000 字、单一主要变化的短篇正文，用 write_document_isolated；" : ""}修改既有局部时用 propose_document_patch；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}以上可用路径没有优先级，也不得互相作为形式上的前置审批。
-- 单章目标字数以「单章篇幅目标」为准，不擅自缩减，也不另按事件密度改判；一次任务包含多章时，每一章分别达到该目标，禁止把目标当作多章总额均分。每次直接 propose_document 必须传 targetCharacters（等于当前章目标）；场景链必须给每场 targetCharacters，且各场之和只对齐当前章目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
-- 目标路径已经存在时保持原路径提交，系统会把整篇成稿记录为该文档的新版本；不要为避开同名另起副本或改写章节路径。局部修改仍用 patch，只有承接现有结尾才用 append。
+- ${fastWritingMode ? `快速模式沿用单 Agent 链路：你完成检索、编排并用 write_file/edit_file 交付${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
+- 根据任务选择最小有效路径：新建或完整成稿用 write_file，修改既有局部用 edit_file；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}运行时自动处理篇幅、审查与审批，只使用当前公开文件工具。
+- 单章目标字数以「单章篇幅目标」为准，不擅自缩减，也不另按事件密度改判；一次任务包含多章时，每一章分别达到该目标，禁止把目标当作多章总额均分。write_file/edit_file 由运行时绑定当前章目标；场景链必须给每场 targetCharacters，且各场之和只对齐当前章目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
+- 目标路径已经存在时保持原路径，系统会把工作副本记录为该文件的新版本；不要为避开同名另起副本或改写章节路径。局部修改用 edit_file，完整替换用 write_file。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
     ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
     : `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
 - 章节动力服从本章目标。冲突章应让阻力真正回应人物行动；静场、过渡章与收束章也可以用理解、关系或条件的变化完成。代价、悬问与不可逆损失只在因果需要时出现，不作为每章配额。
-- 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称；仅正文兑现且有依据的变化才进入 characterChanges。提交前：${proseMannerismPreflightLine()}
+- 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称。提交前：${proseMannerismPreflightLine()}
 - 只交付用户本轮明确要求的正文范围；用户指定多章时逐章提交并沿用已读材料，未要求的章节不得自行扩展。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;
   if (mode === "rewrite") return `工作流（内部执行）：
-- 定位用户引用的原句：locate_document_span/read_document 传 path+quote；模糊描述用 locate_document_span(query) 隔离语义定位，再按需读取锚点及关联上下文。
+- 定位用户引用的原句：先 search_files，或用 read_file(path+quote) 读取原句及必要上下文。
 - 用户要求修复句式、文风、解释腔或生成感时，修改前先 audit_prose_style；按 diagnosis.actionableIssues 的 evidence 定位，优先 verdict=block，revisionIntent 只规定修改目标、不当作替换句。一般修改不为展示流程调用审计。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
-- 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。point/section 用 sourceHash+anchorId+spanHash 提交最小 patch；只有 editScope=document 才 inspect 一次后调用 revise_document_isolated，禁止主 Agent 通读和拼接全文。人设变化进提案 characterChanges。提交前：${proseMannerismPreflightLine()}`;
+- 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。point/section 用 edit_file 对唯一 oldText 做最小修改；editScope=document 才用 write_file 完整替换。提交前：${proseMannerismPreflightLine()}`;
   if (mode === "audit") return `工作流：
 - 先 audit_prose_style；按 diagnosis.actionableIssues 处理，优先 verdict=block；warn 只在结合上下文仍明显模板化时改。
 - 每条问题含严重度、原文证据、违反约束、最小改法；无证据不提。
-- ${documentProposalRequired ? "要求修复：用 read_document 的 quote 参数定位证据句，只改有证据处，用 propose_document_patch 最小提案。" : "只检查：不提案，只输出审阅结论。"}`;
+- ${documentProposalRequired ? "要求修复：用 read_file 的 quote 参数定位证据句，只改有证据处，用 edit_file 做最小修改。" : "只检查：不写文件，只输出审阅结论。"}`;
   return documentProposalRequired
-    ? "文件交付任务：先用 document 或 file 工具读取最小必要原文；多文件、移动、删除或角色联动必须用 propose_change_set 统一提交，禁止直接改盘。"
-    : "先判断构思/规划/写作/改写/审校再执行。改正文须先读原文并提案；待批准变化→characterChanges；已确认→apply_character_changes。";
+    ? "文件交付任务：先用 read_file 读取最小必要原文；新建/完整替换用 write_file，局部修改用 edit_file。"
+    : "先判断构思/规划/写作/改写/审校再执行。改正文须先读原文，再用 write_file/edit_file 交付；已确认角色变化→apply_character_changes。";
 }
 
 function scopedCharacterConstraintPackets(store: WriterStore, task: WritingTask, characterScope?: number[]) {
@@ -1623,7 +1648,7 @@ export function chapterContinuationPrompt(parts: {
   }>;
 }): string {
   const lines: string[] = [
-    "上一份文档提案已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
+    "上一份文件变更已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
   ];
   if (parts.proposal) {
     lines.push(`已交付：${parts.proposal.path} — ${parts.proposal.summary.replace(/\s+/g, " ").slice(0, 200)}`);
@@ -1645,8 +1670,8 @@ export function chapterContinuationPrompt(parts: {
       .slice(0, 16);
     lines.push(
       `本会话材料架已收录 ${shelf.length} 项已读材料${labels.length ? `（${labels.join("、")}）` : ""}。`
-      + "禁止对上述路径/角色无目标整篇重读或反复 search_project；下一章直接依据材料架 digest、章末衔接与任务清单成稿。"
-      + "digest 未覆盖时：inspect 后用 block / startLine+endLine / quote 定点补读；sourceHash 已变才允许重新拉全文。",
+      + "禁止对上述路径/角色无目标整篇重读或反复 search_files；下一章直接依据材料架 digest、章末衔接与任务清单成稿。"
+      + "digest 未覆盖时：用 read_file 的 block / startLine+endLine / quote 定点补读；sourceHash 已变才允许重新拉全文。",
     );
   } else {
     lines.push("材料架仍空：仅对写作必需的事实做最小读取；不要重读已交付章节全文。");
@@ -1655,7 +1680,7 @@ export function chapterContinuationPrompt(parts: {
     parts.remainingDeliverables?.length
       ? `完成约束仍缺：${parts.remainingDeliverables.join("、")}。立即选择其中一项继续交付；任务清单仅供规划，不代表交付已经完成。`
       : "完成约束已经满足；仅在确有必要时处理剩余计划。",
-    "根据下一份正文的篇幅、连续性风险和现有材料重新选择直接成稿、局部 patch、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
+    "根据下一份正文的篇幅、连续性风险和现有材料重新选择 write_file、局部 edit_file、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
     parts.todosText,
   );
   return lines.join("\n");
@@ -1732,64 +1757,133 @@ function completedJobHandoffPrompt(
   return lines.join("\n");
 }
 
+export function proposalRevisionDraftCacheKey(input: {
+  runId?: string;
+  deliverableId?: string;
+  path?: string;
+  sourceHash: string;
+}): string {
+  const pathScope = createHash("sha256")
+    .update(input.path ?? "")
+    .digest("hex")
+    .slice(0, 16);
+  return `proposal_revision_draft:${input.runId ?? "legacy"}:${input.deliverableId ?? "document"}:${pathScope}:${input.sourceHash}`;
+}
+
 function saveProposalRevisionDraft(
   call: ToolAccumulator,
   project: WriterProject,
   store: WriterStore,
   sessionId: string,
-): { artifactId: number; path?: string; sourceHash: string } | undefined {
+  context?: ToolExecutionContext,
+): { artifactId: number; path?: string; deliverableId?: string; sourceHash: string } | undefined {
   try {
     const input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
-    const content = typeof input.content === "string" ? input.content : "";
+    const inputPath = typeof input.path === "string" ? input.path : undefined;
+    const inputDeliverableId = typeof input.deliverableId === "string" && input.deliverableId.trim()
+      ? input.deliverableId.trim()
+      : undefined;
+    const captured = context?.latestProposalDraft;
+    const useCaptured = Boolean(captured
+      && (!inputPath || captured.path === inputPath)
+      && (!inputDeliverableId || captured.deliverableId === inputDeliverableId));
+    const content = useCaptured ? captured!.content : typeof input.content === "string" ? input.content : "";
     if (!content.trim()) return undefined;
-    const path = typeof input.path === "string" ? input.path : undefined;
-    const sourceHash = project.hash(content);
+    const path = useCaptured ? captured!.path : inputPath;
+    const deliverableId = useCaptured ? captured!.deliverableId : inputDeliverableId;
+    const sourceHash = useCaptured ? captured!.sourceHash : project.hash(content);
     const artifactId = store.saveContextArtifact(sessionId, {
-      cacheKey: `proposal_revision_draft:${sourceHash}`,
+      cacheKey: proposalRevisionDraftCacheKey({
+        runId: context?.runId,
+        deliverableId,
+        path,
+        sourceHash,
+      }),
       kind: "proposal_revision_draft",
       path,
       sourceHash,
       content,
       digest: `${path ?? "当前文档"} 待修订稿 ${content.length} 字符`,
     });
-    return { artifactId, path, sourceHash };
+    return { artifactId, path, ...(deliverableId ? { deliverableId } : {}), sourceHash };
   } catch {
     return undefined;
+  } finally {
+    if (context) context.latestProposalDraft = undefined;
   }
 }
 
-export type ProposalRevisionIssue = {
-  id: string;
-  severity: string;
-  kind: string;
-  evidence: string[];
-  problem: string;
-  action: string;
-};
-
-export type ProposalRevisionCase = {
-  revisionCaseId: string;
-  path?: string;
-  draftArtifactId: number;
-  draftSourceHash: string;
-  reviewArtifactId: number;
-  attempt: number;
-  unresolvedIssues: ProposalRevisionIssue[];
-  resolvedIssueIds: string[];
-  stillPresentIssueIds: string[];
-  newlyIntroducedIssueIds: string[];
-  status: "blocked" | "resolved";
-  retention: "executable";
-};
-
-type ProposalRevisionDraftRef = {
+export type ProposalRevisionDraftRef = {
   artifactId: number;
   path?: string;
+  deliverableId?: string;
   sourceHash: string;
   revisionCase?: ProposalRevisionCase;
 };
 
-function proposalRevisionIssues(result: Record<string, unknown>): ProposalRevisionIssue[] {
+type ProposalRevisionDocumentBase = {
+  baseDocumentExists: boolean;
+  baseDocumentSourceHash: string;
+};
+
+export function captureProposalRevisionDocumentBase(
+  project: WriterProject,
+  path?: string,
+): ProposalRevisionDocumentBase {
+  if (!path || !project.textFileExists(path)) {
+    return {
+      baseDocumentExists: false,
+      baseDocumentSourceHash: PROPOSAL_REVISION_MISSING_DOCUMENT_HASH,
+    };
+  }
+  return {
+    baseDocumentExists: true,
+    baseDocumentSourceHash: project.hash(project.readTextFile(path)),
+  };
+}
+
+/**
+ * Active revision cases are optimistic transactions over the document that was
+ * on disk when the chain opened. Legacy cases have no trustworthy base and must
+ * be resumed manually against the current document instead of being rebased.
+ */
+export function proposalRevisionBaseChangeReason(
+  project: WriterProject,
+  revisionCase: ProposalRevisionCase,
+): string | undefined {
+  const legacy = revisionCase as Partial<ProposalRevisionCase> & { schemaVersion?: unknown };
+  if (legacy.schemaVersion !== 3
+    || typeof legacy.baseDocumentExists !== "boolean"
+    || typeof legacy.baseDocumentSourceHash !== "string") {
+    return "活动修订案例来自旧版运行时，缺少可验证的目标文档基线";
+  }
+  if (!revisionCase.path) return "活动修订案例缺少目标文档路径，无法核对落盘基线";
+  try {
+    const currentExists = project.textFileExists(revisionCase.path);
+    if (currentExists !== revisionCase.baseDocumentExists) {
+      return revisionCase.baseDocumentExists
+        ? `目标 ${revisionCase.path} 在修订期间已被删除`
+        : `目标 ${revisionCase.path} 在修订期间已被其他操作创建`;
+    }
+    if (!currentExists) {
+      return revisionCase.baseDocumentSourceHash === PROPOSAL_REVISION_MISSING_DOCUMENT_HASH
+        ? undefined
+        : "活动修订案例的缺失文档基线无效";
+    }
+    const currentSourceHash = project.hash(project.readTextFile(revisionCase.path));
+    if (currentSourceHash !== revisionCase.baseDocumentSourceHash) {
+      return `目标 ${revisionCase.path} 在修订期间已被其他操作修改`;
+    }
+    return undefined;
+  } catch {
+    return `无法核对目标 ${revisionCase.path} 的当前落盘状态`;
+  }
+}
+
+function proposalRevisionIssues(
+  result: Record<string, unknown>,
+  previous: readonly ProposalRevisionIssue[] = [],
+): ProposalRevisionIssue[] {
   const review = result.chapterReview;
   const rawIssues = review && typeof review === "object" && !Array.isArray(review)
     && Array.isArray((review as Record<string, unknown>).issues)
@@ -1798,6 +1892,7 @@ function proposalRevisionIssues(result: Record<string, unknown>): ProposalRevisi
   const issues = rawIssues.flatMap(raw => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
     const value = raw as Record<string, unknown>;
+    if (value.severity !== "blocker") return [];
     const evidence = Array.isArray(value.evidence)
       ? value.evidence.filter((item): item is string => typeof item === "string").slice(0, 3)
       : [];
@@ -1805,79 +1900,126 @@ function proposalRevisionIssues(result: Record<string, unknown>): ProposalRevisi
     const action = typeof value.action === "string" ? value.action.trim() : "";
     if (!problem && !action && !evidence.length) return [];
     const kind = typeof value.kind === "string" ? value.kind : "review";
-    const identity = JSON.stringify([
-      kind,
-      evidence.length ? evidence.map(item => item.replace(/\s+/g, " ").trim()) : problem.replace(/\s+/g, " ").trim(),
-    ]);
+    const priorIssueId = typeof value.priorIssueId === "string"
+      && previous.some(issue => issue.id === value.priorIssueId && issue.kind === kind)
+      ? value.priorIssueId
+      : undefined;
+    const origin: ProposalRevisionIssue["origin"] = value.origin === "unresolved_prior"
+      || value.origin === "introduced_by_revision"
+      || value.origin === "pre_existing_unrelated"
+      ? value.origin
+      : undefined;
     return [{
-      id: `issue:${createHash("sha256").update(identity).digest("hex").slice(0, 12)}`,
-      severity: typeof value.severity === "string" ? value.severity : "blocker",
+      id: priorIssueId ?? proposalRevisionIssueId({ kind, evidence, problem }),
+      severity: "blocker",
       kind,
       evidence,
       problem,
       action,
+      ...(priorIssueId ? { priorIssueId } : {}),
+      ...(origin ? { origin } : {}),
     }];
   });
-  if (issues.length) return issues.slice(0, 8);
-  const fallback = [result.message, result.error, result.rhythmGate]
-    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
-  if (!fallback) return [];
-  const problem = fallback.replace(/\s+/g, " ").trim().slice(0, 1_200);
-  return [{
-    id: `issue:${createHash("sha256").update(problem).digest("hex").slice(0, 12)}`,
-    severity: "blocker",
-    kind: typeof result.code === "string" ? result.code : "proposal_gate",
-    evidence: [],
-    problem,
-    action: "按门禁原因做最小修订后重新提交。",
-  }];
+  return issues.slice(0, 8);
 }
 
-function saveProposalRevisionCase(
-  draft: { artifactId: number; path?: string; sourceHash: string },
-  result: Record<string, unknown>,
+export function saveProposalRevisionCase(
+  draft: { artifactId: number; path?: string; deliverableId?: string; sourceHash: string },
+  gate: ProposalRetryGate,
+  retryState: ProposalRetryState,
   attempt: number,
+  semanticIssues: ProposalRevisionIssue[] | undefined,
+  transition: ProposalIssueTransition | undefined,
+  documentBase: ProposalRevisionDocumentBase | undefined,
   store: WriterStore,
   sessionId: string,
   previous?: ProposalRevisionCase,
-): ProposalRevisionDraftRef {
-  if (previous?.path !== draft.path) previous = undefined;
-  const unresolvedIssues = proposalRevisionIssues(result);
-  const previousIds = new Set(previous?.unresolvedIssues.map(issue => issue.id) ?? []);
-  const currentIds = new Set(unresolvedIssues.map(issue => issue.id));
+  options?: { rhythmPolishPending?: boolean; semanticVerdict?: boolean },
+): ProposalRevisionDraftRef & { revisionCase: ProposalRevisionCase } {
+  if (retryState.deliverableId !== draft.deliverableId || retryState.path !== draft.path) {
+    throw new Error("提案修订稿与重试状态作用域不匹配");
+  }
+  if (previous && (previous.runId !== retryState.runId
+    || previous.deliverableId !== retryState.deliverableId
+    || previous.path !== draft.path)) {
+    throw new Error("提案修订稿与活动案例作用域不匹配");
+  }
+  const previousBase = previous as (Partial<ProposalRevisionCase> & { schemaVersion?: unknown }) | undefined;
+  if (previous && (previousBase?.schemaVersion !== 3
+    || typeof previousBase.baseDocumentExists !== "boolean"
+    || typeof previousBase.baseDocumentSourceHash !== "string")) {
+    throw new Error("活动提案修订案例缺少可验证的目标文档基线");
+  }
+  const effectiveDocumentBase = previous
+    ? {
+        baseDocumentExists: previous.baseDocumentExists,
+        baseDocumentSourceHash: previous.baseDocumentSourceHash,
+      }
+    : documentBase;
+  if (!effectiveDocumentBase) {
+    throw new Error("首次创建提案修订案例前未捕获目标文档基线");
+  }
+  const semanticVerdict = options?.semanticVerdict === true;
+  const unresolvedIssues = semanticVerdict
+    ? semanticIssues ?? []
+    : previous?.unresolvedIssues ?? [];
   const revisionCaseId = previous?.revisionCaseId
-    ?? `revision:${createHash("sha256").update(`${draft.path ?? "document"}:${draft.sourceHash}`).digest("hex").slice(0, 16)}`;
+    ?? `revision:${createHash("sha256").update(JSON.stringify([
+      retryState.runId,
+      retryState.deliverableId ?? "",
+      draft.path ?? "document",
+      effectiveDocumentBase.baseDocumentExists,
+      effectiveDocumentBase.baseDocumentSourceHash,
+      draft.sourceHash,
+    ])).digest("hex").slice(0, 16)}`;
   const base = {
+    schemaVersion: 3 as const,
     revisionCaseId,
+    runId: retryState.runId,
+    ...(retryState.deliverableId ? { deliverableId: retryState.deliverableId } : {}),
     path: draft.path,
+    ...effectiveDocumentBase,
     draftArtifactId: draft.artifactId,
     draftSourceHash: draft.sourceHash,
+    ...(semanticVerdict
+      ? { semanticDraftArtifactId: draft.artifactId, semanticDraftSourceHash: draft.sourceHash }
+      : previous?.semanticDraftArtifactId && previous.semanticDraftSourceHash
+        ? {
+            semanticDraftArtifactId: previous.semanticDraftArtifactId,
+            semanticDraftSourceHash: previous.semanticDraftSourceHash,
+          }
+        : {}),
+    ...(options?.rhythmPolishPending ? { rhythmPolishPending: true as const } : {}),
     attempt,
+    lastGate: gate,
+    retryState,
     unresolvedIssues,
-    resolvedIssueIds: [...previousIds].filter(id => !currentIds.has(id)),
-    stillPresentIssueIds: [...currentIds].filter(id => previousIds.has(id)),
-    newlyIntroducedIssueIds: [...currentIds].filter(id => !previousIds.has(id)),
+    resolvedIssueIds: semanticVerdict ? transition?.resolvedIssueIds ?? [] : previous?.resolvedIssueIds ?? [],
+    stillPresentIssueIds: semanticVerdict ? transition?.stillPresentIssueIds ?? [] : previous?.stillPresentIssueIds ?? [],
+    newlyIntroducedIssueIds: semanticVerdict
+      ? transition?.newlyIntroducedIssueIds ?? []
+      : previous?.newlyIntroducedIssueIds ?? [],
     status: "blocked" as const,
     retention: "executable" as const,
   };
   const sourceHash = createHash("sha256").update(JSON.stringify(base)).digest("hex");
   const reviewArtifactId = store.saveContextArtifact(sessionId, {
-    cacheKey: `proposal_revision_case:${revisionCaseId}:${attempt}:${sourceHash}`,
+    cacheKey: `proposal_revision_case:${retryState.runId}:${retryState.deliverableId ?? "document"}:${revisionCaseId}:${retryState.absoluteSubmissions}:${sourceHash}`,
     kind: "proposal_revision_case",
     path: draft.path,
     sourceHash,
     content: JSON.stringify(base),
-    digest: `${draft.path ?? "当前文档"} 修订案例第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
+    digest: `${draft.path ?? "当前文档"} ${gate} 第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
   });
   const revisionCase: ProposalRevisionCase = { ...base, reviewArtifactId };
   const revisionCaseSourceHash = createHash("sha256").update(JSON.stringify(revisionCase)).digest("hex");
   store.saveContextArtifact(sessionId, {
-    cacheKey: `proposal_revision_case:${revisionCaseId}:${attempt}:${sourceHash}`,
+    cacheKey: `proposal_revision_case:${retryState.runId}:${retryState.deliverableId ?? "document"}:${revisionCaseId}:${retryState.absoluteSubmissions}:${sourceHash}`,
     kind: "proposal_revision_case",
     path: draft.path,
     sourceHash: revisionCaseSourceHash,
     content: JSON.stringify(revisionCase),
-    digest: `${draft.path ?? "当前文档"} 修订案例第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
+    digest: `${draft.path ?? "当前文档"} ${gate} 第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
   });
   return { ...draft, revisionCase };
 }
@@ -1896,9 +2038,10 @@ function closeProposalRevisionCase(
     newlyIntroducedIssueIds: [],
     status: "resolved",
   };
+  delete closed.rhythmPolishPending;
   const sourceHash = createHash("sha256").update(JSON.stringify(closed)).digest("hex");
   store.saveContextArtifact(sessionId, {
-    cacheKey: `proposal_revision_case:${current.revisionCaseId}:resolved:${sourceHash}`,
+    cacheKey: `proposal_revision_case:${current.runId}:${current.deliverableId ?? "document"}:${current.revisionCaseId}:resolved:${sourceHash}`,
     kind: "proposal_revision_case",
     path: current.path,
     sourceHash,
@@ -1907,29 +2050,77 @@ function closeProposalRevisionCase(
   });
 }
 
-function restoreActiveProposalRevisionCase(
+function syncProposalReviewRevisionContext(
+  context: ToolExecutionContext,
+  revisionCase: ProposalRevisionCase | undefined,
   store: WriterStore,
   sessionId: string,
-  targetPath?: string,
-): ProposalRevisionCase | undefined {
-  const seen = new Set<string>();
-  for (const metadata of store.recentContextArtifacts(sessionId, 32)) {
-    if (metadata.kind !== "proposal_revision_case") continue;
-    const artifact = store.contextArtifactById(sessionId, metadata.id);
-    if (!artifact) continue;
-    try {
-      const value = JSON.parse(artifact.content) as ProposalRevisionCase;
-      if (!value.revisionCaseId || seen.has(value.revisionCaseId)) continue;
-      seen.add(value.revisionCaseId);
-      if (value.status !== "blocked" || !Array.isArray(value.unresolvedIssues)) continue;
-      if (targetPath && value.path && value.path !== targetPath) continue;
-      return value;
-    } catch { /* ignore invalid legacy work-memory artifacts */ }
+): void {
+  if (!revisionCase?.path) return;
+  context.proposalReviewRevisions ??= new Map();
+  context.activeProposalRevisionPaths ??= new Set();
+  context.workingTextFiles ??= new Map();
+  if (revisionCase.status === "blocked") {
+    const draftArtifact = store.contextArtifactById(sessionId, revisionCase.draftArtifactId);
+    if (draftArtifact && draftArtifact.sourceHash === revisionCase.draftSourceHash) {
+      context.workingTextFiles.set(revisionCase.path, {
+        path: revisionCase.path,
+        content: draftArtifact.content,
+        sourceHash: revisionCase.draftSourceHash,
+        baseExists: revisionCase.baseDocumentExists,
+        baseSourceHash: revisionCase.baseDocumentSourceHash,
+        ...(revisionCase.deliverableId ? { deliverableId: revisionCase.deliverableId } : {}),
+        revisionCaseId: revisionCase.revisionCaseId,
+      });
+    }
+  } else {
+    context.workingTextFiles.delete(revisionCase.path);
   }
-  return undefined;
+  if (revisionCase.status === "blocked" && revisionCase.rhythmPolishPending) {
+    context.rhythmGracePaths ??= new Set();
+    context.rhythmGracePaths.add(revisionCase.path);
+  }
+  const key = proposalRevisionScopeKey(revisionCase.retryState);
+  if (revisionCase.status === "blocked") context.activeProposalRevisionPaths.add(revisionCase.path);
+  else context.activeProposalRevisionPaths.delete(revisionCase.path);
+  if (revisionCase.status !== "blocked" || !revisionCase.semanticDraftArtifactId
+    || !revisionCase.semanticDraftSourceHash || !revisionCase.unresolvedIssues.length) {
+    context.proposalReviewRevisions.delete(key);
+    return;
+  }
+  const artifact = store.contextArtifactById(sessionId, revisionCase.semanticDraftArtifactId);
+  if (!artifact || artifact.sourceHash !== revisionCase.semanticDraftSourceHash) {
+    context.proposalReviewRevisions.delete(key);
+    return;
+  }
+  context.proposalReviewRevisions.set(key, {
+    runId: revisionCase.runId,
+    ...(revisionCase.deliverableId ? { deliverableId: revisionCase.deliverableId } : {}),
+    path: revisionCase.path,
+    previousContent: artifact.content,
+    previousSourceHash: revisionCase.semanticDraftSourceHash,
+    unresolvedIssues: revisionCase.unresolvedIssues,
+  });
+}
+
+function clearProposalReviewRevisionContext(
+  context: ToolExecutionContext,
+  revisionCase: ProposalRevisionCase | undefined,
+): void {
+  if (!revisionCase) return;
+  context.proposalReviewRevisions?.delete(proposalRevisionScopeKey(revisionCase.retryState));
+  if (revisionCase.path) {
+    context.activeProposalRevisionPaths?.delete(revisionCase.path);
+    context.rhythmGracePaths?.delete(revisionCase.path);
+    context.workingTextFiles?.delete(revisionCase.path);
+  }
 }
 
 const PROPOSAL_SUBMISSION_TOOLS = new Set([
+  "write_file",
+  "edit_file",
+  "move_file",
+  "delete_file",
   "propose_document",
   "write_document_isolated",
   "propose_document_patch",
@@ -1939,8 +2130,12 @@ const PROPOSAL_SUBMISSION_TOOLS = new Set([
   "propose_change_set",
 ]);
 
+const ACTIVE_REVISION_FILE_TOOLS = new Set(["write_file", "edit_file", "propose_document"]);
+
 function deliverableIdFromToolCall(call: ToolCall): string | undefined {
-  if (!PROPOSAL_SUBMISSION_TOOLS.has(call.name) && call.name !== "inspect_chapter_draft") return undefined;
+  if (!PROPOSAL_SUBMISSION_TOOLS.has(call.name)
+    && call.name !== "inspect_chapter_draft"
+    && call.name !== "begin_chapter_draft") return undefined;
   try {
     const input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
     return typeof input.deliverableId === "string" && input.deliverableId.trim()
@@ -1958,13 +2153,12 @@ function proposalRevisionBoundaryPrompt(
   if (!draft) return prompt;
   return [
     prompt,
-    `最新版待修订正文已保存为工作记忆 artifactId=${draft.artifactId}`
-      + `${draft.path ? `（${draft.path}）` : ""}，sourceHash=${draft.sourceHash.slice(0, 12)}。`,
+    `最新版待修订正文已保留为当前工作副本${draft.path ? `（${draft.path}）` : ""}。`,
     draft.revisionCase
-      ? `修订案例 ${draft.revisionCase.revisionCaseId} 已持久化为 reviewArtifactId=${draft.revisionCase.reviewArtifactId}；未解决项必须逐项闭合。`
+      ? "修订状态已由运行时持久化；未解决 blocker 必须逐项闭合。"
       : "",
-    "旧版完整提案与驳回工具链已卸下。先用 read_context_artifact 分页读取该 artifact，"
-      + "只按上述驳回点修订，然后重新提交；禁止重读设定或从头另写。",
+    `需要正文时直接 read_file(${JSON.stringify({ path: draft.path })}) 读取当前工作副本，`
+      + "然后用 edit_file 只改上述驳回点；禁止重读设定、改动落盘旧版或从头另写。",
   ].join("\n");
 }
 
@@ -1972,8 +2166,8 @@ function proposalRevisionTargetConstraint(
   project: WriterProject,
   draft?: ProposalRevisionDraftRef,
 ): string {
-  if (!draft?.path || project.documentExists(draft.path)) return "";
-  return `目标 ${draft.path} 尚未创建：本修订链只能用 propose_document 提交完整正文，禁止 propose_document_patch。`;
+  if (!draft?.path || project.textFileExists(draft.path)) return "";
+  return `目标 ${draft.path} 尚未落盘；继续用 edit_file 修改当前工作副本，或用 write_file 完整替换。`;
 }
 
 function proposalDraftRefFromCase(revisionCase?: ProposalRevisionCase): ProposalRevisionDraftRef | undefined {
@@ -1981,9 +2175,57 @@ function proposalDraftRefFromCase(revisionCase?: ProposalRevisionCase): Proposal
   return {
     artifactId: revisionCase.draftArtifactId,
     path: revisionCase.path,
+    deliverableId: revisionCase.deliverableId,
     sourceHash: revisionCase.draftSourceHash,
     revisionCase,
   };
+}
+
+function proposalDraftMatchesRetryScope(
+  draft: { path?: string; deliverableId?: string },
+  retryState: ProposalRetryState,
+  previous?: ProposalRevisionCase,
+): boolean {
+  if (draft.path !== retryState.path) return false;
+  if (draft.deliverableId !== retryState.deliverableId) return false;
+  if (previous && (previous.runId !== retryState.runId
+    || previous.deliverableId !== retryState.deliverableId
+    || previous.path !== draft.path)) return false;
+  return true;
+}
+
+export function proposalFailureShouldPersistRevisionCase(input: {
+  hasScopedDraft: boolean;
+  action: "revise" | "correct_call" | "pause";
+  pauseReason?: "dependency" | "invalid_request" | "revision_exhausted";
+  retryStateChanged: boolean;
+  hasPreviousCase: boolean;
+}): boolean {
+  if (!input.hasScopedDraft) return false;
+  return input.action === "revise"
+    || (input.action === "correct_call" && input.hasPreviousCase)
+    || input.retryStateChanged
+    || (input.action === "pause"
+      && (input.pauseReason === "revision_exhausted" || input.pauseReason === "dependency"));
+}
+
+export function proposalFailureDraft(input: {
+  action: "revise" | "correct_call" | "pause";
+  caseDraft?: ProposalRevisionDraftRef;
+  savedDraft?: Omit<ProposalRevisionDraftRef, "revisionCase">;
+  previousCase?: ProposalRevisionCase;
+}): ProposalRevisionDraftRef | undefined {
+  if (input.caseDraft) return input.caseDraft;
+  if (input.action === "correct_call" && input.previousCase) {
+    return proposalDraftRefFromCase(input.previousCase);
+  }
+  if (input.savedDraft) {
+    return {
+      ...input.savedDraft,
+      ...(input.previousCase ? { revisionCase: input.previousCase } : {}),
+    };
+  }
+  return proposalDraftRefFromCase(input.previousCase);
 }
 
 function proposalCallCorrectionPrompt(
@@ -1993,25 +2235,36 @@ function proposalCallCorrectionPrompt(
   const code = typeof result.code === "string" ? result.code : "PROPOSAL_CALL_INVALID";
   const message = typeof result.error === "string"
     ? result.error
-    : typeof result.message === "string" ? result.message : "提案工具调用与当前项目状态不匹配。";
+    : typeof result.message === "string" ? result.message : "文件工具调用与当前项目状态不匹配。";
   const nextAllowedActions = Array.isArray(result.nextAllowedActions)
     ? result.nextAllowedActions.filter((item): item is string => typeof item === "string")
     : [];
+  const invalidReviewOutput = result.failureKind === "invalid_output";
   return [
-    `提案工具调用未执行（${code}）；这不是正文审核驳回，不消耗修订次数。`,
+    invalidReviewOutput
+      ? `终审输出无效（${code}）；这不是正文审核驳回，不消耗语义修订次数。`
+      : `文件工具调用未执行（${code}）；这不是正文审核驳回，不消耗修订次数。`,
     `原因：${message.replace(/\s+/g, " ").slice(0, 500)}`,
     nextAllowedActions.length ? `允许的下一步：${nextAllowedActions.join("、")}。` : "",
-    code === "TARGET_DOCUMENT_MISSING"
-      ? "目标文件尚未创建，禁止 propose_document_patch；读取已保存的完整草稿后，必须用 propose_document 重新提交。"
+    invalidReviewOutput
+      ? `保持当前正文不变，用 write_file(${JSON.stringify({ path: draft?.path })}) 重新验证当前工作副本；不要把终审格式错误当作正文问题来改稿。`
+      : code === "ACTIVE_REVISION_REQUIRES_FULL_DRAFT"
+        ? "用 read_file 读取当前工作副本，只改 blocker 后用 edit_file 提交；不得修改已落盘旧版绕过复审。"
+      : code === "TARGET_DOCUMENT_MISSING"
+      ? "目标文件尚未落盘；继续编辑当前工作副本，或用 write_file 完整替换。"
       : "修正工具名或参数后重新调用；不要为了修正调用而改写正文或重读项目材料。",
-    draft ? `继续使用 artifactId=${draft.artifactId} 的完整正文，不要丢弃当前修订成果。` : "",
+    draft ? `继续使用 ${draft.path ?? "当前文件"} 的工作副本，不要丢弃当前修订成果。` : "",
   ].filter(Boolean).join("\n");
 }
 
-function proposalFailurePauseResult(
+export function proposalFailurePauseResult(
   result: Record<string, unknown>,
   reason: "dependency" | "invalid_request" | "revision_exhausted",
   draft?: ProposalRevisionDraftRef,
+  detail?: {
+    exhaustion?: "semantic_no_progress" | "gate_attempts" | "absolute_safety";
+    gate?: ProposalRetryGate;
+  },
 ): Record<string, unknown> {
   const dependency = reason === "dependency";
   const exhausted = reason === "revision_exhausted";
@@ -2022,16 +2275,27 @@ function proposalFailurePauseResult(
       ? "提案审核依赖在允许时限内没有返回结果。"
       : "提案依赖的审核模型及回退模型均不可用。"
     : exhausted
-      ? "同一提案已达到运行时允许的修订提交上限。"
+      ? detail?.exhaustion === "semantic_no_progress"
+        ? "同一语义 blocker 已连续两轮没有修订进展，自动提交已暂停。"
+        : detail?.exhaustion === "gate_attempts"
+          ? `${detail.gate ?? "确定性"} 门禁已连续三次未通过，自动提交已暂停。`
+          : "当前交付项已触发防止无限循环的绝对安全上限。"
       : "提案请求本身无效，继续原样重试不会成功。";
+  const blockerDetails = draft?.revisionCase?.unresolvedIssues.slice(0, 4).flatMap((issue, index) => [
+    `Blocker ${index + 1} [${issue.kind}/${issue.id}]`,
+    `evidence: ${issue.evidence.length ? issue.evidence.join(" | ") : "（无逐字证据）"}`,
+    `problem: ${issue.problem}`,
+    `action: ${issue.action}`,
+  ]) ?? [];
   return {
     ...result,
     status: "waiting",
     displayMessage: [
       summary,
       typeof result.error === "string" ? result.error : typeof result.message === "string" ? result.message : "",
+      ...blockerDetails,
       draft
-        ? `当前正文已保存为工作记忆 artifactId=${draft.artifactId}，未丢失。`
+        ? `当前正文已持久化为 ${draft.path ?? "目标文件"} 的工作副本，未丢失。`
         : "当前正文仍保留在本轮工作记忆中。",
       dependency
         ? "本次已停止自动提交；审核依赖恢复后可续跑。"
@@ -2039,24 +2303,22 @@ function proposalFailurePauseResult(
     ].filter(Boolean).join("\n"),
     question: dependency
       ? dependencyTimedOut
-        ? "提案审核本次响应超时；正文已保留，可续跑重新提交。"
-        : "提案审核依赖暂时不可用；恢复后可续跑。"
-      : "提案自动修订已停止，请检查驳回信息后决定是否续跑。",
+        ? "文件审核本次响应超时；工作副本已保留，可续跑。"
+        : "文件审核依赖暂时不可用；恢复后可续跑。"
+      : "文件自动修订已停止，请检查驳回信息后决定是否续跑。",
     options: ["续跑"],
     ...(draft ? {
-      artifactId: draft.artifactId,
       path: draft.path,
-      sourceHash: draft.sourceHash,
+      workingCopy: true,
+      workingSourceHash: draft.sourceHash,
       ...(draft.revisionCase ? {
-        revisionCaseId: draft.revisionCase.revisionCaseId,
-        reviewArtifactId: draft.revisionCase.reviewArtifactId,
         unresolvedIssues: draft.revisionCase.unresolvedIssues,
       } : {}),
     } : {}),
   };
 }
 
-/** After propose_* is blocked by gate/review — force minimal repair, not a full rewrite loop. */
+/** After a file submission is blocked by gate/review: force a minimal working-copy repair. */
 export function proposalRevisionConvergePrompt(
   result: Record<string, unknown>,
   attempt: number,
@@ -2075,7 +2337,10 @@ export function proposalRevisionConvergePrompt(
   const messageCap = /节奏硬拦截|碎句|缩词|均长|电报|RHYTHM_POLISH/.test(rawMessage + code) ? 900 : 360;
   const message = rawMessage.replace(/\s+/g, " ").slice(0, messageCap);
   const path = typeof result.path === "string" ? result.path : "";
-  const hardLimit = attempt >= 2;
+  const hardLimit = revisionCase
+    ? revisionCase.lastGate !== "semantic_review"
+      && revisionCase.retryState.gateAttempts[revisionCase.lastGate] >= 2
+    : attempt >= 2;
   const rhythmBlock = /节奏硬拦截|碎句|缩词|连发碎句|电报句|RHYTHM_POLISH/.test(rawMessage + code);
   const firstRoundPolish = result.rhythmRevisionRequired === true || code === "RHYTHM_POLISH_REQUIRED";
   const blockerPacket = revisionCase?.unresolvedIssues.length
@@ -2086,20 +2351,22 @@ export function proposalRevisionConvergePrompt(
       `首轮情节/场面草稿已接收（${path || "当前文档"}），句式节奏尚未达标——这是预期中的第二步，不是失败。`,
       message ? `验收与样例：${message}` : "",
       blockerPacket,
-      "请在保留情节、场面与人物选择的前提下，按验收线通读合并碎句、恢复双音节用词并补静场绵延句，然后 propose_document 覆盖修订；禁止重读已读设定、禁止另起大纲或重写剧情。",
+      "请在保留情节、场面与人物选择的前提下，按验收线通读合并碎句、恢复双音节用词并补静场绵延句，然后用 edit_file 修改当前工作副本；禁止重读已读设定、禁止另起大纲或重写剧情。",
     ].filter(Boolean).join("\n");
   }
   return [
-    `文档提案未创建（${status}${code ? `/${code}` : ""}，修订窗口第 ${attempt} 次${path ? `，路径 ${path}` : ""}）。`,
+    `文档提案未创建（${status}${code ? `/${code}` : ""}，${revisionCase?.lastGate ?? "当前门禁"}第 ${attempt} 次${path ? `，路径 ${path}` : ""}）。`,
     message ? `原因：${message}` : "",
     blockerPacket,
     rhythmBlock
       ? (hardLimit
         ? "节奏最后一轮：按原因里的验收线通读全章合并碎句、恢复双音节用词并补绵延句后重新提交一次；禁止只改样例三句或另起大纲。若仍不达标，manage_todos 标明阻塞或 ask_user。"
-        : "节奏修订：不要只改命中样例三句。按验收线处理全章碎句串与缩词，静场补 35+ 字绵延句，然后 propose_document；禁止重读已读设定、禁止另起大纲。")
+        : "节奏修订：不要只改命中样例三句。按验收线处理全章碎句串与缩词，静场补 35+ 字绵延句，然后用 edit_file 提交当前工作副本；禁止重读已读设定、禁止另起大纲。")
       : hardLimit
         ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
-        : "下一步必须是针对驳回点的最小修订后的 propose_document 或 propose_document_patch；禁止为同一章重新 search/read 已读材料，禁止全文重写。",
+        : revisionCase
+          ? "下一步用 read_file 查看当前工作副本，只做针对 blocker 的最小修订，再用 edit_file 提交；禁止重读已读材料或全文重写。"
+          : "下一步必须用 edit_file 对驳回点做最小修订；禁止为同一章重新检索已读材料，禁止全文重写。",
   ].filter(Boolean).join("\n");
 }
 
@@ -2203,6 +2470,10 @@ export type ChapterReviewRepairLock =
   | { mode: "structural"; targetSceneIds: string[] };
 
 const CHAPTER_DRAFT_MUTATION_TOOLS = new Set([
+  "write_file",
+  "edit_file",
+  "move_file",
+  "delete_file",
   "begin_chapter_draft",
   "write_chapter_scene",
   "write_chapter_scene_notes",
@@ -2483,7 +2754,14 @@ export async function runAgent(options: {
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
   const artifactContext = [
-    recentArtifactsContext(store, sessionId, project, task, runtimeSettings.continuityFactsEnabled),
+    recentArtifactsContext(
+      store,
+      sessionId,
+      project,
+      task,
+      runtimeSettings.continuityFactsEnabled,
+      agentLoop.snapshot.deliverables.flatMap(item => item.proposalRevision ? [item.proposalRevision] : []),
+    ),
     roleplayHandoffContext,
   ].filter(Boolean).join("\n\n");
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
@@ -2543,6 +2821,10 @@ export async function runAgent(options: {
   };
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    runId: agentLoop.snapshot.id,
+    proposalReviewRevisions: new Map(),
+    activeProposalRevisionPaths: new Set(),
+    workingTextFiles: new Map(),
     ...(options.models?.image ? { imageGenerator: { model: options.models.image, signal } } : {}),
     sourceMessageId,
     editScope: task.editScope,
@@ -2632,6 +2914,9 @@ export async function runAgent(options: {
         }
       : {}),
   };
+  for (const deliverable of agentLoop.snapshot.deliverables) {
+    syncProposalReviewRevisionContext(toolContext, deliverable.proposalRevision, store, sessionId);
+  }
   const persistAssistantMessage = (content: string): number => {
     const attachments = toolContext.generatedAttachments?.splice(0);
     return store.addMessage(
@@ -2871,19 +3156,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   }
   let transcript = "";
   let documentProposalSubmitted = false;
-  /** Consecutive blocked propose_* attempts in this job (reset on success). */
-  let activeProposalRevisionCase = restoreActiveProposalRevisionCase(
-    store, sessionId, task.targetPath ?? continuationPath,
-  );
-  // The persisted revision case is authoritative when present: it is created
-  // only after a real content verdict and therefore also repairs older runs
-  // whose generic tool errors were historically recorded as proposal gates.
-  let proposalRevisionAttempts = activeProposalRevisionCase?.attempt ?? Math.max(
-    agentLoop.snapshot.progress.gateAttempts.semantic_review ?? 0,
-    agentLoop.snapshot.progress.gateAttempts.style ?? 0,
-    agentLoop.snapshot.progress.gateAttempts.proposal ?? 0,
-  );
-  /** Non-compressible blocker state for the active proposal retry chain. */
+  // Executable proposal revision state belongs to AgentRun deliverables. Session
+  // artifacts retain bodies/reviews, but never decide whether a fresh run may retry.
   /** Cached prefix immediately before the first full-body proposal in a retry chain. */
   let proposalRetryBase: number | undefined;
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
@@ -2962,8 +3236,16 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     const stepBudgetMode = options.maxTurns !== undefined
       ? "hard" as const
       : runtimeSettings.stepBudgetMode;
-    // Single configurable hard ceiling for both modes; experimental only adds soft/stall below it.
-    const hardCap = Math.max(1, options.maxTurns ?? runtimeSettings.maxAgentSteps);
+    // maxAgentSteps is the per-deliverable ceiling. A multi-document request gets
+    // one slice per independent output; tests may still force a single hard cap
+    // with options.maxTurns.
+    const perDeliverableHardCap = Math.max(1, options.maxTurns ?? runtimeSettings.maxAgentSteps);
+    const hardCap = computeAgentHardTurnBudget({
+      baseHardCap: perDeliverableHardCap,
+      documentDeliverables: task.documentDeliverables.length,
+      documentProposalRequired: task.documentProposalRequired,
+      maxTurnsOverride: options.maxTurns !== undefined,
+    });
     // A completed draft must not fail merely because scene retries consumed the
     // ordinary budget. These turns exist only while the terminal review lock is
     // active; unfinished scene chains receive no extra capacity.
@@ -3012,7 +3294,15 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       }
       lastProgressFingerprint = progressFp;
 
-      const reviewGrace = chapterReviewRequired && terminalReviewTurns < terminalReviewTurnLimit;
+      const activeDeliverable = agentLoop.activeDocumentDeliverable();
+      const reserveUsed = activeDeliverable?.execution?.reviewReserveUsed ?? 0;
+      const terminalReviewGrace = chapterReviewRequired
+        && (activeDeliverable
+          ? reserveUsed < AGENT_REVIEW_RESERVE_TURNS_PER_DELIVERABLE
+          : terminalReviewTurns < terminalReviewTurnLimit);
+      const proposalRevisionGrace = Boolean(activeDeliverable?.proposalRevision)
+        && reserveUsed < AGENT_REVIEW_RESERVE_TURNS_PER_DELIVERABLE;
+      const reviewGrace = terminalReviewGrace || proposalRevisionGrace;
       if (turn >= hardCap) {
         if (!reviewGrace) {
           pauseForUserResume = {
@@ -3023,7 +3313,16 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           };
           break;
         }
-        terminalReviewTurns += 1;
+        if (activeDeliverable) {
+          agentLoop.useDeliverableReviewReserve(
+            activeDeliverable.id,
+            turn + 1,
+            terminalReviewGrace ? "terminal_review" : "proposal_revision",
+            `deliverable-review-reserve:${sourceMessageId}:${turn + 1}:${activeDeliverable.id}`,
+          );
+        } else {
+          terminalReviewTurns += 1;
+        }
       }
       if (convergeMode && convergeTurnsLeft <= 0 && !reviewGrace) {
         pauseForUserResume = {
@@ -3067,7 +3366,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
 
       const step = turn + 1;
       currentUsageStep = step;
-      agentLoop.recordStep(step);
+      agentLoop.recordStep(step, activeDeliverable?.id);
       emit({ type: "step_start", step });
       const stepModel = executionModelForStep(
         task.mode,
@@ -3283,6 +3582,19 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       let pendingProposalRevisionDraft: ProposalRevisionDraftRef | undefined;
       for (const call of result.toolCalls) {
         let effectiveCall = call;
+        if (waitingForUser) {
+          emit({ type: "tool", name: call.name });
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: JSON.stringify({
+              status: "skipped",
+              code: "AGENT_RUN_WAITING",
+              message: "本步较早的工具调用已暂停 AgentRun；为防止暂停后继续写入，本调用未执行。",
+            }),
+          });
+          continue;
+        }
         emit({ type: "tool", name: call.name });
         if (executionToolNames.has(call.name) && isCharacterMutationTool(call.name)) {
           // A provider length stop may omit whole trailing fields even when braces
@@ -3329,8 +3641,139 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             }
           }
         }
+        let deliverableId = deliverableIdFromToolCall(effectiveCall);
+        if (!deliverableId && CHAPTER_SCENE_CONTINUATION_TOOLS.has(call.name)) {
+          deliverableId = toolContext.chapterSceneDraft?.deliverableId;
+        }
+        let proposalScopeError: string | undefined;
+        let proposalScopeCode = "PROPOSAL_REVISION_SCOPE_MISMATCH";
+        let proposalScopeRetryable = true;
+        let proposalScopeNextAllowedActions: string[] | undefined;
+        let proposalDocumentBaseBeforeCall: ProposalRevisionDocumentBase | undefined;
+        let proposalRevisionBeforeCall: ProposalRevisionCase | undefined;
+        if (call.name === "begin_chapter_draft") {
+          const requestedDeliverableId = deliverableId;
+          const canonicalDeliverableId = agentLoop.proposalDeliverableId(requestedDeliverableId);
+          if (requestedDeliverableId && !canonicalDeliverableId) {
+            proposalScopeError = `交付项 ${requestedDeliverableId} 不属于当前 AgentRun`;
+          } else if (canonicalDeliverableId) {
+            const activeRevision = agentLoop.proposalRevision(canonicalDeliverableId);
+            if (activeRevision) {
+              proposalScopeCode = "ACTIVE_REVISION_REQUIRES_FULL_DRAFT";
+              proposalScopeError = `交付项 ${canonicalDeliverableId} 有活动完整草稿修订链；不能另建场景草稿绕过复审`;
+            } else {
+              deliverableId = canonicalDeliverableId;
+              try {
+                const input = JSON.parse(effectiveCall.arguments || "{}") as Record<string, unknown>;
+                effectiveCall = {
+                  ...effectiveCall,
+                  arguments: JSON.stringify({ ...input, deliverableId: canonicalDeliverableId }),
+                };
+              } catch { /* Invalid JSON is handled by executeTool. */ }
+            }
+          }
+        } else if (CHAPTER_SCENE_CONTINUATION_TOOLS.has(call.name) && toolContext.chapterSceneDraft) {
+          const draftDeliverableId = toolContext.chapterSceneDraft.deliverableId;
+          if (deliverableId && draftDeliverableId && deliverableId !== draftDeliverableId) {
+            proposalScopeError = `场景草稿绑定交付项 ${draftDeliverableId}，不能改绑为 ${deliverableId}`;
+          } else if (!draftDeliverableId
+            && agentLoop.snapshot.deliverables.some(item => Boolean(item.proposalRevision))) {
+            proposalScopeCode = "ACTIVE_REVISION_REQUIRES_FULL_DRAFT";
+            proposalScopeError = "当前场景草稿没有可验证的交付项作用域，不能覆盖活动完整草稿修订链";
+          } else if (draftDeliverableId) {
+            const canonicalDeliverableId = agentLoop.proposalDeliverableId(draftDeliverableId);
+            if (!canonicalDeliverableId) {
+              proposalScopeError = `场景草稿交付项 ${draftDeliverableId} 不属于当前 AgentRun`;
+            } else {
+              deliverableId = canonicalDeliverableId;
+              if (agentLoop.proposalRevision(canonicalDeliverableId)) {
+                proposalScopeCode = "ACTIVE_REVISION_REQUIRES_FULL_DRAFT";
+                proposalScopeError = `交付项 ${canonicalDeliverableId} 有活动完整草稿修订链；不能通过场景草稿链绕过复审`;
+              }
+            }
+          }
+        }
+        if (!proposalScopeError && PROPOSAL_SUBMISSION_TOOLS.has(call.name)) {
+          toolContext.latestProposalDraft = undefined;
+          toolContext.proposalExpectedDocumentBase = undefined;
+          const requestedDeliverableId = deliverableId;
+          const canonicalDeliverableId = agentLoop.proposalDeliverableId(requestedDeliverableId);
+          if (requestedDeliverableId && !canonicalDeliverableId) {
+            proposalScopeError = `交付项 ${requestedDeliverableId} 不属于当前 AgentRun`;
+          } else if (canonicalDeliverableId) {
+            deliverableId = canonicalDeliverableId;
+            proposalRevisionBeforeCall = agentLoop.proposalRevision(canonicalDeliverableId);
+            try {
+              const input = JSON.parse(effectiveCall.arguments || "{}") as Record<string, unknown>;
+              const path = typeof input.path === "string" ? input.path : undefined;
+              const activeRevision = proposalRevisionBeforeCall;
+              const pathOwner = path
+                ? agentLoop.snapshot.deliverables.find(item => item.id !== canonicalDeliverableId
+                  && item.proposalRevision?.status === "blocked"
+                  && item.proposalRevision.path === path)
+                : undefined;
+              if (pathOwner) {
+                proposalScopeCode = "PROPOSAL_REVISION_PATH_OWNED";
+                proposalScopeError = `路径 ${path} 已绑定交付项 ${pathOwner.id} 的活动修订链，不能由 ${canonicalDeliverableId} 重复提交`;
+              } else if (activeRevision && !ACTIVE_REVISION_FILE_TOOLS.has(call.name)) {
+                proposalScopeCode = "ACTIVE_REVISION_REQUIRES_FULL_DRAFT";
+                proposalScopeError = `交付项 ${canonicalDeliverableId} 有活动工作副本；只能用 read_file 查看并用 edit_file/write_file 修订`;
+                proposalScopeNextAllowedActions = ["read_file", "edit_file", "write_file"];
+              } else if (activeRevision?.path && path && activeRevision.path !== path) {
+                proposalScopeError = `交付项 ${canonicalDeliverableId} 的活动修订链绑定 ${activeRevision.path}，不能切换为 ${path}`;
+              } else if (activeRevision && path && activeRevision.path === path) {
+                const baseChangeReason = proposalRevisionBaseChangeReason(project, activeRevision);
+                if (baseChangeReason) {
+                  proposalScopeCode = "PROPOSAL_REVISION_BASE_CHANGED";
+                  proposalScopeRetryable = false;
+                  proposalScopeNextAllowedActions = ["ask_user"];
+                  proposalScopeError = `${baseChangeReason}；旧修订稿不能自动覆盖当前文档。请由用户确认后重新基于当前文档开始修订`;
+                } else {
+                  toolContext.proposalExpectedDocumentBase = {
+                    path,
+                    deliverableId: canonicalDeliverableId,
+                    exists: activeRevision.baseDocumentExists,
+                    sourceHash: activeRevision.baseDocumentSourceHash,
+                    revisionCaseId: activeRevision.revisionCaseId,
+                  };
+                  effectiveCall = {
+                    ...effectiveCall,
+                    arguments: JSON.stringify({ ...input, deliverableId: canonicalDeliverableId }),
+                  };
+                }
+              } else {
+                if (!activeRevision && path) {
+                  proposalDocumentBaseBeforeCall = captureProposalRevisionDocumentBase(project, path);
+                  toolContext.proposalExpectedDocumentBase = {
+                    path,
+                    deliverableId: canonicalDeliverableId,
+                    exists: proposalDocumentBaseBeforeCall.baseDocumentExists,
+                    sourceHash: proposalDocumentBaseBeforeCall.baseDocumentSourceHash,
+                  };
+                }
+                effectiveCall = {
+                  ...effectiveCall,
+                  arguments: JSON.stringify({ ...input, deliverableId: canonicalDeliverableId }),
+                };
+              }
+            } catch {
+              // Invalid JSON is handled by executeTool and never consumes a gate.
+            }
+          }
+        }
         let toolResult: string;
-        if (chapterReviewRequired && !chapterReviewAllowsTool(call.name)) {
+        if (proposalScopeError) {
+          toolResult = JSON.stringify({
+            status: "recoverable_state_error",
+            code: proposalScopeCode,
+            failureKind: "invalid_request",
+            retryable: proposalScopeRetryable,
+            error: proposalScopeError,
+            ...(proposalScopeNextAllowedActions
+              ? { nextAllowedActions: proposalScopeNextAllowedActions }
+              : {}),
+          });
+        } else if (chapterReviewRequired && !chapterReviewAllowsTool(call.name)) {
           chapterReviewRejectedTools.push(call.name);
           toolResult = JSON.stringify({
             error: "章节场景链已经完成，当前阶段只允许 inspect_chapter_draft；任务清单已由运行时推进。",
@@ -3366,7 +3809,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         }
         // Workflow state consumes the complete result before model-facing bounding.
         const workflowControlResult = toolResult;
-        const deliverableId = deliverableIdFromToolCall(effectiveCall);
         agentLoop.observeTool(call.name, workflowControlResult, `tool:${sourceMessageId}:${step}:${call.id}`, deliverableId);
         executionProgress = agentLoop.executionProgress();
         // Proposal control flow must read the complete structured review before a
@@ -3459,12 +3901,47 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
               const needsRhythmPolish = isExpectedRhythmPolish(parsed);
               if (needsRhythmPolish) {
                 // 首轮情节场面已落提案，但不算交付完成：强制一次句式抛光。
-                // This is an expected two-stage transition, so it neither creates
-                // a blocker case nor consumes the semantic failure budget.
+                // This expected transition consumes no retry budget. It still owns
+                // a scoped case so an interrupted run can recover the exact draft.
                 const savedDraft = saveProposalRevisionDraft(
-                  effectiveCall, project, store, sessionId,
+                  effectiveCall, project, store, sessionId, toolContext,
                 );
-                const draft: ProposalRevisionDraftRef | undefined = savedDraft;
+                let draft: ProposalRevisionDraftRef | undefined;
+                if (savedDraft && deliverableId) {
+                  const retryState = proposalRetryStateAtGate(
+                    proposalRevisionBeforeCall?.retryState
+                    ?? createProposalRetryState({
+                      runId: agentLoop.snapshot.id,
+                      deliverableId,
+                      ...(savedDraft.path ? { path: savedDraft.path } : {}),
+                    }),
+                    "rhythm",
+                  );
+                  const caseDraft = saveProposalRevisionCase(
+                    savedDraft,
+                    "rhythm",
+                    retryState,
+                    retryState.gateAttempts.rhythm,
+                    undefined,
+                    undefined,
+                    proposalDocumentBaseBeforeCall,
+                    store,
+                    sessionId,
+                    proposalRevisionBeforeCall,
+                    { rhythmPolishPending: true },
+                  );
+                  draft = caseDraft;
+                  agentLoop.setProposalRevision(
+                    deliverableId,
+                    caseDraft.revisionCase,
+                    `proposal-revision-rhythm:${sourceMessageId}:${step}:${call.id}`,
+                  );
+                  syncProposalReviewRevisionContext(toolContext, caseDraft.revisionCase, store, sessionId);
+                } else {
+                  draft = savedDraft
+                    ? { ...savedDraft, ...(proposalRevisionBeforeCall ? { revisionCase: proposalRevisionBeforeCall } : {}) }
+                    : proposalDraftRefFromCase(proposalRevisionBeforeCall);
+                }
                 documentProposalSubmitted = false;
                 pendingProposalRevisionPrompt = [
                   proposalRevisionConvergePrompt(parsed, 1),
@@ -3473,12 +3950,18 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 pendingProposalRevisionDraft = draft;
               } else {
                 documentProposalSubmitted = true;
-                if (activeProposalRevisionCase) {
-                  closeProposalRevisionCase(activeProposalRevisionCase, store, sessionId);
-                  activeProposalRevisionCase = undefined;
+                toolContext.latestProposalDraft = undefined;
+                if (proposalRevisionBeforeCall) {
+                  closeProposalRevisionCase(proposalRevisionBeforeCall, store, sessionId);
+                  clearProposalReviewRevisionContext(toolContext, proposalRevisionBeforeCall);
+                  if (deliverableId) {
+                    agentLoop.clearProposalRevision(
+                      deliverableId,
+                      `proposal-revision-cleared:${sourceMessageId}:${step}:${call.id}`,
+                    );
+                  }
                 }
                 const proposalId = proposalIdFromToolResult(parsed);
-                proposalRevisionAttempts = 0;
                 proposalRetryBase = undefined;
               }
               const proposalId = proposalIdFromToolResult(parsed);
@@ -3496,31 +3979,93 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 } catch { /* ignore missing proposal row */ }
               }
             } else if (!("error" in parsed) || typeof parsed.error === "string") {
-              const decision = decideProposalFailure(parsed, proposalRevisionAttempts);
               const savedDraft = saveProposalRevisionDraft(
-                effectiveCall, project, store, sessionId,
+                effectiveCall, project, store, sessionId, toolContext,
               );
+              const scopePath = savedDraft?.path ?? proposalRevisionBeforeCall?.path
+                ?? (typeof parsed.path === "string" ? parsed.path : undefined);
+              const currentRetryState = proposalRevisionBeforeCall?.retryState
+                ?? createProposalRetryState({
+                  runId: agentLoop.snapshot.id,
+                  ...(deliverableId ? { deliverableId } : {}),
+                  ...(scopePath ? { path: scopePath } : {}),
+                });
+              const gate = proposalFailureGate(parsed);
+              const reviewResult = parsed;
+              const semanticIssues = gate === "semantic_review"
+                ? proposalRevisionIssues(reviewResult, proposalRevisionBeforeCall?.unresolvedIssues)
+                : undefined;
+              const issueTransition = gate === "semantic_review"
+                ? proposalIssueTransition(proposalRevisionBeforeCall?.unresolvedIssues ?? [], semanticIssues ?? [])
+                : undefined;
+              const decision = decideProposalFailure(parsed, currentRetryState, issueTransition);
+              const retryStateChanged = decision.state.absoluteSubmissions !== currentRetryState.absoluteSubmissions
+                || decision.state.semanticNoProgress !== currentRetryState.semanticNoProgress
+                || Object.keys(decision.state.gateAttempts).some(key => {
+                  const retryGate = key as ProposalRetryGate;
+                  return decision.state.gateAttempts[retryGate] !== currentRetryState.gateAttempts[retryGate];
+                });
+              const scopedSavedDraft = savedDraft
+                && proposalDraftMatchesRetryScope(savedDraft, decision.state, proposalRevisionBeforeCall)
+                ? savedDraft
+                : undefined;
+              const shouldPersistCase = proposalFailureShouldPersistRevisionCase({
+                hasScopedDraft: Boolean(scopedSavedDraft),
+                action: decision.action,
+                pauseReason: "reason" in decision ? decision.reason : undefined,
+                retryStateChanged,
+                hasPreviousCase: Boolean(proposalRevisionBeforeCall),
+              });
+              const decisionGate = "gate" in decision ? decision.gate : undefined;
+              const caseGate = decisionGate ?? gate ?? proposalRevisionBeforeCall?.lastGate ?? "proposal";
+              const caseAttempt = !decisionGate && !gate && proposalRevisionBeforeCall
+                ? proposalRevisionBeforeCall.attempt
+                : decision.attempt;
+              const caseDraft = scopedSavedDraft && shouldPersistCase
+                ? saveProposalRevisionCase(
+                    scopedSavedDraft,
+                    caseGate,
+                    decision.state,
+                    caseAttempt,
+                    semanticIssues,
+                    issueTransition,
+                    proposalDocumentBaseBeforeCall,
+                    store,
+                    sessionId,
+                    proposalRevisionBeforeCall,
+                    { rhythmPolishPending: Boolean(
+                      scopePath && toolContext.rhythmGracePaths?.has(scopePath),
+                    ), semanticVerdict: gate === "semantic_review" },
+                  )
+                : undefined;
+              if (caseDraft?.revisionCase && deliverableId) {
+                agentLoop.setProposalRevision(
+                  deliverableId,
+                  caseDraft.revisionCase,
+                  `proposal-revision:${sourceMessageId}:${step}:${call.id}:${caseDraft.revisionCase.retryState.absoluteSubmissions}`,
+                );
+                syncProposalReviewRevisionContext(toolContext, caseDraft.revisionCase, store, sessionId);
+              }
+              const draft = proposalFailureDraft({
+                action: decision.action,
+                caseDraft,
+                savedDraft,
+                previousCase: proposalRevisionBeforeCall,
+              });
               if (decision.action === "correct_call") {
-                const draft = savedDraft ?? proposalDraftRefFromCase(activeProposalRevisionCase);
                 pendingProposalRevisionPrompt = proposalCallCorrectionPrompt(parsed, draft);
                 pendingProposalRevisionDraft = draft;
               } else if (decision.action === "pause" && decision.reason !== "revision_exhausted") {
                 waitingForUser = true;
-                const draft = savedDraft ?? proposalDraftRefFromCase(activeProposalRevisionCase);
                 toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
               } else {
-                const reviewResult = "error" in parsed && typeof parsed.error === "string"
-                  ? { status: "error", message: parsed.error, ...(typeof parsed.path === "string" ? { path: parsed.path } : {}) }
-                  : parsed;
-                const draft = savedDraft
-                  ? saveProposalRevisionCase(savedDraft, reviewResult, decision.attempt, store, sessionId, activeProposalRevisionCase)
-                  : undefined;
-                activeProposalRevisionCase = draft?.revisionCase ?? activeProposalRevisionCase;
                 if (decision.action === "pause") {
                   waitingForUser = true;
-                  toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft));
+                  toolResult = JSON.stringify(proposalFailurePauseResult(parsed, decision.reason, draft, {
+                    exhaustion: decision.exhaustion,
+                    gate: decision.gate,
+                  }));
                 } else {
-                  proposalRevisionAttempts = decision.attempt;
                   pendingProposalRevisionPrompt = [
                     proposalRevisionConvergePrompt(
                       reviewResult,
@@ -3804,8 +4349,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 : {}),
             }),
           });
-          // Fresh chapter: allow one clean revision window again.
-          proposalRevisionAttempts = 0;
           const afterTokens = approximateMessageTokens(messages);
           const afterMessageCount = messages.length;
           const shelfCount = toolContext.materialsShelf?.size ?? 0;
@@ -4145,8 +4688,25 @@ export const AGENT_HARD_TURN_CAP = 100;
 export const AGENT_STALL_WINDOW = 4;
 /** Extra steps after soft/stall to force a minimal deliverable or ask_user. */
 export const AGENT_CONVERGE_TURNS = 2;
+/** Extra turns beyond the run hard cap reserved for a scoped final-review repair. */
+export const AGENT_REVIEW_RESERVE_TURNS_PER_DELIVERABLE = 2;
 
 export type AgentBudgetPauseReason = "soft_budget" | "stall" | "hard_cap";
+
+export function computeAgentHardTurnBudget(input: {
+  baseHardCap: number;
+  documentDeliverables: number;
+  documentProposalRequired: boolean;
+  maxTurnsOverride: boolean;
+}): number {
+  if (input.maxTurnsOverride) return input.baseHardCap;
+  const deliverableSlots = Math.max(
+    1,
+    input.documentDeliverables,
+    input.documentProposalRequired ? 1 : 0,
+  );
+  return input.baseHardCap * deliverableSlots;
+}
 
 /**
  * Dynamic soft step budget from remaining work (todos, deliverables, scene chain).
@@ -4290,7 +4850,7 @@ function selectedBlocksContext(project: WriterProject, references?: Array<{ path
       preview,
       message: text.length <= 800
         ? "选区已完整提供；直接用锚点 patch，禁止通读文档。"
-        : "选区较长；使用 startAnchorId/endAnchorId 调用 read_document_span，禁止按块通读。",
+        : "选区较长；使用 read_file 的行范围读取选区及必要接缝，禁止按块通读无关内容。",
     });
   });
   return sections.length ? `用户从网页浏览器明确加入了以下文本选区锚点。只处理这些范围，不要扩展为整篇文档：\n${sections.join("\n")}` : "";
@@ -4323,6 +4883,7 @@ function recentArtifactsContext(
   project: WriterProject,
   task: WritingTask,
   continuityFactsEnabled = false,
+  activeRevisionCases: readonly ProposalRevisionCase[] = [],
 ): string {
   const state = store.sessionContext(sessionId);
   const restorableDraft = task.continuation
@@ -4359,11 +4920,30 @@ function recentArtifactsContext(
     status: fact.status,
     source: fact.sourcePath,
   })) : [];
-  let artifacts = store.recentContextArtifacts(sessionId, 12)
+  const activeRevisionArtifactIds = new Set(activeRevisionCases.flatMap(item => [
+    item.draftArtifactId,
+    item.reviewArtifactId,
+    ...(item.semanticDraftArtifactId ? [item.semanticDraftArtifactId] : []),
+  ]));
+  const recentArtifacts = store.recentContextArtifacts(sessionId, 12);
+  const referencedArtifacts = [...activeRevisionArtifactIds].flatMap(id => {
+    if (recentArtifacts.some(item => item.id === id)) return [];
+    const artifact = store.contextArtifactById(sessionId, id);
+    return artifact ? [{
+      id: artifact.id,
+      kind: artifact.kind,
+      path: artifact.path,
+      sourceHash: artifact.sourceHash,
+      digest: artifact.digest,
+    }] : [];
+  });
+  let artifacts = [...recentArtifacts, ...referencedArtifacts]
     .filter((artifact) => {
       // Generated work-memory artifacts own their content hash and need not have
       // an on-disk document yet. Source-backed reads still validate against disk.
-      if (artifact.kind === "proposal_revision_draft" || artifact.kind === "proposal_revision_case") return true;
+      if (artifact.kind === "proposal_revision_draft" || artifact.kind === "proposal_revision_case") {
+        return activeRevisionArtifactIds.has(artifact.id);
+      }
       if (!artifact.path) return true;
       if (project.isDocumentHidden(artifact.path)) return false;
       if (!project.textFileExists(artifact.path)) return false;
@@ -4432,19 +5012,10 @@ function recentArtifactsContext(
       id, kind, path, sourceHash,
       digest: digest.replace(/\s+/g, " ").slice(0, 240),
     }));
-  const revisionCases = artifacts
-    .filter(item => item.kind === "proposal_revision_case")
-    .flatMap(item => {
-      const artifact = store.contextArtifactById(sessionId, item.id);
-      if (!artifact) return [];
-      try {
-        const value = JSON.parse(artifact.content) as ProposalRevisionCase;
-        return Array.isArray(value.unresolvedIssues) ? [{ artifactId: item.id, ...value }] : [];
-      } catch { return []; }
-    })
-    .filter((item, index, all) => all.findIndex(candidate => candidate.revisionCaseId === item.revisionCaseId) === index)
+  const revisionCases = activeRevisionCases
     .filter(item => item.status === "blocked")
-    .slice(0, 2);
+    .slice(0, 2)
+    .map(item => ({ artifactId: item.reviewArtifactId, ...item }));
   if (!catalog.length && !restored.length && !checkpoint && !continuityFacts.length && !revisionCases.length) return "";
   const scopeNote = task.continuation
     ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
@@ -4568,11 +5139,11 @@ function writingBootstrapContext(
 
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
 - outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接写作，禁止为了写正文创建大纲。
-- 需要衔接：对 previousChapterCandidates 中的路径 read_document(lastSection=true) 一次。
-- 目标之后已有成稿时：对 nextChapterCandidates 中的路径 read_document(startLine=1,endLine=40) 一次，只把其开场事实当作本章离场边界，不把后章事件提前写入本章。
+- 需要衔接：对 previousChapterCandidates 中的路径用 read_file 读取末尾必要范围一次。
+- 目标之后已有成稿时：对 nextChapterCandidates 中的路径 read_file(startLine=1,endLine=40) 一次，只把其开场事实当作本章离场边界，不把后章事件提前写入本章。
 - 需要人设：先对 characterIndex 中的 id 调用 get_character 获取必要字段摘要；摘要不足时再带 sections 选读，场景状态需传 outlineNodeId。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
-- 交付路径由 Agent 根据作品需要决定：可直接 propose_document、局部 patch、先 compile_write_pack，${scenePipeline.isolatedWriter ? "短篇单场可用 write_document_isolated，" : ""}${scenePipeline.enabled ? `或在长篇连续状态确有收益时使用${scenePipeline.isolatedWriter ? "隔离 Writer 的" : ""}场景草稿链` : "场景链当前关闭"}。
+- 交付路径由 Agent 根据作品需要决定：完整成稿用 write_file、局部修改用 edit_file、约束复杂时可先 compile_write_pack，${scenePipeline.enabled ? `或在长篇连续状态确有收益时使用${scenePipeline.isolatedWriter ? "隔离 Writer 的" : ""}场景草稿链` : "场景链当前关闭"}。
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
 - outline、write pack 与 scene guide 都只是可选工作材料；实际正文和人物选择优先，不得扩展成其他章节任务。
 ${JSON.stringify({
@@ -4772,7 +5343,7 @@ export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): st
     `${MATERIALS_SHELF_PROMPT_PREFIX}以下设定/角色已在本会话读过（sourceHash 未变则禁止无目标整篇重读或反复 search）。`,
     "hardConstraints 是不可压缩执行态，角色能力 unlocked、限制、身体与知识边界以它为准；digest 只是可恢复摘要。",
     "写作优先复用 coveredSections/coveredFields；请求字段未覆盖时允许 get_character sections 或文档定点补读。",
-    "文档缺口先 inspect 看 blocks/headings，再用 block 或 startLine/endLine 或 quote 定点补读；禁止用 search_project 当分页阅读。",
+    "文档缺口用 read_file 的 block、startLine/endLine 或 quote 定点补读；禁止用 search_files 当分页阅读。",
     "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
     JSON.stringify({ materials: payload, count: payload.length, scope: "session" }),
   ].join("\n");
@@ -4991,10 +5562,16 @@ async function executeToolCached(
   const path = typeof normalized.path === "string" ? normalized.path : undefined;
   const outlinePath = call.name.includes("outline") ? resolveOutlineSourcePath(project) : undefined;
   const sourcePath = path ?? (outlinePath && project.documentExists(outlinePath) ? outlinePath : undefined);
+  const workingSourcePath = sourcePath
+    ? sourcePath.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").replace(/^resource(?:\/|$)/, "")
+    : undefined;
+  const workingFile = workingSourcePath ? context.workingTextFiles?.get(workingSourcePath) : undefined;
   const characterId = call.name === "get_character" ? optionalPositiveIntegerLike(normalized.id) : undefined;
   const character = characterId ? store.characters().find(item => item.id === characterId) : undefined;
   const sourceHash = character
     ? project.hash(JSON.stringify(character))
+    : workingFile
+      ? workingFile.sourceHash
     : sourcePath && project.textFileExists(sourcePath)
     ? project.hash(project.readTextFile(sourcePath))
     : call.name === "search_project"
@@ -5005,7 +5582,13 @@ async function executeToolCached(
             [fact.id, fact.status, fact.updatedAt]),
         }))
     : call.name.endsWith("_files")
-      ? project.hash(JSON.stringify(project.listTextFiles().map(file => [file, project.hash(project.readTextFile(file))])))
+      ? project.hash(JSON.stringify([...new Set([
+          ...project.listTextFiles(),
+          ...(context.workingTextFiles?.keys() ?? []),
+        ])].sort().map(file => [
+          file,
+          context.workingTextFiles?.get(file)?.sourceHash ?? project.hash(project.readTextFile(file)),
+        ])))
       : project.hash(JSON.stringify(project.listDocuments()));
 
   if (DOCUMENT_READ_TOOLS.has(call.name) && sourcePath) {
@@ -5065,8 +5648,8 @@ async function executeToolCached(
       if (allServed) {
         return JSON.stringify({
           status: "materials_shelf_search_redirect",
-          message: "本 job 材料架已收录项目全部 lore/outline 正文。禁止再 search_project 当分页阅读；"
-            + "请依据 digests 写作，缺段时对具体 path 做 inspect + block/行号定点补读。",
+          message: "本 job 材料架已收录项目全部 lore/outline 正文。禁止再 search_files 当分页阅读；"
+            + "请依据 digests 写作，缺段时对具体 path 用 read_file 的 block/行号定点补读。",
           shelfPaths: loreDocs.slice(0, 20),
           shelfCount: loreDocs.length,
           nextAction: "inspect_or_targeted_read",
@@ -5313,7 +5896,7 @@ export function compactRuntimeMessages(
         endLine: parsed.endLine,
         sourceHash: parsed.sourceHash,
         digest: content.replace(/\s+/g, " ").slice(0, digestLimit),
-        message: "正文已压缩为 digest；请直接基于 digest、本轮任务工作记忆与写作引导继续。禁止因压缩再次 read_document / list_outline_nodes。",
+        message: "正文已压缩为 digest；请直接基于 digest、本轮任务工作记忆与写作引导继续。禁止因压缩再次 read_file / list_outline_nodes。",
       });
     } catch {
       if (toolBody.length > 2_500) {
@@ -5369,14 +5952,17 @@ export function stripStaleReasoningContent(messages: ApiMessage[]): void {
 }
 
 /**
- * Strip older propose_* payloads when rebuilding a multi-proposal transcript.
+ * Strip older full-body file payloads when rebuilding a multi-delivery transcript.
  * CACHE: Not used mid-job (append-only) so prefix cache stays intact.
  */
 export function compactCompletedToolCalls(messages: ApiMessage[]): void {
   let latestProposalMessage = -1;
+  const carriesDocumentBody = (name: string) => name === "write_file"
+    || name === "edit_file"
+    || name.startsWith("propose_document");
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
-    if (message.role === "assistant" && message.tool_calls?.some(call => call.function.name.startsWith("propose_document"))) {
+    if (message.role === "assistant" && message.tool_calls?.some(call => carriesDocumentBody(call.function.name))) {
       latestProposalMessage = index;
     }
   }
@@ -5386,14 +5972,23 @@ export function compactCompletedToolCalls(messages: ApiMessage[]): void {
     if (index === latestProposalMessage) continue;
     if (message.role !== "assistant" || !message.tool_calls) continue;
     for (const call of message.tool_calls) {
-      if (!call.function.name.startsWith("propose_document")) continue;
+      if (!carriesDocumentBody(call.function.name)) continue;
       try {
         const input = JSON.parse(call.function.arguments) as Record<string, unknown>;
-        if (call.function.name === "propose_document") {
+        if (call.function.name === "write_file" || call.function.name === "propose_document") {
           call.function.arguments = JSON.stringify({
             path: input.path,
-            summary: input.summary,
-            content: "[内容已压缩：旧正文已提交并从历史工具参数中移除。新提交时必须重新生成完整正文，不得复制此占位文本。]",
+            ...(input.summary !== undefined ? { summary: input.summary } : {}),
+            content: "[内容已压缩：旧工作副本已提交并从历史工具参数中移除。]",
+          });
+        } else if (call.function.name === "edit_file") {
+          call.function.arguments = JSON.stringify({
+            path: input.path,
+            edits: [{
+              operation: "replace",
+              oldText: "[旧编辑原文已压缩]",
+              content: "[旧编辑内容已压缩]",
+            }],
           });
         } else {
           call.function.arguments = JSON.stringify({
@@ -5481,6 +6076,32 @@ function emitUsageEvent(
 }
 
 const MODEL_TOOL_RESULT_TOKEN_BUDGET = 6_000;
+const MODEL_FILE_MUTATION_TOOLS = new Set(["write_file", "edit_file", "move_file", "delete_file"]);
+
+function modelVisibleFileMutationResult(call: ToolAccumulator, result: string): string {
+  if (!MODEL_FILE_MUTATION_TOOLS.has(call.name)) return result;
+  try {
+    const parsed = JSON.parse(result) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return result;
+    const {
+      proposalId: _proposalId,
+      changeSetId: _changeSetId,
+      deliverableId: _deliverableId,
+      ...visible
+    } = parsed as Record<string, unknown>;
+    const status = typeof visible.status === "string" ? visible.status : "";
+    const message = status === "accepted"
+      ? "文件变更已写入。"
+      : status === "pending"
+        ? "文件变更已提交，等待用户审批。"
+        : typeof visible.message === "string"
+          ? visible.message
+          : undefined;
+    return JSON.stringify({ ...visible, ...(message ? { message } : {}) });
+  } catch {
+    return result;
+  }
+}
 
 /**
  * Bound a tool result before it is appended to the live transcript. The full
@@ -5494,6 +6115,7 @@ export function boundToolResultForModel(
   store: WriterStore,
   sessionId: string,
 ): string {
+  result = modelVisibleFileMutationResult(call, result);
   const estimatedTokens = approximateRequestTokens(result);
   if (estimatedTokens <= MODEL_TOOL_RESULT_TOKEN_BUDGET) return result;
   let parsed: Record<string, unknown> | undefined;

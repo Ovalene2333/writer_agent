@@ -2,6 +2,7 @@ import type { AgentEvent } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ToolCall, ToolExecutionContext, ToolHandlerArgs } from "./types.js";
+import { TOOL_NAMES } from "./schema.js";
 import {
   isToolDependencyTimeout,
   ToolDependencyError,
@@ -41,11 +42,15 @@ import {
   handleWriteDocumentIsolated,
 } from "./proposals.js";
 import {
+  handleDeleteFile,
+  handleEditFile,
   handleInspectFile,
   handleListFiles,
   handleProposeChangeSet,
   handleReadFile,
   handleSearchFiles,
+  handleMoveFile,
+  handleWriteFile,
 } from "./files.js";
 import { handleCompileWritePack } from "./write_pack.js";
 import { handleGenerateImage } from "./images.js";
@@ -80,6 +85,10 @@ const HANDLERS: Record<string, Handler> = {
   inspect_file: handleInspectFile,
   read_file: handleReadFile,
   search_files: handleSearchFiles,
+  write_file: handleWriteFile,
+  edit_file: handleEditFile,
+  move_file: handleMoveFile,
+  delete_file: handleDeleteFile,
   list_outline_nodes: handleListOutlineNodes,
   get_outline_node: handleGetOutlineNode,
   design_creative_outline: handleDesignCreativeOutline,
@@ -166,5 +175,5 @@ export async function executeTool(
 }
 
 export function registeredToolNames(): string[] {
-  return Object.keys(HANDLERS);
+  return Object.keys(HANDLERS).filter(name => TOOL_NAMES.has(name));
 }

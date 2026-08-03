@@ -31,7 +31,7 @@ export const DEFAULT_AGENT_EVALUATION_CASES: AgentEvaluationCase[] = [
     permissionMode: "ask",
     expected: {
       contract: { outcome: "answer", evidence: "none", mutation: "none", planning: "direct" },
-      forbiddenTools: ["propose_document", "propose_document_patch", "propose_change_set", "save_character"],
+      forbiddenTools: ["write_file", "edit_file", "move_file", "delete_file", "save_character"],
       artifact: "none",
       terminal: "done",
       maxSteps: 3,
@@ -43,7 +43,7 @@ export const DEFAULT_AGENT_EVALUATION_CASES: AgentEvaluationCase[] = [
     permissionMode: "ask",
     expected: {
       contract: { outcome: "answer", evidence: "project", mutation: "none" },
-      requiredTools: ["search_project"],
+      requiredTools: ["search_files"],
       artifact: "none",
       terminal: "done",
       maxSteps: 6,
@@ -56,8 +56,8 @@ export const DEFAULT_AGENT_EVALUATION_CASES: AgentEvaluationCase[] = [
     expected: {
       contract: { outcome: "document", evidence: "target", mutation: "document", planning: "adaptive" },
       requiredAnyToolGroups: [
-        ["locate_document_span", "read_document", "read_document_span"],
-        ["propose_document_patch", "propose_document", "propose_change_set"],
+        ["search_files", "read_file"],
+        ["edit_file", "write_file"],
       ],
       artifact: "document",
       terminal: "done",

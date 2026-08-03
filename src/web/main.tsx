@@ -1406,7 +1406,7 @@ function App() {
         start,
         end,
         blockCount,
-        left: Math.max(12, Math.min(window.innerWidth - 260, rect.left + rect.width / 2 - 120)),
+        left: Math.max(12, Math.min(window.innerWidth - 340, rect.left + rect.width / 2 - 160)),
         top: Math.max(12, rect.top - 48),
       });
     });
@@ -1426,6 +1426,29 @@ function App() {
     setReaderSelection(null);
     window.getSelection()?.removeAllRanges();
     requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  async function copyReaderSelection() {
+    if (!readerSelection) return;
+    const text = readerSelection.text;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = globalThis.document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.left = "-9999px";
+        globalThis.document.body.appendChild(area);
+        area.select();
+        globalThis.document.execCommand("copy");
+        area.remove();
+      }
+      setNotice(`已复制选段（${documentWordCount(text)} 字）`);
+    } catch {
+      setNotice("复制失败，请手动复制");
+    }
   }
 
   function editReaderSelectionDirectly() {
@@ -4379,6 +4402,9 @@ function App() {
                 onMouseDown={event => event.preventDefault()}
               >
                 <span>{readerSelection.blockCount > 1 ? "跨段" : "选段"} · {documentWordCount(readerSelection.text)} 字</span>
+                <button type="button" onClick={() => void copyReaderSelection()}>
+                  <Copy size={13} />复制
+                </button>
                 <button type="button" onClick={addReaderSelectionToContext}>
                   <MessageSquare size={13} />加入上下文
                 </button>
@@ -6243,8 +6269,7 @@ function App() {
                   ) : null}
                 </div>
                 <p className="context-graph-hint">
-                  查看<strong>章节/场次切换</strong>节点，可知步骤之间继续携带了什么、卸下了什么。
-                  步骤条在输入骤降处也会标「上下文收束」。项目索引不含全文；切换后按需再读设定属正常。
+                  <strong>章节/场次切换</strong>节点显示保留与卸下的上下文；步骤条会在输入骤降处标记收束。
                 </p>
                 {(() => {
                   const cuts = (contextGraph?.nodes ?? [])

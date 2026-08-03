@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  createProposalRetryState,
   decideProposalFailure,
   isExpectedRhythmPolish,
-  MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW,
+  proposalIssueTransition,
+  type ProposalRevisionCase,
+  type ProposalRevisionIssue,
 } from "./proposal_retry.js";
 /**
  * Cache / prompt-assembly guards. When changing agent prompts, keep the contract
@@ -27,7 +30,14 @@ import {
   buildToolArgumentRepairMessages,
   characterMutationCompletesTask,
   chapterContinuationPrompt,
+  captureProposalRevisionDocumentBase,
   proposalRevisionConvergePrompt,
+  proposalRevisionBaseChangeReason,
+  proposalRevisionDraftCacheKey,
+  proposalFailureDraft,
+  proposalFailurePauseResult,
+  proposalFailureShouldPersistRevisionCase,
+  saveProposalRevisionCase,
   chapterDraftNeedsReview,
   chapterReviewAllowsTool,
   chapterReviewCompleted,
@@ -81,8 +91,14 @@ import { messageContentText } from "./model_compat.js";
 test("agent tool schema has stable order and unique names", () => {
   const names = agentToolNames();
   assert.equal(new Set(names).size, names.length);
+  for (const name of ["read_file", "write_file", "edit_file", "move_file", "delete_file"]) {
+    assert.ok(names.includes(name), `unified file catalog missing ${name}`);
+  }
+  for (const legacy of ["read_document", "propose_document", "propose_document_patch", "propose_change_set"]) {
+    assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
+  }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "b26768172ab1cd26");
+  assert.equal(agentToolSchemaHash(), "e84a96f1ce246dd9");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -208,6 +224,18 @@ test("request waterfall and oversized tool paging stay bounded", () => {
     const artifact = store.contextArtifactById(sessionId, Number(bounded.artifactId));
     assert.equal(artifact?.content, full);
     assert.ok(String(bounded.preview).length < full.length);
+    const visibleWrite = JSON.parse(boundToolResultForModel(
+      { id: "t2", name: "write_file", arguments: "{}" },
+      JSON.stringify({ proposalId: 42, deliverableId: "document-1", status: "pending", path: "lore/a.md" }),
+      project,
+      store,
+      sessionId,
+    )) as Record<string, unknown>;
+    assert.equal(visibleWrite.status, "pending");
+    assert.equal(visibleWrite.path, "lore/a.md");
+    assert.equal("proposalId" in visibleWrite, false);
+    assert.equal("deliverableId" in visibleWrite, false);
+    assert.match(String(visibleWrite.message), /等待用户审批/u);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -248,7 +276,7 @@ test("task modes share one frozen universal capability catalog", () => {
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
   assert.deepEqual(writeNames, catalog);
-  for (const required of ["read_document", "begin_chapter_draft", "write_document_isolated", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "inspect_chapter_draft", "propose_chapter_draft"]) {
+  for (const required of ["read_file", "write_file", "edit_file", "move_file", "delete_file", "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "inspect_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
   assert.equal(writeNames.includes("save_character"), true);
@@ -258,8 +286,10 @@ test("task modes share one frozen universal capability catalog", () => {
   const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
   assert.equal(planNames.includes("write_chapter_scene"), false);
   assert.equal(planNames.includes("write_chapter_scene_notes"), false);
-  assert.equal(planNames.includes("propose_chapter_draft"), false);
-  assert.ok(planNames.includes("read_document"));
+  assert.equal(catalog.some(name => name.startsWith("propose_")), false);
+  assert.equal(planNames.includes("write_file"), false);
+  assert.equal(planNames.includes("edit_file"), false);
+  assert.ok(planNames.includes("read_file"));
 });
 
 test("plan workflows stay read-only and use bounded creative pacing", () => {
@@ -292,7 +322,7 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   const normal = taskInstructions("character", "deliver", "ask", false);
   assert.match(normal, /检查同名卡/);
   assert.match(normal, /角色保存成功即完成本任务/);
-  assert.match(normal, /禁止再提交文档提案或 change set/);
+  assert.match(normal, /禁止再写入无关文件/);
   assert.match(normal, /直接 get_character/);
   assert.match(normal, /不要调用 save_simple_character/);
   assert.match(normal, /结构化错误/);
@@ -518,8 +548,8 @@ test("provider usage parsing and tagged persistence include hidden model calls",
 });
 
 test("audit workflow separates review-only from repair", () => {
-  assert.match(taskInstructions("audit", "shape", "ask", false), /不提案/);
-  assert.match(taskInstructions("audit", "shape", "ask", true), /最小提案/);
+  assert.match(taskInstructions("audit", "shape", "ask", false), /不写文件/);
+  assert.match(taskInstructions("audit", "shape", "ask", true), /edit_file.*最小修改/);
 });
 
 test("rewrite scope requires concrete evidence before locking to one point", () => {
@@ -569,8 +599,8 @@ test("prebuilt todo plans start with one active step", () => {
 test("chapter workflow lets the Agent choose a delivery path", () => {
   const instructions = taskInstructions("write_scene", "deliver", "ask", true);
   assert.match(instructions, /自主决定/);
-  assert.match(instructions, /直接用 propose_document/);
-  assert.match(instructions, /propose_document_patch/);
+  assert.match(instructions, /完整成稿用 write_file/);
+  assert.match(instructions, /局部用 edit_file/);
   assert.match(instructions, /compile_write_pack/);
   assert.match(instructions, /begin_chapter_draft/);
   assert.match(instructions, /write_chapter_scene/);
@@ -585,9 +615,9 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(instructions, /大纲不是前置条件/);
   assert.match(instructions, /问题密集/);
   assert.match(instructions, /重写受影响场景乃至全文/);
-  assert.doesNotMatch(instructions, /不能跳过逐场景|禁止 propose_document\/patch/);
+  assert.doesNotMatch(instructions, /不能跳过逐场景/);
   const fast = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true);
-  assert.match(fast, /传统单 Agent 链路/);
+  assert.match(fast, /单 Agent 链路/);
   assert.match(fast, /不得调用或等待正文 Writer/);
   assert.match(fast, /不要为了展示流程而建立场景链/);
   const withoutScenePipeline = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true, false);
@@ -617,7 +647,7 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   assert.match(prompt, /禁止重复提交同一章/);
   assert.match(prompt, /chapters\/第1章\.md/);
   assert.match(prompt, /警报已触发/);
-  assert.match(prompt, /重新选择直接成稿/);
+  assert.match(prompt, /重新选择 write_file/);
   assert.match(prompt, /撰写第2章/);
   assert.match(prompt, /材料架已收录/);
   assert.match(prompt, /lore\/world\.md/);
@@ -633,14 +663,14 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   assert.match(minimal, /材料架仍空/);
 });
 
-test("proposal revision converge prompt escalates after repeated blocks", () => {
+test("proposal revision converge prompt carries the scoped blocker packet", () => {
   const first = proposalRevisionConvergePrompt({
     status: "final_review_revision_required",
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
     path: "chapters/a.md",
     message: "修英文残留",
   }, 1);
-  assert.match(first, /修订窗口第 1 次/);
+  assert.match(first, /当前门禁第 1 次/);
   assert.match(first, /最小修订/);
   assert.doesNotMatch(first, /最后一轮/);
   const withStructuredBlocker = proposalRevisionConvergePrompt({
@@ -649,12 +679,26 @@ test("proposal revision converge prompt escalates after repeated blocks", () => 
     path: "chapters/a.md",
     message: "终审未通过",
   }, 1, {
+    schemaVersion: 3,
     revisionCaseId: "revision:test",
+    runId: "run-test",
+    deliverableId: "document-1",
     path: "chapters/a.md",
+    baseDocumentExists: false,
+    baseDocumentSourceHash: "__missing__",
     draftArtifactId: 10,
     draftSourceHash: "draft-hash",
     reviewArtifactId: 11,
     attempt: 1,
+    lastGate: "semantic_review",
+    retryState: {
+      runId: "run-test",
+      deliverableId: "document-1",
+      path: "chapters/a.md",
+      gateAttempts: { style: 0, rhythm: 0, length: 0, semantic_review: 1, proposal: 0 },
+      semanticNoProgress: 0,
+      absoluteSubmissions: 1,
+    },
     unresolvedIssues: [{
       id: "issue:ability",
       severity: "blocker",
@@ -672,6 +716,9 @@ test("proposal revision converge prompt escalates after repeated blocks", () => 
   assert.match(withStructuredBlocker, /issue:ability/);
   assert.match(withStructuredBlocker, /脊柱超算/);
   assert.match(withStructuredBlocker, /已解锁纳米核心/);
+  assert.match(withStructuredBlocker, /read_file/);
+  assert.match(withStructuredBlocker, /edit_file/);
+  assert.doesNotMatch(withStructuredBlocker, /artifactId/);
   const last = proposalRevisionConvergePrompt({
     status: "error",
     message: "句式门禁",
@@ -680,7 +727,7 @@ test("proposal revision converge prompt escalates after repeated blocks", () => 
   assert.match(last, /manage_todos|ask_user/);
 });
 
-test("proposal retry policy separates dependency outages from bounded prose revisions", () => {
+test("proposal retry policy counts only same semantic blockers as no progress", () => {
   assert.equal(isExpectedRhythmPolish({
     code: "RHYTHM_POLISH_REQUIRED",
     rhythmRevisionRequired: true,
@@ -689,34 +736,290 @@ test("proposal retry policy separates dependency outages from bounded prose revi
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
   }), false);
 
-  assert.deepEqual(decideProposalFailure({
+  const initial = createProposalRetryState({
+    runId: "run-1", deliverableId: "document-1", path: "chapters/a.md",
+  });
+  const dependency = decideProposalFailure({
     code: "PROSE_GATE_UNAVAILABLE",
     failureKind: "dependency",
     retryable: true,
-  }, 0), { action: "pause", reason: "dependency", attempt: 0 });
+  }, initial);
+  assert.equal(dependency.action, "pause");
+  assert.equal(dependency.action === "pause" ? dependency.reason : "", "dependency");
+  assert.equal(dependency.state.absoluteSubmissions, 0);
 
-  assert.deepEqual(decideProposalFailure({
+  const style = decideProposalFailure({
+    code: "PROSE_STYLE_REVISION_REQUIRED",
+    failureKind: "semantic_revision",
+    error: "句式门禁",
+  }, initial);
+  assert.equal(style.action, "revise");
+  assert.equal(style.action === "revise" ? style.gate : "", "style");
+  assert.equal(style.state.gateAttempts.style, 1);
+  assert.equal(style.state.semanticNoProgress, 0);
+  const styleTwice = decideProposalFailure({
+    code: "PROSE_STYLE_REVISION_REQUIRED",
+    failureKind: "semantic_revision",
+    error: "句式门禁",
+  }, style.state);
+  assert.equal(styleTwice.state.gateAttempts.style, 2);
+
+  const issueA = { id: "issue:a" };
+  const firstSemantic = decideProposalFailure({
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
     status: "final_review_revision_required",
-  }, 0), { action: "revise", attempt: 1 });
+  }, styleTwice.state, proposalIssueTransition([], [issueA]));
+  assert.equal(firstSemantic.action, "revise");
+  assert.equal(firstSemantic.state.semanticNoProgress, 0);
+  assert.equal(firstSemantic.state.gateAttempts.style, 0, "reaching semantic review proves style passed");
 
-  assert.deepEqual(decideProposalFailure({
+  const issueB = { id: "issue:b" };
+  const movingBlocker = decideProposalFailure({
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    status: "final_review_revision_required",
+  }, firstSemantic.state, proposalIssueTransition([issueA], [issueB]));
+  assert.equal(movingBlocker.action, "revise");
+  assert.equal(movingBlocker.state.semanticNoProgress, 0);
+  assert.equal(movingBlocker.state.gateAttempts.style, 0, "passed deterministic gates stay reset");
+
+  const laterStyle = decideProposalFailure({
+    code: "PROSE_STYLE_REVISION_REQUIRED",
+    failureKind: "semantic_revision",
+    error: "语义修订引入了新的句式问题",
+  }, firstSemantic.state);
+  assert.equal(laterStyle.action, "revise");
+  assert.equal(laterStyle.state.gateAttempts.style, 1, "a later style regression starts a new streak");
+
+  const sameOnce = decideProposalFailure({
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    status: "final_review_revision_required",
+  }, firstSemantic.state, proposalIssueTransition([issueA], [issueA]));
+  assert.equal(sameOnce.action, "revise");
+  assert.equal(sameOnce.state.semanticNoProgress, 1);
+  const sameTwice = decideProposalFailure({
+    code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
+    status: "final_review_revision_required",
+  }, sameOnce.state, proposalIssueTransition([issueA], [issueA]));
+  assert.equal(sameTwice.action, "pause");
+  assert.equal(sameTwice.action === "pause" ? sameTwice.exhaustion : "", "semantic_no_progress");
+
+  const invalidCall = decideProposalFailure({
     code: "INVALID_TOOL_ARGUMENTS_JSON",
     error: "工具参数不是有效 JSON",
-  }, 0), { action: "correct_call", attempt: 0 });
+  }, firstSemantic.state);
+  assert.equal(invalidCall.action, "correct_call");
+  assert.equal(invalidCall.state.semanticNoProgress, 0);
+  assert.equal(invalidCall.state.absoluteSubmissions, firstSemantic.state.absoluteSubmissions);
 
-  assert.deepEqual(decideProposalFailure({
-    code: "TARGET_DOCUMENT_MISSING",
+  const invalidReview = decideProposalFailure({
+    code: "DIRECT_CHAPTER_REVIEW_INVALID",
+    failureKind: "invalid_output",
+    message: "JSON 无法解析",
+  }, firstSemantic.state);
+  assert.equal(invalidReview.action, "correct_call");
+  assert.equal(invalidReview.state.semanticNoProgress, 0);
+  assert.equal(invalidReview.state.gateAttempts.semantic_review, 1);
+
+  const driftedBase = decideProposalFailure({
+    status: "recoverable_state_error",
+    code: "PROPOSAL_REVISION_BASE_CHANGED",
     failureKind: "invalid_request",
-    error: "目标文件不存在",
-  }, 2), { action: "correct_call", attempt: 2 });
+    retryable: false,
+    error: "目标文档已变化",
+  }, firstSemantic.state);
+  assert.equal(driftedBase.action, "pause");
+  assert.equal(driftedBase.action === "pause" ? driftedBase.reason : "", "invalid_request");
+  assert.deepEqual(driftedBase.state, firstSemantic.state, "base drift must consume no retry budget");
+});
 
-  assert.deepEqual(decideProposalFailure({ status: "rejected" },
-    MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW - 1), {
-    action: "pause",
-    reason: "revision_exhausted",
-    attempt: MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW,
+test("correct_call keeps the newest scoped draft without replacing semantic baseline", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-proposal-correct-call-"));
+  const project = WriterProject.init(root, "correct-call");
+  const store = new WriterStore(project);
+  try {
+    const sessionId = store.createSession("correct-call");
+    const path = "chapters/retry.md";
+    const deliverableId = "document-1";
+    const baseContent = "# 原稿\n\n落盘版本。";
+    project.writeRaw(path, baseContent);
+    const documentBase = captureProposalRevisionDocumentBase(project, path);
+    const retryState = createProposalRetryState({ runId: "run-correct", deliverableId, path });
+    const issue: ProposalRevisionIssue = {
+      id: "issue:knowledge",
+      severity: "blocker",
+      kind: "knowledge_leak",
+      evidence: ["她已经知道答案。"],
+      problem: "正文没有给出获知路径",
+      action: "补足获知路径",
+    };
+    const rejectedContent = "# 原稿\n\n她已经知道答案。";
+    const rejectedHash = project.hash(rejectedContent);
+    const rejectedArtifactId = store.saveContextArtifact(sessionId, {
+      cacheKey: "test:correct-call:rejected",
+      kind: "proposal_revision_draft",
+      path,
+      sourceHash: rejectedHash,
+      content: rejectedContent,
+      digest: "初次驳回稿",
+    });
+    const first = saveProposalRevisionCase(
+      { artifactId: rejectedArtifactId, path, deliverableId, sourceHash: rejectedHash },
+      "semantic_review",
+      retryState,
+      1,
+      [issue],
+      proposalIssueTransition([], [issue]),
+      documentBase,
+      store,
+      sessionId,
+      undefined,
+      { semanticVerdict: true },
+    );
+
+    const correctedContent = "# 原稿\n\n她从录音里听见答案。";
+    const correctedHash = project.hash(correctedContent);
+    const correctedArtifactId = store.saveContextArtifact(sessionId, {
+      cacheKey: "test:correct-call:latest",
+      kind: "proposal_revision_draft",
+      path,
+      sourceHash: correctedHash,
+      content: correctedContent,
+      digest: "参数错误前的最新修订稿",
+    });
+    const latest = saveProposalRevisionCase(
+      { artifactId: correctedArtifactId, path, deliverableId, sourceHash: correctedHash },
+      first.revisionCase.lastGate,
+      first.revisionCase.retryState,
+      first.revisionCase.attempt,
+      undefined,
+      undefined,
+      undefined,
+      store,
+      sessionId,
+      first.revisionCase,
+      { semanticVerdict: false },
+    );
+
+    assert.equal(latest.revisionCase.draftArtifactId, correctedArtifactId);
+    assert.equal(latest.revisionCase.semanticDraftArtifactId, rejectedArtifactId);
+    assert.deepEqual(latest.revisionCase.unresolvedIssues, [issue]);
+    assert.deepEqual(latest.revisionCase.retryState, first.revisionCase.retryState);
+    assert.equal(latest.revisionCase.attempt, first.revisionCase.attempt);
+    assert.deepEqual({
+      exists: latest.revisionCase.baseDocumentExists,
+      hash: latest.revisionCase.baseDocumentSourceHash,
+    }, { exists: true, hash: project.hash(baseContent) });
+    assert.equal(proposalFailureShouldPersistRevisionCase({
+      hasScopedDraft: true,
+      action: "correct_call",
+      retryStateChanged: false,
+      hasPreviousCase: true,
+    }), true);
+    assert.equal(proposalFailureDraft({
+      action: "correct_call",
+      caseDraft: latest,
+      previousCase: first.revisionCase,
+    })?.artifactId, correctedArtifactId);
+
+    const wrongPathDraft = { artifactId: 999, path: "chapters/other.md", deliverableId, sourceHash: correctedHash };
+    assert.equal(proposalFailureShouldPersistRevisionCase({
+      hasScopedDraft: false,
+      action: "correct_call",
+      retryStateChanged: false,
+      hasPreviousCase: true,
+    }), false);
+    assert.equal(proposalFailureDraft({
+      action: "correct_call",
+      savedDraft: wrongPathDraft,
+      previousCase: latest.revisionCase,
+    })?.artifactId, correctedArtifactId, "wrong-path calls must keep the active case draft");
+    assert.notEqual(
+      proposalRevisionDraftCacheKey({ runId: "run-correct", deliverableId, path, sourceHash: correctedHash }),
+      proposalRevisionDraftCacheKey({
+        runId: "run-correct", deliverableId, path: "chapters/other.md", sourceHash: correctedHash,
+      }),
+      "same-content drafts on different paths must not share an artifact cache key",
+    );
+
+    assert.equal(proposalRevisionBaseChangeReason(project, latest.revisionCase), undefined);
+    project.writeRaw(path, "# 外部新版本\n\n另一任务已修改。\n");
+    assert.match(proposalRevisionBaseChangeReason(project, latest.revisionCase) ?? "", /已被其他操作修改/u);
+    project.removeDocument(path);
+    assert.match(proposalRevisionBaseChangeReason(project, latest.revisionCase) ?? "", /已被删除/u);
+
+    const missingPath = "chapters/new.md";
+    const missingBase = captureProposalRevisionDocumentBase(project, missingPath);
+    const missingCase: ProposalRevisionCase = {
+      ...latest.revisionCase,
+      path: missingPath,
+      baseDocumentExists: missingBase.baseDocumentExists,
+      baseDocumentSourceHash: missingBase.baseDocumentSourceHash,
+      retryState: { ...latest.revisionCase.retryState, path: missingPath },
+    };
+    assert.equal(proposalRevisionBaseChangeReason(project, missingCase), undefined);
+    project.writeRaw(missingPath, "# 被另一任务创建\n");
+    assert.match(proposalRevisionBaseChangeReason(project, missingCase) ?? "", /已被其他操作创建/u);
+
+    const legacy = { ...latest.revisionCase } as unknown as Record<string, unknown>;
+    legacy.schemaVersion = 2;
+    delete legacy.baseDocumentExists;
+    delete legacy.baseDocumentSourceHash;
+    assert.match(
+      proposalRevisionBaseChangeReason(project, legacy as unknown as ProposalRevisionCase) ?? "",
+      /旧版运行时/u,
+    );
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("proposal pause display includes exact blocker evidence, problem and action", () => {
+  const retryState = createProposalRetryState({
+    runId: "run-pause", deliverableId: "document-1", path: "chapters/a.md",
   });
+  const revisionCase = {
+    schemaVersion: 3 as const,
+    revisionCaseId: "revision:pause",
+    runId: "run-pause",
+    deliverableId: "document-1",
+    path: "chapters/a.md",
+    baseDocumentExists: false,
+    baseDocumentSourceHash: "__missing__",
+    draftArtifactId: 1102,
+    draftSourceHash: "draft-hash",
+    semanticDraftArtifactId: 1102,
+    semanticDraftSourceHash: "draft-hash",
+    reviewArtifactId: 1103,
+    attempt: 3,
+    lastGate: "semantic_review" as const,
+    retryState,
+    unresolvedIssues: [{
+      id: "issue:hearing",
+      severity: "blocker",
+      kind: "knowledge_leak",
+      evidence: ["她先听见了回答。"],
+      problem: "听觉编码尚未建立，角色没有获得对白的路径",
+      action: "把听见对白移到听觉编码恢复之后",
+    }],
+    resolvedIssueIds: [],
+    stillPresentIssueIds: ["issue:hearing"],
+    newlyIntroducedIssueIds: [],
+    status: "blocked" as const,
+    retention: "executable" as const,
+  };
+  const paused = proposalFailurePauseResult(
+    { message: "终审未通过" },
+    "revision_exhausted",
+    { artifactId: 1102, path: "chapters/a.md", sourceHash: "draft-hash", revisionCase },
+    { exhaustion: "semantic_no_progress", gate: "semantic_review" },
+  );
+  assert.match(String(paused.displayMessage), /她先听见了回答/u);
+  assert.match(String(paused.displayMessage), /听觉编码尚未建立/u);
+  assert.match(String(paused.displayMessage), /移到听觉编码恢复之后/u);
+  assert.match(String(paused.displayMessage), /工作副本/u);
+  assert.equal(paused.workingCopy, true);
+  assert.equal("artifactId" in paused, false);
 });
 
 test("scene continuation handoff carries seam tail, states and next card without full prose", () => {
@@ -853,7 +1156,7 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.match(messageContentText(a[3].content), /项目技能/);
     assert.match(messageContentText(a[3].content), /chapter-planning/);
     assert.doesNotMatch(messageContentText(a[3].content), /提交前验收/);
-    assert.match(messageContentText(a[0].content), /characterChanges/);
+    assert.match(messageContentText(a[0].content), /apply_character_changes/);
     // Slot 4/5 must not flip with intensive or audit — those go in the dynamic tail.
     const intensive = buildStableSystemPrefix(project, store, "ask", { intensive: true }, "write_scene");
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
@@ -1215,14 +1518,14 @@ test("stripStaleReasoningContent keeps only the latest reasoning block", () => {
   assert.equal(messages[2].reasoning_content, "think2");
 });
 
-test("compactCompletedToolCalls keeps only the latest propose payload", () => {
+test("compactCompletedToolCalls keeps only the latest write_file payload", () => {
   const messages: Msg[] = [
     {
       role: "assistant",
       content: null,
       tool_calls: [{
         id: "1", type: "function",
-        function: { name: "propose_document", arguments: JSON.stringify({ path: "a.md", summary: "old", content: "旧正文很长".repeat(20) }) },
+        function: { name: "write_file", arguments: JSON.stringify({ path: "a.md", content: "旧正文很长".repeat(20) }) },
       }],
     },
     {
@@ -1230,7 +1533,7 @@ test("compactCompletedToolCalls keeps only the latest propose payload", () => {
       content: null,
       tool_calls: [{
         id: "2", type: "function",
-        function: { name: "propose_document", arguments: JSON.stringify({ path: "a.md", summary: "new", content: "新正文" }) },
+        function: { name: "write_file", arguments: JSON.stringify({ path: "a.md", content: "新正文" }) },
       }],
     },
   ];

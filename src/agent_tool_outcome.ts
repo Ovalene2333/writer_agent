@@ -3,12 +3,13 @@ import {
   isSuccessfulDocumentSubmission,
   proposalIdFromToolResult,
 } from "./agent_runtime.js";
+import { isExpectedRhythmPolish, proposalFailureGate } from "./proposal_retry.js";
 import { writingWorkflowStagesForTool } from "./writing_workflow.js";
 import type { AgentRunToolObservation } from "./agent_run_types.js";
 
 const PROJECT_EVIDENCE_TOOLS = new Set([
-  "search_project", "read_document", "read_document_span", "get_outline_node",
-  "get_character", "get_simple_character", "read_file", "read_conversation", "read_context_artifact",
+  "read_file", "search_files", "get_outline_node",
+  "get_character", "get_simple_character", "read_conversation", "read_context_artifact",
 ]);
 
 export interface InterpretedAgentToolResult {
@@ -36,9 +37,11 @@ function gateName(result: Record<string, unknown> | undefined): string | undefin
   if (!result) return undefined;
   const code = typeof result.code === "string" ? result.code : "";
   if (result.rhythmRevisionRequired === true || code === "RHYTHM_POLISH_REQUIRED") return "rhythm";
-  if (code.includes("REVIEW") || result.status === "final_review_revision_required") return "semantic_review";
-  if (code.includes("STYLE")) return "style";
-  if (result.failureKind === "semantic_revision") return "proposal";
+  if (result.status === "final_review_revision_required") return "semantic_review";
+  if (code.includes("STYLE") && (code.includes("BLOCKED") || code.includes("REVISION_REQUIRED"))) return "style";
+  if (code.includes("RHYTHM") && (code.includes("BLOCKED") || code.includes("REVISION_REQUIRED"))) return "rhythm";
+  if (code.includes("LENGTH") && (code.includes("BLOCKED") || code.includes("REVISION_REQUIRED"))) return "length";
+  if (result.failureKind === "semantic_revision") return proposalFailureGate(result);
   return undefined;
 }
 
@@ -57,7 +60,7 @@ export function interpretAgentToolResult(
   // invalid; those remain ordinary retryable tool errors.
   const gate = gateName(parsed);
   const revisionRequired = Boolean(gate && classified.kind === "retryable_error");
-  const expectedRhythmTransition = gate === "rhythm";
+  const expectedRhythmTransition = Boolean(parsed && isExpectedRhythmPolish(parsed));
   const successful = classified.kind === "success" || expectedRhythmTransition;
   const observation: AgentRunToolObservation = {
     toolName,

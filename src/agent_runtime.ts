@@ -634,6 +634,10 @@ export type AgentToolOutcome =
   | { kind: "fatal_error"; message: string };
 
 const DOCUMENT_SUBMISSION_TOOL_NAMES = new Set([
+  "write_file",
+  "edit_file",
+  "move_file",
+  "delete_file",
   "propose_document",
   "write_document_isolated",
   "propose_document_patch",

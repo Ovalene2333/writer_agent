@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import YAML from "yaml";
+import { comparePathNames } from "./path_sort.js";
 import type { StyleTemplate, WriterConfig } from "./types.js";
 import { getStyleTemplate, listStyleTemplates, normalizeStyleTemplate } from "./templates.js";
 
@@ -35,7 +36,7 @@ export const DEFAULT_WRITER_INSTRUCTIONS = `# 项目指令
 ## 协作约定
 
 - 多步任务用 manage_todos 维护清单
-- 局部修改优先 propose_document_patch
+- 局部修改优先 edit_file，完整新建或替换用 write_file
 - 设定进 lore/，大纲进 outline/，正文进 chapters/
 `;
 
@@ -74,7 +75,7 @@ export function documentKind(path: string): DocumentKind {
 /** Long-form narrative documents assembled through the causal scene pipeline. */
 export function isScenePipelineDocument(path: string): boolean {
   const kind = documentKind(path);
-  return kind === "chapter" || kind === "side";
+  return path.trim().toLowerCase().endsWith(".md") && (kind === "chapter" || kind === "side");
 }
 
 /** Chapter documents in the natural path order exposed by the file manager. */
@@ -488,7 +489,7 @@ export class WriterProject {
     };
     if (!existsSync(this.resourceDir)) return [];
     visit(this.resourceDir);
-    return results.sort();
+    return results.sort((a, b) => comparePathNames(a, b));
   }
 
   createFolder(path: string): string {
@@ -550,14 +551,15 @@ export class WriterProject {
     };
     if (!existsSync(this.resourceDir)) return [];
     visit(this.resourceDir);
-    return results.sort();
+    return results.sort((a, b) => comparePathNames(a, b));
   }
 
   listCharacterCardFiles(): string[] {
     mkdirSync(this.charactersDir, { recursive: true });
     return readdirSync(this.charactersDir, { withFileTypes: true })
       .filter(entry => entry.isFile() && extname(entry.name).toLowerCase() === ".json")
-      .map(entry => entry.name).sort();
+      .map(entry => entry.name)
+      .sort((a, b) => comparePathNames(a, b));
   }
 
   readCharacterCardsJsonl(): string {

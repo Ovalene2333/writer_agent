@@ -11,6 +11,10 @@ test("every tool schema has a registered handler", () => {
     assert.ok(handlers.has(name), `missing handler: ${name}`);
   }
   assert.equal(agentToolSchemaHash().length, 16);
+  for (const tool of TOOLS) {
+    const properties = tool.function.parameters.properties as Record<string, unknown> | undefined;
+    assert.equal(Object.hasOwn(properties ?? {}, "deliverableId"), false, `${tool.function.name} exposes internal deliverableId`);
+  }
 });
 
 test("scene write tools expose mode-specific required payloads", () => {

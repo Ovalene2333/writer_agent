@@ -52,22 +52,22 @@ export interface AgentExecutionProgress {
 }
 
 const PROJECT_EVIDENCE_TOOLS = new Set([
-  "search_project", "read_document", "read_document_span", "get_outline_node",
-  "get_character", "get_simple_character", "read_file", "read_conversation",
+  "read_file", "search_files", "get_outline_node",
+  "get_character", "get_simple_character", "read_conversation",
   "read_context_artifact",
 ]);
 
 const TARGET_EVIDENCE_TOOLS = new Set([
-  "inspect_document", "locate_document_span", "read_document", "read_document_span",
-  "inspect_file", "read_file", "get_outline_node", "get_character", "get_simple_character",
+  "read_file", "search_files", "get_outline_node", "get_character", "get_simple_character",
   "read_context_artifact",
 ]);
 
 const CONTINUATION_EVIDENCE_TOOLS = new Set([
-  "read_document", "read_document_span", "read_context_artifact", "inspect_chapter_draft",
+  "read_file", "read_context_artifact", "inspect_chapter_draft",
 ]);
 
 const DOCUMENT_MUTATION_TOOLS = new Set([
+  "write_file", "edit_file", "move_file", "delete_file",
   "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch", "propose_change_set",
   "revise_document_isolated", "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes",
   "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft",
@@ -172,8 +172,8 @@ export function agentCompletionGaps(
     const completed = progress.documentArtifactKeys.size;
     if (completed < required) {
       gaps.push(required === 1
-        ? "尚未成功提交文档提案或 change set"
-        : `文档交付尚未完成：要求 ${required} 份，已有 ${completed} 份可验证提案`);
+        ? "尚未成功提交文件变更"
+        : `文件交付尚未完成：要求 ${required} 份，已有 ${completed} 份可验证提交`);
     }
   }
   if ((contract.mutation === "character" || contract.mutation === "mixed") && !progress.characterArtifactProduced) {
