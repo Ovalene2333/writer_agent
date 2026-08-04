@@ -17,12 +17,22 @@ test("every tool schema has a registered handler", () => {
   }
 });
 
-test("scene write tools expose mode-specific required payloads", () => {
-  const standard = TOOLS.find(tool => tool.function.name === "write_chapter_scene");
-  const isolated = TOOLS.find(tool => tool.function.name === "write_chapter_scene_notes");
-  const isolatedProperties = isolated?.function.parameters.properties as Record<string, unknown> | undefined;
-  assert.deepEqual(standard?.function.parameters.required, ["sceneId", "notes", "content", "actualState"]);
-  assert.deepEqual(isolated?.function.parameters.required, ["sceneId", "notes"]);
-  assert.equal(Object.hasOwn(isolatedProperties ?? {}, "content"), false);
-  assert.equal(Object.hasOwn(isolatedProperties ?? {}, "actualState"), false);
+test("scene write tool requires prose and actual state", () => {
+  const scene = TOOLS.find(tool => tool.function.name === "write_chapter_scene");
+  assert.deepEqual(scene?.function.parameters.required, ["sceneId", "notes", "content", "actualState"]);
+  assert.equal(TOOLS.some(tool => tool.function.name === "write_chapter_scene_notes"), false);
+  assert.equal(TOOLS.some(tool => tool.function.name === "write_document_isolated"), false);
+});
+
+test("scene guides and character reads expose source-linked capability selection", () => {
+  const begin = TOOLS.find(tool => tool.function.name === "begin_chapter_draft");
+  const beginProperties = begin?.function.parameters.properties as Record<string, unknown>;
+  const scenes = beginProperties.scenes as { items: { properties: Record<string, unknown> } };
+  const scopes = scenes.items.properties.characterScopes as { items: { required: string[]; properties: Record<string, unknown> } };
+  assert.deepEqual(scopes.items.required, ["characterId", "competencyIds"]);
+  assert.ok(Object.hasOwn(scopes.items.properties, "dialogue"));
+
+  const getCharacter = TOOLS.find(tool => tool.function.name === "get_character");
+  const readProperties = getCharacter?.function.parameters.properties as Record<string, unknown>;
+  assert.ok(Object.hasOwn(readProperties, "competencyIds"));
 });

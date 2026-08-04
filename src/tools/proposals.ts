@@ -14,7 +14,7 @@ import {
   proseStyleIssuesError,
   type ProseStyleIssue,
 } from "../prose_quality.js";
-import { compileWritePack, findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
+import { findProseMetaLeaks, sanitizeProseMetaLeaks } from "../write_pack.js";
 import { documentSpans } from "../document_spans.js";
 import { documentBlocks } from "../document_blocks.js";
 import { requestDocumentRevision } from "../document_revision.js";
@@ -24,13 +24,6 @@ import {
   type ChapterStyleEdit,
   type ChapterStyleRepairIssue,
 } from "../chapter_style_repair.js";
-import {
-  IsolatedSceneRequestError,
-  proseCharacterCount,
-  proseTargetBounds,
-  requestIsolatedScene,
-} from "../isolated_scene_writer.js";
-import { isolatedWriterStyleDirectives, isolatedWriterVoiceEvidence } from "../style_grounding.js";
 import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } from "../prose_length.js";
 import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "../agent_runtime.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
@@ -51,10 +44,6 @@ import {
 import { boundedRepairPacket, type RepairPacket } from "../repair_packet.js";
 import { ToolRevisionRequiredError } from "../tool_failure.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
-import {
-  DEFAULT_ISOLATED_WRITER_MAX_RATIO,
-  DEFAULT_SCENE_NOTES_CHARACTERS,
-} from "../agent_runtime.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
@@ -64,8 +53,6 @@ import {
   countOccurrences,
   rejectCompressedPlaceholder,
   requireString,
-  resolveDocumentWriteTarget,
-  type DocumentWriteMode,
 } from "./helpers.js";
 
 /** Auto-fix referential meta leaks; block if residual high-confidence leaks remain. */
@@ -633,180 +620,6 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
     false,
     lengthNotice,
   );
-}
-
-/**
- * Direct prose path for a short, single-change document. The parent Agent chooses
- * the material and delivery topology; the configured Writer only realizes prose.
- */
-export async function handleWriteDocumentIsolated(args: ToolHandlerArgs): Promise<string> {
-  const { input, project, store, context } = args;
-  assertWritableMode(context.permissionMode, "write_document_isolated");
-  if (!context.scenePipelineSettings?.isolatedWriter || !context.isolatedSceneWriter) {
-    throw new Error("当前未开启隔离 Writer；可直接 propose_document，或开启后重试");
-  }
-  if (context.chapterSceneDraft) {
-    throw new Error("已有章节场景草稿正在进行；请完成当前草稿，避免直接成稿覆盖已写场景");
-  }
-  const path = requireString(input.path, "path");
-  if (!isScenePipelineDocument(path)) throw new Error("直接隔离正文只能写入 chapters/ 或 side/");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const requestedMode = requireString(input.mode, "mode");
-  if (!(["create", "replace", "append"] as string[]).includes(requestedMode)) {
-    throw new Error("mode 只能是 create/replace/append");
-  }
-  const target = resolveDocumentWriteTarget(project, path, requestedMode as DocumentWriteMode);
-  const mode = target.mode;
-  const beforeContent = target.beforeContent;
-  if (requestedMode !== "create") {
-    const sourceHash = target.baseHash;
-    if (typeof input.sourceHash !== "string" || input.sourceHash !== sourceHash) {
-      throw new Error("replace/append 必须携带 inspect_document 返回的当前 sourceHash");
-    }
-  }
-
-  const notes = requireString(input.notes, "notes");
-  const notesMaxCharacters = context.scenePipelineSettings.notesMaxCharacters
-    ?? DEFAULT_SCENE_NOTES_CHARACTERS;
-  if (notes.length > notesMaxCharacters) {
-    throw new Error(`notes 过长（当前上限 ${notesMaxCharacters} 字）；只保留会约束正文的故事内材料`);
-  }
-  const targetCharacters = Number(input.targetCharacters);
-  if (!Number.isInteger(targetCharacters) || targetCharacters < 500 || targetCharacters > 5_000) {
-    throw new Error("targetCharacters 须为 500—5000 的整数；更长或包含多次关键转折时使用场景链");
-  }
-  const heading = mode === "append"
-    ? ""
-    : requireString(input.heading, "heading").replace(/^#+\s*/u, "").trim();
-  if (mode !== "append" && !heading) throw new Error("create/replace 必须提供正文标题");
-
-  const writePack = compileWritePack(notes, {
-    targetPath: path,
-    instruction: requireString(input.goal, "goal"),
-  });
-  const stringList = (value: unknown): string[] => Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-      .map(item => item.trim()).filter(Boolean).slice(0, 8)
-    : [];
-  const scene = {
-    id: "direct-document",
-    title: heading || "续写",
-    goal: requireString(input.goal, "goal"),
-    entryState: stringList(input.entryState),
-    characterIntent: stringList(input.characterIntent),
-    obstacle: requireString(input.obstacle, "obstacle"),
-    turn: requireString(input.turn, "turn"),
-    outcome: requireString(input.outcome, "outcome"),
-    handoff: "",
-    dividerBefore: false,
-    targetCharacters,
-  };
-  const evidence = isolatedWriterVoiceEvidence(project, store, path, Math.random, {
-    excludeProjectVoice: mode === "replace",
-  });
-  const writer = context.isolatedSceneWriter;
-  const runner = writer.run ?? requestIsolatedScene;
-  const maximumCharacters = Math.floor(targetCharacters * (
-    context.scenePipelineSettings.isolatedWriterMaxRatio ?? DEFAULT_ISOLATED_WRITER_MAX_RATIO
-  ));
-  const targetBounds = proseTargetBounds(targetCharacters);
-  const writerInput = {
-    scene,
-    writePack,
-    ...(mode === "append" ? { previousTail: beforeContent.slice(-800) } : {}),
-    voiceSample: evidence.exemplar,
-    voiceContinuation: evidence.continuation,
-    styleDirectives: isolatedWriterStyleDirectives(project),
-    maximumCharacters,
-  };
-  const runWriter = async (lengthAdjustment?: ProseLengthAssessment, forceBounds = false) => {
-    const lengthRetry = Boolean(lengthAdjustment) || forceBounds;
-    const callKind = lengthRetry
-      ? "isolated_document_writer_length_retry"
-      : "isolated_document_writer";
-    try {
-      const generated = await runner(writer.model, {
-        ...writerInput,
-        ...(lengthAdjustment || forceBounds ? {
-          strictMinimumCharacters: targetBounds.minimum,
-          strictMaximumCharacters: targetBounds.maximum,
-          ...(lengthAdjustment ? { lengthAdjustment } : {}),
-        } : {}),
-      }, writer.signal);
-      if (generated.usage) {
-        context.modelUsageReporter?.(writer.model, generated.usage, {
-          callKind,
-          requestComponents: [{
-            kind: "other",
-            label: "直接隔离正文",
-            characters: generated.requestCharacters,
-            estimatedTokens: Math.ceil(generated.requestCharacters * 0.75),
-            callKind,
-          }],
-        });
-      }
-      return generated;
-    } catch (error) {
-      if (error instanceof IsolatedSceneRequestError && error.usage) {
-        context.modelUsageReporter?.(writer.model, error.usage, {
-          callKind: `${callKind}_failed`,
-        });
-      }
-      throw error;
-    }
-  };
-
-  let generated;
-  try {
-    generated = await runWriter();
-  } catch (error) {
-    if (!(error instanceof IsolatedSceneRequestError)
-      || error.stage !== "writer"
-      || error.failureKind !== "truncated") throw error;
-    generated = await runWriter(undefined, true);
-  }
-  const initialAssessment = assessProseLength(targetCharacters, generated.content);
-  if (initialAssessment.status !== "ok") {
-    generated = await runWriter(initialAssessment);
-  }
-  const finalAssessment = assessProseLength(targetCharacters, generated.content);
-  const finalCharacters = finalAssessment.actual;
-  // 一次按差量重试之后就不再纠缠：偏长仍然拒收，偏短默认接受并提示。
-  const finalOutcome = proseLengthOutcome(finalAssessment, context.proseLength?.enforceMinimum === true);
-  if (finalOutcome.blocked) {
-    throw new Error(`隔离 Writer 重试后正文仍为 ${finalCharacters} 字，未落入目标 ${targetCharacters} 字的可接受范围 ${targetBounds.minimum}—${targetBounds.maximum} 字；请调整事件密度或改用场景链`);
-  }
-  rejectCompressedPlaceholder(generated.content, "隔离 Writer 正文");
-  const generatedBody = generated.content.trim();
-  if (!target.existed) {
-    if (project.documentExists(path)) throw new Error("Writer 生成期间目标文档已被创建；请重新判断 create/replace");
-  } else if (!project.documentExists(path)
-    || project.hash(project.read(path)) !== target.baseHash) {
-    throw new Error("Writer 生成期间目标文档已变化；未创建提案，请重新读取后再试");
-  }
-  const proposedContent = mode === "append"
-    ? `${beforeContent.trimEnd()}\n\n${generatedBody}`
-    : `# ${heading}\n\n${generatedBody}`;
-  const submitted = await submitFullDocumentProposal(
-    args,
-    path,
-    proposedContent,
-    requireString(input.summary, "summary"),
-    input.characterChanges,
-    false,
-    false,
-    finalOutcome.notice,
-  );
-  const parsed = JSON.parse(submitted) as Record<string, unknown>;
-  return JSON.stringify({
-    ...parsed,
-    generationMode: "isolated_document",
-    requestedMode: target.requestedMode,
-    effectiveMode: target.mode,
-    submissionKind: target.versionSubmission ? "new_version" : "new_document",
-    generatedCharacters: proseCharacterCount(generatedBody),
-    targetCharacters,
-  });
 }
 
 export async function submitFullDocumentProposal(

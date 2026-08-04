@@ -13,12 +13,10 @@ import {
   ABSOLUTE_MAX_SCENES,
   MAX_AGENT_STEPS,
   MAX_CHAPTER_TARGET_CHARACTERS,
-  MAX_ISOLATED_WRITER_MAX_RATIO,
   MAX_SCENE_NOTES_CHARACTERS,
   MAX_SCENE_CANDIDATES,
   MIN_AGENT_STEPS,
   MIN_CHAPTER_TARGET_CHARACTERS,
-  MIN_ISOLATED_WRITER_MAX_RATIO,
   MIN_SCENE_NOTES_CHARACTERS,
   isAgentStepBudgetMode,
   isPermissionMode,
@@ -1245,9 +1243,6 @@ export async function startWriterServer(options: {
         if (candidateCount !== undefined && (!Number.isInteger(candidateCount) || Number(candidateCount) < 1 || Number(candidateCount) > MAX_SCENE_CANDIDATES)) {
           return context.json({ error: `candidateCount 须为 1—${MAX_SCENE_CANDIDATES} 的整数（1 = 关闭候选采样）` }, 400);
         }
-        if (body.scenePipeline.isolatedWriter !== undefined && typeof body.scenePipeline.isolatedWriter !== "boolean") {
-          return context.json({ error: "isolatedWriter 必须是布尔值" }, 400);
-        }
         const notesMaxCharacters = body.scenePipeline.notesMaxCharacters;
         if (notesMaxCharacters !== undefined && (
           !Number.isInteger(notesMaxCharacters)
@@ -1256,16 +1251,6 @@ export async function startWriterServer(options: {
         )) {
           return context.json({
             error: `notesMaxCharacters 须为 ${MIN_SCENE_NOTES_CHARACTERS}—${MAX_SCENE_NOTES_CHARACTERS} 的整数`,
-          }, 400);
-        }
-        const writerMaxRatio = body.scenePipeline.isolatedWriterMaxRatio;
-        if (writerMaxRatio !== undefined && (
-          !Number.isFinite(writerMaxRatio)
-          || Number(writerMaxRatio) < MIN_ISOLATED_WRITER_MAX_RATIO
-          || Number(writerMaxRatio) > MAX_ISOLATED_WRITER_MAX_RATIO
-        )) {
-          return context.json({
-            error: `isolatedWriterMaxRatio 须在 ${MIN_ISOLATED_WRITER_MAX_RATIO}—${MAX_ISOLATED_WRITER_MAX_RATIO} 之间`,
           }, 400);
         }
       }

@@ -1740,7 +1740,7 @@ function App() {
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "fast", characterEvolutionEnabled: true, scenePipeline: { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: event.mode! } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "fast", characterEvolutionEnabled: true, scenePipeline: { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 } }), permissionMode: event.mode! } }
           : prev,
       );
     }
@@ -1758,7 +1758,7 @@ function App() {
       });
       setState((prev) =>
         prev
-          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "fast", characterEvolutionEnabled: true, scenePipeline: { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 } }), permissionMode: result.permissionMode } }
+          ? { ...prev, agentSettings: { ...(prev.agentSettings ?? { permissionMode: "ask", writingMode: "fast", characterEvolutionEnabled: true, scenePipeline: { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 } }), permissionMode: result.permissionMode } }
           : prev,
       );
       setNotice(`权限模式：${PERMISSION_MODES.find((item) => item.id === result.permissionMode)?.label ?? result.permissionMode}`);
@@ -1978,8 +1978,6 @@ function App() {
                     preferredMaxScenes: 5,
                     maxScenes: 5,
                     notesMaxCharacters: 3000,
-                    isolatedWriterMaxRatio: 2,
-                    isolatedWriter: false,
                     candidateCount: 1,
                   },
                 }),
@@ -7065,7 +7063,7 @@ function App() {
         <React.Suspense fallback={<div className="management-empty">加载模型设置…</div>}>
           <ModelConfig
           initialCatalog={state.providerCatalog}
-          scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 }}
+          scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 }}
           proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
           writingMode={state.agentSettings?.writingMode ?? "fast"}
           characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
@@ -7235,7 +7233,7 @@ function App() {
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
           stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
-          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength,
           },
           } : previous)}
@@ -7249,7 +7247,7 @@ function App() {
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
           stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
-          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
           } : previous)}
@@ -7263,7 +7261,7 @@ function App() {
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
           stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
-          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
           } : previous)}
@@ -7277,7 +7275,7 @@ function App() {
           reviewFollowsProseModel,
           stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
-          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
           } : previous)}
@@ -7291,7 +7289,7 @@ function App() {
           reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
           stepBudgetMode,
           maxAgentSteps,
-          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1 },
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           },
           } : previous)}

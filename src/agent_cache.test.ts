@@ -79,7 +79,9 @@ import type { AgentTurnMessage } from "./types.js";
 import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
+import { emptyCharacter } from "./characters.js";
 import type { ToolExecutionContext } from "./tools/types.js";
+import { buildFactualChapterReviewContext } from "./chapter_review_context.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage } from "./model_usage.js";
 import { buildChapterReviewMessages, parseChapterReview } from "./chapter_review.js";
 import { buildChapterStyleRepairMessages, CHAPTER_STYLE_REPAIR_BATCH_SIZE, parseChapterStyleRepair } from "./chapter_style_repair.js";
@@ -98,7 +100,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "f38a32a19a007f1e");
+  assert.equal(agentToolSchemaHash(), "b5c7261579fe581f");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -124,6 +126,7 @@ test("isolated chapter review carries the full draft once and returns bounded st
   assert.match(messageContentText(messages[0].content), /voice_homogenization/u);
   assert.match(messageContentText(messages[0].content), /theme_stated/u);
   assert.match(messageContentText(messages[0].content), /resolution_too_smooth/u);
+  assert.match(messageContentText(messages[0].content), /capability_scope/u);
   assert.match(messageContentText(messages[2].content), /门禁灯由绿变红/u);
   assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
 
@@ -151,6 +154,45 @@ test("isolated chapter review carries the full draft once and returns bounded st
   }), new Set(["arrival"]), content);
   assert.equal(demoted.verdict, "pass");
   assert.equal(demoted.issues[0]?.severity, "warning");
+});
+
+test("chapter review receives full cards alongside source-linked scene capability scopes", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-review-capability-scope-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "终审能力范围");
+    store = new WriterStore(project);
+    const character = store.saveCharacter({
+      ...emptyCharacter("闻溪"),
+      competencies: [
+        { id: "track", name: "追踪", summary: "识别足迹", level: "", unlocked: true, description: "泥土和鞋印", resources: [], limitations: ["雨水冲淡"], costs: ["耗时"] },
+        { id: "climb", name: "攀爬", summary: "借墙上行", level: "", unlocked: true, description: "需可攀附表面", resources: [], limitations: ["湿滑"], costs: ["耗力"] },
+      ],
+    });
+    const draft = beginChapterSceneDraft({
+      path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "越过门禁",
+      baseContent: "", baseHash: "empty",
+      scenes: [{
+        id: "arrival", title: "抵达", goal: "穿过门禁", entryState: [], characterIntent: [], obstacle: "锁门",
+        turn: "警报", outcome: "进入", handoff: "",
+        characterScopes: [{ characterId: character.id, competencyIds: ["track"], dialogue: true }],
+      }],
+    });
+    const context: ToolExecutionContext = {
+      permissionMode: "auto",
+      chapterSceneDraft: draft,
+      reviewCharacterIds: [character.id],
+    };
+    const packet = JSON.parse(buildFactualChapterReviewContext({ project, store, context, path: draft.path }));
+    assert.deepEqual(packet.characters[0].constraints.competencies.map((item: { id: string }) => item.id), ["track", "climb"]);
+    assert.deepEqual(packet.sceneCapabilityScopes, [{
+      sceneId: "arrival",
+      characterScopes: [{ characterId: character.id, competencyIds: ["track"], dialogue: true }],
+    }]);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("isolated style repair only admits exact issue sentences", () => {
@@ -276,7 +318,7 @@ test("task modes share one frozen universal capability catalog", () => {
   const writeNames = write.map(tool => tool.function.name);
   assert.ok(Object.isFrozen(write));
   assert.deepEqual(writeNames, catalog);
-  for (const required of ["read_file", "write_file", "edit_file", "move_file", "delete_file", "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "inspect_chapter_draft"]) {
+  for (const required of ["read_file", "write_file", "edit_file", "move_file", "delete_file", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
   assert.equal(writeNames.includes("save_character"), true);
@@ -285,7 +327,6 @@ test("task modes share one frozen universal capability catalog", () => {
 
   const planNames = agentToolsForTask("write_scene", "plan").map(tool => tool.function.name);
   assert.equal(planNames.includes("write_chapter_scene"), false);
-  assert.equal(planNames.includes("write_chapter_scene_notes"), false);
   assert.equal(catalog.some(name => name.startsWith("propose_")), false);
   assert.equal(planNames.includes("write_file"), false);
   assert.equal(planNames.includes("edit_file"), false);
@@ -606,21 +647,19 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(instructions, /write_chapter_scene/);
   assert.match(instructions, /只有长篇连续状态/);
   assert.match(instructions, /不要为了展示流程/);
-  const isolated = taskInstructions("write_scene", "deliver", "ask", true, true);
-  assert.match(isolated, /write_chapter_scene_notes/);
-  assert.match(isolated, /由隔离 Writer 生成正文和状态/);
-  assert.match(taskInstructions("write_scene", "deliver", "ask", true, true, 4_200), /4200 字/);
+  assert.match(taskInstructions("write_scene", "deliver", "ask", true, 4_200), /4200 字/);
   assert.match(instructions, /inspect_chapter_draft/);
   assert.match(instructions, /actualState/);
+  assert.match(instructions, /characterScopes/);
+  assert.match(instructions, /未列入的能力不得在正文使用或点名/);
   assert.match(instructions, /大纲不是前置条件/);
   assert.match(instructions, /问题密集/);
   assert.match(instructions, /重写受影响场景乃至全文/);
   assert.doesNotMatch(instructions, /不能跳过逐场景/);
-  const fast = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true);
-  assert.match(fast, /单 Agent 链路/);
-  assert.match(fast, /不得调用或等待正文 Writer/);
+  const fast = taskInstructions("write_scene", "deliver", "ask", true, 3_000, true);
+  assert.match(fast, /快速模式/);
   assert.match(fast, /不要为了展示流程而建立场景链/);
-  const withoutScenePipeline = taskInstructions("write_scene", "deliver", "ask", true, false, 3_000, true, false);
+  const withoutScenePipeline = taskInstructions("write_scene", "deliver", "ask", true, 3_000, true, false);
   assert.match(withoutScenePipeline, /场景链已关闭/);
   assert.match(withoutScenePipeline, /禁止调用章节场景链工具/);
   assert.doesNotMatch(withoutScenePipeline, /write_chapter_scene 提交/);
@@ -1094,10 +1133,6 @@ test("scene continuation handoff carries seam tail, states and next card without
   assert.doesNotMatch(prompt, /钥匙句/);
   const tailBlock = (prompt.split("上一场结尾")[1] ?? "").split("各场实际离场状态")[0];
   assert.ok(tailBlock.length > 0 && tailBlock.length < 1_000, `tail block out of bounds: ${tailBlock.length}`);
-  const isolatedPrompt = sceneContinuationPrompt(draft, { isolatedWriter: true });
-  assert.match(isolatedPrompt, /调用 write_chapter_scene_notes/);
-  assert.match(isolatedPrompt, /只提交要点式 notes/);
-  assert.doesNotMatch(isolatedPrompt, /提交要点式 notes、正文与 actualState/);
 
   draft = writeChapterScene(draft, "s2", "教官在警报声里签下自己的名字。".repeat(10), {
     situation: ["违规被共同隐瞒"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
@@ -1157,7 +1192,7 @@ test("automatic chapter review preserves character evolution and scopes rejected
   });
   assert.deepEqual(structural, { mode: "structural", targetSceneIds: ["s2", "s4"] });
   assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s2" })), true);
-  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene_notes", JSON.stringify({ sceneId: "s4" })), true);
+  assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s4" })), true);
   assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s3" })), false);
   assert.equal(chapterReviewRepairAllowsTool(structural!, "revise_chapter_scene_guide"), false);
   assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", "{"), false);
@@ -1193,6 +1228,7 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.match(messageContentText(a[3].content), /chapter-planning/);
     assert.doesNotMatch(messageContentText(a[3].content), /提交前验收/);
     assert.match(messageContentText(a[0].content), /apply_character_changes/);
+    assert.match(messageContentText(a[0].content), /角色卡声线只约束所属角色说出口的对白/);
     // Slot 4/5 must not flip with intensive or audit — those go in the dynamic tail.
     const intensive = buildStableSystemPrefix(project, store, "ask", { intensive: true }, "write_scene");
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
@@ -1237,7 +1273,7 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
     };
     const scenePipeline = {
       enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-      notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+      notesMaxCharacters: 3_000, candidateCount: 1,
     };
     const withTarget = dynamicContextPrompt(
       project, store, "写一章", task, "ask", scenePipeline, "fast", false,
@@ -1258,6 +1294,56 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
       project, store, "写一章", task, "ask", scenePipeline, "fast", false,
     );
     assert.doesNotMatch(withoutTarget, /单章篇幅目标：/u);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("character read scope does not inject every visible card into writing context", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-scope-"));
+  try {
+    const project = WriterProject.init(root, "角色范围");
+    const store = new WriterStore(project);
+    const participant = store.saveCharacter({
+      ...emptyCharacter("参演者"),
+      identity: { ...emptyCharacter("参演者").identity, summary: "本场的行动者" },
+    });
+    const readableOnly = store.saveCharacter({
+      ...emptyCharacter("仅可读取者"),
+      identity: { ...emptyCharacter("仅可读取者").identity, summary: "不在本场" },
+    });
+    const task = {
+      mode: "write_scene" as const,
+      label: "写一章",
+      searchQuery: "",
+      characterIds: [participant.id],
+      exampleIds: [],
+      documentContext: "target" as const,
+      creativeDepth: "deliver" as const,
+      editScope: "document" as const,
+      documentProposalRequired: true,
+      continuation: false,
+      todoPlan: [],
+      documentDeliverables: ["chapters/01.md"],
+      outcome: "document" as const,
+      evidence: "none" as const,
+      mutation: "document" as const,
+      planning: "adaptive" as const,
+      capabilities: ["documents" as const],
+      workflow: "chapter_delivery" as const,
+      qualityProfile: "standard" as const,
+    };
+    const scenePipeline = {
+      enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
+      notesMaxCharacters: 3_000, candidateCount: 1,
+    };
+    const prompt = dynamicContextPrompt(
+      project, store, "写参演者的场景", task, "ask", scenePipeline, "fast", false,
+      [participant.id, readableOnly.id],
+    );
+    assert.match(prompt, /参演者/u);
+    assert.doesNotMatch(prompt, /仅可读取者|不在本场/u);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

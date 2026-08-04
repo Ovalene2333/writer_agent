@@ -155,57 +155,52 @@ function feature(v: unknown): CharacterFeature {
   };
 }
 
-export type CharacterCompetencyPromptView =
-  | CharacterCompetency
-  | { id: string; name: string; summary: string; unlocked: false };
+export type CharacterCompetenciesWritingPayload = {
+  /** Selected unlocked entries, minus the card-state flag that invites inventory diction. */
+  inPlay: Array<Omit<CharacterCompetency, "unlocked">>;
+  rule: string;
+};
 
-/**
- * Planning/tool view: locked skills keep only their stable id and public name/summary (no mechanism dump).
- * Still exposes unlocked=false so apply_character_changes / scene planning can see status.
- */
-export function competencyPromptView(item: CharacterCompetency): CharacterCompetencyPromptView {
-  return item.unlocked ? item : { id: item.id, name: item.name, summary: item.summary, unlocked: false };
-}
+/** Discovery-only view: enough to select a capability, never enough to portray its mechanism. */
+export type CharacterCapabilityIndexEntry = Pick<CharacterCompetency, "id" | "name" | "summary">;
 
 /** One-line rule attached to any character payload that may reach a prose model. */
 export const COMPETENCY_WRITING_RULE =
-  "能力写法：仅 inPlay 可在正文用动作/后果兑现；notInPlay 本场不得使用，且禁止写成卡面/系统腔（「未解锁」「还锁着」「档案上…锁着」「不是A不是B——还锁着」点名否定列举）。角色尚不知的武装专名不要提前点名。";
+  "能力写法：仅本次 inPlay 可在正文用动作/后果兑现；未提供的能力本场不写，也不以卡面、系统或否定列举的方式提及。角色尚不知的武装专名不要提前点名。";
 
 /**
  * Writing-facing competency split: never feed unlocked:false flags into prose context.
  * Locked entries are planning constraints only — not inventory HUD lines for the narrator.
  */
-export function competenciesWritingPayload(competencies: CharacterCompetency[]) {
-  const inPlay = competencies.filter(item => item.unlocked).map(item => ({
-    id: item.id,
-    name: item.name,
-    summary: item.summary,
-    level: item.level,
-    description: item.description,
-    resources: item.resources,
-    limitations: item.limitations,
-    costs: item.costs,
-  }));
-  const notInPlay = competencies.filter(item => !item.unlocked).map(item => ({
-    name: item.name,
-    summary: item.summary,
-  }));
+export function competenciesWritingPayload(
+  competencies: CharacterCompetency[],
+  competencyIds?: readonly string[],
+): CharacterCompetenciesWritingPayload {
+  const selected = competencyIds ? new Set(competencyIds) : undefined;
+  const inPlay = competencies
+    .filter(item => item.unlocked && (!selected || selected.has(item.id)))
+    .map(({ unlocked: _unlocked, ...item }) => item);
   return {
     inPlay,
-    notInPlay,
     rule: COMPETENCY_WRITING_RULE,
   };
+}
+
+export function unlockedCompetencyIndex(competencies: CharacterCompetency[]): CharacterCapabilityIndexEntry[] {
+  return competencies
+    .filter(item => item.unlocked)
+    .map(item => ({ id: item.id, name: item.name, summary: item.summary }));
 }
 
 export function characterPromptCard(character: Character) {
   return {
     ...character,
-    competencies: character.competencies.map(competencyPromptView),
+    competencies: competenciesWritingPayload(character.competencies),
     competencyWritingRule: COMPETENCY_WRITING_RULE,
   };
 }
 
-/** First-pass tool view: only the essential portrayal summaries, never full card details. */
+/** First-pass tool view: discover a character without injecting dialogue templates or locked abilities. */
 export function characterSummaryCard(character: Character) {
   return {
     id: character.id,
@@ -214,13 +209,7 @@ export function characterSummaryCard(character: Character) {
     identity: { summary: character.identity.summary },
     appearance: { summary: character.profile.appearanceSummary },
     features: character.features.map(item => ({ id: item.id, name: item.name, summary: item.summary })),
-    competencies: character.competencies.map(item => ({
-      id: item.id,
-      name: item.name,
-      summary: item.summary,
-      unlocked: item.unlocked,
-    })),
-    voice: { summary: character.voice.summary },
+    capabilityIndex: unlockedCompetencyIndex(character.competencies),
   };
 }
 
@@ -1030,7 +1019,14 @@ export function characterPromptViews(character: Character, nodes: OutlineNode[] 
       experiences,
       notes: character.notes,
     },
-    dialogue: { name: character.identity.name, voice: character.voice },
+    dialogue: {
+      owner: {
+        characterId: character.id,
+        name: character.identity.name,
+        appliesTo: "spoken_dialogue_only",
+      },
+      voice: character.voice,
+    },
     scene,
   };
 }

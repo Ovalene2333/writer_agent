@@ -1,6 +1,6 @@
 import {
   characterSummaryCard,
-  competencyPromptView,
+  competenciesWritingPayload,
   normalizeCharacterChangeOp,
   resolveCharacterAt,
   type ApplyCharacterChangesInput,
@@ -51,7 +51,7 @@ export function handleListCharacters({ store, characterScope }: ToolHandlerArgs)
   })));
 }
 
-export function handleGetCharacter({ input, store, project, characterScope }: ToolHandlerArgs): string {
+export function handleGetCharacter({ input, store, project, characterScope, context }: ToolHandlerArgs): string {
   const id = optionalPositiveInteger(input.id, "id");
   if (!id) throw new Error("缺少有效参数：id");
   if (characterScope !== undefined && !characterScope.includes(id)) throw new Error("该角色不在本次可读范围内");
@@ -65,8 +65,12 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
     throw new Error("view 必须是 summary、sections 或 edit");
   }
   const view = explicitView ?? (sections.length ? "sections" : "summary");
+  const requestedCompetencyIds = parseCompetencyIds(input.competencyIds);
+  if (requestedCompetencyIds && !sections.includes("competencies")) {
+    throw new Error("competencyIds 只能与 competencies 分区一起读取");
+  }
   if (view === "summary") {
-    if (sections.length) throw new Error("summary 视图不能指定 sections");
+    if (sections.length || requestedCompetencyIds) throw new Error("summary 视图不能指定 sections 或 competencyIds");
     return JSON.stringify(characterSummaryCard(character));
   }
   if (view === "edit" && !sections.length) return JSON.stringify(character);
@@ -86,9 +90,25 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
     if (section === "storyState") {
       selected.storyState = scene ?? resolveCharacterAt(character, new OutlineStore(project).sync().nodes, outlineNodeId);
     } else if (section === "competencies") {
-      selected.competencies = view === "edit"
-        ? character.competencies
-        : character.competencies.map(competencyPromptView);
+      if (view === "edit") {
+        assertKnownCompetencyIds(character.competencies, requestedCompetencyIds);
+        selected.competencies = requestedCompetencyIds
+          ? character.competencies.filter(item => requestedCompetencyIds.includes(item.id))
+          : character.competencies;
+      } else {
+        const selectedIds = resolvedWritingCompetencyIds(character, requestedCompetencyIds, context);
+        assertUsableCompetencyIds(character.competencies, selectedIds);
+        selected.competencies = competenciesWritingPayload(character.competencies, selectedIds);
+      }
+    } else if (section === "voice" && view !== "edit") {
+      assertSceneDialogueScope(character.id, context);
+      selected.voice = character.voice;
+      selected.voiceScope = {
+        characterId: character.id,
+        name: character.identity.name,
+        appliesTo: "spoken_dialogue_only",
+        rule: "仅约束该角色说出口的对白；不要迁移到叙述、动作描写或其他角色的对白。",
+      };
     } else if (section === "experiences") {
       selected.experiences = scene && outlineNodeId ? scene.experiences : character.experiences;
     } else if (section === "psychology") {
@@ -98,6 +118,74 @@ export function handleGetCharacter({ input, store, project, characterScope }: To
     }
   }
   return JSON.stringify(selected);
+}
+
+function parseCompetencyIds(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length < 1 || value.length > 12) {
+    throw new Error("competencyIds 须为 1—12 个能力 ID");
+  }
+  const ids = value.map((item, index) => {
+    if (typeof item !== "string" || !item.trim() || item.trim().length > 128) {
+      throw new Error(`competencyIds[${index}] 无效`);
+    }
+    return item.trim();
+  });
+  if (new Set(ids).size !== ids.length) throw new Error("competencyIds 不能重复");
+  return ids;
+}
+
+function assertKnownCompetencyIds(
+  competencies: Array<{ id: string }>,
+  ids: readonly string[] | undefined,
+): void {
+  if (!ids) return;
+  const known = new Set(competencies.map(item => item.id));
+  const missing = ids.filter(id => !known.has(id));
+  if (missing.length) throw new Error(`角色卡不存在能力：${missing.join("、")}`);
+}
+
+function assertUsableCompetencyIds(
+  competencies: Array<{ id: string; unlocked: boolean }>,
+  ids: readonly string[],
+): void {
+  assertKnownCompetencyIds(competencies, ids);
+  const unlocked = new Set(competencies.filter(item => item.unlocked).map(item => item.id));
+  const unavailable = ids.filter(id => !unlocked.has(id));
+  if (unavailable.length) throw new Error(`能力尚未解锁，不能用于正文：${unavailable.join("、")}`);
+}
+
+function resolvedWritingCompetencyIds(
+  character: { id: number },
+  requestedIds: string[] | undefined,
+  context: ToolHandlerArgs["context"],
+): string[] {
+  const active = context.activeSceneCharacterScopes;
+  if (!active) {
+    if (!requestedIds) {
+      throw new Error("正文读取 competencies 必须明确提供 competencyIds；先用 summary 的 capabilityIndex 选择，再按需读取详情");
+    }
+    return requestedIds;
+  }
+  const scope = active.characterScopes.find(item => item.characterId === character.id);
+  if (!scope || !scope.competencyIds.length) {
+    throw new Error(`角色 ${character.id} 未获当前场景 ${active.sceneId} 的能力使用许可`);
+  }
+  const selectedIds = requestedIds ?? scope.competencyIds;
+  const allowed = new Set(scope.competencyIds);
+  const outsideScope = selectedIds.filter(id => !allowed.has(id));
+  if (outsideScope.length) {
+    throw new Error(`能力不在当前场景 ${active.sceneId} 的许可范围：${outsideScope.join("、")}`);
+  }
+  return selectedIds;
+}
+
+function assertSceneDialogueScope(characterId: number, context: ToolHandlerArgs["context"]): void {
+  const active = context.activeSceneCharacterScopes;
+  if (!active) return;
+  if (!active.characterScopes.some(item => item.characterId === characterId && item.dialogue)) {
+    throw new Error(`角色 ${characterId} 未获当前场景 ${active.sceneId} 的对白声线许可`);
+  }
 }
 
 export function handleListSimpleCharacters({ store, context }: ToolHandlerArgs): string {

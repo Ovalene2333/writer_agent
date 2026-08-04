@@ -101,9 +101,7 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /简洁、略带吐槽/);
     assert.match(prompt, /不要修改项目文档/);
     assert.match(prompt, /第一人称/);
-    assert.match(prompt, /"name": "终焉协议"/);
-    assert.match(prompt, /"summary": "尚未掌握的禁忌能力"/);
-    assert.match(prompt, /"notInPlay"/);
+    assert.doesNotMatch(prompt, /"name": "终焉协议"|尚未掌握的禁忌能力/u);
     assert.doesNotMatch(prompt, /"unlocked": false/);
     assert.doesNotMatch(prompt, /未解锁能力的秘密说明|绝密|秘密资源|秘密限制|秘密代价/);
     assert.match(prompt, /未透露姓名的来访者/);
@@ -112,10 +110,10 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /篇幅由最终用户消息/);
     assert.match(prompt, /不得因为它仍是一个小节拍就压成一两个块/);
     assert.match(prompt, /不要引用、改写或概括玩家原句/);
-    assert.match(prompt, /默认零解释/);
     assert.match(prompt, /解释角色为什么这样想、这样感受或这样行动/);
-    assert.match(prompt, /普通回合默认零提问/);
-    assert.match(prompt, /缺失的信息会立即阻塞角色已经选择的当前行动/);
+    assert.match(prompt, /可以按自身声线自然说明、追问或说长话/);
+    assert.match(prompt, /信息缺口确有需要时自然提问/);
+    assert.doesNotMatch(prompt, /默认零解释|普通回合默认零提问/u);
     assert.match(prompt, /具体数值只能引用上下文中已有的数值/);
     assert.match(prompt, /长档应在同一核心反应内依次完成/);
     assert.match(prompt, /开场同样服从本轮块数安排/);
@@ -126,6 +124,7 @@ describe("roleplay prompts", () => {
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
     assert.match(prompt, /exampleHint/);
+    assert.match(prompt, /spoken_dialogue_only/);
     assert.doesNotMatch(prompt, /第二条例句不应整卡注入/);
     // Backward-compatible alias still works.
     assert.equal(buildRoleplaySystemPrompt(sampleCharacter()), prompt);
@@ -133,10 +132,18 @@ describe("roleplay prompts", () => {
 
   test("slim views keep at most one voice example as hint", () => {
     const views = slimRoleplayCharacterViews(sampleCharacter()) as {
-      dialogue: { voice: { exampleHint: string; verbalHabits: string[] } };
+      dialogue: {
+        owner: { characterId: number; name: string; appliesTo: string };
+        voice: { exampleHint: string; verbalHabits: string[] };
+      };
     };
     assert.equal(views.dialogue.voice.exampleHint, "别盯着我看。");
     assert.deepEqual(views.dialogue.voice.verbalHabits, ["……嗯"]);
+    assert.deepEqual(views.dialogue.owner, {
+      characterId: 1,
+      name: "林千夏",
+      appliesTo: "spoken_dialogue_only",
+    });
   });
 
   test("roleplay sampling stays lively without allowing incoherent extremes", () => {
@@ -160,8 +167,8 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /叙事权限只覆盖/);
     assert.match(prompt, /不要替对话者、其他角色或世界决定/);
     assert.match(prompt, /current_perception/);
-    assert.match(prompt, /普通回合默认零提问/);
-    assert.match(prompt, /无法用观察、陈述、动作或留白继续/);
+    assert.match(prompt, /信息缺口确有需要时自然提问/);
+    assert.doesNotMatch(prompt, /普通回合默认零提问/u);
   });
 
   test("exit command detection accepts common variants", () => {
@@ -205,7 +212,8 @@ describe("roleplay prompts", () => {
     assert.match(messages[2].content, /现场记忆路由/);
     assert.doesNotMatch(messages[2].content, /已连续 3 轮/);
     assert.match(messages[3].content, /固定回合契约/);
-    assert.match(messages[3].content, /默认零解释、零提问/);
+    assert.match(messages[3].content, /可按稳定扮演规则自然说明、追问或说长话/);
+    assert.doesNotMatch(messages[3].content, /默认零解释、零提问/u);
     assert.match(messages[6].content, /本轮角色可用动态上下文/);
     assert.match(messages[6].content, /训练事故/);
     assert.match(messages[6].content, /现场记忆卡/);

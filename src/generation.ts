@@ -204,7 +204,7 @@ export async function generateCharacter(input: {
 }): Promise<Omit<Character, "id" | "updatedAt">> {
   if (!input.description.trim()) throw new Error("角色描述不能为空");
   const messages: ToolLoopMessage[] = [
-    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/features/competencies/storyStates/experiences/notes；profile 固定使用 appearance/appearanceSummary/background/backgroundSummary/biography，其中 appearance 与 background 放完整资料，两个 Summary 以换行分隔要点、每行一项，不限定固定总字数。结构化条目必须有稳定 ASCII id，演进记录可包含 status/validFrom/validUntil。features 用于不属于能力但会影响描写的稳定细节，每项填写 name、summary、description，summary 使用自然短段落。competencies 每项必须填写 name、summary 和 unlocked；summary 使用自然短段落，详细机制写入 description 等其他字段。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
+    { role: "system", content: `你是小说角色设计助手。只输出 schema v3 JSON 对象，不要 Markdown。顶层字段为 identity/profile/psychology/motivations/voice/features/competencies/storyStates/experiences/notes；profile 固定使用 appearance/appearanceSummary/background/backgroundSummary/biography，其中 appearance 与 background 放完整资料，两个 Summary 以换行分隔要点、每行一项，不限定固定总字数。结构化条目必须有稳定 ASCII id，演进记录可包含 status/validFrom/validUntil。voice 描述角色在对白中如何选择信息、回应别人、处理关系和压力变化；句子长短、口头禅和示例只是佐证，不要把碎句写成角色本质或叙述风格。features 用于不属于能力但会影响描写的稳定细节，每项填写 name、summary、description，summary 使用自然短段落。competencies 每项必须填写 name、summary 和 unlocked；summary 使用自然短段落，详细机制写入 description 等其他字段，并在已有资料支持时明确适用情形、限制与代价。unlocked 表示当前剧情进度下是否已解锁：更新现有卡时默认保持原值；只有用户要求或已提供的确定剧情事实明确发生获得、觉醒、学会、恢复、封印或失去时才改变，伏笔、传闻、失败尝试或单纯提及不能改变它。experiences 为已确认经历条目（id/label/description，可选 validFrom），不是 biography 散文。只填写用户已提供或可可靠归纳的事实，未知内容留空；不要自行拆解或补写事实，不要输出 relationships。identity.name 必须提供。` },
     { role: "user", content: `${input.existing ? `现有角色卡：\n${JSON.stringify(input.existing)}\n\n` : ""}${input.allowedDocumentPaths?.length ? `获准读取的参考文档：${input.allowedDocumentPaths.join("、")}\n` : "没有获准读取的参考文档。\n"}要求：${input.description.trim()}` },
   ];
   const usesToolLoop = Boolean(input.project && input.allowedDocumentPaths?.length);
@@ -232,9 +232,9 @@ const CHARACTER_SUMMARY_REQUIREMENTS: Record<CharacterSummaryKind, string> = {
   appearance: "每行一个外貌辨识点。只写已有事实，不加标题、编号或符号。",
   background: "每行一个背景事实或当前影响。只写已有事实，不加标题、编号或符号。",
   psychology: "60～140 个中文字符。至少覆盖外显行为模式、内在驱动力，以及明显的价值冲突/恐惧/关系反应中的两项；不要只堆形容词。",
-  voice: "50～120 个中文字符。覆盖句子节奏、语域或用词倾向、与人互动时的态度，并在资料支持时说明压力下的变化；不要照抄对白示例。",
+  voice: "50～120 个中文字符。优先概括与人互动时如何选择信息、回应追问、保持或改变距离，并在资料支持时说明关系/压力下的变化；语域和句子节奏只作次要线索。不要照抄对白示例或把短句当作声线本身。",
   feature: "45～110 个中文字符。说明特性本身、显现情形和可观察影响；不要只改写名称。",
-  competency: "45～110 个中文字符。概括能力性质、核心效果与边界。未解锁时也会展示，不泄露具体机制、数值、资源或代价。",
+  competency: "45～110 个中文字符。概括能力性质、核心效果、适用情形与边界；资料明确时区分限制和代价。未解锁时也会展示，不泄露具体机制、数值、资源或代价。",
 };
 
 function hasCharacterSummarySource(value: unknown): boolean {

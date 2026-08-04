@@ -1,11 +1,10 @@
 import type { AgentEvent, MessageAttachment, ModelConfig, PermissionMode } from "../types.js";
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
-import type { ChapterSceneDraft, SceneActualState } from "../scene_pipeline.js";
+import type { ChapterSceneDraft, SceneActualState, SceneCharacterScope } from "../scene_pipeline.js";
 import type { ScenePipelineSettings } from "../agent_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
-import type { IsolatedWriterVoiceEvidence } from "../style_grounding.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
 import type { ProposalReviewRevisionContext } from "../proposal_retry.js";
 import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style_repair.js";
@@ -14,12 +13,6 @@ import type { DocumentRevisionInput } from "../document_revision.js";
 import type { ProseGateRule } from "../prose_gate_rules.js";
 import type { ContinuityFact, ContinuityFactCandidate } from "../continuity_facts.js";
 import type { CharacterConstraintView } from "../character_constraints.js";
-import type {
-  IsolatedSceneWriterInput,
-  IsolatedSceneWriterResult,
-  SceneStateExtractionInput,
-  SceneStateExtractionResult,
-} from "../isolated_scene_writer.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -135,6 +128,11 @@ export type ToolExecutionContext = {
   /** In-run narrative draft; never writes a partial document to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**
+   * Card material authorized for the next scene only. The guide stores IDs;
+   * get_character resolves them against the current source card on demand.
+   */
+  activeSceneCharacterScopes?: { sceneId: string; characterScopes: SceneCharacterScope[] };
+  /**
    * Cached reuse-reference prose for the current chapter draft (previous chapter
    * body, plus base content in append mode). Feeds the verbatim-recycle metric and
    * scene anti-formula hints without re-reading files on every scene write.
@@ -206,7 +204,7 @@ export type ToolExecutionContext = {
     sourceHash: string;
     revisionCaseId?: string;
   };
-  /** Exact normalized body most recently submitted, including isolated-writer output. */
+  /** Exact normalized body most recently submitted. */
   latestProposalDraft?: {
     path: string;
     deliverableId?: string;
@@ -258,33 +256,6 @@ export type ToolExecutionContext = {
      */
     judgeModel?: ModelConfig;
     signal?: AbortSignal;
-  };
-  /** Opt-in prose-only scene generation followed by a separate state extraction call. */
-  isolatedSceneWriter?: {
-    model: ModelConfig;
-    stateModel: ModelConfig;
-    signal?: AbortSignal;
-    run?: (
-      model: ModelConfig,
-      input: IsolatedSceneWriterInput,
-      signal?: AbortSignal,
-    ) => Promise<IsolatedSceneWriterResult>;
-    extractState?: (
-      model: ModelConfig,
-      input: SceneStateExtractionInput,
-      signal?: AbortSignal,
-    ) => Promise<SceneStateExtractionResult>;
-  };
-  /** Exemplar + continuation voice slots cached for the isolated writer during the chapter. */
-  isolatedSceneVoiceSample?: { forPath: string; evidence: IsolatedWriterVoiceEvidence };
-  /** Template + craft baseline for the isolated writer; project-scoped, built once. */
-  isolatedSceneStyleDirectives?: string;
-  /** Complete prose retained when only isolated state extraction failed. */
-  isolatedPendingScene?: {
-    forPath: string;
-    sceneId: string;
-    content: string;
-    writerInputCharacters: number;
   };
   /**
    * Chapter-cached voice evidence for candidate rewrites: one exemplar window is

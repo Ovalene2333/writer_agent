@@ -20,9 +20,6 @@ export const DEFAULT_AGENT_STEPS = 32;
 export const MIN_SCENE_NOTES_CHARACTERS = 500;
 export const MAX_SCENE_NOTES_CHARACTERS = 8_000;
 export const DEFAULT_SCENE_NOTES_CHARACTERS = 3_000;
-export const MIN_ISOLATED_WRITER_MAX_RATIO = 1.2;
-export const MAX_ISOLATED_WRITER_MAX_RATIO = 3;
-export const DEFAULT_ISOLATED_WRITER_MAX_RATIO = 2;
 export const MIN_CHAPTER_TARGET_CHARACTERS = 500;
 export const MAX_CHAPTER_TARGET_CHARACTERS = 50_000;
 export const DEFAULT_CHAPTER_TARGET_CHARACTERS = 3_000;
@@ -48,10 +45,6 @@ export interface ScenePipelineSettings {
   maxScenes: number;
   /** Maximum Agent-authored scene packet size before compilation. */
   notesMaxCharacters: number;
-  /** Hard prose ceiling relative to each scene's targetCharacters. */
-  isolatedWriterMaxRatio: number;
-  /** Experimental prose-only model call with a separate state extraction pass. */
-  isolatedWriter: boolean;
   /**
    * Best-of-N scene prose sampling: 1 = off; 2–3 = per scene, request
    * candidateCount-1 fact-preserving rewrites and keep the winner (judge model if
@@ -66,7 +59,7 @@ export interface ScenePipelineSettings {
 
 export interface AgentRuntimeSettings {
   permissionMode: PermissionMode;
-  /** delegated = isolated prose tools; fast = traditional single-Agent writing with no Writer calls. */
+  /** Selects auxiliary model routing; scene prose always remains in the main Agent flow. */
   writingMode: WritingExecutionMode;
   /** Allow narrative tasks to append character experiences and story state. */
   characterEvolutionEnabled: boolean;
@@ -159,8 +152,6 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     preferredMaxScenes: 5,
     maxScenes: 5,
     notesMaxCharacters: DEFAULT_SCENE_NOTES_CHARACTERS,
-    isolatedWriterMaxRatio: DEFAULT_ISOLATED_WRITER_MAX_RATIO,
-    isolatedWriter: false,
     candidateCount: 2,
   },
   proseLength: {
@@ -208,18 +199,13 @@ export function normalizeScenePipelineSettings(value?: Partial<ScenePipelineSett
   const candidateCount = Number.isInteger(value?.candidateCount)
     ? Math.min(MAX_SCENE_CANDIDATES, Math.max(1, Number(value?.candidateCount)))
     : DEFAULT_SETTINGS.scenePipeline.candidateCount;
-  const isolatedWriter = value?.isolatedWriter === true;
   const notesMaxCharacters = Number.isInteger(value?.notesMaxCharacters)
     ? Math.min(MAX_SCENE_NOTES_CHARACTERS, Math.max(MIN_SCENE_NOTES_CHARACTERS, Number(value?.notesMaxCharacters)))
     : DEFAULT_SETTINGS.scenePipeline.notesMaxCharacters;
-  const rawWriterRatio = Number(value?.isolatedWriterMaxRatio);
-  const isolatedWriterMaxRatio = Number.isFinite(rawWriterRatio)
-    ? Math.round(Math.min(MAX_ISOLATED_WRITER_MAX_RATIO, Math.max(MIN_ISOLATED_WRITER_MAX_RATIO, rawWriterRatio)) * 10) / 10
-    : DEFAULT_SETTINGS.scenePipeline.isolatedWriterMaxRatio;
   return {
     enabled,
     preferredMinScenes, preferredMaxScenes, maxScenes,
-    notesMaxCharacters, isolatedWriterMaxRatio, isolatedWriter, candidateCount,
+    notesMaxCharacters, candidateCount,
   };
 }
 
@@ -639,7 +625,6 @@ const DOCUMENT_SUBMISSION_TOOL_NAMES = new Set([
   "move_file",
   "delete_file",
   "propose_document",
-  "write_document_isolated",
   "propose_document_patch",
   "revise_document_isolated",
   "propose_chapter_draft",

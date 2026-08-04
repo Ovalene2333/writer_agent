@@ -10,7 +10,7 @@ import type {
   StepUsage,
 } from "./types.js";
 import { createHash } from "node:crypto";
-import { chapterSceneDraftComplete, type ChapterSceneDraft } from "./scene_pipeline.js";
+import { chapterSceneDraftComplete, nextChapterScene, type ChapterSceneDraft } from "./scene_pipeline.js";
 import { documentSpans } from "./document_spans.js";
 import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -24,7 +24,7 @@ import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
 import { extractContinuityFacts } from "./continuity_facts.js";
-import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
+import { characterConstraintHash, characterConstraintView, characterWritingConstraintView } from "./character_constraints.js";
 import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
 import {
   buildMultimodalUserContent,
@@ -458,7 +458,7 @@ function writingSystemPrompt(project: WriterProject): string {
 正文底线（正文/续写/改写/终审；构思可大胆但须标明非既有事实）：
 1. 用动作、选择、代价、对白与感官呈现；勿在其后追加情绪/象征解释。
 2. 动作有结果；因果可拆句；保留对白拖音/中断/迟疑。
-3. 对白服从身份与目的；场景落在动作、决定、发现或未决问题上。
+3. 对白服从身份与目的；角色卡声线只约束所属角色说出口的对白，叙述和其他角色各自服从项目文风与自身角色卡；场景落在动作、决定、发现或未决问题上。
 4. 不得把未支撑设定冒充既有事实；区分项目事实 / 推断 / 候选。
 5. 角色演进须有正文/大纲/用户依据。正文落盘后的确认事实→apply_character_changes；伏笔/传闻/失败尝试不得解锁。新建或大改用 save_character。
 6. 句式硬约束与声线自检见「风格锚定」（勿在此重复粘贴）。
@@ -482,7 +482,7 @@ function executionRulesPrompt(mode: PermissionMode): string {
 ${modeRule}
 4. 完整/长对话或扮演史：注入历史仅为预览。须 inspect_conversation，再 read_conversation 从 afterId=0 分页至 hasMore=false。简易卡用 list/get_simple_characters，与普通卡分离。
 5. 仅当缺少目标文档/关键事实且无法推断时 ask_user；可逆创作选择自行决定。询问后立即停止。
-6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，不足再用 view=sections；明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。情节演进→apply_character_changes；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
+6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，能力摘要只用于选择 ID；正文要兑现能力时必须 get_character(view=sections, sections=["competencies"], competencyIds=[...]) 读取该项原卡边界。明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。情节演进→apply_character_changes；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
 7. read_file 默认读取本轮最新工作副本；只复用本轮工作记忆、本轮工具结果与 reused 标记，禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
 8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
 9. 技能描述与当前任务明确匹配时，必须先 load_skill 并遵循其方法；勿编造技能。Skill 只增强判断，不自动构成固定工具流程。
@@ -589,7 +589,6 @@ ${taskInstructions(
     task.creativeDepth,
     permissionMode,
     task.documentProposalRequired,
-    scenePipeline.isolatedWriter,
     scenePipeline.notesMaxCharacters,
     writingMode === "fast",
     scenePipeline.enabled,
@@ -601,8 +600,8 @@ ${taskInstructions(
 角色演进：${characterEvolutionInstruction}
 写入：${documentInstruction}
 修改范围：${editScopeInstruction[task.editScope]}${proseLengthLine}
-写作模式：${writingMode === "fast" ? "快速模式；沿用传统单 Agent 链路，由当前 Agent 完成检索、编排与直接交付，不调用正文 Writer。" : "分工模式；Agent 负责检索与编排，实际正文可交给隔离 Writer。"}
-场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场。链内正文生成：${scenePipeline.isolatedWriter ? "隔离 Writer" : "主 Agent"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、write_chapter_scene_notes、revise_chapter_scene_guide 或 inspect_chapter_draft，直接使用普通文件交付路径。"}
+写作模式：${writingMode === "fast" ? "快速模式；由当前 Agent 完成检索、编排与直接交付。" : "标准模式；正文仍由当前 Agent 在同一任务链中完成。"}
+场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场；正文与实际状态均由主 Agent 提交。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、revise_chapter_scene_guide 或 inspect_chapter_draft，直接使用普通文件交付路径。"}
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
@@ -792,12 +791,11 @@ export function executionModelForStep(
 }
 
 function isChapterSceneWriteTool(name: string): boolean {
-  return name === "write_chapter_scene" || name === "write_chapter_scene_notes";
+  return name === "write_chapter_scene";
 }
 
 const CHAPTER_SCENE_CONTINUATION_TOOLS = new Set([
   "write_chapter_scene",
-  "write_chapter_scene_notes",
   "revise_chapter_scene_guide",
   "revise_chapter_draft_style",
   "inspect_chapter_draft",
@@ -1246,7 +1244,6 @@ export function taskInstructions(
   creativeDepth: CreativeDepth,
   permissionMode: PermissionMode,
   documentProposalRequired: boolean,
-  isolatedWriter = false,
   notesMaxCharacters = DEFAULT_SCENE_NOTES_CHARACTERS,
   fastWritingMode = false,
   scenePipelineEnabled = true,
@@ -1307,13 +1304,12 @@ export function taskInstructions(
   if (mode === "write_scene") return `正文创作原则（内部执行，不输出分析过程）：
 - 主 Agent 对成品负责，自主决定先读什么、是否构思、是否分场、何时修订；不要为了展示流程而调用工具或创建清单。
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
-- ${fastWritingMode ? `快速模式沿用单 Agent 链路：你完成检索、编排并用 write_file/edit_file 交付${scenePipelineEnabled ? "，以及场景链中的正文和 actualState" : ""}；不得调用或等待正文 Writer。` : "分工模式下由 Agent 编排、隔离工具承担正文生成；不要让正文模型承担无关检索与流程管理。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
+- 角色卡原始分区是人物事实的唯一依据：能力、知识、关系、身体状态与对白声线不得压缩进 write pack 后替代原卡。对白声线遵守「正文底线」的角色归属规则。
+- ${fastWritingMode ? "快速模式下优先走最短的单 Agent 路径。" : "标准模式下由当前 Agent 在同一任务链完成检索、编排和正文。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：新建或完整成稿用 write_file，修改既有局部用 edit_file；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}运行时自动处理篇幅、审查与审批，只使用当前公开文件工具。
 - 单章目标字数以「单章篇幅目标」为准，不擅自缩减，也不另按事件密度改判；一次任务包含多章时，每一章分别达到该目标，禁止把目标当作多章总额均分。write_file/edit_file 由运行时绑定当前章目标；场景链必须给每场 targetCharacters，且各场之和只对齐当前章目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径，系统会把工作副本记录为该文件的新版本；不要为避开同名另起副本或改写章节路径。局部修改用 edit_file，完整替换用 write_file。
-${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${isolatedWriter
-    ? `write_chapter_scene_notes 只提交不超过 ${notesMaxCharacters} 字的故事内 notes，由隔离 Writer 生成正文和状态。`
-    : `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
+${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 才可读取该角色声线，且声线只约束该角色说出口的对白。write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
 - 章节动力服从本章目标。冲突章应让阻力真正回应人物行动；静场、过渡章与收束章也可以用理解、关系或条件的变化完成。代价、悬问与不可逆损失只在因果需要时出现，不作为每章配额。
 - 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称。提交前：${proseMannerismPreflightLine()}
@@ -1339,28 +1335,32 @@ function scopedCharacterConstraintPackets(store: WriterStore, task: WritingTask,
     item, score: task.characterIds.includes(item.id) ? 1 : 0,
   })).sort((a, b) => b.score - a.score || a.item.identity.name.localeCompare(b.item.identity.name, "zh-CN"));
   const scopedIds = characterScope === undefined ? undefined : new Set(characterScope);
-  const selectedCharacters = scopedIds
-    ? rankedCharacters.filter(entry => scopedIds.has(entry.item.id))
-    : rankedCharacters.filter((entry) => entry.score > 0).slice(0, 4);
+  // characterScope is a read permission boundary from the UI, not a claim that
+  // every visible card participates in this scene. Only task-selected cards are
+  // injected; other cards stay available through targeted get_character calls.
+  const selectedCharacters = rankedCharacters
+    .filter(entry => entry.score > 0 && (!scopedIds || scopedIds.has(entry.item.id)))
+    .slice(0, 4);
   return selectedCharacters.map(({ item }) => {
     const constraints = characterConstraintView(item);
     return {
       item,
       constraints,
+      writingConstraints: characterWritingConstraintView(item),
       constraintHash: characterConstraintHash(constraints),
     };
   });
 }
 
 function structuredCreativeContext(store: WriterStore, task: WritingTask, characterScope?: number[], simpleCharacterScope?: number[]): string {
-  const characters = scopedCharacterConstraintPackets(store, task, characterScope).map(({ item, constraints, constraintHash }) => {
+  const characters = scopedCharacterConstraintPackets(store, task, characterScope).map(({ item, writingConstraints, constraintHash }) => {
     return {
       id: item.id,
       name: item.identity.name,
       aliases: item.identity.aliases,
       narrativeRole: item.identity.narrativeRole,
       identity: item.identity.summary,
-      constraints,
+      writingConstraints,
       constraintHash,
     };
   });
@@ -1657,7 +1657,6 @@ export function chapterContinuationPrompt(parts: {
   remainingDeliverables?: readonly string[];
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
-  isolatedWriter?: boolean;
   /** Paths/characters already on the session materials shelf — do not re-read. */
   materialsShelf?: ReadonlyArray<{
     path?: string;
@@ -2184,7 +2183,6 @@ const PROPOSAL_SUBMISSION_TOOLS = new Set([
   "move_file",
   "delete_file",
   "propose_document",
-  "write_document_isolated",
   "propose_document_patch",
   "revise_document_isolated",
   "propose_chapter_draft",
@@ -2530,7 +2528,7 @@ export function proposalRevisionConvergePrompt(
  */
 export function sceneContinuationPrompt(
   draft: ChapterSceneDraft,
-  extras: { styleFeedback?: string[]; stylePriorNotes?: string[]; isolatedWriter?: boolean },
+  extras: { styleFeedback?: string[]; stylePriorNotes?: string[] },
 ): string {
   const completedCount = draft.completed.length;
   const next = draft.scenes[completedCount];
@@ -2556,13 +2554,12 @@ export function sceneContinuationPrompt(
     lines.push(`styleFeedback（对已写正文的机器统计，写下一场必须遵守）：${extras.styleFeedback.join("；")}`);
   }
   if (next) {
-    const sceneWriteTool = extras.isolatedWriter ? "write_chapter_scene_notes" : "write_chapter_scene";
-    const submission = extras.isolatedWriter
-      ? "在同一调用中只提交要点式 notes；隔离 Writer 会生成正文并独立提取 actualState"
-      : "在同一调用中提交要点式 notes、正文与 actualState";
+    const sceneWriteTool = "write_chapter_scene";
+    const submission = "在同一调用中提交要点式 notes、正文与 actualState";
     lines.push(
       `当前 scene guide 的下一场：${JSON.stringify(next)}`,
       ...(remaining.length ? [`当前其后引导：${JSON.stringify(remaining)}`] : []),
+      "characterScopes 是本场唯一的角色卡能力/对白声线许可：要兑现能力，先按其中 competencyIds 读取原卡 competencies；只在 dialogue=true 时读取该角色 voice，且仅用于其引号内对白。缺少许可不得推断更宽范围；需要扩大范围先修订未写 guide。",
       `先以真实结尾和 actualState 判断 guide 是否仍成立：成立则调用 ${sceneWriteTool}（sceneId=${next.id}），${submission}；不成立则调用 revise_chapter_scene_guide 替换全部未写引导；章节目标已经抵达则清空 remainingScenes 后终审。不要输出计划说明或更新任务清单。`,
     );
   } else {
@@ -2627,7 +2624,6 @@ const CHAPTER_DRAFT_MUTATION_TOOLS = new Set([
   "delete_file",
   "begin_chapter_draft",
   "write_chapter_scene",
-  "write_chapter_scene_notes",
   "revise_chapter_scene_guide",
   "revise_chapter_draft_style",
   "inspect_chapter_draft",
@@ -2635,7 +2631,6 @@ const CHAPTER_DRAFT_MUTATION_TOOLS = new Set([
   "propose_document",
   "propose_document_patch",
   "revise_document_isolated",
-  "write_document_isolated",
 ]);
 
 export function chapterReviewRepairLock(result: Record<string, unknown>): ChapterReviewRepairLock | undefined {
@@ -2656,7 +2651,7 @@ export function chapterReviewRepairAllowsTool(
 ): boolean {
   if (!CHAPTER_DRAFT_MUTATION_TOOLS.has(toolName)) return true;
   if (lock.mode === "style") return toolName === "revise_chapter_draft_style";
-  if (toolName !== "write_chapter_scene" && toolName !== "write_chapter_scene_notes") return false;
+  if (toolName !== "write_chapter_scene") return false;
   try {
     const input = JSON.parse(argumentsText) as Record<string, unknown>;
     return typeof input.sceneId === "string" && lock.targetSceneIds.includes(input.sceneId.trim());
@@ -2728,10 +2723,9 @@ export async function runAgent(options: {
   const permissionMode = options.permissionMode ?? runtimeSettings.permissionMode;
   const configuredScenePipelineSettings = options.scenePipelineSettings ?? runtimeSettings.scenePipeline;
   const fastWritingMode = runtimeSettings.writingMode === "fast";
-  // Fast mode restores the traditional single-Agent path. Nested Writer and
-  // candidate calls stay off, and the main loop remains on Agent for every step.
+  // Fast mode keeps candidate sampling off and the main loop on Agent for every step.
   const scenePipelineSettings: ScenePipelineSettings = fastWritingMode
-    ? { ...configuredScenePipelineSettings, isolatedWriter: false, candidateCount: 1 }
+    ? { ...configuredScenePipelineSettings, candidateCount: 1 }
     : configuredScenePipelineSettings;
   // 本轮篇幅目标：项目默认档 + 用户这句话的覆盖。纯字符串解析，不额外调模型。
   const turnProseLength = resolveTurnProseLength(prompt, runtimeSettings.proseLength);
@@ -2987,7 +2981,7 @@ export async function runAgent(options: {
     // Session-level shelf: digests survive jobs; stale sourceHash dropped on load.
     materialsShelf: hydrateSessionMaterialsShelf(store, sessionId, project),
     simpleCharacterScope,
-    reviewCharacterIds: [...new Set([...task.characterIds, ...(characterScope ?? [])])],
+    reviewCharacterIds: [...new Set(task.characterIds)],
     writerCharacterConstraintHashes: new Map(
       scopedCharacterConstraintPackets(store, task, characterScope)
         .map(({ item, constraintHash }) => [item.id, constraintHash]),
@@ -2995,6 +2989,14 @@ export async function runAgent(options: {
     characterEvolutionEnabled: runtimeSettings.characterEvolutionEnabled,
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
     ...(restoredChapterDraft ? { chapterSceneDraft: restoredChapterDraft } : {}),
+    ...(restoredChapterDraft && nextChapterScene(restoredChapterDraft)
+      ? {
+          activeSceneCharacterScopes: {
+            sceneId: nextChapterScene(restoredChapterDraft)!.id,
+            characterScopes: nextChapterScene(restoredChapterDraft)!.characterScopes ?? [],
+          },
+        }
+      : {}),
     scenePipelineSettings,
     proseLength: {
       targetCharacters: turnProseLength.targetCharacters,
@@ -3040,18 +3042,6 @@ export async function runAgent(options: {
       signal,
       context: chapterReviewContext,
     },
-    ...(scenePipelineSettings.isolatedWriter
-      ? {
-          isolatedSceneWriter: {
-            model: options.models?.writer ?? executionModel,
-            stateModel: options.models?.inline
-              ?? options.models?.summarizer
-              ?? options.models?.reviewer
-              ?? model,
-            signal,
-          },
-        }
-      : {}),
     // Best-of-N scene sampling: rewrites use the main writing model in a dedicated
     // plain-text call, not the cheap adjudicator. The winner is picked by the
     // reviewer model reading both drafts — a rule score cannot rank "worth reading",
@@ -3956,7 +3946,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
               : "CHAPTER_STRUCTURAL_TARGET_ONLY",
             nextAllowedActions: chapterReviewRepair.mode === "style"
               ? ["revise_chapter_draft_style"]
-              : ["write_chapter_scene", "write_chapter_scene_notes"],
+              : ["write_chapter_scene"],
             ...(chapterReviewRepair.mode === "structural"
               ? { targetSceneIds: chapterReviewRepair.targetSceneIds }
               : {}),
@@ -4419,7 +4409,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             content: sceneContinuationPrompt(toolContext.chapterSceneDraft, {
               styleFeedback: sceneWrittenFeedback,
               stylePriorNotes: toolContext.chapterStylePriorNotes,
-              isolatedWriter: scenePipelineSettings.isolatedWriter,
             }),
           });
           const afterTokens = approximateMessageTokens(messages);
@@ -4509,7 +4498,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             content: chapterContinuationPrompt({
               todosText: formatTodosForPrompt(advanced.todos),
               remainingDeliverables: remainingDocumentDeliverables,
-              isolatedWriter: scenePipelineSettings.isolatedWriter,
               ...(latestProposal
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
                 : {}),
@@ -4650,10 +4638,9 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           toolContext.lastWritePack = undefined;
           toolContext.writePackSceneId = undefined;
           toolContext.chapterSceneDraft = undefined;
-          // Per-chapter scene-gate state: voice evidence and prior notes.
+          toolContext.activeSceneCharacterScopes = undefined;
+          // Per-chapter scene-gate state.
           toolContext.sceneStyleEvidence = undefined;
-          toolContext.isolatedSceneVoiceSample = undefined;
-          toolContext.isolatedPendingScene = undefined;
           toolContext.chapterStylePriorNotes = undefined;
           // Style verdicts are per-chapter sentences; stale entries only waste lookups.
           toolContext.proseVerdictCache = undefined;
@@ -5320,7 +5307,7 @@ function writingBootstrapContext(
 - 目标之后已有成稿时：对 nextChapterCandidates 中的路径 read_file(startLine=1,endLine=40) 一次，只把其开场事实当作本章离场边界，不把后章事件提前写入本章。
 - 需要人设：先对 characterIndex 中的 id 调用 get_character 获取必要字段摘要；摘要不足时再带 sections 选读，场景状态需传 outlineNodeId。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。
-- 交付路径由 Agent 根据作品需要决定：完整成稿用 write_file、局部修改用 edit_file、约束复杂时可先 compile_write_pack，${scenePipeline.enabled ? `或在长篇连续状态确有收益时使用${scenePipeline.isolatedWriter ? "隔离 Writer 的" : ""}场景草稿链` : "场景链当前关闭"}。
+- 交付路径由 Agent 根据作品需要决定：完整成稿用 write_file、局部修改用 edit_file、约束复杂时可先 compile_write_pack，${scenePipeline.enabled ? "或在长篇连续状态确有收益时使用场景草稿链" : "场景链当前关闭"}。
 - 禁止：重复 list_outline_nodes、通读整本大纲、对同一路径反复 read。
 - outline、write pack 与 scene guide 都只是可选工作材料；实际正文和人物选择优先，不得扩展成其他章节任务。
 ${JSON.stringify({
@@ -5513,13 +5500,13 @@ export function formatJobMaterialsShelfPrompt(context: ToolExecutionContext): st
     ...(item.coveredFields?.length ? { coveredFields: item.coveredFields } : {}),
     ...(item.exactEvidenceRanges?.length ? { exactEvidenceRanges: item.exactEvidenceRanges } : {}),
     ...(item.artifactIds?.length ? { artifactIds: item.artifactIds } : {}),
-    ...(item.hardConstraints ? { hardConstraints: item.hardConstraints } : {}),
+    ...(item.hardConstraints ? { constraintHash: characterConstraintHash(item.hardConstraints) } : {}),
     digest: item.digest,
   }));
   return [
     `${MATERIALS_SHELF_PROMPT_PREFIX}以下设定/角色已在本会话读过（sourceHash 未变则禁止无目标整篇重读或反复 search）。`,
-    "hardConstraints 是不可压缩执行态，角色能力 unlocked、限制、身体与知识边界以它为准；digest 只是可恢复摘要。",
-    "写作优先复用 coveredSections/coveredFields；请求字段未覆盖时允许 get_character sections 或文档定点补读。",
+    "digest 只用于定位，不能代替角色原始资料或事实依据。角色需要具体能力、限制、身体、知识或声线时，调用 get_character 以原始分区精确恢复。",
+    "coveredSections/coveredFields 只记录曾经读取过的范围；角色卡允许按需恢复相同且未变化的原始分区，不得只凭摘要续写。",
     "文档缺口用 read_file 的 block、startLine/endLine 或 quote 定点补读；禁止用 search_files 当分页阅读。",
     "材料架不是过程 transcript：各 job 的工具链会丢弃，但已验证设定 digests 仍在此处。",
     JSON.stringify({ materials: payload, count: payload.length, scope: "session" }),
@@ -5602,8 +5589,10 @@ function materialsShelfHitPayload(entry: MaterialsShelfEntry, extra?: Record<str
     ...(entry.exactEvidenceRanges?.length ? { exactEvidenceRanges: entry.exactEvidenceRanges } : {}),
     ...(entry.artifactIds?.length ? { artifactIds: entry.artifactIds } : {}),
     ...(entry.hardConstraints ? { hardConstraints: entry.hardConstraints } : {}),
-    message: "该材料已在会话材料架中（全文已提供过）。禁止无参数整篇重读与反复 search；请直接依据 digest 续写。"
-      + "hardConstraints 仍是权威执行态；若请求字段或段落未在 coverage 中，请定点补读。",
+    message: entry.characterId != null
+      ? "角色卡材料架只保存索引，摘要不能代替原始分区。请用 get_character 精确恢复所需字段。"
+      : "该材料已在会话材料架中（全文已提供过）。禁止无参数整篇重读与反复 search；请直接依据 digest 续写。"
+        + "hardConstraints 仍是权威执行态；若请求字段或段落未在 coverage 中，请定点补读。",
     nextAction: "inspect_or_targeted_read",
     ...extra,
   });
@@ -5793,26 +5782,6 @@ async function executeToolCached(
     }
   }
 
-  if (call.name === "get_character") {
-    const id = Number(normalized.id);
-    if (Number.isInteger(id) && id > 0) {
-      const shelf = context.materialsShelf?.get(materialsShelfKeyForCharacter(id));
-      const requestedSections = Array.isArray(normalized.sections)
-        ? normalized.sections.filter((value): value is string => typeof value === "string")
-        : [];
-      const requestedFields = requestedSections.length
-        ? requestedSections
-        : normalized.view === "edit"
-          ? ["identity", "profile", "psychology", "motivations", "voice", "features", "competencies", "relationships", "storyState", "experiences", "notes"]
-          : ["identity", "appearance", "features", "competencies", "voice"];
-      const coverage = new Set(shelf?.coveredFields ?? []);
-      const requestCovered = requestedFields.every(field => coverage.has(field));
-      if (shelf?.fullBodyServed && shelf.sourceHash === sourceHash && requestCovered) {
-        return materialsShelfHitPayload(shelf, { tool: call.name });
-      }
-    }
-  }
-
   // search_project: once every lore/outline file has been fully served this job,
   // block thrashing re-scans (ignore loose other/ roots that never get shelved).
   if (call.name === "search_project") {
@@ -5839,7 +5808,11 @@ async function executeToolCached(
   }
 
   // Version read artifacts so older cached payload shapes are not mixed in.
-  const cacheVersion = DOCUMENT_READ_TOOLS.has(call.name) ? `:${READ_ATOM_CACHE_VERSION}` : "";
+  const cacheVersion = DOCUMENT_READ_TOOLS.has(call.name)
+    ? `:${READ_ATOM_CACHE_VERSION}`
+    // Character views changed from a lossy card dump to scoped original fields.
+    // Do not revive pre-change artifacts into an active writing turn.
+    : call.name === "get_character" ? ":character-view-v2" : "";
   const cacheKey = `${call.name}${cacheVersion}:${JSON.stringify(normalized)}:${sourceHash}`;
   const count = (counts.get(cacheKey) ?? 0) + 1;
   counts.set(cacheKey, count);
@@ -5933,6 +5906,12 @@ function rememberMaterialsFromToolResult(
           : "";
       const character = store.characters().find(item => item.id === id);
       const hardConstraints = character ? characterConstraintView(character) : undefined;
+      if (context.reviewCharacterIds && !context.reviewCharacterIds.includes(id)) {
+        context.reviewCharacterIds.push(id);
+      }
+      if (context.writerCharacterConstraintHashes && hardConstraints) {
+        context.writerCharacterConstraintHashes.set(id, characterConstraintHash(hardConstraints));
+      }
       const coveredFields = Object.keys(parsed).filter(key => !["artifactId", "reused", "message"].includes(key));
       const artifactId = typeof parsed.artifactId === "number" ? parsed.artifactId : undefined;
       registerMaterialsShelfEntry(context, {

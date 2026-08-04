@@ -40,8 +40,6 @@ export type ScenePipelineSettings = {
   preferredMaxScenes: number;
   maxScenes: number;
   notesMaxCharacters: number;
-  isolatedWriterMaxRatio: number;
-  isolatedWriter: boolean;
   candidateCount: number;
 };
 export type ProseLengthSettings = {
@@ -217,10 +215,7 @@ export function ModelConfig({
     && sceneDraft.notesMaxCharacters <= 8_000
     && Number.isInteger(sceneDraft.candidateCount)
     && sceneDraft.candidateCount >= 1
-    && sceneDraft.candidateCount <= 3
-    && Number.isFinite(sceneDraft.isolatedWriterMaxRatio)
-    && sceneDraft.isolatedWriterMaxRatio >= 1.2
-    && sceneDraft.isolatedWriterMaxRatio <= 3;
+    && sceneDraft.candidateCount <= 3;
   const sceneCountInvalid = ![sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
     || sceneDraft.preferredMinScenes > sceneDraft.preferredMaxScenes
@@ -230,10 +225,7 @@ export function ModelConfig({
     || sceneDraft.notesMaxCharacters > 8_000;
   const writerSettingsInvalid = !Number.isInteger(sceneDraft.candidateCount)
     || sceneDraft.candidateCount < 1
-    || sceneDraft.candidateCount > 3
-    || !Number.isFinite(sceneDraft.isolatedWriterMaxRatio)
-    || sceneDraft.isolatedWriterMaxRatio < 1.2
-    || sceneDraft.isolatedWriterMaxRatio > 3;
+    || sceneDraft.candidateCount > 3;
   const choices = useMemo(() => catalog.providers.flatMap(provider => provider.models.map(model => ({ value: `${provider.id}:${model.id}`, label: `${provider.name} / ${model.name}` }))), [catalog]);
   const resetScan = () => { setScannedModels([]); setSelectedScannedModels(new Set()); setEditorFeedback(null); };
   const addProfile = () => { resetScan(); setEditing(emptyProfile()); };
@@ -675,25 +667,18 @@ export function ModelConfig({
           </div>
         </section>
 
-        {writingMode === "delegated" ? <section className="writing-settings-section">
-          <div className="writing-settings-section-head"><div><h4>隔离正文生成</h4><p>控制分工模式下，正文是否由独立纯文本调用生成。</p></div></div>
-          <label className="writing-setting-row">
-            <input type="checkbox" checked={sceneDraft.isolatedWriter} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriter: event.target.checked }))}/>
-            <span><strong>启用隔离 Writer</strong><small>短篇可直接隔离成稿；长篇由 Agent 提交场景材料，Writer 写正文，轻量模型提取离场状态。</small></span>
-          </label>
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>场景候选</h4><p>只在场景质量有提升空间时，生成事实不变的候选稿并择优。</p></div></div>
           <div className="scene-settings-grid compact">
-            <label className={`${!sceneDraft.isolatedWriter ? "setting-disabled " : ""}${writerSettingsInvalid ? "field-invalid" : ""}`}><span>正文硬上限倍率</span><input aria-invalid={writerSettingsInvalid} disabled={!sceneDraft.isolatedWriter} type="number" min="1.2" max="3" step="0.1" value={sceneDraft.isolatedWriterMaxRatio} onChange={event => setSceneDraft(current => ({ ...current, isolatedWriterMaxRatio: Number(event.target.value) }))}/><small>相对目标篇幅；允许 1.2—3.0 倍。</small></label>
-            <label className={writerSettingsInvalid ? "field-invalid" : ""}><span>候选稿数量</span><select aria-invalid={writerSettingsInvalid} value={sceneDraft.candidateCount} onChange={event => setSceneDraft(current => ({ ...current, candidateCount: Number(event.target.value) }))}><option value={1}>1 · 不生成候选</option><option value={2}>2 · 默认择优</option><option value={3}>3 · 更多比较</option></select><small>只在场景质量有提升空间时追加候选。</small></label>
+            <label className={writerSettingsInvalid ? "field-invalid" : ""}><span>候选稿数量</span><select aria-invalid={writerSettingsInvalid} value={sceneDraft.candidateCount} onChange={event => setSceneDraft(current => ({ ...current, candidateCount: Number(event.target.value) }))}><option value={1}>1 · 不生成候选</option><option value={2}>2 · 默认择优</option><option value={3}>3 · 更多比较</option></select><small>场景正文始终由当前 Agent 在同一任务链中提交。</small></label>
           </div>
-        </section> : <div className="writing-mode-notice"><strong>快速模式不使用正文 Writer</strong><span>当前沿用传统单 Agent 链路：检索、编排、直接提案和场景链正文全部由 Agent 完成。关闭 Agent 面板中的 Fast 后，隔离设置会重新出现。</span></div>}
+        </section>
 
         <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid ? "status" : "alert"}>{sceneDraftValid
           ? !sceneDraft.enabled
             ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式开启" : "分工模式开启"}，正文直接成稿。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-            : writingMode === "fast"
-            ? `当前：快速模式。全部写作步骤使用 Agent，不调用正文 Writer；场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-            : `当前：分工模式${sceneDraft.isolatedWriter ? " + 隔离 Writer" : ""}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-          : "请检查默认章节字数、Agent 步数、场景数量、notes 上限、正文倍率与候选稿数量。"}</div>
+            : `当前：${writingMode === "fast" ? "快速模式" : "标准模式"}；正文由当前 Agent 完成。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+          : "请检查默认章节字数、Agent 步数、场景数量、notes 上限与候选稿数量。"}</div>
         <div className="scene-settings-actions">
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
           <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>

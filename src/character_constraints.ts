@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Character } from "./types.js";
+import { unlockedCompetencyIndex } from "./characters.js";
 
 /**
  * Writing and final review must reason from the same compact, non-compressible
@@ -34,6 +35,15 @@ export type CharacterConstraintView = {
   }>;
 };
 
+/**
+ * The writing Agent sees only a compact discovery index. Full mechanisms and
+ * boundaries are recovered through a targeted card read after a scene scope has
+ * selected the capability; factual review always receives the full view above.
+ */
+export type CharacterWritingConstraintView = Omit<CharacterConstraintView, "competencies"> & {
+  capabilityIndex: Array<{ id: string; name: string; summary: string }>;
+};
+
 export function characterConstraintView(character: Character): CharacterConstraintView {
   return {
     id: character.id,
@@ -61,6 +71,17 @@ export function characterConstraintView(character: Character): CharacterConstrai
       knowledge: state.knowledge.map(item => item.description || item.label),
       beliefs: state.beliefs.map(item => item.description || item.label),
     })),
+  };
+}
+
+export function characterWritingConstraintView(character: Character): CharacterWritingConstraintView {
+  const constraints = characterConstraintView(character);
+  return {
+    id: constraints.id,
+    name: constraints.name,
+    capabilityIndex: unlockedCompetencyIndex(character.competencies),
+    relationships: constraints.relationships,
+    storyStates: constraints.storyStates,
   };
 }
 

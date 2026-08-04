@@ -16,9 +16,15 @@ export function buildFactualChapterReviewContext(options: {
   baseContext?: string;
 }): string {
   const { project, store, context, path } = options;
-  const characterScope = options.characterScope?.length
-    ? options.characterScope
-    : context.reviewCharacterIds?.length ? context.reviewCharacterIds : undefined;
+  // Scene-selected cards are review evidence even when the UI read scope is broader
+  // or absent. Preserve both rather than treating permission scope as participation.
+  const requestedCharacterIds = [
+    ...(context.reviewCharacterIds ?? []),
+    ...(options.characterScope ?? []),
+  ];
+  const characterScope = requestedCharacterIds.length
+    ? [...new Set(requestedCharacterIds)]
+    : undefined;
   const facts = store.continuityFactPacket({
     targetPath: path,
     characterIds: characterScope,
@@ -36,14 +42,13 @@ export function buildFactualChapterReviewContext(options: {
     conflictsWith: fact.conflictsWith,
   }));
   const factCharacterNames = new Set(facts.flatMap(fact => fact.knownBy));
-  const scopedIds = characterScope === undefined ? undefined : new Set(characterScope);
-  const characters = store.characters()
-    .filter(character => scopedIds
-      ? scopedIds.has(character.id)
-      : factCharacterNames.has(character.identity.name)
-        || character.identity.aliases.some(alias => factCharacterNames.has(alias)))
-    .slice(0, REVIEW_CONTEXT_CHARACTER_LIMIT)
-    .map(characterReviewView);
+  const cards = store.characters();
+  const cardsById = new Map(cards.map(character => [character.id, character]));
+  const reviewCards = characterScope
+    ? characterScope.map(id => cardsById.get(id)).filter((character): character is Character => Boolean(character))
+    : cards.filter(character => factCharacterNames.has(character.identity.name)
+      || character.identity.aliases.some(alias => factCharacterNames.has(alias)));
+  const characters = reviewCards.slice(0, REVIEW_CONTEXT_CHARACTER_LIMIT).map(characterReviewView);
   const constraintMismatches = characters.flatMap(character => {
     const writerHash = context.writerCharacterConstraintHashes?.get(character.id);
     return writerHash && writerHash !== character.constraintHash
@@ -72,10 +77,17 @@ export function buildFactualChapterReviewContext(options: {
     }
   }
 
+  const sceneCapabilityScopes = context.chapterSceneDraft?.path === path
+    ? context.chapterSceneDraft.scenes.map(scene => ({
+      sceneId: scene.id,
+      characterScopes: scene.characterScopes ?? [],
+    }))
+    : [];
   const evidencePacket = JSON.stringify({
-    instructions: "以下是终审可用的事实证据，不代表每项都是角色所知。objective 只是客观成立；character_knowledge 仅 knownBy 可直接知道；rumor 只能作为传闻或信念。conflict/pending 不得自行选边。",
+    instructions: "以下是终审可用的事实证据，不代表每项都是角色所知。objective 只是客观成立；character_knowledge 仅 knownBy 可直接知道；rumor 只能作为传闻或信念。conflict/pending 不得自行选边。sceneCapabilityScopes 是逐场能力/对白声线许可：没有列出即不许可，不得从完整角色卡的其他已解锁能力推断正文可以使用。",
     continuityFacts: facts,
     characters,
+    sceneCapabilityScopes,
     readExcerpts: excerpts,
   });
   return [options.baseContext?.trim(), evidencePacket].filter(Boolean).join("\n\n");

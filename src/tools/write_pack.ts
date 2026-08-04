@@ -22,6 +22,6 @@ export function handleCompileWritePack({ input, context }: ToolHandlerArgs): str
   return JSON.stringify({
     status: "compiled",
     writePack,
-    message: "已编译本场可写材料。原始 notes 与解析元数据不再重复返回；正文只依据 writePack 与已读正文衔接。",
+    message: "已编译本场场景材料。writePack 不替代角色卡；能力、知识、关系与对白声线仍须依据本轮 get_character 的原始分区。",
   });
 }

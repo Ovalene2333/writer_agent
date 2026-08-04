@@ -335,7 +335,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       scenePipeline: {
         enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
+        notesMaxCharacters: 3_000, candidateCount: 2,
       },
       proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
     });
@@ -349,7 +349,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
-        notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4,
+        notesMaxCharacters: 4_200,
       },
     });
     assert.deepEqual(loadAgentSettings(project), {
@@ -363,7 +363,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
-        notesMaxCharacters: 4_200, isolatedWriterMaxRatio: 2.4, isolatedWriter: false, candidateCount: 2,
+        notesMaxCharacters: 4_200, candidateCount: 2,
       },
       proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
     });
@@ -389,9 +389,6 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 1);
     assert.equal(loadAgentSettings(project).scenePipeline.maxScenes, 6, "candidate patch must not reset scene counts");
     assert.equal(loadAgentSettings(project).scenePipeline.notesMaxCharacters, 4_200);
-    assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriterMaxRatio, 2.4);
-    saveAgentSettings(project, { scenePipeline: { isolatedWriter: true } });
-    assert.equal(loadAgentSettings(project).scenePipeline.isolatedWriter, true);
     assert.equal(loadAgentSettings(project).writingMode, "fast", "scene patch must preserve writing mode");
     assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
     assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "scene patch must preserve continuity toggle");

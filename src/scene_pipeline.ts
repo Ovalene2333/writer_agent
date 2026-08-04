@@ -1,5 +1,17 @@
 export type ChapterDraftMode = "create" | "replace" | "append";
 
+/**
+ * A scene-local permission to use card material. It deliberately stores only
+ * durable references, never a copied ability/voice summary: the character card
+ * remains the sole factual source and the Agent reads selected fields on demand.
+ */
+export type SceneCharacterScope = {
+  characterId: number;
+  competencyIds: string[];
+  /** This character may have their card voice read for their spoken dialogue. */
+  dialogue?: boolean;
+};
+
 export type ChapterSceneCard = {
   id: string;
   title: string;
@@ -16,6 +28,8 @@ export type ChapterSceneCard = {
   handoff: string;
   dividerBefore: boolean;
   targetCharacters?: number;
+  /** Per-scene card material that may be used; omitted cards remain ordinary NPCs. */
+  characterScopes?: SceneCharacterScope[];
 };
 
 export type SceneActualState = {
@@ -73,6 +87,8 @@ export type BeginChapterSceneDraftInput = {
 
 const DEFAULT_MAX_SCENES = 5;
 export const MAX_SCENE_CHARACTERS = 12_000;
+const MAX_SCENE_CHARACTER_SCOPES = 12;
+const MAX_COMPETENCIES_PER_SCENE_CHARACTER = 12;
 
 export function beginChapterSceneDraft(input: BeginChapterSceneDraftInput): ChapterSceneDraft {
   const heading = cleanString(input.heading);
@@ -329,6 +345,7 @@ function normalizeSceneCard(raw: unknown, index: number): ChapterSceneCard {
   if (targetCharacters !== undefined && (!Number.isInteger(targetCharacters) || targetCharacters < 200 || targetCharacters > 8_000)) {
     throw new Error(`scenes[${index}].targetCharacters 须为 200—8000 的整数`);
   }
+  const characterScopes = normalizeSceneCharacterScopes(value.characterScopes, index);
   return {
     id: requireText(value.id, `scenes[${index}].id`).slice(0, 64),
     title: cleanString(value.title).slice(0, 80) || `场景 ${index + 1}`,
@@ -344,7 +361,54 @@ function normalizeSceneCard(raw: unknown, index: number): ChapterSceneCard {
     handoff: cleanString(value.handoff),
     dividerBefore: value.dividerBefore === true,
     ...(targetCharacters === undefined ? {} : { targetCharacters }),
+    ...(characterScopes.length ? { characterScopes } : {}),
   };
+}
+
+function normalizeSceneCharacterScopes(value: unknown, sceneIndex: number): SceneCharacterScope[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`scenes[${sceneIndex}].characterScopes 必须是数组`);
+  if (value.length > MAX_SCENE_CHARACTER_SCOPES) {
+    throw new Error(`scenes[${sceneIndex}].characterScopes 最多 ${MAX_SCENE_CHARACTER_SCOPES} 人`);
+  }
+  const characterIds = new Set<number>();
+  return value.map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}] 格式无效`);
+    }
+    const scope = raw as Record<string, unknown>;
+    const characterId = Number(scope.characterId);
+    if (!Number.isInteger(characterId) || characterId <= 0) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].characterId 须为正整数`);
+    }
+    if (characterIds.has(characterId)) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes 不能重复角色 ${characterId}`);
+    }
+    characterIds.add(characterId);
+    if (!Array.isArray(scope.competencyIds)) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds 必须是数组`);
+    }
+    if (scope.competencyIds.length > MAX_COMPETENCIES_PER_SCENE_CHARACTER) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds 最多 ${MAX_COMPETENCIES_PER_SCENE_CHARACTER} 项`);
+    }
+    const competencyIds = scope.competencyIds.map((item, competencyIndex) => {
+      const id = cleanString(item);
+      if (!id || id.length > 128) {
+        throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds[${competencyIndex}] 无效`);
+      }
+      return id;
+    });
+    if (new Set(competencyIds).size !== competencyIds.length) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds 不能重复`);
+    }
+    if (scope.dialogue !== undefined && typeof scope.dialogue !== "boolean") {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].dialogue 须为布尔值`);
+    }
+    if (!competencyIds.length && scope.dialogue !== true) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}] 至少选择一项能力或开启 dialogue`);
+    }
+    return { characterId, competencyIds, ...(scope.dialogue === true ? { dialogue: true } : {}) };
+  });
 }
 
 function normalizeActualState(raw: unknown): SceneActualState {

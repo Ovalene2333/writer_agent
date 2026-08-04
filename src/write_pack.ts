@@ -27,8 +27,8 @@ export type WritePack = {
   mustLand: string[];
   /** Character motives / tensions at scene start. */
   characterState: string[];
-  /** Short voice reminders (no template IDs or checklist chrome). */
-  voiceNotes: string[];
+  /** Narration-only reminders; individual dialogue voices stay on character cards. */
+  narrationNotes: string[];
   /** Gaps the writer must not invent. */
   doNotInvent: string[];
   /** When section parse fails, full sanitized brief lives here. */
@@ -45,13 +45,18 @@ export type CompileWritePackOptions = {
   instruction?: string;
 };
 
-const SECTION_MAP: Array<{ keys: RegExp; field: keyof Pick<WritePack, "sceneGoal" | "beatOrder" | "knownFacts" | "mustLand" | "characterState" | "voiceNotes" | "doNotInvent"> }> = [
+type WritePackSectionField = keyof Pick<WritePack, "sceneGoal" | "beatOrder" | "knownFacts" | "mustLand" | "characterState" | "narrationNotes" | "doNotInvent"> | "discard";
+
+const SECTION_MAP: Array<{ keys: RegExp; field: WritePackSectionField }> = [
   { keys: /^(?:场景目标|本次场景目标|场景推进|推进目标|目标与推进|本场目标)$/u, field: "sceneGoal" },
   { keys: /^(?:关键事件|事件顺序|情节顺序|节拍|beats?|行动顺序)$/iu, field: "beatOrder" },
   { keys: /^(?:已知事实|必须保持|既有事实|资料已确认|确认事实|事实约束)$/u, field: "knownFacts" },
   { keys: /^(?:必要信息|须带出|需要自然带出|须自然落地|自然带出|信息落地|必须落地)$/u, field: "mustLand" },
   { keys: /^(?:人物|人物状态|动机|关系张力|人物当下|角色状态)$/u, field: "characterState" },
-  { keys: /^(?:声线|声线约束|叙事视角|视角与声线|文风提醒)$/u, field: "voiceNotes" },
+  { keys: /^(?:叙述提醒|叙事视角|视角与叙述|文风提醒)$/u, field: "narrationNotes" },
+  // An unqualified 声线 section is normally a character card fragment. Discard it
+  // rather than letting it contaminate narration or every speaker via the pack.
+  { keys: /^(?:声线|声线约束|视角与声线)$/u, field: "discard" },
   { keys: /^(?:禁止|禁止补充|勿补写|勿擅自补写|空白|不得虚构|明确禁止)$/u, field: "doNotInvent" },
 ];
 
@@ -197,11 +202,12 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
   const knownFacts = sanitizeList(splitList(take("knownFacts").join("\n")));
   const mustLand = sanitizeList(splitList(take("mustLand").join("\n")));
   const characterState = sanitizeList(splitList(take("characterState").join("\n")));
-  const voiceNotes = sanitizeList(splitList(take("voiceNotes").join("\n")));
+  const narrationNotes = sanitizeList(splitList(take("narrationNotes").join("\n")));
   const doNotInvent = sanitizeList(splitList(take("doNotInvent").join("\n")));
   const structured = Boolean(
     sceneGoal || beatOrder.length || knownFacts.length || mustLand.length
-    || characterState.length || voiceNotes.length || doNotInvent.length,
+    || characterState.length || narrationNotes.length || doNotInvent.length
+    || [...sections.values()].some(entry => entry.field === "discard"),
   );
 
   // Unmapped sections / preamble become narrative brief.
@@ -220,7 +226,7 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
     knownFacts,
     mustLand,
     characterState,
-    voiceNotes,
+    narrationNotes,
     doNotInvent,
     narrativeBrief,
     structured,
@@ -242,7 +248,7 @@ export function formatWritePackForWriter(pack: WritePack): string {
   if (pack.knownFacts.length) lines.push(`【已成立的事实】\n${bullets(pack.knownFacts)}`);
   if (pack.mustLand.length) lines.push(`【须自然落地】\n${bullets(pack.mustLand)}`);
   if (pack.doNotInvent.length) lines.push(`【勿擅自补写】\n${bullets(pack.doNotInvent)}`);
-  if (pack.voiceNotes.length) lines.push(`【声线提醒】\n${bullets(pack.voiceNotes)}`);
+  if (pack.narrationNotes.length) lines.push(`【叙述提醒】\n${bullets(pack.narrationNotes)}`);
   if (pack.narrativeBrief && (!pack.structured || pack.narrativeBrief.length > 40)) {
     lines.push(`【情节提要】\n${pack.narrativeBrief}`);
   }
@@ -262,13 +268,13 @@ export function writePackDraftContractPrompt(): string {
 ## 已知事实
 ## 须自然落地
 ## 勿擅自补写
-## 声线提醒
+## 叙述提醒
 
 约束：
 - 全部用故事世界内说法写事实与回忆；禁止出现「序章/第N章/大纲/草案/lore/outline/chapters」等文档或流程标签。
 - 指称先前情节时写清故事内锚点（如「门缝里那句预估」「入院当晚」），不要写「比序章里…」。
 - 「已知事实」只列已核实内容；不确定标「待定」并放入「勿擅自补写」。
-- 「声线提醒」只写句长/对白密度/视角等可执行点，不写风格模板 ID 或自检口号。
+- 「叙述提醒」只写叙述距离、视角、段落密度等全局叙事选择。不得写某个角色的说话方式、口头禅、句长或对白示例；角色对白必须回到该角色的原始角色卡读取。
 - 区分确定事实与本次创作决定时，用正文可读的措辞，不要写「资料已确认」等内部标签。`;
 }
 
@@ -281,7 +287,7 @@ function emptyPack(sourceDraft: string, instruction?: string): WritePack {
     knownFacts: [],
     mustLand: [],
     characterState: [],
-    voiceNotes: [],
+    narrationNotes: [],
     doNotInvent: [],
     narrativeBrief: brief,
     structured: false,

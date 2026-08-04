@@ -381,7 +381,7 @@ const TOOL_DEFINITIONS = deepFreeze([
         properties: {
           notes: {
             type: "string",
-            description: "要点式情节笔记（上限 4000 字；可用 ## 场景目标/人物当下/事件顺序/已知事实/须自然落地/勿擅自补写/声线提醒）",
+            description: "要点式情节笔记（上限 4000 字；可用 ## 场景目标/人物当下/事件顺序/已知事实/须自然落地/勿擅自补写/叙述提醒；角色卡不是此包来源）",
           },
           targetPath: { type: "string", description: "目标正文路径（仅脱敏，不注入）" },
           instruction: { type: "string", description: "本轮写作要求摘要（可选）" },
@@ -423,6 +423,20 @@ const TOOL_DEFINITIONS = deepFreeze([
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
                 targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
+                characterScopes: {
+                  type: "array", maxItems: 12,
+                  description: "本场允许使用的角色卡引用；只填角色 ID、能力 ID 与是否读取该角色对白声线，不复制卡面事实",
+                  items: {
+                    type: "object",
+                    properties: {
+                      characterId: { type: "number", description: "角色卡 ID" },
+                      competencyIds: { type: "array", items: { type: "string" }, description: "本场允许兑现的已解锁能力 ID；无能力时传 []" },
+                      dialogue: { type: "boolean", description: "该角色本场说话时可读取其声线；只约束其引号内对白" },
+                    },
+                    required: ["characterId", "competencyIds"],
+                    additionalProperties: false,
+                  },
+                },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -437,50 +451,8 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
-      name: "write_document_isolated",
-      description: "用隔离 Writer 一次生成并提议短篇单场正文；长篇或多次关键转折改用场景链",
-      parameters: {
-        type: "object",
-        properties: {
-          deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
-          path: { type: "string", description: "chapters/ 或 side/ 下目标路径" },
-          mode: { type: "string", enum: ["create", "replace", "append"] },
-          sourceHash: { type: "string", description: "replace/append 时必传当前文档哈希" },
-          heading: { type: "string", description: "create/replace 时的正文标题（不含 #）" },
-          goal: { type: "string", description: "全文结束后真正改变什么" },
-          entryState: { type: "array", items: { type: "string" }, description: "入场局面" },
-          characterIntent: { type: "array", items: { type: "string" }, description: "人物各自诉求" },
-          obstacle: { type: "string", description: "直接阻力" },
-          turn: { type: "string", description: "预期落空、代价或关系变化" },
-          outcome: { type: "string", description: "正文收束时的直接结果" },
-          notes: { type: "string", description: "故事内材料；长度上限由场景链设置决定" },
-          targetCharacters: { type: "number", description: `目标正文 500—5000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收并在偏差时重试` },
-          summary: { type: "string", description: "提案摘要" },
-          characterChanges: {
-            type: "array", maxItems: 8,
-            items: {
-              type: "object",
-              properties: {
-                characterId: { type: "number" }, reason: { type: "string" },
-                changes: { type: "array", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
-              },
-              required: ["characterId", "reason", "changes"], additionalProperties: false,
-            },
-          },
-        },
-        required: ["path", "mode", "goal", "obstacle", "turn", "outcome", "notes", "targetCharacters", "summary"],
-        additionalProperties: false,
-      },
-    },
-  },
-  // Scene writing has two payload contracts. Keep both tools in this fixed
-  // catalog: switching schemas by runtime mode would destroy provider prefix
-  // cache reuse, while a shared weak schema lets standard calls omit required data.
-  {
-    type: "function",
-    function: {
       name: "write_chapter_scene",
-      description: "标准/Fast 场景写入：提交故事内 notes、本场正文和实际离场状态",
+      description: "场景写入：提交故事内 notes、本场正文和实际离场状态",
       parameters: {
         type: "object",
         properties: {
@@ -513,25 +485,6 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
-      name: "write_chapter_scene_notes",
-      description: "隔离 Writer 场景写入：只提交故事内 notes，由工具生成正文并提取实际离场状态",
-      parameters: {
-        type: "object",
-        properties: {
-          sceneId: { type: "string" },
-          notes: {
-            type: "string",
-            description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
-          },
-        },
-        required: ["sceneId", "notes"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "revise_chapter_scene_guide",
       description: "根据已写正文与 actualState 替换所有未写场景引导；可增删、合并、改序或清空后终审",
       parameters: {
@@ -557,6 +510,20 @@ const TOOL_DEFINITIONS = deepFreeze([
                 handoff: { type: "string", description: "可能如何交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
                 targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
+                characterScopes: {
+                  type: "array", maxItems: 12,
+                  description: "新的本场角色卡引用；保留 ID/权限，不复制能力或声线内容",
+                  items: {
+                    type: "object",
+                    properties: {
+                      characterId: { type: "number", description: "角色卡 ID" },
+                      competencyIds: { type: "array", items: { type: "string" }, description: "本场允许兑现的已解锁能力 ID；无能力时传 []" },
+                      dialogue: { type: "boolean", description: "该角色本场说话时可读取其声线；只约束其引号内对白" },
+                    },
+                    required: ["characterId", "competencyIds"],
+                    additionalProperties: false,
+                  },
+                },
               },
               required: ["id", "goal", "obstacle", "turn", "outcome"],
               additionalProperties: false,
@@ -838,6 +805,7 @@ const TOOL_DEFINITIONS = deepFreeze([
             },
           },
           outlineNodeId: { type: "string", description: "场景态/经历用的大纲节点 ID" },
+          competencyIds: { type: "array", items: { type: "string" }, description: "读取 competencies 时必填：要核对的能力 ID；正文只返回这些已解锁能力" },
         },
         required: ["id"],
         additionalProperties: false,
@@ -1098,7 +1066,6 @@ const LEGACY_MODEL_FILE_TOOLS = new Set([
   "inspect_file",
   "propose_outline_patch",
   "propose_document",
-  "write_document_isolated",
   "propose_document_patch",
   "revise_document_isolated",
   "propose_change_set",
@@ -1113,7 +1080,7 @@ export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name))
 
 const WRITE_TOOLS = new Set([
   "write_file", "edit_file", "move_file", "delete_file",
-  "begin_chapter_draft", "write_chapter_scene", "write_chapter_scene_notes", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
+  "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
   "manage_prose_gates",
   "generate_image",

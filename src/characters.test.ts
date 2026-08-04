@@ -8,7 +8,6 @@ import {
   applyCharacterChanges,
   applyCharacterInput,
   competenciesWritingPayload,
-  competencyPromptView,
   emptyCharacter,
   characterSummaryCard,
   normalizeV3Character,
@@ -19,7 +18,7 @@ import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleGetCharacter, handleListCharacters, handleSaveCharacter } from "./tools/characters.js";
 import type { Character, OutlineNode } from "./types.js";
-import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
+import { characterConstraintHash, characterConstraintView, characterWritingConstraintView } from "./character_constraints.js";
 
 test("competency unlock state is normalized and defaults to locked", () => {
   const base = emptyCharacter("Tester");
@@ -43,8 +42,6 @@ test("competency unlock state is normalized and defaults to locked", () => {
   });
   assert.equal(locked.competencies[0].unlocked, false);
   assert.equal(unlocked.competencies[0].unlocked, true);
-  assert.deepEqual(competencyPromptView(locked.competencies[0]), { id: "skill-locked", name: "Locked", summary: "Public hint", unlocked: false });
-  assert.deepEqual(competencyPromptView(unlocked.competencies[0]), unlocked.competencies[0]);
 });
 
 test("competenciesWritingPayload splits inPlay without unlocked:false flags", () => {
@@ -61,10 +58,9 @@ test("competenciesWritingPayload splits inPlay without unlocked:false flags", ()
   const payload = competenciesWritingPayload(comps);
   assert.equal(payload.inPlay.length, 1);
   assert.equal(payload.inPlay[0].name, "可用");
-  assert.equal(payload.notInPlay.length, 1);
-  assert.equal(payload.notInPlay[0].name, "专属武装——「霜烬」");
-  assert.equal("unlocked" in payload.notInPlay[0], false);
-  assert.match(payload.rule, /还锁着|未解锁/);
+  assert.equal("unlocked" in payload.inPlay[0], false);
+  assert.doesNotMatch(JSON.stringify(payload), /霜烬|secret/u);
+  assert.match(payload.rule, /未提供的能力本场不写/u);
 });
 
 test("experiences default to empty and normalize from partial cards", () => {
@@ -163,7 +159,7 @@ test("saveCharacter upserts arrays and supports replaceSections", () => {
   }
 });
 
-test("writer/reviewer constraint packet keeps executable character boundaries stable", () => {
+test("writing constraints expose only usable abilities while review keeps the full boundary", () => {
   const card = normalizeV3Character({ ...emptyCharacter("林千夏"), id: 7, updatedAt: "" });
   card.competencies = [{
     id: "spinal-core",
@@ -190,9 +186,12 @@ test("writer/reviewer constraint packet keeps executable character boundaries st
   }];
   const writer = characterConstraintView(card);
   const reviewer = characterConstraintView(card);
+  const prose = characterWritingConstraintView(card);
   assert.equal(writer.competencies[0].unlocked, false);
   assert.deepEqual(writer, reviewer);
   assert.equal(characterConstraintHash(writer), characterConstraintHash(reviewer));
+  assert.deepEqual(prose.capabilityIndex, []);
+  assert.doesNotMatch(JSON.stringify(prose), /脊柱超算核心|融合完成前/u);
 });
 
 test("features persist separately from competencies and first-pass view exposes summaries only", () => {
@@ -214,12 +213,12 @@ test("features persist separately from competencies and first-pass view exposes 
   const summary = characterSummaryCard(card);
   assert.equal(card.features[0].description, "旧伤导致，右手最明显");
   assert.equal(summary.features[0].summary, "低温时动作会变得僵硬 右手尤其明显");
-  assert.equal(summary.competencies[0].summary, "擅长辨认足迹 能判断移动方向");
+  assert.equal((summary.capabilityIndex as Array<{ summary: string }>)[0].summary, "擅长辨认足迹 能判断移动方向");
   assert.equal("description" in summary.features[0], false);
-  assert.equal("description" in summary.competencies[0], false);
+  assert.equal("description" in (summary.capabilityIndex as Array<Record<string, unknown>>)[0], false);
   assert.equal(summary.identity.summary, "调查员");
   assert.equal(summary.appearance.summary, "总戴着旧手套");
-  assert.equal(summary.voice.summary, "短句，常省略主语");
+  assert.equal("voice" in summary, false);
 });
 
 test("legacy v3 profile fields normalize into detailed appearance/background plus summaries", () => {
@@ -251,6 +250,12 @@ test("character tools route summary, section, and edit views without an extra ed
     const card = store.saveCharacter({
       ...emptyCharacter("闻溪"),
       features: [{ id: "feature-cold", name: "怕冷", summary: "低温时动作僵硬", description: "右手旧伤最明显" }],
+      competencies: [
+        { id: "ready", name: "追踪", summary: "能辨认新鲜足迹", level: "熟练", unlocked: true, description: "从泥土和鞋印判断去向", resources: [], limitations: ["雨水会冲淡痕迹"], costs: ["需要时间排查"] },
+        { id: "other", name: "攀爬", summary: "能借墙体快速移动", level: "熟练", unlocked: true, description: "需要可攀附的墙面", resources: [], limitations: ["湿滑表面风险高"], costs: ["消耗体力"] },
+        { id: "sealed", name: "终焉协议", summary: "尚未掌握的禁忌能力", level: "绝密", unlocked: false, description: "未解锁能力的秘密说明", resources: [], limitations: ["秘密限制"], costs: ["秘密代价"] },
+      ],
+      voice: { ...emptyCharacter().voice, summary: "克制，但被逼急会说长句", register: "口语" },
     });
     const sessionId = store.createSession("编辑角色");
     const args = {
@@ -271,6 +276,54 @@ test("character tools route summary, section, and edit views without an extra ed
       ...args, input: { id: card.id, view: "summary" },
     })) as Record<string, unknown>;
     assert.equal(JSON.stringify(summary).includes("右手旧伤最明显"), false);
+    assert.doesNotMatch(JSON.stringify(summary), /终焉协议|禁忌能力|秘密说明|秘密限制|秘密代价/u);
+    const summaryAbilities = summary.capabilityIndex as Array<{ id: string; unlocked?: unknown; description?: unknown }>;
+    assert.deepEqual(summaryAbilities.map(item => item.id), ["ready", "other"]);
+    assert.equal("unlocked" in summaryAbilities[0], false);
+    assert.equal("description" in summaryAbilities[0], false);
+
+    assert.throws(() => handleGetCharacter({
+      ...args, input: { id: card.id, view: "sections", sections: ["competencies"] },
+    }), /competencyIds/u);
+
+    const proseSections = JSON.parse(handleGetCharacter({
+      ...args, input: { id: card.id, view: "sections", sections: ["competencies", "voice"], competencyIds: ["ready"] },
+    })) as {
+      competencies: { inPlay: Array<{ id: string; unlocked?: unknown }> };
+      voice: { summary: string };
+      voiceScope: { characterId: number; name: string; appliesTo: string; rule: string };
+    };
+    assert.deepEqual(proseSections.competencies.inPlay.map(item => item.id), ["ready"]);
+    assert.equal("unlocked" in proseSections.competencies.inPlay[0], false);
+    assert.doesNotMatch(JSON.stringify(proseSections.competencies), /攀爬|湿滑表面/u);
+    assert.equal(proseSections.voice.summary, "克制，但被逼急会说长句");
+    assert.deepEqual(proseSections.voiceScope, {
+      characterId: card.id,
+      name: "闻溪",
+      appliesTo: "spoken_dialogue_only",
+      rule: "仅约束该角色说出口的对白；不要迁移到叙述、动作描写或其他角色的对白。",
+    });
+
+    const sceneScopedArgs = {
+      ...args,
+      context: {
+        ...args.context,
+        activeSceneCharacterScopes: {
+          sceneId: "arrival",
+          characterScopes: [{ characterId: card.id, competencyIds: ["ready"] }],
+        },
+      },
+    };
+    const sceneScopedAbility = JSON.parse(handleGetCharacter({
+      ...sceneScopedArgs, input: { id: card.id, view: "sections", sections: ["competencies"] },
+    })) as { competencies: { inPlay: Array<{ id: string }> } };
+    assert.deepEqual(sceneScopedAbility.competencies.inPlay.map(item => item.id), ["ready"]);
+    assert.throws(() => handleGetCharacter({
+      ...sceneScopedArgs, input: { id: card.id, view: "sections", sections: ["competencies"], competencyIds: ["other"] },
+    }), /许可范围/u);
+    assert.throws(() => handleGetCharacter({
+      ...sceneScopedArgs, input: { id: card.id, view: "sections", sections: ["voice"] },
+    }), /对白声线许可/u);
 
     const selected = JSON.parse(handleGetCharacter({
       ...args, input: { id: card.id, view: "edit", sections: ["features"] },
@@ -281,6 +334,7 @@ test("character tools route summary, section, and edit views without an extra ed
       ...args, input: { id: card.id, view: "edit" },
     })) as Character;
     assert.equal(edit.features[0].id, "feature-cold");
+    assert.equal(edit.competencies.find(item => item.id === "sealed")?.description, "未解锁能力的秘密说明");
 
     assert.throws(() => handleSaveCharacter({
       ...args, input: { id: card.id, features: [] },
@@ -322,6 +376,26 @@ test("web character editor save replaces deleted experiences and story states", 
   }));
   assert.deepEqual(saved.experiences, []);
   assert.deepEqual(saved.storyStates, []);
+});
+
+test("web character editor save payload preserves ability costs", () => {
+  const base = normalizeV3Character({
+    ...emptyCharacter("甲"),
+    id: 1,
+    updatedAt: "",
+    competencies: [{
+      id: "skill-1", name: "灵视", summary: "看见异常轮廓", level: "初阶", unlocked: true,
+      description: "", resources: [], limitations: ["只能在暗处使用"], costs: ["使用后头痛"],
+    }],
+  });
+  const saved = applyCharacterInput(base, characterEditorSaveInput({
+    ...base,
+    competencies: base.competencies.map(item => item.id === "skill-1"
+      ? { ...item, limitations: ["需要保持视线"] }
+      : item),
+  }));
+  assert.deepEqual(saved.competencies[0].limitations, ["需要保持视线"]);
+  assert.deepEqual(saved.competencies[0].costs, ["使用后头痛"]);
 });
 
 test("applyCharacterChanges unlocks, adds experience, and updates personality", () => {

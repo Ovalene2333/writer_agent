@@ -23,6 +23,7 @@ import { emptyCharacter } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { executeTool } from "./tools/execute.js";
+import { handleBeginChapterDraft } from "./tools/scene_pipeline.js";
 import {
   FINAL_PROSE_GATE_TIMEOUT_MS,
   PRIMARY_PROSE_GATE_TIMEOUT_MS,
@@ -82,7 +83,7 @@ test("compileWritePack parses structured draft sections", () => {
 ## 勿擅自补写
 - 第四号下落
 
-## 声线提醒
+## 叙述提醒
 - 短句，少解释
 `;
   const pack = compileWritePack(draft, { targetPath: "chapters/第一章.md" });
@@ -92,6 +93,15 @@ test("compileWritePack parses structured draft sections", () => {
   assert.ok(pack.knownFacts.some(item => item.includes("九十八")));
   assert.ok(pack.mustLand.some(item => item.includes("第三号")));
   assert.ok(pack.doNotInvent.some(item => item.includes("第四号")));
+  assert.deepEqual(pack.narrationNotes, ["短句，少解释"]);
+  assert.match(formatWritePackForWriter(pack), /【叙述提醒】/u);
+});
+
+test("generic voice headings never enter the global write pack", () => {
+  const pack = compileWritePack("## 声线\n- 闻溪面对追问会用短句回避。\n");
+  assert.deepEqual(pack.narrationNotes, []);
+  assert.doesNotMatch(formatWritePackForWriter(pack), /闻溪|追问|短句/u);
+  assert.equal("voiceNotes" in pack, false);
 });
 
 test("compileWritePack rewrites 序章 inside known facts", () => {
@@ -131,6 +141,8 @@ test("writePackDraftContractPrompt forbids chapter labels", () => {
   assert.match(prompt, /场景目标/);
   assert.match(prompt, /禁止出现/);
   assert.match(prompt, /序章/);
+  assert.match(prompt, /角色对白必须回到该角色的原始角色卡读取/);
+  assert.match(prompt, /不得写某个角色的说话方式、口头禅、句长或对白示例/);
 });
 
 test("sanitizeProseMetaLeaks preserves chapter titles but fixes referential leaks", () => {
@@ -233,7 +245,7 @@ test("side prose treats scene count and target length as guidance", async () => 
       scenePipelineSettings: {
         enabled: true,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 3_000, candidateCount: 1,
       },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
@@ -683,6 +695,76 @@ test("scene pipeline rejects empty state change and repeated scene functions", (
   assert.equal(expanded.scenes.length, 6);
 });
 
+test("scene guides retain source-linked capability scopes and reject ambiguous entries", () => {
+  const scoped = beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
+    baseContent: "", baseHash: "empty",
+    scenes: [{
+      ...sceneChain[0],
+      characterScopes: [{ characterId: 7, competencyIds: ["track"], dialogue: true }],
+    }],
+  });
+  assert.deepEqual(scoped.scenes[0].characterScopes, [{ characterId: 7, competencyIds: ["track"], dialogue: true }]);
+  assert.throws(() => beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
+    baseContent: "", baseHash: "empty",
+    scenes: [{
+      ...sceneChain[0],
+      characterScopes: [
+        { characterId: 7, competencyIds: ["track"] },
+        { characterId: 7, competencyIds: ["climb"] },
+      ],
+    }],
+  }), /不能重复角色/u);
+  assert.throws(() => beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
+    baseContent: "", baseHash: "empty",
+    scenes: [{
+      ...sceneChain[0],
+      characterScopes: [{ characterId: 7, competencyIds: [] }],
+    }],
+  }), /至少选择/u);
+});
+
+test("beginning a scene guide rejects locked or inaccessible scoped abilities", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-scene-capability-scope-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "能力范围");
+    store = new WriterStore(project);
+    const activeStore = store;
+    const character = activeStore.saveCharacter({
+      ...emptyCharacter("学员"),
+      competencies: [{
+        id: "sealed", name: "封存协议", summary: "尚不能使用", level: "", unlocked: false,
+        description: "", resources: [], limitations: ["未解锁"], costs: [],
+      }],
+    });
+    const input = {
+      path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
+      scenes: [{
+        ...sceneChain[0],
+        characterScopes: [{ characterId: character.id, competencyIds: ["sealed"] }],
+      }],
+    };
+    assert.throws(() => handleBeginChapterDraft({
+      input, project, store: activeStore, sessionId: activeStore.createSession("能力场景"), emit: () => undefined,
+      characterScope: [character.id], context: { permissionMode: "auto" },
+    }), /尚未解锁/u);
+    assert.throws(() => handleBeginChapterDraft({
+      input: {
+        ...input,
+        scenes: [{ ...input.scenes[0], characterScopes: [{ characterId: character.id + 1, competencyIds: ["sealed"] }] }],
+      },
+      project, store: activeStore, sessionId: activeStore.createSession("越界场景"), emit: () => undefined,
+      characterScope: [character.id], context: { permissionMode: "auto" },
+    }), /不可读/u);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("chapter scene tool compiles notes inline and submits only after inspection", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-scene-pipeline-"));
   let store: WriterStore | undefined;
@@ -699,7 +781,7 @@ test("chapter scene tool compiles notes inline and submits only after inspection
       scenePipelineSettings: {
         enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 3_000, candidateCount: 1,
       },
       modelUsageReporter: (model, _usage, meta) => {
         chapterReviewUsage.push({ model: model.model, callKind: meta.callKind });
@@ -737,10 +819,6 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(begun.status, "started");
     assert.equal(begun.sceneCount, 1);
     assert.equal("scenes" in begun, false, "begin result must not echo the full scene chain");
-    const wrongMode = JSON.parse(await call("write_chapter_scene_notes", {
-      sceneId: "arrival", notes: "只提交笔记。",
-    })) as Record<string, unknown>;
-    assert.match(String(wrongMode.error), /标准\/Fast 模式请调用 write_chapter_scene/u);
     // Planning-only steps mid-draft get steered back to write_chapter_scene.
     const todosNudge = JSON.parse(await call("manage_todos", {
       todos: [{ id: "t1", content: "自定义步骤", status: "in_progress" }],
@@ -931,7 +1009,7 @@ test("disabled scene pipeline rejects a new chapter draft", async () => {
       scenePipelineSettings: {
         enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 1,
+        notesMaxCharacters: 3_000, candidateCount: 1,
       },
     };
     const result = JSON.parse(await executeTool(
@@ -1084,7 +1162,7 @@ test("scene candidate sampling skips clean originals without extra model calls",
       scenePipelineSettings: {
         enabled: true,
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
-        notesMaxCharacters: 3_000, isolatedWriterMaxRatio: 2, isolatedWriter: false, candidateCount: 2,
+        notesMaxCharacters: 3_000, candidateCount: 2,
       },
       // Unreachable endpoint: the test fails with skipped=rewrite_error if a rewrite call is ever attempted.
       sceneCandidates: { model: { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "test" } },

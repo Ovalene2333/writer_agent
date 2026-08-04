@@ -68,7 +68,7 @@ export function writingWorkflowStagesForTool(
   }
   if ([
     "write_file", "edit_file", "move_file", "delete_file",
-    "write_chapter_scene", "write_chapter_scene_notes", "write_document_isolated",
+    "write_chapter_scene",
     "revise_document_isolated", "propose_document", "propose_document_patch", "propose_change_set",
   ].includes(toolName)) {
     stages.push("draft_unit");
@@ -82,7 +82,7 @@ export function writingWorkflowStagesForTool(
   }
   if ([
     "write_file", "edit_file", "move_file", "delete_file",
-    "propose_outline_patch", "propose_document", "write_document_isolated", "propose_document_patch",
+    "propose_outline_patch", "propose_document", "propose_document_patch",
     "propose_change_set", "revise_document_isolated", "propose_chapter_draft",
   ].includes(toolName) || (toolName === "inspect_chapter_draft" && result.proposalSubmitted === true)) {
     stages.push("submit_artifact");

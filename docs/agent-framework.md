@@ -98,7 +98,7 @@ Agent 的模型上下文分为三层：
 - 后一场使用前一场的状态和结尾作为衔接；
 - 完成后组装整章并统一终审。
 
-场景链实现主要在 `src/tools/scene_pipeline.ts` 和 `src/isolated_scene_writer.ts`。
+场景链实现主要在 `src/tools/scene_pipeline.ts`。
 
 ## 六、质量审核
 

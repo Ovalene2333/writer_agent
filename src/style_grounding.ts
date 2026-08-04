@@ -171,68 +171,6 @@ export function dynamicStyleGroundingPrompt(
 }
 
 /**
- * Style constraints for the isolated scene writer.
- *
- * The prose-only call used to receive NONE of this: no active template, no craft
- * baseline — every rule the Agent path treats as shared was silently dropped
- * on the one call that actually produces chapter text. Mannerism prohibitions are
- * deliberately still excluded: ISOLATED_WRITER_SYSTEM already carries its prose
- * contract, and duplicating another checklist would distort the style signal.
- */
-export function isolatedWriterStyleDirectives(project: WriterProject): string {
-  const config = project.config();
-  const template = config.style ? project.styleTemplate(config.style) : undefined;
-  const sections: string[] = [];
-  if (template) {
-    sections.push(`本作品的激活风格模板：${template.name}`, template.systemPromptAddition.trim());
-  }
-  return sections.join("\n\n");
-}
-
-export type IsolatedWriterVoiceEvidence = {
-  /** Imitation target: user 范文 or template example. Never the project's own prose. */
-  exemplar: string;
-  /** Continuity anchor: the work's existing prose. Used only when no in-chapter seam exists. */
-  continuation: string;
-};
-
-/**
- * Two voice slots with different jobs, for the isolated scene writer.
- *
- * These must not substitute for each other. The single-slot predecessor returned
- * project prose whenever any existed, so on every chapter after the first the
- * writer's only stylistic target was its own previous output — a self-imitation
- * loop that regresses to the mean the longer a work runs, which is exactly when
- * voice matters most. The exemplar now always comes from outside the draft; the
- * continuation slot carries seam continuity separately.
- *
- * Unlike the Agent's dynamic grounding block both return bare prose: no notes,
- * source paths or workflow text — the prose-only call gets evidence, not
- * instructions.
- */
-export function isolatedWriterVoiceEvidence(
-  project: WriterProject,
-  store: WriterStore,
-  targetPath?: string,
-  random: () => number = Math.random,
-  options?: { excludeProjectVoice?: boolean },
-): IsolatedWriterVoiceEvidence {
-  const config = project.config();
-  const template = config.style ? project.styleTemplate(config.style) : undefined;
-  const example = pickStyleExamples(store, template?.name, undefined, random)[0];
-  const exemplar = example
-    ? sampleProseWindow(example.content, 1_200, random)
-    : "";
-  const projectSample = pickProjectVoiceSample(
-    project,
-    targetPath,
-    undefined,
-    options?.excludeProjectVoice,
-  );
-  return { exemplar, continuation: projectSample ? projectSample.text.slice(-1_200) : "" };
-}
-
-/**
  * Lightweight rhythm fingerprint. No longer injected into writing prompts
  * (statistical style summaries do not anchor imitation — raw prose does);
  * kept for diagnostics, tests and potential UI display.

@@ -730,10 +730,10 @@ export function CharacterEditor(props: {
 
             {section === "voice" && (
               <div className="ce-panel">
-                <SectionHead title="声线与对白" description="写作与角色扮演时优先读这里。" />
+                <SectionHead title="声线与对白" description="只描述这个角色说出口时如何选择信息、回应他人和随关系变化；不规定叙述口吻。" />
                 <div className="ce-form-stack">
-                  <Field label="声线摘要" hint="节奏、语域、互动姿态与变化" wide>
-                    <textarea value={draft.voice.summary} onChange={e => patchVoice({ summary: e.target.value })} placeholder="平时怎样组织句子、如何对待听者，以及压力下声线会怎样变化。" rows={4} />
+                  <Field label="声线摘要" hint="互动姿态、信息取舍、关系/压力下的变化；句长只是次要线索" wide>
+                    <textarea value={draft.voice.summary} onChange={e => patchVoice({ summary: e.target.value })} placeholder="面对陌生人先问来意，不主动补解释；被逼问时会把理由说完整。" rows={4} />
                   </Field>
                   {summaryAction("voice", "voice", {
                     existingSummary: draft.voice.summary,
@@ -747,14 +747,14 @@ export function CharacterEditor(props: {
                     voice: { ...current.voice, summary },
                   }))}
                   <div className="ce-form-grid">
-                    <Field label="语域 / 口气"><input value={draft.voice.register} onChange={e => patchVoice({ register: e.target.value })} placeholder="口语 / 冷淡 / 文雅…" /></Field>
-                    <Field label="用词与习惯" hint="逗号分隔"><input value={[...draft.voice.diction, ...draft.voice.verbalHabits].join(", ")} onChange={e => patchVoice({ diction: splitList(e.target.value), verbalHabits: [] })} placeholder="……嗯, 少用敬语" /></Field>
+                    <Field label="语域 / 口气"><input value={draft.voice.register} onChange={e => patchVoice({ register: e.target.value })} placeholder="口语 / 谨慎 / 公事公办…" /></Field>
+                    <Field label="用词与习惯" hint="逗号分隔；记录稳定表达选择，不用短句模板"><input value={[...draft.voice.diction, ...draft.voice.verbalHabits].join(", ")} onChange={e => patchVoice({ diction: splitList(e.target.value), verbalHabits: [] })} placeholder="先问来意再回答, 被追问会补足理由" /></Field>
                   </div>
                   <Field label="避免表达" hint="逗号或换行" wide>
                     <input value={draft.voice.avoidedExpressions.join(", ")} onChange={e => patchVoice({ avoidedExpressions: splitList(e.target.value) })} placeholder="不说肉麻情话, 不自称本小姐" />
                   </Field>
-                  <Field label="对白示例" hint="每行一句，越像本人越好" wide>
-                    <textarea className="ce-tall" value={draft.voice.examples.join("\n")} onChange={e => patchVoice({ examples: e.target.value.split(/\n/).map(x => x.trim()).filter(Boolean) })} placeholder={"别盯着我看。\n……知道了。"} rows={6} />
+                  <Field label="对白示例" hint="每行一个不同处境；展示如何回应、回避或解释，不要只堆短句" wide>
+                    <textarea className="ce-tall" value={draft.voice.examples.join("\n")} onChange={e => patchVoice({ examples: e.target.value.split(/\n/).map(x => x.trim()).filter(Boolean) })} placeholder={"陌生人问路时：先问对方从哪里来，再给最短的方向。\n被同伴追问时：会停一下，把原先省去的理由说完整。"} rows={6} />
                   </Field>
                 </div>
               </div>
@@ -841,7 +841,7 @@ export function CharacterEditor(props: {
               <div className="ce-panel">
                 <SectionHead
                   title="能力"
-                  description="能做什么、做到什么程度、代价是什么。"
+                  description="能做什么、做到什么程度、受什么限制、付什么代价。"
                   action={(
                     <button type="button" onClick={() => onChange({
                       ...draft,
@@ -900,9 +900,13 @@ export function CharacterEditor(props: {
                             ...draft,
                             competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, resources: splitList(e.target.value) } : x),
                           })} /></Field>
-                          <Field label="限制 / 代价" hint="逗号分隔"><input value={[...skill.limitations, ...skill.costs].join(", ")} onChange={e => onChange({
+                          <Field label="限制" hint="逗号分隔"><input value={skill.limitations.join(", ")} onChange={e => onChange({
                             ...draft,
-                            competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, limitations: splitList(e.target.value), costs: [] } : x),
+                            competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, limitations: splitList(e.target.value) } : x),
+                          })} /></Field>
+                          <Field label="代价" hint="逗号分隔"><input value={skill.costs.join(", ")} onChange={e => onChange({
+                            ...draft,
+                            competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, costs: splitList(e.target.value) } : x),
                           })} /></Field>
                         </div>
                       </EntryCard>
