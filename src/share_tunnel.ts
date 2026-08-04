@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import process from "node:process";
 import QRCode from "qrcode";
 
@@ -20,6 +21,24 @@ export interface TunnelFailure {
 export interface TunnelDiagnosis {
   cause: string;
   suggestions: string[];
+}
+
+/** named = fixed host; quick = one-shot trycloudflare.com */
+export type ShareTunnelMode = "named" | "quick";
+
+/** Named Tunnel / fixed public hostname configuration. */
+export interface ShareTunnelConfig {
+  /**
+   * named（默认）：固定域名 Named Tunnel。
+   * quick：临时 trycloudflare.com（--share-once）。
+   */
+  mode?: ShareTunnelMode;
+  /** Fixed public hostname or origin, e.g. ovalene.dpdns.org or https://ovalene.dpdns.org */
+  hostname?: string;
+  /** Connector token from Cloudflare Zero Trust dashboard (preferred). */
+  tunnelToken?: string;
+  /** Absolute path to cloudflared binary. */
+  cloudflaredBin?: string;
 }
 
 export function diagnoseTunnelFailure(output: string): TunnelDiagnosis {
@@ -48,8 +67,17 @@ export function diagnoseTunnelFailure(output: string): TunnelDiagnosis {
     return {
       cause: "Cloudflare Quick Tunnel 地址申请失败或服务暂时不可用。",
       suggestions: [
-        "稍后重试，并检查 ~/.cloudflared/config.yaml 是否包含命名隧道配置。",
-        "若需要稳定公网地址，请改用已登录的命名 Tunnel。",
+        "稍后重试；或改用固定域名：`writer web --share`（需 CF_TUNNEL_TOKEN + CF_TUNNEL_HOSTNAME）。",
+        "一次性临时隧道请用 `writer web --share-once`。",
+      ],
+    };
+  }
+  if (/(?:unauthorized|invalid tunnel secret|Provided Tunnel token is not valid|tunnel credentials)/i.test(output)) {
+    return {
+      cause: "命名隧道凭据无效或未登录（token / cert.pem）。",
+      suggestions: [
+        "在 Cloudflare Zero Trust → Networks → Tunnels 复制 connector token，写入 CF_TUNNEL_TOKEN，并设置 CF_TUNNEL_HOSTNAME。",
+        "临时入口请使用 `writer web --share-once`。",
       ],
     };
   }
@@ -67,7 +95,7 @@ export function diagnoseTunnelFailure(output: string): TunnelDiagnosis {
   }
   return {
     cause: "cloudflared 意外退出，日志中没有匹配到已知故障类型。",
-    suggestions: ["根据下方原始日志定位原因；必要时用 `cloudflared tunnel --loglevel debug --url http://127.0.0.1:<端口>` 复现。"],
+    suggestions: ["根据下方原始日志定位原因；必要时用 `cloudflared tunnel --loglevel debug run` 复现。"],
   };
 }
 
@@ -99,13 +127,117 @@ export function formatTunnelFailureReport(failures: TunnelFailure[]): string {
   return `${lines.join("\n")}\n`;
 }
 
+/** Normalize user input into a stable https origin (e.g. https://ovalene.dpdns.org). */
+export function normalizePublicOrigin(hostname: string): string {
+  const raw = hostname.trim();
+  if (!raw) throw new Error("公网域名不能为空");
+  const withProto = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(withProto);
+  } catch {
+    throw new Error(`公网域名无效：${hostname}`);
+  }
+  if (parsed.protocol !== "https:") throw new Error("公网隧道地址必须使用 https");
+  const host = parsed.hostname.toLowerCase();
+  if (!host || host === "localhost" || host === "127.0.0.1") {
+    throw new Error("公网隧道地址不能是本机回环地址");
+  }
+  return parsed.origin;
+}
+
+/** Accept quick tunnels and any fixed HTTPS public origin used by Named Tunnel. */
+export function isAllowedPublicOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    if (!host || host === "localhost" || host === "127.0.0.1" || host === "[::1]") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveCloudflaredBin(explicit?: string): string {
+  const candidates = [
+    explicit?.trim(),
+    process.env.WRITER_CLOUDFLARED?.trim(),
+    "cloudflared",
+    "cloudflared.exe",
+    "/mnt/d/software/cloudflared/cloudflared.exe",
+    "D:\\software\\cloudflared\\cloudflared.exe",
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    if (candidate === "cloudflared" || candidate === "cloudflared.exe") return candidate;
+    if (existsSync(candidate)) return candidate;
+  }
+  return "cloudflared";
+}
+
+function buildCloudflaredArgs(port: number, config: ShareTunnelConfig): string[] {
+  const token = config.tunnelToken?.trim();
+  if (token) return ["tunnel", "run", "--token", token];
+  // Quick Tunnel: random trycloudflare.com hostname each session.
+  return ["tunnel", "--url", `http://127.0.0.1:${port}`];
+}
+
+function resolveShareTunnelConfig(config: ShareTunnelConfig = {}): {
+  fixedOrigin: string | undefined;
+  named: boolean;
+  cloudflaredBin: string;
+  args: (port: number) => string[];
+} {
+  const mode: ShareTunnelMode = config.mode === "quick" ? "quick" : "named";
+  const cloudflaredBin = resolveCloudflaredBin(config.cloudflaredBin);
+
+  if (mode === "quick") {
+    return {
+      fixedOrigin: undefined,
+      named: false,
+      cloudflaredBin,
+      args: (port: number) => buildCloudflaredArgs(port, {}),
+    };
+  }
+
+  const hostname = config.hostname?.trim()
+    || process.env.CF_TUNNEL_HOSTNAME?.trim()
+    || "";
+  const tunnelToken = config.tunnelToken?.trim()
+    || "";
+  if (!tunnelToken || !hostname) {
+    const missing = [
+      !tunnelToken ? "CF_TUNNEL_TOKEN" : "",
+      !hostname ? "CF_TUNNEL_HOSTNAME" : "",
+    ].filter(Boolean);
+    throw new Error(
+      `固定域名分享（--share）必须同时设置 ${missing.join(" 和 ")}；若只要一次性临时域名，请用 writer web --share-once。`,
+    );
+  }
+  const fixedOrigin = normalizePublicOrigin(hostname);
+  return {
+    fixedOrigin,
+    named: true,
+    cloudflaredBin,
+    args: (port: number) => buildCloudflaredArgs(port, {
+      tunnelToken,
+    }),
+  };
+}
+
 export function startShareTunnel(
   port: number,
   token: string,
   lanOrigin: string,
   onPublicOrigin: (origin: string | null) => void = () => undefined,
+  config: ShareTunnelConfig = {},
 ): ShareTunnelController {
-  process.stdout.write("正在创建公网临时访问地址（cloudflared）...\n");
+  const resolved = resolveShareTunnelConfig(config);
+  if (resolved.named && resolved.fixedOrigin) {
+    process.stdout.write(`正在连接 Cloudflare Named Tunnel（固定域名 ${resolved.fixedOrigin}）...\n`);
+  } else {
+    process.stdout.write("正在创建公网临时访问地址（cloudflared Quick Tunnel）...\n");
+  }
   process.stdout.write(`本机/局域网源：${lanOrigin}\n`);
   onPublicOrigin(null);
 
@@ -118,13 +250,14 @@ export function startShareTunnel(
     if (stopped) return;
     let printed = false;
     let registered = false;
-    let publicOrigin = "";
+    let publicOrigin = resolved.fixedOrigin ?? "";
     let outputBuffer = "";
     let readinessTimer: NodeJS.Timeout | undefined;
     let spawnError: Error | undefined;
     let valid = true;
 
-    const tunnel = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+    const args = resolved.args(port);
+    const tunnel = spawn(resolved.cloudflaredBin, args, {
       windowsHide: true,
       stdio: "pipe",
       env: {
@@ -149,7 +282,13 @@ export function startShareTunnel(
           if (stopped || !valid) return;
           process.stdout.write(qr);
           process.stdout.write(`仅公网备用（不在家 Wi‑Fi 时打开）：\n${publicOnly}\n`);
-          process.stdout.write("注意：公网地址会暴露写作工作台。只给可信设备；结束进程后隧道关闭。隧道重连后请使用最新地址。\n");
+          if (resolved.named) {
+            process.stdout.write(
+              `注意：公网固定域名 ${publicOrigin} 会暴露写作工作台。只给可信设备；结束进程后隧道关闭，域名本身不变。\n`,
+            );
+          } else {
+            process.stdout.write("注意：公网地址会暴露写作工作台。只给可信设备；结束进程后隧道关闭。隧道重连后请使用最新地址。\n");
+          }
         })
         .catch(() => {
           if (valid) process.stdout.write("二维码生成失败，请直接复制上方地址。\n");
@@ -159,22 +298,27 @@ export function startShareTunnel(
     const handleOutput = (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       outputBuffer = `${outputBuffer}${text}`.slice(-MAX_OUTPUT_CHARS);
-      const match = outputBuffer.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-      if (match && !publicOrigin) {
-        publicOrigin = match[0];
-        process.stdout.write("公网地址已分配，正在等待隧道连接就绪...\n");
-        readinessTimer = setTimeout(() => {
-          if (printed || stopped) return;
-          const diagnosis = diagnoseTunnelFailure(outputBuffer);
-          process.stderr.write(`公网隧道仍在连接，cloudflared 正在切换边缘节点。当前判断：${diagnosis.cause}\n`);
-        }, 15_000);
-        if (registered) printAccess();
+      if (!resolved.fixedOrigin) {
+        const match = outputBuffer.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+        if (match && !publicOrigin) {
+          publicOrigin = match[0];
+          process.stdout.write("公网地址已分配，正在等待隧道连接就绪...\n");
+          readinessTimer = setTimeout(() => {
+            if (printed || stopped) return;
+            const diagnosis = diagnoseTunnelFailure(outputBuffer);
+            process.stderr.write(`公网隧道仍在连接，cloudflared 正在切换边缘节点。当前判断：${diagnosis.cause}\n`);
+          }, 15_000);
+          if (registered) printAccess();
+        }
       }
       if (!registered && /Registered tunnel connection/i.test(outputBuffer)) {
         registered = true;
         failures.length = 0;
         const registeredAt = outputBuffer.lastIndexOf("Registered tunnel connection");
         if (registeredAt >= 0) outputBuffer = outputBuffer.slice(registeredAt);
+        if (resolved.fixedOrigin && !printed) {
+          process.stdout.write(`命名隧道已连接：${resolved.fixedOrigin}\n`);
+        }
         printAccess();
       }
     };
@@ -192,7 +336,9 @@ export function startShareTunnel(
 
       if (spawnError) {
         process.stderr.write(`无法启动 cloudflared：${spawnError.message}\n`);
-        process.stderr.write("请先安装 Cloudflare Tunnel 客户端，或改用 `writer web --lan` 只在局域网访问。\n");
+        process.stderr.write(
+          `当前二进制：${resolved.cloudflaredBin}\n请安装 Cloudflare Tunnel 客户端，或设置 WRITER_CLOUDFLARED 指向 cloudflared 路径；也可改用 \`writer web --lan\`。\n`,
+        );
         return;
       }
 
@@ -201,8 +347,14 @@ export function startShareTunnel(
         failures.length = 0;
         const delay = RESTART_DELAYS_MS[0];
         const diagnosis = diagnoseTunnelFailure(outputBuffer);
-        process.stderr.write(`已建立的公网隧道中断，旧公网地址已失效（cloudflared 代码 ${code ?? "未知"}）。${diagnosis.cause}\n`);
-        process.stderr.write(`${delay / 1_000} 秒后自动重新创建隧道（新一轮第 1/${MAX_ATTEMPTS} 次）...\n`);
+        if (resolved.named && resolved.fixedOrigin) {
+          process.stderr.write(
+            `命名隧道连接中断（cloudflared 代码 ${code ?? "未知"}），固定域名 ${resolved.fixedOrigin} 暂时不可达。${diagnosis.cause}\n`,
+          );
+        } else {
+          process.stderr.write(`已建立的公网隧道中断，旧公网地址已失效（cloudflared 代码 ${code ?? "未知"}）。${diagnosis.cause}\n`);
+        }
+        process.stderr.write(`${delay / 1_000} 秒后自动重新连接（新一轮第 1/${MAX_ATTEMPTS} 次）...\n`);
         restartTimer = setTimeout(() => launch(1), delay);
         return;
       }

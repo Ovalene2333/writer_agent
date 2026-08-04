@@ -213,7 +213,14 @@ test("--no-token server mode disables public API authentication only when explic
       });
       const tunnelPayload = await tunnelHealth.json() as { publicOrigin: string | null };
       assert.equal(tunnelPayload.publicOrigin, "https://current.trycloudflare.com");
-      assert.throws(() => protectedServer.setPublicOrigin("https://example.com"), /Cloudflare 公网地址无效/);
+      protectedServer.setPublicOrigin("https://ovalene.dpdns.org");
+      const namedHealth = await fetch(`http://127.0.0.1:${protectedPort}/api/health`, {
+        headers: { authorization: `Bearer ${protectedServer.token}` },
+      });
+      const namedPayload = await namedHealth.json() as { publicOrigin: string | null };
+      assert.equal(namedPayload.publicOrigin, "https://ovalene.dpdns.org");
+      assert.throws(() => protectedServer.setPublicOrigin("http://insecure.example"), /Cloudflare 公网地址无效/);
+      assert.throws(() => protectedServer.setPublicOrigin("https://localhost"), /Cloudflare 公网地址无效/);
       protectedServer.setPublicOrigin(null);
       const disconnectedHealth = await fetch(`http://127.0.0.1:${protectedPort}/api/health`, {
         headers: { authorization: `Bearer ${protectedServer.token}` },

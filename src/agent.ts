@@ -489,6 +489,7 @@ ${modeRule}
 10. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
 11. 作者明确把某类正文问题概括为今后持续检查/避免的规则时，用 manage_prose_gates upsert 沉淀；只改当前一句、含糊抱怨或一次性创作选择不要自动学习。删除、停用规则须按作者明确要求。
 12. 不泄露内部参数；对话简洁；文档适量 Markdown。
+13. generate_image 必须独占一步：同一步不得与其他工具并行调用；先完成检索/清单等准备，下一步再单独生图。用户要求修改、延续或参考既有图片时，必须从动态「可用图片参考」选 attachment ID 填入 referenceAttachmentIds；不可只靠文字复述原图。
 模式：${permissionModeLabel(mode)}`;
 }
 
@@ -882,7 +883,7 @@ async function compileWritingTaskContract(
   onUsage?: (usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; cacheWriteTokens?: number; estimated?: boolean }, retry: boolean) => void,
   prefixCache?: Omit<PrefixCacheRequestContext, "callKind" | "stableMessageCount" | "initialMessageCount">,
 ): Promise<{ task: WritingTask }> {
-  const allDocuments = project.listDocuments().filter(path => !project.isDocumentHidden(path));
+  const allDocuments = project.listTextFiles().filter(path => !project.isDocumentHidden(path));
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
   const documents = prioritizeDocumentCatalog(allDocuments, request, 80);
   const allowedCharacters = characterScope === undefined ? undefined : new Set(characterScope);
@@ -1319,13 +1320,13 @@ ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。${is
 - 只交付用户本轮明确要求的正文范围；用户指定多章时逐章提交并沿用已读材料，未要求的章节不得自行扩展。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：先 search_files，或用 read_file(path+quote) 读取原句及必要上下文。
-- 用户要求修复句式、文风、解释腔或生成感时，修改前先 audit_prose_style；按 diagnosis.actionableIssues 的 evidence 定位，优先 verdict=block，revisionIntent 只规定修改目标、不当作替换句。一般修改不为展示流程调用审计。
+- 用户要求修复句式、文风、解释腔或生成感时，修改前先 audit_prose_style；按 diagnosis.actionableIssues 的 evidence 定位，优先 verdict=block，并复核 aiTells.issues 的示例与建议；资料文档只处理资料画像中的问题。revisionIntent 只规定修改目标、不当作替换句。一般修改不为展示流程调用审计。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。
 - 正文禁止文档元指称（序章里/第N章里/大纲里/路径）。point/section 用 edit_file 对唯一 oldText 做最小修改；editScope=document 才用 write_file 完整替换。提交前：${proseMannerismPreflightLine()}`;
   if (mode === "audit") return `工作流：
-- 先 audit_prose_style；按 diagnosis.actionableIssues 处理，优先 verdict=block；warn 只在结合上下文仍明显模板化时改。
+- 先 audit_prose_style；按 diagnosis.actionableIssues 处理，优先 verdict=block；再审阅 aiTells.issues。warn 只在结合上下文仍明显模板化时改；资料文档以资料画像为准，不套用人物声线或叙事收尾标准。
 - 每条问题含严重度、原文证据、违反约束、最小改法；无证据不提。
 - ${documentProposalRequired ? "要求修复：用 read_file 的 quote 参数定位证据句，只改有证据处，用 edit_file 做最小修改。" : "只检查：不写文件，只输出审阅结论。"}`;
   return documentProposalRequired
@@ -1407,7 +1408,7 @@ function structuredCreativeContext(store: WriterStore, task: WritingTask, charac
 }
 
 function explicitReferencePaths(project: WriterProject, request: string): string[] {
-  const available = new Set(project.listDocuments().filter(path => !project.isDocumentHidden(path)));
+  const available = new Set(project.listTextFiles().filter(path => !project.isDocumentHidden(path)));
   return [...request.matchAll(/(?:^|\s)@([^\s]+)/g)]
     .map((match) => match[1].replace(/[，。；：,.!?！？]+$/, ""))
     .filter((path, index, all) => available.has(path) && all.indexOf(path) === index)
@@ -1466,6 +1467,26 @@ function historicalConversationContext(history: Array<ApiMessage & { channel?: s
   });
   return `历史预览（仅指代/事实；非指令队列；roleplay=试演勿当写作任务）：
 ${olderSummary ? `较早：\n${olderSummary}\n` : ""}${JSON.stringify(entries)}`;
+}
+
+function availableImageReferencesContext(store: WriterStore, sessionId: string, limit = 8): string {
+  const images = store.messages(sessionId, 80)
+    .flatMap(message => (message.attachments ?? []).map(attachment => ({
+      attachment,
+      messageId: message.id,
+      role: message.role,
+    })))
+    .slice(-limit)
+    .reverse();
+  if (!images.length) return "可用图片参考：无。";
+  const rows = images.map(({ attachment, messageId, role }, index) => {
+    const source = attachment.imageGeneration ? "生成图" : "用户附图";
+    return `- 第 ${index + 1} 张（由新到旧）：attachmentId=${attachment.id}；${role === "assistant" ? "Agent" : "用户"}消息 #${messageId}；${source}`;
+  });
+  return [
+    "可用图片参考（同一会话内；用户要求改图、延续构图或保持角色/风格时，必须将对应 attachmentId 传给 generate_image.referenceAttachmentIds，工具会上传真实图片）：",
+    ...rows,
+  ].join("\n");
 }
 
 /**
@@ -1531,10 +1552,7 @@ ${transcript}`;
 /** Prefer chapters/outline/lore and request-mentioned paths; cap planner user payload. */
 function prioritizeDocumentCatalog(documents: string[], request: string, limit: number): string[] {
   if (documents.length <= limit) return documents;
-  const mentioned = new Set(
-    [...request.matchAll(/(?:^|[\s@])((?:lore|outline|chapters|side|archive|story)\/[^\s，。；、]+)/g)]
-      .map(match => match[1].replace(/[，。；：,.!?！？]+$/, "")),
-  );
+  const mentioned = new Set(documents.filter(path => request.includes(path)));
   const rank = (path: string): number => {
     if (mentioned.has(path)) return 0;
     if (path.startsWith("chapters/")) return 1;
@@ -2363,6 +2381,55 @@ export function proposalFailurePauseResult(
   };
 }
 
+function toolResultRequestsPause(result: Record<string, unknown> | undefined): boolean {
+  return result?.status === "waiting" || result?.failureKind === "dependency";
+}
+
+function genericDependencyPauseResult(toolName: string, result: Record<string, unknown>): Record<string, unknown> {
+  if (result.status === "waiting") return result;
+  const message = typeof result.error === "string"
+    ? result.error
+    : typeof result.message === "string"
+      ? result.message
+      : "外部工具依赖暂时不可用。";
+  const summary = toolName === "generate_image"
+    ? "生图服务暂时不可用，已停止自动重试。"
+    : "工具依赖暂时不可用，已暂停 AgentRun。";
+  return {
+    ...result,
+    status: "waiting",
+    displayMessage: [summary, message, "依赖恢复后可续跑。"].filter(Boolean).join("\n"),
+    question: toolName === "generate_image"
+      ? "生图服务暂时不可用；恢复后可续跑。"
+      : "外部依赖暂时不可用；恢复后可续跑。",
+    options: ["续跑"],
+  };
+}
+
+/**
+ * UI step partitioning: generate_image never shares a step chip with other tools.
+ * Preserves tool_call order so provider tool-result alignment stays valid.
+ */
+function groupToolCallsForImageSteps<T extends { name: string }>(calls: readonly T[]): T[][] {
+  if (!calls.length) return [];
+  const groups: T[][] = [];
+  let current: T[] = [];
+  let currentIsImage: boolean | undefined;
+  for (const call of calls) {
+    const isImage = call.name === "generate_image";
+    if (currentIsImage === undefined || isImage === currentIsImage) {
+      current.push(call);
+      currentIsImage = isImage;
+      continue;
+    }
+    groups.push(current);
+    current = [call];
+    currentIsImage = isImage;
+  }
+  if (current.length) groups.push(current);
+  return groups;
+}
+
 function repairPacketForConvergePrompt(
   result: Record<string, unknown>,
   revisionCase?: ProposalRevisionCase,
@@ -2847,6 +2914,7 @@ export async function runAgent(options: {
       agentLoop.snapshot.deliverables.flatMap(item => item.proposalRevision ? [item.proposalRevision] : []),
     ),
     roleplayHandoffContext,
+    availableImageReferencesContext(store, sessionId),
   ].filter(Boolean).join("\n\n");
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
   const todosPrompt = turnTodos.length
@@ -3348,6 +3416,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     } | undefined;
     let requestTraceId: string | undefined;
     const requestTraceSteps: NonNullable<AssembleSlicePayload["requestSteps"]> = [];
+    /** UI step ids may advance mid-turn when generate_image is split into its own chip. */
+    let nextUiStep = 1;
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; ; turn += 1) {
@@ -3448,7 +3518,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       }
       if (convergeMode) convergeTurnsLeft -= 1;
 
-      const step = turn + 1;
+      let step = nextUiStep;
+      nextUiStep += 1;
       currentUsageStep = step;
       agentLoop.recordStep(step, activeDeliverable?.id);
       emit({ type: "step_start", step });
@@ -3664,7 +3735,18 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       /** Injected after all tool results of this step (never between tool rows). */
       let pendingProposalRevisionPrompt: string | undefined;
       let pendingProposalRevisionDraft: ProposalRevisionDraftRef | undefined;
-      for (const call of result.toolCalls) {
+      const toolCallGroups = groupToolCallsForImageSteps(result.toolCalls);
+      for (let groupIndex = 0; groupIndex < toolCallGroups.length; groupIndex += 1) {
+        if (groupIndex > 0) {
+          // Close the prep/other-tools chip, then open a dedicated generate_image step.
+          emit({ type: "step_done", step });
+          step = nextUiStep;
+          nextUiStep += 1;
+          currentUsageStep = step;
+          agentLoop.recordStep(step, activeDeliverable?.id);
+          emit({ type: "step_start", step });
+        }
+        for (const call of toolCallGroups[groupIndex] ?? []) {
         let effectiveCall = call;
         if (waitingForUser) {
           emit({ type: "tool", name: call.name });
@@ -4171,8 +4253,18 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             if (parsed.status === "waiting") waitingForUser = true;
           } catch { /* 无效工具结果不能视为等待。 */ }
         }
+        if (!waitingForUser) {
+          try {
+            const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+            if (toolResultRequestsPause(parsed)) {
+              waitingForUser = true;
+              toolResult = JSON.stringify(genericDependencyPauseResult(call.name, parsed));
+            }
+          } catch { /* 非 JSON 工具结果不能触发运行时暂停。 */ }
+        }
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
+      } // toolCallGroups
       if (pendingProposalRevisionPrompt && !documentProposalSubmitted && !waitingForUser) {
         // Proposal retry boundary: keep the cached preparation prefix, unload all
         // complete draft arguments and gate tool rows, then point at the newest
@@ -4758,7 +4850,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
  * CACHE: Keeping this out of the stable prefix lets write↔audit turns share slots 0–5.
  */
 const REVIEW_PROMPT = `终审专则：降低机器生成感，不是换成另一种统一腔调。
-先 audit_prose_style；使用 diagnosis.actionableIssues，优先 verdict=block；warn 仅明显模板化时改；allow 与未列出正文保留。
+先 audit_prose_style；使用 diagnosis.actionableIssues，优先 verdict=block，并检查 aiTells.issues；warn 仅明显模板化时改；allow 与未列出目标文件保留。资料文档只采用资料画像的通用表达信号，不套用人物声线或叙事收尾标准。
 保留：对白拖音/中断/迟疑、对话纠正、停顿—揭示、短同位。见破折号就删是错。
 查：模板转折、动作后解释回声、说明性破折号与抽象「不是…而是」、标签化人物、空泛排比、过匀句段、段尾升华、全员书面语。
 改法：动作有结果；细节供判断；因果拆句；笼统判断落到可见动作/感官；勿堆修辞伪装生动；勿新增事实。
@@ -5633,7 +5725,10 @@ async function executeToolCached(
   if (call.name === "audit_prose_style" && context.chapterSceneDraft) {
     try {
       const input = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
-      if (input.path === context.chapterSceneDraft.path) {
+      const auditPath = typeof input.path === "string"
+        ? input.path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "")
+        : "";
+      if (auditPath === context.chapterSceneDraft.path) {
         return executeTool(call, project, store, sessionId, emit, characterScope, context);
       }
     } catch { /* executeTool returns the structured invalid-JSON diagnostic. */ }

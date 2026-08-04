@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildShareEntryUrl, diagnoseTunnelFailure, formatTunnelFailureReport, tunnelLogTail } from "./share_tunnel.js";
+import {
+  buildShareEntryUrl,
+  diagnoseTunnelFailure,
+  formatTunnelFailureReport,
+  isAllowedPublicOrigin,
+  normalizePublicOrigin,
+  tunnelLogTail,
+} from "./share_tunnel.js";
 
 test("share entry URLs explicitly distinguish token and no-token modes", () => {
   assert.equal(
@@ -11,6 +18,19 @@ test("share entry URLs explicitly distinguish token and no-token modes", () => {
     buildShareEntryUrl("https://demo.trycloudflare.com", "", "lan", "http://192.168.1.2:4096"),
     "https://demo.trycloudflare.com/#auth=none&lan=http%3A%2F%2F192.168.1.2%3A4096",
   );
+  assert.equal(
+    buildShareEntryUrl("https://ovalene.dpdns.org", "secret", "lan", "http://192.168.1.2:4096"),
+    "https://ovalene.dpdns.org/#token=secret&lan=http%3A%2F%2F192.168.1.2%3A4096",
+  );
+});
+
+test("normalizePublicOrigin accepts bare hostnames for Named Tunnel", () => {
+  assert.equal(normalizePublicOrigin("ovalene.dpdns.org"), "https://ovalene.dpdns.org");
+  assert.equal(normalizePublicOrigin("https://ovalene.dpdns.org/"), "https://ovalene.dpdns.org");
+  assert.throws(() => normalizePublicOrigin("http://ovalene.dpdns.org"), /https/);
+  assert.ok(isAllowedPublicOrigin("https://ovalene.dpdns.org"));
+  assert.ok(isAllowedPublicOrigin("https://demo.trycloudflare.com"));
+  assert.equal(isAllowedPublicOrigin("http://192.168.1.2:4096"), false);
 });
 
 const edgeTimeoutLog = [

@@ -77,7 +77,7 @@ export type ToolExecutionContext = {
   /** AgentRun owning workflow-scoped proposal state. */
   runId?: string;
   /** Dedicated Images API model and generated assets owned by this Agent turn. */
-  imageGenerator?: { model: ModelConfig; signal?: AbortSignal };
+  imageGenerator?: { model: ModelConfig; signal?: AbortSignal; retryDelaysMs?: readonly number[] };
   generatedAttachments?: MessageAttachment[];
   /** Whether narrative tasks may append experiences and story state to character cards. */
   characterEvolutionEnabled?: boolean;

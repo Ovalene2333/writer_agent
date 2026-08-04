@@ -26,7 +26,7 @@ import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleApplyCharacterChanges, handleSaveCharacter } from "./tools/characters.js";
 import type { ToolHandlerArgs } from "./tools/types.js";
-import type { AgentTodoItem } from "./types.js";
+import type { AgentTodoItem, ProseQualityReport } from "./types.js";
 
 test("normalizeTodos enforces single in_progress", () => {
   const todos = normalizeTodos([
@@ -701,6 +701,46 @@ test("message rerun rolls back accepted character-only change sets", () => {
     store.prepareMessageRerun(sessionId, userId, { keepChanges: false });
     assert.equal(store.characters().find(item => item.id === character.id)?.experiences.length, 0);
     assert.equal(store.changeSet(changeSet.id).undone, true);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepted final review report stays with the matching document version", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-quality-history-"));
+  try {
+    const project = WriterProject.init(root, "终审快照");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("quality-history");
+    const body = "# 第一章\n\n雨水沿着屋檐滴落。";
+    const report: ProseQualityReport = {
+      characters: 14,
+      vividness: { score: 84, summary: "感官线索充足" },
+      aiTells: { score: 12, summary: "未见明显套话" },
+      grade: "good",
+      length: { target: 3000, actual: 14, status: "too_short" },
+      warnings: [{ source: "metrics", code: "short", message: "篇幅偏短", examples: [] }],
+    };
+    const proposal = store.createProposal(sessionId, "chapters/第一章.md", body, "初稿", [], report);
+    store.acceptProposal(proposal.id);
+
+    const acceptedVersion = store.documentVersions("chapters/第一章.md")[0]!;
+    assert.deepEqual(acceptedVersion.qualityReport, report);
+    assert.deepEqual(store.documentVersion("chapters/第一章.md", acceptedVersion.id).qualityReport, report);
+    assert.deepEqual(
+      store.documentQualityReport("chapters/第一章.md", project.hash(project.read("chapters/第一章.md"))),
+      report,
+    );
+
+    const edited = `${body}\n\n风穿过巷口。`;
+    store.updateDocument("chapters/第一章.md", edited, project.hash(body));
+    const manualVersion = store.documentVersions("chapters/第一章.md")[0]!;
+    assert.equal(manualVersion.qualityReport, undefined);
+    assert.equal(
+      store.documentQualityReport("chapters/第一章.md", project.hash(edited)),
+      undefined,
+    );
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

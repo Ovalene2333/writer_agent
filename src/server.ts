@@ -653,7 +653,9 @@ export async function startWriterServer(options: {
     try {
       const path = context.req.query("path") ?? "";
       const content = options.project.read(path);
-      return context.json({ path, content, hash: options.project.hash(content) });
+      const hash = options.project.hash(content);
+      const qualityReport = options.store.documentQualityReport(path, hash);
+      return context.json({ path, content, hash, ...(qualityReport ? { qualityReport } : {}) });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);
     }
@@ -2004,11 +2006,21 @@ export async function startWriterServer(options: {
         publicOrigin = null;
         return;
       }
-      const parsed = new URL(nextOrigin);
-      if (parsed.protocol !== "https:" || !parsed.hostname.toLowerCase().endsWith(".trycloudflare.com")) {
+      // Quick Tunnel (*.trycloudflare.com) and Named Tunnel fixed hostnames.
+      try {
+        const parsed = new URL(nextOrigin);
+        const host = parsed.hostname.toLowerCase();
+        if (parsed.protocol !== "https:"
+          || !host
+          || host === "localhost"
+          || host === "127.0.0.1"
+          || host === "[::1]") {
+          throw new Error("invalid");
+        }
+        publicOrigin = parsed.origin;
+      } catch {
         throw new Error("Cloudflare 公网地址无效");
       }
-      publicOrigin = parsed.origin;
     },
     close: async () => {
       await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);

@@ -181,12 +181,30 @@ function parseMessageAttachments(value: unknown): MessageAttachment[] {
       if (!item || typeof item !== "object") return [];
       const row = item as Partial<MessageAttachment>;
       if (typeof row.id !== "string" || typeof row.mimeType !== "string" || typeof row.storagePath !== "string") return [];
+      const rawGeneration = row.imageGeneration;
+      const imageGeneration = rawGeneration && typeof rawGeneration === "object"
+        && typeof rawGeneration.finalPrompt === "string" && rawGeneration.finalPrompt.trim()
+        ? {
+            finalPrompt: rawGeneration.finalPrompt,
+            ...(typeof rawGeneration.revisedPrompt === "string" && rawGeneration.revisedPrompt.trim()
+              ? { revisedPrompt: rawGeneration.revisedPrompt }
+              : {}),
+            ...(Array.isArray(rawGeneration.referenceAttachmentIds)
+              ? {
+                  referenceAttachmentIds: [...new Set(rawGeneration.referenceAttachmentIds
+                    .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+                    .map(id => id.trim()))].slice(0, 4),
+                }
+              : {}),
+          }
+        : undefined;
       return [{
         id: row.id,
         name: typeof row.name === "string" && row.name.trim() ? row.name.trim() : row.id,
         mimeType: row.mimeType,
         size: Number(row.size) || 0,
         storagePath: row.storagePath,
+        ...(imageGeneration ? { imageGeneration } : {}),
       }];
     });
   } catch {
@@ -206,6 +224,7 @@ function parseProposalQualityReport(value: unknown): ProseQualityReport | undefi
       vividness: report.vividness,
       aiTells: report.aiTells,
       grade: report.grade as ProseQualityReport["grade"],
+      ...(report.length && typeof report.length === "object" ? { length: report.length } : {}),
       warnings: Array.isArray(report.warnings) ? report.warnings : [],
     };
   } catch {
@@ -308,10 +327,12 @@ export class WriterStore {
         after_hash TEXT NOT NULL,
         created_file INTEGER NOT NULL DEFAULT 0,
         character_revisions_json TEXT NOT NULL DEFAULT '[]',
+        quality_report_json TEXT NOT NULL DEFAULT '',
         undone INTEGER NOT NULL DEFAULT 0,
         label TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS revisions_path_after_hash ON revisions(path, after_hash, id DESC);
       CREATE TABLE IF NOT EXISTS change_sets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -651,6 +672,9 @@ export class WriterStore {
     }
     if (!revisionColumns.some(column => column.name === "character_revisions_json")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN character_revisions_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!revisionColumns.some(column => column.name === "quality_report_json")) {
+      this.database.exec("ALTER TABLE revisions ADD COLUMN quality_report_json TEXT NOT NULL DEFAULT ''");
     }
     if (!revisionColumns.some(column => column.name === "label")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN label TEXT NOT NULL DEFAULT ''");
@@ -2628,7 +2652,7 @@ export class WriterStore {
   /** Persist one trusted model output using the same private attachment layout as uploads. */
   saveGeneratedImageAttachment(
     sessionId: string,
-    input: { name?: string; mimeType: string; bytes: Buffer },
+    input: { name?: string; mimeType: string; bytes: Buffer; imageGeneration?: MessageAttachment["imageGeneration"] },
   ): MessageAttachment {
     const mimeType = normalizeImageMime(input.mimeType || "");
     if (!isSupportedImageMime(mimeType)) throw new Error(`生图模型返回了不支持的图片类型：${input.mimeType || "unknown"}`);
@@ -2642,7 +2666,14 @@ export class WriterStore {
     mkdirSync(dirname(absolute), { recursive: true });
     writeFileSync(absolute, input.bytes);
     const name = (input.name?.trim() || `generated-image.${ext}`).slice(0, 120);
-    return { id, name, mimeType, size: input.bytes.length, storagePath };
+    return {
+      id,
+      name,
+      mimeType,
+      size: input.bytes.length,
+      storagePath,
+      ...(input.imageGeneration ? { imageGeneration: input.imageGeneration } : {}),
+    };
   }
 
   resolveAttachmentBytes(sessionId: string, attachmentId: string): { mimeType: string; bytes: Buffer } | undefined {
@@ -3547,11 +3578,11 @@ export class WriterStore {
       const existingRevision = this.database.prepare("SELECT 1 AS ok FROM revisions WHERE proposal_id=?").get(id);
       if (!existingRevision) {
         this.database.prepare(`
-          INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_file,character_revisions_json,created_at)
-          VALUES(?,?,?,?,?,?,?,?)
+          INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,created_file,character_revisions_json,quality_report_json,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?)
         `).run(
           id, proposal.path, beforeContent, proposal.afterContent, expectedAfterHash, Number(application.created_file) ? 1 : 0,
-          String(application.character_revisions_json ?? "[]"), now,
+          String(application.character_revisions_json ?? "[]"), proposal.qualityReport ? JSON.stringify(proposal.qualityReport) : "", now,
         );
       }
       this.database.prepare("UPDATE proposals SET status='accepted' WHERE id=?").run(id);
@@ -4084,7 +4115,7 @@ export class WriterStore {
     const liveHash = live ? this.project.hash(live) : "";
     const rows = this.database.prepare(`
       SELECT r.id, r.path, r.after_hash, r.created_file, r.created_at, r.undone, r.label,
-             p.summary AS proposal_summary
+             r.quality_report_json, p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
       WHERE r.path = ?
@@ -4096,8 +4127,9 @@ export class WriterStore {
       const baseSummary = typeof row.label === "string" && row.label.trim()
         ? String(row.label)
         : typeof row.proposal_summary === "string" && row.proposal_summary.trim()
-        ? String(row.proposal_summary)
-        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
+          ? String(row.proposal_summary)
+          : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
+      const qualityReport = parseProposalQualityReport(row.quality_report_json);
       return {
         id: Number(row.id),
         path: String(row.path),
@@ -4106,6 +4138,7 @@ export class WriterStore {
         isCurrent: !undone && liveHash !== "" && String(row.after_hash) === liveHash,
         createdFile: Number(row.created_file) === 1,
         undone,
+        ...(qualityReport ? { qualityReport } : {}),
       };
     });
   }
@@ -4116,7 +4149,7 @@ export class WriterStore {
     if (!Number.isInteger(revisionId) || revisionId <= 0) throw new Error("版本编号无效");
     const row = this.database.prepare(`
       SELECT r.id, r.path, r.before_content, r.after_content, r.after_hash,
-             r.created_file, r.created_at, r.undone, r.label, p.summary AS proposal_summary
+             r.created_file, r.created_at, r.undone, r.label, r.quality_report_json, p.summary AS proposal_summary
       FROM revisions r
       LEFT JOIN proposals p ON p.id = r.proposal_id
       WHERE r.id = ? AND r.path = ?
@@ -4128,8 +4161,9 @@ export class WriterStore {
     const baseSummary = typeof row.label === "string" && row.label.trim()
       ? String(row.label)
       : typeof row.proposal_summary === "string" && row.proposal_summary.trim()
-      ? String(row.proposal_summary)
-      : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
+        ? String(row.proposal_summary)
+        : Number(row.created_file) === 1 ? "新建文档" : "手动编辑";
+    const qualityReport = parseProposalQualityReport(row.quality_report_json);
     return {
       id: Number(row.id),
       path: String(row.path),
@@ -4140,7 +4174,21 @@ export class WriterStore {
       undone,
       beforeContent: String(row.before_content ?? ""),
       afterContent: String(row.after_content ?? ""),
+      ...(qualityReport ? { qualityReport } : {}),
     };
+  }
+
+  /** Terminal report for the exact body currently open in the reader. */
+  documentQualityReport(path: string, afterHash: string): ProseQualityReport | undefined {
+    if (!path || !afterHash) return undefined;
+    const row = this.database.prepare(`
+      SELECT quality_report_json
+      FROM revisions
+      WHERE path=? AND after_hash=? AND quality_report_json<>''
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(path, afterHash) as Row | undefined;
+    return row ? parseProposalQualityReport(row.quality_report_json) : undefined;
   }
 
   restoreDocumentVersion(path: string, revisionId: number, baseHash: string): DocumentVersionMeta {

@@ -1,6 +1,43 @@
 import { documentKind, type WriterProject } from "../project.js";
+import type { ToolExecutionContext } from "./types.js";
 
 export type DocumentWriteMode = "create" | "replace" | "append";
+
+/** Canonical resource-relative form shared by text-file tools and audits. */
+export function normalizeTextFilePath(path: string): string {
+  return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
+    .replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "");
+}
+
+/**
+ * Read the same visible snapshot as the unified file tools.
+ * An audit must see a run's staged copy, otherwise it can bless stale text that
+ * will not be submitted.
+ */
+export function readableTextFile(
+  args: Pick<{ project: WriterProject; context: ToolExecutionContext }, "project" | "context">,
+  path: string,
+): { path: string; content: string; sourceHash: string; workingCopy: boolean } {
+  const normalized = normalizeTextFilePath(path);
+  if (!normalized) throw new Error("path 不能为空");
+  if (args.project.isDocumentHidden(normalized)) throw new Error("文件已对 Agent 屏蔽");
+  const working = args.context.workingTextFiles?.get(normalized);
+  if (working) {
+    return {
+      path: normalized,
+      content: working.content,
+      sourceHash: working.sourceHash,
+      workingCopy: true,
+    };
+  }
+  const content = args.project.readTextFile(normalized);
+  return {
+    path: normalized,
+    content,
+    sourceHash: args.project.hash(content),
+    workingCopy: false,
+  };
+}
 
 /** Existing targets are revisions, not filename collisions. */
 export function resolveDocumentWriteTarget(

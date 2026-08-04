@@ -85,7 +85,11 @@ export const MIN_NARRATIVE_SENTENCES = 36;
 /** 叙述句长 p80−p20 低于此值视为低 burstiness。 */
 export const SENTENCE_SPREAD_TARGET = 14;
 
+/** Narrative-only signals are deliberately excluded for reference materials. */
+export type AiTellProfile = "narrative" | "reference";
+
 export type AiTells = {
+  profile: AiTellProfile;
   stats: AiTellStats;
   issues: AiTellIssue[];
 };
@@ -158,7 +162,8 @@ const BODY_EMOTION_METER =
 const STOCK_IDIOM =
   /不由自主|难以置信|难以名状|难以言喻|五味杂陈|若有所思|意味深长|心中一凛|百感交集|不约而同|不动声色|毫不犹豫|情不自禁|鬼使神差|心照不宣|一言不发|不置可否|无可奈何|悄无声息|不知所措|恍然大悟|如释重负|轻描淡写|漫不经心|微不足道|显而易见|不出所料|果不其然|如出一辙|不置一词|欲言又止|面无表情|嗤之以鼻/gu;
 
-export function analyzeAiTells(text: string): AiTells {
+export function analyzeAiTells(text: string, options?: { profile?: AiTellProfile }): AiTells {
+  const profile = options?.profile ?? "narrative";
   const body = stripStructuralLines(text);
   const characters = Math.max(1, body.replace(/\s/g, "").length);
   const per10k = (count: number) => Math.round((count / characters) * 10_000);
@@ -188,12 +193,12 @@ export function analyzeAiTells(text: string): AiTells {
     sentenceLengthSpread: packing.sentenceSpread,
     score: 0,
   };
-  stats.score = compositeScore(stats);
+  stats.score = compositeScore(stats, profile);
 
   const issues: AiTellIssue[] = [];
-  if (characters < MIN_MEASURABLE_CHARACTERS) return { stats, issues };
+  if (characters < MIN_MEASURABLE_CHARACTERS) return { profile, stats, issues };
 
-  if (stats.dialogueLines >= MIN_DIALOGUE_LINES && dialogueHomogeneity(stats) > 0) {
+  if (profile === "narrative" && stats.dialogueLines >= MIN_DIALOGUE_LINES && dialogueHomogeneity(stats) > 0) {
     const reasons = [
       stats.dialogueLengthSpread < DIALOGUE_SPREAD_TARGET
         ? `台词长度起伏仅 ${stats.dialogueLengthSpread} 字（参考 ${DIALOGUE_SPREAD_TARGET}）`
@@ -212,7 +217,7 @@ export function analyzeAiTells(text: string): AiTells {
       examples: dialogue.lines.slice(0, 4),
     });
   }
-  if (closing.hits.length) {
+  if (profile === "narrative" && closing.hits.length) {
     issues.push({
       code: "thematic_uplift",
       message: `收尾有 ${closing.hits.length} 处由叙述者自己点破主题。这是最容易辨认的生成腔：`
@@ -220,7 +225,7 @@ export function analyzeAiTells(text: string): AiTells {
       examples: closing.hits.map(item => clip(item, 60)),
     });
   }
-  if (stats.dialogueLines >= MIN_DIALOGUE_LINES && stats.philosophicalRatio > PHILOSOPHICAL_RATIO_LIMIT) {
+  if (profile === "narrative" && stats.dialogueLines >= MIN_DIALOGUE_LINES && stats.philosophicalRatio > PHILOSOPHICAL_RATIO_LIMIT) {
     issues.push({
       code: "philosophical_dialogue",
       message: `${Math.round(stats.philosophicalRatio * 100)}% 的台词在谈意义、命运、本质这类抽象命题`
@@ -237,7 +242,7 @@ export function analyzeAiTells(text: string): AiTells {
       examples: dedupe(tricolonMatches).slice(0, 5),
     });
   }
-  if (stats.bodyMeterPer10k > BODY_METER_PER_10K_LIMIT) {
+  if (profile === "narrative" && stats.bodyMeterPer10k > BODY_METER_PER_10K_LIMIT) {
     issues.push({
       code: "body_emotion_meter",
       message: `身体情绪计量器 ${stats.bodyMeterPer10k}/万字（参考 ${BODY_METER_PER_10K_LIMIT}）。`
@@ -245,7 +250,7 @@ export function analyzeAiTells(text: string): AiTells {
       examples: dedupe(bodyMeterMatches).slice(0, 5),
     });
   }
-  if (stats.paragraphCount >= MIN_PARAGRAPHS && stats.paragraphLengthSpread < PARAGRAPH_SPREAD_TARGET) {
+  if (profile === "narrative" && stats.paragraphCount >= MIN_PARAGRAPHS && stats.paragraphLengthSpread < PARAGRAPH_SPREAD_TARGET) {
     issues.push({
       code: "paragraph_uniform",
       message: `段落长度起伏仅 ${stats.paragraphLengthSpread} 字（p80−p20，参考 ${PARAGRAPH_SPREAD_TARGET}）；`
@@ -271,7 +276,7 @@ export function analyzeAiTells(text: string): AiTells {
       examples: packing.examples.slice(0, 5),
     });
   }
-  if (packing.sentenceCount >= MIN_NARRATIVE_SENTENCES
+  if (profile === "narrative" && packing.sentenceCount >= MIN_NARRATIVE_SENTENCES
     && stats.sentenceLengthSpread < SENTENCE_SPREAD_TARGET) {
     issues.push({
       code: "sentence_uniform",
@@ -280,7 +285,7 @@ export function analyzeAiTells(text: string): AiTells {
       examples: [],
     });
   }
-  return { stats, issues };
+  return { profile, stats, issues };
 }
 
 /** 0–100，越高越像 AI。与 proseVividnessScore 方向相反，取值时注意别弄反。 */
@@ -289,7 +294,12 @@ export function aiTellScore(text: string): number {
 }
 
 /** 单行摘要，供工具结果与 reviewer signals。 */
-export function formatAiTellSummary(stats: AiTellStats): string {
+export function formatAiTellSummary(stats: AiTellStats, profile: AiTellProfile = "narrative"): string {
+  if (profile === "reference") {
+    return `资料表达风险 ${stats.score}/100（仅作定位参考）；三元并列 ${stats.tricolonPer10k}/万字；`
+      + `套话 ${stats.idiomPer10k}/万字；事件堆叠句 ${Math.round(stats.packingRatio * 100)}%。`
+      + "资料文档不以人物声线、段落均齐或叙事收尾作为判据。";
+  }
   return `表达模式风险 ${stats.score}/100（仅作定位参考）；台词 ${stats.dialogueLines} 条、长度起伏 ${stats.dialogueLengthSpread} 字、`
     + `口语标记 ${Math.round(stats.dialogueColloquialRatio * 100)}%、主题化 ${Math.round(stats.philosophicalRatio * 100)}%；`
     + `收尾升华 ${stats.thematicUpliftCount} 处；三元并列 ${stats.tricolonPer10k}/万字；`
@@ -310,7 +320,13 @@ export function sceneAiTellFeedback(chapterSoFar: string): string[] {
   return [`本章至今的 AI 味计量（${stats.score}/100，越低越好；只提示不拦截）：`, ...lines];
 }
 
-function compositeScore(stats: AiTellStats): number {
+function compositeScore(stats: AiTellStats, profile: AiTellProfile): number {
+  if (profile === "reference") {
+    const tricolon = Math.min(14, over(stats.tricolonPer10k, TRICOLON_PER_10K_LIMIT) * 0.35);
+    const idiom = Math.min(10, over(stats.idiomPer10k, IDIOM_PER_10K_LIMIT) * 0.25);
+    const packing = Math.min(16, over(stats.packingRatio, PACKING_RATIO_LIMIT) * 80);
+    return Math.round(Math.max(0, Math.min(100, tricolon + idiom + packing)) * 10) / 10;
+  }
   const dialogue = stats.dialogueLines >= MIN_DIALOGUE_LINES ? dialogueHomogeneity(stats) * 20 : 0;
   const uplift = Math.min(18, stats.thematicUpliftCount * 9);
   const philosophical = stats.dialogueLines >= MIN_DIALOGUE_LINES

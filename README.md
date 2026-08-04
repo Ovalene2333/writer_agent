@@ -30,7 +30,7 @@
 
 - [Node.js](https://nodejs.org/) **≥ 22**（内置 `node:sqlite`）
 - 兼容 OpenAI Chat Completions 协议的模型 API（内置 DeepSeek 与 OpenAI 兼容配置）
-- （可选）[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/)：`writer web --share` 创建临时公网地址时需要
+- （可选）[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/)：`writer web --share` / `--share-once` 公网分享时需要
 
 ## 安装
 
@@ -97,7 +97,9 @@ writer web -p ./my-novel          # 指定项目目录
 writer web --port 4096            # 端口，默认 4096
 writer web --lan                  # 监听 0.0.0.0，允许局域网访问
 writer web --host 0.0.0.0         # 自定义监听地址
-writer web --share                # 局域网 + cloudflared；扫一次码，进出家自动切换通道
+writer web --share                # 固定域名 Named Tunnel（需 CF_TUNNEL_TOKEN + CF_TUNNEL_HOSTNAME）
+writer web --share-once           # 一次性临时域名 *.trycloudflare.com（重启会变）
+writer web --share --share-host other.example.com   # 覆盖固定域名
 writer web --no-open              # 不自动打开浏览器
 writer web --no-token             # 关闭 API 鉴权；可与 --lan / --share 同用
 writer web --share --no-token     # 建立无令牌公网入口（终端会打印安全警告）
@@ -105,7 +107,21 @@ writer web --debug                # 打印 step 内容 + 模型请求/响应体
 writer web --debug-steps          # 仅打印 Agent 每步 reasoning / tools / output（推荐排查 UI step）
 ```
 
-`--share` 会让 cloudflared 先自行切换边缘节点；若进程仍退出，Writer 会按 2 秒、5 秒退避自动重建，连续 3 次未连接后输出故障分类、恢复建议和最近日志。已经注册成功的隧道若稍后中断，会开启新一轮恢复并提示旧公网地址失效。
+**`--share`（固定域名）** 需要 Cloudflare Named Tunnel：
+
+```bash
+export CF_TUNNEL_TOKEN='<Cloudflare 隧道 connector token>'
+export CF_TUNNEL_HOSTNAME='ovalene.dpdns.org'
+# 可选：WSL 下指定二进制
+# export WRITER_CLOUDFLARED=/mnt/d/software/cloudflared/cloudflared.exe
+writer web --share -p ./p/jn3
+```
+
+CF 控制台里 Public Hostname 的服务地址须指向本机端口（默认 `http://localhost:4096`）。
+
+**`--share-once`** 走 Quick Tunnel，无需 token，地址每次随机。
+
+cloudflared 会自行切换边缘节点；若进程仍退出，Writer 会按 2 秒、5 秒退避自动重建，连续 3 次未连接后输出故障分类。Named Tunnel 固定域名不变；Quick Tunnel 中断后旧临时地址失效。
 
 ### `writer run` 常用选项
 
@@ -240,6 +256,8 @@ style: ""   # 可设为风格模板 id，如 light-novel
 
 ### 环境变量（可选，优先级高于项目配置）
 
+CLI 启动时会自动读取当前工作目录下的 `.env`；已经在 shell 中设置的同名变量优先。`.env` 已被 Git 忽略，不会提交密钥。
+
 | 变量 | 说明 |
 |------|------|
 | `WRITER_API_KEY` | API Key |
@@ -253,6 +271,9 @@ style: ""   # 可设为风格模板 id，如 light-novel
 | `WRITER_DEBUG` | 设为 `1` / `true` 时打印 **step 内容** 与模型请求/原始返回 |
 | `WRITER_DEBUG_STEPS` | 设为 `1` / `true` 时**仅**打印 Agent step（reasoning / tools / output），不含模型 HTTP 原文 |
 | `WRITER_TUNNEL_PROTOCOL` | cloudflared 传输协议，默认 `http2` |
+| `CF_TUNNEL_HOSTNAME` | `--share` 固定域名（必需） |
+| `CF_TUNNEL_TOKEN` | Named Tunnel connector token（`--share` 必需） |
+| `WRITER_CLOUDFLARED` | 可选；cloudflared 可执行文件路径 |
 
 #### 禁用采样参数
 
@@ -371,9 +392,9 @@ npm test                    # 编译并跑测试
 ## 安全提示
 
 - `.writer/providers.json`（或 `WRITER_PROVIDERS_FILE` 指向的文件）含 API Key，**不要提交到公开仓库**
-- `writer web --share` 会把带令牌的公网地址暴露到外网；只发给可信设备，结束进程后隧道关闭
-- `writer web --no-token` 会关闭全部 API 访问鉴权；可与 `--share` 同用，但拿到公网地址的任何人都能读写项目，终端会明确警告
-- `--share` 会同时监听局域网：终端二维码为**局域网入口**（hash 里带公网地址）。手机在家扫一次后，Web 端会探测 `/api/health`，在家走局域网、出门自动改打 Cloudflare；下次重启 Writer 需重新扫码（临时隧道地址会变）
+- `writer web --share` / `--share-once` 会把带令牌的公网地址暴露到外网；只发给可信设备，结束进程后隧道关闭
+- `writer web --no-token` 会关闭全部 API 访问鉴权；可与公网分享同用，但拿到公网地址的任何人都能读写项目，终端会明确警告
+- 公网分享会同时监听局域网：终端二维码为**局域网入口**（hash 里带公网地址）。手机在家扫一次后，Web 端会探测 `/api/health`，在家走局域网、出门自动改打 Cloudflare；`--share` 固定域名可长期复用，`--share-once` 重启后临时地址会变需重扫
 - 请在**家中 Wi‑Fi** 下扫推荐二维码。若先打开纯公网 HTTPS 页，浏览器会拦截对局域网 HTTP 的探测（混合内容），无法自动切回局域网
 - `--lan` 会允许同一局域网内的设备访问工作台，请注意网络安全环境
 

@@ -299,10 +299,10 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "audit_prose_style",
-      description: "风格审计（说明体/解释回声等）；仅过密 error 拦截提案",
+      description: "审计任意可见 UTF-8 文本的 AI 生成腔；正文另含说明体/解释回声诊断，资料文档按资料画像避免误报",
       parameters: {
         type: "object",
-        properties: { path: { type: "string", description: "正文路径" } },
+        properties: { path: { type: "string", description: "resource/ 内相对路径" } },
         required: ["path"], additionalProperties: false,
       },
     },
@@ -1069,11 +1069,12 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "generate_image",
-      description: "调用独立生图模型生成一张图片，并将图片附到本轮回复；仅在用户明确要求图片产物时调用",
+      description: "调用独立生图模型生成一张图片并附到本轮回复；仅在用户明确要求图片产物时调用。必须独占一步，勿与其他工具同批调用",
       parameters: {
         type: "object",
         properties: {
           prompt: { type: "string", description: "完整、可独立执行的视觉提示词" },
+          referenceAttachmentIds: { type: "array", items: { type: "string" }, maxItems: 4, description: "可选，同一会话可用图片参考中的附件 ID；传入后按改图接口上传原图" },
           name: { type: "string", description: "可选文件名，如 chapter-cover.png" },
           size: { type: "string", enum: ["auto", "1024x1024", "1536x1024", "1024x1536"] },
           quality: { type: "string", enum: ["auto", "low", "medium", "high"] },

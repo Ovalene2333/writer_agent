@@ -59,10 +59,16 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
-function isCloudflareTunnelUrl(value: string): boolean {
+/** Quick Tunnel 或 Named Tunnel 固定公网 HTTPS 源（非本机回环）。 */
+function isPublicTunnelUrl(value: string): boolean {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" && url.hostname.toLowerCase().endsWith(".trycloudflare.com");
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    return Boolean(host)
+      && host !== "localhost"
+      && host !== "127.0.0.1"
+      && host !== "[::1]";
   } catch {
     return false;
   }
@@ -182,7 +188,7 @@ function parseBootstrapHash(): { token?: string; tokenless?: boolean; lan?: stri
     token: tokenValue,
     tokenless: params.get("auth") === "none",
     lan: lan && isHttpUrl(lan) ? normalizeBase(lan) : undefined,
-    public: pub && isCloudflareTunnelUrl(pub) ? new URL(pub).origin : undefined,
+    public: pub && isPublicTunnelUrl(pub) ? new URL(pub).origin : undefined,
   };
 }
 
@@ -190,6 +196,7 @@ function parseBootstrapHash(): { token?: string; tokenless?: boolean; lan?: stri
  * 从 URL hash / localStorage 恢复连接配置。
  * hash 形态：`#token=...&public=https://xxx.trycloudflare.com`（局域网入口）
  * 或 `#token=...&lan=http://192.168.x.x:4096`（公网入口）。
+ * Named Tunnel 固定域名同样走 public=https://your.domain。
  */
 export function initConnection(): string {
   const boot = parseBootstrapHash();
@@ -210,7 +217,10 @@ export function initConnection(): string {
     || "";
 
   const pageIsLan = pageOrigin.startsWith("http://") && !/localhost|127\.0\.0\.1/i.test(pageOrigin);
-  const pageIsTunnel = typeof location !== "undefined" && /trycloudflare\.com$/i.test(location.hostname);
+  // HTTPS 非回环页视为公网入口（trycloudflare 临时域或 Named Tunnel 固定域）。
+  const pageIsTunnel = typeof location !== "undefined"
+    && location.protocol === "https:"
+    && !pageIsLocal;
 
   lanBase = boot.lan
     || (pageIsLan ? pageOrigin : null)
@@ -219,7 +229,7 @@ export function initConnection(): string {
 
   publicBase = boot.public
     || (pageIsTunnel ? pageOrigin : null)
-    || (restoreStoredConnection && stored?.publicBase && isCloudflareTunnelUrl(stored.publicBase)
+    || (restoreStoredConnection && stored?.publicBase && isPublicTunnelUrl(stored.publicBase)
       ? new URL(stored.publicBase).origin
       : undefined)
     || null;
@@ -286,7 +296,7 @@ function syncPublicBase(value: unknown): void {
   if (value === null) {
     next = null;
   } else {
-    if (typeof value !== "string" || !isCloudflareTunnelUrl(value)) return;
+    if (typeof value !== "string" || !isPublicTunnelUrl(value)) return;
     try {
       const parsed = new URL(value);
       next = parsed.origin;

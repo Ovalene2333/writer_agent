@@ -290,6 +290,9 @@ function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
 }
 
 function mergeProposalEvent(current: Proposal[], incoming: Proposal): Proposal[] {
+  // Rhythm/style gate drafts are working copies, not author approvals. They may
+  // still arrive through the live stream before the final proposal is submitted.
+  if (incoming.status === "pending" && !incoming.deliveryReady) return current;
   const existing = current.find(item => item.id === incoming.id);
   // Replayed SSE history may contain the original pending event after a refresh
   // has already observed the terminal database state. Never downgrade it.
@@ -744,7 +747,7 @@ function App() {
   // Auto-open the review dock when new pending marks (change-sets / proposals) arrive.
   useEffect(() => {
     if (!state) return;
-    const pending = state.proposals.filter((p) => p.status === "pending").length
+    const pending = state.proposals.filter((p) => p.status === "pending" && p.deliveryReady).length
       + state.changeSets.filter((c) => c.status === "pending").length;
     if (pending > prevPendingReviewRef.current) setReviewOpen(true);
     prevPendingReviewRef.current = pending;
@@ -918,7 +921,11 @@ function App() {
       // Drop stale responses so an older in-flight refresh (e.g. snapshot taken in the
       // re-run rewind gap) cannot overwrite a newer complete conversation.
       if (seq !== refreshSeqRef.current) return next;
-      if (requestedSession && next.sessionId !== requestedSession && sessionIdRef.current === requestedSession) {
+      const requestedSessionStillExists = Boolean(
+        requestedSession && next.sessions.some((session) => session.id === requestedSession),
+      );
+      if (requestedSession && requestedSessionStillExists
+        && next.sessionId !== requestedSession && sessionIdRef.current === requestedSession) {
         return next;
       }
       rememberLastSessionId(next.sessionId);
@@ -1705,7 +1712,7 @@ function App() {
         ? event.question.trim()
         : "Agent 等待输入。");
     }
-    if (event.type === "proposal" && event.proposal) {
+    if (event.type === "proposal" && event.proposal?.deliveryReady) {
       setState((prev) => {
         if (!prev) return prev;
         return { ...prev, proposals: mergeProposalEvent(prev.proposals, event.proposal as Proposal) };
@@ -1788,7 +1795,7 @@ function App() {
           const event = JSON.parse(line.slice(5)) as AgentStreamEvent;
           if (sessionIdRef.current !== sessionId) continue;
           handleAgentEvent(event);
-          if (event.type === "proposal" && event.proposal) completedProposal = event.proposal;
+          if (event.type === "proposal" && event.proposal?.deliveryReady) completedProposal = event.proposal;
           if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "waiting_for_input") {
             terminal = true;
             terminalType = event.type;
@@ -1850,7 +1857,7 @@ function App() {
           }
         }
         if (clearContextOnDone && terminalType === "done") {
-          const pendingCount = (next.proposals ?? []).filter((item) => item.status === "pending").length;
+          const pendingCount = (next.proposals ?? []).filter((item) => item.status === "pending" && item.deliveryReady).length;
           setNotice(
             completedProposal?.status === "accepted"
               ? `Agent job completed · 已写入 ${completedProposal.path}`
@@ -2427,10 +2434,13 @@ function App() {
 
   async function decide(proposal: Proposal, action: "accept" | "reject") {
     try {
-      const result = await api<{ continuityFacts?: number; continuityFactWarning?: string; continuityFactsPending?: boolean }>(
+      const result = await api<{ proposal: Proposal; continuityFacts?: number; continuityFactWarning?: string; continuityFactsPending?: boolean }>(
         `/api/proposals/${proposal.id}/${action}`,
         { method: "POST" },
       );
+      setState((current) => current
+        ? { ...current, proposals: mergeProposalEvent(current.proposals, result.proposal) }
+        : current);
       await refresh(state?.sessionId);
       if (action === "accept" && result.continuityFactsPending) setNotice("内容已接受，事实索引正在后台更新。");
       else if (result.continuityFactWarning) setNotice(result.continuityFactWarning);
@@ -3535,7 +3545,7 @@ function App() {
     );
   }
 
-  const pendingProposals = state.proposals.filter((p) => p.status === "pending");
+  const pendingProposals = state.proposals.filter((p) => p.status === "pending" && p.deliveryReady);
   const readOnly = state.accessMode === "readonly";
   const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
   const visibleMessages = state.messages.filter((msg) =>
@@ -4319,6 +4329,7 @@ function App() {
                             {item.isCurrent && <em className="version-tag">当前</em>}
                             {item.undone && <em className="version-tag version-tag-undone">已回退</em>}
                             {item.createdFile && !item.undone && <em className="version-tag">新建</em>}
+                            {item.qualityReport && <em className="version-tag version-tag-reviewed">终审</em>}
                           </span>
                           <span className="version-item-meta">
                             {formatVersionTime(item.createdAt)} · {item.summary}
@@ -4351,6 +4362,12 @@ function App() {
                       <span className="legend-add">新增</span>
                     </span>
                   </div>
+                  {browsingVersion.qualityReport && (
+                    <section className="document-quality-report" aria-label="终审结果">
+                      <strong>终审结果</strong>
+                      <ProposalQualityCard report={browsingVersion.qualityReport} />
+                    </section>
+                  )}
                   <DocumentDiffView
                     before={browsingVersion.beforeContent}
                     after={browsingVersion.afterContent}
@@ -4358,6 +4375,12 @@ function App() {
                 </div>
               ) : document.content ? (
                 <div className={`document-reader-layout${headings.length === 0 ? " without-outline" : ""}${outlineCollapsed ? " outline-collapsed" : ""}`}>
+                  {document.qualityReport && (
+                    <section className="document-quality-report" aria-label="终审结果">
+                      <strong>终审结果</strong>
+                      <ProposalQualityCard report={document.qualityReport} />
+                    </section>
+                  )}
                   {headings.length > 0 && (
                     <nav className={`document-outline ${outlineCollapsed ? "collapsed" : ""}`} aria-label="Document sections">
                       <div className="document-outline-head">
@@ -4763,6 +4786,31 @@ function App() {
                         )}
                       </a>
                     );
+                  })}
+                </div>
+              ) : null}
+              {msg.attachments?.some((item) => item.imageGeneration) ? (
+                <div className="generated-image-prompts" aria-label="生图提示词">
+                  {msg.attachments.flatMap((item) => {
+                    const generation = item.imageGeneration;
+                    if (!generation) return [];
+                    return [
+                      <details className="generated-image-prompt" key={`${item.id}-prompt`} open>
+                        <summary>{item.name} 的最终提示词</summary>
+                        <div className="generated-image-prompt-body">
+                          <pre>{generation.finalPrompt}</pre>
+                          {generation.revisedPrompt ? (
+                            <div className="generated-image-revised-prompt">
+                              <span>服务修订提示词</span>
+                              <pre>{generation.revisedPrompt}</pre>
+                            </div>
+                          ) : null}
+                          {generation.referenceAttachmentIds?.length ? (
+                            <small>参考图 {generation.referenceAttachmentIds.length} 张</small>
+                          ) : null}
+                        </div>
+                      </details>,
+                    ];
                   })}
                 </div>
               ) : null}

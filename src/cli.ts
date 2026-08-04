@@ -2,7 +2,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
-import process from "node:process";
+import process, { loadEnvFile } from "node:process";
 import { Command } from "commander";
 import { runAgent } from "./agent.js";
 import { DEFAULT_AGENT_EVALUATION_CASES, prepareAgentEvaluationFixtures, runPersistedAgentEvaluation } from "./agent_eval.js";
@@ -16,6 +16,8 @@ import { startWriterServer } from "./server.js";
 import { startShareTunnel } from "./share_tunnel.js";
 import { WriterStore } from "./store.js";
 import type { PermissionMode } from "./types.js";
+
+loadWriterEnv();
 
 const program = new Command();
 program
@@ -147,34 +149,67 @@ program.command("web")
   .option("--lan", "允许局域网设备访问")
   .option("--host <host>", "监听地址")
   .option("--port <port>", "监听端口", "4096")
-  .option("--share", "创建临时公网访问地址（需要已安装 cloudflared；默认同时开局域网，扫一次码可自动切换）")
+  .option("--share", "公网固定域名 Named Tunnel（需 CF_TUNNEL_TOKEN + CF_TUNNEL_HOSTNAME）")
+  .option("--share-once", "一次性临时公网（*.trycloudflare.com，重启会变）")
+  .option("--share-host <hostname>", "覆盖固定公网域名（默认使用 CF_TUNNEL_HOSTNAME）")
+  .option("--tunnel-token <token>", "Cloudflare 命名隧道 connector token（也可用 CF_TUNNEL_TOKEN）")
   .option("--no-open", "不自动打开 PC 浏览器")
   .option("--no-token", "关闭 API 访问令牌（包括 --share 公网入口）")
   .option("--debug", "调试：终端打印 step 内容 + 模型请求/响应体")
   .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端，不含模型原文")
-  .action(async (options: { project: string; lan?: boolean; host?: string; port: string; share?: boolean; open: boolean; token: boolean; debug?: boolean; debugSteps?: boolean }) => {
+  .action(async (options: {
+    project: string;
+    lan?: boolean;
+    host?: string;
+    port: string;
+    share?: boolean;
+    shareOnce?: boolean;
+    shareHost?: string;
+    tunnelToken?: string;
+    open: boolean;
+    token: boolean;
+    debug?: boolean;
+    debugSteps?: boolean;
+  }) => {
     if (options.debug) process.env.WRITER_DEBUG = "1";
     if (options.debugSteps) process.env.WRITER_DEBUG_STEPS = "1";
     if (stepDebugEnabled()) {
       process.stderr.write("[WRITER STEP] step debug enabled — Agent 每步 reasoning/tools/output 会打印到本终端\n");
     }
-    if (!options.token) process.stderr.write(options.share
-      ? "警告：--share --no-token 会把无鉴权的完整项目读写接口暴露到公网。\n"
+    if (options.share && options.shareOnce) {
+      throw new Error("请只选 --share（固定域名）或 --share-once（临时域名）之一");
+    }
+    const shareHost = options.shareHost?.trim()
+      || process.env.CF_TUNNEL_HOSTNAME?.trim()
+      || "";
+    const tunnelToken = options.tunnelToken?.trim()
+      || process.env.CF_TUNNEL_TOKEN?.trim()
+      || "";
+    // --share = 固定域名；--share-once = Quick Tunnel；配置字段存在时默认按固定域名分享
+    const shareOnce = Boolean(options.shareOnce);
+    const shareNamed = Boolean(options.share || (!shareOnce && (shareHost || tunnelToken)));
+    const share = shareNamed || shareOnce;
+    if (!options.token) process.stderr.write(share
+      ? "警告：公网分享且 --no-token 会把无鉴权的完整项目读写接口暴露到公网。\n"
       : "警告：--no-token 已关闭全部 API 鉴权，任何能连接该端口的设备都可读写项目。\n");
     const { project, store, providers } = openProject(options.project);
-    // --share 默认绑定 0.0.0.0，便于手机扫码后在局域网/公网间自动切换
-    const host = options.host || (options.lan || options.share ? "0.0.0.0" : "127.0.0.1");
+    // 公网分享默认绑定 0.0.0.0，便于手机扫码后在局域网/公网间自动切换
+    const host = options.host || (options.lan || share ? "0.0.0.0" : "127.0.0.1");
     const port = Number(options.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口必须是 1 至 65535 的整数");
     const server = await startWriterServer({
       project, store, providers, host, port,
       requireToken: options.token,
-      announce: !options.share,
+      announce: !share,
     });
-    const tunnel = options.share
-      ? startShareTunnel(port, server.token, server.origin, server.setPublicOrigin)
+    const tunnel = share
+      ? startShareTunnel(port, server.token, server.origin, server.setPublicOrigin, {
+        mode: shareOnce ? "quick" : "named",
+        ...(shareHost ? { hostname: shareHost } : {}),
+        ...(tunnelToken ? { tunnelToken } : {}),
+      })
       : undefined;
-    if (options.open && !options.lan && !options.share) openBrowser(server.url);
+    if (options.open && !options.lan && !share) openBrowser(server.url);
     const stop = async () => {
       tunnel?.kill();
       await server.close();
@@ -305,6 +340,16 @@ program.parseAsync().catch((error) => {
   process.stderr.write(`错误：${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
 });
+
+function loadWriterEnv(): void {
+  const envPath = resolve(process.cwd(), ".env");
+  if (!existsSync(envPath)) return;
+  try {
+    loadEnvFile(envPath);
+  } catch (error) {
+    throw new Error(`无法读取 .env：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 function openProject(path: string): { project: WriterProject; store: WriterStore; providers: ProviderManager } {
   const project = new WriterProject(path);

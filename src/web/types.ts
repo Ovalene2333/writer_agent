@@ -17,6 +17,8 @@ export type ProseQualityReport = {
 
 export type Proposal = {
   id: number;
+  /** 门禁修订中的中间草稿不可审批，只有交付就绪提案进入审阅队列。 */
+  deliveryReady: boolean;
   path: string;
   summary: string;
   beforeContent: string;
@@ -47,6 +49,11 @@ export type MessageAttachment = {
   mimeType: string;
   size: number;
   storagePath: string;
+  imageGeneration?: {
+    finalPrompt: string;
+    revisedPrompt?: string;
+    referenceAttachmentIds?: string[];
+  };
 };
 
 export type PendingAttachment = {
@@ -228,7 +235,7 @@ export const emptyRoleplayScene = (): RoleplaySceneDraft => ({
   stakes: [], openingVariants: [], endConditions: [], loreBindings: [],
 });
 export type RoleplayFactDraft = Omit<RoleplayMemoryFact, "id" | "sessionId" | "contextKey" | "createdAt" | "updatedAt"> & { id?: number };
-export type DocumentData = { content: string; hash: string };
+export type DocumentData = { content: string; hash: string; qualityReport?: ProseQualityReport };
 export type DocumentVersionMeta = {
   id: number;
   path: string;
@@ -237,6 +244,7 @@ export type DocumentVersionMeta = {
   isCurrent: boolean;
   createdFile: boolean;
   undone?: boolean;
+  qualityReport?: ProseQualityReport;
 };
 export type DocumentVersionDetail = DocumentVersionMeta & {
   beforeContent: string;
@@ -357,7 +365,7 @@ export type AgentStreamEvent = {
   sessionId?: string;
   question?: string;
   options?: string[];
-  proposal?: { id: number; path: string; summary: string; beforeContent: string; afterContent: string; status: "pending" | "accepted" | "rejected" | "stale" };
+  proposal?: { id: number; deliveryReady: boolean; path: string; summary: string; beforeContent: string; afterContent: string; status: "pending" | "accepted" | "rejected" | "stale" };
   changeSet?: ChangeSet;
   usage?: Usage;
   call?: StepUsage;

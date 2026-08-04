@@ -98,7 +98,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "e84a96f1ce246dd9");
+  assert.equal(agentToolSchemaHash(), "f38a32a19a007f1e");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {

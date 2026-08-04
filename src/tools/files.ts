@@ -2,7 +2,13 @@ import { documentBlocks } from "../document_blocks.js";
 import { isScenePipelineDocument } from "../project.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
 import type { ChangeSetFileOperation } from "../types.js";
-import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
+import {
+  assertWritableMode,
+  normalizeTextFilePath,
+  optionalPositiveInteger,
+  readableTextFile,
+  requireString,
+} from "./helpers.js";
 import {
   captureAcceptedContinuityFacts,
   handleProposeDocument,
@@ -15,47 +21,13 @@ const READ_BLOCK_TARGET_CHARACTERS = 3_000;
 const MAX_READ_CHARACTERS = 4_000;
 const MISSING_TEXT_FILE_HASH = "__missing__";
 
-function normalizeTextPath(path: string): string {
-  return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
-    .replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "");
-}
-
-function workingTextFile(args: Pick<ToolHandlerArgs, "context">, path: string): WorkingTextFile | undefined {
-  return args.context.workingTextFiles?.get(normalizeTextPath(path));
-}
-
-function readableTextFile(
-  args: Pick<ToolHandlerArgs, "project" | "context">,
-  path: string,
-): { path: string; content: string; sourceHash: string; workingCopy: boolean } {
-  const normalized = normalizeTextPath(path);
-  if (!normalized) throw new Error("path 不能为空");
-  if (args.project.isDocumentHidden(normalized)) throw new Error("文件已对 Agent 屏蔽");
-  const working = workingTextFile(args, normalized);
-  if (working) {
-    return {
-      path: normalized,
-      content: working.content,
-      sourceHash: working.sourceHash,
-      workingCopy: true,
-    };
-  }
-  const content = args.project.readTextFile(normalized);
-  return {
-    path: normalized,
-    content,
-    sourceHash: args.project.hash(content),
-    workingCopy: false,
-  };
-}
-
 function stageWorkingTextFile(
   args: ToolHandlerArgs,
   path: string,
   content: string,
 ): WorkingTextFile {
   if (content.includes("\0")) throw new Error("纯文本内容不能包含 NUL 字节");
-  const normalized = normalizeTextPath(path);
+  const normalized = normalizeTextFilePath(path);
   if (!normalized) throw new Error("path 不能为空");
   // Resolve eagerly so traversal, internal paths and symlink targets fail before
   // the body enters the overlay or an approval record.
@@ -309,16 +281,16 @@ export function handleSearchFiles(args: ToolHandlerArgs): string {
 export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
   assertWritableMode(args.context.permissionMode, "write_file");
   const path = requireString(args.input.path, "path");
-  const existing = workingTextFile(args, path);
+  const existing = args.context.workingTextFiles?.get(normalizeTextFilePath(path));
   const chapterDraft = args.context.chapterSceneDraft;
   const inspectedChapterDraft = !existing
     && typeof args.input.content !== "string"
     && chapterDraft
-    && normalizeTextPath(chapterDraft.path) === normalizeTextPath(path)
+    && normalizeTextFilePath(chapterDraft.path) === normalizeTextFilePath(path)
     && chapterSceneDraftComplete(chapterDraft)
     && chapterDraft.inspectedVersion === chapterDraft.version;
   if (inspectedChapterDraft) {
-    const summary = fileMutationSummary(args.input, normalizeTextPath(path), "write");
+    const summary = fileMutationSummary(args.input, normalizeTextFilePath(path), "write");
     return handleProposeChapterDraft({
       ...args,
       input: {
@@ -379,8 +351,8 @@ export async function handleEditFile(args: ToolHandlerArgs): Promise<string> {
 
 export async function handleMoveFile(args: ToolHandlerArgs): Promise<string> {
   assertWritableMode(args.context.permissionMode, "move_file");
-  const path = normalizeTextPath(requireString(args.input.path, "path"));
-  const targetPath = normalizeTextPath(requireString(args.input.targetPath, "targetPath"));
+  const path = normalizeTextFilePath(requireString(args.input.path, "path"));
+  const targetPath = normalizeTextFilePath(requireString(args.input.targetPath, "targetPath"));
   const snapshot = readableTextFile(args, path);
   assertExpectedSourceHash(args.input, snapshot.sourceHash);
   args.project.resolveTextFileSafe(targetPath);
@@ -399,7 +371,7 @@ export async function handleMoveFile(args: ToolHandlerArgs): Promise<string> {
 
 export async function handleDeleteFile(args: ToolHandlerArgs): Promise<string> {
   assertWritableMode(args.context.permissionMode, "delete_file");
-  const path = normalizeTextPath(requireString(args.input.path, "path"));
+  const path = normalizeTextFilePath(requireString(args.input.path, "path"));
   const snapshot = readableTextFile(args, path);
   assertExpectedSourceHash(args.input, snapshot.sourceHash);
   const raw = await handleProposeChangeSet({

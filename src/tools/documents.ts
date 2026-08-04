@@ -2,13 +2,20 @@ import { documentBlocks, documentSections } from "../document_blocks.js";
 import { documentSpanCatalog, documentSpans } from "../document_spans.js";
 import { requestDocumentLocator, type DocumentLocatorCandidate } from "../document_locator.js";
 import { adjudicateLearnedProseGates, adjudicateProseStyleForAudit, applyCachedProseVerdicts } from "../prose_adjudicate.js";
+import { analyzeAiTells, formatAiTellSummary, type AiTellProfile } from "../ai_tells.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { documentKind } from "../project.js";
 import { proseGateRulesForTarget } from "../prose_gate_rules.js";
 import { buildProseDiagnosis } from "../prose_review.js";
 import type { ToolHandlerArgs } from "./types.js";
-import { documentMap, optionalPositiveInteger, requireString } from "./helpers.js";
+import {
+  documentMap,
+  normalizeTextFilePath,
+  optionalPositiveInteger,
+  readableTextFile,
+  requireString,
+} from "./helpers.js";
 
 const READ_BLOCK_TARGET_CHARACTERS = 3_000;
 const MAX_READ_CHARACTERS = 4_000;
@@ -48,27 +55,37 @@ export function handleListDocuments({ project }: ToolHandlerArgs): string {
 }
 
 export async function handleAuditProseStyle({ input, project, context }: ToolHandlerArgs): Promise<string> {
-  const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  const path = normalizeTextFilePath(requireString(input.path, "path"));
+  if (!path) throw new Error("path 不能为空");
+  if (project.isDocumentHidden(path)) throw new Error("文件已对 Agent 屏蔽");
   const activeDraft = context.chapterSceneDraft?.path === path && chapterSceneDraftComplete(context.chapterSceneDraft)
     ? context.chapterSceneDraft
     : undefined;
-  const content = activeDraft ? assembleChapterSceneDraft(activeDraft) : project.read(path);
+  const snapshot = activeDraft ? undefined : readableTextFile({ project, context }, path);
+  const content = activeDraft ? assembleChapterSceneDraft(activeDraft) : snapshot!.content;
+  const kind = documentKind(path);
+  const aiTellProfile: AiTellProfile = kind === "chapter" || kind === "side" ? "narrative" : "reference";
+  const aiTells = analyzeAiTells(content, { profile: aiTellProfile });
   // Draft audits share the gate's verdict cache so audit → inspect never disagree
   // on the same sentence and repeated audits skip already-adjudicated candidates.
   const verdictCache = activeDraft ? (context.proseVerdictCache ??= new Map()) : undefined;
-  const rules = applyCachedProseVerdicts(content, analyzeProseStyle(content), verdictCache);
-  const flash = await adjudicateProseStyleForAudit(
-    content,
-    rules,
-    context.proseAdjudicator?.model,
-    {
-      signal: context.proseAdjudicator?.signal,
-      verdictCache,
-      usageReporter: context.modelUsageReporter,
-      callKind: "prose_audit",
-    },
-  );
+  const narrativeStyleAudit = aiTellProfile === "narrative";
+  const rules = narrativeStyleAudit
+    ? applyCachedProseVerdicts(content, analyzeProseStyle(content), verdictCache)
+    : [];
+  const flash = narrativeStyleAudit
+    ? await adjudicateProseStyleForAudit(
+      content,
+      rules,
+      context.proseAdjudicator?.model,
+      {
+        signal: context.proseAdjudicator?.signal,
+        verdictCache,
+        usageReporter: context.modelUsageReporter,
+        callKind: "prose_audit",
+      },
+    )
+    : { issues: rules, adjudicated: 0, skipped: "reference_document" };
   const issues = flash.issues;
   issues.push(...await adjudicateLearnedProseGates(
     content,
@@ -80,12 +97,14 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
       callKind: "learned_prose_audit",
     },
   ));
-  const sourceHash = project.hash(content);
+  const sourceHash = activeDraft ? project.hash(content) : snapshot!.sourceHash;
   const diagnosis = buildProseDiagnosis(sourceHash, issues, content);
   return JSON.stringify({
     path,
     source: activeDraft ? "chapter_draft" : "document",
     sourceHash,
+    kind,
+    workingCopy: Boolean(snapshot?.workingCopy),
     summary: {
       errors: issues.filter(issue => issue.severity === "error").length,
       warnings: issues.filter(issue => issue.severity === "warning").length,
@@ -95,6 +114,13 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
     },
     diagnosis,
     issues,
+    aiTells: {
+      profile: aiTells.profile,
+      score: aiTells.stats.score,
+      summary: formatAiTellSummary(aiTells.stats, aiTells.profile),
+      stats: aiTells.stats,
+      issues: aiTells.issues,
+    },
   });
 }
 
