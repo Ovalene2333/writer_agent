@@ -35,16 +35,11 @@ import { comparePathNames } from "./path_sort.js";
 import { calculateUsageCost } from "./pricing.js";
 import { WriterProject } from "./project.js";
 import {
-  CONTINUITY_FACT_EPISTEMIC_KINDS,
-  CONTINUITY_FACT_KINDS,
-  CONTINUITY_FACT_SCOPE_KINDS,
-  type ContinuityFact,
-  type ContinuityFactCandidate,
-  type ContinuityFactEpistemicKind,
-  type ContinuityFactKind,
-  type ContinuityFactScopeKind,
-  type ContinuityFactStatus,
-} from "./continuity_facts.js";
+  WRITING_MEMORY_KINDS,
+  type WritingMemoryCandidate,
+  type WritingMemoryEntry,
+  type WritingMemoryKind,
+} from "./writing_memory.js";
 import type {
   ContextEdge, ContextEdgeKind, ContextNode, ContextNodeKind, ContextNodeStatus,
 } from "./context_graph.js";
@@ -476,34 +471,28 @@ export class WriterStore {
         last_used_at TEXT NOT NULL,
         UNIQUE(session_id, cache_key)
       );
-      CREATE TABLE IF NOT EXISTS continuity_facts (
+      CREATE TABLE IF NOT EXISTS writing_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        statement TEXT NOT NULL,
-        normalized_statement TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_message_id INTEGER NOT NULL,
+        source_proposal_id INTEGER,
         kind TEXT NOT NULL,
-        scope_kind TEXT NOT NULL,
-        scope_value TEXT NOT NULL DEFAULT '',
-        valid_from TEXT NOT NULL DEFAULT '',
-        valid_until TEXT NOT NULL DEFAULT '',
-        epistemic TEXT NOT NULL DEFAULT 'objective',
-        known_by_json TEXT NOT NULL DEFAULT '[]',
+        content TEXT NOT NULL,
+        character_ids_json TEXT NOT NULL DEFAULT '[]',
         importance INTEGER NOT NULL DEFAULT 50,
         status TEXT NOT NULL DEFAULT 'active',
-        resume_status TEXT NOT NULL DEFAULT 'active',
         source_path TEXT NOT NULL DEFAULT '',
         source_hash TEXT NOT NULL DEFAULT '',
         source_evidence TEXT NOT NULL DEFAULT '',
         source_anchor_id TEXT NOT NULL DEFAULT '',
-        source_proposal_id INTEGER,
-        conflicts_with_json TEXT NOT NULL DEFAULT '[]',
-        supersedes_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        UNIQUE(session_id,source_message_id,kind,content,source_path,source_evidence)
       );
-      CREATE INDEX IF NOT EXISTS continuity_facts_status_scope
-        ON continuity_facts(status,scope_kind,scope_value,importance);
-      CREATE INDEX IF NOT EXISTS continuity_facts_source
-        ON continuity_facts(source_path,source_hash,status);
+      CREATE INDEX IF NOT EXISTS writing_memory_session
+        ON writing_memory(session_id,status,importance,updated_at);
+      CREATE INDEX IF NOT EXISTS writing_memory_source
+        ON writing_memory(source_path,source_hash,status);
       CREATE TABLE IF NOT EXISTS session_context (
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
         active_document TEXT,
@@ -663,13 +652,9 @@ export class WriterStore {
       CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(path UNINDEXED, content);
     `);
     const revisionColumns = this.database.prepare("PRAGMA table_info(revisions)").all() as Row[];
-    const continuityFactColumns = this.database.prepare("PRAGMA table_info(continuity_facts)").all() as Row[];
-    if (!continuityFactColumns.some(column => column.name === "resume_status")) {
-      this.database.exec("ALTER TABLE continuity_facts ADD COLUMN resume_status TEXT NOT NULL DEFAULT 'active'");
-    }
-    if (!continuityFactColumns.some(column => column.name === "source_anchor_id")) {
-      this.database.exec("ALTER TABLE continuity_facts ADD COLUMN source_anchor_id TEXT NOT NULL DEFAULT ''");
-    }
+    // Legacy project-wide facts are intentionally discarded. Writing memory is
+    // session-scoped and may only be rebuilt from accepted text in that session.
+    this.database.exec("DROP TABLE IF EXISTS continuity_facts");
     if (!revisionColumns.some(column => column.name === "created_file")) {
       this.database.exec("ALTER TABLE revisions ADD COLUMN created_file INTEGER NOT NULL DEFAULT 0");
     }
@@ -814,15 +799,14 @@ export class WriterStore {
       });
   }
 
-  continuityFacts(options: {
-    statuses?: ContinuityFactStatus[];
+  writingMemory(sessionId: string, options: {
+    statuses?: Array<"active" | "stale">;
     sourcePath?: string;
     limit?: number;
-  } = {}): ContinuityFact[] {
-    const statuses = options.statuses?.filter(status =>
-      ["active", "conflict", "pending", "stale", "retracted"].includes(status));
-    const where: string[] = [];
-    const values: Array<string | number> = [];
+  } = {}): WritingMemoryEntry[] {
+    const statuses = options.statuses?.filter(status => status === "active" || status === "stale");
+    const where = ["session_id=?"];
+    const values: Array<string | number> = [sessionId];
     if (statuses?.length) {
       where.push(`status IN (${statuses.map(() => "?").join(",")})`);
       values.push(...statuses);
@@ -833,198 +817,94 @@ export class WriterStore {
     }
     const limit = Math.max(1, Math.min(1_000, Math.round(options.limit ?? 300)));
     values.push(limit);
-    return (this.database.prepare(`SELECT * FROM continuity_facts
+    return (this.database.prepare(`SELECT * FROM writing_memory
       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-      ORDER BY CASE status WHEN 'conflict' THEN 0 WHEN 'pending' THEN 1 WHEN 'active' THEN 2 ELSE 3 END,
+      ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,
         importance DESC,updated_at DESC,id DESC LIMIT ?`).all(...values) as Row[])
-      .map(row => continuityFactFromRow(row));
+      .map(row => writingMemoryFromRow(row));
   }
 
-  saveContinuityFact(input: Partial<ContinuityFact> & { statement: string }): ContinuityFact {
-    const statement = input.statement.trim().replace(/\s+/gu, " ").slice(0, 280);
-    if (!statement) throw new Error("事实陈述不能为空");
-    const kind = continuityEnum(input.kind, CONTINUITY_FACT_KINDS, "other");
-    const scopeKind = continuityEnum(input.scopeKind, CONTINUITY_FACT_SCOPE_KINDS, "global");
-    const epistemic = continuityEnum(input.epistemic, CONTINUITY_FACT_EPISTEMIC_KINDS, "objective");
-    const status = continuityStatus(input.status);
-    const now = new Date().toISOString();
-    const knownBy = continuityStrings(input.knownBy, 20);
-    const conflictsWith = continuityIds(input.conflictsWith);
-    const supersedes = continuityIds(input.supersedes);
-    const sourcePath = typeof input.sourcePath === "string" ? input.sourcePath.trim().slice(0, 500) : "";
-    const sourceEvidence = typeof input.sourceEvidence === "string" ? input.sourceEvidence.trim().slice(0, 500) : "";
-    const sourceContent = sourcePath && this.project.textFileExists(sourcePath)
-      ? this.project.readTextFile(sourcePath)
-      : "";
-    const sourceHash = sourceContent
-      ? this.project.hash(sourceContent)
-      : typeof input.sourceHash === "string" ? input.sourceHash : "";
-    if (sourcePath && sourceEvidence && sourceContent && !sourceContent.includes(sourceEvidence)) {
-      throw new Error("来源证据不在当前文档中");
-    }
-    const sourceAnchorId = sourceContent && sourceEvidence
-      ? continuityEvidenceAnchor(sourceContent, sourceHash, sourceEvidence)
-      : typeof input.sourceAnchorId === "string" ? input.sourceAnchorId : "";
-    let id = Number(input.id);
-    const values = [
-      statement,
-      normalizeContinuityStatement(statement),
-      kind,
-      scopeKind,
-      typeof input.scopeValue === "string" ? input.scopeValue.trim().slice(0, 160) : "",
-      typeof input.validFrom === "string" ? input.validFrom.trim().slice(0, 120) : "",
-      typeof input.validUntil === "string" ? input.validUntil.trim().slice(0, 120) : "",
-      epistemic,
-      JSON.stringify(knownBy),
-      Math.max(0, Math.min(100, Math.round(Number(input.importance ?? 50)) || 0)),
-      status,
-      status === "active" || status === "conflict" || status === "pending" ? status : "active",
-      sourcePath,
-      sourceHash,
-      sourceEvidence,
-      sourceAnchorId,
-      Number.isInteger(input.sourceProposalId) && Number(input.sourceProposalId) > 0 ? Number(input.sourceProposalId) : null,
-      JSON.stringify(conflictsWith),
-      JSON.stringify(supersedes),
-    ] as const;
-    if (Number.isInteger(id) && id > 0) {
-      const result = this.database.prepare(`UPDATE continuity_facts SET
-        statement=?,normalized_statement=?,kind=?,scope_kind=?,scope_value=?,valid_from=?,valid_until=?,
-        epistemic=?,known_by_json=?,importance=?,status=?,resume_status=?,source_path=?,source_hash=?,source_evidence=?,source_anchor_id=?,
-        source_proposal_id=?,conflicts_with_json=?,supersedes_json=?,updated_at=? WHERE id=?`)
-        .run(...values, now, id);
-      if (!result.changes) throw new Error("连续性事实不存在");
-    } else {
-      id = Number(this.database.prepare(`INSERT INTO continuity_facts(
-        statement,normalized_statement,kind,scope_kind,scope_value,valid_from,valid_until,epistemic,
-        known_by_json,importance,status,resume_status,source_path,source_hash,source_evidence,source_anchor_id,source_proposal_id,
-        conflicts_with_json,supersedes_json,created_at,updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(...values, now, now).lastInsertRowid);
-    }
-    const row = this.database.prepare("SELECT * FROM continuity_facts WHERE id=?").get(id) as Row | undefined;
-    if (!row) throw new Error("连续性事实保存失败");
-    return continuityFactFromRow(row);
-  }
-
-  retractContinuityFact(id: number): ContinuityFact {
-    if (!Number.isInteger(id) || id <= 0) throw new Error("连续性事实 ID 无效");
-    const now = new Date().toISOString();
-    if (!this.database.prepare("UPDATE continuity_facts SET status='retracted',updated_at=? WHERE id=?").run(now, id).changes) {
-      throw new Error("连续性事实不存在");
-    }
-    return continuityFactFromRow(this.database.prepare("SELECT * FROM continuity_facts WHERE id=?").get(id) as Row);
-  }
-
-  /**
-   * Revalidate provenance after a document revision. Evidence that survived stays
-   * usable under the new hash; missing evidence becomes stale, never silently deleted.
-   */
-  refreshContinuityFactsForDocument(path: string, content: string): void {
+  refreshWritingMemoryForDocument(path: string, content: string): void {
     const hash = this.project.hash(content);
-    const rows = this.database.prepare(`SELECT id,source_evidence,status,resume_status FROM continuity_facts
-      WHERE source_path=? AND status!='retracted'`).all(path) as Row[];
+    const rows = this.database.prepare("SELECT id,source_evidence FROM writing_memory WHERE source_path=?").all(path) as Row[];
     const now = new Date().toISOString();
-    const update = this.database.prepare(`UPDATE continuity_facts
-      SET source_hash=?,source_anchor_id=?,status=?,resume_status=?,updated_at=? WHERE id=?`);
+    const update = this.database.prepare(`UPDATE writing_memory
+      SET source_hash=?,source_anchor_id=?,status=?,updated_at=? WHERE id=?`);
     for (const row of rows) {
       const evidence = String(row.source_evidence ?? "");
       const survives = Boolean(evidence && content.includes(evidence));
-      const oldStatus = String(row.status);
-      const oldResumeStatus = continuityStatus(row.resume_status);
-      const status = survives
-        ? oldStatus === "stale" ? oldResumeStatus : oldStatus
-        : "stale";
-      const resumeStatus = !survives && oldStatus !== "stale"
-        && (oldStatus === "active" || oldStatus === "conflict" || oldStatus === "pending")
-        ? oldStatus
-        : oldResumeStatus;
-      update.run(hash, survives ? continuityEvidenceAnchor(content, hash, evidence) : "", status, resumeStatus, now, Number(row.id));
+      update.run(hash, survives ? writingMemoryEvidenceAnchor(content, hash, evidence) : "", survives ? "active" : "stale", now, Number(row.id));
     }
   }
 
-  moveContinuityFactsSource(fromPath: string, toPath: string, content: string): void {
+  moveWritingMemorySource(fromPath: string, toPath: string, content: string): void {
     const now = new Date().toISOString();
     const hash = this.project.hash(content);
-    const rows = this.database.prepare(`SELECT id,source_evidence FROM continuity_facts
-      WHERE source_path=? AND status!='retracted'`).all(fromPath) as Row[];
-    const update = this.database.prepare(`UPDATE continuity_facts
+    const rows = this.database.prepare("SELECT id,source_evidence FROM writing_memory WHERE source_path=?").all(fromPath) as Row[];
+    const update = this.database.prepare(`UPDATE writing_memory
       SET source_path=?,source_hash=?,source_anchor_id=?,updated_at=? WHERE id=?`);
     for (const row of rows) {
-      update.run(toPath, hash, continuityEvidenceAnchor(content, hash, String(row.source_evidence ?? "")), now, Number(row.id));
+      update.run(toPath, hash, writingMemoryEvidenceAnchor(content, hash, String(row.source_evidence ?? "")), now, Number(row.id));
     }
   }
 
-  saveExtractedContinuityFacts(
+  saveExtractedWritingMemory(
+    sessionId: string,
+    sourceMessageId: number,
     path: string,
     content: string,
     proposalId: number,
-    candidates: ContinuityFactCandidate[],
-  ): ContinuityFact[] {
-    if (this.project.isDocumentHidden(path)) return [];
-    const saved: ContinuityFact[] = [];
+    candidates: WritingMemoryCandidate[],
+  ): WritingMemoryEntry[] {
+    const sourceMessageExists = Number.isInteger(sourceMessageId) && sourceMessageId > 0
+      && Boolean(this.database.prepare("SELECT 1 AS ok FROM messages WHERE session_id=? AND id=?").get(sessionId, sourceMessageId));
+    if (!this.sessionExists(sessionId) || !sourceMessageExists
+      || this.project.isDocumentHidden(path)) return [];
+    const saved: WritingMemoryEntry[] = [];
     const hash = this.project.hash(content);
-    for (const candidate of candidates.slice(0, 24)) {
+    const now = new Date().toISOString();
+    const insert = this.database.prepare(`INSERT INTO writing_memory(
+      session_id,source_message_id,source_proposal_id,kind,content,character_ids_json,importance,status,
+      source_path,source_hash,source_evidence,source_anchor_id,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,?,?)
+    ON CONFLICT(session_id,source_message_id,kind,content,source_path,source_evidence) DO UPDATE SET
+      source_hash=excluded.source_hash,source_anchor_id=excluded.source_anchor_id,status='active',updated_at=excluded.updated_at`);
+    for (const candidate of candidates.slice(0, 18)) {
       if (!candidate.sourceEvidence || !content.includes(candidate.sourceEvidence)) continue;
-      const normalized = normalizeContinuityStatement(candidate.statement);
-      const existing = this.database.prepare(`SELECT * FROM continuity_facts
-        WHERE normalized_statement=? AND scope_kind=? AND scope_value=? AND epistemic=?
-          AND status!='retracted' ORDER BY id DESC LIMIT 1`)
-        .get(normalized, candidate.scopeKind, candidate.scopeValue, candidate.epistemic) as Row | undefined;
-      const status: ContinuityFactStatus = candidate.conflictsWith.length || candidate.supersedes.length
-        ? "conflict"
-        : "active";
-      saved.push(this.saveContinuityFact({
-        ...(existing ? { id: Number(existing.id) } : {}),
-        ...candidate,
-        status,
-        sourcePath: path,
-        sourceHash: hash,
-        sourceProposalId: proposalId,
-      }));
+      insert.run(
+        sessionId, sourceMessageId, proposalId > 0 ? proposalId : null, candidate.kind,
+        candidate.content, JSON.stringify(candidate.characterIds), candidate.importance,
+        path, hash, candidate.sourceEvidence,
+        writingMemoryEvidenceAnchor(content, hash, candidate.sourceEvidence), now, now,
+      );
     }
-    return saved;
+    return this.writingMemory(sessionId, { statuses: ["active"], sourcePath: path, limit: 200 })
+      .filter(item => item.sourceMessageId === sourceMessageId);
   }
 
-  continuityFactPacket(options: {
+  writingMemoryPacket(sessionId: string, options: {
     targetPath?: string;
     characterIds?: number[];
     limit?: number;
-  } = {}): ContinuityFact[] {
-    const facts = this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 })
-      .filter(fact => !fact.sourcePath || !this.project.isDocumentHidden(fact.sourcePath));
-    const characterKeys = new Set((options.characterIds ?? []).map(String));
+  } = {}): WritingMemoryEntry[] {
+    const entries = this.writingMemory(sessionId, { statuses: ["active"], limit: 1_000 })
+      .filter(item => !item.sourcePath || !this.project.isDocumentHidden(item.sourcePath));
+    const characterIds = new Set(options.characterIds ?? []);
     const targetPath = options.targetPath ?? "";
-    return facts.map(fact => {
-      let score = fact.importance;
-      if (fact.scopeKind === "global") score += 45;
-      if (fact.kind === "milieu") score += 25;
-      if (targetPath && (fact.sourcePath === targetPath || fact.scopeValue === targetPath)) score += 80;
-      if (fact.scopeKind === "character" && characterKeys.has(fact.scopeValue)) score += 80;
-      if (fact.status === "conflict") score += 100;
-      return { fact, score };
-    }).sort((a, b) => b.score - a.score || b.fact.id - a.fact.id)
+    return entries.map(entry => {
+      let score = entry.importance;
+      if (targetPath && entry.sourcePath === targetPath) score += 70;
+      if (entry.characterIds.some(id => characterIds.has(id))) score += 90;
+      if (entry.kind === "open_thread" || entry.kind === "character_state") score += 20;
+      return { entry, score };
+    }).sort((a, b) => b.score - a.score || b.entry.id - a.entry.id)
       .slice(0, Math.max(1, Math.min(40, options.limit ?? 24)))
-      .map(item => item.fact);
+      .map(item => item.entry);
   }
 
-  searchContinuityFacts(query: string, limit = 8): ContinuityFact[] {
-    const normalized = query.trim().toLocaleLowerCase("zh-CN");
-    if (!normalized) return [];
-    const terms = normalized.match(/[a-z0-9_]{2,}|[\p{Script=Han}]{2,}/gu)?.slice(0, 8) ?? [];
-    if (!terms.length) return [];
-    return this.continuityFacts({ statuses: ["active", "conflict"], limit: 1_000 })
-      .filter(fact => !fact.sourcePath || !this.project.isDocumentHidden(fact.sourcePath))
-      .map(fact => {
-        const haystack = `${fact.statement} ${fact.scopeValue} ${fact.knownBy.join(" ")} ${fact.sourcePath}`
-          .toLocaleLowerCase("zh-CN");
-        const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? Math.max(2, term.length) : 0), 0)
-          + (haystack.includes(normalized) ? 20 : 0);
-        return { fact, score };
-      })
-      .filter(item => item.score > 0)
-      .sort((a, b) => b.score - a.score || b.fact.importance - a.fact.importance)
-      .slice(0, Math.max(1, Math.min(20, limit)))
-      .map(item => item.fact);
+  deleteWritingMemoryFromMessage(sessionId: string, fromMessageId: number): void {
+    this.database.prepare("DELETE FROM writing_memory WHERE session_id=? AND source_message_id>=?")
+      .run(sessionId, fromMessageId);
   }
 
   sessionContext(sessionId: string): { activeDocument?: string; currentIntent: string } {
@@ -3239,7 +3119,7 @@ export class WriterStore {
       if (characterRevisions.length) this.writeCharacters(originalCharacters);
       throw error;
     }
-    this.refreshContinuityFactsForChangeSet(changeSet.files, true);
+    this.refreshWritingMemoryForChangeSet(changeSet.files, true);
     this.reindex();
     return this.changeSet(id);
   }
@@ -3262,7 +3142,7 @@ export class WriterStore {
       validateCharacters(restoredCharacters, this.outlineNodeIds());
       if (characterRevisions.length) this.writeCharacters(restoredCharacters);
       this.database.prepare("UPDATE change_sets SET undone=1 WHERE id=?").run(id);
-      this.refreshContinuityFactsForChangeSet(changeSet.files, false);
+      this.refreshWritingMemoryForChangeSet(changeSet.files, false);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -3294,7 +3174,7 @@ export class WriterStore {
       validateCharacters(restoredCharacters, this.outlineNodeIds());
       if (characterRevisions.length) this.writeCharacters(restoredCharacters);
       this.database.prepare("UPDATE change_sets SET undone=0 WHERE id=?").run(id);
-      this.refreshContinuityFactsForChangeSet(changeSet.files, true);
+      this.refreshWritingMemoryForChangeSet(changeSet.files, true);
       this.reindex();
       this.database.exec("COMMIT");
       return this.changeSet(id);
@@ -3389,14 +3269,14 @@ export class WriterStore {
     }
   }
 
-  private refreshContinuityFactsForChangeSet(files: ChangeSetFileChange[], applied: boolean): void {
+  private refreshWritingMemoryForChangeSet(files: ChangeSetFileChange[], applied: boolean): void {
     for (const file of files) {
       if (file.operation === "move" && file.targetPath) {
-        if (applied) this.moveContinuityFactsSource(file.path, file.targetPath, file.afterContent);
-        else this.moveContinuityFactsSource(file.targetPath, file.path, file.beforeContent);
+        if (applied) this.moveWritingMemorySource(file.path, file.targetPath, file.afterContent);
+        else this.moveWritingMemorySource(file.targetPath, file.path, file.beforeContent);
         continue;
       }
-      this.refreshContinuityFactsForDocument(
+      this.refreshWritingMemoryForDocument(
         file.path,
         applied ? file.operation === "delete" ? "" : file.afterContent : file.beforeContent,
       );
@@ -3595,7 +3475,7 @@ export class WriterStore {
       try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
       throw error;
     }
-    this.refreshContinuityFactsForDocument(proposal.path, proposal.afterContent);
+    this.refreshWritingMemoryForDocument(proposal.path, proposal.afterContent);
     this.reindex();
     return this.proposal(id);
   }
@@ -3630,7 +3510,7 @@ export class WriterStore {
     else this.project.writeRaw(path, row.before_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(row.id as number);
-    this.refreshContinuityFactsForDocument(path, row.created_file === 1 ? "" : String(row.before_content));
+    this.refreshWritingMemoryForDocument(path, row.created_file === 1 ? "" : String(row.before_content));
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已撤销文档修改：${path}`);
     return path;
@@ -3660,7 +3540,7 @@ export class WriterStore {
     this.project.writeRaw(path, row.after_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=0 WHERE id=?").run(row.id as number);
-    this.refreshContinuityFactsForDocument(path, String(row.after_content));
+    this.refreshWritingMemoryForDocument(path, String(row.after_content));
     this.reindex();
     if (sessionId) this.addSystemMessage(sessionId, `已重做文档修改：${path}`);
     return path;
@@ -3678,7 +3558,7 @@ export class WriterStore {
     else this.project.writeRaw(path, String(row.before_content));
     if (revisions.length) this.writeCharacters(restoredCharacters);
     this.database.prepare("UPDATE revisions SET undone=1 WHERE id=?").run(Number(row.id));
-    this.refreshContinuityFactsForDocument(path, Number(row.created_file) === 1 ? "" : String(row.before_content));
+    this.refreshWritingMemoryForDocument(path, Number(row.created_file) === 1 ? "" : String(row.before_content));
     return {
       path,
       characterNames: revisions.map(revision => this.normalizeCharacter(revision.after).identity.name),
@@ -3754,6 +3634,7 @@ export class WriterStore {
     this.database.prepare("DELETE FROM proposals WHERE session_id=? AND created_at>=? AND status!='accepted' AND id NOT IN (SELECT proposal_id FROM revisions WHERE proposal_id IS NOT NULL)").run(sessionId, fromTime);
     this.deleteMessageStepTrailsFrom(sessionId, fromId);
     this.archiveContextGraphFrom(sessionId, fromId);
+    if (!keepChanges) this.deleteWritingMemoryFromMessage(sessionId, fromId);
     // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
     if (userRow.channel === "roleplay") this.restoreRoleplayMemoryBefore(sessionId, fromId);
@@ -4206,7 +4087,7 @@ export class WriterStore {
       INSERT INTO revisions(proposal_id,path,before_content,after_content,after_hash,label,created_at)
       VALUES(NULL,?,?,?,?,?,?)
     `).run(path, current, target.afterContent, this.project.hash(target.afterContent), `恢复版本 #${revisionId}`, now);
-    this.refreshContinuityFactsForDocument(path, target.afterContent);
+    this.refreshWritingMemoryForDocument(path, target.afterContent);
     this.reindex();
     return this.documentVersions(path).find(version => version.id === Number(result.lastInsertRowid))!;
   }
@@ -4217,10 +4098,10 @@ export class WriterStore {
     this.database.prepare("UPDATE revisions SET path=? WHERE path=?").run(finalPath, fromPath);
     if (this.project.isDocumentHidden(finalPath)) {
       // Moving into archive/屏蔽：废弃该来源事实，避免旧稿继续注入 Agent。
-      this.refreshContinuityFactsForDocument(fromPath, "");
-      this.refreshContinuityFactsForDocument(finalPath, "");
+      this.refreshWritingMemoryForDocument(fromPath, "");
+      this.refreshWritingMemoryForDocument(finalPath, "");
     } else {
-      this.moveContinuityFactsSource(fromPath, finalPath, this.project.read(finalPath));
+      this.moveWritingMemorySource(fromPath, finalPath, this.project.read(finalPath));
     }
     this.reindex();
     return finalPath;
@@ -4237,16 +4118,16 @@ export class WriterStore {
     const updateRevision = this.database.prepare("UPDATE revisions SET path=? WHERE id=?");
     for (const row of proposalRows) updateProposal.run(rewrite(row.path), row.id);
     for (const row of revisionRows) updateRevision.run(rewrite(row.path), row.id);
-    const factRows = this.database.prepare("SELECT DISTINCT source_path FROM continuity_facts WHERE source_path LIKE ?")
+    const memoryRows = this.database.prepare("SELECT DISTINCT source_path FROM writing_memory WHERE source_path LIKE ?")
       .all(`${fromPrefix}%`) as Row[];
-    for (const row of factRows) {
+    for (const row of memoryRows) {
       const from = String(row.source_path);
       const to = rewrite(from);
       if (this.project.isDocumentHidden(to) || this.project.isDocumentHidden(from)) {
-        this.refreshContinuityFactsForDocument(from, "");
-        this.refreshContinuityFactsForDocument(to, "");
+        this.refreshWritingMemoryForDocument(from, "");
+        this.refreshWritingMemoryForDocument(to, "");
       } else if (this.project.textFileExists(to)) {
-        this.moveContinuityFactsSource(from, to, this.project.readTextFile(to));
+        this.moveWritingMemorySource(from, to, this.project.readTextFile(to));
       }
     }
     this.reindex();
@@ -4256,9 +4137,9 @@ export class WriterStore {
   removeFolder(path: string): void {
     const prefix = `${path.replace(/\/+$/u, "")}/`;
     this.project.removeFolder(path);
-    const rows = this.database.prepare("SELECT DISTINCT source_path FROM continuity_facts WHERE source_path LIKE ?")
+    const rows = this.database.prepare("SELECT DISTINCT source_path FROM writing_memory WHERE source_path LIKE ?")
       .all(`${prefix}%`) as Row[];
-    for (const row of rows) this.refreshContinuityFactsForDocument(String(row.source_path), "");
+    for (const row of rows) this.refreshWritingMemoryForDocument(String(row.source_path), "");
     this.reindex();
   }
 
@@ -4367,69 +4248,45 @@ function canonicalTextPath(path: string): string {
   return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "").replace(/^resource(?:\/|$)/, "");
 }
 
-function normalizeContinuityStatement(value: string): string {
-  return value.trim().replace(/\s+/gu, " ").toLocaleLowerCase("zh-CN");
-}
-
-function continuityEvidenceAnchor(content: string, sourceHash: string, evidence: string): string {
+function writingMemoryEvidenceAnchor(content: string, sourceHash: string, evidence: string): string {
   const offset = evidence ? content.indexOf(evidence) : -1;
   if (offset < 0) return "";
   return documentSpans(content, sourceHash)
     .find(span => span.startOffset <= offset && span.endOffset > offset)?.anchorId ?? "";
 }
 
-function continuityEnum<T extends readonly string[]>(value: unknown, allowed: T, fallback: T[number]): T[number] {
+function writingMemoryEnum<T extends readonly string[]>(value: unknown, allowed: T, fallback: T[number]): T[number] {
   return typeof value === "string" && allowed.includes(value) ? value as T[number] : fallback;
 }
 
-function continuityStatus(value: unknown): ContinuityFactStatus {
-  return typeof value === "string" && ["active", "conflict", "pending", "stale", "retracted"].includes(value)
-    ? value as ContinuityFactStatus
-    : "active";
-}
-
-function continuityStrings(value: unknown, limit: number): string[] {
-  if (!Array.isArray(value)) return [];
-  return [...new Set(value.filter((item): item is string => typeof item === "string")
-    .map(item => item.trim()).filter(Boolean))].slice(0, limit);
-}
-
-function continuityIds(value: unknown): number[] {
-  if (!Array.isArray(value)) return [];
-  return [...new Set(value.map(Number).filter(id => Number.isInteger(id) && id > 0))].slice(0, 12);
-}
-
-function continuityFactFromRow(row: Row): ContinuityFact {
-  const parseArray = <T>(value: unknown): T[] => {
+function writingMemoryFromRow(row: Row): WritingMemoryEntry {
+  const parseCharacterIds = (value: unknown): number[] => {
     if (typeof value !== "string") return [];
     try {
       const parsed = JSON.parse(value) as unknown;
-      return Array.isArray(parsed) ? parsed as T[] : [];
+      return Array.isArray(parsed)
+        ? [...new Set(parsed.map(Number).filter(id => Number.isInteger(id) && id > 0))].slice(0, 8)
+        : [];
     } catch {
       return [];
     }
   };
   return {
     id: Number(row.id),
-    statement: String(row.statement),
-    kind: continuityEnum(row.kind, CONTINUITY_FACT_KINDS, "other") as ContinuityFactKind,
-    scopeKind: continuityEnum(row.scope_kind, CONTINUITY_FACT_SCOPE_KINDS, "global") as ContinuityFactScopeKind,
-    scopeValue: String(row.scope_value ?? ""),
-    validFrom: String(row.valid_from ?? ""),
-    validUntil: String(row.valid_until ?? ""),
-    epistemic: continuityEnum(row.epistemic, CONTINUITY_FACT_EPISTEMIC_KINDS, "objective") as ContinuityFactEpistemicKind,
-    knownBy: parseArray<string>(row.known_by_json),
+    sessionId: String(row.session_id),
+    sourceMessageId: Number(row.source_message_id),
+    ...(Number.isInteger(Number(row.source_proposal_id)) && Number(row.source_proposal_id) > 0
+      ? { sourceProposalId: Number(row.source_proposal_id) }
+      : {}),
+    kind: writingMemoryEnum(row.kind, WRITING_MEMORY_KINDS, "portrayal") as WritingMemoryKind,
+    content: String(row.content),
+    characterIds: parseCharacterIds(row.character_ids_json),
     importance: Number(row.importance),
-    status: continuityStatus(row.status),
+    status: row.status === "stale" ? "stale" : "active",
     sourcePath: String(row.source_path ?? ""),
     sourceHash: String(row.source_hash ?? ""),
     sourceEvidence: String(row.source_evidence ?? ""),
     sourceAnchorId: String(row.source_anchor_id ?? ""),
-    ...(Number.isInteger(Number(row.source_proposal_id)) && Number(row.source_proposal_id) > 0
-      ? { sourceProposalId: Number(row.source_proposal_id) }
-      : {}),
-    conflictsWith: parseArray<number>(row.conflicts_with_json).map(Number).filter(id => Number.isInteger(id) && id > 0),
-    supersedes: parseArray<number>(row.supersedes_json).map(Number).filter(id => Number.isInteger(id) && id > 0),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };

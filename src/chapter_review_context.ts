@@ -12,6 +12,7 @@ export function buildFactualChapterReviewContext(options: {
   project: WriterProject;
   store: WriterStore;
   context: ToolExecutionContext;
+  sessionId?: string;
   path: string;
   characterScope?: number[];
   baseContext?: string;
@@ -30,6 +31,7 @@ export function buildFactualChapterReviewContext(options: {
     project,
     store,
     context,
+    sessionId: options.sessionId,
     path,
     ...(characterScope ? { characterIds: characterScope } : {}),
   });

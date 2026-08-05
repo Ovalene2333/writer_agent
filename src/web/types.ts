@@ -496,30 +496,6 @@ export type AuthorPolicyFeedback = {
   note?: string;
   createdAt: string;
 };
-export type ContinuityFact = {
-  id: number;
-  statement: string;
-  kind: "milieu" | "character" | "location" | "event" | "object" | "relationship" | "organization" | "other";
-  scopeKind: "global" | "era" | "arc" | "chapter" | "location" | "character";
-  scopeValue: string;
-  validFrom: string;
-  validUntil: string;
-  epistemic: "objective" | "character_knowledge" | "rumor";
-  knownBy: string[];
-  importance: number;
-  status: "active" | "conflict" | "pending" | "stale" | "retracted";
-  sourcePath: string;
-  sourceHash: string;
-  sourceEvidence: string;
-  sourceAnchorId: string;
-  sourceProposalId?: number;
-  conflictsWith: number[];
-  supersedes: number[];
-  createdAt: string;
-  updatedAt: string;
-};
-export type ContinuityFactDraft = Omit<ContinuityFact, "id" | "sourceHash" | "sourceAnchorId" | "sourceProposalId" | "createdAt" | "updatedAt">
-  & { id?: number };
 export type MessageStepTrail = {
   sourceMessageId: number;
   jobId?: string;
@@ -611,7 +587,6 @@ export type State = {
     permissionMode: PermissionMode;
     writingMode: WritingExecutionMode;
     characterEvolutionEnabled: boolean;
-    continuityFactsEnabled?: boolean;
     reviewFollowsProseModel?: boolean;
     stepBudgetMode?: AgentStepBudgetMode;
     maxAgentSteps?: number;
@@ -621,7 +596,6 @@ export type State = {
   proseGateRules?: ProseGateRule[];
   authorPolicies?: AuthorPolicy[];
   authorPolicyFeedback?: AuthorPolicyFeedback[];
-  continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;
 };
@@ -658,7 +632,7 @@ export const EMPTY_CHARACTER: CharacterDraft = {
 export type UiThemeId = "light" | "dark" | "ink" | "rose" | "ocean" | "graphite";
 export type WorkspaceMode = "split" | "editor-focus" | "agent-focus";
 export type DocumentSidebarMode = "chapters" | "files";
-export type ManagementView = "characters" | "sessions" | "models" | "prose-gates" | "continuity-facts" | "context-graph";
+export type ManagementView = "characters" | "sessions" | "models" | "prose-gates" | "context-graph";
 
 export type UiTheme = {
   id: UiThemeId;

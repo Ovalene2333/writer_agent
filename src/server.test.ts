@@ -11,7 +11,7 @@ import {
   BackgroundAgentJobs,
   conversationMessageForWeb,
   resolveWebRoot,
-  scheduleAcceptedContinuityIndexing,
+  scheduleAcceptedWritingMemoryIndexing,
   startWriterServer,
 } from "./server.js";
 import { WriterStore } from "./store.js";
@@ -138,9 +138,9 @@ test("web server switches only among projects in its workspace", async () => {
   }
 });
 
-test("accepted continuity indexing starts after the approval response turn", async () => {
+test("accepted writing-memory indexing starts after the approval response turn", async () => {
   let started = false;
-  scheduleAcceptedContinuityIndexing(async () => { started = true; });
+  scheduleAcceptedWritingMemoryIndexing(async () => { started = true; });
   assert.equal(started, false);
   await waitForImmediate();
   assert.equal(started, true);

@@ -57,7 +57,7 @@ export function handleListCharacters({ store, characterScope }: ToolHandlerArgs)
   })));
 }
 
-export function handleGetCharacter({ input, store, project, characterScope, context }: ToolHandlerArgs): string {
+export function handleGetCharacter({ input, store, project, sessionId, characterScope, context }: ToolHandlerArgs): string {
   const id = optionalPositiveInteger(input.id, "id");
   if (!id) throw new Error("缺少有效参数：id");
   if (characterScope !== undefined && !characterScope.includes(id)) throw new Error("该角色不在本次可读范围内");
@@ -121,6 +121,17 @@ export function handleGetCharacter({ input, store, project, characterScope, cont
         ?? (context.dialogueEvidenceCharacterIds = []);
       if (!dialogueEvidenceCharacterIds.includes(character.id)) dialogueEvidenceCharacterIds.push(character.id);
       selected.voice = character.voice;
+      selected.writingMemory = store.writingMemoryPacket(sessionId, {
+        targetPath: activePath,
+        characterIds: [character.id],
+        limit: 8,
+      }).map(entry => ({
+        kind: entry.kind,
+        content: entry.content,
+        evidence: entry.sourceEvidence,
+        sourcePath: entry.sourcePath,
+        rule: "当前会话的近期辅助状态；不得覆盖角色卡或正文，禁止照抄对白措辞。",
+      }));
       selected.voiceScope = {
         characterId: character.id,
         name: character.identity.name,

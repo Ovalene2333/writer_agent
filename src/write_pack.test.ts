@@ -291,21 +291,13 @@ test("side prose treats scene count and target length as guidance", async () => 
   }
 });
 
-test("direct chapter proposal blocks factual knowledge leaks before creating a proposal", async () => {
+test("direct chapter proposal preserves reviewer knowledge blockers before creating a proposal", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-direct-review-"));
   let store: WriterStore | undefined;
   try {
     const project = WriterProject.init(root, "事实终审");
     store = new WriterStore(project);
     const sessionId = store.createSession("直接整章");
-    store.saveContinuityFact({
-      statement: "密钥藏在北塔钟摆内",
-      epistemic: "character_knowledge",
-      knownBy: ["守塔人"],
-      status: "active",
-      sourcePath: "",
-      sourceEvidence: "",
-    });
     let shouldBlock = true;
     let reviewCalls = 0;
     let sawRevisionReview = false;
@@ -320,8 +312,7 @@ test("direct chapter proposal blocks factual knowledge leaks before creating a p
         run: async (_model, input) => {
           reviewCalls += 1;
           sawRevisionReview ||= Boolean(input.revisionReview);
-          assert.match(input.context ?? "", /character_knowledge/u);
-          assert.match(input.context ?? "", /守塔人/u);
+          assert.match(input.context ?? "", /项目终审约束/u);
           return {
             review: shouldBlock ? {
               verdict: "revise" as const,

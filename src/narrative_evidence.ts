@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
 import { competenciesWritingPayload } from "./characters.js";
 import { resolveCompetencyStates, type SceneCompetencyUse } from "./competency_state.js";
-import type { ContinuityFact } from "./continuity_facts.js";
+import type { WritingMemoryEntry } from "./writing_memory.js";
 import { orderedChapterPaths, type WriterProject } from "./project.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
 import type { Character } from "./types.js";
@@ -10,11 +10,11 @@ import type { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { OutlineStore } from "./outline.js";
 
-const MAX_FACTS = 24;
+const MAX_MEMORY_ENTRIES = 24;
 const MAX_CHARACTERS = 8;
 const MAX_EXCERPT_CHARACTERS = 12_000;
 const MAX_READ_SOURCES = 12;
-const MAX_SOURCES = MAX_FACTS + 3;
+const MAX_SOURCES = MAX_MEMORY_ENTRIES + 3;
 
 export type NarrativeEvidenceGap = {
   code: "character_sections_missing" | "competency_evidence_missing";
@@ -28,7 +28,7 @@ export type NarrativeEvidenceSource = {
   id: string;
   path: string;
   sourceHash: string;
-  kind: "read" | "fact" | "target" | "previous_boundary" | "next_boundary";
+  kind: "read" | "memory" | "target" | "previous_boundary" | "next_boundary";
   excerpts: Array<{ startLine: number; endLine: number; content: string }>;
 };
 
@@ -52,17 +52,13 @@ export type NarrativeEvidencePacket = {
   path: string;
   sceneId?: string;
   instructions: string;
-  continuityFacts: Array<{
+  writingMemory: Array<{
     id: number;
-    statement: string;
     kind: string;
-    scope: string;
-    epistemic: string;
-    knownBy: string[];
-    validity: { from: string; until: string };
+    content: string;
+    characterIds: number[];
     status: string;
     source: { sourceId?: string; path: string; sourceHash: string; evidence: string };
-    conflictsWith: number[];
   }>;
   characters: NarrativeCharacterEvidence[];
   scene?: {
@@ -104,6 +100,7 @@ export function buildNarrativeEvidencePacket(options: {
   project: WriterProject;
   store: WriterStore;
   context: ToolExecutionContext;
+  sessionId?: string;
   path: string;
   scene?: ChapterSceneCard;
   currentState?: SceneActualState;
@@ -121,47 +118,38 @@ export function buildNarrativeEvidencePacket(options: {
     ...sceneScopes.keys(),
   ])].slice(0, MAX_CHARACTERS);
   const cards = new Map(store.characters().map(character => [character.id, character]));
-  const rawFacts = store.continuityFactPacket({
+  const rawMemory = options.sessionId ? store.writingMemoryPacket(options.sessionId, {
     targetPath: path,
     characterIds: requestedCharacterIds,
-    limit: MAX_FACTS,
-  });
-  const factCharacterNames = new Set(rawFacts.flatMap(fact => fact.knownBy));
-  const inferredCharacterIds = requestedCharacterIds.length ? [] : [...cards.values()]
-    .filter(character => factCharacterNames.has(character.identity.name)
-      || character.identity.aliases.some(alias => factCharacterNames.has(alias)))
-    .map(character => character.id);
-  const characterIds = [...new Set([...requestedCharacterIds, ...inferredCharacterIds])].slice(0, MAX_CHARACTERS);
+    limit: MAX_MEMORY_ENTRIES,
+  }) : [];
+  const characterIds = requestedCharacterIds;
   const characters = characterIds.flatMap(characterId => {
     const character = cards.get(characterId);
     return character ? [characterEvidence(character, context, sceneScopes.get(characterId), outlineNodes, targetNodeId)] : [];
   });
   const coverageGaps = characters.flatMap(character => characterCoverageGaps(character, context));
-  const sources = buildEvidenceSources(project, context, path, rawFacts);
+  const sources = buildEvidenceSources(project, context, path, rawMemory);
   const sourceByPath = new Map(sources.map(source => [source.path, source]));
-  const continuityFacts = rawFacts.map(fact => ({
-    id: fact.id,
-    statement: fact.statement,
-    kind: fact.kind,
-    scope: [fact.scopeKind, fact.scopeValue].filter(Boolean).join(":"),
-    epistemic: fact.epistemic,
-    knownBy: fact.knownBy,
-    validity: { from: fact.validFrom, until: fact.validUntil },
-    status: fact.status,
+  const writingMemory = rawMemory.map(entry => ({
+    id: entry.id,
+    kind: entry.kind,
+    content: entry.content,
+    characterIds: entry.characterIds,
+    status: entry.status,
     source: {
-      ...(sourceByPath.get(fact.sourcePath) ? { sourceId: sourceByPath.get(fact.sourcePath)!.id } : {}),
-      path: fact.sourcePath,
-      sourceHash: fact.sourceHash,
-      evidence: fact.sourceEvidence,
+      ...(sourceByPath.get(entry.sourcePath) ? { sourceId: sourceByPath.get(entry.sourcePath)!.id } : {}),
+      path: entry.sourcePath,
+      sourceHash: entry.sourceHash,
+      evidence: entry.sourceEvidence,
     },
-    conflictsWith: fact.conflictsWith,
   }));
   const packetBase = {
     version: 1 as const,
     path,
     ...(scene ? { sceneId: scene.id } : {}),
-    instructions: "objective 是客观事实；character_knowledge 只允许 knownBy 中的人物直接知道；rumor 只能作为传闻或信念。conflict/pending 不得自行选边。角色能力只可按 allowedCompetencyUses 的 mode 与入场状态处理：use 才可直接使用，attempt 可失败，unlock/regain 必须在本场建立状态转变，lose 必须写出失去事件；dialogueAllowed 只授权该角色说出口的对白声线。sources 是带哈希的原文证据，不足时必须读取，不得用摘要补造。",
-    continuityFacts,
+    instructions: "writingMemory 只是当前会话从已接受正文提取的近期辅助状态，不是项目事实、角色卡或扩写许可；冲突时以正文、角色卡和大纲为准，不确定时读取 source 原文。角色能力只可按 allowedCompetencyUses 的 mode 与入场状态处理：use 才可直接使用，attempt 可失败，unlock/regain 必须在本场建立状态转变，lose 必须写出失去事件；dialogueAllowed 只授权该角色说出口的对白声线。",
+    writingMemory,
     characters,
     ...(scene ? {
       scene: {
@@ -327,7 +315,7 @@ function buildEvidenceSources(
   project: WriterProject,
   context: ToolExecutionContext,
   targetPath: string,
-  facts: readonly ContinuityFact[],
+  memory: readonly WritingMemoryEntry[],
 ): NarrativeEvidenceSource[] {
   const sources = new Map<string, NarrativeEvidenceSource>();
   const add = (
@@ -354,18 +342,18 @@ function buildEvidenceSources(
     sources.set(path, current);
   };
 
-  // Narrative boundaries and continuity records are irreducible context. Admit
+  // Narrative boundaries and session memory evidence are admitted before
   // them before opportunistic reads so a large research pass cannot evict them.
   addNarrativeBoundaries(project, context, targetPath, add);
-  for (const fact of facts) {
-    if (!fact.sourcePath || !fact.sourceEvidence) continue;
-    const content = project.textFileExists(fact.sourcePath) ? project.readTextFile(fact.sourcePath) : "";
+  for (const entry of memory) {
+    if (!entry.sourcePath || !entry.sourceEvidence) continue;
+    const content = project.textFileExists(entry.sourcePath) ? project.readTextFile(entry.sourcePath) : "";
     if (!content) continue;
-    const offset = content.indexOf(fact.sourceEvidence);
+    const offset = content.indexOf(entry.sourceEvidence);
     if (offset < 0) continue;
     const startLine = content.slice(0, offset).split(/\r?\n/u).length;
-    const endLine = content.slice(0, offset + fact.sourceEvidence.length).split(/\r?\n/u).length;
-    add(fact.sourcePath, "fact", [{ startLine, endLine, content: fact.sourceEvidence }], fact.sourceHash || undefined);
+    const endLine = content.slice(0, offset + entry.sourceEvidence.length).split(/\r?\n/u).length;
+    add(entry.sourcePath, "memory", [{ startLine, endLine, content: entry.sourceEvidence }], entry.sourceHash || undefined);
   }
 
   let excerptCharacters = 0;

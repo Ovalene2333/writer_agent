@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  BookOpenText, Bot, Columns3, Drama, IdCard, Library, Menu, MessageSquare, MoreHorizontal,
+  BookOpenText, Bot, Columns3, Drama, IdCard, Menu, MessageSquare, MoreHorizontal,
   PanelLeftClose, PanelLeftOpen, PanelRight, Pencil, RefreshCw, Settings, Share2, ShieldCheck,
   Sun, WandSparkles, Wifi, X,
 } from "lucide-react";
@@ -186,13 +186,12 @@ export function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggl
   );
 }
 
-export function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRules, onContinuityFacts }: {
+export function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRules }: {
   open: boolean;
   connectionAvailable: boolean;
   onClose: () => void;
   onSelect: (section: SettingsSection) => void;
   onReviewRules: () => void;
-  onContinuityFacts: () => void;
 }) {
   if (!open) return null;
   const pick = (action: () => void) => () => {
@@ -207,7 +206,6 @@ export function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onR
         <button type="button" role="menuitem" onClick={pick(() => onSelect("style"))}><WandSparkles size={16} aria-hidden="true" />写作风格</button>
         <i className="settings-menu-separator" aria-hidden="true" />
         <button type="button" role="menuitem" onClick={pick(onReviewRules)}><ShieldCheck size={16} aria-hidden="true" />作者复审规则</button>
-        <button type="button" role="menuitem" onClick={pick(onContinuityFacts)}><Library size={16} aria-hidden="true" />连续性事实</button>
         <i className="settings-menu-separator" aria-hidden="true" />
         <button type="button" role="menuitem" disabled={!connectionAvailable} onClick={pick(() => onSelect("connection"))}><Wifi size={16} aria-hidden="true" />连接设置</button>
         <button type="button" role="menuitem" onClick={pick(() => onSelect("appearance"))}><Sun size={16} aria-hidden="true" />外观与动效</button>

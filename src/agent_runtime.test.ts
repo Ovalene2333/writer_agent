@@ -330,7 +330,6 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "ask",
       writingMode: "fast",
       characterEvolutionEnabled: true,
-      continuityFactsEnabled: false,
       reviewFollowsProseModel: true,
       stepBudgetMode: "hard",
       maxAgentSteps: 32,
@@ -345,7 +344,6 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "plan",
       writingMode: "fast",
       characterEvolutionEnabled: false,
-      continuityFactsEnabled: true,
       stepBudgetMode: "experimental",
       maxAgentSteps: 48,
       scenePipeline: {
@@ -358,7 +356,6 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "plan",
       writingMode: "fast",
       characterEvolutionEnabled: false,
-      continuityFactsEnabled: true,
       reviewFollowsProseModel: true,
       stepBudgetMode: "experimental",
       maxAgentSteps: 48,
@@ -372,7 +369,6 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
     saveAgentSettings(project, { reviewFollowsProseModel: false });
     assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false);
-    assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "review toggle must preserve continuity toggle");
     saveAgentSettings(project, { scenePipeline: { enabled: false } });
     assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false, "scene patch must preserve review toggle");
     saveAgentSettings(project, { reviewFollowsProseModel: true });
@@ -393,7 +389,6 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.equal(loadAgentSettings(project).scenePipeline.notesMaxCharacters, 4_200);
     assert.equal(loadAgentSettings(project).writingMode, "fast", "scene patch must preserve writing mode");
     assert.equal(loadAgentSettings(project).characterEvolutionEnabled, false, "scene patch must preserve evolution toggle");
-    assert.equal(loadAgentSettings(project).continuityFactsEnabled, true, "scene patch must preserve continuity toggle");
     assert.equal(loadAgentSettings(project).stepBudgetMode, "experimental", "scene patch must preserve step budget mode");
     assert.equal(loadAgentSettings(project).maxAgentSteps, 48, "scene patch must preserve maxAgentSteps");
     saveAgentSettings(project, { stepBudgetMode: "hard", maxAgentSteps: 200 });

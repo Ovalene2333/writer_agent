@@ -103,22 +103,23 @@ test("narrative evidence does not expose competencies outside the active scene a
   }
 });
 
-test("narrative evidence preserves source hashes and only reads authorized sources", () => {
+test("narrative evidence scopes writing memory to its session and preserves source hashes", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-evidence-source-"));
   let store: WriterStore | undefined;
   try {
     const project = WriterProject.init(root, "证据来源");
-    project.writeTextFile("chapters/001.md", "# 前章\n\n钟声停在午夜。\n");
-    project.writeTextFile("lore/key.md", "# 密钥\n\n密钥藏在北塔钟摆内。\n只有守塔人知道。\n");
+    project.writeTextFile("chapters/001.md", "# 前章\n\n密钥藏在北塔钟摆内。\n只有守塔人知道。\n");
     store = new WriterStore(project);
-    store.saveContinuityFact({
-      statement: "密钥藏在北塔钟摆内",
-      epistemic: "character_knowledge",
-      knownBy: ["守塔人"],
-      status: "active",
-      sourcePath: "lore/key.md",
-      sourceEvidence: "密钥藏在北塔钟摆内。",
-    });
+    const sessionId = store.createSession("当前会话");
+    const otherSessionId = store.createSession("其他会话");
+    const sourceMessageId = store.addMessage(sessionId, "user", "续写前章", "agent");
+    store.saveExtractedWritingMemory(sessionId, sourceMessageId, "chapters/001.md", project.readTextFile("chapters/001.md"), 1, [{
+      kind: "knowledge",
+      content: "守塔人知道密钥的位置",
+      characterIds: [],
+      importance: 80,
+      sourceEvidence: "只有守塔人知道。",
+    }]);
     const readSnapshots: NonNullable<ToolExecutionContext["readSnapshots"]> = new Map();
     for (let index = 0; index < 12; index += 1) {
       const path = `lore/decoy-${index}.md`;
@@ -130,16 +131,18 @@ test("narrative evidence preserves source hashes and only reads authorized sourc
       });
     }
     const context: ToolExecutionContext = { permissionMode: "ask", readSnapshots };
-    const packet = buildNarrativeEvidencePacket({ project, store, context, path: "chapters/new.md" });
-    const fact = packet.continuityFacts.find(item => item.statement.includes("密钥"));
-    assert.ok(fact?.source.sourceId);
-    assert.equal(fact?.source.sourceHash, project.hash(project.readTextFile("lore/key.md")));
-    const source = packet.sources.find(item => item.id === fact?.source.sourceId);
-    assert.equal(source?.sourceHash, project.hash(project.readTextFile("lore/key.md")));
+    const packet = buildNarrativeEvidencePacket({ project, store, context, sessionId, path: "chapters/new.md" });
+    const memory = packet.writingMemory.find(item => item.content.includes("守塔人"));
+    assert.ok(memory?.source.sourceId);
+    assert.equal(memory?.source.sourceHash, project.hash(project.readTextFile("chapters/001.md")));
+    const source = packet.sources.find(item => item.id === memory?.source.sourceId);
+    assert.equal(source?.sourceHash, project.hash(project.readTextFile("chapters/001.md")));
     assert.equal(packet.sources.some(item => item.kind === "previous_boundary"), true);
     const read = readNarrativeEvidenceSource(project, context, packet, source!.id);
-    assert.match(read.content, /密钥藏在北塔钟摆内/u);
+    assert.match(read.content, /只有守塔人知道/u);
     assert.throws(() => readNarrativeEvidenceSource(project, context, packet, "src-not-authorized"), /授权范围/u);
+    const isolated = buildNarrativeEvidencePacket({ project, store, context, sessionId: otherSessionId, path: "chapters/new.md" });
+    assert.deepEqual(isolated.writingMemory, []);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

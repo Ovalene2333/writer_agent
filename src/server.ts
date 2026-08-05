@@ -73,7 +73,7 @@ import {
 } from "./prose_gate_rules.js";
 import { proseStyleIssuesError } from "./prose_quality.js";
 import { proseStyleGateIssues } from "./tools/proposals.js";
-import { extractContinuityFacts, type ContinuityFact } from "./continuity_facts.js";
+import { extractWritingMemory } from "./writing_memory.js";
 import {
   compileAuthorPolicyDraft,
   loadAuthorPolicies,
@@ -863,7 +863,7 @@ export async function startWriterServer(options: {
       proseGateRules: loadProseGateRules(options.project),
       authorPolicies: loadAuthorPolicies(options.project),
       authorPolicyFeedback: loadAuthorPolicyFeedback(options.project),
-      continuityFacts: options.store.continuityFacts({ limit: 500 }),
+      writingMemory: options.store.writingMemory(sessionId, { limit: 200 }),
       projectInstructions: loadProjectInstructions(options.project)?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description,
@@ -1321,31 +1321,6 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
-  app.get("/api/continuity-facts", (context) => {
-    try {
-      return context.json({ facts: options.store.continuityFacts({ limit: 1_000 }) });
-    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
-  });
-
-  app.post("/api/continuity-facts", async (context) => {
-    try {
-      const body = await context.req.json<Partial<ContinuityFact>>();
-      const fact = options.store.saveContinuityFact({
-        ...body,
-        statement: typeof body.statement === "string" ? body.statement : "",
-      });
-      return context.json({ fact, facts: options.store.continuityFacts({ limit: 1_000 }) });
-    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
-  });
-
-  app.delete("/api/continuity-facts/:id", (context) => {
-    try {
-      const id = Number(context.req.param("id"));
-      const fact = options.store.retractContinuityFact(id);
-      return context.json({ fact, facts: options.store.continuityFacts({ limit: 1_000 }) });
-    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
-  });
-
   app.post("/api/style/templates", async (context) => {
     try {
       const body = await context.req.json<Partial<StyleTemplate>>();
@@ -1507,7 +1482,6 @@ export async function startWriterServer(options: {
         permissionMode?: string;
         writingMode?: string;
         characterEvolutionEnabled?: boolean;
-        continuityFactsEnabled?: boolean;
         reviewFollowsProseModel?: boolean;
         stepBudgetMode?: string;
         maxAgentSteps?: number;
@@ -1519,9 +1493,6 @@ export async function startWriterServer(options: {
       }
       if (body.characterEvolutionEnabled !== undefined && typeof body.characterEvolutionEnabled !== "boolean") {
         return context.json({ error: "characterEvolutionEnabled 必须是布尔值" }, 400);
-      }
-      if (body.continuityFactsEnabled !== undefined && typeof body.continuityFactsEnabled !== "boolean") {
-        return context.json({ error: "continuityFactsEnabled 必须是布尔值" }, 400);
       }
       if (body.reviewFollowsProseModel !== undefined && typeof body.reviewFollowsProseModel !== "boolean") {
         return context.json({ error: "reviewFollowsProseModel 必须是布尔值" }, 400);
@@ -1587,7 +1558,6 @@ export async function startWriterServer(options: {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
         ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
         ...(typeof body.characterEvolutionEnabled === "boolean" ? { characterEvolutionEnabled: body.characterEvolutionEnabled } : {}),
-        ...(typeof body.continuityFactsEnabled === "boolean" ? { continuityFactsEnabled: body.continuityFactsEnabled } : {}),
         ...(typeof body.reviewFollowsProseModel === "boolean" ? { reviewFollowsProseModel: body.reviewFollowsProseModel } : {}),
         ...(body.stepBudgetMode ? { stepBudgetMode: body.stepBudgetMode as AgentStepBudgetMode } : {}),
         ...(body.maxAgentSteps !== undefined ? { maxAgentSteps: body.maxAgentSteps } : {}),
@@ -1598,7 +1568,6 @@ export async function startWriterServer(options: {
         permissionMode: settings.permissionMode,
         writingMode: settings.writingMode,
         characterEvolutionEnabled: settings.characterEvolutionEnabled,
-        continuityFactsEnabled: settings.continuityFactsEnabled,
         reviewFollowsProseModel: settings.reviewFollowsProseModel,
         stepBudgetMode: settings.stepBudgetMode,
         maxAgentSteps: settings.maxAgentSteps,
@@ -2059,22 +2028,22 @@ export async function startWriterServer(options: {
       const action = context.req.param("action");
       if (!Number.isInteger(id) || !["accept", "reject"].includes(action)) throw new Error("审批参数无效");
       const proposal = action === "accept" ? options.store.acceptProposal(id) : options.store.rejectProposal(id);
-      const shouldIndexContinuity = action === "accept"
-        && loadAgentSettings(options.project).continuityFactsEnabled
-        && ["lore", "chapter", "side"].includes(documentKind(proposal.path));
-      if (shouldIndexContinuity) {
-        scheduleAcceptedContinuityIndexing(() => indexAcceptedContinuityFacts({
+      const shouldIndexMemory = action === "accept" && Boolean(proposal.sourceMessageId)
+        && ["chapter", "side"].includes(documentKind(proposal.path));
+      if (shouldIndexMemory) {
+        scheduleAcceptedWritingMemoryIndexing(() => indexAcceptedWritingMemory({
             project: options.project,
             store: options.store,
             providers: options.providers,
             path: proposal.path,
             beforeContent: proposal.beforeContent,
             afterContent: proposal.afterContent,
-            sourceId: proposal.id,
+            sourceProposalId: proposal.id,
             sessionId: proposal.sessionId,
+            sourceMessageId: proposal.sourceMessageId!,
         }));
       }
-      return context.json({ proposal, continuityFacts: 0, continuityFactsPending: shouldIndexContinuity });
+      return context.json({ proposal, writingMemory: 0, writingMemoryPending: shouldIndexMemory });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -2089,27 +2058,7 @@ export async function startWriterServer(options: {
         : action === "reject" ? options.store.rejectChangeSet(id)
           : action === "undo" ? options.store.undoChangeSet(id)
             : options.store.redoChangeSet(id);
-      const continuityFiles = action === "accept" && loadAgentSettings(options.project).continuityFactsEnabled
-        ? changeSet.files.filter(file => file.operation !== "delete" && file.operation !== "move"
-          && ["lore", "chapter", "side"].includes(documentKind(file.path)))
-        : [];
-      for (const file of continuityFiles) {
-        scheduleAcceptedContinuityIndexing(() => indexAcceptedContinuityFacts({
-          project: options.project,
-          store: options.store,
-          providers: options.providers,
-          path: file.path,
-          beforeContent: file.beforeContent,
-          afterContent: file.afterContent,
-          sessionId: changeSet.sessionId,
-        }));
-      }
-      return context.json({
-        changeSet,
-        continuityFacts: 0,
-        continuityFactWarnings: [],
-        continuityFactsPending: continuityFiles.length > 0,
-      });
+      return context.json({ changeSet });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 409);
     }
@@ -2441,49 +2390,56 @@ function usageReporterForSession(store: WriterStore, sessionId?: string): ModelU
 }
 
 /** Keep manual approval latency independent from the best-effort model indexer. */
-export function scheduleAcceptedContinuityIndexing(run: () => Promise<unknown>): void {
+export function scheduleAcceptedWritingMemoryIndexing(run: () => Promise<unknown>): void {
   setImmediate(() => {
     void run().catch(() => undefined);
   });
 }
 
-async function indexAcceptedContinuityFacts(options: {
+async function indexAcceptedWritingMemory(options: {
   project: WriterProject;
   store: WriterStore;
   providers: ProviderManager;
   path: string;
   beforeContent: string;
   afterContent: string;
-  sourceId?: number;
-  sessionId?: string;
+  sourceProposalId: number;
+  sessionId: string;
+  sourceMessageId: number;
   signal?: AbortSignal;
-}): Promise<{ continuityFacts: number; continuityFactWarning?: string }> {
-  if (!["lore", "chapter", "side"].includes(documentKind(options.path))) return { continuityFacts: 0 };
+}): Promise<{ writingMemory: number; writingMemoryWarning?: string }> {
+  if (!["chapter", "side"].includes(documentKind(options.path))) return { writingMemory: 0 };
   try {
-    const candidates = await extractContinuityFacts({
+    const candidates = await extractWritingMemory({
       model: options.providers.summaryModelConfig(),
       path: options.path,
       beforeContent: options.beforeContent,
       afterContent: options.afterContent,
-      existingFacts: options.store.continuityFacts({ statuses: ["active", "conflict", "pending"], limit: 300 }),
+      characters: options.store.characters().map(character => ({
+        id: character.id,
+        name: character.identity.name,
+        aliases: character.identity.aliases,
+      })),
       signal: options.signal,
       usageReporter: usageReporterForSession(options.store, options.sessionId),
     });
     if (!options.project.documentExists(options.path)
       || options.project.hash(options.project.read(options.path)) !== options.project.hash(options.afterContent)) {
-      return { continuityFacts: 0 };
+      return { writingMemory: 0 };
     }
-    const saved = options.store.saveExtractedContinuityFacts(
+    const saved = options.store.saveExtractedWritingMemory(
+      options.sessionId,
+      options.sourceMessageId,
       options.path,
       options.afterContent,
-      options.sourceId ?? 0,
+      options.sourceProposalId,
       candidates,
     );
-    return { continuityFacts: saved.length };
+    return { writingMemory: saved.length };
   } catch (error) {
     return {
-      continuityFacts: 0,
-      continuityFactWarning: `内容已接受，但事实索引更新失败：${errorMessage(error)}`,
+      writingMemory: 0,
+      writingMemoryWarning: `内容已接受，但会话写作记忆更新失败：${errorMessage(error)}`,
     };
   }
 }

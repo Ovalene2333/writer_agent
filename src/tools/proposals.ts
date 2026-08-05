@@ -197,36 +197,42 @@ function normalizeProposalCharacterChange(
   return { ...change, entry: { ...source, notes } };
 }
 
-export async function captureAcceptedContinuityFacts(
+export async function captureAcceptedWritingMemory(
   store: WriterStore,
-  proposal: Pick<Proposal, "id" | "path" | "beforeContent" | "afterContent">,
+  proposal: Pick<Proposal, "id" | "sessionId" | "sourceMessageId" | "path" | "beforeContent" | "afterContent">,
   context: ToolExecutionContext,
-): Promise<{ continuityFacts: number; continuityFactWarning?: string }> {
+): Promise<{ writingMemory: number; writingMemoryWarning?: string }> {
   const kind = documentKind(proposal.path);
-  if (!context.continuityExtractor || !["lore", "chapter", "side"].includes(kind)) {
-    return { continuityFacts: 0 };
+  if (!context.writingMemoryExtractor || !proposal.sourceMessageId || !["chapter", "side"].includes(kind)) {
+    return { writingMemory: 0 };
   }
   try {
-    const existingFacts = store.continuityFacts({ statuses: ["active", "conflict", "pending"], limit: 300 });
-    const candidates = context.continuityExtractor.run
-      ? await context.continuityExtractor.run({
+    const characters = store.characters().map(character => ({
+      id: character.id,
+      name: character.identity.name,
+      aliases: character.identity.aliases,
+    }));
+    const candidates = context.writingMemoryExtractor.run
+      ? await context.writingMemoryExtractor.run({
           path: proposal.path,
           beforeContent: proposal.beforeContent,
           afterContent: proposal.afterContent,
-          existingFacts,
+          characters,
         })
       : [];
-    const saved = store.saveExtractedContinuityFacts(
+    const saved = store.saveExtractedWritingMemory(
+      proposal.sessionId,
+      proposal.sourceMessageId,
       proposal.path,
       proposal.afterContent,
       proposal.id,
       candidates,
     );
-    return { continuityFacts: saved.length };
+    return { writingMemory: saved.length };
   } catch (error) {
     return {
-      continuityFacts: 0,
-      continuityFactWarning: `正文已接受，但事实索引更新失败：${error instanceof Error ? error.message : String(error)}`,
+      writingMemory: 0,
+      writingMemoryWarning: `正文已接受，但会话写作记忆更新失败：${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }
@@ -237,7 +243,7 @@ export async function maybeAutoAcceptProposal(
   permissionMode: PermissionMode,
   emit: (event: AgentEvent) => void,
   context: ToolExecutionContext,
-): Promise<{ proposalId: number; status: string; message: string; autoAccepted?: boolean; continuityFacts?: number; continuityFactWarning?: string }> {
+): Promise<{ proposalId: number; status: string; message: string; autoAccepted?: boolean; writingMemory?: number; writingMemoryWarning?: string }> {
   if (permissionMode !== "auto" || proposal.status !== "pending") {
     return {
       proposalId: proposal.id,
@@ -248,13 +254,13 @@ export async function maybeAutoAcceptProposal(
   try {
     const accepted = store.acceptProposal(proposal.id);
     emit({ type: "proposal", proposal: accepted });
-    const continuity = await captureAcceptedContinuityFacts(store, accepted, context);
+    const memory = await captureAcceptedWritingMemory(store, accepted, context);
     return {
       proposalId: accepted.id,
       status: accepted.status,
       autoAccepted: true,
       message: "auto 模式：提案已自动写入文件",
-      ...continuity,
+      ...memory,
     };
   } catch (error) {
     return {

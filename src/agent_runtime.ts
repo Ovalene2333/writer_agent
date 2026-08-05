@@ -79,8 +79,6 @@ export interface AgentRuntimeSettings {
   writingMode: WritingExecutionMode;
   /** Allow narrative tasks to append character experiences and story state. */
   characterEvolutionEnabled: boolean;
-  /** Extract accepted prose/lore facts and inject relevant facts into later Agent tasks. */
-  continuityFactsEnabled: boolean;
   /**
    * 终审与候选评判跟随正文模型（默认开）。
    *
@@ -150,7 +148,6 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   permissionMode: "ask",
   writingMode: "fast",
   characterEvolutionEnabled: true,
-  continuityFactsEnabled: false,
   reviewFollowsProseModel: true,
   stepBudgetMode: "hard",
   maxAgentSteps: DEFAULT_AGENT_STEPS,
@@ -241,7 +238,6 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
         ? raw.writingMode
         : DEFAULT_SETTINGS.writingMode,
       characterEvolutionEnabled: raw.characterEvolutionEnabled !== false,
-      continuityFactsEnabled: raw.continuityFactsEnabled === true,
       reviewFollowsProseModel: raw.reviewFollowsProseModel !== false,
       stepBudgetMode: typeof raw.stepBudgetMode === "string" && isAgentStepBudgetMode(raw.stepBudgetMode)
         ? raw.stepBudgetMode
@@ -261,7 +257,6 @@ export function saveAgentSettings(
     permissionMode?: PermissionMode;
     writingMode?: WritingExecutionMode;
     characterEvolutionEnabled?: boolean;
-    continuityFactsEnabled?: boolean;
     reviewFollowsProseModel?: boolean;
     stepBudgetMode?: AgentStepBudgetMode;
     maxAgentSteps?: number;
@@ -280,9 +275,6 @@ export function saveAgentSettings(
     characterEvolutionEnabled: typeof patch.characterEvolutionEnabled === "boolean"
       ? patch.characterEvolutionEnabled
       : current.characterEvolutionEnabled,
-    continuityFactsEnabled: typeof patch.continuityFactsEnabled === "boolean"
-      ? patch.continuityFactsEnabled
-      : current.continuityFactsEnabled,
     reviewFollowsProseModel: typeof patch.reviewFollowsProseModel === "boolean"
       ? patch.reviewFollowsProseModel
       : current.reviewFollowsProseModel,

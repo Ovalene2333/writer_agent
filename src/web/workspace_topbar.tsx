@@ -38,7 +38,6 @@ export function WorkspaceTopbar({
   onCloseSettings,
   onSelectSettings,
   onReviewRules,
-  onContinuityFacts,
   onToggleMore,
   onCloseMore,
   onRefresh,
@@ -72,7 +71,6 @@ export function WorkspaceTopbar({
   onCloseSettings: () => void;
   onSelectSettings: (section: SettingsSection) => void;
   onReviewRules: () => void;
-  onContinuityFacts: () => void;
   onToggleMore: () => void;
   onCloseMore: () => void;
   onRefresh: () => void;
@@ -220,7 +218,6 @@ export function WorkspaceTopbar({
             onClose={onCloseSettings}
             onSelect={onSelectSettings}
             onReviewRules={onReviewRules}
-            onContinuityFacts={onContinuityFacts}
           />
         )}
       </div>

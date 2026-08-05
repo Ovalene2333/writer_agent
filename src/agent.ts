@@ -29,7 +29,7 @@ import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
 import { authorPoliciesForTarget, loadAuthorPolicies } from "./author_policies.js";
-import { extractContinuityFacts } from "./continuity_facts.js";
+import { extractWritingMemory } from "./writing_memory.js";
 import { characterConstraintHash, characterConstraintView, characterWritingConstraintView } from "./character_constraints.js";
 import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
 import {
@@ -2959,7 +2959,6 @@ export async function runAgent(options: {
       sessionId,
       project,
       task,
-      runtimeSettings.continuityFactsEnabled,
       agentLoop.snapshot.deliverables.flatMap(item => item.proposalRevision ? [item.proposalRevision] : []),
     ),
     roleplayHandoffContext,
@@ -3064,16 +3063,16 @@ export async function runAgent(options: {
       ...(adjudicatorFallbackModel ? { fallbackModel: adjudicatorFallbackModel } : {}),
       signal,
     },
-    ...(runtimeSettings.continuityFactsEnabled ? { continuityExtractor: {
+    writingMemoryExtractor: {
       model: options.models?.summarizer ?? options.models?.inline ?? adjudicatorModel,
       signal,
-      run: async (input) => extractContinuityFacts({
+      run: async (input) => extractWritingMemory({
         model: options.models?.summarizer ?? options.models?.inline ?? adjudicatorModel,
         ...input,
         signal,
         usageReporter: reportToolUsage,
       }),
-    } } : {}),
+    },
     proseGateRules: loadProseGateRules(project),
     chapterStyleRepairer: {
       model: options.models?.inline ?? executionModel,
@@ -5117,7 +5116,6 @@ function recentArtifactsContext(
   sessionId: string,
   project: WriterProject,
   task: WritingTask,
-  continuityFactsEnabled = false,
   activeRevisionCases: readonly ProposalRevisionCase[] = [],
 ): string {
   const state = store.sessionContext(sessionId);
@@ -5139,22 +5137,18 @@ function recentArtifactsContext(
         artifactIds: savedCheckpoint.artifactIds?.slice(0, 8),
       }
     : undefined;
-  const continuityFacts = continuityFactsEnabled ? store.continuityFactPacket({
+  const writingMemory = store.writingMemoryPacket(sessionId, {
     targetPath: task.targetPath ?? state.activeDocument,
     characterIds: task.characterIds,
     limit: 20,
-  }).map(fact => ({
-    id: fact.id,
-    fact: fact.statement,
-    kind: fact.kind,
-    scope: [fact.scopeKind, fact.scopeValue].filter(Boolean).join(":"),
-    epistemic: fact.epistemic,
-    ...(fact.knownBy.length ? { knownBy: fact.knownBy } : {}),
-    ...(fact.validFrom ? { validFrom: fact.validFrom } : {}),
-    ...(fact.validUntil ? { validUntil: fact.validUntil } : {}),
-    status: fact.status,
-    source: fact.sourcePath,
-  })) : [];
+  }).map(entry => ({
+    id: entry.id,
+    kind: entry.kind,
+    content: entry.content,
+    ...(entry.characterIds.length ? { characterIds: entry.characterIds } : {}),
+    source: entry.sourcePath,
+    evidence: entry.sourceEvidence.slice(0, 240),
+  }));
   const activeRevisionArtifactIds = new Set(activeRevisionCases.flatMap(item => [
     item.draftArtifactId,
     item.reviewArtifactId,
@@ -5190,9 +5184,9 @@ function recentArtifactsContext(
   if (!task.continuation) {
     const focusPath = task.targetPath ?? state.activeDocument;
     if (focusPath) artifacts = artifacts.filter(item => item.path === focusPath);
-    if (!artifacts.length && !checkpoint && !continuityFacts.length) return "";
+    if (!artifacts.length && !checkpoint && !writingMemory.length) return "";
   }
-  if (!artifacts.length && !state.activeDocument && !state.currentIntent && !checkpoint && !continuityFacts.length) return "";
+  if (!artifacts.length && !state.activeDocument && !state.currentIntent && !checkpoint && !writingMemory.length) return "";
   const activePath = task.continuation ? state.activeDocument : (task.targetPath ?? state.activeDocument);
   const activeHash = activePath && project.textFileExists(activePath)
     ? project.hash(project.readTextFile(activePath))
@@ -5251,14 +5245,14 @@ function recentArtifactsContext(
     .filter(item => item.status === "blocked")
     .slice(0, 2)
     .map(item => ({ artifactId: item.reviewArtifactId, ...item }));
-  if (!catalog.length && !restored.length && !checkpoint && !continuityFacts.length && !revisionCases.length) return "";
+  if (!catalog.length && !restored.length && !checkpoint && !writingMemory.length && !revisionCases.length) return "";
   const scopeNote = task.continuation
     ? "承接上一轮：catalog 列出已读资料（文档未变时禁止重复 inspect/read/list_outline_nodes）；restoredReads 至多含一段末尾正文可直接续写"
     : "同会话已验证且未变化的读取索引；有目标路径时仅列目标。先按 digest 判断是否足够，正文不足再按需读取；相同 path+参数+sourceHash 会直接复用已有工具结果";
-  return `本轮任务工作记忆（${scopeNote}）。continuityFacts 是带来源的项目连续性索引：active 可直接约束写作；conflict 只提示矛盾，禁止自行选边；事实缺失、冲突或需要原文措辞时才回读最小证据片段：\n${JSON.stringify({
+  return `本轮任务工作记忆（${scopeNote}）。writingMemory 仅是当前会话从已接受正文提取的近期辅助状态，不是项目事实或角色卡；与正文、角色卡、大纲冲突时立即忽略，措辞或事实不确定时回读原文：\n${JSON.stringify({
     state: { activeDocument: state.activeDocument, currentIntent: state.currentIntent.slice(0, 160) },
     ...(checkpoint ? { checkpoint } : {}),
-    continuityFacts,
+    writingMemory,
     revisionCases,
     artifacts: catalog,
     restoredReads: restored,
@@ -5851,8 +5845,8 @@ async function executeToolCached(
       ? project.hash(JSON.stringify({
           documents: project.listDocuments().map(documentPath =>
             [documentPath, project.hash(project.read(documentPath))]),
-          facts: store.continuityFacts({ limit: 1_000 }).map(fact =>
-            [fact.id, fact.status, fact.updatedAt]),
+          writingMemory: store.writingMemory(sessionId, { limit: 1_000 }).map(entry =>
+            [entry.id, entry.status, entry.updatedAt]),
         }))
     : call.name.endsWith("_files")
       ? project.hash(JSON.stringify([...new Set([

@@ -13,7 +13,6 @@ import {
   requireString,
 } from "./helpers.js";
 import {
-  captureAcceptedContinuityFacts,
   handleProposeDocument,
   prepareDeferredCharacterChanges,
 } from "./proposals.js";
@@ -327,6 +326,7 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
     project: args.project,
     store: args.store,
     context: args.context,
+    sessionId: args.sessionId,
     path,
   });
   args.context.narrativeEvidencePackets?.set(path, evidence);
@@ -526,19 +526,7 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
   try {
     const accepted = store.acceptChangeSet(changeSet.id);
     emit({ type: "change_set", changeSet: accepted });
-    const indexed: Array<{ continuityFacts: number; continuityFactWarning?: string }> = [];
-    for (const file of accepted.files) {
-      if (file.operation === "delete" || file.operation === "move") continue;
-      indexed.push(await captureAcceptedContinuityFacts(store, {
-        id: 0,
-        path: file.path,
-        beforeContent: file.beforeContent,
-        afterContent: file.afterContent,
-      }, context));
-    }
     return JSON.stringify({ changeSetId: accepted.id, status: accepted.status, files: accepted.files.length, autoAccepted: true,
-      continuityFacts: indexed.reduce((sum, item) => sum + item.continuityFacts, 0),
-      continuityFactWarnings: indexed.flatMap(item => item.continuityFactWarning ? [item.continuityFactWarning] : []),
       ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}) });
   } catch (error) {
     return JSON.stringify({ changeSetId: changeSet.id, status: "pending",

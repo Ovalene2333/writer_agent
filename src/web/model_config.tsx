@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Bot, CheckCircle2, Library, LoaderCircle, Palette, Pencil, Plus, Radar, ShieldCheck, WandSparkles, Wifi, X, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, LoaderCircle, Palette, Pencil, Plus, Radar, ShieldCheck, WandSparkles, Wifi, X, XCircle } from "lucide-react";
 
 export type Pricing = {
   billingMode?: "metered" | "unmetered";
@@ -48,7 +48,7 @@ export type ProseLengthSettings = {
 };
 export type WritingExecutionMode = "delegated" | "fast";
 export type AgentStepBudgetMode = "hard" | "experimental";
-export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "continuity-facts" | "connection" | "appearance";
+export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "connection" | "appearance";
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
@@ -114,14 +114,12 @@ type ModelConfigProps = {
   proseLength: ProseLengthSettings;
   writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
-  continuityFactsEnabled: boolean;
   reviewFollowsProseModel: boolean;
   stepBudgetMode: AgentStepBudgetMode;
   maxAgentSteps: number;
   section: SettingsSection;
   styleContent: React.ReactNode;
   proseGatesContent: React.ReactNode;
-  continuityFactsContent: React.ReactNode;
   connectionContent: React.ReactNode;
   appearanceContent: React.ReactNode;
   connectionAvailable: boolean;
@@ -132,7 +130,6 @@ type ModelConfigProps = {
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onProseLengthChanged: (settings: ProseLengthSettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
-  onContinuityFactsChanged: (enabled: boolean) => void;
   onReviewFollowsProseModelChanged: (enabled: boolean) => void;
   onStepBudgetChanged: (settings: { stepBudgetMode: AgentStepBudgetMode; maxAgentSteps: number }) => void;
 };
@@ -143,14 +140,12 @@ export function ModelConfig({
   proseLength,
   writingMode,
   characterEvolutionEnabled,
-  continuityFactsEnabled,
   reviewFollowsProseModel,
   stepBudgetMode,
   maxAgentSteps,
   section,
   styleContent,
   proseGatesContent,
-  continuityFactsContent,
   connectionContent,
   appearanceContent,
   connectionAvailable,
@@ -161,7 +156,6 @@ export function ModelConfig({
   onScenePipelineChanged,
   onProseLengthChanged,
   onCharacterEvolutionChanged,
-  onContinuityFactsChanged,
   onReviewFollowsProseModelChanged,
   onStepBudgetChanged,
 }: ModelConfigProps) {
@@ -169,7 +163,6 @@ export function ModelConfig({
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [lengthDraft, setLengthDraft] = useState(proseLength);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
-  const [continuityFactsDraft, setContinuityFactsDraft] = useState(continuityFactsEnabled);
   const [reviewFollowsProseDraft, setReviewFollowsProseDraft] = useState(reviewFollowsProseModel);
   const [stepBudgetModeDraft, setStepBudgetModeDraft] = useState(stepBudgetMode);
   const [maxAgentStepsDraft, setMaxAgentStepsDraft] = useState(maxAgentSteps);
@@ -186,7 +179,6 @@ export function ModelConfig({
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setLengthDraft(proseLength), [proseLength]);
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
-  useEffect(() => setContinuityFactsDraft(continuityFactsEnabled), [continuityFactsEnabled]);
   useEffect(() => setReviewFollowsProseDraft(reviewFollowsProseModel), [reviewFollowsProseModel]);
   useEffect(() => setStepBudgetModeDraft(stepBudgetMode), [stepBudgetMode]);
   useEffect(() => setMaxAgentStepsDraft(maxAgentSteps), [maxAgentSteps]);
@@ -201,7 +193,6 @@ export function ModelConfig({
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
     || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
-    || continuityFactsDraft !== continuityFactsEnabled
     || reviewFollowsProseDraft !== reviewFollowsProseModel
     || stepBudgetModeDraft !== stepBudgetMode
     || maxAgentStepsDraft !== maxAgentSteps
@@ -378,7 +369,6 @@ export function ModelConfig({
           scenePipeline: sceneDraft,
           proseLength: lengthDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
-          continuityFactsEnabled: continuityFactsDraft,
           reviewFollowsProseModel: reviewFollowsProseDraft,
           stepBudgetMode: stepBudgetModeDraft,
           maxAgentSteps: maxAgentStepsDraft,
@@ -387,7 +377,6 @@ export function ModelConfig({
         scenePipeline: ScenePipelineSettings;
         proseLength: ProseLengthSettings;
         characterEvolutionEnabled: boolean;
-        continuityFactsEnabled: boolean;
         reviewFollowsProseModel: boolean;
         stepBudgetMode: AgentStepBudgetMode;
         maxAgentSteps: number;
@@ -395,14 +384,12 @@ export function ModelConfig({
       setSceneDraft(result.scenePipeline);
       setLengthDraft(result.proseLength);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
-      setContinuityFactsDraft(result.continuityFactsEnabled);
       setReviewFollowsProseDraft(result.reviewFollowsProseModel);
       setStepBudgetModeDraft(result.stepBudgetMode);
       setMaxAgentStepsDraft(result.maxAgentSteps);
       onScenePipelineChanged(result.scenePipeline);
       onProseLengthChanged(result.proseLength);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
-      onContinuityFactsChanged(result.continuityFactsEnabled);
       onReviewFollowsProseModelChanged(result.reviewFollowsProseModel);
       onStepBudgetChanged({ stepBudgetMode: result.stepBudgetMode, maxAgentSteps: result.maxAgentSteps });
       setMessage("写作设置已保存，将从下一次 Agent 任务开始生效");
@@ -417,7 +404,6 @@ export function ModelConfig({
     setSceneDraft(scenePipeline);
     setLengthDraft(proseLength);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
-    setContinuityFactsDraft(continuityFactsEnabled);
     setReviewFollowsProseDraft(reviewFollowsProseModel);
     setStepBudgetModeDraft(stepBudgetMode);
     setMaxAgentStepsDraft(maxAgentSteps);
@@ -444,7 +430,6 @@ export function ModelConfig({
     writing: { eyebrow: "Writing behavior", title: "写作行为", description: "调整角色演进、可选场景链与正文生成策略。" },
     style: { eyebrow: "Writing style", title: "写作风格", description: "管理写作模板、范文与采样建议。" },
     "prose-gates": { eyebrow: "Author policies", title: "作者政策与复审", description: "管理长期写作要求、试运行和门禁。" },
-    "continuity-facts": { eyebrow: "Continuity", title: "连续性事实", description: "维护可追溯的长期事实索引。" },
     connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
     appearance: { eyebrow: "Appearance", title: "外观与动效", description: "选择工作区主题，并按设备性能控制全局动态效果。" },
   };
@@ -471,10 +456,6 @@ export function ModelConfig({
           <button className={section === "prose-gates" ? "active" : ""} aria-current={section === "prose-gates" ? "page" : undefined} onClick={() => selectSection("prose-gates")}>
             <ShieldCheck size={17}/>
             <span><strong>作者复审规则</strong><small>语义门禁与长期偏好</small></span>
-          </button>
-          <button className={section === "continuity-facts" ? "active" : ""} aria-current={section === "continuity-facts" ? "page" : undefined} onClick={() => selectSection("continuity-facts")}>
-            <Library size={17}/>
-            <span><strong>连续性事实</strong><small>事实索引与来源证据</small></span>
           </button>
           <button className={section === "connection" ? "active" : ""} aria-current={section === "connection" ? "page" : undefined} disabled={!connectionAvailable} onClick={() => selectSection("connection")}>
             <Wifi size={17}/>
@@ -602,10 +583,6 @@ export function ModelConfig({
             <span><strong>角色演进</strong><small>允许叙事任务自动追加角色经历和故事状态。关闭后仍可显式新建或编辑角色卡。</small></span>
           </label>
           <label className="writing-setting-row">
-            <input type="checkbox" checked={continuityFactsDraft} onChange={event => setContinuityFactsDraft(event.target.checked)}/>
-            <span><strong>连续性事实</strong><small>接受正文或设定后调用摘要模型提取事实，并在后续相关任务中注入。关闭时不增加审批等待、模型调用或写作上下文。</small></span>
-          </label>
-          <label className="writing-setting-row">
             <input type="checkbox" checked={reviewFollowsProseDraft} onChange={event => setReviewFollowsProseDraft(event.target.checked)}/>
             <span><strong>终审跟随正文模型</strong><small>整章终审与候选评判使用「正文写作」的模型。判「像不像人写的」靠语感，用更便宜的模型评它自己写不出来的文字，只会把标准降到它的水平。关闭后改用「审阅校对」角色的模型。</small></span>
           </label>
@@ -687,7 +664,6 @@ export function ModelConfig({
           </div>}
           {section === "style" && styleContent}
           {section === "prose-gates" && proseGatesContent}
-          {section === "continuity-facts" && continuityFactsContent}
           {section === "connection" && connectionContent}
           {section === "appearance" && appearanceContent}
         </main>

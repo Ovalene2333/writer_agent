@@ -11,7 +11,7 @@ import type { ChapterStyleRepairIssue, ChapterStyleEdit } from "../chapter_style
 import type { DocumentLocatorCandidate, DocumentLocatorMatch } from "../document_locator.js";
 import type { DocumentRevisionInput } from "../document_revision.js";
 import type { ProseGateRule } from "../prose_gate_rules.js";
-import type { ContinuityFact, ContinuityFactCandidate } from "../continuity_facts.js";
+import type { WritingMemoryCandidate } from "../writing_memory.js";
 import type { CharacterConstraintView } from "../character_constraints.js";
 import type { CharacterEvidenceRead, NarrativeEvidencePacket } from "../narrative_evidence.js";
 import type {
@@ -174,16 +174,16 @@ export type ToolExecutionContext = {
    * Second submit of the same path must pass the hard rhythm gate.
    */
   rhythmGracePaths?: Set<string>;
-  /** Best-effort delta extractor run only after a lore/chapter proposal is accepted. */
-  continuityExtractor?: {
+  /** Best-effort, session-scoped memory extractor run after narrative text is accepted. */
+  writingMemoryExtractor?: {
     model: ModelConfig;
     signal?: AbortSignal;
     run?: (input: {
       path: string;
       beforeContent: string;
       afterContent: string;
-      existingFacts: ContinuityFact[];
-    }) => Promise<ContinuityFactCandidate[]>;
+      characters: Array<{ id: number; name: string; aliases: string[] }>;
+    }) => Promise<WritingMemoryCandidate[]>;
   };
   /** Project-persisted semantic review rules learned from explicit author feedback. */
   proseGateRules?: ProseGateRule[];

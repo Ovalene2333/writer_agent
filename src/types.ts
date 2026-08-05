@@ -304,6 +304,8 @@ export interface WritingExample {
   updatedAt: string;
 }
 
+export type { WritingMemoryEntry, WritingMemoryKind, WritingMemoryStatus } from "./writing_memory.js";
+
 export type OutlineNodeType = "act" | "chapter" | "scene";
 export type OutlineNodeStatus = "idea" | "planned" | "drafted" | "diverged";
 
