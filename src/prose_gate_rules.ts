@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { DocumentKind, WriterProject } from "./project.js";
+import { authorPolicyGateRules, MAX_ACTIVE_AUTHOR_POLICIES, upsertAuthorPolicy } from "./author_policies.js";
 
 export type ProseGateRuleSeverity = "block" | "warn";
 export type ProseGateRuleKind = "hard_gate" | "style_preference";
@@ -24,6 +25,12 @@ export interface ProseGateRule {
   sourceFeedback: string;
   createdAt: string;
   updatedAt: string;
+  /** Present when this rule is a compiled, read-only projection of AuthorPolicy. */
+  policyId?: string;
+  policyVersion?: number;
+  skillId?: string;
+  enforcement?: "observe" | "advise" | "block";
+  policyStatus?: "trial" | "active";
 }
 
 export const BUILT_IN_PROSE_GATE_RULES: readonly ProseGateRule[] = [
@@ -91,7 +98,9 @@ export const BUILT_IN_PROSE_GATE_RULES: readonly ProseGateRule[] = [
 
 /** Built-ins grow independently without reducing the long-standing project-rule capacity. */
 export const PROSE_GATE_PROJECT_RULE_CAPACITY = 19;
-export const MAX_PROSE_GATE_RULES = PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length;
+export const MAX_PROSE_GATE_RULES = PROSE_GATE_PROJECT_RULE_CAPACITY
+  + BUILT_IN_PROSE_GATE_RULES.length
+  + MAX_ACTIVE_AUTHOR_POLICIES;
 
 function rulesPath(project: WriterProject): string {
   return resolve(project.privateDir, "prose-gates.json");
@@ -157,14 +166,14 @@ function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRul
   };
 }
 
-export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
+function loadPersistedProseGateRules(project: WriterProject): ProseGateRule[] {
   const path = rulesPath(project);
   if (!existsSync(path)) return BUILT_IN_PROSE_GATE_RULES.map(rule => ({ ...rule }));
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(path, "utf8")); }
   catch { throw new Error(".writer/prose-gates.json 格式无效"); }
   if (!Array.isArray(parsed)) throw new Error(".writer/prose-gates.json 必须是规则数组");
-  const saved = parsed.slice(0, MAX_PROSE_GATE_RULES).map(item => {
+  const saved = parsed.slice(0, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length).map(item => {
     const rule = normalizeRule(item);
     const builtIn = BUILT_IN_PROSE_GATE_RULES.find(candidate => candidate.id === rule.id);
     if (builtIn && item && typeof item === "object" && !Array.isArray(item)) {
@@ -179,13 +188,19 @@ export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
   });
   const merged = new Map(BUILT_IN_PROSE_GATE_RULES.map(rule => [rule.id, { ...rule }]));
   for (const rule of saved) merged.set(rule.id, rule);
-  return [...merged.values()].slice(0, MAX_PROSE_GATE_RULES);
+  return [...merged.values()].slice(0, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length);
+}
+
+export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
+  return [...loadPersistedProseGateRules(project), ...authorPolicyGateRules(project)].slice(0, MAX_PROSE_GATE_RULES);
 }
 
 function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): void {
   const target = rulesPath(project);
   const temporary = `${target}.writer-tmp-${process.pid}`;
-  const content = `${JSON.stringify(rules.slice(0, MAX_PROSE_GATE_RULES), null, 2)}\n`;
+  const persisted = rules.filter(rule => !rule.policyId)
+    .slice(0, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length);
+  const content = `${JSON.stringify(persisted, null, 2)}\n`;
   writeFileSync(temporary, content, "utf8");
   try { renameSync(temporary, target); }
   catch (error) {
@@ -200,7 +215,7 @@ export function upsertProseGateRule(
   input: Pick<ProseGateRule, "id" | "instruction"> & Partial<Pick<ProseGateRule,
     "label" | "revisionIntent" | "kind" | "severity" | "enabled" | "documentKinds" | "pathPrefixes" | "sourceFeedback">>,
 ): ProseGateRule {
-  const rules = loadProseGateRules(project);
+  const rules = loadPersistedProseGateRules(project);
   const id = normalizeId(input.id);
   const existing = rules.find(rule => rule.id === id);
   const now = new Date().toISOString();
@@ -215,7 +230,8 @@ export function upsertProseGateRule(
   if (BUILT_IN_PROSE_GATE_RULES.some(item => item.id === id)) rule.builtIn = true;
   if (existing) rules[rules.indexOf(existing)] = rule;
   else {
-    if (rules.length >= MAX_PROSE_GATE_RULES) throw new Error(`复审规则最多 ${MAX_PROSE_GATE_RULES} 条（含 ${BUILT_IN_PROSE_GATE_RULES.length} 条内置规则）；请先停用或删除旧规则`);
+    const projectRuleCount = rules.filter(item => !item.builtIn).length;
+    if (projectRuleCount >= PROSE_GATE_PROJECT_RULE_CAPACITY) throw new Error(`旧式复审规则最多 ${PROSE_GATE_PROJECT_RULE_CAPACITY} 条；新作者要求请保存为作者政策`);
     rules.push(rule);
   }
   saveProseGateRules(project, rules);
@@ -238,7 +254,7 @@ export function proseGateRulesForTarget(
 
 export function removeProseGateRule(project: WriterProject, idValue: unknown): boolean {
   const id = normalizeId(idValue);
-  const rules = loadProseGateRules(project);
+  const rules = loadPersistedProseGateRules(project);
   const next = rules.filter(rule => rule.id !== id);
   if (next.length === rules.length) return false;
   saveProseGateRules(project, next);
@@ -247,11 +263,54 @@ export function removeProseGateRule(project: WriterProject, idValue: unknown): b
 
 export function setProseGateRuleEnabled(project: WriterProject, idValue: unknown, enabled: boolean): ProseGateRule {
   const id = normalizeId(idValue);
-  const rules = loadProseGateRules(project);
+  const rules = loadPersistedProseGateRules(project);
   const rule = rules.find(item => item.id === id);
   if (!rule) throw new Error(`复审规则不存在：${id}`);
   rule.enabled = enabled;
   rule.updatedAt = new Date().toISOString();
   saveProseGateRules(project, rules);
   return rule;
+}
+
+/** Explicit, reversible migration: legacy custom gates become trial policies. */
+export function migrateProjectProseGatesToPolicies(project: WriterProject): {
+  migratedPolicyIds: string[];
+  skippedRuleIds: string[];
+} {
+  const rules = loadPersistedProseGateRules(project);
+  const migratedPolicyIds: string[] = [];
+  const skippedRuleIds: string[] = [];
+  for (const rule of rules.filter(item => !item.builtIn && item.enabled)) {
+    const id = rule.id.replace(/_/gu, "-").replace(/-+/gu, "-");
+    try {
+      const policy = upsertAuthorPolicy(project, {
+        id,
+        title: rule.label || rule.id,
+        userIntent: rule.sourceFeedback || rule.instruction,
+        semanticCriterion: rule.instruction,
+        evidenceRequirement: "引用能够独立证明违反该要求的最短连续原文；模式或密度问题必须包含必要的相邻上下文。",
+        allowConditions: ["相似表达承担了新的事实、人物目的、因果变化或必要的场景功能时放行。"],
+        revisionIntent: rule.revisionIntent || "只修正命中问题，保留事实、人物目的、线索顺序和有效节奏。",
+        dislikedExamples: [],
+        acceptableExamples: [],
+        scope: {
+          documentKinds: rule.documentKinds,
+          pathPrefixes: rule.pathPrefixes,
+          characterIds: [],
+          sceneKinds: [],
+        },
+        enforcement: "advise",
+        status: "trial",
+        skillId: "repair-author-policy-findings",
+        sourceFeedback: rule.sourceFeedback,
+      });
+      migratedPolicyIds.push(policy.id);
+      rule.enabled = false;
+      rule.updatedAt = new Date().toISOString();
+    } catch {
+      skippedRuleIds.push(rule.id);
+    }
+  }
+  if (migratedPolicyIds.length) saveProseGateRules(project, rules);
+  return { migratedPolicyIds, skippedRuleIds };
 }

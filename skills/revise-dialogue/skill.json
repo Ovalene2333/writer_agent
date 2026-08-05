@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "kind": "review",
+  "status": "active",
+  "capabilities": ["write", "review", "revise", "audit"],
+  "documentKinds": ["chapter", "side"],
+  "characterIds": [],
+  "policyIds": [],
+  "priority": 75
+}

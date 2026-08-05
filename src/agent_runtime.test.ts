@@ -13,6 +13,8 @@ import {
   loadSkillById,
   loadAgentSettings,
   loadProjectInstructions,
+  readSkillResource,
+  routeProjectSkills,
   normalizeTodos,
   persistAdvancedTodosAfterProposal,
   persistCompletedCharacterTaskTodos,
@@ -415,8 +417,8 @@ test("listProjectSkills merges built-in skills with project overrides", () => {
     const skillDir = join(project.privateDir, "skills", "scene-open");
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, "SKILL.md"), `---
-name: 场景开场
-description: 用动作切入
+name: scene-open
+description: 用动作切入。写场景开头时使用。
 ---
 
 # 场景开场
@@ -424,15 +426,53 @@ description: 用动作切入
 先写具体动作。
 `, "utf8");
     const skills = listProjectSkills(project);
-    assert.equal(skills.length, 2);
-    assert.equal(skills.find(skill => skill.id === "scene-open")?.name, "场景开场");
+    assert.equal(skills.filter(skill => skill.source === "project").length, 1);
+    assert.ok(skills.some(skill => skill.id === "revise-dialogue" && skill.source === "builtin"));
+    assert.equal(skills.find(skill => skill.id === "scene-open")?.name, "scene-open");
+    assert.deepEqual(skills.find(skill => skill.id === "scene-open")?.validationErrors, []);
 
     const overrideDir = join(project.privateDir, "skills", "chapter-planning");
     mkdirSync(overrideDir, { recursive: true });
-    writeFileSync(join(overrideDir, "SKILL.md"), "---\nname: 项目章节规划\ndescription: 项目自定义章节方法\n---\n\n# 自定义\n", "utf8");
+    writeFileSync(join(overrideDir, "SKILL.md"), "---\nname: chapter-planning\ndescription: 项目自定义章节方法。规划完整章节时使用。\n---\n\n# 自定义\n", "utf8");
     const overridden = loadSkillById(project, "chapter-planning");
-    assert.equal(overridden?.name, "项目章节规划");
+    assert.equal(overridden?.name, "chapter-planning");
     assert.equal(overridden?.path, ".writer/skills/chapter-planning/SKILL.md");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("skill resources are bounded to the declared folder and routing honors manifests", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
+  try {
+    const project = WriterProject.init(root, "测试");
+    const skillDir = join(project.privateDir, "skills", "dialogue-repair");
+    mkdirSync(join(skillDir, "references"), { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "---\nname: dialogue-repair\ndescription: 修订对白。对白任务时使用。\n---\n\n# 对白\n", "utf8");
+    writeFileSync(join(skillDir, "skill.json"), JSON.stringify({
+      schemaVersion: 1,
+      version: 2,
+      kind: "review",
+      status: "active",
+      capabilities: ["revise"],
+      documentKinds: ["chapter"],
+      characterIds: [],
+      policyIds: ["dialogue-naturalness"],
+      priority: 80,
+    }), "utf8");
+    writeFileSync(join(skillDir, "references", "examples.md"), "第一条参照。\n第二条参照。", "utf8");
+
+    const page = readSkillResource(project, "dialogue-repair", "references/examples.md", 0, 500);
+    assert.match(page.content, /第一条参照/u);
+    assert.equal(page.hasMore, false);
+    assert.throws(() => readSkillResource(project, "dialogue-repair", "../WRITER.md"), /资源/u);
+
+    const routed = routeProjectSkills(project, {
+      capability: "revise",
+      documentKind: "chapter",
+      policyIds: ["dialogue-naturalness"],
+    });
+    assert.deepEqual(routed.required.map(skill => skill.id), ["dialogue-repair"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

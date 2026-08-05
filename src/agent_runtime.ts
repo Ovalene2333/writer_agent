@@ -1,7 +1,23 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { resolve } from "node:path";
 import { DEFAULT_WRITER_INSTRUCTIONS, type WriterProject } from "./project.js";
+export {
+  listProjectSkills,
+  loadSkillById,
+  readSkillResource,
+  routeProjectSkills,
+  skillsCatalogPrompt,
+} from "./skill_runtime.js";
+export type {
+  ProjectSkill,
+  ProjectSkillResource,
+  SkillCapability,
+  SkillKind,
+  SkillManifest,
+  SkillRouteInput,
+  SkillRouteResult,
+  SkillStatus,
+} from "./skill_runtime.js";
 
 /** 权限/执行模式，对齐主流 code agent 的 ask / auto-run / plan。 */
 export type PermissionMode = "ask" | "auto" | "plan";
@@ -91,14 +107,6 @@ export interface AgentTodoItem {
   id: string;
   content: string;
   status: "pending" | "in_progress" | "completed" | "cancelled";
-}
-
-export interface ProjectSkill {
-  id: string;
-  name: string;
-  description: string;
-  path: string;
-  body: string;
 }
 
 export type ScenePipelineMilestone = "draft_started" | "draft_reopened" | "draft_complete";
@@ -335,96 +343,6 @@ export function projectInstructionsPrompt(project: WriterProject): string | unde
   if (!loaded) return undefined;
   return `项目指令（${loaded.path}，作者/仓库约定，优先级高于默认习惯、低于用户当前消息）：
 ${loaded.content}`;
-}
-
-function parseSkillMarkdown(raw: string, fallbackName: string): { name: string; description: string; body: string } {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("---")) {
-    const end = trimmed.indexOf("\n---", 3);
-    if (end > 0) {
-      const front = trimmed.slice(3, end).trim();
-      const body = trimmed.slice(end + 4).trim();
-      const name = front.match(/^name:\s*(.+)$/m)?.[1]?.trim() || fallbackName;
-      const description = front.match(/^description:\s*(.+)$/m)?.[1]?.trim()
-        || body.split(/\r?\n/).find(line => line.trim() && !line.startsWith("#"))?.trim().slice(0, 200)
-        || "";
-      return { name, description, body: body || trimmed };
-    }
-  }
-  const title = trimmed.match(/^#\s+(.+)$/m)?.[1]?.trim() || fallbackName;
-  const description = trimmed.split(/\r?\n/).find(line => line.trim() && !line.startsWith("#"))?.trim().slice(0, 200) || "";
-  return { name: title, description, body: trimmed };
-}
-
-const BUILTIN_SKILLS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "skills");
-
-function skillRoots(project: WriterProject): string[] {
-  return [
-    resolve(project.root, ".writer", "skills"),
-    resolve(project.root, ".agents", "skills"),
-    BUILTIN_SKILLS_ROOT,
-  ];
-}
-
-/** 扫描项目技能目录，并以项目同名技能覆盖内置技能。 */
-export function listProjectSkills(project: WriterProject): ProjectSkill[] {
-  const skills: ProjectSkill[] = [];
-  const seen = new Set<string>();
-  for (const root of skillRoots(project)) {
-    if (!existsSync(root)) continue;
-    let entries: string[];
-    try {
-      entries = readdirSync(root);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const skillFile = join(root, entry, "SKILL.md");
-      const flatFile = entry.toLowerCase().endsWith(".md") ? join(root, entry) : "";
-      const file = existsSync(skillFile) ? skillFile : flatFile && existsSync(flatFile) ? flatFile : "";
-      if (!file) continue;
-      try {
-        const raw = readFileSync(file, "utf8");
-        const id = existsSync(skillFile) ? entry : basename(entry, ".md");
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const parsed = parseSkillMarkdown(raw, id);
-        const relative = file.startsWith(project.root)
-          ? file.slice(project.root.length + 1).replace(/\\/g, "/")
-          : file.startsWith(BUILTIN_SKILLS_ROOT)
-            ? `builtin/${file.slice(BUILTIN_SKILLS_ROOT.length + 1).replace(/\\/g, "/")}`
-          : file;
-        skills.push({
-          id,
-          name: parsed.name,
-          description: parsed.description,
-          path: relative,
-          body: parsed.body.slice(0, 32_000),
-        });
-      } catch {
-        continue;
-      }
-    }
-  }
-  return skills.sort((a, b) => a.id.localeCompare(b.id));
-}
-
-/**
- * Injected into agent stable-prefix slot 3 (catalog only).
- * CACHE: id + name + short description — never the full SKILL.md body (load_skill
- * pulls details on demand so the stable prefix stays small and stable).
- */
-export function skillsCatalogPrompt(project: WriterProject): string | undefined {
-  const skills = listProjectSkills(project);
-  if (!skills.length) return undefined;
-  const lines = skills.map(skill => `- ${skill.id}：${skill.name}${skill.description ? ` — ${skill.description}` : ""}`);
-  return `可用项目技能（需要细则时调用 load_skill）：
-${lines.join("\n")}`;
-}
-
-export function loadSkillById(project: WriterProject, id: string): ProjectSkill | undefined {
-  const normalized = id.trim();
-  return listProjectSkills(project).find(skill => skill.id === normalized || skill.name === normalized);
 }
 
 export function normalizeTodos(input: unknown): AgentTodoItem[] {

@@ -12,6 +12,9 @@ export type ChapterStyleRepairIssue = {
   before: string;
   after: string;
   instruction: string;
+  policyId?: string;
+  policyVersion?: number;
+  skillId?: string;
 };
 
 export type ChapterStyleEdit = { search: string; replace: string };

@@ -18,6 +18,9 @@ export type RepairPacketIssue = {
   problem?: string;
   action?: string;
   relatedIssueIds?: string[];
+  policyId?: string;
+  policyVersion?: number;
+  skillId?: string;
 };
 
 export type RepairPacket = {
@@ -46,6 +49,11 @@ function boundedIssue(value: unknown): RepairPacketIssue | undefined {
   const suggestion = boundedString(row.suggestion, 320);
   const problem = boundedString(row.problem, 360);
   const action = boundedString(row.action, 360);
+  const policyId = boundedString(row.policyId, 80);
+  const skillId = boundedString(row.skillId, 80);
+  const policyVersion = typeof row.policyVersion === "number" && Number.isInteger(row.policyVersion) && row.policyVersion > 0
+    ? row.policyVersion
+    : undefined;
   const line = typeof row.line === "number" && Number.isInteger(row.line) && row.line > 0
     ? row.line
     : undefined;
@@ -64,6 +72,9 @@ function boundedIssue(value: unknown): RepairPacketIssue | undefined {
     ...(suggestion ? { suggestion } : {}),
     ...(problem ? { problem } : {}),
     ...(action ? { action } : {}),
+    ...(policyId ? { policyId } : {}),
+    ...(policyVersion ? { policyVersion } : {}),
+    ...(skillId ? { skillId } : {}),
     ...(relatedIssueIds.length ? { relatedIssueIds } : {}),
   };
 }

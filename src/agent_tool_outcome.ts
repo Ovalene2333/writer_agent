@@ -73,7 +73,7 @@ export function interpretAgentToolResult(
       ? { characterArtifactProduced: successful }
       : {}),
     ...(toolName === "generate_image" && parsed?.status === "generated" ? { imageArtifactProduced: true } : {}),
-    ...(toolName === "manage_prose_gates" && parsed?.status === "saved" ? { proseGateRuleSaved: true } : {}),
+    ...((toolName === "manage_author_policies" || toolName === "manage_prose_gates") && parsed?.status === "saved" ? { proseGateRuleSaved: true } : {}),
     ...(parsed ? { workflowStages: [...writingWorkflowStagesForTool(toolName, parsed)] } : {}),
     ...(gate ? { gate } : {}),
   };

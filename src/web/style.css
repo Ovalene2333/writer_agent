@@ -4107,6 +4107,21 @@ input.composer-file-input[type="file"] {
 }
 .management-empty { grid-column: 1 / -1; padding: 80px 20px; text-align: center; color: var(--text-faint); }
 .prose-gate-manager { display: flex; flex-direction: column; gap: 16px; }
+.author-policy-section { display: flex; flex-direction: column; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid var(--border-light); }
+.author-policy-section > label,
+.author-policy-editor > label { display: flex; flex-direction: column; gap: 6px; color: var(--text-dim); font-size: 11px; font-weight: 700; }
+.author-policy-section textarea,
+.author-policy-editor input,
+.author-policy-editor select,
+.author-policy-editor textarea,
+.author-policy-list select {
+  width: 100%; min-width: 0; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  padding: 8px 10px; font: inherit;
+}
+.author-policy-list select { width: auto; max-width: 130px; padding: 5px 7px; font-size: 11px; }
+.author-policy-list .prose-gate-card { gap: 8px; }
+.author-policy-list .prose-gate-card small { display: block; }
+.legacy-gate-title { margin-top: 4px; padding-top: 4px; border-top: 0; }
 .prose-gate-intro {
   margin: -10px 0 0; padding: 12px 14px; border: 1px solid var(--border-light);
   border-radius: 12px; background: color-mix(in srgb, var(--accent-light) 45%, var(--surface));

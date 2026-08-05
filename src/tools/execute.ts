@@ -64,9 +64,11 @@ import {
 import {
   handleAskUser,
   handleLoadSkill,
+  handleManageAuthorPolicies,
   handleManageTodos,
   handleManageProseGates,
   handleReadContextArtifact,
+  handleReadSkillResource,
 } from "./meta.js";
 
 type Handler = (args: ToolHandlerArgs) => string | Promise<string>;
@@ -115,7 +117,9 @@ const HANDLERS: Record<string, Handler> = {
   read_conversation: handleReadConversation,
   ask_user: handleAskUser,
   manage_todos: handleManageTodos,
+  manage_author_policies: handleManageAuthorPolicies,
   load_skill: handleLoadSkill,
+  read_skill_resource: handleReadSkillResource,
   read_context_artifact: handleReadContextArtifact,
   manage_prose_gates: handleManageProseGates,
   generate_image: handleGenerateImage,

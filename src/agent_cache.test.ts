@@ -100,7 +100,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "f3c3e70e1fc4368f");
+  assert.equal(agentToolSchemaHash(), "0db71f559e7037fb");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -444,8 +444,14 @@ test("planner prose gate candidates require an independently executable semantic
     sourceFeedback: "作者要求避免频繁细写元件温度升降数值。",
   }), {
     id: "technical-telemetry-density",
-    instruction: "正文不要连续堆叠精确技术参数；只有数值直接影响人物判断、风险或行动时才保留。",
-    severity: "warn",
+    title: "technical-telemetry-density",
+    userIntent: "作者要求避免频繁细写元件温度升降数值。",
+    semanticCriterion: "正文不要连续堆叠精确技术参数；只有数值直接影响人物判断、风险或行动时才保留。",
+    evidenceRequirement: "引用能够独立证明该模式的最短连续原文；涉及密度或问答关系时必须包含相邻上下文。",
+    allowConditions: [],
+    revisionIntent: "只修正命中问题，保留事实、人物目的、线索顺序和有效表达。",
+    enforcement: "advise",
+    status: "trial",
     sourceFeedback: "作者要求避免频繁细写元件温度升降数值。",
   });
   assert.equal(normalizePlannedProseGateCandidate({

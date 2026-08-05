@@ -66,6 +66,7 @@ import type { CharacterInput } from "./characters.js";
 import {
   loadProseGateRules,
   removeProseGateRule,
+  migrateProjectProseGatesToPolicies,
   setProseGateRuleEnabled,
   upsertProseGateRule,
   type ProseGateRule,
@@ -73,6 +74,18 @@ import {
 import { proseStyleIssuesError } from "./prose_quality.js";
 import { proseStyleGateIssues } from "./tools/proposals.js";
 import { extractContinuityFacts, type ContinuityFact } from "./continuity_facts.js";
+import {
+  compileAuthorPolicyDraft,
+  loadAuthorPolicies,
+  loadAuthorPolicyFeedback,
+  recordAuthorPolicyFeedback,
+  removeAuthorPolicy,
+  setAuthorPolicyStatus,
+  upsertAuthorPolicy,
+  type AuthorPolicy,
+  type AuthorPolicyFeedbackDisposition,
+  type AuthorPolicyStatus,
+} from "./author_policies.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -848,10 +861,15 @@ export async function startWriterServer(options: {
       todos: options.store.sessionTodos(sessionId),
       agentSettings: loadAgentSettings(options.project),
       proseGateRules: loadProseGateRules(options.project),
+      authorPolicies: loadAuthorPolicies(options.project),
+      authorPolicyFeedback: loadAuthorPolicyFeedback(options.project),
       continuityFacts: options.store.continuityFacts({ limit: 500 }),
       projectInstructions: loadProjectInstructions(options.project)?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description,
+        manifest: skill.manifest,
+        resources: skill.resources,
+        validationErrors: skill.validationErrors,
       })),
       activeJobs: agentJobs.activeJobs(),
       characterDirectory: "characters/",
@@ -1186,6 +1204,87 @@ export async function startWriterServer(options: {
     } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
   });
 
+  app.get("/api/author-policies", (context) => {
+    try {
+      return context.json({
+        policies: loadAuthorPolicies(options.project),
+        feedback: loadAuthorPolicyFeedback(options.project),
+      });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/author-policies/compile", async (context) => {
+    try {
+      const body = await context.req.json<{ feedback?: unknown; scope?: unknown }>();
+      if (typeof body.feedback !== "string" || !body.feedback.trim()) throw new Error("请先描述希望长期避免或保留的写作效果");
+      const policy = await compileAuthorPolicyDraft({
+        model: options.providers.modelConfig("inline"),
+        feedback: body.feedback,
+        scope: body.scope && typeof body.scope === "object" ? body.scope as Partial<AuthorPolicy["scope"]> : undefined,
+        existingPolicies: loadAuthorPolicies(options.project).map(item => ({
+          id: item.id, title: item.title, userIntent: item.userIntent,
+        })),
+      });
+      return context.json({ policy });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/author-policies", async (context) => {
+    try {
+      const body = await context.req.json<AuthorPolicy>();
+      const policy = upsertAuthorPolicy(options.project, body);
+      return context.json({ policy, policies: loadAuthorPolicies(options.project), proseGateRules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/author-policies/migrate-legacy", (context) => {
+    try {
+      const migration = migrateProjectProseGatesToPolicies(options.project);
+      return context.json({
+        ...migration,
+        policies: loadAuthorPolicies(options.project),
+        proseGateRules: loadProseGateRules(options.project),
+      });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.put("/api/author-policies/:id/status", async (context) => {
+    try {
+      const body = await context.req.json<{ status?: AuthorPolicyStatus }>();
+      if (!body.status) throw new Error("status 不能为空");
+      const policy = setAuthorPolicyStatus(options.project, context.req.param("id"), body.status);
+      return context.json({ policy, policies: loadAuthorPolicies(options.project), proseGateRules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.post("/api/author-policies/:id/feedback", async (context) => {
+    try {
+      const body = await context.req.json<{
+        disposition?: AuthorPolicyFeedbackDisposition;
+        issueId?: string;
+        evidence?: string;
+        note?: string;
+      }>();
+      if (!body.disposition) throw new Error("disposition 不能为空");
+      const feedback = recordAuthorPolicyFeedback(options.project, {
+        policyId: context.req.param("id"),
+        disposition: body.disposition,
+        issueId: body.issueId,
+        evidence: body.evidence,
+        note: body.note,
+      });
+      return context.json({ feedback, feedbackItems: loadAuthorPolicyFeedback(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
+  app.delete("/api/author-policies/:id", (context) => {
+    try {
+      const id = context.req.param("id");
+      const removed = removeAuthorPolicy(options.project, id);
+      return context.json({ removed, id, policies: loadAuthorPolicies(options.project), proseGateRules: loadProseGateRules(options.project) });
+    } catch (error) { return context.json({ error: errorMessage(error) }, 400); }
+  });
+
   app.post("/api/prose-gates", async (context) => {
     try {
       const body = await context.req.json<Partial<ProseGateRule>>();
@@ -1395,6 +1494,9 @@ export async function startWriterServer(options: {
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description, path: skill.path,
+        manifest: skill.manifest,
+        resources: skill.resources,
+        validationErrors: skill.validationErrors,
       })),
     });
   });

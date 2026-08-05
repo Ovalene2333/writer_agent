@@ -443,7 +443,7 @@ export function ModelConfig({
     models: { eyebrow: "Model routing", title: "模型与分工", description: "管理模型连接，并为写作流程的不同环节分配模型。" },
     writing: { eyebrow: "Writing behavior", title: "写作行为", description: "调整角色演进、可选场景链与正文生成策略。" },
     style: { eyebrow: "Writing style", title: "写作风格", description: "管理写作模板、范文与采样建议。" },
-    "prose-gates": { eyebrow: "Review rules", title: "作者复审规则", description: "管理项目级语义复审规则。" },
+    "prose-gates": { eyebrow: "Author policies", title: "作者政策与复审", description: "管理长期写作要求、试运行和门禁。" },
     "continuity-facts": { eyebrow: "Continuity", title: "连续性事实", description: "维护可追溯的长期事实索引。" },
     connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
     appearance: { eyebrow: "Appearance", title: "外观与动效", description: "选择工作区主题，并按设备性能控制全局动态效果。" },

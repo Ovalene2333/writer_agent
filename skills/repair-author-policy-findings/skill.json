@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "kind": "workflow",
+  "status": "active",
+  "capabilities": ["review", "revise", "audit"],
+  "documentKinds": ["chapter", "side", "lore", "outline", "archive", "other"],
+  "characterIds": [],
+  "policyIds": [],
+  "priority": 90
+}

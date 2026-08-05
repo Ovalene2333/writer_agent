@@ -26,6 +26,7 @@ import {
   type ProseGateRule,
 } from "./prose_gate_rules.js";
 import { buildProseDiagnosis } from "./prose_review.js";
+import { MAX_ACTIVE_AUTHOR_POLICIES } from "./author_policies.js";
 
 test("selectAdjudicationCandidates prefers warnings and skips pure speech info", () => {
   const speech = analyzeProseStyle("「你——你怎么来了？」");
@@ -119,7 +120,7 @@ test("project prose gates honor document kind and path scopes", () => {
 });
 
 test("built-in semantic rules keep a fixed project-rule capacity and repair metadata", () => {
-  assert.equal(MAX_PROSE_GATE_RULES, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length);
+  assert.equal(MAX_PROSE_GATE_RULES, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length + MAX_ACTIVE_AUTHOR_POLICIES);
   assert.equal(PROSE_GATE_PROJECT_RULE_CAPACITY, 19);
   assert.deepEqual(BUILT_IN_PROSE_GATE_RULES.map(rule => rule.id), [
     "quoted-text-count-consistency",

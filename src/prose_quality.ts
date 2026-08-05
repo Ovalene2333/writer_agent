@@ -34,6 +34,10 @@ export interface ProseStyleIssue {
   semanticVerdict?: "allow" | "warn" | "block";
   /** Semantic validity and family density are independent; only true quotations/metadata should opt out. */
   countsTowardFamilyBudget?: boolean;
+  /** Source policy/skill for explainable review and targeted repair. */
+  policyId?: string;
+  policyVersion?: number;
+  skillId?: string;
 }
 
 export interface ContrastStyleReport {
@@ -357,6 +361,9 @@ export function proseStyleRepairPacket(
       ...(issue.evidence ? { evidence: issue.evidence } : {}),
       suggestion: issue.suggestions[0] ?? rewriteTipForSubtype(issue.subtype),
       problem: issue.reason,
+      ...(issue.policyId ? { policyId: issue.policyId } : {}),
+      ...(issue.policyVersion ? { policyVersion: issue.policyVersion } : {}),
+      ...(issue.skillId ? { skillId: issue.skillId } : {}),
     });
   }
   return boundedRepairPacket({

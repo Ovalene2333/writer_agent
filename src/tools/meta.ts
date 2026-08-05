@@ -1,4 +1,4 @@
-import { loadSkillById, normalizeTodos, reconcileManagedTodos } from "../agent_runtime.js";
+import { loadSkillById, normalizeTodos, readSkillResource, reconcileManagedTodos } from "../agent_runtime.js";
 import { chapterSceneDraftComplete, nextChapterScene } from "../scene_pipeline.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { requireString } from "./helpers.js";
@@ -9,6 +9,79 @@ import {
   upsertProseGateRule,
 } from "../prose_gate_rules.js";
 import type { ProseGateTargetKind } from "../prose_gate_rules.js";
+import {
+  loadAuthorPolicies,
+  loadAuthorPolicyFeedback,
+  recordAuthorPolicyFeedback,
+  removeAuthorPolicy,
+  setAuthorPolicyStatus,
+  upsertAuthorPolicy,
+  type AuthorPolicyEnforcement,
+  type AuthorPolicyFeedbackDisposition,
+  type AuthorPolicyStatus,
+} from "../author_policies.js";
+
+export function handleManageAuthorPolicies({ input, project, context }: ToolHandlerArgs): string {
+  const operation = requireString(input.operation, "operation");
+  if (operation === "list") {
+    return JSON.stringify({ policies: loadAuthorPolicies(project), feedback: loadAuthorPolicyFeedback(project) });
+  }
+  if (context.permissionMode === "plan") throw new Error("plan 模式不能修改作者政策");
+  if (operation === "upsert") {
+    const policy = upsertAuthorPolicy(project, {
+      id: requireString(input.id, "id"),
+      title: requireString(input.title, "title"),
+      userIntent: requireString(input.userIntent, "userIntent"),
+      semanticCriterion: requireString(input.semanticCriterion, "semanticCriterion"),
+      evidenceRequirement: requireString(input.evidenceRequirement, "evidenceRequirement"),
+      allowConditions: Array.isArray(input.allowConditions) ? input.allowConditions as string[] : [],
+      revisionIntent: requireString(input.revisionIntent, "revisionIntent"),
+      dislikedExamples: Array.isArray(input.dislikedExamples) ? input.dislikedExamples as string[] : [],
+      acceptableExamples: Array.isArray(input.acceptableExamples) ? input.acceptableExamples as string[] : [],
+      scope: (() => {
+        const scope = input.scope && typeof input.scope === "object"
+          ? input.scope as Record<string, unknown> : {};
+        return {
+          documentKinds: Array.isArray(scope.documentKinds) ? scope.documentKinds as ProseGateTargetKind[] : [],
+          pathPrefixes: Array.isArray(scope.pathPrefixes) ? scope.pathPrefixes as string[] : [],
+          characterIds: Array.isArray(scope.characterIds) ? scope.characterIds as string[] : [],
+          sceneKinds: Array.isArray(scope.sceneKinds) ? scope.sceneKinds as string[] : [],
+        };
+      })(),
+      enforcement: (input.enforcement === "block" || input.enforcement === "advise" ? input.enforcement : "observe") as AuthorPolicyEnforcement,
+      status: (input.status === "trial" || input.status === "active" || input.status === "paused" ? input.status : "draft") as AuthorPolicyStatus,
+      ...(typeof input.skillId === "string" ? { skillId: input.skillId } : {}),
+      sourceFeedback: typeof input.sourceFeedback === "string" ? input.sourceFeedback : "",
+    });
+    context.proseGateRules = loadProseGateRules(project);
+    return JSON.stringify({ status: "saved", policy, message: policy.status === "draft"
+      ? "作者要求已保存为草案；确认边界和例外后再进入试运行。"
+      : "作者政策已保存；正文出口将按当前状态进行语义复审。" });
+  }
+  if (operation === "set_status") {
+    const status = requireString(input.status, "status") as AuthorPolicyStatus;
+    const policy = setAuthorPolicyStatus(project, requireString(input.id, "id"), status);
+    context.proseGateRules = loadProseGateRules(project);
+    return JSON.stringify({ status: "updated", policy });
+  }
+  if (operation === "remove") {
+    const id = requireString(input.id, "id");
+    const removed = removeAuthorPolicy(project, id);
+    context.proseGateRules = loadProseGateRules(project);
+    return JSON.stringify({ status: removed ? "removed" : "not_found", id });
+  }
+  if (operation === "feedback") {
+    const feedback = recordAuthorPolicyFeedback(project, {
+      policyId: requireString(input.id, "id"),
+      disposition: requireString(input.disposition, "disposition") as AuthorPolicyFeedbackDisposition,
+      ...(typeof input.issueId === "string" ? { issueId: input.issueId } : {}),
+      ...(typeof input.evidence === "string" ? { evidence: input.evidence } : {}),
+      ...(typeof input.note === "string" ? { note: input.note } : {}),
+    });
+    return JSON.stringify({ status: "recorded", feedback });
+  }
+  throw new Error("operation 仅支持 list、upsert、set_status、remove、feedback");
+}
 
 export function handleManageProseGates({ input, project, context }: ToolHandlerArgs): string {
   const operation = requireString(input.operation, "operation");
@@ -93,7 +166,25 @@ export function handleLoadSkill({ input, project }: ToolHandlerArgs): string {
     name: skill.name,
     description: skill.description,
     path: skill.path,
+    manifest: skill.manifest,
+    resources: skill.resources,
+    validationErrors: skill.validationErrors,
     content: skill.body,
+  });
+}
+
+export function handleReadSkillResource({ input, project }: ToolHandlerArgs): string {
+  const result = readSkillResource(
+    project,
+    requireString(input.skillId, "skillId"),
+    requireString(input.path, "path"),
+    Number(input.offset ?? 0),
+    Number(input.limit ?? 4_000),
+  );
+  return JSON.stringify({
+    status: "skill_resource_page",
+    ...result,
+    message: "仅在当前页不足以执行 Skill 时继续读取下一页；不要重复读取已有页。",
   });
 }
 

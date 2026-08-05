@@ -981,8 +981,50 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "manage_author_policies",
+      description: "把作者明确的长期写作要求保存为可试运行、可解释的项目政策；含糊反馈先存 draft，不能直接升级为硬门禁",
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["list", "upsert", "set_status", "remove", "feedback"] },
+          id: { type: "string", description: "小写英文数字连字符政策 ID；list 时省略" },
+          title: { type: "string", description: "作者可理解的短标题；upsert 必填" },
+          userIntent: { type: "string", description: "忠实概括作者希望避免或保留的效果；upsert 必填" },
+          semanticCriterion: { type: "string", description: "可独立执行的语义判断标准；不得以关键词或固定句长代替；upsert 必填" },
+          evidenceRequirement: { type: "string", description: "命中时必须引用什么连续原文；upsert 必填" },
+          allowConditions: { type: "array", items: { type: "string" }, maxItems: 20, description: "相似但应放行的例外；block 至少一项" },
+          revisionIntent: { type: "string", description: "局部修订目标和必须保留的内容；upsert 必填" },
+          dislikedExamples: { type: "array", items: { type: "string" }, maxItems: 20 },
+          acceptableExamples: { type: "array", items: { type: "string" }, maxItems: 20 },
+          scope: {
+            type: "object",
+            properties: {
+              documentKinds: { type: "array", items: { type: "string", enum: ["chapter", "side", "lore", "outline", "archive", "other", "writing_example"] } },
+              pathPrefixes: { type: "array", items: { type: "string" }, maxItems: 12 },
+              characterIds: { type: "array", items: { type: "string" }, maxItems: 100 },
+              sceneKinds: { type: "array", items: { type: "string" }, maxItems: 40 },
+            },
+            additionalProperties: false,
+          },
+          enforcement: { type: "string", enum: ["observe", "advise", "block"], description: "审美偏好默认 advise；事实性确定错误才考虑 block" },
+          status: { type: "string", enum: ["draft", "trial", "active", "paused", "deprecated"], description: "模糊或新政策默认 draft/trial" },
+          skillId: { type: "string", description: "命中后应加载的修订 Skill，可省略" },
+          sourceFeedback: { type: "string", description: "作者原始反馈的短摘要" },
+          disposition: { type: "string", enum: ["accepted", "dismissed", "edited", "false_positive"], description: "feedback 操作必填" },
+          issueId: { type: "string" },
+          evidence: { type: "string" },
+          note: { type: "string" },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "manage_prose_gates",
-      description: "管理项目级语义复审规则；作者明确要求以后持续检查/避免某类问题时 upsert，单次改稿偏好不要沉淀",
+      description: "兼容管理旧式项目复审规则；新的长期作者要求使用 manage_author_policies",
       parameters: {
         type: "object",
         properties: {
@@ -1048,13 +1090,31 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "load_skill",
-      description: "加载项目技能全文（.writer/skills 或 .agents/skills）",
+      description: "加载项目 Skill 的指令、运行清单与资源目录；匹配任务或修订问题指定 skillId 时使用",
       parameters: {
         type: "object",
         properties: {
           id: { type: "string", description: "技能 id 或 name" },
         },
         required: ["id"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_skill_resource",
+      description: "分页读取已加载 Skill 声明的文本资源；只读取完成当前任务必需的页",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "已加载的 Skill ID" },
+          path: { type: "string", description: "load_skill 返回的资源相对路径" },
+          offset: { type: "number", description: "字符偏移，首页为 0" },
+          limit: { type: "number", description: "每页 500–6000 字符，默认 4000" },
+        },
+        required: ["skillId", "path"],
         additionalProperties: false,
       },
     },
@@ -1109,6 +1169,7 @@ const WRITE_TOOLS = new Set([
   "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
   "save_character", "apply_character_changes", "save_simple_character",
   "manage_prose_gates",
+  "manage_author_policies",
   "generate_image",
 ]);
 

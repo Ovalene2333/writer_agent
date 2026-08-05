@@ -56,6 +56,7 @@ import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } fro
 import {
   analyzeProseStyle,
   isHardBlockSubtype,
+  proseStyleRepairPacket,
   proseStyleIssuesError,
   sceneMannerismGateError,
   type ProseStyleIssue,
@@ -782,6 +783,9 @@ function styleRepairIssues(content: string, blockers: ProseStyleIssue[]): Chapte
     before: content.slice(Math.max(0, issue.start - 100), issue.start).trim(),
     after: content.slice(issue.end, Math.min(content.length, issue.end + 100)).trim(),
     instruction: [issue.reason, ...issue.suggestions.slice(0, 2)].filter(Boolean).join("；"),
+    ...(issue.policyId ? { policyId: issue.policyId } : {}),
+    ...(issue.policyVersion ? { policyVersion: issue.policyVersion } : {}),
+    ...(issue.skillId ? { skillId: issue.skillId } : {}),
   }));
 }
 
@@ -945,6 +949,15 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
   attempts: number;
   blockers: ProseStyleIssue[];
   errors: string[];
+  policyObservations: Array<{
+    issueId: string;
+    policyId: string;
+    policyVersion?: number;
+    skillId?: string;
+    evidence: string;
+    reason: string;
+    suggestion?: string;
+  }>;
 }> {
   const { project, store, context } = args;
   const maxRequests = 4;
@@ -952,16 +965,31 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
   const errors: string[] = [];
   for (;;) {
     const draft = context.chapterSceneDraft;
-    if (!draft) return { passed: false, attempts, blockers: [], errors: ["章节草稿已丢失"] };
+    if (!draft) return { passed: false, attempts, blockers: [], errors: ["章节草稿已丢失"], policyObservations: [] };
     const content = assembleChapterSceneDraft(draft);
     const issues = await proseStyleGateIssues(beforeContent, content, context, {
       targetPath: draft.path,
       targetKind: documentKind(draft.path),
     });
     const blockers = issues.filter(issue => issue.severity === "error");
-    if (!blockers.length) return { passed: true, attempts, blockers: [], errors };
-    if (context.evidenceGroundedWriter || !context.chapterStyleRepairer || attempts >= maxRequests) {
-      return { passed: false, attempts, blockers, errors };
+    if (!blockers.length) return {
+      passed: true,
+      attempts,
+      blockers: [],
+      errors,
+      policyObservations: issues.flatMap(issue => issue.policyId ? [{
+        issueId: issue.id,
+        policyId: issue.policyId,
+        ...(issue.policyVersion ? { policyVersion: issue.policyVersion } : {}),
+        ...(issue.skillId ? { skillId: issue.skillId } : {}),
+        evidence: issue.evidence,
+        reason: issue.reason,
+        ...(issue.suggestions[0] ? { suggestion: issue.suggestions[0] } : {}),
+      }] : []),
+    };
+    if (blockers.some(issue => issue.policyId)
+      || context.evidenceGroundedWriter || !context.chapterStyleRepairer || attempts >= maxRequests) {
+      return { passed: false, attempts, blockers, errors, policyObservations: [] };
     }
     const repairer = context.chapterStyleRepairer;
     const runRepair = repairer.run ?? requestChapterStyleRepair;
@@ -1012,7 +1040,7 @@ async function autoRepairChapterStyle(args: ToolHandlerArgs, beforeContent: stri
         }
       }
     }
-    if (!applied) return { passed: false, attempts, blockers, errors };
+    if (!applied) return { passed: false, attempts, blockers, errors, policyObservations: [] };
   }
 }
 
@@ -1076,12 +1104,21 @@ async function submitPassedChapterReview(
     aiTellWarnings: Array<{ code: string; message: string; examples: string[] }>;
     ledger: ReturnType<typeof chapterSceneLedger>;
     chapterReview: ChapterReviewResult;
+    policyObservations: Array<{
+      issueId: string;
+      policyId: string;
+      policyVersion?: number;
+      skillId?: string;
+      evidence: string;
+      reason: string;
+      suggestion?: string;
+    }>;
   },
 ): Promise<string> {
   const { input } = args;
   const {
     draft, proposalSummary, contentCharacters, metrics, styleWarnings,
-    vividness, vividnessWarnings, aiTells, aiTellWarnings, ledger, chapterReview,
+    vividness, vividnessWarnings, aiTells, aiTellWarnings, ledger, chapterReview, policyObservations,
   } = values;
   draft.inspectedVersion = draft.version;
   saveDraftCheckpoint(args, "review_passed", draft);
@@ -1136,6 +1173,7 @@ async function submitPassedChapterReview(
     ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
     ledger,
     chapterReview,
+    ...(policyObservations.length ? { policyObservations } : {}),
     ...(preparedCharacterChanges.warnings.length
       ? { characterChangeWarnings: preparedCharacterChanges.warnings }
       : {}),
@@ -1230,12 +1268,18 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       status: "style_revision_required",
       code: "CHAPTER_DRAFT_STYLE_BLOCKED",
       error: proseStyleIssuesError(styleRepair.blockers) ?? "局部风格修订未通过",
+      repairPacket: proseStyleRepairPacket(content, styleRepair.blockers, {
+        path: draft.path,
+        sourceHash: project.hash(content),
+      }),
       autoRepairAttempts: styleRepair.attempts,
       ...(styleRepair.errors.length ? { autoRepairErrors: styleRepair.errors } : {}),
       path: draft.path,
       complete: true,
       invalidatedSceneIds: [],
-      message: "把 error 中列出的全部命中句在一次 revise_chapter_draft_style 调用中修完（最多 20 条替换），只替换命中句、不重写场景；修订结果自带复检（styleRecheck），复检 passed 后再重新 inspect，不要为查看结果单独 inspect。",
+      message: styleRepair.blockers.some(issue => issue.policyId)
+        ? "作者政策命中已进入 repairPacket。先加载其中指定的 skillId，核对政策证据与放行条件，再由 Agent 对目标句做有限修订并重新 inspect；不得让隔离修订器自行扩大政策含义。"
+        : "把 error 中列出的全部命中句在一次 revise_chapter_draft_style 调用中修完（最多 20 条替换），只替换命中句、不重写场景；修订结果自带复检（styleRecheck），复检 passed 后再重新 inspect，不要为查看结果单独 inspect。",
     });
   }
   // Rhythm / reuse metrics on the newly written scenes only (base content excluded):
@@ -1406,6 +1450,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             ...(dialogueWarnings.length ? { dialogueWarnings } : {}),
             ledger,
             chapterReview,
+            ...(styleRepair.policyObservations.length ? { policyObservations: styleRepair.policyObservations } : {}),
             targetScenes,
             reviewCycle: {
               status: draft.reviewCycle!.status,
@@ -1436,6 +1481,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           aiTellWarnings,
           ledger,
           chapterReview,
+          policyObservations: styleRepair.policyObservations,
         });
       } catch (error) {
         if (error instanceof ChapterReviewRequestError && error.usage) {
@@ -1465,6 +1511,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     chapterGoal: draft.chapterGoal,
     contentCharacters: content.length,
     sceneCount: draft.completed.length,
+    ...(styleRepair.policyObservations.length ? { policyObservations: styleRepair.policyObservations } : {}),
     message: parseOnly
       ? "隔离终审已响应，但输出无法形成带场景和逐字证据的有效结论。草稿与审阅事务已保留，未标记通过；可重试终审，不要改写正文来猜测审核意见。"
       : "隔离终审及回退模型均不可用。草稿与审阅事务已保留，未标记通过；依赖恢复后重新 inspect，不能由主 Agent 自审后绕过终审。",

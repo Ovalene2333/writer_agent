@@ -136,7 +136,7 @@ export function recordAgentToolResult(
     progress.characterArtifactProduced = true;
   }
   if (toolName === "generate_image" && result.status === "generated") progress.imageArtifactProduced = true;
-  if (toolName === "manage_prose_gates" && result.status === "saved") {
+  if ((toolName === "manage_author_policies" || toolName === "manage_prose_gates") && result.status === "saved") {
     progress.proseGateRuleSaved = true;
   }
   for (const stage of writingWorkflowStagesForTool(toolName, result)) {

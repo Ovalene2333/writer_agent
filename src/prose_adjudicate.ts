@@ -554,6 +554,9 @@ evidence 必须逐字复制自对应 passage：单句足以证明时只引一句
         evidence: finding.evidence.length <= 120 ? finding.evidence : `${finding.evidence.slice(0, 117)}…`,
         reason: `作者复审规则「${rule.id}」：${finding.reason}`,
         suggestions: [finding.suggestion],
+        ...(rule.policyId ? { policyId: rule.policyId } : {}),
+        ...(rule.policyVersion ? { policyVersion: rule.policyVersion } : {}),
+        ...(rule.skillId ? { skillId: rule.skillId } : {}),
       };
     })];
   } catch (error) {
@@ -635,6 +638,9 @@ export function deterministicLearnedProseGateIssues(
       evidence: evidence.length <= 120 ? evidence : `${evidence.slice(0, 117)}…`,
       reason: `作者复审规则「${rule.id}」：引号内为 ${actual} 个书写单位，正文写成 ${declared} 个。`,
       suggestions: [`将“${declaredText}个字”改为“${replacement}个字”。`],
+      ...(rule.policyId ? { policyId: rule.policyId } : {}),
+      ...(rule.policyVersion ? { policyVersion: rule.policyVersion } : {}),
+      ...(rule.skillId ? { skillId: rule.skillId } : {}),
     });
   }
   return issues;

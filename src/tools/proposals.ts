@@ -343,7 +343,21 @@ async function gateProseStyleWithSparseAutoRepair(
   path: string,
   summary: string,
   recordDraft?: (content: string, sourceHash: string) => void,
-): Promise<{ content: string; sourceHash: string; stripped: string[]; autoRepair?: { attempts: number; edits: number; initialBlockers: number } }> {
+): Promise<{
+  content: string;
+  sourceHash: string;
+  stripped: string[];
+  autoRepair?: { attempts: number; edits: number; initialBlockers: number };
+  policyObservations?: Array<{
+    issueId: string;
+    policyId: string;
+    policyVersion?: number;
+    skillId?: string;
+    evidence: string;
+    reason: string;
+    suggestion?: string;
+  }>;
+}> {
   let current = content;
   const stripped: string[] = [];
   // Delegated prose must not pass through a second model that lacks the Writer's
@@ -363,10 +377,20 @@ async function gateProseStyleWithSparseAutoRepair(
     });
     const styleError = proseStyleIssuesError(issues);
     if (!styleError) {
+      const policyObservations = issues.flatMap(issue => issue.policyId ? [{
+        issueId: issue.id,
+        policyId: issue.policyId,
+        ...(issue.policyVersion ? { policyVersion: issue.policyVersion } : {}),
+        ...(issue.skillId ? { skillId: issue.skillId } : {}),
+        evidence: issue.evidence,
+        reason: issue.reason,
+        ...(issue.suggestions[0] ? { suggestion: issue.suggestions[0] } : {}),
+      }] : []);
       return {
         content: current,
         sourceHash,
         stripped,
+        ...(policyObservations.length ? { policyObservations } : {}),
         ...(attempt > 0 ? {
           autoRepair: {
             attempts: attempt,
@@ -657,6 +681,7 @@ export async function submitFullDocumentProposal(
   };
   recordLatestProposalDraft(proposedBody, draftSourceHash);
   let styleAutoRepair: { attempts: number; edits: number; initialBlockers: number } | undefined;
+  let policyObservations: Awaited<ReturnType<typeof gateProseStyleWithSparseAutoRepair>>["policyObservations"];
   const expectedDocumentBase = context.proposalExpectedDocumentBase?.path === path
     && context.proposalExpectedDocumentBase.deliverableId === deliverableId
     ? context.proposalExpectedDocumentBase
@@ -712,6 +737,7 @@ export async function submitFullDocumentProposal(
     draftSourceHash = styleGate.sourceHash;
     strippedMeta.push(...styleGate.stripped);
     styleAutoRepair = styleGate.autoRepair;
+    policyObservations = styleGate.policyObservations;
     recordLatestProposalDraft(proposedBody, draftSourceHash);
   }
   if (isScenePipelineDocument(path)) {
@@ -757,6 +783,7 @@ export async function submitFullDocumentProposal(
     submissionKind: existed ? "new_version" : "new_document",
     ...(lengthNotice ? { lengthNotice } : {}),
     ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
+    ...(policyObservations?.length ? { policyObservations } : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(styleAutoRepair ? { styleAutoRepaired: styleAutoRepair } : {}),

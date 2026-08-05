@@ -458,6 +458,42 @@ export type ProseGateRule = {
 };
 export type ProseGateRuleDraft = Pick<ProseGateRule, "id" | "instruction" | "kind" | "severity" | "enabled" | "documentKinds" | "pathPrefixes" | "sourceFeedback">
   & { isNew: boolean };
+export type AuthorPolicyStatus = "draft" | "trial" | "active" | "paused" | "deprecated";
+export type AuthorPolicyEnforcement = "observe" | "advise" | "block";
+export type AuthorPolicy = {
+  id: string;
+  title: string;
+  userIntent: string;
+  semanticCriterion: string;
+  evidenceRequirement: string;
+  allowConditions: string[];
+  revisionIntent: string;
+  dislikedExamples: string[];
+  acceptableExamples: string[];
+  scope: {
+    documentKinds: ProseGateRule["documentKinds"];
+    pathPrefixes: string[];
+    characterIds: string[];
+    sceneKinds: string[];
+  };
+  enforcement: AuthorPolicyEnforcement;
+  status: AuthorPolicyStatus;
+  skillId?: string;
+  version?: number;
+  sourceFeedback: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+export type AuthorPolicyFeedback = {
+  id: string;
+  policyId: string;
+  policyVersion: number;
+  disposition: "accepted" | "dismissed" | "edited" | "false_positive";
+  issueId?: string;
+  evidence?: string;
+  note?: string;
+  createdAt: string;
+};
 export type ContinuityFact = {
   id: number;
   statement: string;
@@ -581,6 +617,8 @@ export type State = {
     proseLength?: ProseLengthSettings;
   };
   proseGateRules?: ProseGateRule[];
+  authorPolicies?: AuthorPolicy[];
+  authorPolicyFeedback?: AuthorPolicyFeedback[];
   continuityFacts?: ContinuityFact[];
   projectInstructions?: string | null;
   skills?: Array<{ id: string; name: string; description: string }>;

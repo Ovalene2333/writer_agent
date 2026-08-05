@@ -88,6 +88,8 @@ import {
   roleplaySetupPhases,
   todoStatusMark,
   type ActiveRoleplayState,
+  type AuthorPolicy,
+  type AuthorPolicyStatus,
   type AgentJob,
   type AgentStreamEvent,
   type AgentTodoItem,
@@ -570,6 +572,8 @@ function App() {
   const [styleDraft, setStyleDraft] = useState<StyleTemplateDraft | null>(null);
   const [proseGateDraft, setProseGateDraft] = useState<ProseGateRuleDraft | null>(null);
   const [proseGateBusy, setProseGateBusy] = useState(false);
+  const [authorPolicyFeedback, setAuthorPolicyFeedback] = useState("");
+  const [authorPolicyDraft, setAuthorPolicyDraft] = useState<AuthorPolicy | null>(null);
   const [continuityFactDraft, setContinuityFactDraft] = useState<ContinuityFactDraft | null>(null);
   const [continuityFactBusy, setContinuityFactBusy] = useState(false);
   const [managementView, setManagementView] = useState<ManagementView | null>(null);
@@ -3453,6 +3457,136 @@ function App() {
     }
   }
 
+  async function compileAuthorPolicy() {
+    if (!authorPolicyFeedback.trim()) return;
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ policy: AuthorPolicy }>("/api/author-policies/compile", {
+        method: "POST",
+        body: JSON.stringify({
+          feedback: authorPolicyFeedback,
+          scope: { documentKinds: ["chapter", "side"] },
+        }),
+      });
+      setAuthorPolicyDraft({ ...result.policy, status: "trial" });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function saveAuthorPolicy() {
+    if (!authorPolicyDraft) return;
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ policies: AuthorPolicy[]; proseGateRules: ProseGateRule[] }>("/api/author-policies", {
+        method: "POST",
+        body: JSON.stringify(authorPolicyDraft),
+      });
+      setState(current => current ? {
+        ...current,
+        authorPolicies: result.policies,
+        proseGateRules: result.proseGateRules,
+      } : current);
+      setAuthorPolicyFeedback("");
+      setAuthorPolicyDraft(null);
+      setNotice("作者政策已保存；试运行只记录命中，不会阻断交付。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function setAuthorPolicyStatus(policy: AuthorPolicy, status: AuthorPolicyStatus) {
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ policies: AuthorPolicy[]; proseGateRules: ProseGateRule[] }>(
+        `/api/author-policies/${encodeURIComponent(policy.id)}/status`,
+        { method: "PUT", body: JSON.stringify({ status }) },
+      );
+      setState(current => current ? {
+        ...current,
+        authorPolicies: result.policies,
+        proseGateRules: result.proseGateRules,
+      } : current);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function deleteAuthorPolicy(policy: AuthorPolicy) {
+    if (!confirm(`删除作者政策“${policy.title}”？`)) return;
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ policies: AuthorPolicy[]; proseGateRules: ProseGateRule[] }>(
+        `/api/author-policies/${encodeURIComponent(policy.id)}`,
+        { method: "DELETE" },
+      );
+      setState(current => current ? {
+        ...current,
+        authorPolicies: result.policies,
+        proseGateRules: result.proseGateRules,
+      } : current);
+      if (authorPolicyDraft?.id === policy.id) setAuthorPolicyDraft(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function migrateLegacyProseGates() {
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{
+        migratedPolicyIds: string[];
+        policies: AuthorPolicy[];
+        proseGateRules: ProseGateRule[];
+      }>("/api/author-policies/migrate-legacy", { method: "POST" });
+      setState(current => current ? {
+        ...current,
+        authorPolicies: result.policies,
+        proseGateRules: result.proseGateRules,
+      } : current);
+      setNotice(result.migratedPolicyIds.length
+        ? `已迁移 ${result.migratedPolicyIds.length} 条旧规则到试运行政策。`
+        : "没有需要迁移的旧式自定义规则。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
+  async function recordAuthorPolicyDisposition(
+    policy: AuthorPolicy,
+    disposition: "accepted" | "false_positive",
+  ) {
+    setProseGateBusy(true);
+    setError("");
+    try {
+      const result = await api<{ feedbackItems: NonNullable<State["authorPolicyFeedback"]> }>(
+        `/api/author-policies/${encodeURIComponent(policy.id)}/feedback`,
+        { method: "POST", body: JSON.stringify({ disposition }) },
+      );
+      setState(current => current ? { ...current, authorPolicyFeedback: result.feedbackItems } : current);
+      setNotice(disposition === "accepted" ? "已记录为有效政策。" : "已记录误报，政策不会自动升级强度。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProseGateBusy(false);
+    }
+  }
+
   async function saveContinuityFact() {
     if (!continuityFactDraft) return;
     setContinuityFactBusy(true);
@@ -3663,8 +3797,168 @@ function App() {
   const showThemePicker = false;
   const proseGatesSettingsContent = <div className="settings-section-body prose-gate-manager">
     <p className="prose-gate-intro">
-      项目级语义复审会在正文出口运行。确定错误可设为阻断；偏好、倾向和可能误报的规则建议使用提醒。
+      作者政策
     </p>
+    <section className="author-policy-section">
+      <label>
+        <span>长期写作要求</span>
+        <textarea
+          value={authorPolicyFeedback}
+          disabled={proseGateBusy || readOnly}
+          rows={3}
+          maxLength={4000}
+          placeholder="例如：人物说完话以后，不要总由旁白解释他真正想表达什么；揭示必要线索时可以解释。"
+          onChange={(event) => setAuthorPolicyFeedback(event.target.value)}
+        />
+      </label>
+      <div className="prose-gate-editor-actions">
+        <button
+          type="button"
+          className="primary"
+          disabled={proseGateBusy || readOnly || !authorPolicyFeedback.trim()}
+          onClick={() => void compileAuthorPolicy()}
+        ><WandSparkles size={15} />生成政策草案</button>
+      </div>
+      {authorPolicyDraft && <div className="prose-gate-editor author-policy-editor">
+        <div className="prose-gate-editor-grid">
+          <label>
+            <span>标题</span>
+            <input
+              value={authorPolicyDraft.title}
+              disabled={proseGateBusy}
+              onChange={(event) => setAuthorPolicyDraft(current => current ? { ...current, title: event.target.value } : current)}
+            />
+          </label>
+          <label>
+            <span>治理强度</span>
+            <select
+              value={authorPolicyDraft.enforcement}
+              disabled={proseGateBusy}
+              onChange={(event) => setAuthorPolicyDraft(current => current ? {
+                ...current,
+                enforcement: event.target.value === "block" ? "block" : event.target.value === "advise" ? "advise" : "observe",
+              } : current)}
+            >
+              <option value="observe">仅观察</option>
+              <option value="advise">提醒修改</option>
+              <option value="block">阻止提交</option>
+            </select>
+          </label>
+        </div>
+        <label>
+          <span>作者意图</span>
+          <textarea rows={2} value={authorPolicyDraft.userIntent} disabled={proseGateBusy}
+            onChange={(event) => setAuthorPolicyDraft(current => current ? { ...current, userIntent: event.target.value } : current)} />
+        </label>
+        <label>
+          <span>语义核验标准</span>
+          <textarea rows={4} value={authorPolicyDraft.semanticCriterion} disabled={proseGateBusy}
+            onChange={(event) => setAuthorPolicyDraft(current => current ? { ...current, semanticCriterion: event.target.value } : current)} />
+        </label>
+        <label>
+          <span>命中证据</span>
+          <textarea rows={2} value={authorPolicyDraft.evidenceRequirement} disabled={proseGateBusy}
+            onChange={(event) => setAuthorPolicyDraft(current => current ? { ...current, evidenceRequirement: event.target.value } : current)} />
+        </label>
+        <label>
+          <span>允许例外（每行一项）</span>
+          <textarea rows={3} value={authorPolicyDraft.allowConditions.join("\n")} disabled={proseGateBusy}
+            onChange={(event) => setAuthorPolicyDraft(current => current ? {
+              ...current,
+              allowConditions: event.target.value.split(/\r?\n/u).map(item => item.trim()).filter(Boolean),
+            } : current)} />
+        </label>
+        <label>
+          <span>修订目标</span>
+          <textarea rows={2} value={authorPolicyDraft.revisionIntent} disabled={proseGateBusy}
+            onChange={(event) => setAuthorPolicyDraft(current => current ? { ...current, revisionIntent: event.target.value } : current)} />
+        </label>
+        <div className="prose-gate-editor-grid">
+          <label>
+            <span>启用阶段</span>
+            <select
+              value={authorPolicyDraft.status}
+              disabled={proseGateBusy}
+              onChange={(event) => setAuthorPolicyDraft(current => current ? {
+                ...current,
+                status: event.target.value === "active" ? "active" : event.target.value === "draft" ? "draft" : "trial",
+              } : current)}
+            >
+              <option value="draft">草案</option>
+              <option value="trial">试运行</option>
+              <option value="active">正式生效</option>
+            </select>
+          </label>
+          <label>
+            <span>修订 Skill（可选）</span>
+            <select
+              value={authorPolicyDraft.skillId ?? ""}
+              disabled={proseGateBusy}
+              onChange={(event) => setAuthorPolicyDraft(current => current ? {
+                ...current,
+                skillId: event.target.value || undefined,
+              } : current)}
+            >
+              <option value="">自动选择</option>
+              {(state.skills ?? []).map(skill => <option key={skill.id} value={skill.id}>{skill.name || skill.id}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className="prose-gate-editor-actions">
+          <button type="button" className="primary" disabled={proseGateBusy
+            || !authorPolicyDraft.title.trim()
+            || !authorPolicyDraft.semanticCriterion.trim()
+            || !authorPolicyDraft.evidenceRequirement.trim()
+            || !authorPolicyDraft.revisionIntent.trim()
+            || (authorPolicyDraft.enforcement === "block" && !authorPolicyDraft.allowConditions.length)}
+            onClick={() => void saveAuthorPolicy()}><Save size={15} />保存政策</button>
+          <button type="button" disabled={proseGateBusy} onClick={() => setAuthorPolicyDraft(null)}>取消</button>
+        </div>
+      </div>}
+    </section>
+    <div className="prose-gate-list author-policy-list">
+      {(state.authorPolicies ?? []).map(policy => <article className={`prose-gate-card${policy.status === "paused" || policy.status === "deprecated" ? " disabled" : ""}`} key={policy.id}>
+        <div className="prose-gate-card-head">
+          <div>
+            <strong>{policy.title}</strong>
+            <span className={`prose-gate-severity ${policy.enforcement === "block" ? "block" : "warn"}`}>
+              {policy.status === "trial" ? "试运行" : policy.status === "active" ? "生效" : policy.status === "draft" ? "草案" : "暂停"}
+            </span>
+          </div>
+          <select value={policy.status} disabled={proseGateBusy || readOnly}
+            aria-label={`${policy.title}状态`}
+            onChange={(event) => void setAuthorPolicyStatus(policy, event.target.value as AuthorPolicyStatus)}>
+            <option value="draft">草案</option>
+            <option value="trial">试运行</option>
+            <option value="active">生效</option>
+            <option value="paused">暂停</option>
+            <option value="deprecated">废弃</option>
+          </select>
+        </div>
+        <p>{policy.userIntent}</p>
+        <small>{policy.semanticCriterion}</small>
+        {policy.allowConditions.length > 0 && <small>放行：{policy.allowConditions.join("；")}</small>}
+        <div className="prose-gate-card-foot">
+          <time>v{policy.version ?? 1}{policy.skillId ? ` · ${policy.skillId}` : ""}{(() => {
+            const feedback = (state.authorPolicyFeedback ?? []).filter(item => item.policyId === policy.id);
+            return feedback.length ? ` · ${feedback.length} 条反馈` : "";
+          })()}</time>
+          <div>
+            <button className="icon-btn ghost" title="标记有效" aria-label="标记有效" disabled={proseGateBusy || readOnly}
+              onClick={() => void recordAuthorPolicyDisposition(policy, "accepted")}><ShieldCheck size={14} /></button>
+            <button className="icon-btn ghost" title="标记误报" aria-label="标记误报" disabled={proseGateBusy || readOnly}
+              onClick={() => void recordAuthorPolicyDisposition(policy, "false_positive")}><X size={14} /></button>
+            <button className="icon-btn ghost" title="删除政策" aria-label="删除政策" disabled={proseGateBusy || readOnly}
+              onClick={() => void deleteAuthorPolicy(policy)}><Trash2 size={14} /></button>
+          </div>
+        </div>
+      </article>)}
+    </div>
+    <div className="prose-gate-card-head legacy-gate-title">
+      <p className="prose-gate-intro">旧式复审规则</p>
+      <button type="button" className="ghost" disabled={proseGateBusy || readOnly}
+        onClick={() => void migrateLegacyProseGates()}><RefreshCw size={14} />迁移到政策</button>
+    </div>
     <div className="style-picker-actions">
       <button
         type="button"
@@ -6763,7 +7057,9 @@ function App() {
                 </div>
               </div>
             ) : managementView === "prose-gates" ? (
-              <div className="prose-gate-manager">
+              <>
+              {proseGatesSettingsContent}
+              {false && <div className="prose-gate-manager">
                 <p className="prose-gate-intro">
                   项目级语义复审会在正文出口运行。确定错误可设为阻断；偏好、倾向和可能误报的规则建议使用提醒。
                 </p>
@@ -6928,7 +7224,8 @@ function App() {
                     <div className="management-empty">暂无作者复审规则，可以从右上角新增。</div>
                   )}
                 </div>
-              </div>
+              </div>}
+              </>
             ) : (
               <div className="continuity-fact-manager">
                 <p className="prose-gate-intro">

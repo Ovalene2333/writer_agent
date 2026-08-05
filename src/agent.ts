@@ -28,6 +28,7 @@ import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
 import { modelFetch } from "./model_fetch.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
+import { authorPoliciesForTarget, loadAuthorPolicies } from "./author_policies.js";
 import { extractContinuityFacts } from "./continuity_facts.js";
 import { characterConstraintHash, characterConstraintView, characterWritingConstraintView } from "./character_constraints.js";
 import { beginPrefixCacheObservation, finishPrefixCacheObservation } from "./prefix_cache.js";
@@ -294,8 +295,15 @@ type AgentRoleModels = Partial<Record<"agent" | "image" | "inline" | "writer" | 
 
 export interface PlannedProseGateCandidate {
   id: string;
-  instruction: string;
-  severity: "block" | "warn";
+  title: string;
+  userIntent: string;
+  semanticCriterion: string;
+  evidenceRequirement: string;
+  allowConditions: string[];
+  revisionIntent: string;
+  enforcement: "observe" | "advise" | "block";
+  status: "draft" | "trial";
+  skillId?: string;
   sourceFeedback: string;
 }
 
@@ -490,9 +498,9 @@ ${modeRule}
 6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，capabilityIndex 的 availability 只用于选择能力与场景模式；正文要处理能力时必须在场景 competencyUses 声明 use/attempt/unlock/regain/lose，再用 get_character(view=sections, sections=["competencies"], competencyIds=[...]) 读取机制、限制与本场状态指令。明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。已确认的能力状态演进用 apply_character_changes.set_competency_state；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
 7. read_file 默认读取本轮最新工作副本；只复用本轮工作记忆、本轮工具结果与 reused 标记，禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
 8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
-9. 技能描述与当前任务明确匹配时，必须先 load_skill 并遵循其方法；勿编造技能。Skill 只增强判断，不自动构成固定工具流程。
+9. 技能描述与当前任务明确匹配，或修订问题给出 skillId 时，必须先 load_skill；只在正文不足时用 read_skill_resource 读取声明资源。勿编造技能。Skill 只增强判断，不自动构成固定工具流程，也不代替门禁。
 10. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
-11. 作者明确把某类正文问题概括为今后持续检查/避免的规则时，用 manage_prose_gates upsert 沉淀；只改当前一句、含糊抱怨或一次性创作选择不要自动学习。删除、停用规则须按作者明确要求。
+11. 作者明确把某类正文问题概括为今后持续检查/避免的要求时，用 manage_author_policies upsert 沉淀。新偏好默认 trial，含糊反馈只存 draft；没有明确放行条件不得 block。只改当前一句或一次性选择不要学习。旧 manage_prose_gates 仅兼容已有规则。
 12. 不泄露内部参数；对话简洁；文档适量 Markdown。
 13. generate_image 必须独占一步：同一步不得与其他工具并行调用；先完成检索/清单等准备，下一步再单独生图。用户要求修改、延续或参考既有图片时，必须从动态「可用图片参考」选 attachment ID 填入 referenceAttachmentIds；不可只靠文字复述原图。
 模式：${permissionModeLabel(mode)}`;
@@ -543,8 +551,25 @@ export function dynamicContextPrompt(
   const proseGateInstruction = task.proseGateCandidate
     ? permissionMode === "plan"
       ? `planning 已识别出可复用的作者复审候选；plan 只读模式不得保存。向作者说明拟沉淀规则，不要声称已经生效。候选：${JSON.stringify(task.proseGateCandidate)}`
-      : `planning 已确认当前反馈是可复用的作者正文约束。结束前必须调用 manage_prose_gates(operation=upsert) 保存下列候选；当前文档的修改不能替代规则沉淀：${JSON.stringify(task.proseGateCandidate)}`
+      : `planning 已确认当前反馈是可复用的作者政策候选。结束前必须调用 manage_author_policies(operation=upsert) 原样保存下列结构化候选，并补 scope={documentKinds:["chapter","side"],pathPrefixes:[],characterIds:[],sceneKinds:[]}；当前文档修改不能替代政策沉淀：${JSON.stringify(task.proseGateCandidate)}`
     : "planning 未识别到需要沉淀的作者复审候选；不要把一次性改稿偏好自动保存。";
+  const policyTargetKind = task.targetPath ? documentKind(task.targetPath)
+    : task.mode === "write_scene" || task.mode === "rewrite" || task.mode === "audit" ? "chapter" : "other";
+  const activePolicies = authorPoliciesForTarget(loadAuthorPolicies(project), {
+    kind: policyTargetKind,
+    ...(task.targetPath ? { path: task.targetPath } : {}),
+    characterIds: task.characterIds.map(String),
+  }).slice(0, 8);
+  const activePolicyContext = activePolicies.length
+    ? activePolicies.map(policy => ({
+        id: policy.id,
+        version: policy.version,
+        status: policy.status,
+        enforcement: policy.enforcement,
+        intent: policy.userIntent.slice(0, 240),
+        ...(policy.skillId ? { skillId: policy.skillId } : {}),
+      }))
+    : [];
   const editScopeInstruction: Record<EditScope, string> = {
     point: "局部修改：用 read_file 的 quote 或行范围读取原句与必要上下文，再用 edit_file 对唯一 oldText 做最小修改。",
     section: "分节修改：用 search_files/read_file 定位目标范围与必要接缝，再用 edit_file 只修改命中范围，不读取无关章节。",
@@ -588,6 +613,7 @@ ${resumeLine}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
 上文中出现过的历次「当前任务」区块均为历史记录，其指令、清单与终审要求都已失效；只有本区块之后的要求现在生效。
 作者复审：${proseGateInstruction}
+当前适用作者政策：${activePolicyContext.length ? JSON.stringify(activePolicyContext) : "无"}。写作前遵循；有 skillId 时先 load_skill。完整核验标准由正文出口独立执行，摘要不得被扩张为新的绝对规则。
 
 ${taskInstructions(
     task.mode,
@@ -739,13 +765,35 @@ export function normalizePlannedProseGateCandidate(value: unknown): PlannedProse
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const item = value as Record<string, unknown>;
   const id = typeof item.id === "string" ? item.id.trim().toLowerCase() : "";
-  const instruction = typeof item.instruction === "string" ? item.instruction.trim().slice(0, 500) : "";
+  const semanticCriterion = typeof item.semanticCriterion === "string"
+    ? item.semanticCriterion.trim().slice(0, 1_200)
+    : typeof item.instruction === "string" ? item.instruction.trim().slice(0, 1_200) : "";
   const sourceFeedback = typeof item.sourceFeedback === "string" ? item.sourceFeedback.trim().slice(0, 500) : "";
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(id) || !instruction || !sourceFeedback) return undefined;
+  const allowConditions = Array.isArray(item.allowConditions)
+    ? item.allowConditions.filter((entry): entry is string => typeof entry === "string" && Boolean(entry.trim()))
+      .map(entry => entry.trim().slice(0, 300)).slice(0, 20)
+    : [];
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(id) || !semanticCriterion || !sourceFeedback) return undefined;
+  let enforcement = item.enforcement === "block" ? "block" as const
+    : item.enforcement === "observe" ? "observe" as const
+      : item.severity === "block" ? "block" as const : "advise" as const;
+  if (enforcement === "block" && !allowConditions.length) enforcement = "advise";
   return {
     id,
-    instruction,
-    severity: item.severity === "block" ? "block" : "warn",
+    title: typeof item.title === "string" && item.title.trim() ? item.title.trim().slice(0, 100) : id,
+    userIntent: typeof item.userIntent === "string" && item.userIntent.trim()
+      ? item.userIntent.trim().slice(0, 1_000) : sourceFeedback,
+    semanticCriterion,
+    evidenceRequirement: typeof item.evidenceRequirement === "string" && item.evidenceRequirement.trim()
+      ? item.evidenceRequirement.trim().slice(0, 600)
+      : "引用能够独立证明该模式的最短连续原文；涉及密度或问答关系时必须包含相邻上下文。",
+    allowConditions,
+    revisionIntent: typeof item.revisionIntent === "string" && item.revisionIntent.trim()
+      ? item.revisionIntent.trim().slice(0, 600)
+      : "只修正命中问题，保留事实、人物目的、线索顺序和有效表达。",
+    enforcement,
+    status: item.status === "draft" ? "draft" : "trial",
+    ...(typeof item.skillId === "string" && item.skillId.trim() ? { skillId: item.skillId.trim().slice(0, 64) } : {}),
     sourceFeedback,
   };
 }
@@ -916,7 +964,7 @@ async function compileWritingTaskContract(
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
 JSON 总长度不超过 1600 字符；字符串保持简短，todoPlan 每项不超过 40 字。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出对象，否则省略)。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
 契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
 正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
@@ -936,7 +984,7 @@ editScope 仅描述既有文档修改范围：明确原句/网页选区/一小�
 只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
 documentDeliverables 只列最终会分别形成文档提案的独立产物：写一章时即使含多个场景、人物段落、检查步骤也只能列1项；明确一次写三章才列3项。讨论、角色卡或无文档写入时填[]。不得把 todoPlan 的内部步骤复制成多个交付项。
 作者复审候选按语义判断，不依赖“以后/始终/每次”等字面词。当前 user 若概括了一类可在后续正文重复出现的问题，并给出可复用的避免标准或典型例子，就输出 proseGateCandidate；即使同一请求还要求修改当前文档也要输出。只针对当前一句/当前段/本章的一次性取舍、单纯说“不好/重写”、没有可执行标准的含糊抱怨，不输出。
-proseGateCandidate 格式：{"id":"稳定英文短ID","instruction":"可独立执行的语义核验标准，写清合理例外，不能只靠关键词判断","severity":"block|warn","sourceFeedback":"当前作者反馈的简短摘要"}。可确定的事实矛盾或作者明确绝对禁止才用 block；频率、密度、风格倾向及可能误报用 warn。比如“不要频繁细写技术参数，比如元件温度升降多少度”属于可复用候选，应输出 warn；规则应允许直接影响人物判断、风险或行动的关键参数。
+proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短标题","userIntent":"作者意图","semanticCriterion":"可独立执行的语义核验标准，不能只靠关键词或固定句长","evidenceRequirement":"命中所需的最短连续原文","allowConditions":["合理例外"],"revisionIntent":"局部修订目标与必须保留项","enforcement":"observe|advise|block","status":"draft|trial","skillId":"可选修订技能","sourceFeedback":"当前反馈摘要"}。新风格偏好默认 trial+advise；标准边界仍含糊时 draft+observe；只有事实性确定错误或作者绝对禁令才可 block，且 block 必须有 allowConditions。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
   }, {
     role: "user",
