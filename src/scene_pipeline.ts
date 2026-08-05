@@ -1,4 +1,5 @@
 import { isCompetencyUseMode, type SceneCompetencyUse } from "./competency_state.js";
+import type { ProposalRevisionIssue } from "./proposal_retry.js";
 
 export type ChapterDraftMode = "create" | "replace" | "append";
 
@@ -64,6 +65,29 @@ export type ChapterSceneGuideRevision = {
   removedSceneIds: string[];
 };
 
+export type ChapterSceneReviewIssue = ProposalRevisionIssue & {
+  sceneId: string;
+};
+
+/**
+ * Durable semantic-review transaction for a scene draft. The baseline is the
+ * exact body that received the verdict; later reviews can therefore prove that
+ * old blockers were resolved and that a repair did not introduce new ones.
+ */
+export type ChapterSceneReviewCycle = {
+  schemaVersion: 1;
+  status: "blocked" | "repairing" | "resolved";
+  baselineVersion: number;
+  baselineContent: string;
+  baselineSourceHash: string;
+  unresolvedIssues: ChapterSceneReviewIssue[];
+  targetSceneIds: string[];
+  resolvedIssueIds: string[];
+  stillPresentIssueIds: string[];
+  newlyIntroducedIssueIds: string[];
+  repairAttempts: number;
+};
+
 export type ChapterSceneDraft = {
   deliverableId?: string;
   path: string;
@@ -76,7 +100,61 @@ export type ChapterSceneDraft = {
   completed: CompletedChapterScene[];
   version: number;
   inspectedVersion?: number;
+  reviewCycle?: ChapterSceneReviewCycle;
 };
+
+export function blockChapterSceneReview(input: {
+  draft: ChapterSceneDraft;
+  baselineContent: string;
+  baselineSourceHash: string;
+  issues: ChapterSceneReviewIssue[];
+  resolvedIssueIds?: string[];
+  stillPresentIssueIds?: string[];
+  newlyIntroducedIssueIds?: string[];
+}): ChapterSceneDraft {
+  const targetSceneIds = [...new Set(input.issues.map(issue => issue.sceneId))];
+  if (!input.issues.length || !targetSceneIds.length) {
+    throw new Error("结构终审阻断必须包含可定位的场景问题");
+  }
+  return {
+    ...input.draft,
+    reviewCycle: {
+      schemaVersion: 1,
+      status: "blocked",
+      baselineVersion: input.draft.version,
+      baselineContent: input.baselineContent,
+      baselineSourceHash: input.baselineSourceHash,
+      unresolvedIssues: input.issues,
+      targetSceneIds,
+      resolvedIssueIds: [...new Set([
+        ...(input.draft.reviewCycle?.resolvedIssueIds ?? []),
+        ...(input.resolvedIssueIds ?? []),
+      ])],
+      stillPresentIssueIds: input.stillPresentIssueIds ?? [],
+      newlyIntroducedIssueIds: input.newlyIntroducedIssueIds ?? [],
+      repairAttempts: input.draft.reviewCycle?.repairAttempts ?? 0,
+    },
+  };
+}
+
+export function resolveChapterSceneReview(
+  draft: ChapterSceneDraft,
+  resolvedIssueIds: string[],
+): ChapterSceneDraft {
+  if (!draft.reviewCycle) return draft;
+  return {
+    ...draft,
+    reviewCycle: {
+      ...draft.reviewCycle,
+      status: "resolved",
+      unresolvedIssues: [],
+      targetSceneIds: [],
+      resolvedIssueIds: [...new Set([...draft.reviewCycle.resolvedIssueIds, ...resolvedIssueIds])],
+      stillPresentIssueIds: [],
+      newlyIntroducedIssueIds: [],
+    },
+  };
+}
 
 export type BeginChapterSceneDraftInput = {
   deliverableId?: string;
@@ -145,6 +223,13 @@ export function writeChapterScene(
   }
 
   const revised = index < draft.completed.length;
+  if (draft.reviewCycle?.status === "blocked") {
+    if (!revised || !draft.reviewCycle.targetSceneIds.includes(sceneId)) {
+      throw new Error(
+        `终审修订锁仅允许先重写目标场景：${draft.reviewCycle.targetSceneIds.join("、")}`,
+      );
+    }
+  }
   const invalidatedSceneIds = revised ? draft.completed.slice(index + 1).map(scene => scene.sceneId) : [];
   const completed = draft.completed.slice(0, index);
   completed.push({ sceneId, content: trimmed, actualState });
@@ -154,6 +239,15 @@ export function writeChapterScene(
       completed,
       version: draft.version + 1,
       inspectedVersion: undefined,
+      ...(draft.reviewCycle && draft.reviewCycle.status !== "resolved"
+        ? {
+            reviewCycle: {
+              ...draft.reviewCycle,
+              status: "repairing" as const,
+              repairAttempts: draft.reviewCycle.repairAttempts + (draft.reviewCycle.status === "blocked" ? 1 : 0),
+            },
+          }
+        : {}),
     },
     invalidatedSceneIds,
     revised,
@@ -212,6 +306,9 @@ export function reviseChapterDraftStyle(
   editsValue: unknown,
 ): { draft: ChapterSceneDraft; editedSceneIds: string[]; preservedSceneIds: string[] } {
   if (!chapterSceneDraftComplete(draft)) throw new Error("场景链尚未完成，不能进行整章风格修订");
+  if (draft.reviewCycle && draft.reviewCycle.status !== "resolved") {
+    throw new Error("当前存在语义终审 blocker；须通过证据型场景重写解决，不能用局部风格替换绕过");
+  }
   if (!Array.isArray(editsValue) || editsValue.length < 1 || editsValue.length > 20) {
     throw new Error("风格修订须包含 1–20 条精确替换");
   }

@@ -1172,7 +1172,8 @@ test("actionable chapter review results release the inspect-only terminal lock",
     error: "六个句子需要精确替换",
   }), true);
   assert.equal(chapterReviewCompleted({ status: "structural_revision_required" }), true);
-  assert.equal(chapterReviewCompleted({ status: "inspection_required" }), true);
+  assert.equal(chapterReviewCompleted({ status: "inspection_required" }), false);
+  assert.equal(chapterReviewCompleted({ status: "final_review_unavailable" }), false);
   assert.equal(chapterReviewCompleted({ status: "proposal_failed", error: "提案暂时失败" }), true);
   assert.equal(chapterReviewCompleted({ status: "proposal_submitted" }), true);
   assert.equal(chapterReviewCompleted({ error: "缺少有效参数：summary" }), false);

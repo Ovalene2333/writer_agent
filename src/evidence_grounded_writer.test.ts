@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parseSceneActualState } from "./evidence_grounded_writer.js";
+import { assembleChapterSceneDraft, blockChapterSceneReview } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleCompileWritePack } from "./tools/write_pack.js";
@@ -114,6 +115,106 @@ test("delegated chapter scene omits prose and derives actual state after grounde
     assert.equal(context.chapterSceneDraft?.completed[0]?.actualState.knowledge[0], "林觉认出旧车票日期");
     assert.equal(context.narrativeEvidencePackets?.has("chapters/delegated.md#door"), true);
     assert.equal((result.candidateSampling as Record<string, unknown>)?.skipped, "evidence_grounded_preserves_fact_packet");
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review-blocked scene rewrite reuses the target scene baseline and its true previous state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-grounded-review-repair-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "证据复审");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("证据复审");
+    const first = "雨水顺着门框流到地面，林觉用鞋尖拨开一张湿透的票根，又抬头确认走廊里没有第二个人。他没有追，只把门留了一条缝，等里面的脚步声自己靠近。风从站台灌进来，门轴每隔几秒便轻轻响一下，他始终没有碰门把。";
+    const second = "值班员停在门后，没有回答车票从哪里来。他把登记簿压在肘下，只说昨夜没人经过这里，随后伸手去关那条门缝。林觉看见纸页边缘沾着与票根相同的蓝墨水。值班员察觉他的视线，把登记簿翻了个面，另一只手仍抵着门板。";
+    const revised = "值班员停在门后，把登记簿压在肘下。他没有说明车票的来处，只反问林觉为什么盯着纸页。门缝收窄以前，林觉看见页角沾着蓝墨水，却还不能据此确认两件东西出自同一人。他退开半步，改问昨夜的巡检时间，等对方自己决定是否翻开登记簿。";
+    const writerInputs: Array<{ previousTail?: string; existingText?: string; issueCount: number }> = [];
+    let writerCall = 0;
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      scenePipelineSettings: {
+        enabled: true, preferredMinScenes: 2, preferredMaxScenes: 2, maxScenes: 3,
+        notesMaxCharacters: 3_000, candidateCount: 1,
+      },
+      proseLength: { targetCharacters: 500, enforceMinimum: false },
+      reviewCharacterIds: [],
+      characterEvidenceReads: new Map(),
+      narrativeEvidencePackets: new Map(),
+      evidenceGroundedWriter: {
+        model: MODEL,
+        stateModel: MODEL,
+        run: async (_model, input) => {
+          writerInputs.push({
+            previousTail: input.previousTail,
+            existingText: input.existingText,
+            issueCount: input.reviewIssues?.length ?? 0,
+          });
+          const content = writerCall === 0 ? first : writerCall === 1 ? second : revised;
+          writerCall += 1;
+          return {
+            content,
+            requestCharacters: 100,
+            evidenceHash: input.evidence.hash,
+            evidenceReads: [],
+          };
+        },
+        extractState: async () => ({
+          actualState: {
+            situation: [`状态-${writerCall}`], physical: [], knowledge: [], relationships: [],
+            goals: [], openLoops: [], usedMotifs: [],
+          },
+          requestCharacters: 20,
+        }),
+      },
+    };
+    const baseArgs: Omit<ToolHandlerArgs, "input"> = { project, store, sessionId, emit: () => undefined, context };
+    handleBeginChapterDraft({
+      ...baseArgs,
+      input: {
+        path: "chapters/review-repair.md", mode: "create", heading: "复审", chapterGoal: "确认线索边界",
+        scenes: [
+          { id: "door", goal: "接近值班室", entryState: [], characterIntent: [], obstacle: "门内有人", turn: "留下门缝", outcome: "等到值班员", handoff: "值班员来到门后" },
+          { id: "ledger", goal: "判断票根来源", entryState: [], characterIntent: [], obstacle: "值班员回避", turn: "看见蓝墨水", outcome: "只得到待核线索" },
+        ],
+      },
+    });
+    await handleWriteChapterScene({
+      ...baseArgs,
+      input: { sceneId: "door", notes: "## 场景目标\n林觉在门外等待值班员。" },
+    });
+    await handleWriteChapterScene({
+      ...baseArgs,
+      input: { sceneId: "ledger", notes: "## 场景目标\n林觉观察登记簿，但不能确认票根来源。" },
+    });
+    const blockedDraft = context.chapterSceneDraft!;
+    const baseline = assembleChapterSceneDraft(blockedDraft);
+    context.chapterSceneDraft = blockChapterSceneReview({
+      draft: blockedDraft,
+      baselineContent: baseline,
+      baselineSourceHash: project.hash(baseline),
+      issues: [{
+        id: "issue:unsupported",
+        severity: "blocker",
+        kind: "unsupported_fact",
+        sceneId: "ledger",
+        evidence: ["相同的蓝墨水"],
+        problem: "颜色相同不足以确认同一来源",
+        action: "保留观察，撤回确认性判断",
+      }],
+    });
+
+    const result = JSON.parse(await handleWriteChapterScene({
+      ...baseArgs,
+      input: { sceneId: "ledger", notes: "## 场景目标\n保留蓝墨水观察，但不得确认票根来源。" },
+    })) as Record<string, unknown>;
+    assert.equal(result.status, "revised");
+    assert.match(writerInputs[2].previousTail ?? "", /门留了一条缝/u);
+    assert.equal(writerInputs[2].existingText, second);
+    assert.equal(writerInputs[2].issueCount, 1);
+    assert.equal(context.chapterSceneDraft?.reviewCycle?.status, "repairing");
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

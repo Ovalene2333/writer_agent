@@ -3,10 +3,12 @@ import { compileWritePack, formatWritePackForWriter } from "../write_pack.js";
 import {
   assembleChapterSceneDraft,
   beginChapterSceneDraft,
+  blockChapterSceneReview,
   chapterDriveSignals,
   chapterSceneDraftComplete,
   chapterSceneLedger,
   nextChapterScene,
+  resolveChapterSceneReview,
   reviseChapterDraftStyle,
   reviseChapterSceneGuide,
   sceneCardForTool,
@@ -15,6 +17,7 @@ import {
   type ChapterDraftMode,
   type ChapterSceneCard,
   type ChapterSceneDraft,
+  type ChapterSceneReviewIssue,
 } from "../scene_pipeline.js";
 import {
   judgeSceneCandidates,
@@ -57,7 +60,15 @@ import {
   sceneMannerismGateError,
   type ProseStyleIssue,
 } from "../prose_quality.js";
-import { ChapterReviewRequestError, reviewChapterDraft, type ChapterReviewResult } from "../chapter_review.js";
+import {
+  buildChapterReviewRevisionContext,
+  ChapterReviewRequestError,
+  constrainChapterRevisionReview,
+  reviewChapterDraft,
+  type ChapterReviewIssue,
+  type ChapterReviewResult,
+} from "../chapter_review.js";
+import { proposalIssueTransition, proposalRevisionIssueId } from "../proposal_retry.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
   CHAPTER_STYLE_REPAIR_BATCH_SIZE,
@@ -275,14 +286,24 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   if (!writePack.trim()) throw new Error("notes 未能编译为有效的故事内可写材料");
   const scene = draft.scenes.find(item => item.id === sceneId);
   if (!scene) throw new Error(`sceneId 不在当前 guide 中：${sceneId}`);
+  const sceneIndex = draft.scenes.indexOf(scene);
+  const existingScene = sceneIndex < draft.completed.length ? draft.completed[sceneIndex] : undefined;
+  const activeReviewCycle = draft.reviewCycle && draft.reviewCycle.status !== "resolved"
+    ? draft.reviewCycle
+    : undefined;
   let submitted: string;
   let actualState: unknown = input.actualState;
   let writerStyleRevision: EvidenceGroundedWriterResult["styleRevision"];
   if (typeof input.content === "string") {
+    if (activeReviewCycle && context.evidenceGroundedWriter) {
+      throw new Error(
+        "当前是终审后的结构修订；请省略 content 与 actualState，让证据型 Writer 依据原证据包、blocker 和原场景完成重写",
+      );
+    }
     submitted = requireString(input.content, "content");
   } else if (context.evidenceGroundedWriter) {
     const writer = context.evidenceGroundedWriter;
-    const previous = draft.completed.at(-1);
+    const previous = sceneIndex > 0 ? draft.completed[sceneIndex - 1] : undefined;
     const evidence = buildNarrativeEvidencePacket({
       project,
       store,
@@ -302,6 +323,7 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
       evidence,
       scene,
       ...(previous?.content ? { previousTail: previous.content.slice(-2_000) } : {}),
+      ...(existingScene?.content ? { existingText: existingScene.content } : {}),
       styleEvidence: [
         stableStyleGroundingPrompt(project, store),
         chapterStyleEvidence({ project, store, context }, draft),
@@ -311,6 +333,19 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
         priorChapterText,
         priorNotes: context.chapterStylePriorNotes,
       }),
+      ...(activeReviewCycle
+        ? {
+            reviewIssues: activeReviewCycle.unresolvedIssues
+              .filter(issue => issue.sceneId === sceneId)
+              .map(issue => ({
+                id: issue.id,
+                kind: issue.kind,
+                evidence: issue.evidence,
+                problem: issue.problem,
+                action: issue.action,
+              })),
+          }
+        : {}),
       targetCharacters: scene.targetCharacters,
     }, { project, context }, writer.signal);
     if (generated.usage) {
@@ -497,6 +532,15 @@ async function acceptChapterScene(args: {
     sceneVividness: formatVividnessSummary(sceneVividness),
     ...(styleFeedback.length ? { styleFeedback } : {}),
     ...(args.writerStyleRevision ? { groundedStyleRevision: args.writerStyleRevision } : {}),
+    ...(result.draft.reviewCycle && result.draft.reviewCycle.status !== "resolved"
+      ? {
+          reviewCycle: {
+            status: result.draft.reviewCycle.status,
+            repairAttempts: result.draft.reviewCycle.repairAttempts,
+            unresolvedIssueIds: result.draft.reviewCycle.unresolvedIssues.map(issue => issue.id),
+          },
+        }
+      : {}),
     ...(candidateReport ? { candidateSampling: candidateReport } : {}),
     ...(dedup.removed.length || sceneStyleRepair.edits.length
       ? {
@@ -984,6 +1028,40 @@ function rosterNames(store: ToolHandlerArgs["store"]): string[] {
   }
 }
 
+function chapterSceneReviewIssues(issues: readonly ChapterReviewIssue[]): ChapterSceneReviewIssue[] {
+  return issues.flatMap(issue => {
+    if (issue.severity !== "blocker" || !issue.sceneId || !issue.evidence.length) return [];
+    return [{
+      id: issue.origin === "unresolved_prior" && issue.priorIssueId
+        ? issue.priorIssueId
+        : proposalRevisionIssueId(issue),
+      severity: issue.severity,
+      kind: issue.kind,
+      sceneId: issue.sceneId,
+      evidence: issue.evidence,
+      ...(issue.oldText ? { oldText: issue.oldText } : {}),
+      problem: issue.problem,
+      action: issue.action,
+      ...(issue.priorIssueId ? { priorIssueId: issue.priorIssueId } : {}),
+      ...(issue.origin ? { origin: issue.origin } : {}),
+    }];
+  });
+}
+
+function targetScenesForReview(draft: ChapterSceneDraft, targetIds: ReadonlySet<string>) {
+  return draft.completed.flatMap((completed, index) => {
+    if (!targetIds.has(completed.sceneId)) return [];
+    return [{
+      sceneId: completed.sceneId,
+      card: draft.scenes[index],
+      content: completed.content,
+      actualState: completed.actualState,
+      ...(index > 0 ? { previousTail: draft.completed[index - 1].content.slice(-600) } : {}),
+      ...(index + 1 < draft.completed.length ? { nextHead: draft.completed[index + 1].content.slice(0, 600) } : {}),
+    }];
+  });
+}
+
 async function submitPassedChapterReview(
   args: ToolHandlerArgs,
   values: {
@@ -1084,6 +1162,29 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       text: `\n\n草稿预览（终审仍在继续）：${draft.path}\n\n${content}\n\n`,
     });
   }
+  if (draft.reviewCycle?.status === "blocked" && draft.reviewCycle.baselineVersion === draft.version) {
+    const targetIds = new Set(draft.reviewCycle.targetSceneIds);
+    return JSON.stringify({
+      status: "structural_revision_required",
+      code: "CHAPTER_REVIEW_BLOCKED",
+      path: draft.path,
+      contentCharacters: content.length,
+      sceneCount: draft.completed.length,
+      chapterReview: {
+        verdict: "revise",
+        chapterChange: "正文与上一轮被阻断的草稿相同",
+        reviewNotes: "未检测到可闭合既有 blocker 的场景修订；复用上一轮终审结论。",
+        issues: draft.reviewCycle.unresolvedIssues,
+      },
+      targetScenes: targetScenesForReview(draft, targetIds),
+      reviewCycle: {
+        status: draft.reviewCycle.status,
+        repairAttempts: draft.reviewCycle.repairAttempts,
+        unresolvedIssueIds: draft.reviewCycle.unresolvedIssues.map(issue => issue.id),
+      },
+      message: "草稿版本未变化，未重复调用终审。选择 targetScenes 中的目标场景，以同一 sceneId 调用 write_chapter_scene 并省略 content/actualState；运行时将复用证据型 Writer。",
+    });
+  }
   const beforeContent = project.documentExists(draft.path) ? project.read(draft.path) : "";
   let dialogueFormatError = dialogueFormatGateError(content);
   if (dialogueFormatError) {
@@ -1158,7 +1259,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       complete: true,
       invalidatedSceneIds: [],
       message: metrics.issues.some(issue => issue.code === "rhythm_flat")
-        ? "节奏/碎句：按 error 中的验收线合并碎句、恢复双音节用词并补 35+ 字绵延句（可用 revise_chapter_draft_style 分批替换碎句样例，或在仍未写完时重写受影响场），达标后重新 inspect。"
+        ? "节奏/碎句：结合场景语义复核连续碎句是否真正承担命令、停顿或动作落点；只合并失去自然承接的观察与因果，不按均长或长句比例改稿。"
         : "复读句与逐字回收句用一次 revise_chapter_draft_style 精确替换修完（复读：把「S。S。」替换为单句；回收：只改写命中句，不重写场景），然后重新 inspect 确认计量通过。",
     });
   }
@@ -1216,8 +1317,18 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       characterScope: args.characterScope,
       baseContext: reviewer.context,
     });
+    const priorReviewCycle = draft.reviewCycle?.status === "repairing" ? draft.reviewCycle : undefined;
+    const revisionReview = priorReviewCycle
+      ? buildChapterReviewRevisionContext({
+          previousContent: priorReviewCycle.baselineContent,
+          content,
+          previousSourceHash: priorReviewCycle.baselineSourceHash,
+          priorBlockers: priorReviewCycle.unresolvedIssues,
+        })
+      : undefined;
     const reviewRequestCharacters = content.length + JSON.stringify(ledger).length
-      + draft.chapterGoal.length + reviewContext.length + 1_200;
+      + draft.chapterGoal.length + reviewContext.length
+      + (revisionReview ? JSON.stringify(revisionReview).length : 0) + 1_200;
     for (const reviewModel of reviewModels) {
       try {
         const reviewed = await runReview(reviewModel, {
@@ -1225,6 +1336,10 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           content,
           scenes: ledger,
           context: reviewContext,
+          ...(revisionReview ? {
+            revisionReview,
+            revisionBaselineContent: priorReviewCycle!.baselineContent,
+          } : {}),
           proseSignals: {
             stats: metrics.stats,
             warnings: styleWarnings,
@@ -1243,25 +1358,36 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             requestComponents: isolatedRequestComponent("隔离整章终审请求", reviewRequestCharacters, "chapter_review"),
           });
         }
-        if (reviewed.review.verdict === "revise") {
-          const targetIds = new Set(reviewed.review.issues
-            .filter(issue => issue.severity === "blocker" && issue.sceneId)
-            .map(issue => issue.sceneId!));
+        const chapterReview = revisionReview
+          ? constrainChapterRevisionReview(
+              reviewed.review,
+              revisionReview,
+              priorReviewCycle!.baselineContent,
+              content,
+            )
+          : reviewed.review;
+        if (chapterReview.verdict === "revise") {
+          const cycleIssues = chapterSceneReviewIssues(chapterReview.issues);
+          const transition = proposalIssueTransition(
+            priorReviewCycle?.unresolvedIssues ?? [],
+            cycleIssues,
+          );
+          draft = blockChapterSceneReview({
+            draft,
+            baselineContent: content,
+            baselineSourceHash: project.hash(content),
+            issues: cycleIssues,
+            resolvedIssueIds: transition.resolvedIssueIds,
+            stillPresentIssueIds: transition.stillPresentIssueIds,
+            newlyIntroducedIssueIds: transition.newlyIntroducedIssueIds,
+          });
+          context.chapterSceneDraft = draft;
+          const targetIds = new Set(draft.reviewCycle!.targetSceneIds);
           saveDraftCheckpoint(args, "review_blocked", draft, {
-            unresolved: reviewed.review.issues.filter(issue => issue.severity === "blocker").map(issue => issue.problem),
+            unresolved: cycleIssues.map(issue => issue.problem),
             reviewRepair: { mode: "structural", targetSceneIds: [...targetIds] },
           });
-          const targetScenes = draft.completed.flatMap((completed, index) => {
-            if (!targetIds.has(completed.sceneId)) return [];
-            return [{
-              sceneId: completed.sceneId,
-              card: draft.scenes[index],
-              content: completed.content,
-              actualState: completed.actualState,
-              ...(index > 0 ? { previousTail: draft.completed[index - 1].content.slice(-600) } : {}),
-              ...(index + 1 < draft.completed.length ? { nextHead: draft.completed[index + 1].content.slice(0, 600) } : {}),
-            }];
-          });
+          const targetScenes = targetScenesForReview(draft, targetIds);
           return JSON.stringify({
             status: "structural_revision_required",
             code: "CHAPTER_REVIEW_BLOCKED",
@@ -1279,10 +1405,24 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             proseDialogue: formatDialogueSummary(dialogue.stats),
             ...(dialogueWarnings.length ? { dialogueWarnings } : {}),
             ledger,
-            chapterReview: reviewed.review,
+            chapterReview,
             targetScenes,
-            message: "终审发现有证据的结构/连续性问题。只重写 targetScenes 中 blocker 对应场景；保留无关事实与声线，并以新 actualState 为准续写被失效的后续场景。禁止复述审阅报告或全文重写。",
+            reviewCycle: {
+              status: draft.reviewCycle!.status,
+              repairAttempts: draft.reviewCycle!.repairAttempts,
+              resolvedIssueIds: draft.reviewCycle!.resolvedIssueIds,
+              stillPresentIssueIds: draft.reviewCycle!.stillPresentIssueIds,
+              newlyIntroducedIssueIds: draft.reviewCycle!.newlyIntroducedIssueIds,
+            },
+            message: "终审发现有证据的结构/连续性问题。由 Agent 选择 targetScenes 中要先处理的场景，并以同一 sceneId 调用 write_chapter_scene，省略 content/actualState；运行时会把原场景、blocker 与原证据包交给证据型 Writer。新 actualState 会使依赖它的后续场景失效并要求续写。",
           });
+        }
+        if (priorReviewCycle) {
+          draft = resolveChapterSceneReview(
+            draft,
+            priorReviewCycle.unresolvedIssues.map(issue => issue.id),
+          );
+          context.chapterSceneDraft = draft;
         }
         return submitPassedChapterReview(args, {
           draft,
@@ -1295,7 +1435,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           aiTells,
           aiTellWarnings,
           ledger,
-          chapterReview: reviewed.review,
+          chapterReview,
         });
       } catch (error) {
         if (error instanceof ChapterReviewRequestError && error.usage) {
@@ -1309,60 +1449,25 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     }
     reviewFailure = { attempts: reviewModels.length, errors: reviewErrors };
   }
-  draft.inspectedVersion = draft.version;
+  const parseOnly = Boolean(reviewFailure?.errors.length)
+    && reviewFailure!.errors.every(error =>
+      /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(error),
+    );
   return JSON.stringify({
-    status: "inspection_required",
+    status: "final_review_unavailable",
+    code: parseOnly ? "CHAPTER_REVIEW_INVALID" : "CHAPTER_REVIEW_UNAVAILABLE",
+    failureKind: parseOnly ? "invalid_output" : "dependency",
+    retryable: !parseOnly,
     reviewCompleted: false,
-    reviewMode: "agent_fallback",
+    proposalCreated: false,
     ...(reviewFailure ? { reviewFailure } : {}),
     path: draft.path,
     chapterGoal: draft.chapterGoal,
     contentCharacters: content.length,
     sceneCount: draft.completed.length,
-    proseStyle: "passed",
-    proseMetrics: metrics.stats,
-    ...(styleWarnings.length ? { styleWarnings } : {}),
-    proseVividness: formatVividnessSummary(vividness.stats),
-    ...(vividnessWarnings.length ? { vividnessWarnings } : {}),
-    proseAiTells: formatAiTellSummary(aiTells.stats),
-    ...(aiTellWarnings.length ? { aiTellWarnings } : {}),
-    proseDrive: drive,
-    proseDialogue: formatDialogueSummary(dialogue.stats),
-    ...(dialogueWarnings.length ? { dialogueWarnings } : {}),
-    ledger,
-    ...(reviewFailure ? { factReviewContext: buildFactualChapterReviewContext({
-      project,
-      store: args.store,
-      context,
-      path: draft.path,
-      characterScope: args.characterScope,
-      baseContext: context.chapterReviewer?.context,
-    }) } : {}),
-    // Only the compatibility fallback appends the full chapter to the Agent loop.
-    content,
-    reviewChecklist: [
-      "逐个角色核对其对白、内心与行动依据：该信息是否来自亲历、被告知、可见线索推断或公共知识；客观真相不自动等于角色所知",
-      "传闻、误解与 beliefs 是否被误写成确认事实；关键解题信息是否无来源突然出现",
-      "时间、地点、伤势、物品、身份、关系、经历、能力解锁和世界规则是否与事实证据冲突",
-      "相邻场景是否因果承接，而非只按时间并列",
-      "各场转折与结果是否承担不同功能",
-      "人物关系、信息、目标或处境是否逐场发生变化",
-      "是否重复使用相同意象、参数展示、沉默或总结式章尾",
-      "章节开头到结尾能否用一句话说明总变化",
-      "有没有换掉人名地点仍能套进多数故事的句子；现场是否只被叙述者报告、没有被人物看见听见摸到",
-      "主要人物的措辞、信息取舍和说话目的是否长期无法区分；不要靠固定口癖、句长或强行回避制造差异",
-      "叙述者或人物有没有把本章主题、教训或成长直接说出口（章尾与场尾尤其要查）",
-      "人物立场或阻力是否无新依据地改变，抹掉了正文已经建立的矛盾；圆满、理解与可挽回结果本身不判错",
-      "结合 chapterGoal 判断章节承诺的变化是否成立；静场、铺垫、过渡与收束不强制主动阻力、不可逆代价或新悬问（proseDrive 仅作定位参考）",
-      "本章需要谈判、冲突、试探或隐瞒时，对白是否回避了应有的利益差异；直接回答、解释、配合和日常交流本身有效（proseDialogue 仅作定位参考）",
-    ],
-    message: (
-      reviewFailure?.errors.every(err => /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(err))
-        ? "隔离终审已响应但结论无法解析或缺少可定位证据，已回退到主 Agent 通读（非服务故障）。"
-        : "隔离终审不可用，已回退到主 Agent 通读："
-    )
-      + `content 为组装后的整章正文。通读后禁止先输出审阅说明；发现结构问题就直接重写目标 sceneId，确认无误则调用 write_file(${JSON.stringify({ path: draft.path })})，省略 content 提交已终审的当前工作副本。`
-      + "若有 styleWarnings，只处理有正文证据且明显影响理解或项目声线的少量问题；统计提示不能成为改稿理由，也不要为凑指标全文重写。",
+    message: parseOnly
+      ? "隔离终审已响应，但输出无法形成带场景和逐字证据的有效结论。草稿与审阅事务已保留，未标记通过；可重试终审，不要改写正文来猜测审核意见。"
+      : "隔离终审及回退模型均不可用。草稿与审阅事务已保留，未标记通过；依赖恢复后重新 inspect，不能由主 Agent 自审后绕过终审。",
   });
 }
 

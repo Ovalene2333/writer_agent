@@ -7,9 +7,9 @@
  * proposal so the author sees it in the review dock before pressing Accept.
  * Building it in one place keeps the two paths from drifting.
  *
- * Advisory only. Nothing here blocks: metric *errors* still block earlier, inside
- * `chapterMetricsBlockError`; by the time a proposal exists they are already gone,
- * so what lands here is the residual checklist plus two scores.
+ * Advisory only. Nothing here blocks. Deterministic defects such as verbatim
+ * reuse may have blocked earlier; rhythm and other shape signals remain here for
+ * semantic review instead of becoming numeric rewrite targets.
  */
 
 import { formatAiTellSummary } from "./ai_tells.js";

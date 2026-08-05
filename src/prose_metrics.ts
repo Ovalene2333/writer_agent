@@ -76,19 +76,6 @@ export const LONG_SENTENCE_MIN_RATIO = 0.03;
 /** Single 2-char paragraph-opening prefix share (non-dialogue paragraphs) before warning. */
 export const OPENING_MONOTONY_RATIO = 0.35;
 
-/**
- * 节奏修订验收线：首次可不过，但一次修订后必须达标再提交。
- * 门禁文案与复检共用此阈值，避免 Agent 猜标准。
- */
-export const RHYTHM_REPAIR_TARGETS = {
-  meanSentenceLengthMin: 16,
-  shortSentenceRatioMax: 0.30,
-  longSentenceRatioMin: 0.08,
-  fragmentRunsMax: 1,
-  /** ≤2 字的电报句占比（刻意缩词/单字成句）。 */
-  microSentenceRatioMax: 0.06,
-} as const;
-
 const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const SAMENESS_FRAME = /和[^，。！？；、\n]{1,12}一样/gu;
 const NUMERIC_READOUT =
@@ -199,10 +186,12 @@ export function analyzeChapterProseMetrics(
     );
   if (staccato) {
     const examples = collectShortSentenceExamples(body, 8);
-    // 硬拦：首次可被打回，但必须带着可验收指标改；避免「尚可」放行后碎句章入库。
+    // Shape metrics locate a semantic rhythm risk; they do not prove that a
+    // command, interruption or compressed scene is wrong. The Writer/reviewer
+    // decides from prose context instead of rewriting toward numeric quotas.
     issues.push({
       code: "rhythm_flat",
-      severity: "error",
+      severity: "warning",
       message: formatRhythmFlatMessage(rhythm),
       examples,
     });
@@ -237,35 +226,15 @@ export function analyzeChapterProseMetrics(
   };
 }
 
-/** Blocking message for metric errors only (including chapter-wide dash overload). */
+/** Blocking message for deterministic metric errors only. Rhythm is advisory. */
 export function chapterMetricsBlockError(metrics: ChapterProseMetrics): string | undefined {
   const errors = metrics.issues.filter(issue => issue.severity === "error");
   if (!errors.length) return undefined;
-  const rhythmError = errors.find(issue => issue.code === "rhythm_flat");
-  const other = errors.filter(issue => issue.code !== "rhythm_flat");
-  const parts = other.map(issue => {
+  const parts = errors.map(issue => {
     const examples = issue.examples.length ? `：${issue.examples.map(item => `「${clip(item, 40)}」`).join("、")}` : "";
     return `${issue.message}${examples}`;
   });
-  const chunks: string[] = [];
-  if (rhythmError) {
-    chunks.push(formatRhythmRepairBlock(metrics.stats, rhythmError.examples));
-  }
-  if (parts.length) {
-    chunks.push(`章级复用计量硬拦截（${parts.length} 类）：${parts.join("；")}`);
-  }
-  return chunks.join("\n");
-}
-
-/**
- * 直接 propose_document 路径的节奏门禁诊断（与场景链 inspect 共用阈值）。
- * 文案自带验收线 + 命中碎句；首轮由调用方 grace 放行，二轮硬拦。
- */
-export function chapterRhythmGateError(text: string, options?: { phase?: "first" | "hard" }): string | undefined {
-  const metrics = analyzeChapterProseMetrics(text);
-  const rhythm = metrics.issues.find(issue => issue.code === "rhythm_flat" && issue.severity === "error");
-  if (!rhythm) return undefined;
-  return formatRhythmRepairBlock(metrics.stats, rhythm.examples, options?.phase ?? "hard");
+  return `章级确定性计量硬拦截（${parts.length} 类）：${parts.join("；")}`;
 }
 
 function formatRhythmFlatMessage(rhythm: {
@@ -276,39 +245,6 @@ function formatRhythmFlatMessage(rhythm: {
   microSentenceRatio: number;
 }): string {
   return `叙述句均长 ${rhythm.meanSentenceLength} 字、≥30 字长句仅 ${Math.round(rhythm.longSentenceRatio * 100)}%、≤6 字碎句 ${Math.round(rhythm.shortSentenceRatio * 100)}%、≤2 字电报句 ${Math.round(rhythm.microSentenceRatio * 100)}%、4 连发碎句串 ${rhythm.fragmentRuns} 处：全篇短促/缩词节拍。`;
-}
-
-function formatRhythmRepairBlock(
-  stats: Pick<ChapterRhythmStats, "meanSentenceLength" | "shortSentenceRatio" | "longSentenceRatio" | "fragmentRuns"> & { microSentenceRatio?: number },
-  examples: string[],
-  phase: "first" | "hard" = "hard",
-): string {
-  const t = RHYTHM_REPAIR_TARGETS;
-  const micro = stats.microSentenceRatio ?? 0;
-  const exampleLine = examples.length
-    ? `必须处理的碎句样例（并入邻句或扩写，禁止原样保留）：${examples.map(item => `「${clip(item, 28)}」`).join("、")}`
-    : "必须打散全章 4 连发碎句串，并把过密的 ≤6 字叙述句并入邻句。";
-  const head = phase === "first"
-    ? `首轮句式待抛光（情节/场面可先保留）：${formatRhythmFlatMessage({
-      meanSentenceLength: stats.meanSentenceLength,
-      longSentenceRatio: stats.longSentenceRatio,
-      shortSentenceRatio: stats.shortSentenceRatio,
-      fragmentRuns: stats.fragmentRuns,
-      microSentenceRatio: micro,
-    })}`
-    : `节奏硬拦截（碎句/缩词）：${formatRhythmFlatMessage({
-      meanSentenceLength: stats.meanSentenceLength,
-      longSentenceRatio: stats.longSentenceRatio,
-      shortSentenceRatio: stats.shortSentenceRatio,
-      fragmentRuns: stats.fragmentRuns,
-      microSentenceRatio: micro,
-    })}`;
-  return [
-    head,
-    `一次修订验收（须全部达标后再 propose，勿只加一两句长句应付）：均长≥${t.meanSentenceLengthMin} 字；≤6 字碎句≤${Math.round(t.shortSentenceRatioMax * 100)}%；≥30 字长句≥${Math.round(t.longSentenceRatioMin * 100)}%；4 连发碎句串≤${t.fragmentRunsMax}；≤2 字电报句≤${Math.round(t.microSentenceRatioMax * 100)}%。`,
-    "改法：①合并相邻碎句为完整自然句；②静场/情感段每 300 字至少一个 35+ 字绵延句；③恢复常用双音节（感觉/恢复/身体/冷意等），禁止为利落压成单字；④对白可短于叙述，但不得整章压成几个字的应答；叙述勿通篇电报体。",
-    exampleLine,
-  ].join("\n");
 }
 
 function collectShortSentenceExamples(text: string, limit: number): string[] {

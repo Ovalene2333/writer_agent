@@ -14,7 +14,9 @@ import {
 import {
   assembleChapterSceneDraft,
   beginChapterSceneDraft,
+  blockChapterSceneReview,
   chapterSceneDraftComplete,
+  resolveChapterSceneReview,
   reviseChapterDraftStyle,
   reviseChapterSceneGuide,
   writeChapterScene,
@@ -531,7 +533,7 @@ test("direct proposal repairs sparse hard style blockers before creating the pro
   }
 });
 
-test("rhythm-grace draft defers the cold semantic review until the polished submission", async () => {
+test("rhythm risk goes through semantic review instead of a numeric repair gate", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-rhythm-review-"));
   let store: WriterStore | undefined;
   try {
@@ -565,8 +567,9 @@ test("rhythm-grace draft defers the cold semantic review until the polished subm
       args, "chapters/第一章.md", shortDraft, "短句节奏草稿", undefined,
     )) as Record<string, unknown>;
 
-    assert.equal(result.code, "RHYTHM_POLISH_REQUIRED");
-    assert.equal(reviewCalls, 0);
+    assert.equal(result.status, "pending");
+    assert.equal(result.code, undefined);
+    assert.equal(reviewCalls, 1);
     assert.equal(store.proposals().length, 1);
   } finally {
     store?.close();
@@ -619,6 +622,50 @@ test("revising an earlier scene invalidates dependent later scenes", () => {
   assert.deepEqual(revised.invalidatedSceneIds, ["alarm"]);
   assert.equal(revised.draft.completed.length, 1);
   assert.equal(revised.draft.inspectedVersion, undefined);
+});
+
+test("semantic review cycle locks repair scope and tracks the repaired draft version", () => {
+  let draft = beginChapterSceneDraft({
+    path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "关系改变",
+    baseContent: "", baseHash: "empty", scenes: sceneChain,
+  });
+  draft = writeChapterScene(draft, "arrival", "旧版本场景。".repeat(20), actualState("旧变化")).draft;
+  draft = writeChapterScene(draft, "alarm", "后续场景。".repeat(20), actualState("后续变化")).draft;
+  const baseline = assembleChapterSceneDraft(draft);
+  draft = blockChapterSceneReview({
+    draft,
+    baselineContent: baseline,
+    baselineSourceHash: "reviewed-v2",
+    issues: [{
+      id: "issue:knowledge",
+      severity: "blocker",
+      kind: "knowledge_leak",
+      sceneId: "arrival",
+      evidence: ["旧版本场景"],
+      problem: "人物没有获知路径",
+      action: "删除无来源断言",
+    }],
+  });
+
+  assert.throws(
+    () => writeChapterScene(draft, "alarm", "绕过目标场景。".repeat(20), actualState("绕过")),
+    /目标场景.*arrival/u,
+  );
+  const repaired = writeChapterScene(
+    draft,
+    "arrival",
+    "修订后的场景。".repeat(20),
+    actualState("修订变化"),
+  );
+  assert.equal(repaired.draft.reviewCycle?.status, "repairing");
+  assert.equal(repaired.draft.reviewCycle?.repairAttempts, 1);
+  assert.deepEqual(repaired.invalidatedSceneIds, ["alarm"]);
+  assert.equal(repaired.draft.reviewCycle?.baselineContent, baseline);
+
+  const resolved = resolveChapterSceneReview(repaired.draft, ["issue:knowledge"]);
+  assert.equal(resolved.reviewCycle?.status, "resolved");
+  assert.deepEqual(resolved.reviewCycle?.unresolvedIssues, []);
+  assert.deepEqual(resolved.reviewCycle?.resolvedIssueIds, ["issue:knowledge"]);
 });
 
 test("prose-only chapter draft edits preserve later scenes and state", () => {

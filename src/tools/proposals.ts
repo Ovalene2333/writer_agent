@@ -28,7 +28,6 @@ import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } fro
 import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "../agent_runtime.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
 import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
-import { chapterRhythmGateError } from "../prose_metrics.js";
 import {
   buildChapterReviewRevisionContext,
   ChapterReviewRequestError,
@@ -721,26 +720,7 @@ export async function submitFullDocumentProposal(
       throw new ToolRevisionRequiredError("DIALOGUE_FORMAT_REVISION_REQUIRED", dialogueFormatError);
     }
   }
-  // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
-  let rhythmRevisionRequired: string | undefined;
-  if (isScenePipelineDocument(path) && !proseStyleApproved) {
-    context.rhythmGracePaths ??= new Set();
-    const usedGrace = context.rhythmGracePaths.has(path);
-    const rhythmError = chapterRhythmGateError(proposedBody, { phase: usedGrace ? "hard" : "first" });
-    if (rhythmError) {
-      if (usedGrace) {
-        throw new ToolRevisionRequiredError("RHYTHM_REVISION_REQUIRED", rhythmError);
-      }
-      context.rhythmGracePaths.add(path);
-      rhythmRevisionRequired = rhythmError;
-    } else {
-      context.rhythmGracePaths.delete(path);
-    }
-  }
-  // A rhythm-grace draft is guaranteed to change before delivery. Reviewing it
-  // now creates a cold full-chapter call and stale blockers that the polished
-  // draft must pay to review again. Semantic review starts only after rhythm passes.
-  if (!rhythmRevisionRequired && !semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
+  if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
     const blocked = await reviewDirectNarrativeProposal(args, path, proposedBody, summary);
     if (blocked) return blocked;
   }
@@ -763,7 +743,7 @@ export async function submitFullDocumentProposal(
       preparedCharacterChanges.changes,
       qualityReport,
       context.sourceMessageId,
-      !rhythmRevisionRequired,
+      true,
       expectedBaseHash,
     );
   } catch (error) {
@@ -771,14 +751,7 @@ export async function submitFullDocumentProposal(
     return baseChangedResult();
   }
   emit({ type: "proposal", proposal });
-  // 首轮节奏未达标：不自动落盘，等句式修订提案通过后再写。
-  const accept = rhythmRevisionRequired
-    ? {
-        proposalId: proposal.id,
-        status: proposal.status,
-        message: "首轮已接收情节/场面草稿（节奏待修订）；提案待审批，请按验收线做一次句式修订后重新提交",
-      }
-    : await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context);
+  const accept = await maybeAutoAcceptProposal(store, proposal, context.permissionMode, emit, context);
   return JSON.stringify({
     ...accept,
     submissionKind: existed ? "new_version" : "new_document",
@@ -788,15 +761,6 @@ export async function submitFullDocumentProposal(
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(styleAutoRepair ? { styleAutoRepaired: styleAutoRepair } : {}),
     ...(strippedMeta.length ? { metaSanitized: [...new Set(strippedMeta)] } : {}),
-    ...(rhythmRevisionRequired
-      ? {
-          rhythmRevisionRequired: true,
-          code: "RHYTHM_POLISH_REQUIRED",
-          path,
-          rhythmGate: rhythmRevisionRequired,
-          message: "首轮创作已抓情节与场面；句式节奏/缩词未达标，须按 rhythmGate 验收线用 edit_file 修订当前工作副本。",
-        }
-      : {}),
   });
 }
 
@@ -1072,12 +1036,6 @@ export async function handleProposeDocumentPatch({ input, project, store, sessio
     sourceHash: draftSourceHash,
   };
   await gateProseStyle(beforeContent, content, context, path, draftSourceHash);
-  // 首轮 grace 后若用 patch 抛光：同一 path 必须过硬节奏门禁。
-  if (isScenePipelineDocument(path) && context.rhythmGracePaths?.has(path)) {
-    const rhythmError = chapterRhythmGateError(content);
-    if (rhythmError) throw new ToolRevisionRequiredError("RHYTHM_REVISION_REQUIRED", rhythmError);
-    context.rhythmGracePaths.delete(path);
-  }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(input.characterChanges, context, characterScope);
   const proposal = store.createProposal(
     sessionId, path, content, requireString(input.summary, "summary"),

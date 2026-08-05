@@ -10,7 +10,12 @@ import type {
   StepUsage,
 } from "./types.js";
 import { createHash } from "node:crypto";
-import { chapterSceneDraftComplete, nextChapterScene, type ChapterSceneDraft } from "./scene_pipeline.js";
+import {
+  chapterSceneDraftComplete,
+  nextChapterScene,
+  type ChapterSceneDraft,
+  type ChapterSceneReviewCycle,
+} from "./scene_pipeline.js";
 import { documentSpans } from "./document_spans.js";
 import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -2483,7 +2488,8 @@ export function proposalRevisionConvergePrompt(
       : typeof result.rhythmGate === "string"
         ? result.rhythmGate
         : "";
-  // 节奏驳回文案含验收线与样例，需多留一些字节，否则 Agent 只看见半句「碎句」。
+  // Legacy rhythm notices may contain useful locators, but never turn their
+  // numeric thresholds into prose instructions.
   const messageCap = /节奏硬拦截|碎句|缩词|均长|电报|RHYTHM_POLISH/.test(rawMessage + code) ? 900 : 360;
   const message = rawMessage.replace(/\s+/g, " ").slice(0, messageCap);
   const path = typeof result.path === "string" ? result.path : "";
@@ -2499,10 +2505,10 @@ export function proposalRevisionConvergePrompt(
     : "";
   if (firstRoundPolish) {
     return [
-      `首轮情节/场面草稿已接收（${path || "当前文档"}），句式节奏尚未达标——这是预期中的第二步，不是失败。`,
-      message ? `验收与样例：${message}` : "",
+      `收到旧式节奏提示（${path || "当前文档"}）；它只定位需要通读的段落，不构成数字验收线。`,
+      message ? `定位信号：${message}` : "",
       blockerPacket,
-      "请在保留情节、场面与人物选择的前提下，按验收线通读合并碎句、恢复双音节用词并补静场绵延句，然后用 edit_file 修改当前工作副本；禁止重读已读设定、禁止另起大纲或重写剧情。",
+      "结合人物处境和句间因果判断是否需要修改；只处理语义上失去承接的碎句，不补配额长句。完成必要的局部修改后用 edit_file 提交当前工作副本。",
     ].filter(Boolean).join("\n");
   }
   return [
@@ -2511,8 +2517,8 @@ export function proposalRevisionConvergePrompt(
     blockerPacket,
     rhythmBlock
       ? (hardLimit
-        ? "节奏最后一轮：按原因里的验收线通读全章合并碎句、恢复双音节用词并补绵延句后重新提交一次；禁止只改样例三句或另起大纲。若仍不达标，manage_todos 标明阻塞或 ask_user。"
-        : "节奏修订：不要只改命中样例三句。按验收线处理全章碎句串与缩词，静场补 35+ 字绵延句，然后用 edit_file 提交当前工作副本；禁止重读已读设定、禁止另起大纲。")
+        ? "旧式节奏提示已重复出现：只在正文语义确实断裂处合并观察、动作与因果；不要为均长、长句比例或碎句比例改稿。若没有可证明的问题，保留正文并标明该兼容门禁无法继续执行。"
+        : "节奏信号只用于定位。通读命中段，保留承担命令、停顿和动作落点的短句，只合并语义上被机械切碎的内容；不要补配额长句或扩大改写。")
       : hardLimit
         ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
         : repairPacketInstructions(repairPacket, revisionCase),
@@ -2602,7 +2608,6 @@ const COMPLETED_CHAPTER_REVIEW_STATUSES = new Set([
   "proposal_failed",
   "style_revision_required",
   "structural_revision_required",
-  "inspection_required",
 ]);
 
 /**
@@ -5213,6 +5218,38 @@ function recentArtifactsContext(
 }
 
 /** Restore only a validated, unfinished write-scene checkpoint. */
+function validRestoredReviewCycle(
+  value: unknown,
+  draft: Partial<ChapterSceneDraft>,
+  project: WriterProject,
+): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const cycle = value as Partial<ChapterSceneReviewCycle>;
+  if (cycle.schemaVersion !== 1
+    || (cycle.status !== "blocked" && cycle.status !== "repairing" && cycle.status !== "resolved")
+    || typeof cycle.baselineVersion !== "number" || cycle.baselineVersion > (draft.version ?? -1)
+    || typeof cycle.baselineContent !== "string" || cycle.baselineContent.length > 200_000
+    || typeof cycle.baselineSourceHash !== "string"
+    || project.hash(cycle.baselineContent) !== cycle.baselineSourceHash
+    || !Array.isArray(cycle.unresolvedIssues) || cycle.unresolvedIssues.length > 8
+    || !Array.isArray(cycle.targetSceneIds) || !Array.isArray(cycle.resolvedIssueIds)
+    || !Array.isArray(cycle.stillPresentIssueIds) || !Array.isArray(cycle.newlyIntroducedIssueIds)
+    || typeof cycle.repairAttempts !== "number" || cycle.repairAttempts < 0) return false;
+  const sceneIds = new Set((draft.scenes ?? []).flatMap(scene =>
+    scene && typeof scene === "object" && "id" in scene && typeof scene.id === "string" ? [scene.id] : [],
+  ));
+  if (cycle.targetSceneIds.some(id => typeof id !== "string" || !sceneIds.has(id))) return false;
+  return cycle.unresolvedIssues.every(issue =>
+    Boolean(issue) && typeof issue === "object"
+    && typeof issue.id === "string" && typeof issue.kind === "string"
+    && typeof issue.sceneId === "string" && sceneIds.has(issue.sceneId)
+    && Array.isArray(issue.evidence) && issue.evidence.length <= 3
+    && issue.evidence.every(item => typeof item === "string")
+    && typeof issue.problem === "string" && typeof issue.action === "string",
+  );
+}
+
 export function restoreChapterDraftCheckpoint(
   store: WriterStore,
   sessionId: string,
@@ -5228,6 +5265,7 @@ export function restoreChapterDraftCheckpoint(
     || !Array.isArray(draft.scenes) || !Array.isArray(draft.completed)
     || typeof draft.version !== "number" || typeof draft.chapterGoal !== "string"
     || typeof draft.baseContent !== "string" || typeof draft.heading !== "string"
+    || !validRestoredReviewCycle(draft.reviewCycle, draft, project)
     || (draft.mode !== "create" && draft.mode !== "replace" && draft.mode !== "append")) return undefined;
   const exists = project.documentExists(draft.path);
   if ((draft.mode === "create" && exists) || (draft.mode !== "create" && !exists)) return undefined;

@@ -27,6 +27,14 @@ export type EvidenceGroundedWriterInput = {
   styleEvidence: string;
   /** Dynamic diagnosis of already-written prose; never part of the stable style slot. */
   styleFeedback?: string[];
+  /** Evidence-backed semantic blockers for a bounded rewrite of existing prose. */
+  reviewIssues?: Array<{
+    id: string;
+    kind: string;
+    evidence: string[];
+    problem: string;
+    action: string;
+  }>;
   targetCharacters?: number;
 };
 
@@ -136,6 +144,12 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
     sections.push(
       "既有正文暴露出的动态文风问题如下。它们只定位风险，不是要求凑齐的数字配额；结合本场语义避免继续复制：\n"
         + input.styleFeedback.join("\n"),
+    );
+  }
+  if (input.reviewIssues?.length) {
+    sections.push(
+      "这是终审后的定向修订，不是重新创作。只解决下面有正文证据的问题；未涉及的事件、信息释放、人物选择和关系压力保持成立。若 action 与事实证据冲突，以证据为准：\n"
+        + JSON.stringify(input.reviewIssues.slice(0, 8)),
     );
   }
   const style = input.styleEvidence.trim();
