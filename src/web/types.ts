@@ -450,6 +450,8 @@ export type ProseGateRule = {
   severity: "block" | "warn";
   enabled: boolean;
   builtIn?: boolean;
+  /** Present when this runtime gate is projected from an AuthorPolicy. */
+  policyId?: string;
   documentKinds: Array<"chapter" | "side" | "lore" | "outline" | "archive" | "other" | "writing_example">;
   pathPrefixes: string[];
   sourceFeedback: string;

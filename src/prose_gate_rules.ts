@@ -17,6 +17,8 @@ export interface ProseGateRule {
   kind: ProseGateRuleKind;
   severity: ProseGateRuleSeverity;
   enabled: boolean;
+  /** Project-level tombstone. Keeps built-in defaults from reappearing after deletion. */
+  retired?: boolean;
   builtIn: boolean;
   /** Empty means every prose target; otherwise the rule only reviews these kinds. */
   documentKinds: ProseGateTargetKind[];
@@ -157,6 +159,7 @@ function normalizeRule(value: unknown, fallbackCreatedAt?: string): ProseGateRul
     kind,
     severity,
     enabled: item.enabled !== false,
+    retired: item.retired === true,
     builtIn: false,
     documentKinds: normalizeTargetKinds(item.documentKinds),
     pathPrefixes: normalizePathPrefixes(item.pathPrefixes),
@@ -192,7 +195,10 @@ function loadPersistedProseGateRules(project: WriterProject): ProseGateRule[] {
 }
 
 export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
-  return [...loadPersistedProseGateRules(project), ...authorPolicyGateRules(project)].slice(0, MAX_PROSE_GATE_RULES);
+  return [
+    ...loadPersistedProseGateRules(project).filter(rule => !rule.retired),
+    ...authorPolicyGateRules(project),
+  ].slice(0, MAX_PROSE_GATE_RULES);
 }
 
 function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): void {
@@ -227,6 +233,7 @@ export function upsertProseGateRule(
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   }, existing?.createdAt);
+  rule.retired = false;
   if (BUILT_IN_PROSE_GATE_RULES.some(item => item.id === id)) rule.builtIn = true;
   if (existing) rules[rules.indexOf(existing)] = rule;
   else {
@@ -255,8 +262,16 @@ export function proseGateRulesForTarget(
 export function removeProseGateRule(project: WriterProject, idValue: unknown): boolean {
   const id = normalizeId(idValue);
   const rules = loadPersistedProseGateRules(project);
+  const existing = rules.find(rule => rule.id === id);
+  if (!existing || existing.retired) return false;
+  if (existing.builtIn) {
+    existing.enabled = false;
+    existing.retired = true;
+    existing.updatedAt = new Date().toISOString();
+    saveProseGateRules(project, rules);
+    return true;
+  }
   const next = rules.filter(rule => rule.id !== id);
-  if (next.length === rules.length) return false;
   saveProseGateRules(project, next);
   return true;
 }
@@ -267,6 +282,7 @@ export function setProseGateRuleEnabled(project: WriterProject, idValue: unknown
   const rule = rules.find(item => item.id === id);
   if (!rule) throw new Error(`复审规则不存在：${id}`);
   rule.enabled = enabled;
+  if (enabled) rule.retired = false;
   rule.updatedAt = new Date().toISOString();
   saveProseGateRules(project, rules);
   return rule;
@@ -306,6 +322,7 @@ export function migrateProjectProseGatesToPolicies(project: WriterProject): {
       });
       migratedPolicyIds.push(policy.id);
       rule.enabled = false;
+      rule.retired = true;
       rule.updatedAt = new Date().toISOString();
     } catch {
       skippedRuleIds.push(rule.id);

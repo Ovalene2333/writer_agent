@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,8 @@ import { WriterProject } from "./project.js";
 import {
   loadProseGateRules,
   migrateProjectProseGatesToPolicies,
+  removeProseGateRule,
+  setProseGateRuleEnabled,
   upsertProseGateRule,
 } from "./prose_gate_rules.js";
 
@@ -77,7 +79,7 @@ test("hard policies without release conditions are downgraded", () => {
   }
 });
 
-test("legacy project gates migrate to trial policies and become disabled", () => {
+test("legacy project gates migrate to trial policies and become retired", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-policy-"));
   try {
     const project = WriterProject.init(root, "测试");
@@ -92,7 +94,32 @@ test("legacy project gates migrate to trial policies and become disabled", () =>
     const result = migrateProjectProseGatesToPolicies(project);
     assert.deepEqual(result.migratedPolicyIds, ["dialogue-register"]);
     assert.equal(loadAuthorPolicies(project)[0].status, "trial");
-    assert.equal(loadProseGateRules(project).find(rule => rule.id === "dialogue_register")?.enabled, false);
+    assert.equal(loadProseGateRules(project).some(rule => rule.id === "dialogue_register"), false);
+    const persisted = JSON.parse(readFileSync(join(root, ".writer", "prose-gates.json"), "utf8"));
+    assert.equal(persisted.find((rule: { id: string }) => rule.id === "dialogue_register")?.retired, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("removing a built-in gate persists a reversible project tombstone", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-policy-"));
+  try {
+    const project = WriterProject.init(root, "测试");
+    const id = "telegraphic-object-beats";
+    assert.equal(loadProseGateRules(project).some(rule => rule.id === id), true);
+    assert.equal(removeProseGateRule(project, id), true);
+    assert.equal(loadProseGateRules(project).some(rule => rule.id === id), false);
+
+    const persisted = JSON.parse(readFileSync(join(root, ".writer", "prose-gates.json"), "utf8"));
+    assert.deepEqual(
+      persisted.filter((rule: { id: string }) => rule.id === id)
+        .map((rule: { enabled: boolean; retired?: boolean }) => ({ enabled: rule.enabled, retired: rule.retired })),
+      [{ enabled: false, retired: true }],
+    );
+
+    setProseGateRuleEnabled(project, id, true);
+    assert.equal(loadProseGateRules(project).find(rule => rule.id === id)?.enabled, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

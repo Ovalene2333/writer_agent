@@ -3795,6 +3795,8 @@ function App() {
   const showStylePicker = false;
   const showConnectionPanel = false;
   const showThemePicker = false;
+  const showLegacyProseGateManager: boolean = false;
+  const legacyProseGateRules = (state?.proseGateRules ?? []).filter(rule => !rule.policyId);
   const proseGatesSettingsContent = <div className="settings-section-body prose-gate-manager">
     <p className="prose-gate-intro">
       作者政策
@@ -4088,7 +4090,7 @@ function App() {
       </div>
     )}
     <div className="prose-gate-list">
-      {(state.proseGateRules ?? []).map(rule => (
+      {legacyProseGateRules.map(rule => (
         <article className={`prose-gate-card${rule.enabled ? "" : " disabled"}`} key={rule.id}>
           <div className="prose-gate-card-head">
             <div>
@@ -4134,7 +4136,7 @@ function App() {
           </div>
         </article>
       ))}
-      {(state.proseGateRules ?? []).length === 0 && (
+      {legacyProseGateRules.length === 0 && (
         <div className="management-empty">暂无作者复审规则，可以从右上角新增。</div>
       )}
     </div>
@@ -7059,7 +7061,7 @@ function App() {
             ) : managementView === "prose-gates" ? (
               <>
               {proseGatesSettingsContent}
-              {false && <div className="prose-gate-manager">
+              {showLegacyProseGateManager && state && <div className="prose-gate-manager">
                 <p className="prose-gate-intro">
                   项目级语义复审会在正文出口运行。确定错误可设为阻断；偏好、倾向和可能误报的规则建议使用提醒。
                 </p>
@@ -7174,7 +7176,7 @@ function App() {
                   </div>
                 )}
                 <div className="prose-gate-list">
-                  {(state.proseGateRules ?? []).map(rule => (
+                  {legacyProseGateRules.map(rule => (
                     <article className={`prose-gate-card${rule.enabled ? "" : " disabled"}`} key={rule.id}>
                       <div className="prose-gate-card-head">
                         <div>
@@ -7220,7 +7222,7 @@ function App() {
                       </div>
                     </article>
                   ))}
-                  {(state.proseGateRules ?? []).length === 0 && (
+                  {legacyProseGateRules.length === 0 && (
                     <div className="management-empty">暂无作者复审规则，可以从右上角新增。</div>
                   )}
                 </div>
