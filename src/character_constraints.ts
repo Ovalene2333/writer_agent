@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import type { Character } from "./types.js";
-import { unlockedCompetencyIndex } from "./characters.js";
+import type { Character, OutlineNode } from "./types.js";
+import { competencyCapabilityIndex } from "./characters.js";
+import { resolveCompetencyStates } from "./competency_state.js";
 
 /**
  * Writing and final review must reason from the same compact, non-compressible
@@ -14,6 +15,10 @@ export type CharacterConstraintView = {
     id: string;
     name: string;
     summary: string;
+    availability: string;
+    stateReason: string;
+    stateEvidence?: string;
+    /** Legacy compatibility signal; availability is authoritative. */
     unlocked: boolean;
     limitations: string[];
     costs: string[];
@@ -32,6 +37,7 @@ export type CharacterConstraintView = {
     physical: string;
     knowledge: string[];
     beliefs: string[];
+    competencyStates: Array<{ competencyId: string; state: string; reason: string; evidence?: string }>;
   }>;
 };
 
@@ -44,7 +50,18 @@ export type CharacterWritingConstraintView = Omit<CharacterConstraintView, "comp
   capabilityIndex: Array<{ id: string; name: string; summary: string }>;
 };
 
-export function characterConstraintView(character: Character): CharacterConstraintView {
+export function characterConstraintView(
+  character: Character,
+  nodes: OutlineNode[] = [],
+  targetNodeId?: string,
+): CharacterConstraintView {
+  const competencyStates = resolveCompetencyStates(character, nodes, targetNodeId);
+  const order = new Map(nodes.map(node => [node.id, node.order]));
+  const target = targetNodeId ? order.get(targetNodeId) : undefined;
+  const storyStates = target === undefined
+    ? character.storyStates
+    : character.storyStates.filter(state => Boolean(state.outlineNodeId)
+      && (order.get(state.outlineNodeId!) ?? Infinity) <= target);
   return {
     id: character.id,
     name: character.identity.name,
@@ -52,6 +69,9 @@ export function characterConstraintView(character: Character): CharacterConstrai
       id: item.id,
       name: item.name,
       summary: item.summary,
+      availability: competencyStates.get(item.id)?.state ?? "unknown",
+      stateReason: competencyStates.get(item.id)?.reason ?? "没有能力状态记录",
+      ...(competencyStates.get(item.id)?.evidence ? { stateEvidence: competencyStates.get(item.id)!.evidence } : {}),
       unlocked: item.unlocked,
       limitations: item.limitations,
       costs: item.costs,
@@ -63,23 +83,33 @@ export function characterConstraintView(character: Character): CharacterConstrai
       status: item.status,
       validity: { from: item.validFrom, until: item.validUntil },
     })),
-    storyStates: character.storyStates.slice(-4).map(state => ({
+    storyStates: storyStates.slice(-4).map(state => ({
       anchor: state.outlineNodeId ?? (state.unanchored ? "unanchored" : ""),
       validity: { from: state.validFrom, until: state.validUntil },
       location: state.location,
       physical: state.physical,
       knowledge: state.knowledge.map(item => item.description || item.label),
       beliefs: state.beliefs.map(item => item.description || item.label),
+      competencyStates: (state.competencyStates ?? []).map(item => ({
+        competencyId: item.competencyId,
+        state: item.state,
+        reason: item.reason,
+        ...(item.evidence ? { evidence: item.evidence } : {}),
+      })),
     })),
   };
 }
 
-export function characterWritingConstraintView(character: Character): CharacterWritingConstraintView {
-  const constraints = characterConstraintView(character);
+export function characterWritingConstraintView(
+  character: Character,
+  nodes: OutlineNode[] = [],
+  targetNodeId?: string,
+): CharacterWritingConstraintView {
+  const constraints = characterConstraintView(character, nodes, targetNodeId);
   return {
     id: constraints.id,
     name: constraints.name,
-    capabilityIndex: unlockedCompetencyIndex(character.competencies),
+    capabilityIndex: competencyCapabilityIndex(character, nodes, targetNodeId),
     relationships: constraints.relationships,
     storyStates: constraints.storyStates,
   };

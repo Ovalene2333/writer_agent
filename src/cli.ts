@@ -146,6 +146,7 @@ program.command("web")
   .alias("serve")
   .description("启动 Web 写作工作台")
   .option("-p, --project <directory>", "项目目录", ".")
+  .option("--workspace <directory>", "多项目工作区目录（默认使用当前项目的父目录）")
   .option("--lan", "允许局域网设备访问")
   .option("--host <host>", "监听地址")
   .option("--port <port>", "监听端口", "4096")
@@ -159,6 +160,7 @@ program.command("web")
   .option("--debug-steps", "仅打印 Agent step（reasoning / tools / output）到终端，不含模型原文")
   .action(async (options: {
     project: string;
+    workspace?: string;
     lan?: boolean;
     host?: string;
     port: string;
@@ -199,6 +201,7 @@ program.command("web")
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口必须是 1 至 65535 的整数");
     const server = await startWriterServer({
       project, store, providers, host, port,
+      ...(options.workspace ? { workspaceRoot: resolve(options.workspace) } : {}),
       requireToken: options.token,
       announce: !share,
     });
@@ -213,7 +216,6 @@ program.command("web")
     const stop = async () => {
       tunnel?.kill();
       await server.close();
-      store.close();
       process.exit(0);
     };
     process.once("SIGINT", stop);

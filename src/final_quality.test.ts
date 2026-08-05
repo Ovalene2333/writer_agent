@@ -70,6 +70,40 @@ test("低于统计下限的短文只给分数，不编造问题", () => {
   assert.ok(["good", "fair", "weak"].includes(report.grade));
 });
 
+test("对白结构问题进入统一质量报告并保留 dialogue 来源", () => {
+  const clippedDialogue = Array.from({ length: 12 }, () => "「知道。」").join("\n\n");
+  const report = buildProseQualityReport(clippedDialogue);
+  assert.ok(report.warnings.some(warning => (
+    warning.source === "dialogue" && warning.code === "dialogue_exchange_compressed"
+  )));
+  assert.ok(!report.warnings.some(warning => warning.code === "dialogue_clipped"));
+  assert.ok(!report.warnings.some(warning => warning.code === "dialogue_monotone"));
+});
+
+test("低口语标记只归入对白参考，不与模式风险来源混用", () => {
+  const formal = [
+    "请把记录留在桌上。",
+    "你可以核对附件，但不得删去签名和日期。",
+    "门关闭之后程序将自行推进，任何人都无权临时撤回已经登记的异议。",
+    "理由已经写明。",
+    "责任需要等损失确认以后再行讨论，目前没有提前分配的依据。",
+    "确认并不妨碍选择，只是选择必须留下完整的审议过程。",
+    "证人尚未到场。",
+    "那份文件首先属于提出异议的人，其次才属于保管档案的部门。",
+    "程序能够证明手续发生过，却不能替任何人证明决定本身正确。",
+    "我不接受这个结论。",
+    "会议记录已经封存，后续更改需要两名在场人员共同签署书面说明。",
+    "现阶段只能等待正式答复。",
+  ].map(line => `「${line}相关材料已经编号封存，后续处理必须保留完整书面记录。」`).join("\n\n");
+  const report = buildProseQualityReport(formal);
+  assert.ok(report.warnings.some(warning => (
+    warning.source === "dialogue" && warning.code === "dialogue_bookish"
+  )));
+  assert.ok(!report.warnings.some(warning => (
+    warning.source === "ai_tells" && warning.code === "dialogue_bookish"
+  )));
+});
+
 test("gradeLabel covers every grade", () => {
   assert.equal(gradeLabel("good"), "良好");
   assert.equal(gradeLabel("fair"), "尚可");

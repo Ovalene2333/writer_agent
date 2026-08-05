@@ -12,7 +12,7 @@ export type ProseQualityReport = {
   grade: "good" | "fair" | "weak";
   /** 本轮篇幅目标与实际；偏短不阻断交付，只在这里露出来。 */
   length?: { target: number; actual: number; status: "ok" | "too_short" | "too_long" };
-  warnings: Array<{ source: "metrics" | "vividness" | "ai_tells"; code: string; message: string; examples: string[] }>;
+  warnings: Array<{ source: "metrics" | "vividness" | "ai_tells" | "dialogue"; code: string; message: string; examples: string[] }>;
 };
 
 export type Proposal = {
@@ -37,6 +37,7 @@ export const QUALITY_SOURCE_LABEL: Record<ProseQualityReport["warnings"][number]
   metrics: "节奏",
   vividness: "现场感",
   ai_tells: "AI 味",
+  dialogue: "对白",
 };
 
 /**
@@ -264,8 +265,10 @@ export type TextEntry = Temporal & { id: string; label: string; description: str
 export type Goal = Temporal & { id: string; category: "longTerm" | "current"; status: "active" | "achieved" | "abandoned" | "blocked" | "unknown"; priority: number; summary: string; stakes: string; obstacles: string[] };
 export type Relationship = Temporal & { id: string; characterId: number; type: string; description: string; attitude: string; status: "active" | "ended" | "strained" | "unknown" };
 export type Competency = Temporal & { id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[] };
+export type CompetencyAvailability = "available" | "latent" | "blocked" | "lost" | "unknown";
+export type CompetencyState = { id: string; competencyId: string; state: CompetencyAvailability; reason: string; evidence?: string };
 export type Feature = { id: string; name: string; summary: string; description: string };
-export type StoryState = Temporal & { id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string; knowledge: TextEntry[]; beliefs: TextEntry[]; intentions: string[]; temporaryGoals: Goal[]; notes: string };
+export type StoryState = Temporal & { id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string; knowledge: TextEntry[]; beliefs: TextEntry[]; intentions: string[]; temporaryGoals: Goal[]; competencyStates?: CompetencyState[]; notes: string };
 export type Character = {
   schemaVersion: 3; id: number;
   identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
@@ -531,8 +534,16 @@ export type ContextGraphView = {
   /** True when `nodes` is a recent window rather than the whole session. */
   truncated: boolean;
 };
+export type ProjectSummary = {
+  /** Workspace-relative project ID. `.` is the project at the workspace root. */
+  id: string;
+  title: string;
+};
 export type State = {
   accessMode?: "owner" | "readonly";
+  project: ProjectSummary;
+  /** Increments every time the server replaces its active project resources. */
+  projectEpoch: number;
   config: { title: string; style?: string };
   documents: string[];
   documentFolders: string[];

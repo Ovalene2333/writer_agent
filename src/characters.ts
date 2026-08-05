@@ -1,6 +1,7 @@
 import type {
   Character,
   CharacterCompetency,
+  CharacterCompetencyState,
   CharacterFeature,
   CharacterGoal,
   CharacterRelationship,
@@ -9,6 +10,13 @@ import type {
   CharacterTextEntry,
   OutlineNode,
 } from "./types.js";
+import {
+  competencyUseInstruction,
+  isCompetencyAvailability,
+  resolveCompetencyStates,
+  type ResolvedCompetencyState,
+  type SceneCompetencyUse,
+} from "./competency_state.js";
 
 export type CharacterSection =
   | "identity"
@@ -155,18 +163,36 @@ function feature(v: unknown): CharacterFeature {
   };
 }
 
+function competencyState(v: unknown): CharacterCompetencyState {
+  const r = obj(v);
+  return {
+    id: txt(r.id),
+    competencyId: txt(r.competencyId),
+    state: isCompetencyAvailability(r.state) ? r.state : "unknown",
+    reason: txt(r.reason),
+    ...(txt(r.evidence) ? { evidence: txt(r.evidence) } : {}),
+  };
+}
+
 export type CharacterCompetenciesWritingPayload = {
-  /** Selected unlocked entries, minus the card-state flag that invites inventory diction. */
-  inPlay: Array<Omit<CharacterCompetency, "unlocked">>;
+  /** Selected entries plus scene-local lifecycle instructions, without the legacy boolean. */
+  inPlay: Array<Omit<CharacterCompetency, "unlocked"> & {
+    availability: ResolvedCompetencyState["state"];
+    sceneMode: SceneCompetencyUse["mode"];
+    instruction: string;
+  }>;
   rule: string;
 };
 
 /** Discovery-only view: enough to select a capability, never enough to portray its mechanism. */
-export type CharacterCapabilityIndexEntry = Pick<CharacterCompetency, "id" | "name" | "summary">;
+export type CharacterCapabilityIndexEntry = Pick<CharacterCompetency, "id" | "name" | "summary"> & {
+  availability: ResolvedCompetencyState["state"];
+  stateReason: string;
+};
 
 /** One-line rule attached to any character payload that may reach a prose model. */
 export const COMPETENCY_WRITING_RULE =
-  "能力写法：仅本次 inPlay 可在正文用动作/后果兑现；未提供的能力本场不写，也不以卡面、系统或否定列举的方式提及。角色尚不知的武装专名不要提前点名。";
+  "能力写法：仅本次 inPlay 可进入正文，并严格按 sceneMode 与 instruction 处理。use 才能作为既有能力直接解题；attempt 可失败或部分生效；unlock/regain 必须在正文建立触发、来源和状态转变后才可生效；lose 须写出失去事件与后果。未提供的能力本场不写，也不以卡面、系统或否定列举的方式提及。角色尚不知的专名不要提前点名。";
 
 /**
  * Writing-facing competency split: never feed unlocked:false flags into prose context.
@@ -175,33 +201,74 @@ export const COMPETENCY_WRITING_RULE =
 export function competenciesWritingPayload(
   competencies: CharacterCompetency[],
   competencyIds?: readonly string[],
+  stateById?: ReadonlyMap<string, ResolvedCompetencyState>,
+  competencyUses?: readonly SceneCompetencyUse[],
 ): CharacterCompetenciesWritingPayload {
-  const selected = competencyIds ? new Set(competencyIds) : undefined;
+  const uses = new Map((competencyUses ?? competencyIds?.map(competencyId => ({ competencyId, mode: "use" as const })) ?? [])
+    .map(use => [use.competencyId, use]));
+  const selected = competencyIds ? new Set(competencyIds) : competencyUses ? new Set(uses.keys()) : undefined;
   const inPlay = competencies
-    .filter(item => item.unlocked && (!selected || selected.has(item.id)))
-    .map(({ unlocked: _unlocked, ...item }) => item);
+    .filter(item => selected ? selected.has(item.id) : (stateById?.get(item.id)?.state ?? (item.unlocked ? "available" : "unknown")) === "available")
+    .flatMap(({ unlocked: _unlocked, ...item }) => {
+      const state = stateById?.get(item.id) ?? {
+        id: `legacy:${item.id}`,
+        competencyId: item.id,
+        state: _unlocked ? "available" as const : "unknown" as const,
+        reason: _unlocked ? "旧版角色卡标记为已解锁" : "旧版角色卡未提供可解释的剧情状态",
+        source: "legacy" as const,
+      };
+      const use = uses.get(item.id) ?? { competencyId: item.id, mode: "use" as const };
+      return [{ ...item, availability: state.state, sceneMode: use.mode, instruction: competencyUseInstruction(state, use) }];
+    });
   return {
     inPlay,
     rule: COMPETENCY_WRITING_RULE,
   };
 }
 
+export function competencyCapabilityIndex(
+  character: Character,
+  nodes: OutlineNode[] = [],
+  targetNodeId?: string,
+): CharacterCapabilityIndexEntry[] {
+  const states = resolveCompetencyStates(character, nodes, targetNodeId);
+  return character.competencies.flatMap(item => {
+    const state = states.get(item.id);
+    // Legacy false means "unclassified", not permission to expose a secret
+    // inventory item. Explicit latent/blocked/lost records are discoverable so
+    // the Agent can plan a semantically valid transition.
+    if (!state || state.state === "unknown") return [];
+    return [{
+      id: item.id,
+      name: item.name,
+      summary: item.summary,
+      availability: state.state,
+      stateReason: state.reason,
+    }];
+  });
+}
+
+/** @deprecated Use competencyCapabilityIndex so non-available abilities can be planned semantically. */
 export function unlockedCompetencyIndex(competencies: CharacterCompetency[]): CharacterCapabilityIndexEntry[] {
-  return competencies
-    .filter(item => item.unlocked)
-    .map(item => ({ id: item.id, name: item.name, summary: item.summary }));
+  const character = normalizeV3Character({ ...emptyCharacter(), id: 1, competencies, updatedAt: "" });
+  return competencyCapabilityIndex(character).filter(item => item.availability === "available");
 }
 
 export function characterPromptCard(character: Character) {
+  const states = resolveCompetencyStates(character);
   return {
     ...character,
-    competencies: competenciesWritingPayload(character.competencies),
+    competencies: competenciesWritingPayload(
+      character.competencies,
+      [...states].filter(([, state]) => state.state === "available").map(([id]) => id),
+      states,
+    ),
     competencyWritingRule: COMPETENCY_WRITING_RULE,
   };
 }
 
 /** First-pass tool view: discover a character without injecting dialogue templates or locked abilities. */
-export function characterSummaryCard(character: Character) {
+export function characterSummaryCard(character: Character, nodes: OutlineNode[] = [], targetNodeId?: string) {
   return {
     id: character.id,
     name: character.identity.name,
@@ -209,7 +276,7 @@ export function characterSummaryCard(character: Character) {
     identity: { summary: character.identity.summary },
     appearance: { summary: character.profile.appearanceSummary },
     features: character.features.map(item => ({ id: item.id, name: item.name, summary: item.summary })),
-    capabilityIndex: unlockedCompetencyIndex(character.competencies),
+    capabilityIndex: competencyCapabilityIndex(character, nodes, targetNodeId),
   };
 }
 
@@ -241,6 +308,7 @@ function state(v: unknown): CharacterStoryState {
     beliefs: arr(r.beliefs).map(entry),
     intentions: strs(r.intentions),
     temporaryGoals: arr(r.temporaryGoals).map(goal),
+    competencyStates: arr(r.competencyStates).map(competencyState),
     notes: txt(r.notes),
     ...temporal(r),
   };
@@ -588,6 +656,7 @@ function ensureEntryId(raw: Record<string, unknown>, prefix: string): string {
 
 export const CHARACTER_CHANGE_OPS = [
   "set_unlocked",
+  "set_competency_state",
   "upsert_competency",
   "set_psychology_summary",
   "upsert_psychology_entry",
@@ -634,7 +703,7 @@ export function isCharacterChangeOp(op: string): boolean {
 }
 
 export function characterChangeOpsHint(): string {
-  return "可用 op：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / "
+  return "可用 op：set_competency_state{competencyId,state,reason,evidence?,storyStateId?,outlineNodeId?} / upsert_competency{entry} / set_psychology_summary{summary} / "
     + "upsert_psychology_entry{group,entry} / delete_psychology_entry{group,entryId} / add_experience{entry} / "
     + "delete_experience{entryId} / upsert_motivation{entry} / upsert_relationship{entry.characterId} / "
     + "upsert_story_state{entry} / delete_entry{section,entryId}";
@@ -671,22 +740,74 @@ export function applyCharacterChanges(
 
     try {
       switch (op) {
-        case "set_unlocked": {
+        case "set_unlocked":
+        case "set_competency_state": {
           const competencyId = txt(raw.competencyId ?? raw.id);
           if (!competencyId) {
             skip(op, "缺少 competencyId");
             break;
           }
-          const unlocked = raw.unlocked === true;
-          const index = current.competencies.findIndex(x => x.id === competencyId);
-          if (index < 0) {
+          const competencyIndex = current.competencies.findIndex(x => x.id === competencyId);
+          if (competencyIndex < 0) {
             skip(op, `能力不存在：${competencyId}`);
             break;
           }
-          const next = [...current.competencies];
-          next[index] = { ...next[index], unlocked };
-          current = { ...current, competencies: next };
-          applied.push({ op, detail: `${competencyId} → unlocked=${unlocked}` });
+          const nextAvailability = op === "set_unlocked"
+            ? raw.unlocked === true ? "available" : "unknown"
+            : raw.state;
+          if (!isCompetencyAvailability(nextAvailability)) {
+            skip(op, "state 必须是 available/latent/blocked/lost/unknown");
+            break;
+          }
+          const reason = txt(raw.reason) || (op === "set_unlocked"
+            ? raw.unlocked === true
+              ? "兼容旧 set_unlocked 操作：已确认能力可用"
+              : "兼容旧 set_unlocked 操作：仅确认不可直接使用，具体原因未知"
+            : "");
+          if (!reason) {
+            skip(op, "能力状态变更必须提供 reason（已确认的正文事实）");
+            break;
+          }
+          const requestedStoryStateId = txt(raw.storyStateId);
+          const outlineNodeId = txt(raw.outlineNodeId);
+          let storyIndex = requestedStoryStateId
+            ? current.storyStates.findIndex(item => item.id === requestedStoryStateId)
+            : outlineNodeId
+              ? current.storyStates.findIndex(item => item.outlineNodeId === outlineNodeId)
+              : -1;
+          if (requestedStoryStateId && storyIndex < 0) {
+            skip(op, `故事状态不存在：${requestedStoryStateId}`);
+            break;
+          }
+          const storyStates = [...current.storyStates];
+          if (storyIndex < 0) {
+            storyStates.push(state({
+              id: generatedEntryId("state"),
+              ...(outlineNodeId ? { outlineNodeId } : { unanchored: true }),
+              competencyStates: [],
+            }));
+            storyIndex = storyStates.length - 1;
+          }
+          const storyState = storyStates[storyIndex];
+          const existingStates = storyState.competencyStates ?? [];
+          const existing = existingStates.find(item => item.competencyId === competencyId);
+          const nextState = competencyState({
+            id: existing?.id ?? generatedEntryId("competency-state"),
+            competencyId,
+            state: nextAvailability,
+            reason,
+            evidence: raw.evidence,
+          });
+          storyStates[storyIndex] = {
+            ...storyState,
+            competencyStates: existing
+              ? existingStates.map(item => item.id === existing.id ? nextState : item)
+              : [...existingStates, nextState],
+          };
+          const competencies = [...current.competencies];
+          competencies[competencyIndex] = { ...competencies[competencyIndex], unlocked: nextAvailability === "available" };
+          current = { ...current, storyStates, competencies };
+          applied.push({ op: "set_competency_state", detail: `${competencyId} → ${nextAvailability} (${storyStates[storyIndex].id})` });
           break;
         }
         case "upsert_competency": {
@@ -947,9 +1068,22 @@ function validateOne(
       && !x.beliefs.length
       && !x.intentions.length
       && !x.temporaryGoals.length
+      && !(x.competencyStates?.length)
     ) {
       errors.push(`${root}.storyStates[${i}]: 记录没有内容`);
     }
+    const competencyStateIds = new Set<string>();
+    const stateCompetencyIds = new Set<string>();
+    const competencyIds = new Set(c.competencies.map(item => item.id));
+    (x.competencyStates ?? []).forEach((item, stateIndex) => {
+      if (!VALID_ID.test(item.id)) errors.push(`${root}.storyStates[${i}].competencyStates[${stateIndex}].id: 非法或为空`);
+      if (competencyStateIds.has(item.id)) errors.push(`${root}.storyStates[${i}].competencyStates[${stateIndex}].id: 重复`);
+      competencyStateIds.add(item.id);
+      if (!competencyIds.has(item.competencyId)) errors.push(`${root}.storyStates[${i}].competencyStates[${stateIndex}].competencyId: 能力不存在`);
+      if (stateCompetencyIds.has(item.competencyId)) errors.push(`${root}.storyStates[${i}].competencyStates[${stateIndex}].competencyId: 同一状态切片不能重复能力`);
+      stateCompetencyIds.add(item.competencyId);
+      if (!item.reason) errors.push(`${root}.storyStates[${i}].competencyStates[${stateIndex}].reason: 不能为空`);
+    });
   });
 }
 
@@ -999,11 +1133,13 @@ export function resolveCharacterAt(character: Character, nodes: OutlineNode[], t
     storyState: states[0],
     experiences,
     psychology,
+    competencyStates: Object.fromEntries(resolveCompetencyStates(character, nodes, targetNodeId)),
   };
 }
 
 export function characterPromptViews(character: Character, nodes: OutlineNode[] = [], targetNodeId?: string) {
   const scene = resolveCharacterAt(character, nodes, targetNodeId);
+  const competencyStates = resolveCompetencyStates(character, nodes, targetNodeId);
   const experiences = targetNodeId
     ? scene.experiences
     : character.experiences.slice(-3);
@@ -1015,7 +1151,11 @@ export function characterPromptViews(character: Character, nodes: OutlineNode[] 
       psychology: targetNodeId ? scene.psychology : character.psychology,
       features: character.features,
       // Prose-bound: no unlocked:false flags (those become「还锁着」inventory diction).
-      competencies: competenciesWritingPayload(character.competencies),
+      competencies: competenciesWritingPayload(
+        character.competencies,
+        [...competencyStates].filter(([, state]) => state.state === "available").map(([id]) => id),
+        competencyStates,
+      ),
       experiences,
       notes: character.notes,
     },

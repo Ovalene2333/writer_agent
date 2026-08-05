@@ -203,7 +203,7 @@ export function analyzeDialogueTexture(text: string, knownSpeakers: readonly str
     && (stats.shortRatio >= SHORT_RATIO_LIMIT || stats.longRatio < DIALOGUE_LONG_RATIO_TARGET)) {
     issues.push({
       code: "dialogue_clipped",
-      message: `对白中位数 ${stats.medianLength} 字、≤${SHORT_LINE_CHARS} 字占 ${pct(stats.shortRatio)}%、≥${LONG_LINE_CHARS} 字仅 ${pct(stats.longRatio)}%（参考中位数 ${DIALOGUE_MEDIAN_TARGET} 字、长台词 ${pct(DIALOGUE_LONG_RATIO_TARGET)}%）；全章没有人真正把话说开，只在确认和应答。让至少一次交锋里有人说长——辩解、还价、绕开问题、讲一件对方没问的事；对白短是重音，通篇短就只剩电报。`,
+      message: `电报体候选：对白中位数 ${stats.medianLength} 字、≤${SHORT_LINE_CHARS} 字占 ${pct(stats.shortRatio)}%、≥${LONG_LINE_CHARS} 字仅 ${pct(stats.longRatio)}%（参考中位数 ${DIALOGUE_MEDIAN_TARGET} 字、长台词 ${pct(DIALOGUE_LONG_RATIO_TARGET)}%）。检查连续短句是否省掉了施事、对象或与上句的承接，以至于读者无法从近邻语境补全；短命令、紧张、沉默和上下文足够的口语省略应保留。若确有问题，让一次交锋落到人物正在争取、隐瞒或拒绝的具体信息，而不是单纯把句子拉长。`,
       examples: shortestSamples(lines, 4),
     });
   }
@@ -237,7 +237,7 @@ export function analyzeDialogueTexture(text: string, knownSpeakers: readonly str
   if (profiled.length >= 2 && stats.voiceDistance < VOICE_DISTANCE_TARGET) {
     issues.push({
       code: "voice_uniform",
-      message: `${profiled.map(p => `${p.speaker}(${p.lines}句/中位${p.medianLength}字/每句${p.clausesPerLine}节)`).join("、")} 的对白在长度、分句数与句式统计上几乎重合（差异度 ${stats.voiceDistance}，参考 ${VOICE_DISTANCE_TARGET}）；这只是形式统计，是否真的换人也说得通请自行核对——把提示语遮住通读一遍。若确实互换无碍，给每人一个别人不会用的说话方式：回避的角度、爱用的句式、说不利索的地方。`,
+      message: `${profiled.map(p => `${p.speaker}(${p.lines}句/中位${p.medianLength}字/每句${p.clausesPerLine}节)`).join("、")} 的对白在长度、分句数与句式统计上几乎重合（差异度 ${stats.voiceDistance}，参考 ${VOICE_DISTANCE_TARGET}）；这只是形式统计。把提示语遮住后，若人物确实可互换，回到各自目标、掌握与隐瞒的信息、以及提问/讨价还价/拒绝/解释的策略，不要用口头禅或固定句长制造差异。`,
       examples: [],
     });
   }

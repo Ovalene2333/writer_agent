@@ -100,7 +100,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "b5c7261579fe581f");
+  assert.equal(agentToolSchemaHash(), "f3c3e70e1fc4368f");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -187,7 +187,12 @@ test("chapter review receives full cards alongside source-linked scene capabilit
     assert.deepEqual(packet.characters[0].constraints.competencies.map((item: { id: string }) => item.id), ["track", "climb"]);
     assert.deepEqual(packet.sceneCapabilityScopes, [{
       sceneId: "arrival",
-      characterScopes: [{ characterId: character.id, competencyIds: ["track"], dialogue: true }],
+      characterScopes: [{
+        characterId: character.id,
+        competencyUses: [{ competencyId: "track", mode: "use" }],
+        competencyIds: ["track"],
+        dialogue: true,
+      }],
     }]);
   } finally {
     store?.close();

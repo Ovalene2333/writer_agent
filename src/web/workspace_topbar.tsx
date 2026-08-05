@@ -1,17 +1,20 @@
 import React from "react";
 import {
-  BookOpenText, ChevronDown, Drama, IdCard, Library, LockKeyhole, MessageSquare,
+  BookOpenText, Check, ChevronDown, Drama, FolderKanban, IdCard, Library, LockKeyhole, MessageSquare,
   MoreHorizontal, RefreshCw, Settings, Share2, Sun, Wifi, Zap,
 } from "lucide-react";
 import type { ConnectionInfo } from "./connection";
 import type { SettingsSection } from "./model_config";
-import type { PermissionMode, Provider, Usage, UiThemeId, WorkspaceMode } from "./types";
+import type { PermissionMode, ProjectSummary, Provider, Usage, UiThemeId, WorkspaceMode } from "./types";
 import { PERMISSION_MODES } from "./types";
 import { IconButton, HeaderMoreMenu, LayoutControls, SettingsMenu } from "./ui_primitives";
 import { realCacheHitRate, formatTokenCount } from "./agent_steps";
 
 export function WorkspaceTopbar({
   title,
+  project,
+  projects,
+  projectSwitching,
   connection,
   model,
   usagePct,
@@ -25,6 +28,7 @@ export function WorkspaceTopbar({
   workspaceMode,
   documentsCollapsed,
   onCharacters,
+  onSwitchProject,
   onRoleplay,
   onSessions,
   onUsage,
@@ -42,6 +46,9 @@ export function WorkspaceTopbar({
   onToggleDocuments,
 }: {
   title: string;
+  project: ProjectSummary;
+  projects: ProjectSummary[];
+  projectSwitching: boolean;
   connection: ConnectionInfo;
   model: string;
   usagePct: number;
@@ -55,6 +62,7 @@ export function WorkspaceTopbar({
   workspaceMode: WorkspaceMode;
   documentsCollapsed: boolean;
   onCharacters: () => void;
+  onSwitchProject: (projectId: string) => void;
   onRoleplay: () => void;
   onSessions: () => void;
   onUsage: () => void;
@@ -71,6 +79,8 @@ export function WorkspaceTopbar({
   onModeChange: (mode: WorkspaceMode) => void;
   onToggleDocuments: () => void;
 }) {
+  const [projectsOpen, setProjectsOpen] = React.useState(false);
+  React.useEffect(() => setProjectsOpen(false), [project.id]);
   const usageLabel = usageUnmetered ? "非按量" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(2)}`;
   return (
     <header className="workspace-topbar">
@@ -79,6 +89,41 @@ export function WorkspaceTopbar({
         <div className="title-stack">
           <span className="product-line">Writer</span>
           <h1 title={title}>{title}</h1>
+        </div>
+        <div className="project-switcher">
+          <IconButton
+            label="切换项目"
+            className={projectsOpen ? "active" : ""}
+            onClick={() => setProjectsOpen((open) => !open)}
+            disabled={projectSwitching}
+          >
+            <FolderKanban size={16} />
+          </IconButton>
+          {projectsOpen && (
+            <div className="project-menu" role="menu" aria-label="项目列表">
+              {projects.map((candidate) => {
+                const current = candidate.id === project.id;
+                return (
+                  <button
+                    key={candidate.id}
+                    type="button"
+                    className={`project-menu-item${current ? " active" : ""}`}
+                    role="menuitemradio"
+                    aria-checked={current}
+                    disabled={current || projectSwitching}
+                    title={candidate.title}
+                    onClick={() => {
+                      setProjectsOpen(false);
+                      onSwitchProject(candidate.id);
+                    }}
+                  >
+                    <span>{candidate.title}</span>
+                    {current && <Check size={15} aria-hidden="true" />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
         {connection.dualMode && (
           <button

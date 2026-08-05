@@ -44,6 +44,7 @@ import {
 import { boundedRepairPacket, type RepairPacket } from "../repair_packet.js";
 import { ToolRevisionRequiredError } from "../tool_failure.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
+import { dialogueFormatGateError } from "../dialogue_format.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
@@ -346,7 +347,10 @@ async function gateProseStyleWithSparseAutoRepair(
 ): Promise<{ content: string; sourceHash: string; stripped: string[]; autoRepair?: { attempts: number; edits: number; initialBlockers: number } }> {
   let current = content;
   const stripped: string[] = [];
-  const repairer = context.chapterStyleRepairer;
+  // Delegated prose must not pass through a second model that lacks the Writer's
+  // evidence packet. Keep the gate, but return its exact repair packet to the
+  // evidence-owning Agent instead of silently changing facts during cleanup.
+  const repairer = context.evidenceGroundedWriter ? undefined : context.chapterStyleRepairer;
   const errors: string[] = [];
   let appliedEdits = 0;
   let initialBlockers = 0;
@@ -710,6 +714,12 @@ export async function submitFullDocumentProposal(
     strippedMeta.push(...styleGate.stripped);
     styleAutoRepair = styleGate.autoRepair;
     recordLatestProposalDraft(proposedBody, draftSourceHash);
+  }
+  if (isScenePipelineDocument(path)) {
+    const dialogueFormatError = dialogueFormatGateError(proposedBody);
+    if (dialogueFormatError) {
+      throw new ToolRevisionRequiredError("DIALOGUE_FORMAT_REVISION_REQUIRED", dialogueFormatError);
+    }
   }
   // 碎句/缩词：首轮放行情节场面，记 grace；同 path 二次提交必须达标（验收线在文案里）。
   let rhythmRevisionRequired: string | undefined;

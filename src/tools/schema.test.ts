@@ -17,9 +17,9 @@ test("every tool schema has a registered handler", () => {
   }
 });
 
-test("scene write tool requires prose and actual state", () => {
+test("scene write schema supports delegated prose while fast mode validates its runtime payload", () => {
   const scene = TOOLS.find(tool => tool.function.name === "write_chapter_scene");
-  assert.deepEqual(scene?.function.parameters.required, ["sceneId", "notes", "content", "actualState"]);
+  assert.deepEqual(scene?.function.parameters.required, ["sceneId", "notes"]);
   assert.equal(TOOLS.some(tool => tool.function.name === "write_chapter_scene_notes"), false);
   assert.equal(TOOLS.some(tool => tool.function.name === "write_document_isolated"), false);
 });
@@ -29,7 +29,8 @@ test("scene guides and character reads expose source-linked capability selection
   const beginProperties = begin?.function.parameters.properties as Record<string, unknown>;
   const scenes = beginProperties.scenes as { items: { properties: Record<string, unknown> } };
   const scopes = scenes.items.properties.characterScopes as { items: { required: string[]; properties: Record<string, unknown> } };
-  assert.deepEqual(scopes.items.required, ["characterId", "competencyIds"]);
+  assert.deepEqual(scopes.items.required, ["characterId", "competencyUses"]);
+  assert.ok(Object.hasOwn(scopes.items.properties, "competencyUses"));
   assert.ok(Object.hasOwn(scopes.items.properties, "dialogue"));
 
   const getCharacter = TOOLS.find(tool => tool.function.name === "get_character");

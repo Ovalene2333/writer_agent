@@ -22,6 +22,8 @@ export type StyleGroundingOptions = {
   preferredSample?: string;
   /** Full rewrites use project prose for facts, never as unvalidated voice evidence. */
   excludeProjectVoice?: boolean;
+  /** Scene chains use recent project prose for continuity, not as a positive style exemplar. */
+  projectSampleRole?: "voice_anchor" | "continuity";
   /** RNG for exemplar window sampling (tests inject a seeded fn). Defaults to Math.random. */
   random?: () => number;
 };
@@ -66,7 +68,7 @@ export function naturalProseCraftPrompt(): string {
 - 贴住当前视角人物的注意力。信息按人物会看见、误会、回避和确认的顺序出现，不为解释方便越过认知边界。
 - 场景从人物此刻想完成的事情生长。行动招来阻力或回应，变化留下足以影响下一步的事实、关系或选择；静场也可以只完成理解与关系上的细微移动。
 - 选择真正参与现场的细节。物件、环境、技术与感官应被人物使用、承受或误读，而不是作为设定清单陈列。
-- 对白是人物在关系中采取的行动。直说、回避、沉默、玩笑或解释都可以，只要符合说话者的目的、知识与处境；人物差异首先来自各自在意和不愿承认的东西。
+- 对白是人物在关系中采取的行动。直说、回避、沉默、玩笑或解释都可以，只要符合说话者的目的、知识与处境；人物差异首先来自各自在意和不愿承认的东西。说出口的直接对白统一使用「……」，其中嵌套引文使用『……』。
 - 节奏服从现场。叙述需要展开时让句子自然延伸，压力逼近时可以收紧；段落在动作、发现、停顿或余波真正落定时结束，不按固定长短配额排列。
 - 已经由动作、对白或后果传达的意义不必再解释。需要说明时只补充会改变理解或行动的新事实。
 - 完整章节兑现本章承担的变化，并从结果自然留下后续条件；是否需要悬问、损失、和解或平静收束，由本章目标决定。`;
@@ -126,11 +128,10 @@ export function stableStyleGroundingPrompt(
  * Per-turn voice evidence for agent dynamic-tail (after history/task).
  * CACHE: Always miss-priced — 范文 + one short project sample; no multi-chapter dumps.
  *
- * Continuation-anchor form: raw exemplar prose first, then the immediately
- * preceding project prose LAST, framed as the text being continued. Style
- * imitation research shows raw text + completion framing anchors voice far
- * better than instructions, and statistical style summaries do not anchor at
- * all — so no fingerprints here, just prose.
+ * Normal form keeps the immediately preceding prose last as a voice anchor.
+ * Scene-chain form marks it as continuity-only and puts approved exemplars last:
+ * a recently generated chapter may contain the exact defect being corrected and
+ * must not become the next chapter's sole positive demonstration.
  */
 export function dynamicStyleGroundingPrompt(
   project: WriterProject,
@@ -156,16 +157,25 @@ export function dynamicStyleGroundingPrompt(
   if (!projectSample && !examples.length) return "";
 
   const sections = ["本轮动态声线证据（只学句法、节奏与叙述姿态，不复述其中内容）："];
-  if (examples.length) {
-    // Long exemplars: each build samples a different paragraph-aligned window.
-    sections.push(examples.map((item, index) => {
+  const exemplarSection = examples.length
+    ? examples.map((item, index) => {
       const body = sampleProseWindow(item.content, 1_500, random);
       const notes = item.notes.trim() ? `（${item.notes.trim().slice(0, 120)}）` : "";
-      return `［范文 ${index + 1}·《${item.title}》${notes}］\n${body}`;
-    }).join("\n\n"));
-  }
-  if (projectSample) {
-    sections.push(`［紧接本次写作之前的正文（来源：${projectSample.source}）——新正文从这里的声线自然续下去，句法与节奏保持同一支笔的手感］\n${projectSample.text}`);
+      return `［正向范文 ${index + 1}·《${item.title}》${notes}］\n${body}`;
+    }).join("\n\n")
+    : "";
+  const continuityOnly = options.projectSampleRole === "continuity";
+  const projectSection = projectSample
+    ? continuityOnly
+      ? `［最近正文连续性材料（来源：${projectSample.source}）——只承接人物称谓、叙述距离、现场状态和语域；它未经风格验收，不模仿其中重复段首、固定句长或短对白节拍］\n${projectSample.text}`
+      : `［紧接本次写作之前的正文（来源：${projectSample.source}）——新正文从这里的声线自然续下去，句法与节奏保持同一支笔的手感］\n${projectSample.text}`
+    : "";
+  if (continuityOnly) {
+    if (projectSection) sections.push(projectSection);
+    if (exemplarSection) sections.push(exemplarSection);
+  } else {
+    if (exemplarSection) sections.push(exemplarSection);
+    if (projectSection) sections.push(projectSection);
   }
   return sections.join("\n\n");
 }

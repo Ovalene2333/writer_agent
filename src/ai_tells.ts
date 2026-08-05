@@ -30,6 +30,8 @@
 
 export type AiTellCode =
   | "dialogue_homogeneous"
+  /** 书面腔候选；不等于人物声线同质。 */
+  | "dialogue_bookish"
   | "thematic_uplift"
   | "philosophical_dialogue"
   | "tricolon_stacking"
@@ -96,7 +98,7 @@ export type AiTells = {
 
 /** 台词长度 p80−p20 低于此值，说明每个人都用同样长度的句子说话。 */
 export const DIALOGUE_SPREAD_TARGET = 12;
-/** 带口语标记的台词占比低于此值，对白读起来像书面陈述而非说话。 */
+/** 仅用于定位书面腔候选，绝不作为声线同质的判据。 */
 export const DIALOGUE_COLLOQUIAL_TARGET = 0.25;
 /** 同一 2 字句首的台词占比超过此值，所有人用同一种方式起头。 */
 export const DIALOGUE_OPENER_REPEAT_LIMIT = 0.3;
@@ -203,17 +205,21 @@ export function analyzeAiTells(text: string, options?: { profile?: AiTellProfile
       stats.dialogueLengthSpread < DIALOGUE_SPREAD_TARGET
         ? `台词长度起伏仅 ${stats.dialogueLengthSpread} 字（参考 ${DIALOGUE_SPREAD_TARGET}）`
         : "",
-      stats.dialogueColloquialRatio < DIALOGUE_COLLOQUIAL_TARGET
-        ? `带口语标记的台词仅 ${Math.round(stats.dialogueColloquialRatio * 100)}%（参考 ${Math.round(DIALOGUE_COLLOQUIAL_TARGET * 100)}%）`
-        : "",
       stats.dialogueOpenerRepeatRatio > DIALOGUE_OPENER_REPEAT_LIMIT
         ? `${Math.round(stats.dialogueOpenerRepeatRatio * 100)}% 的台词共用同一个起头`
         : "",
     ].filter(Boolean);
     issues.push({
       code: "dialogue_homogeneous",
-      message: `角色声线同质：${reasons.join("；")}。把名字遮住后台词还能互换，就说明人物没有各自的说话方式。`
-        + "给至少两个人物各自的句长、口头禅、回避方式与用词层级——不要靠加语气词，靠改他们各自想达成什么。",
+      message: `角色声线形态接近：${reasons.join("；")}。这只能定位候选，不能替代人物判断；把名字遮住后，检查至少两人是否仍会为不同目标选择不同的信息、回避角度与谈话策略。不要用语气词、口头禅或固定句长伪造差异。`,
+      examples: dialogue.lines.slice(0, 4),
+    });
+  }
+  if (profile === "narrative" && stats.dialogueLines >= MIN_DIALOGUE_LINES
+    && stats.dialogueColloquialRatio < DIALOGUE_COLLOQUIAL_TARGET) {
+    issues.push({
+      code: "dialogue_bookish",
+      message: `对白口语标记较少（${Math.round(stats.dialogueColloquialRatio * 100)}%，仅作参考）。检查人物是否在用书面陈述替代当下说话：能否自然地停顿、改口、省略已知成分或答非所问。短命令、克制、紧张和有充分上下文的省略都可以保留；这不证明人物声线相同。`,
       examples: dialogue.lines.slice(0, 4),
     });
   }
@@ -388,12 +394,15 @@ function packingProfile(text: string): {
   };
 }
 
-/** 0–1：三项声线信号里命中了多少（长度均齐、无口语、同一起头）。 */
+/**
+ * 0–1：只比较两项形式信号（长度均齐、同一起头）。
+ * 低口语标记可能来自庄重、克制或场景压力，不能拿来判断不同人物可互换。
+ */
 function dialogueHomogeneity(stats: AiTellStats): number {
   const flat = below(stats.dialogueLengthSpread, DIALOGUE_SPREAD_TARGET);
-  const bookish = below(stats.dialogueColloquialRatio, DIALOGUE_COLLOQUIAL_TARGET);
   const sameOpener = Math.min(1, over(stats.dialogueOpenerRepeatRatio, DIALOGUE_OPENER_REPEAT_LIMIT) * 2);
-  return Math.round(((flat + bookish + sameOpener) / 3) * 100) / 100;
+  if (!flat || !sameOpener) return 0;
+  return Math.round(((flat + sameOpener) / 2) * 100) / 100;
 }
 
 function over(value: number, limit: number): number {

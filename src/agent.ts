@@ -482,7 +482,7 @@ function executionRulesPrompt(mode: PermissionMode): string {
 ${modeRule}
 4. 完整/长对话或扮演史：注入历史仅为预览。须 inspect_conversation，再 read_conversation 从 afterId=0 分页至 hasMore=false。简易卡用 list/get_simple_characters，与普通卡分离。
 5. 仅当缺少目标文档/关键事实且无法推断时 ask_user；可逆创作选择自行决定。询问后立即停止。
-6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，能力摘要只用于选择 ID；正文要兑现能力时必须 get_character(view=sections, sections=["competencies"], competencyIds=[...]) 读取该项原卡边界。明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。情节演进→apply_character_changes；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
+6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，capabilityIndex 的 availability 只用于选择能力与场景模式；正文要处理能力时必须在场景 competencyUses 声明 use/attempt/unlock/regain/lose，再用 get_character(view=sections, sections=["competencies"], competencyIds=[...]) 读取机制、限制与本场状态指令。明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。已确认的能力状态演进用 apply_character_changes.set_competency_state；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
 7. read_file 默认读取本轮最新工作副本；只复用本轮工作记忆、本轮工具结果与 reused 标记，禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
 8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
 9. 技能描述与当前任务明确匹配时，必须先 load_skill 并遵循其方法；勿编造技能。Skill 只增强判断，不自动构成固定工具流程。
@@ -600,8 +600,8 @@ ${taskInstructions(
 角色演进：${characterEvolutionInstruction}
 写入：${documentInstruction}
 修改范围：${editScopeInstruction[task.editScope]}${proseLengthLine}
-写作模式：${writingMode === "fast" ? "快速模式；由当前 Agent 完成检索、编排与直接交付。" : "标准模式；正文仍由当前 Agent 在同一任务链中完成。"}
-场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场；正文与实际状态均由主 Agent 提交。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、revise_chapter_scene_guide 或 inspect_chapter_draft，直接使用普通文件交付路径。"}
+写作模式：${writingMode === "fast" ? "快速模式；由当前 Agent 完成检索、编排与直接交付。" : "分工模式；主 Agent 负责检索与编排，证据型 Writer 只依据共享事实包实现正文。"}
+场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场；${writingMode === "fast" ? "正文与实际状态均由主 Agent 提交" : "主 Agent 提交 notes，证据型 Writer 生成正文并由运行时提取实际状态"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、revise_chapter_scene_guide 或 inspect_chapter_draft，直接使用普通文件交付路径。"}
 
 结构化资料（JSON；缺失≠不存在，需时用工具）：
 ${creativeContext}
@@ -1304,12 +1304,12 @@ export function taskInstructions(
   if (mode === "write_scene") return `正文创作原则（内部执行，不输出分析过程）：
 - 主 Agent 对成品负责，自主决定先读什么、是否构思、是否分场、何时修订；不要为了展示流程而调用工具或创建清单。
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
-- 角色卡原始分区是人物事实的唯一依据：能力、知识、关系、身体状态与对白声线不得压缩进 write pack 后替代原卡。对白声线遵守「正文底线」的角色归属规则。
-- ${fastWritingMode ? "快速模式下优先走最短的单 Agent 路径。" : "标准模式下由当前 Agent 在同一任务链完成检索、编排和正文。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
+- 角色卡原始分区是人物事实的唯一依据：能力、知识、关系、身体状态与对白声线不得压缩进 write pack 后替代原卡。确实要写某角色的对白时，按需读取该角色 voice、motivations、relationships、storyState；涉及价值、恐惧或内在冲突才读取 psychology，只读会开口的角色。对白声线遵守「正文底线」的角色归属规则。
+- ${fastWritingMode ? "快速模式下优先走最短的单 Agent 路径，由你提交正文。" : "分工模式下你负责检索、角色原卡取证与编排；正文交给证据型 Writer。直接完整成稿先 compile_write_pack，再调用 write_file(path) 并省略 content；资料不足时工具会返回必须补读的原始分区。局部 edit_file 仍由你完成。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：新建或完整成稿用 write_file，修改既有局部用 edit_file；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}运行时自动处理篇幅、审查与审批，只使用当前公开文件工具。
 - 单章目标字数以「单章篇幅目标」为准，不擅自缩减，也不另按事件密度改判；一次任务包含多章时，每一章分别达到该目标，禁止把目标当作多章总额均分。write_file/edit_file 由运行时绑定当前章目标；场景链必须给每场 targetCharacters，且各场之和只对齐当前章目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径，系统会把工作副本记录为该文件的新版本；不要为避开同名另起副本或改写章节路径。局部修改用 edit_file，完整替换用 write_file。
-${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 才可读取该角色声线，且声线只约束该角色说出口的对白。write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
+${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 时，写前须读取该角色 voice、motivations、relationships、storyState，且声线只约束该角色说出口的对白。${fastWritingMode ? `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。` : `write_chapter_scene 只提交 sceneId 与不超过 ${notesMaxCharacters} 字的故事内 notes，省略 content/actualState，由证据型 Writer 和状态提取器完成。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
 - 章节动力服从本章目标。冲突章应让阻力真正回应人物行动；静场、过渡章与收束章也可以用理解、关系或条件的变化完成。代价、悬问与不可逆损失只在因果需要时出现，不作为每章配额。
 - 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称。提交前：${proseMannerismPreflightLine()}
@@ -2528,7 +2528,7 @@ export function proposalRevisionConvergePrompt(
  */
 export function sceneContinuationPrompt(
   draft: ChapterSceneDraft,
-  extras: { styleFeedback?: string[]; stylePriorNotes?: string[] },
+  extras: { styleFeedback?: string[]; stylePriorNotes?: string[]; evidenceGroundedWriter?: boolean },
 ): string {
   const completedCount = draft.completed.length;
   const next = draft.scenes[completedCount];
@@ -2551,15 +2551,17 @@ export function sceneContinuationPrompt(
     lines.push(`stylePriorNotes（既有正文高频表达负面清单，每场都要遵守）：${extras.stylePriorNotes.join("；")}`);
   }
   if (extras.styleFeedback?.length) {
-    lines.push(`styleFeedback（对已写正文的机器统计，写下一场必须遵守）：${extras.styleFeedback.join("；")}`);
+    lines.push(`styleFeedback（对已写正文的结构定位；写下一场先复核语义成因，不为统计值凑句式或口语词）：${extras.styleFeedback.join("；")}`);
   }
   if (next) {
     const sceneWriteTool = "write_chapter_scene";
-    const submission = "在同一调用中提交要点式 notes、正文与 actualState";
+    const submission = extras.evidenceGroundedWriter
+      ? "只提交要点式 notes，省略 content 与 actualState；证据型 Writer 会读取共享事实包并生成正文"
+      : "在同一调用中提交要点式 notes、正文与 actualState";
     lines.push(
       `当前 scene guide 的下一场：${JSON.stringify(next)}`,
       ...(remaining.length ? [`当前其后引导：${JSON.stringify(remaining)}`] : []),
-      "characterScopes 是本场唯一的角色卡能力/对白声线许可：要兑现能力，先按其中 competencyIds 读取原卡 competencies；只在 dialogue=true 时读取该角色 voice，且仅用于其引号内对白。缺少许可不得推断更宽范围；需要扩大范围先修订未写 guide。",
+      "characterScopes 是本场唯一的角色卡能力/对白声线许可：先按 competencyUses 的能力 ID 读取原卡 competencies，并遵守 mode 与返回的入场状态指令；use 才可直接使用，attempt 可失败或部分生效，unlock/regain 必须在正文建立触发与状态转变，lose 必须写出失去事件。确实要写 dialogue=true 角色的对白时，按需一并读取 voice、motivations、relationships、storyState，涉及价值/恐惧/内在冲突才读取 psychology，且只读会开口的角色。voice 仅用于所属角色的引号内对白。缺少许可不得推断更宽范围；需要扩大范围先修订未写 guide。",
       `先以真实结尾和 actualState 判断 guide 是否仍成立：成立则调用 ${sceneWriteTool}（sceneId=${next.id}），${submission}；不成立则调用 revise_chapter_scene_guide 替换全部未写引导；章节目标已经抵达则清空 remainingScenes 后终审。不要输出计划说明或更新任务清单。`,
     );
   } else {
@@ -2986,6 +2988,8 @@ export async function runAgent(options: {
       scopedCharacterConstraintPackets(store, task, characterScope)
         .map(({ item, constraintHash }) => [item.id, constraintHash]),
     ),
+    characterEvidenceReads: new Map(),
+    narrativeEvidencePackets: new Map(),
     characterEvolutionEnabled: runtimeSettings.characterEvolutionEnabled,
     requireCreativeOutlineDesign: task.mode === "outline" && task.documentProposalRequired,
     ...(restoredChapterDraft ? { chapterSceneDraft: restoredChapterDraft } : {}),
@@ -3042,6 +3046,16 @@ export async function runAgent(options: {
       signal,
       context: chapterReviewContext,
     },
+    ...(!fastWritingMode && permissionMode !== "plan" ? {
+      evidenceGroundedWriter: {
+        model: options.models?.writer ?? executionModel,
+        stateModel: options.models?.inline
+          ?? options.models?.summarizer
+          ?? options.models?.reviewer
+          ?? executionModel,
+        signal,
+      },
+    } : {}),
     // Best-of-N scene sampling: rewrites use the main writing model in a dedicated
     // plain-text call, not the cheap adjudicator. The winner is picked by the
     // reviewer model reading both drafts — a rule score cannot rank "worth reading",
@@ -4408,7 +4422,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             role: "user",
             content: sceneContinuationPrompt(toolContext.chapterSceneDraft, {
               styleFeedback: sceneWrittenFeedback,
-              stylePriorNotes: toolContext.chapterStylePriorNotes,
+              // Unified feedback already carries the prior-chapter negative list.
+              // Keep the legacy field only as a fallback for older tool results.
+              stylePriorNotes: sceneWrittenFeedback.length ? undefined : toolContext.chapterStylePriorNotes,
+              evidenceGroundedWriter: Boolean(toolContext.evidenceGroundedWriter),
             }),
           });
           const afterTokens = approximateMessageTokens(messages);
@@ -4636,6 +4653,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           // Each scene needs its own diegetic pack — do not reuse the previous chapter's.
           toolContext.writePackCompiled = false;
           toolContext.lastWritePack = undefined;
+          toolContext.lastWritePackData = undefined;
           toolContext.writePackSceneId = undefined;
           toolContext.chapterSceneDraft = undefined;
           toolContext.activeSceneCharacterScopes = undefined;

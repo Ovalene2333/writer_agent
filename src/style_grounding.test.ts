@@ -221,4 +221,37 @@ describe("style prompt cache boundaries", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("treats recent generated prose as continuity and leaves approved examples as the positive anchor", () => {
+    const root = mkdtempSync(join(tmpdir(), "writer-style-continuity-"));
+    const project = WriterProject.init(root, "连续性与声线分离");
+    const store = new WriterStore(project);
+    try {
+      project.writeRaw(
+        "chapters/chapter-001.md",
+        `# 第一章\n\n${"她沿着走廊停下。门灯从红色跳成绿色。".repeat(12)}\n`,
+      );
+      store.saveWritingExample({
+        title: "作者验收样章",
+        category: "作者范文",
+        content: "雨水顺着窗框往下淌，落到桌角那封拆过的信上。老周伸手挪了一次，没挪开，又把杯子压在信封边缘。".repeat(6),
+        notes: "动作自然承接，不固定收句",
+        gatePassed: true,
+      });
+      const prompt = dynamicStyleGroundingPrompt(project, store, {
+        intensive: true,
+        targetPath: "chapters/chapter-002.md",
+        projectSampleRole: "continuity",
+        random: () => 0,
+      });
+      const continuity = prompt.indexOf("最近正文连续性材料");
+      const exemplar = prompt.indexOf("正向范文");
+      assert.ok(continuity >= 0, prompt);
+      assert.ok(exemplar > continuity, prompt);
+      assert.match(prompt, /未经风格验收，不模仿/u);
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

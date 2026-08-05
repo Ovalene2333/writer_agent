@@ -109,6 +109,7 @@ import {
   type MessageVersionBundle,
   type PendingAttachment,
   type PermissionMode,
+  type ProjectSummary,
   type ProseGateRule,
   type ProseGateRuleDraft,
   type ProseQualityReport,
@@ -146,6 +147,7 @@ import {
   loadPerformanceMode,
   loadUiTheme,
   loadWorkspaceMode,
+  clearLastSessionId,
   readLastSessionId,
   rememberLastSessionId,
   IconButton,
@@ -531,6 +533,8 @@ function formatVersionTime(iso: string): string {
 }
 function App() {
   const [state, setState] = useState<State>();
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectSwitching, setProjectSwitching] = useState(false);
   const [activePath, setActivePath] = useState("");
   const [document, setDocument] = useState<DocumentData>({ content: "", hash: "" });
   const [documentDraft, setDocumentDraft] = useState("");
@@ -694,6 +698,9 @@ function App() {
   const streamStepsAnchorIdRef = useRef<number | null>(null);
   const streamStepsRafRef = useRef<number | null>(null);
   const refreshSeqRef = useRef(0);
+  const projectSwitchSeqRef = useRef(0);
+  const documentRequestSeqRef = useRef(0);
+  const chaptersRequestSeqRef = useRef(0);
   const sessionIdRef = useRef<string | undefined>(undefined);
   const todosCompletionRef = useRef({ sessionId: "", complete: false });
   const activePathRef = useRef(activePath);
@@ -932,7 +939,7 @@ function App() {
       let appliedMessages = next.messages;
       setState((current) => {
         if (seq !== refreshSeqRef.current) return current ?? next;
-        if (!current || current.sessionId !== next.sessionId) {
+        if (!current || current.projectEpoch !== next.projectEpoch || current.sessionId !== next.sessionId) {
           appliedMessages = next.messages;
           return next;
         }
@@ -982,6 +989,12 @@ function App() {
     },
     [mergeConversationMessages, reconcileStreamStepsAnchor, updateStreamStepsAnchorId],
   );
+
+  const loadProjects = useCallback(async () => {
+    const result = await api<{ currentProjectId: string; projects: ProjectSummary[] }>("/api/projects");
+    setProjects(result.projects);
+    return result;
+  }, []);
 
   const loadOlderMessages = useCallback(async () => {
     if (!state?.sessionId || !state.messagesHasMore || olderMessagesLoading) return;
@@ -1112,13 +1125,13 @@ function App() {
     const stopMonitor = startConnectionMonitor();
     const unsubscribe = subscribeConnection(setConnection);
     void ensureConnection()
-      .then(() => refresh())
+      .then(() => Promise.all([refresh(), loadProjects()]))
       .catch((e) => setError(String(e)));
     return () => {
       stopMonitor();
       unsubscribe();
     };
-  }, []);
+  }, [loadProjects, refresh]);
 
   useEffect(() => {
     if (!state?.styleTemplates?.some(template => template.exampleReviewStatus === "reviewing")) return;
@@ -1312,6 +1325,7 @@ function App() {
   }, [resizing]);
 
   useEffect(() => {
+    const requestSequence = ++documentRequestSeqRef.current;
     if (!activePath) return;
     setVersionPanelOpen(false);
     setVersions([]);
@@ -1319,11 +1333,14 @@ function App() {
     setReaderSelection(null);
     void api<DocumentData>(`/api/document?path=${encodeURIComponent(activePath)}`)
       .then((value) => {
+        if (requestSequence !== documentRequestSeqRef.current) return;
         setDocument(value);
         setDocumentDraft(value.content);
         setEditingDocument(false);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (requestSequence === documentRequestSeqRef.current) setError(String(e));
+      });
   }, [activePath]);
 
   useEffect(() => {
@@ -1489,16 +1506,80 @@ function App() {
   }, []);
 
   const loadChapters = useCallback(async () => {
+    const requestSequence = ++chaptersRequestSeqRef.current;
     setChaptersLoading(true);
     try {
       const result = await api<{ chapters: ChapterSummary[] }>("/api/chapters");
-      setChapters(result.chapters);
+      if (requestSequence === chaptersRequestSeqRef.current) setChapters(result.chapters);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (requestSequence === chaptersRequestSeqRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setChaptersLoading(false);
+      if (requestSequence === chaptersRequestSeqRef.current) setChaptersLoading(false);
     }
   }, []);
+
+  const switchProject = useCallback(async (projectId: string) => {
+    if (!state || projectSwitching || state.accessMode === "readonly" || projectId === state.project.id) return;
+    const switchSequence = ++projectSwitchSeqRef.current;
+    // Invalidate every pending workspace refresh before dropping the old snapshot.
+    refreshSeqRef.current += 1;
+    const previousSessionId = state.sessionId;
+    setProjectSwitching(true);
+    setError("");
+    clearAgentStream({ abort: true, clearStorage: true, sessionId: previousSessionId });
+    clearLastSessionId();
+    sessionIdRef.current = undefined;
+    setState(undefined);
+    setActivePath("");
+    setDocument({ content: "", hash: "" });
+    setDocumentDraft("");
+    setEditingDocument(false);
+    setPrompt("");
+    setPendingAttachments([]);
+    setChapters([]);
+    setVersions([]);
+    setBrowsingVersion(null);
+    setReaderSelection(null);
+    setDocumentContextSelections([]);
+    setRoleplay(null);
+    setRoleplaySetup(null);
+    setSimpleCardDraft(null);
+    setRoleplaySceneDraft(null);
+    setRoleplaySceneManagerOpen(false);
+    setRoleplayMemoryOpen(false);
+    setRoleplayFactDraft(null);
+    setManagementView(null);
+    setReviewOpen(false);
+    setSettingsMenuOpen(false);
+    setHeaderMoreOpen(false);
+    setSelectedSessionIds(new Set());
+    setSessionBatchMode(false);
+    setMessageVersionViews({});
+    setComposerBranch(null);
+    setBranchConfirm(null);
+    setRoleplayBranchTimeline(null);
+    setContextGraph(null);
+    setCharacterDraft(null);
+    setStyleDraft(null);
+    setProseGateDraft(null);
+    setContinuityFactDraft(null);
+    try {
+      const result = await api<{ project: ProjectSummary; projectEpoch: number }>("/api/projects/switch", {
+        method: "POST",
+        body: JSON.stringify({ projectId }),
+      });
+      if (switchSequence !== projectSwitchSeqRef.current) return;
+      await Promise.all([refresh(), loadProjects(), loadChapters()]);
+      setNotice(`已切换至${result.project.title}`);
+    } catch (cause) {
+      if (switchSequence !== projectSwitchSeqRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+      // The server retains the old project when a switch fails; rebuild from it.
+      await Promise.all([refresh(), loadProjects(), loadChapters()]).catch(() => undefined);
+    } finally {
+      if (switchSequence === projectSwitchSeqRef.current) setProjectSwitching(false);
+    }
+  }, [clearAgentStream, loadChapters, loadProjects, projectSwitching, refresh, state]);
 
   async function loadContextGraph(sessionId?: string) {
     const id = sessionId ?? state?.sessionId;
@@ -3917,6 +3998,9 @@ function App() {
       />}
       <WorkspaceTopbar
         title={state.config.title || "Writer Agent"}
+        project={state.project}
+        projects={projects.some((project) => project.id === state.project.id) ? projects : [state.project, ...projects]}
+        projectSwitching={projectSwitching}
         connection={connection}
         model={state.provider.model}
         usagePct={usagePct}
@@ -3935,6 +4019,7 @@ function App() {
           setSelectedSessionIds(new Set());
           setManagementView("characters");
         }}
+        onSwitchProject={(projectId) => void switchProject(projectId)}
         onRoleplay={() => {
           setHeaderMoreOpen(false);
           beginRoleplaySetup();

@@ -704,7 +704,12 @@ test("scene guides retain source-linked capability scopes and reject ambiguous e
       characterScopes: [{ characterId: 7, competencyIds: ["track"], dialogue: true }],
     }],
   });
-  assert.deepEqual(scoped.scenes[0].characterScopes, [{ characterId: 7, competencyIds: ["track"], dialogue: true }]);
+  assert.deepEqual(scoped.scenes[0].characterScopes, [{
+    characterId: 7,
+    competencyUses: [{ competencyId: "track", mode: "use" }],
+    competencyIds: ["track"],
+    dialogue: true,
+  }]);
   assert.throws(() => beginChapterSceneDraft({
     path: "chapters/第一章.md", mode: "create", heading: "第一章", chapterGoal: "变化",
     baseContent: "", baseHash: "empty",
@@ -726,7 +731,7 @@ test("scene guides retain source-linked capability scopes and reject ambiguous e
   }), /至少选择/u);
 });
 
-test("beginning a scene guide rejects locked or inaccessible scoped abilities", () => {
+test("scene guide requires a lifecycle mode for unavailable abilities and still rejects inaccessible cards", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-scene-capability-scope-"));
   let store: WriterStore | undefined;
   try {
@@ -750,7 +755,22 @@ test("beginning a scene guide rejects locked or inaccessible scoped abilities", 
     assert.throws(() => handleBeginChapterDraft({
       input, project, store: activeStore, sessionId: activeStore.createSession("能力场景"), emit: () => undefined,
       characterScope: [character.id], context: { permissionMode: "auto" },
-    }), /尚未解锁/u);
+    }), /入场状态 unknown.*模式 use/u);
+    const awakening = handleBeginChapterDraft({
+      input: {
+        ...input,
+        scenes: [{
+          ...input.scenes[0],
+          characterScopes: [{
+            characterId: character.id,
+            competencyUses: [{ competencyId: "sealed", mode: "unlock" }],
+          }],
+        }],
+      },
+      project, store: activeStore, sessionId: activeStore.createSession("能力觉醒场景"), emit: () => undefined,
+      characterScope: [character.id], context: { permissionMode: "auto" },
+    });
+    assert.match(awakening, /"status":"started"/u);
     assert.throws(() => handleBeginChapterDraft({
       input: {
         ...input,

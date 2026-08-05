@@ -255,12 +255,23 @@ export interface CharacterRelationship extends CharacterTemporal {
 export interface CharacterCompetency extends CharacterTemporal {
   id: string; name: string; summary: string; level: string; unlocked: boolean; description: string; resources: string[]; limitations: string[]; costs: string[];
 }
+export type CompetencyAvailability = "available" | "latent" | "blocked" | "lost" | "unknown";
+export interface CharacterCompetencyState {
+  id: string;
+  competencyId: string;
+  state: CompetencyAvailability;
+  reason: string;
+  evidence?: string;
+}
 export interface CharacterFeature {
   id: string; name: string; summary: string; description: string;
 }
 export interface CharacterStoryState extends CharacterTemporal {
   id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string;
-  knowledge: CharacterTextEntry[]; beliefs: CharacterTextEntry[]; intentions: string[]; temporaryGoals: CharacterGoal[]; notes: string;
+  knowledge: CharacterTextEntry[]; beliefs: CharacterTextEntry[]; intentions: string[]; temporaryGoals: CharacterGoal[];
+  /** Plot-time capability availability. Later applicable records override earlier records for the same competency. */
+  competencyStates?: CharacterCompetencyState[];
+  notes: string;
 }
 export interface Character {
   schemaVersion: 3;
@@ -351,8 +362,8 @@ export interface Proposal {
 
 /**
  * Final writing-quality picture shown to the author before Accept.
- * Built by `buildProseQualityReport` (src/final_quality.ts) from the three
- * deterministic layers; advisory only — it never blocks a proposal.
+ * Built by `buildProseQualityReport` (src/final_quality.ts) from deterministic
+ * layers; advisory only — it never blocks a proposal.
  */
 export interface ProseQualityReport {
   characters: number;
@@ -367,7 +378,7 @@ export interface ProseQualityReport {
    */
   length?: { target: number; actual: number; status: "ok" | "too_short" | "too_long" };
   warnings: Array<{
-    source: "metrics" | "vividness" | "ai_tells";
+    source: "metrics" | "vividness" | "ai_tells" | "dialogue";
     code: string;
     message: string;
     examples: string[];

@@ -65,6 +65,79 @@ test("agent job synthesizes an error terminal event when runner returns silently
   assert.match(String((snapshot.events.at(-1) as { message?: string }).message), /未产生终态事件/);
 });
 
+test("web server switches only among projects in its workspace", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "writer-workspace-"));
+  const firstRoot = join(workspace, "first-novel");
+  const secondRoot = join(workspace, "second-novel");
+  const firstProject = WriterProject.init(firstRoot, "第一部");
+  WriterProject.init(secondRoot, "第二部");
+  firstProject.writeRaw("chapters/first-only.md", "# 只属于第一部\n");
+  const store = new WriterStore(firstProject);
+  store.reindex();
+  store.createSession("第一部会话");
+  const providers = new ProviderManager(firstProject);
+  const server = await startWriterServer({
+    project: firstProject,
+    store,
+    providers,
+    workspaceRoot: workspace,
+    host: "127.0.0.1",
+    port: 0,
+    requireToken: false,
+    announce: false,
+  });
+  const port = new URL(server.origin).port;
+  try {
+    const projectsResponse = await fetch(`http://127.0.0.1:${port}/api/projects`);
+    assert.equal(projectsResponse.status, 200);
+    const projects = await projectsResponse.json() as {
+      currentProjectId: string;
+      projects: Array<{ id: string; title: string }>;
+    };
+    assert.equal(projects.currentProjectId, "first-novel");
+    assert.deepEqual(projects.projects.map(project => project.id), ["first-novel", "second-novel"]);
+
+    const firstState = await fetch(`http://127.0.0.1:${port}/api/state`);
+    const firstPayload = await firstState.json() as {
+      project: { id: string };
+      documents: string[];
+      sessions: Array<{ title: string }>;
+    };
+    assert.equal(firstPayload.project.id, "first-novel");
+    assert.ok(firstPayload.documents.includes("chapters/first-only.md"));
+    assert.ok(firstPayload.sessions.some(session => session.title === "第一部会话"));
+
+    const switchResponse = await fetch(`http://127.0.0.1:${port}/api/projects/switch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId: "second-novel" }),
+    });
+    assert.equal(switchResponse.status, 200);
+    const secondState = await fetch(`http://127.0.0.1:${port}/api/state`);
+    const secondPayload = await secondState.json() as {
+      project: { id: string };
+      documents: string[];
+      sessions: Array<{ title: string }>;
+    };
+    assert.equal(secondPayload.project.id, "second-novel");
+    assert.equal(secondPayload.documents.includes("chapters/first-only.md"), false);
+    assert.equal(secondPayload.sessions.some(session => session.title === "第一部会话"), false);
+
+    for (const projectId of ["../outside", secondRoot]) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/projects/switch`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectId }),
+      });
+      assert.equal(response.status, 400);
+    }
+  } finally {
+    await server.close();
+    store.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("accepted continuity indexing starts after the approval response turn", async () => {
   let started = false;
   scheduleAcceptedContinuityIndexing(async () => { started = true; });

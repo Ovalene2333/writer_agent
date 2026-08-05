@@ -33,6 +33,14 @@ type Competency = Temporal & {
   limitations: string[];
   costs: string[];
 };
+type CompetencyAvailability = "available" | "latent" | "blocked" | "lost" | "unknown";
+type CompetencyState = {
+  id: string;
+  competencyId: string;
+  state: CompetencyAvailability;
+  reason: string;
+  evidence?: string;
+};
 type Feature = {
   id: string;
   name: string;
@@ -50,6 +58,7 @@ type StoryState = Temporal & {
   beliefs: TextEntry[];
   intentions: string[];
   temporaryGoals: Goal[];
+  competencyStates?: CompetencyState[];
   notes: string;
 };
 
@@ -146,6 +155,25 @@ const REL_STATUS: Array<{ value: Relationship["status"]; label: string }> = [
   { value: "strained", label: "紧张" },
   { value: "unknown", label: "未知" },
 ];
+
+const COMPETENCY_STATE_OPTIONS: Array<{ value: CompetencyAvailability; label: string }> = [
+  { value: "available", label: "可用" },
+  { value: "latent", label: "潜藏 / 未觉醒" },
+  { value: "blocked", label: "暂时受阻" },
+  { value: "lost", label: "已失去" },
+  { value: "unknown", label: "未知" },
+];
+
+const currentCompetencyState = (storyStates: StoryState[], competency: Competency): CompetencyAvailability => {
+  for (let index = storyStates.length - 1; index >= 0; index -= 1) {
+    const found = (storyStates[index].competencyStates ?? []).find(item => item.competencyId === competency.id);
+    if (found) return found.state;
+  }
+  return competency.unlocked ? "available" : "unknown";
+};
+
+const competencyStateLabel = (state: CompetencyAvailability) =>
+  COMPETENCY_STATE_OPTIONS.find(item => item.value === state)?.label ?? state;
 
 const splitList = (value: string) => value.split(/[,，\n]/).map(item => item.trim()).filter(Boolean);
 const entryId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -246,6 +274,10 @@ export function CharacterEditor(props: {
     ...props.draft,
     features: Array.isArray(props.draft.features) ? props.draft.features : [],
     experiences: Array.isArray(props.draft.experiences) ? props.draft.experiences : [],
+    storyStates: (props.draft.storyStates ?? []).map(story => ({
+      ...story,
+      competencyStates: Array.isArray(story.competencyStates) ? story.competencyStates : [],
+    })),
   };
   const onChange = props.onChange;
   const draftRef = useRef(draft);
@@ -487,7 +519,7 @@ export function CharacterEditor(props: {
                     ) : (
                       <ul>
                         {draft.competencies.slice(0, 4).map(skill => (
-                          <li key={skill.id}>{skill.name || "未命名"}{skill.level ? ` · ${skill.level}` : ""} · {skill.unlocked ? "已解锁" : "未解锁"}</li>
+                          <li key={skill.id}>{skill.name || "未命名"}{skill.level ? ` · ${skill.level}` : ""} · {competencyStateLabel(currentCompetencyState(draft.storyStates, skill))}</li>
                         ))}
                       </ul>
                     )}
@@ -871,16 +903,10 @@ export function CharacterEditor(props: {
                             ...draft,
                             competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, level: e.target.value } : x),
                           })} placeholder="精通 / S 级…" /></Field>
-                          <Field label="是否解锁">
-                            <select value={skill.unlocked ? "yes" : "no"} onChange={e => onChange({
-                              ...draft,
-                              competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, unlocked: e.target.value === "yes" } : x),
-                            })}>
-                              <option value="no">否</option>
-                              <option value="yes">是</option>
-                            </select>
+                          <Field label="当前剧情状态" hint="在“故事状态”中维护">
+                            <input readOnly value={competencyStateLabel(currentCompetencyState(draft.storyStates, skill))} />
                           </Field>
-                          <Field label="能力摘要" hint="未解锁时智能体仍可见" wide>
+                          <Field label="能力摘要" hint="用于选择能力与场景模式" wide>
                             <textarea value={skill.summary} onChange={e => onChange({
                               ...draft,
                               competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, summary: e.target.value } : x),
@@ -890,7 +916,7 @@ export function CharacterEditor(props: {
                             ...current,
                             competencies: current.competencies.map(x => x.id === skill.id ? { ...x, summary } : x),
                           }))}
-                          <Field label="详细说明" hint="仅解锁后向智能体暴露" wide>
+                          <Field label="详细说明" hint="选入场景后按需读取" wide>
                             <textarea value={skill.description} onChange={e => onChange({
                               ...draft,
                               competencies: draft.competencies.map(x => x.id === skill.id ? { ...x, description: e.target.value } : x),
@@ -1125,7 +1151,7 @@ export function CharacterEditor(props: {
                       ...draft,
                       storyStates: [...draft.storyStates, {
                         id: entryId("state"), unanchored: true, location: "", physical: "", emotion: "",
-                        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], notes: "",
+                        knowledge: [], beliefs: [], intentions: [], temporaryGoals: [], competencyStates: [], notes: "",
                       }],
                     })}>+ 添加状态</button>
                   )}
@@ -1192,6 +1218,83 @@ export function CharacterEditor(props: {
                             ...draft,
                             storyStates: draft.storyStates.map(x => x.id === story.id ? { ...x, intentions: splitList(e.target.value) } : x),
                           })} /></Field>
+                          <Field label="能力状态" hint="记录该剧情时点发生的可用性变化" wide>
+                            <div className="ce-entry-list">
+                              {(story.competencyStates ?? []).map(compState => (
+                                <div className="ce-form-grid" key={compState.id}>
+                                  <select value={compState.competencyId} onChange={e => onChange({
+                                    ...draft,
+                                    storyStates: draft.storyStates.map(x => x.id === story.id ? {
+                                      ...x,
+                                      competencyStates: (x.competencyStates ?? []).map(item => item.id === compState.id
+                                        ? { ...item, competencyId: e.target.value }
+                                        : item),
+                                    } : x),
+                                  })}>
+                                    {draft.competencies.map(skill => (
+                                      <option key={skill.id} value={skill.id}>{skill.name || skill.id}</option>
+                                    ))}
+                                  </select>
+                                  <select value={compState.state} onChange={e => onChange({
+                                    ...draft,
+                                    storyStates: draft.storyStates.map(x => x.id === story.id ? {
+                                      ...x,
+                                      competencyStates: (x.competencyStates ?? []).map(item => item.id === compState.id
+                                        ? { ...item, state: e.target.value as CompetencyAvailability }
+                                        : item),
+                                    } : x),
+                                  })}>
+                                    {COMPETENCY_STATE_OPTIONS.map(option => (
+                                      <option key={option.value} value={option.value}>{option.label}</option>
+                                    ))}
+                                  </select>
+                                  <input value={compState.reason} placeholder="状态依据（必填）" onChange={e => onChange({
+                                    ...draft,
+                                    storyStates: draft.storyStates.map(x => x.id === story.id ? {
+                                      ...x,
+                                      competencyStates: (x.competencyStates ?? []).map(item => item.id === compState.id
+                                        ? { ...item, reason: e.target.value }
+                                        : item),
+                                    } : x),
+                                  })} />
+                                  <input value={compState.evidence ?? ""} placeholder="正文证据（可选）" onChange={e => onChange({
+                                    ...draft,
+                                    storyStates: draft.storyStates.map(x => x.id === story.id ? {
+                                      ...x,
+                                      competencyStates: (x.competencyStates ?? []).map(item => item.id === compState.id
+                                        ? { ...item, evidence: e.target.value || undefined }
+                                        : item),
+                                    } : x),
+                                  })} />
+                                  <button type="button" onClick={() => onChange({
+                                    ...draft,
+                                    storyStates: draft.storyStates.map(x => x.id === story.id ? {
+                                      ...x,
+                                      competencyStates: (x.competencyStates ?? []).filter(item => item.id !== compState.id),
+                                    } : x),
+                                  })}>删除状态</button>
+                                </div>
+                              ))}
+                              <button
+                                type="button"
+                                disabled={draft.competencies.length === 0 || (story.competencyStates?.length ?? 0) >= draft.competencies.length}
+                                onClick={() => {
+                                const used = new Set((story.competencyStates ?? []).map(item => item.competencyId));
+                                const competencyId = draft.competencies.find(item => !used.has(item.id))?.id ?? draft.competencies[0]?.id;
+                                if (!competencyId) return;
+                                onChange({
+                                  ...draft,
+                                  storyStates: draft.storyStates.map(x => x.id === story.id ? {
+                                    ...x,
+                                    competencyStates: [...(x.competencyStates ?? []), {
+                                      id: entryId("competency-state"), competencyId, state: "unknown", reason: "",
+                                    }],
+                                  } : x),
+                                });
+                                }}
+                              >+ 添加能力状态</button>
+                            </div>
+                          </Field>
                           <Field label="所知信息" hint="每行一条" wide>
                             <textarea value={story.knowledge.map(x => x.description).join("\n")} onChange={e => onChange({
                               ...draft,

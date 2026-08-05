@@ -1,7 +1,8 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -121,6 +122,12 @@ export type AgentJobInfo = {
   updatedAt: string;
 };
 
+export type ProjectSummary = {
+  /** Stable workspace-relative ID. `.` represents a project at the workspace root. */
+  id: string;
+  title: string;
+};
+
 function styleTemplateExampleReviewed(store: WriterStore, template: StyleTemplate): boolean {
   const content = template.exampleContent.trim();
   if (!content) return false;
@@ -167,6 +174,8 @@ type AgentJob = {
   events: StoredAgentEvent[];
   controller: AbortController;
   listeners: Set<(event: StoredAgentEvent) => void>;
+  /** The store this job started with. It must never follow a workspace switch. */
+  store?: WriterStore;
 };
 
 const STEP_TRAIL_TEXT_MAX = 12_000;
@@ -246,8 +255,13 @@ type JobTrailState = {
 export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
   private trails = new Map<string, JobTrailState>();
+  private runners = new Map<string, Promise<void>>();
 
   constructor(private store?: WriterStore) {}
+
+  setStore(store: WriterStore): void {
+    this.store = store;
+  }
 
   start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
     if (this.activeJob(sessionId)) throw new Error("SESSION_JOB_ALREADY_RUNNING");
@@ -260,13 +274,15 @@ export class BackgroundAgentJobs {
       events: [],
       controller: new AbortController(),
       listeners: new Set(),
+      store: this.store,
     };
     this.jobs.set(job.id, job);
     this.trails.set(job.id, { steps: [], lastFlushAt: 0, dirty: false });
     const emit = (event: AgentEvent) => this.emit(job.id, event);
     // Defer so callers can finish `const job = start(...)` before the runner touches `job`.
-    queueMicrotask(() => {
-      void run(job.controller.signal, emit).then(() => {
+    const runner = new Promise<void>((settle) => {
+      queueMicrotask(() => {
+        void run(job.controller.signal, emit).then(() => {
         if (job.status === "running") {
           // A runner that returns without a terminal event violated the Agent
           // protocol. Emit a real terminal event so SSE subscribers and persisted
@@ -276,13 +292,16 @@ export class BackgroundAgentJobs {
             message: "Agent 运行函数未产生终态事件，任务已安全终止，可从原指令续跑。",
           });
         }
-      }).catch((error) => {
+        }).catch((error) => {
         if (job.status === "running") {
           this.emit(job.id, { type: "error", message: errorMessage(error) });
           this.finish(job, "failed");
         }
+        }).finally(settle);
       });
     });
+    this.runners.set(job.id, runner);
+    void runner.finally(() => this.runners.delete(job.id));
     return job;
   }
 
@@ -306,6 +325,19 @@ export class BackgroundAgentJobs {
     if (!job || job.status !== "running") return false;
     job.controller.abort();
     return true;
+  }
+
+  /** Stop all current jobs before their project resources are released. */
+  async cancelAllAndWait(): Promise<void> {
+    const active = [...this.jobs.values()].filter(job => job.status === "running");
+    for (const job of active) job.controller.abort();
+    await Promise.all(active.map(job => this.runners.get(job.id)).filter((runner): runner is Promise<void> => Boolean(runner)));
+  }
+
+  /** Discard old project job history after every runner has stopped. */
+  clear(): void {
+    this.jobs.clear();
+    this.trails.clear();
   }
 
   snapshotAndSubscribe(id: string, listener: (event: StoredAgentEvent) => void): {
@@ -434,7 +466,7 @@ export class BackgroundAgentJobs {
 
   private flushTrail(job: AgentJob, force: boolean): void {
     const trail = this.trails.get(job.id);
-    if (!trail?.dirty || !trail.sourceMessageId || !trail.steps.length || !this.store) return;
+    if (!trail?.dirty || !trail.sourceMessageId || !trail.steps.length || !job.store) return;
     const now = Date.now();
     if (!force && now - trail.lastFlushAt < STEP_TRAIL_FLUSH_MS) return;
     const steps = trail.steps.map(step => ({
@@ -443,7 +475,7 @@ export class BackgroundAgentJobs {
       reasoning: compactStepTrailText(step.reasoning),
     }));
     try {
-      this.store.upsertMessageStepTrail(job.sessionId, trail.sourceMessageId, steps, { jobId: job.id });
+      job.store.upsertMessageStepTrail(job.sessionId, trail.sourceMessageId, steps, { jobId: job.id });
       trail.lastFlushAt = now;
       trail.dirty = false;
     } catch {
@@ -470,10 +502,91 @@ function jobInfo({ id, sessionId, status, createdAt, updatedAt }: AgentJob): Age
   return { id, sessionId, status, createdAt, updatedAt };
 }
 
+type ProjectWorkspace = {
+  realRoot: string;
+};
+
+function isInsideDirectory(parent: string, candidate: string): boolean {
+  const path = relative(parent, candidate);
+  return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
+}
+
+function workspaceProjectId(workspace: ProjectWorkspace, projectRoot: string): string {
+  const realProjectRoot = realpathSync(projectRoot);
+  if (!isInsideDirectory(workspace.realRoot, realProjectRoot)) {
+    throw new Error("当前项目不在指定工作区内");
+  }
+  const path = relative(workspace.realRoot, realProjectRoot);
+  if (path && path.includes(sep)) throw new Error("工作区仅支持切换根目录和直接子目录中的项目");
+  return path || ".";
+}
+
+function isWorkspaceProjectId(value: string): boolean {
+  if (value === ".") return true;
+  return Boolean(value)
+    && !value.includes("\0")
+    && !value.includes("/")
+    && !value.includes("\\")
+    && value !== "."
+    && value !== "..";
+}
+
+function resolveWorkspaceProject(workspace: ProjectWorkspace, id: string): WriterProject {
+  if (!isWorkspaceProjectId(id)) throw new Error("项目标识无效");
+  const candidate = id === "." ? workspace.realRoot : resolve(workspace.realRoot, id);
+  let metadata: ReturnType<typeof lstatSync>;
+  try {
+    metadata = lstatSync(candidate);
+  } catch {
+    throw new Error("项目不存在");
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("项目目录无效");
+  }
+  const realProjectRoot = realpathSync(candidate);
+  if (!isInsideDirectory(workspace.realRoot, realProjectRoot)) {
+    throw new Error("项目目录超出工作区边界");
+  }
+  const relativePath = relative(workspace.realRoot, realProjectRoot);
+  if (relativePath && relativePath.includes(sep)) {
+    throw new Error("工作区仅支持切换根目录和直接子目录中的项目");
+  }
+  const marker = resolve(realProjectRoot, "writer.yaml");
+  try {
+    if (!statSync(marker).isFile() || !isInsideDirectory(realProjectRoot, realpathSync(marker))) {
+      throw new Error("不是 Writer 项目");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "不是 Writer 项目") throw error;
+    throw new Error("不是 Writer 项目");
+  }
+  return new WriterProject(realProjectRoot);
+}
+
+function projectSummary(workspace: ProjectWorkspace, project: WriterProject): ProjectSummary {
+  return { id: workspaceProjectId(workspace, project.root), title: project.config().title };
+}
+
+function listWorkspaceProjects(workspace: ProjectWorkspace): ProjectSummary[] {
+  const ids = [".", ...readdirSync(workspace.realRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => entry.name)
+    .sort((left, right) => left.localeCompare(right, "zh-CN"))];
+  return ids.flatMap((id) => {
+    try {
+      return [projectSummary(workspace, resolveWorkspaceProject(workspace, id))];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export async function startWriterServer(options: {
   project: WriterProject;
   store: WriterStore;
   providers: ProviderManager;
+  /** Workspace root containing the current project and its sibling projects. */
+  workspaceRoot?: string;
   host?: string;
   port?: number;
   /** Disable API bearer-token checks only when explicitly requested by the CLI. */
@@ -491,6 +604,21 @@ export async function startWriterServer(options: {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4096;
   const requireToken = options.requireToken !== false;
+  const workspaceRoot = resolve(options.workspaceRoot ?? dirname(options.project.root));
+  let workspace: ProjectWorkspace;
+  try {
+    workspace = { realRoot: realpathSync(workspaceRoot) };
+    if (!statSync(workspace.realRoot).isDirectory()) throw new Error("工作区不是目录");
+    // Validate the initially opened project against the same boundary as every switch.
+    resolveWorkspaceProject(workspace, workspaceProjectId(workspace, options.project.root));
+  } catch (error) {
+    throw new Error(`工作区无效：${errorMessage(error)}`);
+  }
+  let activeProject = projectSummary(workspace, options.project);
+  let projectEpoch = 0;
+  let switchingProject = false;
+  let inFlightWorkspaceRequests = 0;
+  const workspaceRequestWaiters = new Set<() => void>();
   const token = requireToken ? randomBytes(24).toString("base64url") : "";
   const localBypassToken = randomBytes(24).toString("base64url");
   let readonlyToken = "";
@@ -500,24 +628,32 @@ export async function startWriterServer(options: {
   let publicOrigin: string | null | undefined;
 
   const scheduleStyleExampleReview = (template: StyleTemplate) => {
-    const contentHash = options.project.hash(template.exampleContent.trim());
+    // Reviews run asynchronously. Capture the resource set so a delayed review
+    // cannot seed or report against whichever project happens to be active later.
+    const project = options.project;
+    const store = options.store;
+    const providers = options.providers;
+    const scheduledEpoch = projectEpoch;
+    const contentHash = project.hash(template.exampleContent.trim());
     const running = styleExampleReviews.get(template.id);
     if (running?.status === "reviewing" && running.contentHash === contentHash) return;
-    options.store.seedStyleExample(template, false);
+    store.seedStyleExample(template, false);
     styleExampleReviews.set(template.id, { contentHash, status: "reviewing" });
     setImmediate(() => {
       void assertWritingExamplePassesGates(
         template.exampleContent,
-        options.project,
-        options.providers,
+        project,
+        providers,
       ).then(() => {
-        const current = options.project.styleTemplate(template.id);
-        if (!current || options.project.hash(current.exampleContent.trim()) !== contentHash) return;
-        options.store.seedStyleExample(current, true);
+        if (projectEpoch !== scheduledEpoch || options.project !== project) return;
+        const current = project.styleTemplate(template.id);
+        if (!current || project.hash(current.exampleContent.trim()) !== contentHash) return;
+        store.seedStyleExample(current, true);
         styleExampleReviews.delete(template.id);
       }).catch((cause) => {
-        const current = options.project.styleTemplate(template.id);
-        if (!current || options.project.hash(current.exampleContent.trim()) !== contentHash) return;
+        if (projectEpoch !== scheduledEpoch || options.project !== project) return;
+        const current = project.styleTemplate(template.id);
+        if (!current || project.hash(current.exampleContent.trim()) !== contentHash) return;
         styleExampleReviews.set(template.id, {
           contentHash,
           status: "failed",
@@ -567,6 +703,64 @@ export async function startWriterServer(options: {
     return readonlyToken && tokensEqual(provided, readonlyToken) ? "readonly" : "owner";
   };
 
+  const switchProject = async (projectId: string): Promise<ProjectSummary> => {
+    if (switchingProject) throw new Error("正在切换项目，请稍后再试");
+    const nextProject = resolveWorkspaceProject(workspace, projectId);
+    const nextSummary = projectSummary(workspace, nextProject);
+    if (nextSummary.id === activeProject.id) return activeProject;
+    switchingProject = true;
+    try {
+      if (inFlightWorkspaceRequests > 0) {
+        await new Promise<void>((resolveIdle) => workspaceRequestWaiters.add(resolveIdle));
+      }
+      // Running jobs carry their original store, and must finish before it closes.
+      await agentJobs.cancelAllAndWait();
+      const nextStore = new WriterStore(nextProject);
+      const nextProviders = new ProviderManager(nextProject);
+      const previousStore = options.store;
+      options.project = nextProject;
+      options.store = nextStore;
+      options.providers = nextProviders;
+      agentJobs.setStore(nextStore);
+      agentJobs.clear();
+      styleExampleReviews.clear();
+      readonlyToken = "";
+      activeProject = nextSummary;
+      projectEpoch += 1;
+      previousStore.close();
+      return activeProject;
+    } finally {
+      switchingProject = false;
+    }
+  };
+
+  // A workspace switch is a resource transaction. Refuse requests that arrive
+  // during its cancellation/close window instead of letting them target a stale DB.
+  app.use("/api/*", async (context, next) => {
+    const path = context.req.path;
+    const switchRequest = path === "/api/projects/switch";
+    const jobEventStream = /^\/api\/chat\/jobs\/[^/]+\/events$/.test(path);
+    if (switchingProject && !switchRequest) {
+      return context.json({ error: "正在切换项目，请稍后再试" }, 409);
+    }
+    // SSE only observes a job and may intentionally remain open. It never owns
+    // project resources, so it must not delay the resource transaction.
+    if (switchRequest || jobEventStream) {
+      await next();
+      return;
+    }
+    inFlightWorkspaceRequests += 1;
+    try {
+      await next();
+    } finally {
+      inFlightWorkspaceRequests -= 1;
+      if (inFlightWorkspaceRequests === 0) {
+        for (const resolveIdle of workspaceRequestWaiters) resolveIdle();
+        workspaceRequestWaiters.clear();
+      }
+    }
+  });
+
   app.get("/api/health", (context) => context.json({
     ok: true,
     ts: Date.now(),
@@ -587,6 +781,22 @@ export async function startWriterServer(options: {
     return context.json({ ok: true });
   });
 
+  app.get("/api/projects", (context) => context.json({
+    currentProjectId: activeProject.id,
+    projects: listWorkspaceProjects(workspace),
+  }));
+
+  app.post("/api/projects/switch", async (context) => {
+    try {
+      const body = await context.req.json<{ projectId?: unknown }>();
+      if (typeof body.projectId !== "string") throw new Error("项目标识无效");
+      const project = await switchProject(body.projectId);
+      return context.json({ project, projectEpoch });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.get("/api/state", (context) => {
     const accessMode = requestAccessMode(context.req.header("authorization"));
     const requested = context.req.query("session");
@@ -595,6 +805,8 @@ export async function startWriterServer(options: {
       : options.store.latestSession() ?? options.store.createSession();
     return context.json({
       accessMode,
+      project: activeProject,
+      projectEpoch,
       config: options.project.config(),
       documents: options.project.listDocuments(),
       documentFolders: options.project.listDocumentFolders(),
@@ -1475,7 +1687,12 @@ export async function startWriterServer(options: {
 
   app.post("/api/chat", async (context) => {
     const body = await context.req.json<{ sessionId: string; prompt: string; mode?: WritingMode | "character" | "roleplay"; permissionMode?: string; performer?: RoleplayParticipant; identity?: RoleplayParticipant; characterId?: number; interlocutor?: RoleplayInterlocutor; scene?: RoleplayScene; inputMode?: RoleplayInputMode; opening?: boolean; performerAutoReply?: boolean; contextDocumentPaths?: string[]; characterScope?: number[]; simpleCharacterScope?: number[]; variantGroupId?: string; rerunDirections?: unknown; rerunControls?: unknown; perceptionOverride?: unknown; documentSelections?: Array<{ path: string; text: string }>; resumeInterrupted?: boolean; attachments?: Array<{ name?: string; mimeType: string; dataBase64: string }> }>();
-    if (!body.sessionId || !options.store.sessionExists(body.sessionId)) {
+    // A job keeps this exact resource set for its whole lifetime. Workspace
+    // switching waits for these jobs before closing their store.
+    const project = options.project;
+    const store = options.store;
+    const providers = options.providers;
+    if (!body.sessionId || !store.sessionExists(body.sessionId)) {
       return context.json({ error: "Session not found" }, 404);
     }
     if (agentJobs.activeJob(body.sessionId)) {
@@ -1499,7 +1716,7 @@ export async function startWriterServer(options: {
     const variantGroupId = typeof body.variantGroupId === "string" && body.variantGroupId.length <= 100
       ? body.variantGroupId
       : undefined;
-    const runtimeSettings = loadAgentSettings(options.project);
+    const runtimeSettings = loadAgentSettings(project);
     const permissionMode = body.permissionMode && isPermissionMode(body.permissionMode)
       ? body.permissionMode
       : runtimeSettings.permissionMode;
@@ -1537,24 +1754,24 @@ export async function startWriterServer(options: {
         };
         if (body.mode === "character") {
           await updateCharacterFromConversation({
-            model: options.providers.modelConfig("agent"), summaryModel: options.providers.summaryModelConfig(), store: options.store,
+            model: providers.modelConfig("agent"), summaryModel: providers.summaryModelConfig(), store,
             sessionId: body.sessionId, instruction: body.prompt,
             characterId: Number.isInteger(body.characterId) ? body.characterId : undefined,
             jobId: job.id,
-            allowedDocumentPaths: characterContextDocumentPaths(options.project, body.contextDocumentPaths),
+            allowedDocumentPaths: characterContextDocumentPaths(project, body.contextDocumentPaths),
             signal, onEvent,
           });
         } else if (body.mode === "roleplay") {
           if (!body.performer && !Number.isInteger(body.characterId)) throw new Error("角色扮演需要指定扮演者");
           await runRoleplayChat({
-            project: options.project,
-            store: options.store,
+            project,
+            store,
             sessionId: body.sessionId,
             performer: body.performer,
             characterId: body.characterId,
             identity: body.identity,
             interlocutor: body.interlocutor,
-            scene: body.scene?.id ? options.store.roleplayScenes().find(item => item.id === body.scene!.id) : undefined,
+            scene: body.scene?.id ? store.roleplayScenes().find(item => item.id === body.scene!.id) : undefined,
             prompt: body.prompt,
             jobId: job.id,
             inputMode: body.inputMode === "director" ? "director" : "dialogue",
@@ -1566,17 +1783,17 @@ export async function startWriterServer(options: {
             ...(body.perceptionOverride
               ? { perceptionOverride: parseRoleplayPerception(JSON.stringify(body.perceptionOverride)) }
               : {}),
-            model: options.providers.modelConfig("roleplay"),
-            perceptionModel: options.providers.modelConfig("roleplay_perception"),
-            qualityModel: options.providers.modelConfig("roleplay_quality"),
-            summarizer: options.providers.modelConfig("roleplay_memory"),
+            model: providers.modelConfig("roleplay"),
+            perceptionModel: providers.modelConfig("roleplay_perception"),
+            qualityModel: providers.modelConfig("roleplay_quality"),
+            summarizer: providers.modelConfig("roleplay_memory"),
             signal,
             onEvent,
           });
         } else {
           await runAgent({
-            project: options.project,
-            store: options.store,
+            project,
+            store,
             sessionId: body.sessionId,
             jobId: job.id,
             prompt: body.prompt,
@@ -1589,9 +1806,9 @@ export async function startWriterServer(options: {
             permissionMode,
             scenePipelineSettings: runtimeSettings.scenePipeline,
             models: {
-              agent: options.providers.modelConfig("agent"), image: options.providers.imageModelConfig(), writer: options.providers.modelConfig("writer"),
-              inline: options.providers.modelConfig("inline"), reviewer: options.providers.modelConfig("reviewer"),
-              summarizer: options.providers.summaryModelConfig(),
+              agent: providers.modelConfig("agent"), image: providers.imageModelConfig(), writer: providers.modelConfig("writer"),
+              inline: providers.modelConfig("inline"), reviewer: providers.modelConfig("reviewer"),
+              summarizer: providers.summaryModelConfig(),
             },
             signal,
             onEvent,
@@ -1611,12 +1828,12 @@ export async function startWriterServer(options: {
           try {
             const titleSignal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
             await maybeAutoTitleSession({
-              store: options.store,
-              model: options.providers.summaryModelConfig(),
+              store,
+              model: providers.summaryModelConfig(),
               sessionId: body.sessionId,
               signal: titleSignal,
               usageReporter: (callModel, callUsage, meta) => {
-                emit(buildRecordedUsageEvent(options.store, body.sessionId, callModel, callUsage, {
+                emit(buildRecordedUsageEvent(store, body.sessionId, callModel, callUsage, {
                   ...meta,
                   jobId: job.id,
                 }));
@@ -2008,7 +2225,13 @@ export async function startWriterServer(options: {
       }
     },
     close: async () => {
-      await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);
+      await agentJobs.cancelAllAndWait();
+      agentJobs.clear();
+      try {
+        await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);
+      } finally {
+        options.store.close();
+      }
     },
   };
 }

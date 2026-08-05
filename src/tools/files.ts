@@ -1,6 +1,9 @@
 import { documentBlocks } from "../document_blocks.js";
 import { isScenePipelineDocument } from "../project.js";
+import { buildNarrativeEvidencePacket } from "../narrative_evidence.js";
+import { requestEvidenceGroundedProse } from "../evidence_grounded_writer.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
+import { styleGroundingPrompt } from "../style_grounding.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import {
   assertWritableMode,
@@ -301,6 +304,10 @@ export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
       },
     });
   }
+  if (typeof args.input.content !== "string" && !existing
+    && args.context.evidenceGroundedWriter && isScenePipelineDocument(path)) {
+    return handleEvidenceGroundedWriteFile(args, path);
+  }
   if (typeof args.input.content !== "string" && !existing) {
     throw new Error("新建或完整替换文件时 content 必须是字符串；只有已有工作副本或已终审场景草稿才能省略 content 重新验证");
   }
@@ -308,6 +315,64 @@ export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
     ? args.input.content
     : existing!.content);
   return submitWorkingTextFile(args, staged, "write");
+}
+
+async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: string): Promise<string> {
+  const pack = args.context.lastWritePackData;
+  if (!pack || !args.context.writePackCompiled) {
+    throw new Error("EVIDENCE_WRITER_PACK_REQUIRED：先 compile_write_pack 提交场景目标、人物当下、已知事实、事件方向与不可补写项，再调用 write_file(path) 并省略 content");
+  }
+  const writer = args.context.evidenceGroundedWriter!;
+  const evidence = buildNarrativeEvidencePacket({
+    project: args.project,
+    store: args.store,
+    context: args.context,
+    path,
+  });
+  args.context.narrativeEvidencePackets?.set(path, evidence);
+  const existingText = args.project.textFileExists(path) ? args.project.readTextFile(path) : "";
+  const run = writer.run ?? requestEvidenceGroundedProse;
+  const generated = await run(writer.model, {
+    path,
+    outputKind: "document",
+    writePack: pack,
+    evidence,
+    ...(existingText ? { existingText } : {}),
+    styleEvidence: styleGroundingPrompt(args.project, args.store, {
+      intensive: true,
+      targetPath: path,
+      excludeProjectVoice: Boolean(existingText),
+      projectSampleRole: "continuity",
+    }),
+    targetCharacters: args.context.proseLength?.targetCharacters,
+  }, { project: args.project, context: args.context }, writer.signal);
+  if (generated.usage) {
+    args.context.modelUsageReporter?.(writer.model, generated.usage, {
+      callKind: "evidence_grounded_document_writer",
+    });
+  }
+  const content = ensureDocumentHeading(path, existingText, generated.content);
+  args.context.writePackCompiled = false;
+  args.context.lastWritePack = undefined;
+  args.context.lastWritePackData = undefined;
+  const staged = stageWorkingTextFile(args, path, content);
+  const result = await submitWorkingTextFile(args, staged, "write");
+  const parsed = JSON.parse(result) as Record<string, unknown>;
+  return JSON.stringify({
+    ...parsed,
+    generationMode: "evidence_grounded_writer",
+    evidenceHash: generated.evidenceHash,
+    evidenceReads: generated.evidenceReads.length,
+  });
+}
+
+function ensureDocumentHeading(path: string, existingText: string, generated: string): string {
+  const body = generated.trim();
+  if (/^#{1,6}\s+/u.test(body)) return `${body}\n`;
+  const existingHeading = /^#\s+(.+)$/mu.exec(existingText)?.[1]?.trim();
+  const pathHeading = path.split("/").at(-1)?.replace(/\.[^.]+$/u, "").trim();
+  const heading = existingHeading || pathHeading || "正文";
+  return `# ${heading}\n\n${body}\n`;
 }
 
 export async function handleEditFile(args: ToolHandlerArgs): Promise<string> {

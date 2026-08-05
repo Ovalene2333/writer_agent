@@ -13,6 +13,14 @@ import type { DocumentRevisionInput } from "../document_revision.js";
 import type { ProseGateRule } from "../prose_gate_rules.js";
 import type { ContinuityFact, ContinuityFactCandidate } from "../continuity_facts.js";
 import type { CharacterConstraintView } from "../character_constraints.js";
+import type { CharacterEvidenceRead, NarrativeEvidencePacket } from "../narrative_evidence.js";
+import type {
+  EvidenceGroundedWriterAccess,
+  EvidenceGroundedWriterInput,
+  EvidenceGroundedWriterResult,
+  SceneStateExtractionResult,
+} from "../evidence_grounded_writer.js";
+import type { WritePack } from "../write_pack.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -102,8 +110,14 @@ export type ToolExecutionContext = {
   simpleCharacterScope?: number[];
   /** Planner/UI-selected characters whose factual state should be supplied to final review. */
   reviewCharacterIds?: number[];
+  /** Characters whose voice section was actually read for spoken dialogue this job. */
+  dialogueEvidenceCharacterIds?: number[];
   /** Hashes of the exact constraint packets supplied to the writing context. */
   writerCharacterConstraintHashes?: Map<number, string>;
+  /** Original character-card sections actually read during this writing job. */
+  characterEvidenceReads?: Map<number, CharacterEvidenceRead>;
+  /** Evidence packets used by delegated prose calls, retained for matching review. */
+  narrativeEvidencePackets?: Map<string, NarrativeEvidencePacket>;
   /**
    * When true (outline mode), write_file / edit_file targeting
    * outline paths require a successful design_creative_outline earlier in this run.
@@ -116,6 +130,8 @@ export type ToolExecutionContext = {
   writePackCompiled?: boolean;
   /** Last compiled write pack text (for debugging / optional agent reuse). */
   lastWritePack?: string;
+  /** Structured counterpart of lastWritePack; delegated Writer must not reparse display text. */
+  lastWritePackData?: WritePack;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
   /** Current project scene-chain guidance and enforced per-document limit. */
@@ -187,6 +203,27 @@ export type ToolExecutionContext = {
       input: ChapterReviewInput,
       signal?: AbortSignal,
     ) => Promise<{ review: ChapterReviewResult; usage?: import("../types.js").ModelTokenUsage }>;
+  };
+  /** Prose-only model with read-only access to the shared narrative evidence packet. */
+  evidenceGroundedWriter?: {
+    model: ModelConfig;
+    stateModel: ModelConfig;
+    signal?: AbortSignal;
+    run?: (
+      model: ModelConfig,
+      input: EvidenceGroundedWriterInput,
+      access: EvidenceGroundedWriterAccess,
+      signal?: AbortSignal,
+    ) => Promise<EvidenceGroundedWriterResult>;
+    extractState?: (
+      model: ModelConfig,
+      input: {
+        previousState?: SceneActualState;
+        sceneContent: string;
+        nextScene?: { goal: string; entryState: string[]; characterIntent: string[]; obstacle: string };
+      },
+      signal?: AbortSignal,
+    ) => Promise<SceneStateExtractionResult>;
   };
   /** Semantic repair baselines, keyed by run + deliverable + path. */
   proposalReviewRevisions?: Map<string, ProposalReviewRevisionContext>;

@@ -72,6 +72,22 @@ test("human-written dialogue raises nothing", () => {
   assert.deepEqual(codes, []);
 });
 
+test("formal dialogue is a bookishness candidate, not proof that voices are interchangeable", () => {
+  const formal = [
+    "「请把记录留在桌上。我会在会后逐项核对，现在不宜当着他们谈这件事。」",
+    "「你可以核对，但不要替我删掉签名。那份记录首先属于提出异议的人。」",
+    "「门一旦关上，程序就会自行推进。你若要阻止它，现在只能说明理由。」",
+    "「理由已经写在附件里。真正的问题是，你准备让谁承担延误的责任。」",
+    "「我不接受把责任提前分配。先确认损失，再讨论由谁补救。」",
+    "「确认并不妨碍选择。你一直拖着，只是希望别人替你作决定。」",
+    "「我会作决定，不过不会在没有证人的房间里作。」",
+    "「那就把门打开。你想要见证，我想要一个明确的答复。」",
+  ].map(line => line.replace("」", "；相关记录仍待交接，谁都不能替另一方先作判断。」")).join("\n\n");
+  const codes = analyzeAiTells(formal).issues.map(issue => issue.code);
+  assert.ok(codes.includes("dialogue_bookish"));
+  assert.ok(!codes.includes("dialogue_homogeneous"), `codes=${codes.join(",")}`);
+});
+
 test("这一层测的东西，前面的规则层一个都发现不了", () => {
   // 既有的减分层对这段完全无话可说 —— 这正是本模块存在的理由。
   assert.deepEqual(newProseStyleIssues("", AI_ISH).map(issue => issue.subtype), []);

@@ -10,7 +10,7 @@ import {
 import { proposalRevisionIssueId, type ProposalRevisionIssue } from "./proposal_retry.js";
 
 const SCENES = new Set(["s1"]);
-const SOURCE = "「我们必须面对这个真相。」他说。她也这样说话。最后他终于明白了一切。";
+const SOURCE = "「我们必须面对这个真相。」他说。「别把话说满。」她说。最后他终于明白了一切。";
 
 function review(
   issues: unknown[],
@@ -30,7 +30,7 @@ test("终审接受三类新增的生成腔判断", () => {
   const parsed = parseChapterReview(review([
     {
       severity: "blocker", kind: "voice_homogenization", sceneId: "s1",
-      evidence: ["「我们必须面对这个真相。」"],
+      evidence: ["「我们必须面对这个真相。」", "「别把话说满。」"],
       problem: "两个人物的台词可以互换", action: "给她一套自己的说话方式",
     },
     {
@@ -43,9 +43,14 @@ test("终审接受三类新增的生成腔判断", () => {
       evidence: [],
       problem: "冲突靠互相理解化解，没有人付出代价", action: "让某一方失去一件不可撤销的东西",
     },
+    {
+      severity: "warning", kind: "dialogue_telegraphic", sceneId: "s1",
+      evidence: ["「我们必须面对这个真相。」他说。「别把话说满。」她说。"],
+      problem: "两句之间没有可补全的行动或信息承接", action: "补出人物正在争取的信息",
+    },
   ]), SCENES, SOURCE);
   assert.deepEqual(parsed.issues.map(issue => issue.kind), [
-    "voice_homogenization", "theme_stated", "resolution_too_smooth",
+    "voice_homogenization", "theme_stated", "resolution_too_smooth", "dialogue_telegraphic",
   ]);
   assert.equal(parsed.verdict, "revise");
 });
@@ -74,7 +79,7 @@ test("新 kind 不放宽 blocker 的证据要求", () => {
 });
 
 test("直接文档终审可回填 document sceneId，并容忍引号空白差异", () => {
-  const source = "「我们必须面对这个真相。」他说。";
+  const source = "「我们必须面对这个真相。」他说。「别把话说满。」她说。";
   const parsed = parseChapterReview(JSON.stringify({
     verdict: "revise",
     chapterChange: "对白区分说话人",
@@ -82,7 +87,7 @@ test("直接文档终审可回填 document sceneId，并容忍引号空白差异
     issues: [{
       severity: "blocker",
       kind: "voice_homogenization",
-      evidence: ['"我们必须面对这个真相。"'],
+      evidence: ['"我们必须面对这个真相。"', '"别把话说满。"'],
       problem: "台词可互换",
       action: "改说话方式",
     }],
@@ -119,7 +124,7 @@ test("有可定位 blocker 时，不完整 sibling 不拖垮整次 revise", () =
   const parsed = parseChapterReview(review([
     {
       severity: "blocker", kind: "voice_homogenization", sceneId: "s1",
-      evidence: ["「我们必须面对这个真相。」"],
+      evidence: ["「我们必须面对这个真相。」", "「别把话说满。」"],
       problem: "对白不可分", action: "区分声口",
     },
     {

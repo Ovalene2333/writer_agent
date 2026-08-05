@@ -62,6 +62,14 @@ export function rememberLastSessionId(id: string | undefined): void {
     /* ignore quota / private mode */
   }
 }
+
+export function clearLastSessionId(): void {
+  try {
+    localStorage.removeItem(LAST_SESSION_KEY);
+  } catch {
+    /* ignore unavailable storage */
+  }
+}
 export function IconButton({ label, children, className = "", onClick, disabled = false }: {
   label: string;
   children: React.ReactNode;

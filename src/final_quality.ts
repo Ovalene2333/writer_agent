@@ -1,5 +1,5 @@
 /**
- * Final writing-quality report: one object composed from the three deterministic
+ * Final writing-quality report: one object composed from the deterministic
  * prose layers, computed once at proposal time.
  *
  * Why a separate module: `scene_pipeline.ts` (章节场景管线) and `proposals.ts`
@@ -12,9 +12,9 @@
  * so what lands here is the residual checklist plus two scores.
  */
 
-import { analyzeAiTells, formatAiTellSummary } from "./ai_tells.js";
-import { analyzeChapterProseMetrics } from "./prose_metrics.js";
-import { analyzeProseVividness, formatVividnessSummary } from "./prose_vividness.js";
+import { formatAiTellSummary } from "./ai_tells.js";
+import { adaptiveQualityWarnings, analyzeAdaptiveStyle } from "./adaptive_style.js";
+import { formatVividnessSummary } from "./prose_vividness.js";
 import { assessProseLength } from "./prose_length.js";
 import type { ProseQualityReport } from "./types.js";
 
@@ -27,33 +27,17 @@ export function buildProseQualityReport(
   text: string,
   options?: { priorText?: string; lengthTarget?: number },
 ): ProseQualityReport {
-  const metrics = analyzeChapterProseMetrics(text, options?.priorText ? { priorText: options.priorText } : undefined);
-  const vividness = analyzeProseVividness(text);
-  const aiTells = analyzeAiTells(text);
-
-  const warnings: ProseQualityReport["warnings"] = [
-    ...metrics.issues.map(issue => ({
-      source: "metrics" as const,
-      code: issue.code,
-      message: issue.message,
-      examples: issue.examples.slice(0, 5),
-    })),
-    ...vividness.issues.map(issue => ({
-      source: "vividness" as const,
-      code: issue.code,
-      message: issue.message,
-      examples: issue.examples.slice(0, 5),
-    })),
-    ...aiTells.issues.map(issue => ({
-      source: "ai_tells" as const,
-      code: issue.code,
-      message: issue.message,
-      examples: issue.examples.slice(0, 5),
-    })),
-  ];
+  const adaptive = analyzeAdaptiveStyle(
+    text,
+    options?.priorText ? { priorText: options.priorText } : undefined,
+  );
+  const { vividness, aiTells } = adaptive;
+  const warnings: ProseQualityReport["warnings"] = adaptiveQualityWarnings(adaptive);
 
   const rhythmHeavy = warnings.some(warning =>
-    warning.code === "rhythm_flat" || warning.code === "rhythm_uniform",
+    warning.code === "rhythm_flat"
+      || warning.code === "rhythm_uniform"
+      || warning.code === "narrative_rhythm_uniform",
   );
   return {
     characters: vividness.stats.characters,

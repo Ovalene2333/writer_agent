@@ -670,14 +670,14 @@ export function ModelConfig({
         <section className="writing-settings-section">
           <div className="writing-settings-section-head"><div><h4>场景候选</h4><p>只在场景质量有提升空间时，生成事实不变的候选稿并择优。</p></div></div>
           <div className="scene-settings-grid compact">
-            <label className={writerSettingsInvalid ? "field-invalid" : ""}><span>候选稿数量</span><select aria-invalid={writerSettingsInvalid} value={sceneDraft.candidateCount} onChange={event => setSceneDraft(current => ({ ...current, candidateCount: Number(event.target.value) }))}><option value={1}>1 · 不生成候选</option><option value={2}>2 · 默认择优</option><option value={3}>3 · 更多比较</option></select><small>场景正文始终由当前 Agent 在同一任务链中提交。</small></label>
+            <label className={writerSettingsInvalid ? "field-invalid" : ""}><span>候选稿数量</span><select aria-invalid={writerSettingsInvalid} value={sceneDraft.candidateCount} onChange={event => setSceneDraft(current => ({ ...current, candidateCount: Number(event.target.value) }))}><option value={1}>1 · 不生成候选</option><option value={2}>2 · 默认择优</option><option value={3}>3 · 更多比较</option></select><small>分工模式优先保持共享事实包，不再对证据型 Writer 的正文做无证据候选改写。</small></label>
           </div>
         </section>
 
         <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid ? "status" : "alert"}>{sceneDraftValid
           ? !sceneDraft.enabled
-            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式开启" : "分工模式开启"}，正文直接成稿。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-            : `当前：${writingMode === "fast" ? "快速模式" : "标准模式"}；正文由当前 Agent 完成。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式由 Agent 直接成稿" : "分工模式由 Agent 取证、证据型 Writer 成稿"}。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+            : `当前：${writingMode === "fast" ? "快速模式由 Agent 提交正文与状态" : "分工模式由证据型 Writer 生成正文、运行时提取状态"}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
           : "请检查默认章节字数、Agent 步数、场景数量、notes 上限与候选稿数量。"}</div>
         <div className="scene-settings-actions">
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>

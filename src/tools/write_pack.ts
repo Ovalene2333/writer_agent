@@ -18,6 +18,7 @@ export function handleCompileWritePack({ input, context }: ToolHandlerArgs): str
   const writePack = formatWritePackForWriter(pack);
   context.writePackCompiled = true;
   context.lastWritePack = writePack;
+  context.lastWritePackData = pack;
   context.writePackSceneId = undefined;
   return JSON.stringify({
     status: "compiled",

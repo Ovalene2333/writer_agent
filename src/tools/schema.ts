@@ -202,7 +202,7 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "write_file",
-      description: "新建或完整替换 resource/ 内 UTF-8 文本工作副本；已有工作副本或已终审场景草稿时可省略 content 重新验证",
+      description: "新建或完整替换 resource/ 内 UTF-8 文本工作副本；分工写正文时先 compile_write_pack，再省略 content 调用证据型 Writer；已有工作副本或已终审场景草稿也可省略 content 重新验证",
       parameters: {
         type: "object",
         properties: {
@@ -425,15 +425,28 @@ const TOOL_DEFINITIONS = deepFreeze([
                 targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
                 characterScopes: {
                   type: "array", maxItems: 12,
-                  description: "本场允许使用的角色卡引用；只填角色 ID、能力 ID 与是否读取该角色对白声线，不复制卡面事实",
+                  description: "本场允许使用的角色卡引用；能力须声明 use/attempt/unlock/regain/lose 语义，不复制卡面事实",
                   items: {
                     type: "object",
                     properties: {
                       characterId: { type: "number", description: "角色卡 ID" },
-                      competencyIds: { type: "array", items: { type: "string" }, description: "本场允许兑现的已解锁能力 ID；无能力时传 []" },
+                      competencyUses: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            competencyId: { type: "string", description: "角色卡中的稳定能力 ID" },
+                            mode: { type: "string", enum: ["use", "attempt", "unlock", "regain", "lose"], description: "直接使用、尝试、首次觉醒、恢复或失去" },
+                          },
+                          required: ["competencyId", "mode"],
+                          additionalProperties: false,
+                        },
+                        description: "本场能力授权；无能力时传 []",
+                      },
+                      competencyIds: { type: "array", items: { type: "string" }, description: "旧草稿兼容字段；新场景不要传" },
                       dialogue: { type: "boolean", description: "该角色本场说话时可读取其声线；只约束其引号内对白" },
                     },
-                    required: ["characterId", "competencyIds"],
+                    required: ["characterId", "competencyUses"],
                     additionalProperties: false,
                   },
                 },
@@ -452,7 +465,7 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "write_chapter_scene",
-      description: "场景写入：提交故事内 notes、本场正文和实际离场状态",
+      description: "场景写入：快速模式提交 notes/正文/实际状态；分工模式只提交 notes，由证据型 Writer 生成",
       parameters: {
         type: "object",
         properties: {
@@ -477,7 +490,7 @@ const TOOL_DEFINITIONS = deepFreeze([
             additionalProperties: false,
           },
         },
-        required: ["sceneId", "notes", "content", "actualState"],
+        required: ["sceneId", "notes"],
         additionalProperties: false,
       },
     },
@@ -517,10 +530,23 @@ const TOOL_DEFINITIONS = deepFreeze([
                     type: "object",
                     properties: {
                       characterId: { type: "number", description: "角色卡 ID" },
-                      competencyIds: { type: "array", items: { type: "string" }, description: "本场允许兑现的已解锁能力 ID；无能力时传 []" },
+                      competencyUses: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            competencyId: { type: "string", description: "角色卡中的稳定能力 ID" },
+                            mode: { type: "string", enum: ["use", "attempt", "unlock", "regain", "lose"], description: "直接使用、尝试、首次觉醒、恢复或失去" },
+                          },
+                          required: ["competencyId", "mode"],
+                          additionalProperties: false,
+                        },
+                        description: "本场能力授权；无能力时传 []",
+                      },
+                      competencyIds: { type: "array", items: { type: "string" }, description: "旧草稿兼容字段；新场景不要传" },
                       dialogue: { type: "boolean", description: "该角色本场说话时可读取其声线；只约束其引号内对白" },
                     },
-                    required: ["characterId", "competencyIds"],
+                    required: ["characterId", "competencyUses"],
                     additionalProperties: false,
                   },
                 },
@@ -805,7 +831,7 @@ const TOOL_DEFINITIONS = deepFreeze([
             },
           },
           outlineNodeId: { type: "string", description: "场景态/经历用的大纲节点 ID" },
-          competencyIds: { type: "array", items: { type: "string" }, description: "读取 competencies 时必填：要核对的能力 ID；正文只返回这些已解锁能力" },
+          competencyIds: { type: "array", items: { type: "string" }, description: "读取 competencies 时必填：当前场景按 competencyUses 返回机制、入场状态与模式约束" },
         },
         required: ["id"],
         additionalProperties: false,
@@ -860,7 +886,7 @@ const TOOL_DEFINITIONS = deepFreeze([
           reason: { type: "string", description: "已确认事实摘要" },
           changes: {
             type: "array",
-            description: "变更列表。op 及参数：set_unlocked{competencyId,unlocked} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,location|physical|emotion|notes|knowledge|beliefs|intentions|temporaryGoals}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
+            description: "变更列表。op 及参数：set_competency_state{competencyId,state:available|latent|blocked|lost|unknown,reason,evidence?,storyStateId?,outlineNodeId?} / upsert_competency{entry} / set_psychology_summary{summary} / upsert_psychology_entry{group:traits|values|fears|conflicts,entry:{label,description}} / delete_psychology_entry{group,entryId} / add_experience{entry:{label,description}} / delete_experience{entryId} / upsert_motivation{entry:{summary,category,status}} / upsert_relationship{entry:{characterId,type,attitude,description}} / upsert_story_state{entry:{outlineNodeId或unanchored:true,location|physical|emotion|notes|knowledge|beliefs|intentions|temporaryGoals|competencyStates}} / delete_entry{section,entryId}。entry 带 id=更新，省略=新增",
             items: { type: "object", additionalProperties: true },
           },
         },

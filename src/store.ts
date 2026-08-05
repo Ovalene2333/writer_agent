@@ -244,6 +244,7 @@ function parseProposalCharacterRevisions(value: unknown): ProposalCharacterRevis
 
 export class WriterStore {
   readonly database: DatabaseSync;
+  private closed = false;
 
   constructor(readonly project: WriterProject) {
     mkdirSync(project.privateDir, { recursive: true });
@@ -261,6 +262,8 @@ export class WriterStore {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.database.close();
   }
 

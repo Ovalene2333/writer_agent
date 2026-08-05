@@ -1,3 +1,5 @@
+import { isCompetencyUseMode, type SceneCompetencyUse } from "./competency_state.js";
+
 export type ChapterDraftMode = "create" | "replace" | "append";
 
 /**
@@ -7,6 +9,9 @@ export type ChapterDraftMode = "create" | "replace" | "append";
  */
 export type SceneCharacterScope = {
   characterId: number;
+  /** Scene-local lifecycle semantics. This is the authoritative permission list. */
+  competencyUses?: SceneCompetencyUse[];
+  /** Derived legacy ID list retained for old checkpoints and consumers. */
   competencyIds: string[];
   /** This character may have their card voice read for their spoken dialogue. */
   dialogue?: boolean;
@@ -385,19 +390,29 @@ function normalizeSceneCharacterScopes(value: unknown, sceneIndex: number): Scen
       throw new Error(`scenes[${sceneIndex}].characterScopes 不能重复角色 ${characterId}`);
     }
     characterIds.add(characterId);
-    if (!Array.isArray(scope.competencyIds)) {
-      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds 必须是数组`);
+    const rawUses = Array.isArray(scope.competencyUses)
+      ? scope.competencyUses
+      : Array.isArray(scope.competencyIds)
+        ? scope.competencyIds.map(competencyId => ({ competencyId, mode: "use" }))
+        : undefined;
+    if (!rawUses) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyUses 必须是数组`);
     }
-    if (scope.competencyIds.length > MAX_COMPETENCIES_PER_SCENE_CHARACTER) {
-      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds 最多 ${MAX_COMPETENCIES_PER_SCENE_CHARACTER} 项`);
+    if (rawUses.length > MAX_COMPETENCIES_PER_SCENE_CHARACTER) {
+      throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyUses 最多 ${MAX_COMPETENCIES_PER_SCENE_CHARACTER} 项`);
     }
-    const competencyIds = scope.competencyIds.map((item, competencyIndex) => {
-      const id = cleanString(item);
-      if (!id || id.length > 128) {
-        throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds[${competencyIndex}] 无效`);
+    const competencyUses = rawUses.map((item, competencyIndex): SceneCompetencyUse => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyUses[${competencyIndex}] 无效`);
       }
-      return id;
+      const use = item as Record<string, unknown>;
+      const competencyId = cleanString(use.competencyId);
+      if (!competencyId || competencyId.length > 128 || !isCompetencyUseMode(use.mode)) {
+        throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyUses[${competencyIndex}] 需要有效 competencyId 与 mode`);
+      }
+      return { competencyId, mode: use.mode };
     });
+    const competencyIds = competencyUses.map(use => use.competencyId);
     if (new Set(competencyIds).size !== competencyIds.length) {
       throw new Error(`scenes[${sceneIndex}].characterScopes[${index}].competencyIds 不能重复`);
     }
@@ -407,7 +422,7 @@ function normalizeSceneCharacterScopes(value: unknown, sceneIndex: number): Scen
     if (!competencyIds.length && scope.dialogue !== true) {
       throw new Error(`scenes[${sceneIndex}].characterScopes[${index}] 至少选择一项能力或开启 dialogue`);
     }
-    return { characterId, competencyIds, ...(scope.dialogue === true ? { dialogue: true } : {}) };
+    return { characterId, competencyUses, competencyIds, ...(scope.dialogue === true ? { dialogue: true } : {}) };
   });
 }
 
