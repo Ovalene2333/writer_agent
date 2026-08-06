@@ -4928,6 +4928,28 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
+    if (isRecoverableProviderTermination(error)) {
+      const partial = stripDsmlText(transcript, "").trim();
+      const pauseBody = [
+        partial,
+        "模型连接在本步中途终止，已保留当前进度。",
+        "这不是用户取消；可以点击本步的「续跑」继续，系统会从当前任务状态接着执行。",
+        "[生成已中断]",
+      ].filter(Boolean).join("\n\n");
+      try {
+        if (partial || toolContext.generatedAttachments?.length) persistAssistantMessage(pauseBody);
+        store.addSystemMessage(sessionId, `Agent 供应商连接中断：${message}`);
+      } catch { /* 保持可续跑终态，不因诊断持久化失败再次遮蔽原错误。 */ }
+      freezeCurrentTurn();
+      persistRunTerminal("interrupted", "供应商连接中断");
+      emit({
+        type: "waiting_for_input",
+        sessionId,
+        question: "模型连接中途终止，当前进度已保留。可点击本步「续跑」继续。",
+        options: ["续跑"],
+      });
+      return;
+    }
     if (toolContext.generatedAttachments?.length) {
       try { persistAssistantMessage("图片已生成，但后续任务异常中断。"); } catch { /* retain original error */ }
     }
@@ -4958,6 +4980,13 @@ const REVIEW_PROMPT = `终审专则：降低机器生成感，不是换成另一
 export const AGENT_HARD_TURN_CAP = 100;
 /** Consecutive steps with an unchanged progress fingerprint before stall converge. */
 export const AGENT_STALL_WINDOW = 4;
+
+/** Provider-side stream termination is recoverable: keep the turn resumable. */
+export function isRecoverableProviderTermination(error: unknown): boolean {
+  if (error instanceof Error && error.name === "AbortError") return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:^|\b)(?:terminated|connection terminated|stream terminated|socket hang up|ECONNRESET|ETIMEDOUT)(?:\b|$)/iu.test(message.trim());
+}
 /** Extra steps after soft/stall to force a minimal deliverable or ask_user. */
 export const AGENT_CONVERGE_TURNS = 2;
 /** Extra turns beyond the run hard cap reserved for a scoped final-review repair. */

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AgentRunController } from "./agent_run_controller.js";
-import { computeAgentHardTurnBudget, proposalRevisionBaseChangeReason } from "./agent.js";
+import { computeAgentHardTurnBudget, isRecoverableProviderTermination, proposalRevisionBaseChangeReason } from "./agent.js";
 import { agentRunInvariantViolations } from "./agent_run_invariants.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -23,6 +23,16 @@ const twoDocumentTask: AgentTaskContract = {
   qualityProfile: "fast",
   documentDeliverables: ["第一章", "第二章"],
 };
+
+test("provider stream termination is resumable but explicit abort remains cancellation", () => {
+  assert.equal(isRecoverableProviderTermination(new Error("terminated")), true);
+  assert.equal(isRecoverableProviderTermination(new Error("socket hang up")), true);
+  assert.equal(isRecoverableProviderTermination(new Error("ECONNRESET")), true);
+  const abort = new Error("terminated");
+  abort.name = "AbortError";
+  assert.equal(isRecoverableProviderTermination(abort), false);
+  assert.equal(isRecoverableProviderTermination(new Error("模型请求失败（400）：invalid request")), false);
+});
 
 function fixture(name: string): { root: string; project: WriterProject; store: WriterStore; sessionId: string } {
   const root = mkdtempSync(join(tmpdir(), `writer-agent-run-v2-${name}-`));
