@@ -1,5 +1,8 @@
 import {
+  CHARACTER_PORTRAYAL_WRITING_RULE,
+  CHARACTER_VOICE_WRITING_RULE,
   characterSummaryCard,
+  characterVoiceWritingPayload,
   competenciesWritingPayload,
   normalizeCharacterChangeOp,
   resolveCharacterAt,
@@ -120,7 +123,7 @@ export function handleGetCharacter({ input, store, project, sessionId, character
       const dialogueEvidenceCharacterIds = context.dialogueEvidenceCharacterIds
         ?? (context.dialogueEvidenceCharacterIds = []);
       if (!dialogueEvidenceCharacterIds.includes(character.id)) dialogueEvidenceCharacterIds.push(character.id);
-      selected.voice = character.voice;
+      selected.voice = characterVoiceWritingPayload(character.voice);
       selected.writingMemory = store.writingMemoryPacket(sessionId, {
         targetPath: activePath,
         characterIds: [character.id],
@@ -136,8 +139,9 @@ export function handleGetCharacter({ input, store, project, sessionId, character
         characterId: character.id,
         name: character.identity.name,
         appliesTo: "spoken_dialogue_only",
-        rule: "仅约束该角色说出口的对白；不要迁移到叙述、动作描写或其他角色的对白。",
+        rule: `仅约束该角色说出口的对白；不要迁移到叙述、动作描写或其他角色的对白。${CHARACTER_VOICE_WRITING_RULE}`,
       };
+      selected.portrayalRule = CHARACTER_PORTRAYAL_WRITING_RULE;
     } else if (section === "experiences") {
       selected.experiences = scene && outlineNodeId ? scene.experiences : character.experiences;
     } else if (section === "psychology") {

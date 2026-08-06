@@ -82,6 +82,15 @@ export type CharacterDraft = {
     verbalHabits: string[];
     avoidedExpressions: string[];
     examples: string[];
+    interactionPrinciples: string[];
+    modes: Array<{
+      id: string;
+      context: string;
+      intent: string;
+      informationStrategy: string;
+      interactionStrategy: string;
+      register: string;
+    }>;
   };
   features: Feature[];
   competencies: Competency[];
@@ -177,8 +186,16 @@ const competencyStateLabel = (state: CompetencyAvailability) =>
 
 const splitList = (value: string) => value.split(/[,，\n]/).map(item => item.trim()).filter(Boolean);
 const entryId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-const filled = (value: string | string[] | undefined) =>
-  Array.isArray(value) ? value.some(item => item.trim()) : Boolean(value?.trim());
+const filled = (value: string | readonly unknown[] | undefined) => {
+  if (typeof value === "string") return Boolean(value.trim());
+  if (!Array.isArray(value)) return false;
+  return value.some(item => {
+    if (typeof item === "string") return Boolean(item.trim());
+    if (!item || typeof item !== "object") return Boolean(item);
+    return Object.values(item as Record<string, unknown>)
+      .some(field => typeof field === "string" && Boolean(field.trim()));
+  });
+};
 const clip = (value: string, max = 120) => {
   const text = value.trim();
   if (!text) return "";
@@ -313,6 +330,8 @@ export function CharacterEditor(props: {
         draft.voice.verbalHabits,
         draft.voice.avoidedExpressions,
         draft.voice.examples,
+        draft.voice.interactionPrinciples,
+        draft.voice.modes,
       ].filter(filled).length,
       goals: draft.motivations.length,
       features: draft.features.length,
@@ -470,7 +489,8 @@ export function CharacterEditor(props: {
                   </OverviewCard>
                   <OverviewCard
                     title="声线"
-                    empty={!filled(draft.voice.summary) && !filled(draft.voice.register)}
+                    empty={!filled(draft.voice.summary) && !filled(draft.voice.register)
+                      && draft.voice.interactionPrinciples.length === 0 && draft.voice.modes.length === 0}
                     onJump={() => setSection("voice")}
                   >
                     <p>{clip(draft.voice.summary || draft.voice.register) || "尚未填写声线"}</p>
@@ -774,6 +794,8 @@ export function CharacterEditor(props: {
                     verbalHabits: draft.voice.verbalHabits,
                     avoidedExpressions: draft.voice.avoidedExpressions,
                     examples: draft.voice.examples,
+                    interactionPrinciples: draft.voice.interactionPrinciples,
+                    modes: draft.voice.modes,
                   }, (current, summary) => ({
                     ...current,
                     voice: { ...current.voice, summary },
@@ -785,8 +807,38 @@ export function CharacterEditor(props: {
                   <Field label="避免表达" hint="逗号或换行" wide>
                     <input value={draft.voice.avoidedExpressions.join(", ")} onChange={e => patchVoice({ avoidedExpressions: splitList(e.target.value) })} placeholder="不说肉麻情话, 不自称本小姐" />
                   </Field>
-                  <Field label="对白示例" hint="每行一个不同处境；展示如何回应、回避或解释，不要只堆短句" wide>
-                    <textarea className="ce-tall" value={draft.voice.examples.join("\n")} onChange={e => patchVoice({ examples: e.target.value.split(/\n/).map(x => x.trim()).filter(Boolean) })} placeholder={"陌生人问路时：先问对方从哪里来，再给最短的方向。\n被同伴追问时：会停一下，把原先省去的理由说完整。"} rows={6} />
+                  <Field label="互动原则" hint="每行一条稳定选择；写信息取舍和回应方式，不写固定台词" wide>
+                    <textarea value={draft.voice.interactionPrinciples.join("\n")} onChange={e => patchVoice({ interactionPrinciples: e.target.value.split(/\n/).map(x => x.trim()).filter(Boolean) })} placeholder={"先判断对方为何发问，再决定是否解释。\n对熟人会用玩笑缓冲，但重要理由仍会说完整。"} rows={4} />
+                  </Field>
+                  <div className="ce-inline-head">
+                    <strong>情境模式</strong>
+                    <button type="button" onClick={() => patchVoice({
+                      modes: [...draft.voice.modes, {
+                        id: entryId("voice-mode"), context: "", intent: "", informationStrategy: "", interactionStrategy: "", register: "",
+                      }],
+                    })}>+ 添加模式</button>
+                  </div>
+                  {draft.voice.modes.length === 0 ? (
+                    <EmptyHint text="还没有情境模式。只有关系、场合或压力确实改变说话策略时才需要添加。" />
+                  ) : (
+                    <div className="ce-entry-list">
+                      {draft.voice.modes.map(mode => (
+                        <EntryCard key={mode.id} title={mode.context || "未命名情境"} onRemove={() => patchVoice({
+                          modes: draft.voice.modes.filter(item => item.id !== mode.id),
+                        })}>
+                          <div className="ce-form-grid">
+                            <Field label="适用情境"><input value={mode.context} onChange={e => patchVoice({ modes: draft.voice.modes.map(item => item.id === mode.id ? { ...item, context: e.target.value } : item) })} placeholder="熟人私下 / 正式汇报 / 被逼问" /></Field>
+                            <Field label="交谈目的"><input value={mode.intent} onChange={e => patchVoice({ modes: draft.voice.modes.map(item => item.id === mode.id ? { ...item, intent: e.target.value } : item) })} placeholder="维持距离、争取条件、确认事实…" /></Field>
+                            <Field label="信息取舍" wide><textarea value={mode.informationStrategy} onChange={e => patchVoice({ modes: draft.voice.modes.map(item => item.id === mode.id ? { ...item, informationStrategy: e.target.value } : item) })} placeholder="主动说什么，保留什么，何时补足理由" rows={2} /></Field>
+                            <Field label="回应策略" wide><textarea value={mode.interactionStrategy} onChange={e => patchVoice({ modes: draft.voice.modes.map(item => item.id === mode.id ? { ...item, interactionStrategy: e.target.value } : item) })} placeholder="如何回答、转移、拒绝、解释或结束话题" rows={2} /></Field>
+                            <Field label="语域变化"><input value={mode.register} onChange={e => patchVoice({ modes: draft.voice.modes.map(item => item.id === mode.id ? { ...item, register: e.target.value } : item) })} placeholder="比平时正式；术语仅在对表时使用" /></Field>
+                          </div>
+                        </EntryCard>
+                      ))}
+                    </div>
+                  )}
+                  <Field label="对白参考" hint="仅供作者核验，不会注入正文模型；每行一个带明确处境的参考" wide>
+                    <textarea className="ce-tall" value={draft.voice.examples.join("\n")} onChange={e => patchVoice({ examples: e.target.value.split(/\n/).map(x => x.trim()).filter(Boolean) })} placeholder={"陌生人追问身份时：先确认对方权限，再给必要范围内的回答。\n熟人误解她时：先用一句玩笑卸力，随后把真正理由说完整。"} rows={5} />
                   </Field>
                 </div>
               </div>

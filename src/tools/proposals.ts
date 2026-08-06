@@ -868,7 +868,9 @@ async function reviewDirectNarrativeProposal(
     characterScope: args.characterScope,
     baseContext: reviewer.context,
   });
+  const comparisonMaterials = directReviewComparisonMaterials(args, path);
   const requestCharacters = content.length + reviewContext.length + summary.length
+    + comparisonMaterials.reduce((sum, item) => sum + item.path.length + item.content.length, 0)
     + (revisionReview ? JSON.stringify(revisionReview).length : 0) + 1_200;
   const errors: string[] = [];
   for (const model of models) {
@@ -877,6 +879,7 @@ async function reviewDirectNarrativeProposal(
         chapterGoal: summary,
         content,
         context: reviewContext,
+        ...(comparisonMaterials.length ? { comparisonMaterials } : {}),
         ...(revisionReview ? {
           revisionReview,
           revisionBaselineContent: revisionContext!.previousContent,
@@ -949,6 +952,35 @@ async function reviewDirectNarrativeProposal(
     message: parseOnly
       ? "终审已响应但结论无法解析或缺少可定位证据，未创建提案（非服务故障）。请按 errors 自检事实/认知边界后做最小修订再提交；不要原样空重试。"
       : "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
+  });
+}
+
+function directReviewComparisonMaterials(
+  args: Pick<ToolHandlerArgs, "project">,
+  path: string,
+): Array<{ path: string; content: string; role: "template_check" }> {
+  const kind = documentKind(path);
+  if (kind !== "chapter" && kind !== "side") return [];
+  const slash = path.lastIndexOf("/");
+  const directory = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const siblings = args.project.listDocuments()
+    .filter(candidate => candidate !== path && !args.project.isDocumentHidden(candidate))
+    .filter(candidate => candidate.startsWith(directory) && !candidate.slice(directory.length).includes("/"))
+    .filter(candidate => documentKind(candidate) === kind)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const orderedWithTarget = [...siblings, path]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const targetIndex = orderedWithTarget.indexOf(path);
+  const candidates = targetIndex > 0
+    ? orderedWithTarget.slice(Math.max(0, targetIndex - 3), targetIndex)
+    : siblings.slice(-3);
+  return candidates.flatMap(candidate => {
+    try {
+      const content = args.project.read(candidate).trim().slice(0, 1_600);
+      return content ? [{ path: candidate, content, role: "template_check" as const }] : [];
+    } catch {
+      return [];
+    }
   });
 }
 

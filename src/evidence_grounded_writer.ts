@@ -18,6 +18,7 @@ import type { ToolExecutionContext } from "./tools/types.js";
 import { formatWritePackForWriter, type WritePack } from "./write_pack.js";
 import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 import { proseCompressionGuidance } from "./prose_quality.js";
+import { proseRealizationContract } from "./prose_realization.js";
 
 export type EvidenceGroundedWriterInput = {
   path: string;
@@ -77,6 +78,7 @@ const WRITER_SYSTEM = `你是成熟的中文小说作者，只负责把已经取
 对白是人物在关系中采取的行动。每一轮都承接前一轮带来的信息和压力；直答、解释、回避、沉默、误解、玩笑或让步均可。差异来自人物想得到、知道和不愿承认的内容，不靠口头禅、固定句长或随机口语词。
 
 只输出可直接入稿的正文。不要标题、前言、总结、引用标记、JSON 或代码围栏。直接对白使用项目声线证据所采用的引号；证据不一致时使用「……」。`;
+const WRITER_REALIZATION_RULE = proseRealizationContract();
 
 const STATE_SYSTEM = `你是小说场景状态提取器。只根据 previousState 与 sceneContent，提取正文结束时仍会约束后续场景的最小事实。nextScene 只用于相关性筛选，不是已经发生的事实。
 
@@ -171,7 +173,7 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
   }
   const style = input.styleEvidence.trim();
   return [
-    { role: "system", content: WRITER_SYSTEM },
+    { role: "system", content: `${WRITER_SYSTEM}\n\n${WRITER_REALIZATION_RULE}` },
     { role: "system", content: style },
     { role: "user", content: sections.join("\n\n") },
   ];

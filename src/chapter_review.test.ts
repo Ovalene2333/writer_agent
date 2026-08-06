@@ -106,6 +106,33 @@ test("终审接受连续关系压缩的 compressed_prose warning", () => {
   assert.equal(parsed.issues[0]?.severity, "warning");
 });
 
+test("终审接受字段口述与声线宏证据，并把旧章对照留在动态审查包", () => {
+  const source = "她说：「权限三级，皮层清醒。」过了一会儿，她又碰了碰耳钉，说：「状态稳定，皮层清醒。」";
+  const parsed = parseChapterReview(review([
+    {
+      severity: "warning", kind: "field_verbalization", sceneId: "s1",
+      evidence: ["「权限三级，皮层清醒。」", "「状态稳定，皮层清醒。」"],
+      problem: "两轮普通对白都在朗读后台字段", action: "保留事实，改成对当下行动有用的回答",
+    },
+    {
+      severity: "warning", kind: "voice_macro_reuse", sceneId: "s1",
+      evidence: ["她说：「权限三级，皮层清醒。」", "她又碰了碰耳钉，说：「状态稳定，皮层清醒。」"],
+      problem: "耳钉动作与状态短句被当作固定角色签名", action: "只保留有本场触发和功能的一处",
+    },
+  ], "pass"), SCENES, source);
+  assert.deepEqual(parsed.issues.map(issue => issue.kind), ["field_verbalization", "voice_macro_reuse"]);
+
+  const messages = buildChapterReviewMessages({
+    chapterGoal: "独立完成新场景",
+    content: source,
+    scenes: [{ sceneId: "s1", title: "新场", plannedTurn: "试探", plannedOutcome: "拒绝", actualState: null }],
+    comparisonMaterials: [{ path: "chapters/old.md", content: "旧章开头。", role: "template_check" }],
+  });
+  assert.equal(messages.length, 3);
+  assert.doesNotMatch(messages[0].content, /chapters\/old\.md|旧章开头/u);
+  assert.match(messages[2].content, /template_check|chapters\/old\.md/u);
+});
+
 test("直接文档终审可回填 document sceneId，并容忍引号空白差异", () => {
   const source = "「我们必须面对这个真相。」他说。「别把话说满。」她说。";
   const parsed = parseChapterReview(JSON.stringify({

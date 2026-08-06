@@ -8,6 +8,8 @@ import type {
   CharacterStoryState,
   CharacterTemporal,
   CharacterTextEntry,
+  CharacterVoice,
+  CharacterVoiceMode,
   OutlineNode,
 } from "./types.js";
 import {
@@ -93,7 +95,16 @@ export const emptyCharacter = (name = ""): Omit<Character, "id" | "updatedAt"> =
   profile: { appearance: "", appearanceSummary: "", background: "", backgroundSummary: "", biography: "" },
   psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] },
   motivations: [],
-  voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
+  voice: {
+    summary: "",
+    register: "",
+    diction: [],
+    verbalHabits: [],
+    avoidedExpressions: [],
+    examples: [],
+    interactionPrinciples: [],
+    modes: [],
+  },
   features: [],
   competencies: [],
   relationships: [],
@@ -163,6 +174,18 @@ function feature(v: unknown): CharacterFeature {
   };
 }
 
+function voiceMode(v: unknown): CharacterVoiceMode {
+  const r = obj(v);
+  return {
+    id: txt(r.id),
+    context: txt(r.context),
+    intent: txt(r.intent),
+    informationStrategy: txt(r.informationStrategy),
+    interactionStrategy: txt(r.interactionStrategy),
+    register: txt(r.register),
+  };
+}
+
 function competencyState(v: unknown): CharacterCompetencyState {
   const r = obj(v);
   return {
@@ -193,6 +216,41 @@ export type CharacterCapabilityIndexEntry = Pick<CharacterCompetency, "id" | "na
 /** One-line rule attached to any character payload that may reach a prose model. */
 export const COMPETENCY_WRITING_RULE =
   "能力写法：仅本次 inPlay 可进入正文，并严格按 sceneMode 与 instruction 处理。use 才能作为既有能力直接解题；attempt 可失败或部分生效；unlock/regain 必须在正文建立触发、来源和状态转变后才可生效；lose 须写出失去事件与后果。未提供的能力本场不写，也不以卡面、系统或否定列举的方式提及。角色尚不知的专名不要提前点名。";
+
+export const CHARACTER_VOICE_WRITING_RULE = [
+  "声线决定角色在交谈中选择什么信息、怎样回应以及如何处理关系，不提供固定句式。",
+  "先确定台词的即时目的和对上一句的承接，再选择措辞；不能把短句、反问、吐槽、专业术语或口头习惯当成每轮必做特征。",
+  "角色卡对白示例只供作者编辑与核验，正文模型不得接收或近邻改写其中原句。",
+  "contextModes 只在其 context 确实成立时使用；没有匹配模式时回到 core 与人物当前目标，不自行套用最接近的模板。",
+].join("");
+
+export const CHARACTER_PORTRAYAL_WRITING_RULE =
+  "人物特征与外显习惯是有触发条件的因果材料，不是场景签名。只有当前刺激、关系压力或身体状态真正触发，且该动作会改变人物感知、选择或对方判断时才写；近期正文已经使用同一动作时，优先写本场真实反应或不写动作锚点。";
+
+export type CharacterVoiceWritingPayload = {
+  core: { summary: string; register: string };
+  interactionPrinciples: string[];
+  contextModes: CharacterVoiceMode[];
+  lexicalSignals: { diction: string[]; verbalHabits: string[]; avoidedExpressions: string[] };
+  sourceExampleCount: number;
+  rule: string;
+};
+
+/** Writing-facing voice preserves decisions and boundaries, never literal example lines. */
+export function characterVoiceWritingPayload(voice: CharacterVoice): CharacterVoiceWritingPayload {
+  return {
+    core: { summary: voice.summary, register: voice.register },
+    interactionPrinciples: voice.interactionPrinciples.slice(0, 12),
+    contextModes: voice.modes.slice(0, 12).map(mode => ({ ...mode })),
+    lexicalSignals: {
+      diction: voice.diction.slice(0, 12),
+      verbalHabits: voice.verbalHabits.slice(0, 12),
+      avoidedExpressions: voice.avoidedExpressions.slice(0, 12),
+    },
+    sourceExampleCount: voice.examples.length,
+    rule: CHARACTER_VOICE_WRITING_RULE,
+  };
+}
 
 /**
  * Writing-facing competency split: never feed unlocked:false flags into prose context.
@@ -359,6 +417,8 @@ export function normalizeV3Character(value: unknown): Character {
       verbalHabits: strs(v.verbalHabits),
       avoidedExpressions: strs(v.avoidedExpressions),
       examples: strs(v.examples),
+      interactionPrinciples: strs(v.interactionPrinciples),
+      modes: arr(v.modes).map(voiceMode).filter(mode => mode.id && mode.context),
     },
     features: arr(r.features).map(feature),
     competencies: arr(r.competencies).map(competency),
@@ -454,6 +514,8 @@ export function migrateV2Character(value: unknown): Character {
       verbalHabits: [],
       avoidedExpressions: [],
       examples: [],
+      interactionPrinciples: [],
+      modes: [],
     },
     features: [],
     competencies: (txt(r.capabilities) || txt(r.abilities) || txt(r.limitations))
@@ -1165,7 +1227,8 @@ export function characterPromptViews(character: Character, nodes: OutlineNode[] 
         name: character.identity.name,
         appliesTo: "spoken_dialogue_only",
       },
-      voice: character.voice,
+      voice: characterVoiceWritingPayload(character.voice),
+      portrayalRule: CHARACTER_PORTRAYAL_WRITING_RULE,
     },
     scene,
   };

@@ -10,10 +10,12 @@ import { proseGateRulesForTarget } from "../prose_gate_rules.js";
 import { buildProseDiagnosis } from "../prose_review.js";
 import type { ToolHandlerArgs } from "./types.js";
 import {
+  assertProseReferenceReadAllowed,
   documentMap,
   normalizeTextFilePath,
   optionalPositiveInteger,
   readableTextFile,
+  proseReferenceReadAllowed,
   requireString,
 } from "./helpers.js";
 
@@ -50,12 +52,13 @@ function boundedText(value: string, fromEnd = false): { content: string; truncat
   };
 }
 
-export function handleListDocuments({ project }: ToolHandlerArgs): string {
-  return JSON.stringify(documentMap(project));
+export function handleListDocuments({ project, context }: ToolHandlerArgs): string {
+  return JSON.stringify(documentMap(project, context));
 }
 
 export async function handleAuditProseStyle({ input, project, context }: ToolHandlerArgs): Promise<string> {
   const path = normalizeTextFilePath(requireString(input.path, "path"));
+  assertProseReferenceReadAllowed(context, path);
   if (!path) throw new Error("path 不能为空");
   if (project.isDocumentHidden(path)) throw new Error("文件已对 Agent 屏蔽");
   const activeDraft = context.chapterSceneDraft?.path === path && chapterSceneDraftComplete(context.chapterSceneDraft)
@@ -125,13 +128,13 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
 }
 
 export function handleInspectDocument({ input, project, context }: ToolHandlerArgs): string {
-  const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
+  const snapshot = readableTextFile({ project, context }, requireString(input.path, "path"));
+  const path = snapshot.path;
+  assertProseReferenceReadAllowed(context, path);
   if (context.editScope === "point") {
     throw new Error("局部修改禁止 inspect 整篇；请用 locate_document_span 取得 sourceHash 和目标锚点");
   }
-  const content = project.read(path);
-  const sourceHash = project.hash(content);
+  const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
   const lines = content.split(/\r?\n/);
   const blocks = documentBlocks(content, READ_BLOCK_TARGET_CHARACTERS);
@@ -142,6 +145,7 @@ export function handleInspectDocument({ input, project, context }: ToolHandlerAr
   return JSON.stringify({
     path,
     sourceHash,
+    workingCopy: snapshot.workingCopy,
     lineCount: lines.length,
     characterCount: content.length,
     blockCount: blocks.length,
@@ -217,10 +221,10 @@ function readDocumentByQuote(path: string, content: string, quote: string): stri
 }
 
 export function handleReadDocument({ input, project, context }: ToolHandlerArgs): string {
-  const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const content = project.read(path);
-  const sourceHash = project.hash(content);
+  const snapshot = readableTextFile({ project, context }, requireString(input.path, "path"));
+  const path = snapshot.path;
+  assertProseReferenceReadAllowed(context, path);
+  const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
   if (context.editScope === "point" && context.editTargetLocked?.path === path
     && !(typeof input.quote === "string" && input.quote.trim())) {
@@ -351,10 +355,10 @@ function locatorCandidates(content: string, sourceHash: string, query: string): 
 }
 
 export async function handleLocateDocumentSpan({ input, project, context }: ToolHandlerArgs): Promise<string> {
-  const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const content = project.read(path);
-  const sourceHash = project.hash(content);
+  const snapshot = readableTextFile({ project, context }, requireString(input.path, "path"));
+  const path = snapshot.path;
+  assertProseReferenceReadAllowed(context, path);
+  const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
   const spans = documentSpans(content, sourceHash);
   const locked = context.editScope === "point" ? context.editTargetLocked : undefined;
@@ -411,10 +415,10 @@ export async function handleLocateDocumentSpan({ input, project, context }: Tool
 }
 
 export function handleReadDocumentSpan({ input, project, context }: ToolHandlerArgs): string {
-  const path = requireString(input.path, "path");
-  if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
-  const content = project.read(path);
-  const sourceHash = project.hash(content);
+  const snapshot = readableTextFile({ project, context }, requireString(input.path, "path"));
+  const path = snapshot.path;
+  assertProseReferenceReadAllowed(context, path);
+  const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
   const spans = documentSpans(content, sourceHash);
   const startId = requireString(input.anchorId ?? input.startAnchorId, "anchorId");
@@ -477,7 +481,8 @@ export function handleSearchProject({ input, project, store, context }: ToolHand
   const pathPrefix = typeof input.pathPrefix === "string" ? input.pathPrefix : undefined;
   const query = requireString(input.query, "query");
   const found = store.search(query, limit, { scope, mode, contextLines, pathPrefix })
-    .filter(item => !project.isDocumentHidden(item.path));
+    .filter(item => !project.isDocumentHidden(item.path))
+    .filter(item => proseReferenceReadAllowed(context, item.path));
   // Search is a locator, not a bulk reader. Keep the complete result atom under
   // a fixed excerpt budget even when the caller asks for many wide contexts.
   let excerptBudget = 6_000;

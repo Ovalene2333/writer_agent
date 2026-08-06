@@ -60,6 +60,7 @@ import {
   type AgentEvidenceRequirement,
   type AgentMutationRequirement,
   type AgentPlanningStrategy,
+  type ProseReferenceMode,
   type AgentTaskContract,
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
@@ -321,6 +322,8 @@ interface WritingTask extends AgentTaskContract {
   todoPlan: string[];
   /** Independent document outputs requested by the user; scenes/checks inside one document are not deliverables. */
   documentDeliverables: string[];
+  /** Existing narrative text policy selected by the planner. */
+  proseReferenceMode: ProseReferenceMode;
   proseGateCandidate?: PlannedProseGateCandidate;
   targetPath?: string;
 }
@@ -590,6 +593,11 @@ export function dynamicContextPrompt(
     target: `需目标文件。${references.length ? `候选：${references.join("、")}。` : "先定位路径。"}工作记忆已有且未变则复用；否则 read_file 一次最小范围，禁止重复读。`,
     continuation: `承接正文。${continuationPath ? `目标：${continuationPath}。` : "从对话/文件结果确定路径。"}记忆有末尾且未变则续写；否则 read_file 读取末尾必要范围。`,
   };
+  const proseReferenceInstruction: Record<ProseReferenceMode, string> = {
+    project: "项目参考：可按当前任务读取必要正文，但不得把旧章当句式模板或遍历寻找可复用结构。",
+    continuity: "连续性参考：只读取目标正文或紧邻前文的最小末尾范围，用于人物状态、称谓和未完成动作衔接；不得把它当正向范文。",
+    independent: "独立创作：运行时已隔离既有 chapter/side 正文。只从 lore、outline、角色卡和本轮工作副本取证；不得要求绕过隔离，也不得凭章节名臆测旧章结构。",
+  };
   const reviewBlock = task.mode === "audit" ? `\n\n${REVIEW_PROMPT}` : "";
   // 作者定的篇幅，不是模型按事件密度自己拍的。来源写出来，作者一看就知道这个数字
   // 是他这句话带来的还是项目默认档。
@@ -614,7 +622,7 @@ export function dynamicContextPrompt(
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
     : "";
   return `当前任务：${task.label}
-任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile, deliverables: runDeliverables })}
+任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, proseReferenceMode: task.proseReferenceMode, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile, deliverables: runDeliverables })}
 mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后用 manage_todos 修订剩余计划。
 ${writingWorkflowPrompt(task.workflow ?? "free", task.qualityProfile ?? "fast")}
 ${resumeLine}
@@ -634,6 +642,7 @@ ${taskInstructions(
   )}${reviewBlock}
 
 上下文：${contextInstruction[task.documentContext]}
+正文引用边界：${proseReferenceInstruction[task.proseReferenceMode]}
 角色范围：${characterScopeInstruction}
 简易卡范围：${simpleCharacterScopeInstruction}
 角色演进：${characterEvolutionInstruction}
@@ -972,7 +981,7 @@ async function compileWritingTaskContract(
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
 JSON 总长度不超过 1600 字符；字符串保持简短，todoPlan 每项不超过 40 字。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；proseReferenceMode(project|continuity|independent)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
 契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
 正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
@@ -981,6 +990,10 @@ documentContext 判定（关键，勿默认 none）：
 - search：用户讨论、分析、推演项目内设定/组织/实体/专名/关系/军政势力，或答案正确性依赖 lore/outline 中未在对话里写清的事实（即使 mode=brainstorm/general 也要用 search）。searchQuery 填核心专名。
 - target：用户指定或语义可确定单篇文档要读/改。
 - continuation：承接上一轮正文续写。
+proseReferenceMode 判定：
+- independent：用户明确要求独立故事、全新口吻、不要基于或模仿现有章节。只允许读取 lore、outline 和角色卡核对事实；禁止读取 chapter/side 正文作为范文或结构来源。
+- continuity：用户要求承接现有情节或续写，只允许读取目标正文及紧邻前文的最小末尾范围，用于状态衔接，不把它当正向范文。
+- project：其余项目写作。可按任务需要读取现有资料；仍不得为了模仿而遍历正文。
 纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；执行阶段统一使用 list_files/read_file/write_file/edit_file/move_file/delete_file。
 图片产物：用户明确要求生成封面、插图、概念图或视觉参考时 capabilities 必须含 images；单独生图用 outcome=answer、mutation=none，若还要求文档/角色写入则保留相应 outcome 与 mutation。只讨论画面或撰写生图提示词时不要加入 images。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
@@ -1058,10 +1071,16 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
   const documentContext = contextModes.includes(parsed.documentContext as DocumentContextMode)
     ? parsed.documentContext as DocumentContextMode
     : "none";
+  const proseReferenceModes: ProseReferenceMode[] = ["project", "continuity", "independent"];
+  const plannedProseReferenceMode = proseReferenceModes.includes(parsed.proseReferenceMode as ProseReferenceMode)
+    ? parsed.proseReferenceMode as ProseReferenceMode
+    : undefined;
   const validCharacterIds = new Set(characters.map(item => item.id));
   const validExampleIds = new Set(examples.map(item => item.id));
   const validDocumentPaths = new Set(documents);
   const continuation = parsed.continuation === true;
+  const proseReferenceMode: ProseReferenceMode = plannedProseReferenceMode
+    ?? (continuation ? "continuity" : "project");
   const mutations: AgentMutationRequirement[] = ["none", "document", "character", "mixed"];
   let mutation = mutations.includes(parsed.mutation as AgentMutationRequirement)
     ? parsed.mutation as AgentMutationRequirement
@@ -1171,6 +1190,7 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
       characterIds: selectedCharacterIds,
       exampleIds: Array.isArray(parsed.exampleIds) ? parsed.exampleIds.filter(id => validExampleIds.has(id)).slice(0, 2) : [],
       documentContext: normalizedDocumentContext,
+      proseReferenceMode,
       creativeDepth,
       editScope,
       documentProposalRequired,
@@ -1373,6 +1393,7 @@ export function taskInstructions(
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 时，写前须读取该角色 voice、motivations、relationships、storyState，且声线只约束该角色说出口的对白。${fastWritingMode ? `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。` : `write_chapter_scene 只提交 sceneId 与不超过 ${notesMaxCharacters} 字的故事内 notes，省略 content/actualState，由证据型 Writer 和状态提取器完成。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
 - ${proseCompressionGuidance()}
+- 表达转换契约已纳入「风格锚定」并由正文出口复用：先把资料字段转成当前人物的注意、目标和关系动作，再决定自然措辞；不要把字段直接朗读成对白或旁白。
 - 设定中的规范术语是事实来源，不是正文默认措辞。若同一概念会同时进入专业汇报、普通对白和贴身叙述，在 compile_write_pack 或场景 notes 中增加「## 表达边界」，按“事实 | 用途=… | 精度=exact/normal/sensory | 叙述=… | 对白=… | 技术对白=… | 避免=…”说明语域；只在确有污染风险时填写，不为普通名词制造同义词配额。
 - 章节动力服从本章目标。冲突章应让阻力真正回应人物行动；静场、过渡章与收束章也可以用理解、关系或条件的变化完成。代价、悬问与不可逆损失只在因果需要时出现，不作为每章配额。
 - 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称。提交前：${proseMannerismPreflightLine()}
@@ -2987,8 +3008,9 @@ export async function runAgent(options: {
       && (isIntensiveWritingMode(task.mode) || task.documentProposalRequired),
     targetPath: task.targetPath ?? continuationPath,
     exampleIds: task.exampleIds,
-    preferredSample: preferredSample || undefined,
-    excludeProjectVoice: task.mode === "rewrite",
+    preferredSample: task.proseReferenceMode === "independent" ? undefined : (preferredSample || undefined),
+    excludeProjectVoice: task.mode === "rewrite" || task.proseReferenceMode === "independent",
+    ...(task.proseReferenceMode === "continuity" ? { projectSampleRole: "continuity" as const } : {}),
   };
   // Direct drafting remains available even when the optional scene chain is
   // configured for isolated writing, so the parent Agent always needs voice evidence.
@@ -3031,6 +3053,7 @@ export async function runAgent(options: {
   };
   const toolContext: ToolExecutionContext = {
     permissionMode,
+    proseReferencePolicy: buildProseReferencePolicy(project, task, continuationPath),
     runId: agentLoop.snapshot.id,
     proposalReviewRevisions: new Map(),
     activeProposalRevisionPaths: new Set(),
@@ -5331,6 +5354,50 @@ export function restoreChapterDraftCheckpoint(
   return draft as ChapterSceneDraft;
 }
 
+function buildProseReferencePolicy(
+  project: WriterProject,
+  task: WritingTask,
+  continuationPath?: string,
+): NonNullable<ToolExecutionContext["proseReferencePolicy"]> {
+  const targetPath = task.targetPath ?? continuationPath;
+  if (task.proseReferenceMode === "project") {
+    return { mode: "project", ...(targetPath ? { targetPath } : {}) };
+  }
+  if (task.proseReferenceMode === "independent") {
+    return { mode: "independent", ...(targetPath ? { targetPath } : {}), allowedNarrativePaths: [] };
+  }
+  const narrativePaths = project.listDocuments()
+    .filter(path => !project.isDocumentHidden(path))
+    .filter(path => documentKind(path) === "chapter" || documentKind(path) === "side")
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const allowed = new Set<string>();
+  const addPathAndPrevious = (path: string | undefined) => {
+    if (!path || !narrativePaths.includes(path)) return;
+    allowed.add(path);
+    const slash = path.lastIndexOf("/");
+    const directory = slash >= 0 ? path.slice(0, slash + 1) : "";
+    const family = narrativePaths.filter(candidate => documentKind(candidate) === documentKind(path)
+      && candidate.startsWith(directory) && !candidate.slice(directory.length).includes("/"));
+    const index = family.indexOf(path);
+    if (index > 0) allowed.add(family[index - 1]);
+  };
+  addPathAndPrevious(targetPath);
+  if (targetPath) {
+    const chapterNum = parseChapterNumber(targetPath);
+    if (chapterNum !== undefined) {
+      narrativePaths
+        .filter(path => chapterTitleMatches(path, chapterNum - 1) || chapterTitleMatches(safeReadHeading(project, path), chapterNum - 1))
+        .slice(0, 2)
+        .forEach(path => allowed.add(path));
+    }
+  }
+  return {
+    mode: "continuity",
+    ...(targetPath ? { targetPath } : {}),
+    allowedNarrativePaths: [...allowed].slice(0, 4),
+  };
+}
+
 /**
  * Dynamic-tail write index only (ids/paths/short summaries).
  * CACHE: miss-priced — never dump full outline prose or character cards here;
@@ -5376,18 +5443,22 @@ function writingBootstrapContext(
     outlineNodes = undefined;
   }
 
-  const chapterDocs = project.listDocuments()
-    .filter(path => !project.isDocumentHidden(path) && documentKind(path) === "chapter")
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const chapterDocs = task.proseReferenceMode === "independent"
+    ? []
+    : project.listDocuments()
+      .filter(path => !project.isDocumentHidden(path) && documentKind(path) === "chapter")
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
   // Only paths that actually exist — never invent chapters/第N章.md.
   const targetCandidates = [
-    ...(task.targetPath && project.documentExists(task.targetPath) ? [task.targetPath] : []),
+    ...(task.proseReferenceMode !== "independent" && task.targetPath && project.documentExists(task.targetPath) ? [task.targetPath] : []),
     ...(chapterNum !== undefined
       ? chapterDocs.filter(path =>
         chapterTitleMatches(path, chapterNum) || chapterTitleMatches(safeReadHeading(project, path), chapterNum))
       : []),
-    ...outlineDocPaths.filter(path => project.documentExists(path) && !project.isDocumentHidden(path)),
+    ...outlineDocPaths.filter(path => project.documentExists(path) && !project.isDocumentHidden(path)
+      && (task.proseReferenceMode !== "independent"
+        || (documentKind(path) !== "chapter" && documentKind(path) !== "side"))),
   ].filter((path, index, all) => all.indexOf(path) === index).slice(0, 3);
 
   const prevCandidates = chapterNum !== undefined && chapterNum > 1
@@ -5414,9 +5485,14 @@ function writingBootstrapContext(
     return "";
   }
 
+  const narrativeReferenceGuidance = task.proseReferenceMode === "independent"
+    ? "- 本轮为独立创作：旧 chapter/side 正文不会出现在索引中，也不可通过文件工具读取；只核对 outline、lore 和角色卡。"
+    : task.proseReferenceMode === "continuity"
+      ? "- 连续性正文只用于核对人物称谓、现场状态和未完成动作；只读允许路径的末尾最小范围，不把旧章作为结构或句法范本。"
+      : "- 需要衔接时，对 previousChapterCandidates 中的路径用 read_file 读取末尾必要范围一次。";
   return `写作线索（系统启发式索引，未经验证，不是已读正文）：
 - outlineNodes 有与本章精确匹配项时，才可用其 id 调用 get_outline_node 一次（id 为 UUID，不是章号）；为空时直接写作，禁止为了写正文创建大纲。
-- 需要衔接：对 previousChapterCandidates 中的路径用 read_file 读取末尾必要范围一次。
+${narrativeReferenceGuidance}
 - 目标之后已有成稿时：对 nextChapterCandidates 中的路径 read_file(startLine=1,endLine=40) 一次，只把其开场事实当作本章离场边界，不把后章事件提前写入本章。
 - 需要人设：先对 characterIndex 中的 id 调用 get_character 获取必要字段摘要；摘要不足时再带 sections 选读，场景状态需传 outlineNodeId。
 - 目标文档：对 targetDocumentCandidates 中的路径 inspect 或按需读取；路径不存在时按项目惯例新建，勿盲目使用未列出的路径。

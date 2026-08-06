@@ -266,6 +266,32 @@ export interface CharacterCompetencyState {
 export interface CharacterFeature {
   id: string; name: string; summary: string; description: string;
 }
+export interface CharacterVoiceMode {
+  id: string;
+  /** Relationship, setting or pressure condition in which this mode applies. */
+  context: string;
+  /** What the character is trying to achieve through the exchange. */
+  intent: string;
+  /** What they volunteer, withhold, qualify or ask for. */
+  informationStrategy: string;
+  /** How they respond, redirect, refuse, explain or close distance. */
+  interactionStrategy: string;
+  /** Optional register shift for this context; never a sentence-length quota. */
+  register: string;
+}
+export interface CharacterVoice {
+  summary: string;
+  register: string;
+  diction: string[];
+  verbalHabits: string[];
+  avoidedExpressions: string[];
+  /** Author reference only. Prose-facing views deliberately omit literal lines. */
+  examples: string[];
+  /** Stable conversational decisions that hold across contexts. */
+  interactionPrinciples: string[];
+  /** Context-conditioned conversational modes. */
+  modes: CharacterVoiceMode[];
+}
 export interface CharacterStoryState extends CharacterTemporal {
   id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string;
   knowledge: CharacterTextEntry[]; beliefs: CharacterTextEntry[]; intentions: string[]; temporaryGoals: CharacterGoal[];
@@ -280,7 +306,7 @@ export interface Character {
   profile: { appearance: string; appearanceSummary: string; background: string; backgroundSummary: string; biography: string };
   psychology: { summary: string; traits: CharacterTextEntry[]; values: CharacterTextEntry[]; fears: CharacterTextEntry[]; conflicts: CharacterTextEntry[] };
   motivations: CharacterGoal[];
-  voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
+  voice: CharacterVoice;
   /** Stable details that shape portrayal but are not abilities (habits, physiology, quirks, etc.). */
   features: CharacterFeature[];
   competencies: CharacterCompetency[];

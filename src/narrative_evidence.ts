@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
-import { competenciesWritingPayload } from "./characters.js";
+import {
+  CHARACTER_PORTRAYAL_WRITING_RULE,
+  characterVoiceWritingPayload,
+  competenciesWritingPayload,
+} from "./characters.js";
 import { resolveCompetencyStates, type SceneCompetencyUse } from "./competency_state.js";
 import type { WritingMemoryEntry } from "./writing_memory.js";
 import { orderedChapterPaths, type WriterProject } from "./project.js";
@@ -240,7 +244,10 @@ function characterEvidence(
   if (sectionSet.has("profile")) sections.profile = character.profile;
   if (sectionSet.has("psychology")) sections.psychology = character.psychology;
   if (sectionSet.has("motivations")) sections.motivations = character.motivations;
-  if (sectionSet.has("voice") && dialogueAllowed) sections.voice = character.voice;
+  if (sectionSet.has("voice") && dialogueAllowed) {
+    sections.voice = characterVoiceWritingPayload(character.voice);
+    sections.portrayalRule = CHARACTER_PORTRAYAL_WRITING_RULE;
+  }
   if (sectionSet.has("features")) sections.features = character.features;
   if (sectionSet.has("competencies")) {
     sections.competencies = competenciesWritingPayload(

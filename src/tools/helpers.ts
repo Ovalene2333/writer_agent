@@ -9,6 +9,42 @@ export function normalizeTextFilePath(path: string): string {
     .replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "");
 }
 
+export function isNarrativeReferencePath(path: string): boolean {
+  const kind = documentKind(normalizeTextFilePath(path));
+  return kind === "chapter" || kind === "side";
+}
+
+/**
+ * Existing narrative prose is a separate evidence class from lore and cards.
+ * Independent tasks cannot read it; continuity tasks receive a bounded path
+ * allowlist. Current run working copies remain readable for review and repair.
+ */
+export function proseReferenceReadAllowed(
+  context: ToolExecutionContext,
+  path: string,
+): boolean {
+  const normalized = normalizeTextFilePath(path);
+  if (!isNarrativeReferencePath(normalized)) return true;
+  if (context.workingTextFiles?.has(normalized)) return true;
+  const policy = context.proseReferencePolicy;
+  if (!policy || policy.mode === "project") return true;
+  if (policy.mode === "independent") return false;
+  return (policy.allowedNarrativePaths ?? [])
+    .map(normalizeTextFilePath)
+    .includes(normalized);
+}
+
+export function assertProseReferenceReadAllowed(
+  context: ToolExecutionContext,
+  path: string,
+): void {
+  if (proseReferenceReadAllowed(context, path)) return;
+  const mode = context.proseReferencePolicy?.mode ?? "project";
+  throw new Error(mode === "independent"
+    ? "独立创作模式禁止读取既有 chapter/side 正文；可读取 lore、outline、角色卡和本轮生成的工作副本"
+    : "连续性模式只允许读取目标正文或紧邻前文；请改读 lore/outline，或使用本轮允许的连续性路径");
+}
+
 /**
  * Read the same visible snapshot as the unified file tools.
  * An audit must see a run's staged copy, otherwise it can bless stale text that
@@ -20,6 +56,7 @@ export function readableTextFile(
 ): { path: string; content: string; sourceHash: string; workingCopy: boolean } {
   const normalized = normalizeTextFilePath(path);
   if (!normalized) throw new Error("path 不能为空");
+  assertProseReferenceReadAllowed(args.context, normalized);
   if (args.project.isDocumentHidden(normalized)) throw new Error("文件已对 Agent 屏蔽");
   const working = args.context.workingTextFiles?.get(normalized);
   if (working) {
@@ -94,10 +131,16 @@ export function countOccurrences(content: string, search: string): number {
   return count;
 }
 
-export function documentMap(project: WriterProject): Array<{ path: string; kind: string; lines: number; characters: number; headings: string[] }> {
+export function documentMap(
+  project: WriterProject,
+  context?: ToolExecutionContext,
+): Array<{ path: string; kind: string; lines: number; characters: number; headings: string[] }> {
   const result: Array<{ path: string; kind: string; lines: number; characters: number; headings: string[] }> = [];
   let budget = 6_000;
-  for (const path of project.listDocuments().filter(path => !project.isDocumentHidden(path)).slice(0, 100)) {
+  for (const path of project.listDocuments()
+    .filter(path => !project.isDocumentHidden(path))
+    .filter(path => !context || proseReferenceReadAllowed(context, path))
+    .slice(0, 100)) {
     const content = project.read(path);
     const entry = {
       path,

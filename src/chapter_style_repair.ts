@@ -3,6 +3,7 @@ import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.j
 import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
+import { proseRealizationContract } from "./prose_realization.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 
 export type ChapterStyleRepairIssue = {
@@ -34,7 +35,8 @@ export class ChapterStyleRepairRequestError extends Error {
 
 const STYLE_REPAIR_SYSTEM = `你是中文小说局部句式修订器。只修复输入列出的硬拦截句，不改事件、事实、人物状态、场景顺序或未列出的正文。
 只输出 JSON：{"edits":[{"search":"原句","replace":"替换句"}]}。
-search 必须逐字取自 issue.sentence；每个 issue 至多一条 edit；replace 必须是可直接替换的完整正文，不得包含 Markdown 标题、解释、占位符或元信息。`;
+search 必须逐字取自 issue.sentence；每个 issue 至多一条 edit；replace 必须是可直接替换的完整正文，不得包含 Markdown 标题、解释、占位符或元信息。
+${proseRealizationContract()}`;
 
 export const CHAPTER_STYLE_REPAIR_BATCH_SIZE = 8;
 

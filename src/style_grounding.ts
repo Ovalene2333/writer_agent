@@ -1,5 +1,6 @@
 import { orderedChapterPaths, WriterProject } from "./project.js";
 import { proseMannerismConstraintPrompt } from "./prose_quality.js";
+import { proseRealizationContract } from "./prose_realization.js";
 import { WriterStore } from "./store.js";
 
 /**
@@ -119,6 +120,7 @@ export function stableStyleGroundingPrompt(
 
   // Craft + full mannerism once in the stable style slot; workflows only cross-ref preflight.
   sections.push(naturalProseCraftPrompt());
+  sections.push(proseRealizationContract());
   sections.push(proseMannerismConstraintPrompt());
 
   return sections.join("\n\n");

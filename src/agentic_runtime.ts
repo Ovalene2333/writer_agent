@@ -14,6 +14,8 @@ export type AgentTaskOutcome = "answer" | "document" | "character" | "review" | 
 export type AgentEvidenceRequirement = "none" | "project" | "target" | "continuation";
 export type AgentMutationRequirement = "none" | "document" | "character" | "mixed";
 export type AgentPlanningStrategy = "direct" | "adaptive";
+/** Controls which existing narrative text may be used as a prose reference. */
+export type ProseReferenceMode = "project" | "continuity" | "independent";
 export type AgentCapability = "research" | "documents" | "files" | "outline" | "scenes" | "characters" | "review" | "images";
 
 /**
@@ -37,6 +39,8 @@ export interface AgentTaskContract {
   proseGateRequired?: boolean;
   /** Unordered user-visible document outputs. It constrains completion, never action order. */
   documentDeliverables?: readonly string[];
+  /** Narrative-reference policy selected by the task compiler. */
+  proseReferenceMode?: ProseReferenceMode;
 }
 
 export interface AgentExecutionProgress {

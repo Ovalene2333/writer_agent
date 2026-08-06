@@ -200,6 +200,31 @@ test("chapter file operations use filesystem paths without rewriting writer.yaml
   }
 });
 
+test("independent prose references hide existing narrative text at the tool boundary", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-independent-prose-"));
+  try {
+    const project = WriterProject.init(root, "独立正文");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("独立正文");
+    project.writeTextFile("chapters/old.md", "# 旧章\n\n旧正文声线。\n");
+    project.writeTextFile("lore/facts.md", "# 设定\n\n可读取事实。\n");
+    const context = {
+      permissionMode: "ask" as const,
+      proseReferencePolicy: { mode: "independent" as const, allowedNarrativePaths: [] },
+    };
+    const args = (input: Record<string, unknown>): ToolHandlerArgs => ({
+      input, project, store, sessionId, emit: () => undefined, context,
+    });
+    const listed = JSON.parse(handleListFiles(args({ limit: 100 }))) as { files: string[] };
+    assert.equal(listed.files.includes("chapters/old.md"), false);
+    assert.ok(listed.files.includes("lore/facts.md"));
+    assert.throws(() => handleReadFile(args({ path: "chapters/old.md" })), /独立创作模式禁止读取/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("unified file tools edit a visible working copy and route all text through approval", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-unified-files-"));
   try {

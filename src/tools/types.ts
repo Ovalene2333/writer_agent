@@ -3,6 +3,7 @@ import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ChapterSceneDraft, SceneActualState, SceneCharacterScope } from "../scene_pipeline.js";
 import type { ProseLengthMode, ScenePipelineSettings } from "../agent_runtime.js";
+import type { ProseReferenceMode } from "../agentic_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
@@ -75,6 +76,12 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Runtime boundary for using existing narrative text as prose reference. */
+  proseReferencePolicy?: {
+    mode: ProseReferenceMode;
+    targetPath?: string;
+    allowedNarrativePaths?: string[];
+  };
   /** AgentRun owning workflow-scoped proposal state. */
   runId?: string;
   /** Dedicated Images API model and generated assets owned by this Agent turn. */

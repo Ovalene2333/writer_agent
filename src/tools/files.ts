@@ -7,8 +7,10 @@ import { styleGroundingPrompt } from "../style_grounding.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import {
   assertWritableMode,
+  assertProseReferenceReadAllowed,
   normalizeTextFilePath,
   optionalPositiveInteger,
+  proseReferenceReadAllowed,
   readableTextFile,
   requireString,
 } from "./helpers.js";
@@ -165,6 +167,7 @@ export function handleListFiles(args: ToolHandlerArgs): string {
   ])]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     .filter(path => !project.isDocumentHidden(path))
+    .filter(path => proseReferenceReadAllowed(context, path))
     .filter(path => !prefix || path === prefix || path.startsWith(`${prefix}/`))
     .filter(path => !cursor || path.localeCompare(cursor, undefined, { numeric: true }) > 0);
   const files = all.slice(0, limit);
@@ -174,6 +177,7 @@ export function handleListFiles(args: ToolHandlerArgs): string {
 export function handleInspectFile(args: ToolHandlerArgs): string {
   const { input } = args;
   const path = requireString(input.path, "path");
+  assertProseReferenceReadAllowed(args.context, path);
   const snapshot = readableTextFile(args, path);
   const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
@@ -195,6 +199,7 @@ export function handleInspectFile(args: ToolHandlerArgs): string {
 export function handleReadFile(args: ToolHandlerArgs): string {
   const { input } = args;
   const path = requireString(input.path, "path");
+  assertProseReferenceReadAllowed(args.context, path);
   const snapshot = readableTextFile(args, path);
   const { content, sourceHash } = snapshot;
   assertExpectedSourceHash(input, sourceHash);
@@ -269,7 +274,8 @@ export function handleSearchFiles(args: ToolHandlerArgs): string {
   ])].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   for (const path of paths) {
     if (matches.length >= limit) break;
-    if (project.isDocumentHidden(path) || (prefix && path !== prefix && !path.startsWith(`${prefix}/`))) continue;
+    if (project.isDocumentHidden(path) || !proseReferenceReadAllowed(context, path)
+      || (prefix && path !== prefix && !path.startsWith(`${prefix}/`))) continue;
     const content = context.workingTextFiles?.get(path)?.content ?? project.readTextFile(path);
     const offset = content.toLocaleLowerCase().indexOf(needle);
     if (offset < 0) continue;

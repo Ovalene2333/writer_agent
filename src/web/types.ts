@@ -268,13 +268,24 @@ export type Competency = Temporal & { id: string; name: string; summary: string;
 export type CompetencyAvailability = "available" | "latent" | "blocked" | "lost" | "unknown";
 export type CompetencyState = { id: string; competencyId: string; state: CompetencyAvailability; reason: string; evidence?: string };
 export type Feature = { id: string; name: string; summary: string; description: string };
+export type VoiceMode = {
+  id: string;
+  context: string;
+  intent: string;
+  informationStrategy: string;
+  interactionStrategy: string;
+  register: string;
+};
 export type StoryState = Temporal & { id: string; outlineNodeId?: string; unanchored?: boolean; location: string; physical: string; emotion: string; knowledge: TextEntry[]; beliefs: TextEntry[]; intentions: string[]; temporaryGoals: Goal[]; competencyStates?: CompetencyState[]; notes: string };
 export type Character = {
   schemaVersion: 3; id: number;
   identity: { name: string; aliases: string[]; tags: string[]; narrativeRole: string; summary: string };
   profile: { appearance: string; appearanceSummary: string; background: string; backgroundSummary: string; biography: string };
   psychology: { summary: string; traits: TextEntry[]; values: TextEntry[]; fears: TextEntry[]; conflicts: TextEntry[] };
-  motivations: Goal[]; voice: { summary: string; register: string; diction: string[]; verbalHabits: string[]; avoidedExpressions: string[]; examples: string[] };
+  motivations: Goal[]; voice: {
+    summary: string; register: string; diction: string[]; verbalHabits: string[];
+    avoidedExpressions: string[]; examples: string[]; interactionPrinciples: string[]; modes: VoiceMode[];
+  };
   features: Feature[]; competencies: Competency[]; relationships: Relationship[]; storyStates: StoryState[]; experiences: TextEntry[]; notes: string; updatedAt: string;
 };
 export type CharacterDraft = Omit<Character, "id" | "updatedAt"> & { id?: number };
@@ -626,7 +637,10 @@ export const EMPTY_CHARACTER: CharacterDraft = {
   schemaVersion: 3, identity: { name: "", aliases: [], tags: [], narrativeRole: "", summary: "" },
   profile: { appearance: "", appearanceSummary: "", background: "", backgroundSummary: "", biography: "" },
   psychology: { summary: "", traits: [], values: [], fears: [], conflicts: [] }, motivations: [],
-  voice: { summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [] },
+  voice: {
+    summary: "", register: "", diction: [], verbalHabits: [], avoidedExpressions: [], examples: [],
+    interactionPrinciples: [], modes: [],
+  },
   features: [], competencies: [], relationships: [], storyStates: [], experiences: [], notes: "",
 };
 /** Visual UI themes (workspace chrome). Not writing style templates. */

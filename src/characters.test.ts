@@ -290,19 +290,18 @@ test("character tools route summary, section, and edit views without an extra ed
       ...args, input: { id: card.id, view: "sections", sections: ["competencies", "voice"], competencyIds: ["ready"] },
     })) as {
       competencies: { inPlay: Array<{ id: string; unlocked?: unknown }> };
-      voice: { summary: string };
+      voice: { core: { summary: string }; sourceExampleCount: number; contextModes: unknown[] };
       voiceScope: { characterId: number; name: string; appliesTo: string; rule: string };
     };
     assert.deepEqual(proseSections.competencies.inPlay.map(item => item.id), ["ready"]);
     assert.equal("unlocked" in proseSections.competencies.inPlay[0], false);
     assert.doesNotMatch(JSON.stringify(proseSections.competencies), /攀爬|湿滑表面/u);
-    assert.equal(proseSections.voice.summary, "克制，但被逼急会说长句");
-    assert.deepEqual(proseSections.voiceScope, {
-      characterId: card.id,
-      name: "闻溪",
-      appliesTo: "spoken_dialogue_only",
-      rule: "仅约束该角色说出口的对白；不要迁移到叙述、动作描写或其他角色的对白。",
-    });
+    assert.equal(proseSections.voice.core.summary, "克制，但被逼急会说长句");
+    assert.equal(proseSections.voice.sourceExampleCount, 0);
+    assert.deepEqual(proseSections.voice.contextModes, []);
+    assert.equal(proseSections.voiceScope.characterId, card.id);
+    assert.match(proseSections.voiceScope.rule, /声线决定角色在交谈中选择什么信息/);
+    assert.match(proseSections.voiceScope.rule, /不要迁移到叙述/);
 
     const sceneScopedArgs = {
       ...args,

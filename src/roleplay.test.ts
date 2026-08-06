@@ -123,22 +123,24 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /不要为了追求短而截断表达/);
     assert.doesNotMatch(prompt, /停顿、目光、呼吸、姿势/);
     assert.ok(prompt.includes("\"name\": \"林千夏\"") || prompt.includes("\"name\":\"林千夏\""));
-    assert.match(prompt, /exampleHint/);
+    assert.match(prompt, /contextModes|interactionPrinciples|sourceExampleCount/);
     assert.match(prompt, /spoken_dialogue_only/);
     assert.doesNotMatch(prompt, /第二条例句不应整卡注入/);
     // Backward-compatible alias still works.
     assert.equal(buildRoleplaySystemPrompt(sampleCharacter()), prompt);
   });
 
-  test("slim views keep at most one voice example as hint", () => {
+  test("slim views keep voice decisions but omit literal example lines", () => {
     const views = slimRoleplayCharacterViews(sampleCharacter()) as {
       dialogue: {
         owner: { characterId: number; name: string; appliesTo: string };
-        voice: { exampleHint: string; verbalHabits: string[] };
+        voice: { sourceExampleCount: number; lexicalSignals: { verbalHabits: string[] }; contextModes: unknown[] };
       };
     };
-    assert.equal(views.dialogue.voice.exampleHint, "别盯着我看。");
-    assert.deepEqual(views.dialogue.voice.verbalHabits, ["……嗯"]);
+    assert.equal(views.dialogue.voice.sourceExampleCount, 2);
+    assert.deepEqual(views.dialogue.voice.contextModes, []);
+    assert.deepEqual(views.dialogue.voice.lexicalSignals.verbalHabits, ["……嗯"]);
+    assert.doesNotMatch(JSON.stringify(views), /别盯着我看|第二条例句不应整卡注入/u);
     assert.deepEqual(views.dialogue.owner, {
       characterId: 1,
       name: "林千夏",

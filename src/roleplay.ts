@@ -563,15 +563,8 @@ export function slimRoleplayCharacterViews(
     dialogue: {
       owner: views.dialogue.owner,
       name: views.dialogue.owner.name,
-      voice: {
-        summary: views.dialogue.voice.summary,
-        register: views.dialogue.voice.register,
-        diction: views.dialogue.voice.diction.slice(0, 8),
-        verbalHabits: views.dialogue.voice.verbalHabits.slice(0, 4),
-        avoidedExpressions: views.dialogue.voice.avoidedExpressions.slice(0, 6),
-        // Examples are boundaries, not per-turn templates — keep at most one.
-        exampleHint: views.dialogue.voice.examples[0]?.slice(0, 80) ?? "",
-      },
+      voice: views.dialogue.voice,
+      portrayalRule: views.dialogue.portrayalRule,
     },
   };
 }

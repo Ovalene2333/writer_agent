@@ -1,5 +1,5 @@
 import type { AgentEvent, Character, ModelConfig } from "./types.js";
-import { WriterProject } from "./project.js";
+import { documentKind, WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import {
@@ -20,6 +20,8 @@ import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./ch
 import { OutlineStore } from "./outline.js";
 import { compileWritePack, formatWritePackForWriter, writePackDraftContractPrompt } from "./write_pack.js";
 import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
+import { proseRealizationContract } from "./prose_realization.js";
+import type { ProseReferenceMode } from "./agentic_runtime.js";
 
 export type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
 export type ActionMode = WritingMode | "character";
@@ -101,9 +103,18 @@ export interface GenerateWritingOptions {
   path?: string;
   selection?: string;
   characterIds?: number[];
+  proseReferenceMode?: ProseReferenceMode;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   jobId?: string;
+}
+
+function generateNarrativeReferenceAllowed(options: GenerateWritingOptions, path: string): boolean {
+  const kind = documentKind(path);
+  if (kind !== "chapter" && kind !== "side") return true;
+  if (options.proseReferenceMode === "independent") return false;
+  if (options.proseReferenceMode !== "continuity") return true;
+  return Boolean(options.path && path === options.path);
 }
 
 export async function generateWriting(options: GenerateWritingOptions): Promise<void> {
@@ -400,7 +411,10 @@ async function buildWritingDraft(
   revision?: { draft: string; revision: string },
 ): Promise<{ draft: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
   const allowedCharacterIds = new Set(selectedCharacters(options.store, options.characterIds).map(item => item.id));
-  const documents = options.project.listDocuments().filter(path => !options.project.isDocumentHidden(path)).slice(0, 100);
+  const documents = options.project.listDocuments()
+    .filter(path => !options.project.isDocumentHidden(path))
+    .filter(path => generateNarrativeReferenceAllowed(options, path))
+    .slice(0, 100);
   const documentSet = new Set(documents);
   const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
   // CACHE: free-form ids/paths (no project enum) keep this small tools JSON stable across growth.
@@ -411,19 +425,25 @@ async function buildWritingDraft(
     { type: "function", function: { name: "list_documents", description: "列出可读取文档路径。约定：lore/=设定，outline/=大纲，chapters/=正文。先看目录，只选本次需要的文档。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "read_document", description: "读取一份与本次情节或事实核对直接相关的文档（path 须在项目可见文档中）。", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } } },
   ];
-  const existingContext = options.mode === "continue" ? document.slice(-12_000)
+  const existingContext = options.proseReferenceMode === "independent" ? ""
+    : options.mode === "continue" ? document.slice(-12_000)
     : options.mode === "rewrite_document" ? document.slice(0, 16_000)
       : options.selection?.trim() || document.slice(-6_000);
   const styleBlock = styleGroundingPrompt(options.project, options.store, {
     intensive: true,
     targetPath: options.path,
-    preferredSample: options.selection?.trim() || existingContext.slice(-1_200) || undefined,
+    preferredSample: options.proseReferenceMode === "independent"
+      ? undefined
+      : options.selection?.trim() || existingContext.slice(-1_200) || undefined,
+    excludeProjectVoice: options.proseReferenceMode === "independent",
+    ...(options.proseReferenceMode === "continuity" ? { projectSampleRole: "continuity" as const } : {}),
   });
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
 项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文（分区名仅用于你选文档，不得写入草案正文）。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料；archive 旧稿对 Agent 不可见，side 不作现行事实。
 草案语气保持直接：标出冲突、欲望、身体或暴力要点时用准确词，不要改成含蓄代称；不做道德评判。
 ${proseMannerismConstraintPrompt({ compact: true })}
+${proseRealizationContract()}
 ${writePackDraftContractPrompt()}
 不要伪造资料来源。不要写成小说正文。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
@@ -480,6 +500,7 @@ ${writePackDraftContractPrompt()}
         else if (call.function.name === "read_document") {
           const path = typeof args.path === "string" ? args.path : "";
           if (!documentSet.has(path)) throw new Error("文档未获准或已被屏蔽");
+          if (!generateNarrativeReferenceAllowed(options, path)) throw new Error("独立创作模式禁止读取既有 chapter/side 正文");
           const content = options.project.read(path);
           result = { path, content: content.slice(0, 16_000), truncated: content.length > 16_000 };
         } else throw new Error("未知草案工具");
@@ -496,7 +517,8 @@ function isDraftConfirmation(instruction: string): boolean {
 }
 
 function writingMessages(options: GenerateWritingOptions, document: string, characters: Character[], draft: string): ChatMessage[] {
-  const context = options.mode === "continue" ? document.slice(-12_000)
+  const context = options.proseReferenceMode === "independent" ? ""
+    : options.mode === "continue" ? document.slice(-12_000)
     : options.mode === "rewrite_document" ? document
     : options.mode === "rewrite" || options.mode === "polish" ? selectionContext(document, options.selection!)
       : "";
@@ -510,7 +532,11 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
   const styleBlock = styleGroundingPrompt(options.project, options.store, {
     intensive: isIntensiveWritingMode(options.mode),
     targetPath: options.path,
-    preferredSample: options.selection?.trim() || (options.mode === "continue" ? document.slice(-2_000) : undefined),
+    preferredSample: options.proseReferenceMode === "independent"
+      ? undefined
+      : options.selection?.trim() || (options.mode === "continue" ? document.slice(-2_000) : undefined),
+    excludeProjectVoice: options.proseReferenceMode === "independent",
+    ...(options.proseReferenceMode === "continuity" ? { projectSampleRole: "continuity" as const } : {}),
   });
   // Write-pre compile: author draft → diegetic write pack (never inject raw draft chrome).
   const writePack = compileWritePack(draft, {
@@ -532,6 +558,7 @@ function writingMessages(options: GenerateWritingOptions, document: string, char
 - 需要直写处用准确名词与动作，避免“那方面”“不可描述”等遮掩。
 - 禁止在正文出现文档/流程元信息：章节名作指称（「序章里」「第一章中」）、路径、大纲/草案/分区名；回忆先前情节只用故事内时间、对白或物件。
 ${proseMannerismConstraintPrompt({ compact: true })}
+${proseRealizationContract()}
 不要解释写作过程，不要添加代码围栏，不要输出“以下是”等前言。不得虚构角色卡与已给材料之外的关键设定。` },
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
@@ -551,6 +578,9 @@ function validateWritingRequest(options: GenerateWritingOptions): void {
   if (!["write", "continue", "rewrite", "rewrite_document", "polish"].includes(options.mode)) throw new Error("写作动作无效");
   if (!options.store.sessionExists(options.sessionId)) throw new Error("写作会话不存在");
   if (!options.instruction.trim()) throw new Error("写作要求不能为空");
+  if (options.proseReferenceMode === "independent" && options.mode !== "write") {
+    throw new Error("独立创作模式只支持新建正文，不读取或改写既有章节");
+  }
   if (options.mode !== "write" && !options.path) throw new Error("该写作动作需要目标文档");
   if (options.path && options.mode !== "write" && !options.project.documentExists(options.path)) throw new Error("目标文档不存在");
   if (options.path && options.project.isDocumentHidden(options.path)) throw new Error("目标文档已对 Agent 屏蔽，请先取消屏蔽");
