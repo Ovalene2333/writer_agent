@@ -99,6 +99,35 @@ test("compileWritePack parses structured draft sections", () => {
   assert.match(formatWritePackForWriter(pack), /【叙述提醒】/u);
 });
 
+test("compileWritePack separates fact precision from contextual realization", () => {
+  const pack = compileWritePack(`## 已知事实
+- 千夏的神经组织仍在工作
+- 皮层完整度为百分之九十八点三
+
+## 表达边界
+- 千夏的神经组织仍在工作 | 用途=表现超频后的不适 | 精度=sensory | 叙述=写成发胀、发灰或困意 | 对白=我还醒着 | 技术对白=皮层清醒 | 避免=旁白反复点名皮层
+`);
+  assert.equal(pack.factAtoms?.length, 2);
+  assert.equal(pack.factAtoms?.[0]?.precision, "sensory");
+  assert.equal(pack.factAtoms?.[1]?.precision, "normal");
+  assert.equal(pack.realizationBoundaries?.length, 1);
+  assert.equal(pack.realizationBoundaries?.[0]?.precision, "sensory");
+  assert.match(formatWritePackForWriter(pack), /普通对白倾向：我还醒着/u);
+  assert.match(formatWritePackForWriter(pack), /不是固定替换表/u);
+});
+
+test("malformed realization boundary falls back without changing legacy facts", () => {
+  const pack = compileWritePack(`## 已知事实
+- 她仍然清醒
+
+## 表达边界
+- 这不是结构化表达边界
+`);
+  assert.deepEqual(pack.knownFacts, ["她仍然清醒"]);
+  assert.equal(pack.realizationBoundaries?.length, 0);
+  assert.doesNotMatch(formatWritePackForWriter(pack), /这不是结构化表达边界/u);
+});
+
 test("generic voice headings never enter the global write pack", () => {
   const pack = compileWritePack("## 声线\n- 闻溪面对追问会用短句回避。\n");
   assert.deepEqual(pack.narrationNotes, []);

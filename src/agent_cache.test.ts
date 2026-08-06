@@ -664,6 +664,11 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(instructions, /characterScopes/);
   assert.match(instructions, /未列入的能力不得在正文使用或点名/);
   assert.match(instructions, /大纲不是前置条件/);
+  assert.match(instructions, /设定中的规范术语是事实来源/);
+  assert.match(instructions, /上下文能猜出意思不等于表达自然/);
+  assert.match(instructions, /抽象归属或判断硬扣到物件/u);
+  assert.match(instructions, /## 表达边界/);
+  assert.match(instructions, /不为普通名词制造同义词配额/);
   assert.match(instructions, /问题密集/);
   assert.match(instructions, /重写受影响场景乃至全文/);
   assert.doesNotMatch(instructions, /不能跳过逐场景/);

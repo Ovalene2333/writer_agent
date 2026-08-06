@@ -21,7 +21,7 @@ import { documentKind, resolveOutlineSourcePath, WriterProject } from "./project
 import { WriterStore } from "./store.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { proseMannerismPreflightLine } from "./prose_quality.js";
+import { proseCompressionGuidance, proseMannerismPreflightLine } from "./prose_quality.js";
 import { PROSE_TARGET_BAND_TEXT, resolveTurnProseLength, type TurnProseLength } from "./prose_length.js";
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
@@ -1372,6 +1372,8 @@ export function taskInstructions(
 - 目标路径已经存在时保持原路径，系统会把工作副本记录为该文件的新版本；不要为避开同名另起副本或改写章节路径。局部修改用 edit_file，完整替换用 write_file。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 时，写前须读取该角色 voice、motivations、relationships、storyState，且声线只约束该角色说出口的对白。${fastWritingMode ? `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。` : `write_chapter_scene 只提交 sceneId 与不超过 ${notesMaxCharacters} 字的故事内 notes，省略 content/actualState，由证据型 Writer 和状态提取器完成。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
+- ${proseCompressionGuidance()}
+- 设定中的规范术语是事实来源，不是正文默认措辞。若同一概念会同时进入专业汇报、普通对白和贴身叙述，在 compile_write_pack 或场景 notes 中增加「## 表达边界」，按“事实 | 用途=… | 精度=exact/normal/sensory | 叙述=… | 对白=… | 技术对白=… | 避免=…”说明语域；只在确有污染风险时填写，不为普通名词制造同义词配额。
 - 章节动力服从本章目标。冲突章应让阻力真正回应人物行动；静场、过渡章与收束章也可以用理解、关系或条件的变化完成。代价、悬问与不可逆损失只在因果需要时出现，不作为每章配额。
 - 不论选择哪条路径，正文都不得出现路径、大纲、草案、工具 JSON、角色卡分区等元指称。提交前：${proseMannerismPreflightLine()}
 - 只交付用户本轮明确要求的正文范围；用户指定多章时逐章提交并沿用已读材料，未要求的章节不得自行扩展。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;

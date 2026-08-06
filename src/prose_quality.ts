@@ -145,6 +145,11 @@ export function proseMannerismPreflightLine(): string {
   return "按「风格锚定」的句式边界复核密集复现、重复解释与关系含混；孤立且符合人物和现场的表达保留。";
 }
 
+/** Dynamic guidance: keep terse prose from collapsing into note-like predicates. */
+export function proseCompressionGuidance(): string {
+  return "缩句自然度契约：短句和省略必须来自人物当下的说话压力、动作落点或已明确的近邻关系。不要把本可自然说清的主谓、动作对象、感受来源或比较维度连续压成“名词短语＋一个状态/动作”，也不要把抽象归属或判断硬扣到物件上制造冷淡机锋。上下文能猜出意思不等于表达自然；若连续几句都靠读者补关系，应恢复其中至少一处完整而朴素的承接。";
+}
+
 /**
  * Scene-level hard-mannerism gate (rules only, no Flash).
  * Reject a single scene before it enters the chapter draft so density never

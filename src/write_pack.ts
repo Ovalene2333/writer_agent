@@ -37,6 +37,30 @@ export type WritePack = {
   structured: boolean;
   /** Meta labels stripped during compile (for debug / tests). */
   strippedMeta: string[];
+  /** Optional normalized facts; absent in legacy callers and old persisted packs. */
+  factAtoms?: FactAtom[];
+  /** Optional viewpoint/register guidance; never a forced synonym replacement. */
+  realizationBoundaries?: RealizationBoundary[];
+};
+
+export type FactPrecision = "exact" | "normal" | "sensory";
+
+export type FactAtom = {
+  id: string;
+  claim: string;
+  purpose?: string;
+  precision: FactPrecision;
+};
+
+export type RealizationBoundary = {
+  factId: string;
+  claim: string;
+  purpose?: string;
+  precision?: FactPrecision;
+  narration?: string;
+  dialogue?: string;
+  technicalDialogue?: string;
+  avoid?: string;
 };
 
 export type CompileWritePackOptions = {
@@ -45,7 +69,7 @@ export type CompileWritePackOptions = {
   instruction?: string;
 };
 
-type WritePackSectionField = keyof Pick<WritePack, "sceneGoal" | "beatOrder" | "knownFacts" | "mustLand" | "characterState" | "narrationNotes" | "doNotInvent"> | "discard";
+type WritePackSectionField = keyof Pick<WritePack, "sceneGoal" | "beatOrder" | "knownFacts" | "mustLand" | "characterState" | "narrationNotes" | "doNotInvent"> | "realizationBoundaries" | "discard";
 
 const SECTION_MAP: Array<{ keys: RegExp; field: WritePackSectionField }> = [
   { keys: /^(?:场景目标|本次场景目标|场景推进|推进目标|目标与推进|本场目标)$/u, field: "sceneGoal" },
@@ -54,6 +78,7 @@ const SECTION_MAP: Array<{ keys: RegExp; field: WritePackSectionField }> = [
   { keys: /^(?:必要信息|须带出|需要自然带出|须自然落地|自然带出|信息落地|必须落地)$/u, field: "mustLand" },
   { keys: /^(?:人物|人物状态|动机|关系张力|人物当下|角色状态)$/u, field: "characterState" },
   { keys: /^(?:叙述提醒|叙事视角|视角与叙述|文风提醒)$/u, field: "narrationNotes" },
+  { keys: /^(?:表达边界|事实表达|术语表达|语域实现|表达策略)$/u, field: "realizationBoundaries" },
   // An unqualified 声线 section is normally a character card fragment. Discard it
   // rather than letting it contaminate narration or every speaker via the pack.
   { keys: /^(?:声线|声线约束|视角与声线)$/u, field: "discard" },
@@ -204,9 +229,28 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
   const characterState = sanitizeList(splitList(take("characterState").join("\n")));
   const narrationNotes = sanitizeList(splitList(take("narrationNotes").join("\n")));
   const doNotInvent = sanitizeList(splitList(take("doNotInvent").join("\n")));
+  const factAtoms = knownFacts.slice(0, 12).map((claim, index) => ({
+    id: `fact-${index + 1}`,
+    claim,
+    precision: "normal" as const,
+  }));
+  const realizationBoundaries = parseRealizationBoundaries(
+    take("realizationBoundaries").flatMap(body => splitList(body)),
+    factAtoms,
+    sanitize,
+  );
+  const compiledFactAtoms = factAtoms.map(fact => {
+    const boundary = realizationBoundaries.find(item => item.factId === fact.id);
+    return {
+      ...fact,
+      ...(boundary?.purpose ? { purpose: boundary.purpose } : {}),
+      ...(boundary?.precision ? { precision: boundary.precision } : {}),
+    };
+  });
   const structured = Boolean(
     sceneGoal || beatOrder.length || knownFacts.length || mustLand.length
     || characterState.length || narrationNotes.length || doNotInvent.length
+    || take("realizationBoundaries").length
     || [...sections.values()].some(entry => entry.field === "discard"),
   );
 
@@ -231,6 +275,8 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
     narrativeBrief,
     structured,
     strippedMeta: [...new Set(strippedMeta)],
+    factAtoms: compiledFactAtoms,
+    realizationBoundaries,
   };
 }
 
@@ -252,6 +298,11 @@ export function formatWritePackForWriter(pack: WritePack): string {
   if (pack.narrativeBrief && (!pack.structured || pack.narrativeBrief.length > 40)) {
     lines.push(`【情节提要】\n${pack.narrativeBrief}`);
   }
+  if (pack.realizationBoundaries?.length) {
+    lines.push(
+      `【事实表达边界】\n${pack.realizationBoundaries.map(formatRealizationBoundary).join("\n")}\n（以上是语域和信息精度提示，不是固定替换表；以当前视角、人物知识和行动需要决定最终说法。）`,
+    );
+  }
 
   if (lines.length === 1) {
     lines.push("（可写材料为空；仅依据文档上下文与写作要求创作。）");
@@ -269,12 +320,14 @@ export function writePackDraftContractPrompt(): string {
 ## 须自然落地
 ## 勿擅自补写
 ## 叙述提醒
+## 表达边界
 
 约束：
 - 全部用故事世界内说法写事实与回忆；禁止出现「序章/第N章/大纲/草案/lore/outline/chapters」等文档或流程标签。
 - 指称先前情节时写清故事内锚点（如「门缝里那句预估」「入院当晚」），不要写「比序章里…」。
 - 「已知事实」只列已核实内容；不确定标「待定」并放入「勿擅自补写」。
 - 「叙述提醒」只写叙述距离、视角、段落密度等全局叙事选择。不得写某个角色的说话方式、口头禅、句长或对白示例；角色对白必须回到该角色的原始角色卡读取。
+- 「表达边界」只在设定术语容易污染普通叙述或对白时填写。每行使用：事实 | 用途=… | 精度=exact/normal/sensory | 叙述=… | 对白=… | 技术对白=… | 避免=…。它是语域和信息精度提示，不是固定同义词替换；未填写的栏目留空。
 - 区分确定事实与本次创作决定时，用正文可读的措辞，不要写「资料已确认」等内部标签。`;
 }
 
@@ -292,7 +345,74 @@ function emptyPack(sourceDraft: string, instruction?: string): WritePack {
     narrativeBrief: brief,
     structured: false,
     strippedMeta: [],
+    factAtoms: [],
+    realizationBoundaries: [],
   };
+}
+
+function parseRealizationBoundaries(
+  rows: string[],
+  facts: FactAtom[],
+  sanitize: (value: string) => string,
+): RealizationBoundary[] {
+  const boundaries: RealizationBoundary[] = [];
+  for (const raw of rows.slice(0, 12)) {
+    const pieces = raw.split("|").map(item => item.trim()).filter(Boolean);
+    if (!pieces.length) continue;
+    const values = new Map<string, string>();
+    let claim = "";
+    for (const piece of pieces) {
+      const separator = piece.indexOf("=");
+      if (separator < 0) {
+        if (!claim) claim = sanitize(piece).trim();
+        continue;
+      }
+      const key = piece.slice(0, separator).trim().toLocaleLowerCase();
+      const value = sanitize(piece.slice(separator + 1)).trim();
+      if (value) values.set(key, value);
+    }
+    claim = values.get("事实") ?? values.get("fact") ?? claim;
+    if (!claim) continue;
+    const hasGuidance = [
+      "用途", "purpose", "精度", "precision", "叙述", "narration", "对白", "dialogue",
+      "技术对白", "technical", "technicaldialogue", "避免", "avoid",
+    ].some(key => values.has(key));
+    if (!hasGuidance) continue;
+    const matched = facts.find(fact => fact.claim === claim)
+      ?? facts.find(fact => fact.claim.includes(claim) || claim.includes(fact.claim));
+    const factId = matched?.id ?? `boundary-${boundaries.length + 1}`;
+    const precision = normalizeFactPrecision(values.get("精度") ?? values.get("precision"));
+    boundaries.push({
+      factId,
+      claim,
+      ...(values.get("用途") || values.get("purpose") ? { purpose: values.get("用途") ?? values.get("purpose") } : {}),
+      ...(precision ? { precision } : {}),
+      ...(values.get("叙述") || values.get("narration") ? { narration: values.get("叙述") ?? values.get("narration") } : {}),
+      ...(values.get("对白") || values.get("dialogue") ? { dialogue: values.get("对白") ?? values.get("dialogue") } : {}),
+      ...(values.get("技术对白") || values.get("technical") || values.get("technicaldialogue")
+        ? { technicalDialogue: values.get("技术对白") ?? values.get("technical") ?? values.get("technicaldialogue") } : {}),
+      ...(values.get("避免") || values.get("avoid") ? { avoid: values.get("避免") ?? values.get("avoid") } : {}),
+    });
+  }
+  return boundaries;
+}
+
+function normalizeFactPrecision(value: string | undefined): FactPrecision | undefined {
+  if (value === "exact" || value === "normal" || value === "sensory") return value;
+  return undefined;
+}
+
+function formatRealizationBoundary(boundary: RealizationBoundary): string {
+  const fields = [
+    `事实：${boundary.claim}`,
+    boundary.purpose ? `用途：${boundary.purpose}` : "",
+    boundary.precision ? `精度：${boundary.precision}` : "",
+    boundary.narration ? `叙述倾向：${boundary.narration}` : "",
+    boundary.dialogue ? `普通对白倾向：${boundary.dialogue}` : "",
+    boundary.technicalDialogue ? `专业对白可用：${boundary.technicalDialogue}` : "",
+    boundary.avoid ? `避免：${boundary.avoid}` : "",
+  ].filter(Boolean);
+  return `- ${fields.join("；")}`;
 }
 
 function parseDraftSections(draft: string): Map<string, { field: string; body: string }> {

@@ -22,7 +22,7 @@ export type ChapterReviewIssue = {
   severity: "blocker" | "warning";
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
     | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "identity_relationship" | "capability_scope"
-    | "telemetry_pileup" | "expository_mechanics" | "semantic_echo" | "generic_prose"
+    | "telemetry_pileup" | "register_leak" | "compressed_prose" | "expository_mechanics" | "semantic_echo" | "generic_prose"
     | "voice_homogenization" | "dialogue_format" | "dialogue_telegraphic"
     | "theme_stated" | "resolution_too_smooth" | "dialogue_frictionless"
     | "drive_flat" | "stakes_absent";
@@ -100,7 +100,7 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 
 随后按本章目标检查结构与表达：
 - 场景接续是否存在因果断裂、状态矛盾或换地点重复同一功能；章首到章尾是否形成与 chapterGoal 相符的变化。静场、铺垫章、过渡章和收束章可以只改变认知、关系或选择，不必强造对抗、悬念和损失；
-- telemetry_pileup：读数或术语连续出现，却不影响人物判断与行动；expository_mechanics：已经成立的动作又被教程式解释挤占；semantic_echo：相邻句段重复同一信息；generic_prose：关键场面长期只有泛化判断，缺少可辨认的现场依据；
+- telemetry_pileup：读数或术语连续出现，却不影响人物判断与行动；register_leak：资料中的规范术语跨越专业报告、普通对白、贴身叙述或人物内心后仍被当作唯一默认指称，使人物不像在自己的处境中说话或感受。单个必要术语、角色确有专业身份、正式状态汇报和首次精确定义都应放行；不得因词频本身报告，必须引用至少两处能证明语域不分的原文，并说明各处为什么应采用不同的信息精度或体验表达；compressed_prose：叙述或对白连续把主谓、动作对象、感受来源、比较维度或句间承接压成“名词短语＋谓词”，或用抽象归属硬扣物件制造短梗，导致句子虽可猜懂却长期像提纲字段。报此项必须引用至少两处相邻或同段原文并指出被压掉的具体关系；单个短句、军令、紧张重音、自然问答和符合人物压力的口语省略应放行；expository_mechanics：已经成立的动作又被教程式解释挤占；semantic_echo：相邻句段重复同一信息；generic_prose：关键场面长期只有泛化判断，缺少可辨认的现场依据；
 - voice_homogenization：主要人物的措辞、信息取舍和说话目的长期无法区分。若 evidence packet 有 dialogueCharacters，先对照其 voice、目标、关系与当前状态；判断两人是否因想达成不同事情而选择不同信息、回避角度和谈话策略（追问、换题、还价、拒绝、解释、威胁等）。报此项必须引用至少两名人物各自的逐字台词，并在 problem 说明可互换的原因；口语标记比例、短句或统计接近都不能单独成立。不要以口头禅、固定句长或强行回避作为角色声线模板；
 - dialogue_format：说出口的直接对白应使用「……」，对白内嵌引用使用『……』。独立格式门禁会处理可见的混用与错配；只有明显的裸台词逃过该门禁时才报此项，并引用原文。不要把转述、内心或引文误当作直接对白；
 - dialogue_telegraphic：只在相邻对白反复压成名词/状态播报、或省掉施事、对象、因果承接后无法由近邻语境自然补全时报告。检查它是否仍像人在当下为某事说话，而非把提纲字段逐项念出；书面、完整的句子不自动自然，短命令、紧张、沉默、改口及上下文充分的口语省略也不自动有错。必须引用连续原文，说明缺失了什么承接；
@@ -111,7 +111,7 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。风格、声线、主题直陈、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
 
 单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|capability_scope|telemetry_pileup|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
+字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -199,7 +199,7 @@ export function parseChapterReview(
   const kinds = new Set<ChapterReviewIssue["kind"]>([
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
     "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship", "capability_scope",
-    "telemetry_pileup", "expository_mechanics", "semantic_echo", "generic_prose",
+    "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose",
     "voice_homogenization", "dialogue_format", "dialogue_telegraphic",
     "theme_stated", "resolution_too_smooth", "dialogue_frictionless",
     "drive_flat", "stakes_absent",
@@ -261,11 +261,11 @@ export function parseChapterReview(
   // Incomplete blockers must not invalidate sibling locatable blockers (old `.some` did that).
   const locatableBlockers = issues.filter(
     issue => issue.severity === "blocker" && issue.sceneId && issue.evidence.length > 0
-      && (issue.kind !== "voice_homogenization" || issue.evidence.length >= 2),
+      && (!["voice_homogenization", "register_leak", "compressed_prose"].includes(issue.kind) || issue.evidence.length >= 2),
   );
   const normalizedIssues = issues.map(issue => {
     if (issue.severity === "blocker" && (!issue.sceneId || !issue.evidence.length
-      || (issue.kind === "voice_homogenization" && issue.evidence.length < 2))) {
+      || (["voice_homogenization", "register_leak", "compressed_prose"].includes(issue.kind) && issue.evidence.length < 2))) {
       return { ...issue, severity: "warning" as const };
     }
     return issue;

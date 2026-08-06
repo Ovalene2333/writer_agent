@@ -138,6 +138,12 @@ test("built-in semantic rules keep a fixed project-rule capacity and repair meta
   assert.match(characterization?.instruction ?? "", /行动证明.*外部背书.*点题定性/u);
   assert.match(characterization?.revisionIntent ?? "", /具体选择.*后果/u);
 
+  const telegraphic = BUILT_IN_PROSE_GATE_RULES.find(rule => rule.id === "telegraphic-object-beats");
+  assert.match(telegraphic?.instruction ?? "", /上下文猜出关系.*仍像提纲字段/u);
+  assert.match(telegraphic?.instruction ?? "", /抽象归属.*具体物件.*短梗/u);
+  assert.match(telegraphic?.instruction ?? "", /不能只摘一个短句/u);
+  assert.match(telegraphic?.revisionIntent ?? "", /比较维度.*至少展开一处/u);
+
   const precisionStaccato = BUILT_IN_PROSE_GATE_RULES.find(rule => rule.id === "manufactured-precision-staccato");
   assert.equal(precisionStaccato?.kind, "style_preference");
   assert.equal(precisionStaccato?.severity, "warn");

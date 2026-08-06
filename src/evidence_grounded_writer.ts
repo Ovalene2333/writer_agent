@@ -17,6 +17,7 @@ import type { WriterProject } from "./project.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { formatWritePackForWriter, type WritePack } from "./write_pack.js";
 import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
+import { proseCompressionGuidance } from "./prose_quality.js";
 
 export type EvidenceGroundedWriterInput = {
   path: string;
@@ -121,7 +122,13 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
   const sections = [
     `写作材料：\n${formatWritePackForWriter(input.writePack)}`,
     `共享事实证据（hash=${input.evidence.hash}）：\n${JSON.stringify(narrativeEvidenceForPrompt(input.evidence))}`,
+    `正文缩句契约：\n${proseCompressionGuidance()}`,
   ];
+  if (input.writePack.realizationBoundaries?.length) {
+    sections.push(
+      "表达边界执行规则：先保证事实和本场变化，再按视角、人物知识、说话目的和专业程度选择表达。边界中的词语只是允许或倾向，不是逐字替换表；普通对白和贴身叙述不要为了“忠实设定”强行复述技术术语。",
+    );
+  }
   if (input.previousTail?.trim()) {
     sections.push(`故事刚停在这里。不要复述，接住动作、语气和未完成的压力：\n${input.previousTail.trim().slice(-2_000)}`);
   }

@@ -5,6 +5,7 @@ import {
   contrastStyleError,
   contrastStyleReport,
   newProseStyleIssues,
+  proseCompressionGuidance,
   proseMannerismConstraintPrompt,
   proseMannerismPreflightLine,
   proseStyleRepairPacket,
@@ -32,6 +33,14 @@ test("generation-time constraint prompt targets dense repetition without banning
   }
   assert.match(proseMannerismPreflightLine(), /密集复现/);
   assert.match(proseMannerismPreflightLine(), /孤立.*保留/);
+});
+
+test("dynamic compression guidance distinguishes natural ellipsis from note-like prose", () => {
+  const guidance = proseCompressionGuidance();
+  assert.match(guidance, /名词短语＋一个状态\/动作/u);
+  assert.match(guidance, /比较维度/u);
+  assert.match(guidance, /上下文能猜出意思不等于表达自然/u);
+  assert.match(guidance, /完整而朴素的承接/u);
 });
 
 test("registered construction rules feed generation and semantic review in stable order", () => {

@@ -78,6 +78,34 @@ test("新 kind 不放宽 blocker 的证据要求", () => {
   assert.equal(direct.issues[0]?.severity, "warning");
 });
 
+test("终审接受有跨语域证据的 register_leak warning", () => {
+  const source = "她说：「纳容满，核心满，皮层清醒。」休息时，她又说：「喝点水，给皮层一个还活着的信号。」";
+  const parsed = parseChapterReview(review([
+    {
+      severity: "warning", kind: "register_leak", sceneId: "s1",
+      evidence: ["「纳容满，核心满，皮层清醒。」", "「喝点水，给皮层一个还活着的信号。」"],
+      problem: "正式状态汇报和休息时的普通对白沿用了同一技术指称",
+      action: "保留状态汇报中的术语，把日常对白改为人物自然会说的话",
+    },
+  ], "pass"), SCENES, source);
+  assert.equal(parsed.issues[0]?.kind, "register_leak");
+  assert.equal(parsed.issues[0]?.severity, "warning");
+});
+
+test("终审接受连续关系压缩的 compressed_prose warning", () => {
+  const source = "「我穿卫衣。」她碰了碰耳钉，金属凉，贴着人造皮肤比真皮更清楚。「百褶裙也穿。响的责任算裙摆。」";
+  const parsed = parseChapterReview(review([
+    {
+      severity: "warning", kind: "compressed_prose", sceneId: "s1",
+      evidence: ["金属凉，贴着人造皮肤比真皮更清楚。", "「百褶裙也穿。响的责任算裙摆。」"],
+      problem: "叙述省掉了感受来源和比较维度，对白又用抽象责任制造短梗",
+      action: "恢复一处朴素承接并写清比较的具体感觉",
+    },
+  ], "pass"), SCENES, source);
+  assert.equal(parsed.issues[0]?.kind, "compressed_prose");
+  assert.equal(parsed.issues[0]?.severity, "warning");
+});
+
 test("直接文档终审可回填 document sceneId，并容忍引号空白差异", () => {
   const source = "「我们必须面对这个真相。」他说。「别把话说满。」她说。";
   const parsed = parseChapterReview(JSON.stringify({

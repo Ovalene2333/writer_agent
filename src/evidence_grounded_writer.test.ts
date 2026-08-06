@@ -52,8 +52,56 @@ test("dialogue naturalness guidance stays in the dynamic writer request", () => 
   assert.match(String(messages[2]?.content), /此刻想得到什么/u);
   assert.match(String(messages[2]?.content), /回避/u);
   assert.match(String(messages[2]?.content), /不要批量补助词/u);
+  assert.match(String(messages[2]?.content), /上下文能猜出意思不等于表达自然/u);
+  assert.match(String(messages[2]?.content), /比较维度/u);
   assert.doesNotMatch(String(messages[0]?.content), /对白自然度契约/u);
   assert.match(dialogueNaturalnessGuidance(), /保持事实、知识和人物声线不变/u);
+  assert.match(dialogueNaturalnessGuidance(), /不能只为显得干脆、冷淡或机灵/u);
+});
+
+test("realization boundaries stay in the dynamic writer user message", () => {
+  const pack = {
+    sourceDraft: "",
+    sceneGoal: "表现超频后的不适",
+    beatOrder: [],
+    knownFacts: ["千夏的神经组织仍在工作"],
+    mustLand: [],
+    characterState: [],
+    narrationNotes: [],
+    doNotInvent: [],
+    narrativeBrief: "",
+    structured: true,
+    strippedMeta: [],
+    realizationBoundaries: [{
+      factId: "fact-1",
+      claim: "千夏的神经组织仍在工作",
+      precision: "sensory" as const,
+      narration: "写成发胀或发灰",
+      dialogue: "我还醒着",
+      technicalDialogue: "皮层清醒",
+      avoid: "旁白反复点名皮层",
+    }],
+  };
+  const evidence = {
+    version: 1 as const,
+    path: "chapters/test.md",
+    instructions: "",
+    writingMemory: [],
+    characters: [],
+    sources: [],
+    coverageGaps: [],
+    hash: "test-hash",
+  };
+  const messages = buildEvidenceGroundedWriterMessages({
+    path: "chapters/test.md",
+    outputKind: "document",
+    writePack: pack,
+    evidence,
+    styleEvidence: "稳定文风",
+  });
+  assert.doesNotMatch(String(messages[0]?.content), /表达边界执行规则/u);
+  assert.match(String(messages[2]?.content), /皮层清醒/u);
+  assert.match(String(messages[2]?.content), /不是逐字替换表/u);
 });
 
 test("delegated write_file realizes a compiled pack through the evidence-grounded writer", async () => {

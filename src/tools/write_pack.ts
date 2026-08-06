@@ -23,6 +23,8 @@ export function handleCompileWritePack({ input, context }: ToolHandlerArgs): str
   return JSON.stringify({
     status: "compiled",
     writePack,
+    factAtomCount: pack.factAtoms?.length ?? 0,
+    realizationBoundaryCount: pack.realizationBoundaries?.length ?? 0,
     message: "已编译本场场景材料。writePack 不替代角色卡；能力、知识、关系与对白声线仍须依据本轮 get_character 的原始分区。",
   });
 }

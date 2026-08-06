@@ -5,6 +5,7 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import {
   analyzeProseStyle,
   contrastStyleError,
+  proseCompressionGuidance,
   proseMannerismConstraintPrompt,
   proseMannerismPreflightLine,
   type ProseStyleIssue,
@@ -538,6 +539,7 @@ ${proseMannerismConstraintPrompt({ compact: true })}
       characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(item => characterContext(item, options.project, options.path, options.selection)), null, 2)}` : "相关角色卡：无",
       packText,
       context ? `文档上下文（纯正文，用于衔接声线与事实）：\n${context}` : "",
+      `正文缩句契约：\n${proseCompressionGuidance()}`,
       `对白执行契约：\n${dialogueNaturalnessGuidance()}`,
       `写作要求：${options.instruction.trim()}`,
       `只输出正文。声线优先贴合文档上下文与风格样本。${proseMannerismPreflightLine()}`,
