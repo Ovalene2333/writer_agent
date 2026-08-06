@@ -3062,6 +3062,10 @@ export async function runAgent(options: {
       model: adjudicatorModel,
       ...(adjudicatorFallbackModel ? { fallbackModel: adjudicatorFallbackModel } : {}),
       signal,
+      reviewTimeoutsMs: {
+        primary: runtimeSettings.proseGateTimeouts.primarySeconds * 1_000,
+        final: runtimeSettings.proseGateTimeouts.finalSeconds * 1_000,
+      },
     },
     writingMemoryExtractor: {
       model: options.models?.summarizer ?? options.models?.inline ?? adjudicatorModel,

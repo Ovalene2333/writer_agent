@@ -592,6 +592,7 @@ export type State = {
     maxAgentSteps?: number;
     scenePipeline: ScenePipelineSettings;
     proseLength?: ProseLengthSettings;
+    proseGateTimeouts?: { primarySeconds: number; finalSeconds: number };
   };
   proseGateRules?: ProseGateRule[];
   authorPolicies?: AuthorPolicy[];

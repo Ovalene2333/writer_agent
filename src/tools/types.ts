@@ -168,6 +168,7 @@ export type ToolExecutionContext = {
     /** Distinct provider/model used only after the primary adjudicator fails. */
     fallbackModel?: ModelConfig;
     signal?: AbortSignal;
+    reviewTimeoutsMs?: { primary: number; final: number };
   };
   /**
    * Paths that already used the first-draft rhythm grace (plot/scene first).

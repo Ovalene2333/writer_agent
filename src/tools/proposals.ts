@@ -535,10 +535,14 @@ export const FINAL_PROSE_GATE_TIMEOUT_MS = 180_000;
  * needs more than 60 seconds, so applying the primary timeout to the fallback
  * incorrectly turned normal latency into a dependency outage.
  */
-export function proseGateReviewTimeoutMs(modelIndex: number, modelCount: number): number {
+export function proseGateReviewTimeoutMs(
+  modelIndex: number,
+  modelCount: number,
+  configured?: { primary: number; final: number },
+): number {
   return modelCount > 1 && modelIndex < modelCount - 1
-    ? PRIMARY_PROSE_GATE_TIMEOUT_MS
-    : FINAL_PROSE_GATE_TIMEOUT_MS;
+    ? configured?.primary ?? PRIMARY_PROSE_GATE_TIMEOUT_MS
+    : configured?.final ?? FINAL_PROSE_GATE_TIMEOUT_MS;
 }
 
 export async function proseStyleGateIssues(
@@ -596,7 +600,13 @@ export async function proseStyleGateIssues(
             usageReporter: context.modelUsageReporter,
             callKind: "learned_prose_gate",
             ...(options?.failClosed
-              ? { timeoutMs: proseGateReviewTimeoutMs(modelIndex, adjudicatorModels.length) }
+              ? {
+                  timeoutMs: proseGateReviewTimeoutMs(
+                    modelIndex,
+                    adjudicatorModels.length,
+                    context.proseAdjudicator.reviewTimeoutsMs,
+                  ),
+                }
               : {}),
             ...(options?.reviewWholeText ? {} : { beforeText: beforeContent }),
             failClosed: options?.failClosed === true,

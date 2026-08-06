@@ -404,7 +404,16 @@ function upsertGrokProxyProvider(
         currency: "CNY",
         contextWindow: 128_000,
       },
+      // Starting the local proxy updates its endpoint/key, but must not reset
+      // model-level tuning configured in the provider UI.
+      temperature: existingModel?.temperature,
+      topP: existingModel?.topP,
+      frequencyPenalty: existingModel?.frequencyPenalty,
+      presencePenalty: existingModel?.presencePenalty,
+      reasoningEffort: existingModel?.reasoningEffort,
+      verbosity: existingModel?.verbosity,
       disableSampling: true,
+      supportsMultimodal: existingModel?.supportsMultimodal,
     }],
   });
 }

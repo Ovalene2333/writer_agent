@@ -112,6 +112,7 @@ type ModelConfigProps = {
   initialCatalog: ProviderCatalog;
   scenePipeline: ScenePipelineSettings;
   proseLength: ProseLengthSettings;
+  proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
   writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
   reviewFollowsProseModel: boolean;
@@ -129,6 +130,7 @@ type ModelConfigProps = {
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onProseLengthChanged: (settings: ProseLengthSettings) => void;
+  onProseGateTimeoutsChanged: (settings: { primarySeconds: number; finalSeconds: number }) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
   onReviewFollowsProseModelChanged: (enabled: boolean) => void;
   onStepBudgetChanged: (settings: { stepBudgetMode: AgentStepBudgetMode; maxAgentSteps: number }) => void;
@@ -138,6 +140,7 @@ export function ModelConfig({
   initialCatalog,
   scenePipeline,
   proseLength,
+  proseGateTimeouts,
   writingMode,
   characterEvolutionEnabled,
   reviewFollowsProseModel,
@@ -155,6 +158,7 @@ export function ModelConfig({
   onChanged,
   onScenePipelineChanged,
   onProseLengthChanged,
+  onProseGateTimeoutsChanged,
   onCharacterEvolutionChanged,
   onReviewFollowsProseModelChanged,
   onStepBudgetChanged,
@@ -162,6 +166,7 @@ export function ModelConfig({
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [lengthDraft, setLengthDraft] = useState(proseLength);
+  const [proseGateTimeoutsDraft, setProseGateTimeoutsDraft] = useState(proseGateTimeouts);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [reviewFollowsProseDraft, setReviewFollowsProseDraft] = useState(reviewFollowsProseModel);
   const [stepBudgetModeDraft, setStepBudgetModeDraft] = useState(stepBudgetMode);
@@ -178,6 +183,7 @@ export function ModelConfig({
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setLengthDraft(proseLength), [proseLength]);
+  useEffect(() => setProseGateTimeoutsDraft(proseGateTimeouts), [proseGateTimeouts]);
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
   useEffect(() => setReviewFollowsProseDraft(reviewFollowsProseModel), [reviewFollowsProseModel]);
   useEffect(() => setStepBudgetModeDraft(stepBudgetMode), [stepBudgetMode]);
@@ -193,6 +199,8 @@ export function ModelConfig({
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
     || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
+    || proseGateTimeoutsDraft.primarySeconds !== proseGateTimeouts.primarySeconds
+    || proseGateTimeoutsDraft.finalSeconds !== proseGateTimeouts.finalSeconds
     || reviewFollowsProseDraft !== reviewFollowsProseModel
     || stepBudgetModeDraft !== stepBudgetMode
     || maxAgentStepsDraft !== maxAgentSteps
@@ -207,6 +215,11 @@ export function ModelConfig({
     && Number.isInteger(sceneDraft.candidateCount)
     && sceneDraft.candidateCount >= 1
     && sceneDraft.candidateCount <= 3;
+  const proseGateTimeoutsInvalid = !Number.isInteger(proseGateTimeoutsDraft.primarySeconds)
+    || !Number.isInteger(proseGateTimeoutsDraft.finalSeconds)
+    || proseGateTimeoutsDraft.primarySeconds < 10 || proseGateTimeoutsDraft.primarySeconds > 900
+    || proseGateTimeoutsDraft.finalSeconds < 10 || proseGateTimeoutsDraft.finalSeconds > 900
+    || proseGateTimeoutsDraft.finalSeconds < proseGateTimeoutsDraft.primarySeconds;
   const sceneCountInvalid = ![sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
     || sceneDraft.preferredMinScenes > sceneDraft.preferredMaxScenes
@@ -368,6 +381,7 @@ export function ModelConfig({
         body: JSON.stringify({
           scenePipeline: sceneDraft,
           proseLength: lengthDraft,
+          proseGateTimeouts: proseGateTimeoutsDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
           reviewFollowsProseModel: reviewFollowsProseDraft,
           stepBudgetMode: stepBudgetModeDraft,
@@ -376,6 +390,7 @@ export function ModelConfig({
       }) as {
         scenePipeline: ScenePipelineSettings;
         proseLength: ProseLengthSettings;
+        proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
         characterEvolutionEnabled: boolean;
         reviewFollowsProseModel: boolean;
         stepBudgetMode: AgentStepBudgetMode;
@@ -383,12 +398,14 @@ export function ModelConfig({
       };
       setSceneDraft(result.scenePipeline);
       setLengthDraft(result.proseLength);
+      setProseGateTimeoutsDraft(result.proseGateTimeouts);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
       setReviewFollowsProseDraft(result.reviewFollowsProseModel);
       setStepBudgetModeDraft(result.stepBudgetMode);
       setMaxAgentStepsDraft(result.maxAgentSteps);
       onScenePipelineChanged(result.scenePipeline);
       onProseLengthChanged(result.proseLength);
+      onProseGateTimeoutsChanged(result.proseGateTimeouts);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
       onReviewFollowsProseModelChanged(result.reviewFollowsProseModel);
       onStepBudgetChanged({ stepBudgetMode: result.stepBudgetMode, maxAgentSteps: result.maxAgentSteps });
@@ -403,6 +420,7 @@ export function ModelConfig({
   function resetWritingSettings() {
     setSceneDraft(scenePipeline);
     setLengthDraft(proseLength);
+    setProseGateTimeoutsDraft(proseGateTimeouts);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
     setReviewFollowsProseDraft(reviewFollowsProseModel);
     setStepBudgetModeDraft(stepBudgetMode);
@@ -586,6 +604,10 @@ export function ModelConfig({
             <input type="checkbox" checked={reviewFollowsProseDraft} onChange={event => setReviewFollowsProseDraft(event.target.checked)}/>
             <span><strong>终审跟随正文模型</strong><small>整章终审与候选评判使用「正文写作」的模型。判「像不像人写的」靠语感，用更便宜的模型评它自己写不出来的文字，只会把标准降到它的水平。关闭后改用「审阅校对」角色的模型。</small></span>
           </label>
+          <div className="scene-settings-grid compact">
+            <label className={proseGateTimeoutsInvalid ? "field-invalid" : ""}><span>首选审核超时（秒）</span><input type="number" min="10" max="900" step="1" value={proseGateTimeoutsDraft.primarySeconds} onChange={event => setProseGateTimeoutsDraft(current => ({ ...current, primarySeconds: Number(event.target.value) }))}/><small>有独立回退模型时先使用此预算。</small></label>
+            <label className={proseGateTimeoutsInvalid ? "field-invalid" : ""}><span>最终审核超时（秒）</span><input type="number" min="10" max="900" step="1" value={proseGateTimeoutsDraft.finalSeconds} onChange={event => setProseGateTimeoutsDraft(current => ({ ...current, finalSeconds: Number(event.target.value) }))}/><small>唯一或最后一个审核模型使用，不能低于首选值。</small></label>
+          </div>
         </section>
 
         <section className="writing-settings-section">
@@ -651,15 +673,15 @@ export function ModelConfig({
           </div>
         </section>
 
-        <div className={sceneDraftValid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid ? "status" : "alert"}>{sceneDraftValid
+        <div className={sceneDraftValid && !proseGateTimeoutsInvalid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid && !proseGateTimeoutsInvalid ? "status" : "alert"}>{sceneDraftValid && !proseGateTimeoutsInvalid
           ? !sceneDraft.enabled
             ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式由 Agent 直接成稿" : "分工模式由 Agent 取证、证据型 Writer 成稿"}。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
             : `当前：${writingMode === "fast" ? "快速模式由 Agent 提交正文与状态" : "分工模式由证据型 Writer 生成正文、运行时提取状态"}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-          : "请检查默认章节字数、Agent 步数、场景数量、notes 上限与候选稿数量。"}</div>
+          : "请检查默认章节字数、Agent 步数、场景数量、notes 上限、候选稿数量与审核超时。"}</div>
         <div className="scene-settings-actions">
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
           <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>
-          <button className="primary" onClick={() => void saveWritingSettings()} disabled={busy || !sceneDraftValid || !writingSettingsDirty}>{busy ? "保存中…" : "保存修改"}</button>
+          <button className="primary" onClick={() => void saveWritingSettings()} disabled={busy || !sceneDraftValid || proseGateTimeoutsInvalid || !writingSettingsDirty}>{busy ? "保存中…" : "保存修改"}</button>
         </div>
           </div>}
           {section === "style" && styleContent}

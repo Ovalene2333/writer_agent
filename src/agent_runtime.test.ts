@@ -339,6 +339,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         notesMaxCharacters: 3_000, candidateCount: 2,
       },
       proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
+      proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
@@ -365,6 +366,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         notesMaxCharacters: 4_200, candidateCount: 2,
       },
       proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
+      proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
     });
     // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
     saveAgentSettings(project, { reviewFollowsProseModel: false });
@@ -373,6 +375,10 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.equal(loadAgentSettings(project).reviewFollowsProseModel, false, "scene patch must preserve review toggle");
     saveAgentSettings(project, { reviewFollowsProseModel: true });
     assert.equal(loadAgentSettings(project).reviewFollowsProseModel, true);
+    saveAgentSettings(project, { proseGateTimeouts: { primarySeconds: 90, finalSeconds: 420 } });
+    assert.deepEqual(loadAgentSettings(project).proseGateTimeouts, { primarySeconds: 90, finalSeconds: 420 });
+    saveAgentSettings(project, { proseGateTimeouts: { primarySeconds: 1, finalSeconds: 1_200 } });
+    assert.deepEqual(loadAgentSettings(project).proseGateTimeouts, { primarySeconds: 10, finalSeconds: 900 });
     // 篇幅档：可单独打补丁，越界值 clamp 而不是抛错，且不碰同组的其他开关。
     saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 6_000, enforceMinimum: true } });
     assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 6_000, enforceMinimum: true });

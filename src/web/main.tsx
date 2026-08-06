@@ -7042,6 +7042,7 @@ function App() {
           initialCatalog={state.providerCatalog}
           scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 }}
           proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
+          proseGateTimeouts={state.agentSettings?.proseGateTimeouts ?? { primarySeconds: 60, finalSeconds: 180 }}
           writingMode={state.agentSettings?.writingMode ?? "fast"}
           characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
           reviewFollowsProseModel={state.agentSettings?.reviewFollowsProseModel ?? true}
@@ -7208,6 +7209,20 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength,
+          },
+          } : previous)}
+          onProseGateTimeoutsChanged={proseGateTimeouts => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          proseGateTimeouts,
           },
           } : previous)}
           onCharacterEvolutionChanged={characterEvolutionEnabled => setState(previous => previous ? {

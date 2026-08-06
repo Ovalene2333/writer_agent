@@ -18,6 +18,8 @@ import {
   MAX_SCENE_CANDIDATES,
   MIN_AGENT_STEPS,
   MIN_CHAPTER_TARGET_CHARACTERS,
+  MIN_PROSE_GATE_TIMEOUT_SECONDS,
+  MAX_PROSE_GATE_TIMEOUT_SECONDS,
   MIN_SCENE_NOTES_CHARACTERS,
   isAgentStepBudgetMode,
   isPermissionMode,
@@ -28,6 +30,7 @@ import {
   isWritingExecutionMode,
   type AgentStepBudgetMode,
   type ProseLengthSettings,
+  type ProseGateTimeoutSettings,
   type ScenePipelineSettings,
   type WritingExecutionMode,
 } from "./agent_runtime.js";
@@ -1466,6 +1469,7 @@ export async function startWriterServer(options: {
       maxAgentSteps: settings.maxAgentSteps,
       scenePipeline: settings.scenePipeline,
       proseLength: settings.proseLength,
+      proseGateTimeouts: settings.proseGateTimeouts,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description, path: skill.path,
@@ -1487,6 +1491,7 @@ export async function startWriterServer(options: {
         maxAgentSteps?: number;
         scenePipeline?: Partial<ScenePipelineSettings>;
         proseLength?: Partial<ProseLengthSettings>;
+        proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
       }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
@@ -1554,6 +1559,17 @@ export async function startWriterServer(options: {
           return context.json({ error: "enforceMinimum 必须是布尔值" }, 400);
         }
       }
+      if (body.proseGateTimeouts !== undefined) {
+        const values = [body.proseGateTimeouts.primarySeconds, body.proseGateTimeouts.finalSeconds]
+          .filter(value => value !== undefined);
+        if (values.some(value => !Number.isInteger(value) || Number(value) < MIN_PROSE_GATE_TIMEOUT_SECONDS || Number(value) > MAX_PROSE_GATE_TIMEOUT_SECONDS)) {
+          return context.json({ error: `proseGateTimeouts 须为 ${MIN_PROSE_GATE_TIMEOUT_SECONDS}—${MAX_PROSE_GATE_TIMEOUT_SECONDS} 秒的整数` }, 400);
+        }
+        if (body.proseGateTimeouts.primarySeconds !== undefined && body.proseGateTimeouts.finalSeconds !== undefined
+          && body.proseGateTimeouts.finalSeconds < body.proseGateTimeouts.primarySeconds) {
+          return context.json({ error: "最终审核超时不能小于首选审核超时" }, 400);
+        }
+      }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
         ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
@@ -1563,6 +1579,7 @@ export async function startWriterServer(options: {
         ...(body.maxAgentSteps !== undefined ? { maxAgentSteps: body.maxAgentSteps } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
         ...(body.proseLength ? { proseLength: body.proseLength } : {}),
+        ...(body.proseGateTimeouts ? { proseGateTimeouts: body.proseGateTimeouts } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
@@ -1573,6 +1590,7 @@ export async function startWriterServer(options: {
         maxAgentSteps: settings.maxAgentSteps,
         scenePipeline: settings.scenePipeline,
         proseLength: settings.proseLength,
+        proseGateTimeouts: settings.proseGateTimeouts,
       });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);

@@ -40,6 +40,16 @@ export const MIN_CHAPTER_TARGET_CHARACTERS = 500;
 export const MAX_CHAPTER_TARGET_CHARACTERS = 50_000;
 export const DEFAULT_CHAPTER_TARGET_CHARACTERS = 3_000;
 
+export const MIN_PROSE_GATE_TIMEOUT_SECONDS = 10;
+export const MAX_PROSE_GATE_TIMEOUT_SECONDS = 900;
+export const DEFAULT_PRIMARY_PROSE_GATE_TIMEOUT_SECONDS = 60;
+export const DEFAULT_FINAL_PROSE_GATE_TIMEOUT_SECONDS = 180;
+
+export interface ProseGateTimeoutSettings {
+  primarySeconds: number;
+  finalSeconds: number;
+}
+
 export interface ProseLengthSettings {
   /**
    * 对话没有指定字数时的默认整章目标。作者在这里定一次「这个项目一章多长」，
@@ -99,6 +109,7 @@ export interface AgentRuntimeSettings {
   scenePipeline: ScenePipelineSettings;
   /** 作者的篇幅偏好：默认目标字数与下限执行强度。 */
   proseLength: ProseLengthSettings;
+  proseGateTimeouts: ProseGateTimeoutSettings;
 }
 
 export interface AgentTodoItem {
@@ -162,6 +173,10 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   proseLength: {
     chapterTargetCharacters: DEFAULT_CHAPTER_TARGET_CHARACTERS,
     enforceMinimum: false,
+  },
+  proseGateTimeouts: {
+    primarySeconds: DEFAULT_PRIMARY_PROSE_GATE_TIMEOUT_SECONDS,
+    finalSeconds: DEFAULT_FINAL_PROSE_GATE_TIMEOUT_SECONDS,
   },
 };
 
@@ -245,6 +260,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       maxAgentSteps: normalizeMaxAgentSteps(raw.maxAgentSteps, DEFAULT_SETTINGS.maxAgentSteps),
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
       proseLength: normalizeProseLengthSettings(raw.proseLength),
+      proseGateTimeouts: normalizeProseGateTimeoutSettings(raw.proseGateTimeouts),
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -262,6 +278,7 @@ export function saveAgentSettings(
     maxAgentSteps?: number;
     scenePipeline?: Partial<ScenePipelineSettings>;
     proseLength?: Partial<ProseLengthSettings>;
+    proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
   },
 ): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
@@ -290,6 +307,9 @@ export function saveAgentSettings(
     proseLength: patch.proseLength
       ? normalizeProseLengthSettings({ ...current.proseLength, ...patch.proseLength })
       : current.proseLength,
+    proseGateTimeouts: patch.proseGateTimeouts
+      ? normalizeProseGateTimeoutSettings({ ...current.proseGateTimeouts, ...patch.proseGateTimeouts })
+      : current.proseGateTimeouts,
   };
   mkdirSync(project.privateDir, { recursive: true });
   writeFileSync(settingsPath(project), `${JSON.stringify(next, null, 2)}\n`, "utf8");
@@ -521,6 +541,18 @@ export function isSuccessfulDocumentSubmission(
     return true;
   }
   return false;
+}
+
+export function normalizeProseGateTimeoutSettings(value?: Partial<ProseGateTimeoutSettings>): ProseGateTimeoutSettings {
+  const seconds = (candidate: unknown, fallback: number) => {
+    const raw = Number(candidate);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.round(Math.min(MAX_PROSE_GATE_TIMEOUT_SECONDS, Math.max(MIN_PROSE_GATE_TIMEOUT_SECONDS, raw)))
+      : fallback;
+  };
+  const primarySeconds = seconds(value?.primarySeconds, DEFAULT_SETTINGS.proseGateTimeouts.primarySeconds);
+  const finalSeconds = Math.max(primarySeconds, seconds(value?.finalSeconds, DEFAULT_SETTINGS.proseGateTimeouts.finalSeconds));
+  return { primarySeconds, finalSeconds };
 }
 
 export type AgentToolOutcome =
