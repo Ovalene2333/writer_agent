@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { parseSceneActualState } from "./evidence_grounded_writer.js";
+import { buildEvidenceGroundedWriterMessages, parseSceneActualState } from "./evidence_grounded_writer.js";
+import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 import { assembleChapterSceneDraft, blockChapterSceneReview } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
@@ -13,6 +14,47 @@ import { handleBeginChapterDraft, handleWriteChapterScene } from "./tools/scene_
 import type { ToolExecutionContext, ToolHandlerArgs } from "./tools/types.js";
 
 const MODEL = { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" };
+
+test("dialogue naturalness guidance stays in the dynamic writer request", () => {
+  const pack = {
+    sourceDraft: "",
+    sceneGoal: "取得线索",
+    beatOrder: [],
+    knownFacts: [],
+    mustLand: [],
+    characterState: [],
+    narrationNotes: [],
+    doNotInvent: [],
+    narrativeBrief: "",
+    structured: true,
+    strippedMeta: [],
+  };
+  const evidence = {
+    version: 1 as const,
+    path: "chapters/test.md",
+    instructions: "",
+    writingMemory: [],
+    characters: [],
+    sources: [],
+    coverageGaps: [],
+    hash: "test-hash",
+  };
+  const messages = buildEvidenceGroundedWriterMessages({
+    path: "chapters/test.md",
+    outputKind: "document",
+    writePack: pack,
+    evidence,
+    styleEvidence: "稳定文风",
+  });
+  assert.equal(messages[0]?.role, "system");
+  assert.equal(messages[1]?.role, "system");
+  assert.equal(messages[2]?.role, "user");
+  assert.match(String(messages[2]?.content), /此刻想得到什么/u);
+  assert.match(String(messages[2]?.content), /回避/u);
+  assert.match(String(messages[2]?.content), /不要批量补助词/u);
+  assert.doesNotMatch(String(messages[0]?.content), /对白自然度契约/u);
+  assert.match(dialogueNaturalnessGuidance(), /保持事实、知识和人物声线不变/u);
+});
 
 test("delegated write_file realizes a compiled pack through the evidence-grounded writer", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-grounded-document-"));

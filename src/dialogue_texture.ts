@@ -102,6 +102,11 @@ export type DialogueTexture = {
   issues: DialogueTextureIssue[];
 };
 
+/** Dynamic craft contract shared by direct writing and evidence-grounded scenes. */
+export function dialogueNaturalnessGuidance(): string {
+  return "对白自然度契约（按本场语义选择，不是配额）：每个说话人先明确此刻想得到什么、知道什么、在回避什么，以及对上一句施加了什么压力；对白要承接或有意错开上一轮的信息。优先用答非所问、追问、让步、反问、改口、停顿、半句和省略表达关系变化，必要时才使用吧/啊/呢等语气词。不要批量补助词、随机换同义词、把所有人改成碎句，保留克制、正式或紧张场景中没有助词的自然说法。修订时只改有证据的对白及其最小邻近上下文，保持事实、知识和人物声线不变。";
+}
+
 /** At or below this many chars a line is a beat, not an exchange. */
 export const SHORT_LINE_CHARS = 6;
 /** At or below this many content chars a line only acknowledges: 嗯 / 知道 / 下来. */

@@ -15,6 +15,7 @@ import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import type { WriterProject } from "./project.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { formatWritePackForWriter, type WritePack } from "./write_pack.js";
+import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 
 export type EvidenceGroundedWriterInput = {
   path: string;
@@ -136,6 +137,7 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
       cost: input.scene.cost,
       oppositionMove: input.scene.oppositionMove,
     })}`);
+    sections.push(`本场对白执行契约：\n${dialogueNaturalnessGuidance()}\n把 scene.goal、characterIntent、obstacle 和 oppositionMove 转成说话人的即时目标与回避点；没有谈话必要时不要为了制造口语感添加对白。`);
   }
   if (input.targetCharacters) {
     sections.push(`目标约 ${input.targetCharacters} 字。篇幅服从场景变化，不用总结、复述和无关支线凑字。`);
@@ -145,6 +147,9 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
       "既有正文暴露出的动态文风问题如下。它们只定位风险，不是要求凑齐的数字配额；结合本场语义避免继续复制：\n"
         + input.styleFeedback.join("\n"),
     );
+  }
+  if (!input.scene) {
+    sections.push(`对白执行契约：\n${dialogueNaturalnessGuidance()}`);
   }
   if (input.reviewIssues?.length) {
     sections.push(

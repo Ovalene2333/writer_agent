@@ -18,6 +18,7 @@ import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter 
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { compileWritePack, formatWritePackForWriter, writePackDraftContractPrompt } from "./write_pack.js";
+import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 
 export type WritingMode = "write" | "continue" | "rewrite" | "rewrite_document" | "polish";
 export type ActionMode = WritingMode | "character";
@@ -537,6 +538,7 @@ ${proseMannerismConstraintPrompt({ compact: true })}
       characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(item => characterContext(item, options.project, options.path, options.selection)), null, 2)}` : "相关角色卡：无",
       packText,
       context ? `文档上下文（纯正文，用于衔接声线与事实）：\n${context}` : "",
+      `对白执行契约：\n${dialogueNaturalnessGuidance()}`,
       `写作要求：${options.instruction.trim()}`,
       `只输出正文。声线优先贴合文档上下文与风格样本。${proseMannerismPreflightLine()}`,
     ].filter(Boolean).join("\n\n") },
@@ -662,7 +664,7 @@ async function repairGeneratedProse(
 
 function repairMessages(text: string, issues: ProseStyleIssue[]): ChatMessage[] {
   return [
-    { role: "system", content: "你是小说局部修订器。只修复给定问题句，保持事实、视角、时序、人物声线和其他句子不变。优先让动作产生结果、用可观察细节承载信息，必要因果拆为独立句。对白拖音、中断、迟疑和真实纠正不得修改。只输出 JSON 数组，每项为 {search,replace}，search 必须逐字等于问题句。" },
+    { role: "system", content: "你是小说局部修订器。只修复给定问题句，保持事实、视角、时序、人物声线和其他句子不变。优先让动作产生结果、用可观察细节承载信息，必要因果拆为独立句。对白问题优先修复谈话动作、信息承接、回避和压力变化；不得靠批量增加吧/啊/呢、随机同义词或统一碎句伪造真人感。对白拖音、中断、迟疑和真实纠正不得修改。只输出 JSON 数组，每项为 {search,replace}，search 必须逐字等于问题句。" },
     { role: "user", content: JSON.stringify({
       issues: issues.map(issue => ({
         sentence: issue.sentence, subtype: issue.subtype, reason: issue.reason, suggestions: issue.suggestions,
