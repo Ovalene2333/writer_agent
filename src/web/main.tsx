@@ -246,7 +246,7 @@ const ModelConfig = React.lazy(async () => {
 });
 
 /** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
-const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, enforceMinimum: false };
+const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, mode: "bounded", enforceMinimum: false };
 
 function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
   const [open, setOpen] = useState(false);

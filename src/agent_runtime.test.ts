@@ -338,7 +338,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
         notesMaxCharacters: 3_000, candidateCount: 2,
       },
-      proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
+      proseLength: { chapterTargetCharacters: 3_000, mode: "bounded", enforceMinimum: false },
       proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
     });
     saveAgentSettings(project, {
@@ -365,7 +365,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
         notesMaxCharacters: 4_200, candidateCount: 2,
       },
-      proseLength: { chapterTargetCharacters: 3_000, enforceMinimum: false },
+      proseLength: { chapterTargetCharacters: 3_000, mode: "bounded", enforceMinimum: false },
       proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
     });
     // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
@@ -381,9 +381,11 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.deepEqual(loadAgentSettings(project).proseGateTimeouts, { primarySeconds: 10, finalSeconds: 900 });
     // 篇幅档：可单独打补丁，越界值 clamp 而不是抛错，且不碰同组的其他开关。
     saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 6_000, enforceMinimum: true } });
-    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 6_000, enforceMinimum: true });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 6_000, mode: "bounded", enforceMinimum: true });
+    saveAgentSettings(project, { proseLength: { mode: "guidance" } });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 6_000, mode: "guidance", enforceMinimum: true });
     saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 90_000 } });
-    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 50_000, enforceMinimum: true });
+    assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 50_000, mode: "guidance", enforceMinimum: true });
     saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 100 } });
     assert.equal(loadAgentSettings(project).proseLength.chapterTargetCharacters, 500);
     // Best-of-N switch: persisted, clamped to 1—3 (2 by default).

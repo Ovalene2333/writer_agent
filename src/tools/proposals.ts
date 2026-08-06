@@ -649,6 +649,7 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
     const outcome = proseLengthOutcome(
       assessProseLength(targetCharacters, body),
       context.proseLength?.enforceMinimum === true,
+      context.proseLength?.mode ?? "bounded",
     );
     if (outcome.blocked) throw new ToolRevisionRequiredError("PROSE_LENGTH_REVISION_REQUIRED", outcome.message);
     lengthNotice = outcome.notice;

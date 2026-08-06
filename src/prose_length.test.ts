@@ -10,6 +10,7 @@ import type { ProseLengthSettings } from "./agent_runtime.js";
 
 const settings = (patch?: Partial<ProseLengthSettings>): ProseLengthSettings => ({
   chapterTargetCharacters: 3_000,
+  mode: "bounded",
   enforceMinimum: false,
   ...patch,
 });
@@ -18,6 +19,7 @@ test("resolveTurnProseLength reads an explicit number out of the prompt", () => 
   assert.deepEqual(resolveTurnProseLength("这一章写 6000 字", settings()), {
     targetCharacters: 6_000,
     source: "prompt_exact",
+    mode: "bounded",
   });
   assert.equal(resolveTurnProseLength("写个 1.5万字 的长章", settings()).targetCharacters, 15_000);
   assert.equal(resolveTurnProseLength("目标 3千字", settings()).targetCharacters, 3_000);
@@ -35,6 +37,7 @@ test("relative wording scales the project default, not the previous chapter", ()
   assert.deepEqual(resolveTurnProseLength("这章写长一点", settings()), {
     targetCharacters: 4_200,
     source: "prompt_relative",
+    mode: "bounded",
   });
   assert.equal(resolveTurnProseLength("这章短一点", settings()).targetCharacters, 2_100);
   assert.equal(resolveTurnProseLength("尽量长", settings()).targetCharacters, 5_400);
@@ -45,6 +48,7 @@ test("no length signal falls back to the project default", () => {
   assert.deepEqual(resolveTurnProseLength("接着写下一章", settings({ chapterTargetCharacters: 2_500 })), {
     targetCharacters: 2_500,
     source: "settings",
+    mode: "bounded",
   });
 });
 
@@ -67,6 +71,8 @@ test("prose length outcome blocks over the ceiling but only warns under the targ
   assert.equal(proseLengthOutcome(long, false).blocked, true);
   // 打开 enforceMinimum 就恢复旧的硬拦行为。
   assert.equal(proseLengthOutcome(short, true).blocked, true);
+  assert.equal(proseLengthOutcome(long, false, "guidance").blocked, false);
+  assert.match(proseLengthOutcome(long, false, "guidance").notice ?? "", /弱引导/u);
 });
 
 test("an on-target draft is neither blocked nor annotated", () => {

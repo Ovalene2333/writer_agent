@@ -2,7 +2,7 @@ import type { AgentEvent, MessageAttachment, ModelConfig, PermissionMode } from 
 import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ChapterSceneDraft, SceneActualState, SceneCharacterScope } from "../scene_pipeline.js";
-import type { ScenePipelineSettings } from "../agent_runtime.js";
+import type { ProseLengthMode, ScenePipelineSettings } from "../agent_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
 import type { ChapterReviewInput, ChapterReviewResult } from "../chapter_review.js";
@@ -134,13 +134,13 @@ export type ToolExecutionContext = {
   lastWritePackData?: WritePack;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
-  /** Current project scene-chain guidance and enforced per-document limit. */
+  /** Current project scene-chain guidance and per-document prose target. */
   scenePipelineSettings?: ScenePipelineSettings;
   /**
-   * 本轮整章篇幅目标与下限执行强度。工具在调用方没给 targetCharacters 时用它兜底，
-   * 并据 enforceMinimum 决定偏短是拦截还是只提示。
+   * 本轮整章篇幅目标与控制模式。工具在调用方没给 targetCharacters 时用它兜底；
+   * 旧调用方省略 mode 时按范围验收兼容。
    */
-  proseLength?: { targetCharacters: number; enforceMinimum: boolean };
+  proseLength?: { targetCharacters: number; enforceMinimum: boolean; mode?: ProseLengthMode };
   /** In-run narrative draft; never writes a partial document to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**

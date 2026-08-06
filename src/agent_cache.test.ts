@@ -100,7 +100,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "0db71f559e7037fb");
+  assert.equal(agentToolSchemaHash(), "ba62877c6760f61d");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -1290,11 +1290,19 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
     const withTarget = dynamicContextPrompt(
       project, store, "写一章", task, "ask", scenePipeline, "fast", false,
       undefined, undefined, undefined, false,
-      { targetCharacters: 4_200, source: "prompt_relative" },
+      { targetCharacters: 4_200, source: "prompt_relative", mode: "bounded" },
     );
     assert.match(withTarget, /单章篇幅目标：本轮涉及的每一章都分别约 4200 字/u);
     assert.match(withTarget, /不是本轮所有章节合计；不得因本轮要写多章而均分/u);
     assert.match(withTarget, /用户本轮要求相对项目默认调整/u);
+
+    const guidanceTarget = dynamicContextPrompt(
+      project, store, "写一章", task, "ask", scenePipeline, "fast", false,
+      undefined, undefined, undefined, false,
+      { targetCharacters: 4_200, source: "settings", mode: "guidance" },
+    );
+    assert.match(guidanceTarget, /弱引导参考/u);
+    assert.match(guidanceTarget, /不因偏离目标而缩句、扩句或发起重写/u);
 
     // 这个数字每轮都可能变，只能待在 miss-priced 的动态块里。
     const stable = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "write_scene");

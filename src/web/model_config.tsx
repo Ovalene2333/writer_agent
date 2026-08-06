@@ -44,6 +44,7 @@ export type ScenePipelineSettings = {
 };
 export type ProseLengthSettings = {
   chapterTargetCharacters: number;
+  mode: "bounded" | "guidance";
   enforceMinimum: boolean;
 };
 export type WritingExecutionMode = "delegated" | "fast";
@@ -198,6 +199,7 @@ export function ModelConfig({
     || maxAgentStepsDraft > 100;
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
+    || lengthDraft.mode !== proseLength.mode
     || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
     || proseGateTimeoutsDraft.primarySeconds !== proseGateTimeouts.primarySeconds
     || proseGateTimeoutsDraft.finalSeconds !== proseGateTimeouts.finalSeconds
@@ -646,10 +648,11 @@ export function ModelConfig({
           <div className="writing-settings-section-head"><div><h4>章节篇幅</h4><p>不在对话里说字数时，这里就是每章的目标长度；说了「写 6000 字」或「这章长一点」时以对话为准。</p></div></div>
           <div className="scene-settings-grid compact">
             <label className={lengthDraftInvalid ? "field-invalid" : ""}><span>默认章节字数</span><input aria-invalid={lengthDraftInvalid} type="number" min="500" max="50000" step="100" value={lengthDraft.chapterTargetCharacters} onChange={event => setLengthDraft(current => ({ ...current, chapterTargetCharacters: Number(event.target.value) }))}/><small>500—50000 字，不计空白。</small></label>
+            <label><span>篇幅控制</span><select value={lengthDraft.mode} onChange={event => setLengthDraft(current => ({ ...current, mode: event.target.value as ProseLengthSettings["mode"] }))}><option value="bounded">范围验收（当前）</option><option value="guidance">弱引导</option></select><small>{lengthDraft.mode === "guidance" ? "只作参考，不因偏短或偏长触发重写。" : "按目标范围验收；上限硬拦，下限可单独设置。"}</small></label>
           </div>
-          <label className="writing-setting-row">
-            <input type="checkbox" checked={lengthDraft.enforceMinimum} onChange={event => setLengthDraft(current => ({ ...current, enforceMinimum: event.target.checked }))}/>
-            <span><strong>字数不足时拦截交付</strong><small>默认关闭：偏短只在质量卡上提示，正文照常提交，需要更长直接说一句就行。打开后不达下限会要求重写。超出上限任何时候都会被拦。</small></span>
+          <label className={`writing-setting-row${lengthDraft.mode === "guidance" ? " setting-disabled" : ""}`}>
+            <input type="checkbox" disabled={lengthDraft.mode === "guidance"} checked={lengthDraft.enforceMinimum} onChange={event => setLengthDraft(current => ({ ...current, enforceMinimum: event.target.checked }))}/>
+            <span><strong>字数不足时拦截交付</strong><small>{lengthDraft.mode === "guidance" ? "弱引导模式不执行此项；切回范围验收后继续沿用当前选择。" : "默认关闭：偏短只在质量卡上提示，正文照常提交，需要更长直接说一句就行。打开后不达下限会要求重写。超出上限会被拦。"}</small></span>
           </label>
         </section>
 

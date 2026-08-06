@@ -345,6 +345,7 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
       projectSampleRole: "continuity",
     }),
     targetCharacters: args.context.proseLength?.targetCharacters,
+    lengthMode: args.context.proseLength?.mode,
   }, { project: args.project, context: args.context }, writer.signal);
   if (generated.usage) {
     args.context.modelUsageReporter?.(writer.model, generated.usage, {

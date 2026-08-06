@@ -22,6 +22,7 @@ import {
   MAX_PROSE_GATE_TIMEOUT_SECONDS,
   MIN_SCENE_NOTES_CHARACTERS,
   isAgentStepBudgetMode,
+  isProseLengthMode,
   isPermissionMode,
   listProjectSkills,
   loadAgentSettings,
@@ -1557,6 +1558,11 @@ export async function startWriterServer(options: {
         }
         if (body.proseLength.enforceMinimum !== undefined && typeof body.proseLength.enforceMinimum !== "boolean") {
           return context.json({ error: "enforceMinimum 必须是布尔值" }, 400);
+        }
+        if (body.proseLength.mode !== undefined && (
+          typeof body.proseLength.mode !== "string" || !isProseLengthMode(body.proseLength.mode)
+        )) {
+          return context.json({ error: "mode 仅支持 bounded、guidance" }, 400);
         }
       }
       if (body.proseGateTimeouts !== undefined) {

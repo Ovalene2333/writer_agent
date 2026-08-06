@@ -422,7 +422,7 @@ const TOOL_DEFINITIONS = deepFreeze([
                 oppositionMove: { type: "string", description: "若存在主动阻力，写其行动；静场或内在变化可省略" },
                 handoff: { type: "string", description: "如何因果交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
+                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；范围验收模式按 ${PROSE_TARGET_BAND_TEXT} 处理，弱引导模式仅作参考` },
                 characterScopes: {
                   type: "array", maxItems: 12,
                   description: "本场允许使用的角色卡引用；能力须声明 use/attempt/unlock/regain/lose 语义，不复制卡面事实",
@@ -474,7 +474,7 @@ const TOOL_DEFINITIONS = deepFreeze([
             type: "string",
             description: "故事内场景笔记；长度上限由场景链设置决定。只保留本场人物当下、事件、事实边界与不可擅自确定项",
           },
-          content: { type: "string", description: `仅本场正文，不含任何 markdown 标题；guide 有 targetCharacters 时按 ${PROSE_TARGET_BAND_TEXT} 验收` },
+          content: { type: "string", description: `仅本场正文，不含任何 markdown 标题；guide 有 targetCharacters 时按当前篇幅控制模式处理（范围验收 ${PROSE_TARGET_BAND_TEXT}，弱引导仅作参考）` },
           actualState: {
             type: "object",
             description: "从实际正文归纳的离场状态；不可照抄计划",
@@ -522,7 +522,7 @@ const TOOL_DEFINITIONS = deepFreeze([
                 oppositionMove: { type: "string", description: "若存在主动阻力，写其行动" },
                 handoff: { type: "string", description: "可能如何交给下一场；末场可空" },
                 dividerBefore: { type: "boolean", description: "场前是否需要 --- 硬切" },
-                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；工具按 ${PROSE_TARGET_BAND_TEXT} 验收` },
+                targetCharacters: { type: "number", description: `本场目标正文 200—8000 字；范围验收模式按 ${PROSE_TARGET_BAND_TEXT} 处理，弱引导模式仅作参考` },
                 characterScopes: {
                   type: "array", maxItems: 12,
                   description: "新的本场角色卡引用；保留 ID/权限，不复制能力或声线内容",
@@ -655,7 +655,7 @@ const TOOL_DEFINITIONS = deepFreeze([
           deliverableId: { type: "string", description: "多文档任务的交付项 ID；单文档可省略" },
           path: { type: "string", description: "文档路径" },
           content: { type: "string", description: "完整 Markdown" },
-          targetCharacters: { type: "number", description: `正文目标字数 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS}；章节/支线正文须传，用本轮篇幅目标，按 ${PROSE_TARGET_BAND_TEXT} 验收（不计首行标题）：超上限拒收，不足下限只提示` },
+          targetCharacters: { type: "number", description: `正文目标字数 ${MIN_CHAPTER_TARGET_CHARACTERS}—${MAX_CHAPTER_TARGET_CHARACTERS}；章节/支线正文须传，用本轮篇幅目标（不计首行标题）；范围验收按 ${PROSE_TARGET_BAND_TEXT} 处理，弱引导仅作参考` },
           summary: { type: "string", description: "修改摘要" },
           characterChanges: {
             type: "array", maxItems: 8,

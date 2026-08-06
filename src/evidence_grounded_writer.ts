@@ -10,6 +10,7 @@ import {
   readNarrativeEvidenceSource,
   type NarrativeEvidencePacket,
 } from "./narrative_evidence.js";
+import type { ProseLengthMode } from "./agent_runtime.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import type { WriterProject } from "./project.js";
@@ -37,6 +38,8 @@ export type EvidenceGroundedWriterInput = {
     action: string;
   }>;
   targetCharacters?: number;
+  /** Per-turn prose control; omitted legacy callers use bounded behavior. */
+  lengthMode?: ProseLengthMode;
 };
 
 export type EvidenceGroundedWriterResult = {
@@ -140,7 +143,9 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
     sections.push(`本场对白执行契约：\n${dialogueNaturalnessGuidance()}\n把 scene.goal、characterIntent、obstacle 和 oppositionMove 转成说话人的即时目标与回避点；没有谈话必要时不要为了制造口语感添加对白。`);
   }
   if (input.targetCharacters) {
-    sections.push(`目标约 ${input.targetCharacters} 字。篇幅服从场景变化，不用总结、复述和无关支线凑字。`);
+    sections.push(input.lengthMode === "guidance"
+      ? `篇幅参考约 ${input.targetCharacters} 字（弱引导）。保持场景自然完整，不因偏离参考而缩句、扩句或重写；不用总结、复述和无关支线凑字。`
+      : `目标约 ${input.targetCharacters} 字。篇幅服从场景变化，不用总结、复述和无关支线凑字。`);
   }
   if (input.styleFeedback?.length) {
     sections.push(
@@ -235,7 +240,7 @@ export async function requestEvidenceGroundedProse(
     const revisedDraft = await completePhase();
     const revisedAnalysis = analyzeAdaptiveStyle(revisedDraft);
     const improved = adaptiveRevisionImproved(firstAnalysis, revisedAnalysis)
-      && groundedRevisionLengthSafe(firstDraft, revisedDraft, input.targetCharacters);
+      && groundedRevisionLengthSafe(firstDraft, revisedDraft, input.targetCharacters, input.lengthMode);
     const content = improved ? revisedDraft : firstDraft;
     return writerResult(content, input, messages, evidenceReads, hasUsage ? usage : undefined, {
       triggeredBy,
@@ -368,10 +373,18 @@ function writerMaxTokens(targetCharacters?: number): number {
   return Math.min(16_000, Math.max(2_400, Math.ceil(characters * 2.4)));
 }
 
-function groundedRevisionLengthSafe(original: string, revised: string, targetCharacters?: number): boolean {
+function groundedRevisionLengthSafe(
+  original: string,
+  revised: string,
+  targetCharacters?: number,
+  lengthMode?: ProseLengthMode,
+): boolean {
   const before = original.replace(/\s/g, "").length;
   const after = revised.replace(/\s/g, "").length;
   if (!before || after < before * 0.7) return false;
+  // Weak guidance must not turn a style pass into a target-driven rewrite;
+  // preserve only a reasonable relationship with the submitted draft.
+  if (lengthMode === "guidance") return after <= before * 1.3;
   if (targetCharacters && before < targetCharacters * 0.7) {
     return after <= targetCharacters * 1.2;
   }

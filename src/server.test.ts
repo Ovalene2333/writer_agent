@@ -389,6 +389,12 @@ test("--no-token server mode disables public API authentication only when explic
         body: JSON.stringify({ proseLength: { enforceMinimum: "yes" } }),
       });
       assert.equal(badEnforce.status, 400);
+      const badMode = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { mode: "free" } }),
+      });
+      assert.equal(badMode.status, 400);
       const savedLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -397,12 +403,22 @@ test("--no-token server mode disables public API authentication only when explic
       assert.equal(savedLength.status, 200);
       assert.deepEqual(
         (await savedLength.json() as { proseLength: unknown }).proseLength,
-        { chapterTargetCharacters: 4_200, enforceMinimum: true },
+        { chapterTargetCharacters: 4_200, mode: "bounded", enforceMinimum: true },
       );
       const reloadedLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`);
       assert.deepEqual(
         (await reloadedLength.json() as { proseLength: unknown }).proseLength,
-        { chapterTargetCharacters: 4_200, enforceMinimum: true },
+        { chapterTargetCharacters: 4_200, mode: "bounded", enforceMinimum: true },
+      );
+      const guidanceLength = await fetch(`http://127.0.0.1:${openPort}/api/agent-settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ proseLength: { mode: "guidance" } }),
+      });
+      assert.equal(guidanceLength.status, 200);
+      assert.deepEqual(
+        (await guidanceLength.json() as { proseLength: unknown }).proseLength,
+        { chapterTargetCharacters: 4_200, mode: "guidance", enforceMinimum: true },
       );
       const unsafeShare = await fetch(`http://127.0.0.1:${openPort}/api/share/readonly`, { method: "POST" });
       assert.equal(unsafeShare.status, 400);

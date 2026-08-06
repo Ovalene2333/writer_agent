@@ -50,6 +50,9 @@ export interface ProseGateTimeoutSettings {
   finalSeconds: number;
 }
 
+/** 篇幅控制：范围验收保留现有门禁，弱引导只把目标作为参考。 */
+export type ProseLengthMode = "bounded" | "guidance";
+
 export interface ProseLengthSettings {
   /**
    * 对话没有指定字数时的默认整章目标。作者在这里定一次「这个项目一章多长」，
@@ -57,8 +60,12 @@ export interface ProseLengthSettings {
    */
   chapterTargetCharacters: number;
   /**
-   * 下限是否硬性拦截。默认关：偏短只提示并记进质量报告，交付照常继续。
-   * 打开后恢复旧行为 —— 不达下限就报错要求重写。上限任何时候都硬拦。
+   * 现有范围验收或只作参考的弱引导。缺失时按 bounded 兼容旧项目设置。
+   */
+  mode: ProseLengthMode;
+  /**
+   * 范围验收模式下，下限是否硬性拦截。默认关：偏短只提示并记进质量报告，交付照常继续。
+   * 打开后恢复旧行为 —— 不达下限就报错要求重写。弱引导模式不执行此项。
    */
   enforceMinimum: boolean;
 }
@@ -172,6 +179,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
   },
   proseLength: {
     chapterTargetCharacters: DEFAULT_CHAPTER_TARGET_CHARACTERS,
+    mode: "bounded",
     enforceMinimum: false,
   },
   proseGateTimeouts: {
@@ -185,6 +193,7 @@ export const MAX_SCENE_CANDIDATES = 3;
 const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
 const WRITING_EXECUTION_MODES = new Set<WritingExecutionMode>(["delegated", "fast"]);
 const STEP_BUDGET_MODES = new Set<AgentStepBudgetMode>(["hard", "experimental"]);
+const PROSE_LENGTH_MODES = new Set<ProseLengthMode>(["bounded", "guidance"]);
 
 export function isPermissionMode(value: string): value is PermissionMode {
   return PERMISSION_MODES.has(value as PermissionMode);
@@ -196,6 +205,10 @@ export function isWritingExecutionMode(value: string): value is WritingExecution
 
 export function isAgentStepBudgetMode(value: string): value is AgentStepBudgetMode {
   return STEP_BUDGET_MODES.has(value as AgentStepBudgetMode);
+}
+
+export function isProseLengthMode(value: string): value is ProseLengthMode {
+  return PROSE_LENGTH_MODES.has(value as ProseLengthMode);
 }
 
 export function normalizeMaxAgentSteps(value: unknown, fallback = DEFAULT_AGENT_STEPS): number {
@@ -235,6 +248,9 @@ export function normalizeProseLengthSettings(value?: Partial<ProseLengthSettings
     chapterTargetCharacters: Number.isFinite(raw) && raw > 0
       ? Math.round(Math.min(MAX_CHAPTER_TARGET_CHARACTERS, Math.max(MIN_CHAPTER_TARGET_CHARACTERS, raw)))
       : DEFAULT_SETTINGS.proseLength.chapterTargetCharacters,
+    mode: typeof value?.mode === "string" && isProseLengthMode(value.mode)
+      ? value.mode
+      : DEFAULT_SETTINGS.proseLength.mode,
     enforceMinimum: value?.enforceMinimum === true,
   };
 }

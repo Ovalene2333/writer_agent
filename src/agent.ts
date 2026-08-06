@@ -594,13 +594,21 @@ export function dynamicContextPrompt(
   // 作者定的篇幅，不是模型按事件密度自己拍的。来源写出来，作者一看就知道这个数字
   // 是他这句话带来的还是项目默认档。
   const proseLengthLine = proseLength && (task.documentProposalRequired || task.mode === "write_scene" || task.mode === "rewrite")
-    ? `\n单章篇幅目标：本轮涉及的每一章都分别约 ${proseLength.targetCharacters} 字（${
-      proseLength.source === "prompt_exact"
-        ? "用户本轮指定"
-        : proseLength.source === "prompt_relative"
-          ? "用户本轮要求相对项目默认调整"
-          : "项目默认篇幅档"
-    }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。write_file/edit_file 会由运行时自动绑定该章目标；场景链各场之和只对齐当前这一章。用户明确为不同章节分别指定数字时，以各章指定值为准。`
+    ? proseLength.mode === "guidance"
+      ? `\n单章篇幅参考：本轮涉及的每一章约 ${proseLength.targetCharacters} 字（${
+          proseLength.source === "prompt_exact"
+            ? "用户本轮指定"
+            : proseLength.source === "prompt_relative"
+              ? "用户本轮要求相对项目默认调整"
+              : "项目默认篇幅档"
+        }）。这是弱引导参考，不是本轮所有章节合计；保持场景自然完整，不因偏离目标而缩句、扩句或发起重写。场景链仍按实际故事选择每场目标。`
+      : `\n单章篇幅目标：本轮涉及的每一章都分别约 ${proseLength.targetCharacters} 字（${
+          proseLength.source === "prompt_exact"
+            ? "用户本轮指定"
+            : proseLength.source === "prompt_relative"
+              ? "用户本轮要求相对项目默认调整"
+              : "项目默认篇幅档"
+        }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。write_file/edit_file 会由运行时自动绑定该章目标；场景链各场之和只对齐当前这一章。用户明确为不同章节分别指定数字时，以各章指定值为准。`
     : "";
   const resumeLine = resumeInterrupted
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
@@ -1360,7 +1368,7 @@ export function taskInstructions(
 - 角色卡原始分区是人物事实的唯一依据：能力、知识、关系、身体状态与对白声线不得压缩进 write pack 后替代原卡。确实要写某角色的对白时，按需读取该角色 voice、motivations、relationships、storyState；涉及价值、恐惧或内在冲突才读取 psychology，只读会开口的角色。对白声线遵守「正文底线」的角色归属规则。
 - ${fastWritingMode ? "快速模式下优先走最短的单 Agent 路径，由你提交正文。" : "分工模式下你负责检索、角色原卡取证与编排；正文交给证据型 Writer。直接完整成稿先 compile_write_pack，再调用 write_file(path) 并省略 content；资料不足时工具会返回必须补读的原始分区。局部 edit_file 仍由你完成。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
 - 根据任务选择最小有效路径：新建或完整成稿用 write_file，修改既有局部用 edit_file；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}运行时自动处理篇幅、审查与审批，只使用当前公开文件工具。
-- 单章目标字数以「单章篇幅目标」为准，不擅自缩减，也不另按事件密度改判；一次任务包含多章时，每一章分别达到该目标，禁止把目标当作多章总额均分。write_file/edit_file 由运行时绑定当前章目标；场景链必须给每场 targetCharacters，且各场之和只对齐当前章目标。工具按目标的 ${PROSE_TARGET_BAND_TEXT} 验收：超出上限会被拒收，需先删不改变选择的说明与重复过程；不足下限只提示不拦截，但要靠扩展行动、阻力、后果、反应和余波去补，禁止用总结、同义复述、额外支线或元说明凑字。
+- 单章篇幅按动态块中的「篇幅控制模式」处理，不擅自改变已成立事实，也不把目标当作多章总额均分。范围验收模式按目标的 ${PROSE_TARGET_BAND_TEXT} 处理：超出上限会被拒收，不足下限是否拦截由设置决定；弱引导模式只把目标作为参考，不因偏离目标重写。无论哪种模式，都禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径，系统会把工作副本记录为该文件的新版本；不要为避开同名另起副本或改写章节路径。局部修改用 edit_file，完整替换用 write_file。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 时，写前须读取该角色 voice、motivations、relationships、storyState，且声线只约束该角色说出口的对白。${fastWritingMode ? `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。` : `write_chapter_scene 只提交 sceneId 与不超过 ${notesMaxCharacters} 字的故事内 notes，省略 content/actualState，由证据型 Writer 和状态提取器完成。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
@@ -3056,6 +3064,7 @@ export async function runAgent(options: {
     scenePipelineSettings,
     proseLength: {
       targetCharacters: turnProseLength.targetCharacters,
+      mode: turnProseLength.mode,
       enforceMinimum: runtimeSettings.proseLength.enforceMinimum,
     },
     proseAdjudicator: {

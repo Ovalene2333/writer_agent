@@ -1,6 +1,7 @@
 import {
   MAX_CHAPTER_TARGET_CHARACTERS,
   MIN_CHAPTER_TARGET_CHARACTERS,
+  type ProseLengthMode,
   type ProseLengthSettings,
 } from "./agent_runtime.js";
 
@@ -60,6 +61,8 @@ export function proseLengthAdjustmentInstruction(assessment: ProseLengthAssessme
 export type TurnProseLength = {
   targetCharacters: number;
   source: "prompt_exact" | "prompt_relative" | "settings";
+  /** The per-turn enforcement mode resolved from project settings. */
+  mode: ProseLengthMode;
 };
 
 /** 「长一点」这类相对说法的倍率，强到弱排列 —— 先匹配到的先生效。 */
@@ -83,6 +86,7 @@ const EXPLICIT_LENGTH_PATTERN = /(\d[\d,]*(?:\.\d+)?)\s*(万|千)?\s*字/gu;
 export function resolveTurnProseLength(prompt: string, settings: ProseLengthSettings): TurnProseLength {
   const fallback = clampChapterTarget(settings.chapterTargetCharacters);
   const text = prompt ?? "";
+  const mode = settings.mode ?? "bounded";
 
   let explicit: number | undefined;
   for (const match of text.matchAll(EXPLICIT_LENGTH_PATTERN)) {
@@ -92,14 +96,14 @@ export function resolveTurnProseLength(prompt: string, settings: ProseLengthSett
     // 最后一个匹配胜出：用户往往是在补充修正前面说过的数字。
     explicit = value * scale;
   }
-  if (explicit !== undefined) return { targetCharacters: clampChapterTarget(explicit), source: "prompt_exact" };
+  if (explicit !== undefined) return { targetCharacters: clampChapterTarget(explicit), source: "prompt_exact", mode };
 
   for (const rule of RELATIVE_LENGTH_RULES) {
     if (rule.pattern.test(text)) {
-      return { targetCharacters: clampChapterTarget(fallback * rule.ratio), source: "prompt_relative" };
+      return { targetCharacters: clampChapterTarget(fallback * rule.ratio), source: "prompt_relative", mode };
     }
   }
-  return { targetCharacters: fallback, source: "settings" };
+  return { targetCharacters: fallback, source: "settings", mode };
 }
 
 function clampChapterTarget(value: number): number {
@@ -119,14 +123,25 @@ export type ProseLengthOutcome = {
  * 篇幅判定的唯一出口。三条写作路径（直接提案、标准场景、隔离 Writer）都走这里，
  * 免得各自写一套。
  *
- * 非对称是有意的：**超上限硬拦，不足只提示**。偏长会挤掉后文预算、也常常是模型在灌水，
- * 拦下来是对的；偏短则往往是这一场本来就没那么多事发生，为了凑数重写一遍既贵又会
- * 招来总结句和同义反复 —— 交给作者看着办，比让工具卡住交付好。
+ * 范围验收模式的非对称是有意的：**超上限硬拦，不足默认只提示**。偏长会挤掉后文预算、
+ * 也常常是模型在灌水；偏短则往往是这一场本来就没那么多事发生，为了凑数重写一遍既贵
+ * 又会招来总结句和同义反复。弱引导模式则完全不因篇幅偏离阻断，避免模型为数字来回改稿。
  */
 export function proseLengthOutcome(
   assessment: ProseLengthAssessment,
   enforceMinimum: boolean,
+  mode: ProseLengthMode = "bounded",
 ): ProseLengthOutcome {
+  if (mode === "guidance") {
+    const notice = assessment.status === "ok"
+      ? undefined
+      : `篇幅 ${assessment.actual} 字，目标 ${assessment.target} 字；当前为弱引导，仅作参考，不因偏离目标重写，保持正文自然完整。`;
+    return {
+      blocked: false,
+      ...(notice ? { notice } : {}),
+      message: notice ?? `篇幅 ${assessment.actual} 字，目标 ${assessment.target} 字；当前为弱引导，仅作参考。`,
+    };
+  }
   if (assessment.status === "too_long") {
     return {
       blocked: true,

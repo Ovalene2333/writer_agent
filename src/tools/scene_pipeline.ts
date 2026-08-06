@@ -349,6 +349,7 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
           }
         : {}),
       targetCharacters: scene.targetCharacters,
+      lengthMode: context.proseLength?.mode,
     }, { project, context }, writer.signal);
     if (generated.usage) {
       context.modelUsageReporter?.(writer.model, generated.usage, {
@@ -378,8 +379,12 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
   const targetCharacters = scene.targetCharacters;
   if (targetCharacters) {
     const assessment = assessProseLength(targetCharacters, submitted);
-    // 偏长挤掉后文预算，硬拦；偏短默认放行 —— 这一场本来就可能没那么多事发生。
-    if (proseLengthOutcome(assessment, context.proseLength?.enforceMinimum === true).blocked) {
+    // 范围验收模式保留现有门禁；弱引导模式只记录参考，不触发场景重写。
+    if (proseLengthOutcome(
+      assessment,
+      context.proseLength?.enforceMinimum === true,
+      context.proseLength?.mode ?? "bounded",
+    ).blocked) {
       throw new Error(
         `本场正文 ${assessment.actual} 字，目标 ${targetCharacters} 字，可接受范围 ${assessment.minimum}—${assessment.maximum} 字。保持本场目标、事实和 actualState 一致，按差量${assessment.status === "too_short" ? `补足约 ${assessment.delta} 字` : `删减约 ${assessment.delta} 字`}后重新提交；不得用总结、重复或元说明凑字。`,
       );
