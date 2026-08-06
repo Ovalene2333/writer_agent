@@ -219,7 +219,6 @@ import type { ContextGraphNode } from "./types";
 import { WorkspaceTopbar } from "./workspace_topbar";
 import { api, apiFetch } from "./api_client";
 import "./style.css";
-import "./neo_brutalism.css";
 
 const INITIAL_PERFORMANCE_MODE = loadPerformanceMode();
 window.document.documentElement.dataset.motion = INITIAL_PERFORMANCE_MODE ? "off" : "full";
