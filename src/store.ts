@@ -237,6 +237,32 @@ function parseProposalCharacterRevisions(value: unknown): ProposalCharacterRevis
   }
 }
 
+function backgroundJobFromRow(row: Row): {
+  id: string;
+  sessionId: string;
+  status: string;
+  kind: string;
+  promptPreview: string;
+  sourceMessageId?: number;
+  terminalMessage: string;
+  createdAt: string;
+  updatedAt: string;
+} {
+  return {
+    id: String(row.id),
+    sessionId: String(row.session_id),
+    status: String(row.status),
+    kind: String(row.kind ?? "agent"),
+    promptPreview: String(row.prompt_preview ?? ""),
+    ...(row.source_message_id != null && Number.isFinite(Number(row.source_message_id))
+      ? { sourceMessageId: Number(row.source_message_id) }
+      : {}),
+    terminalMessage: String(row.terminal_message ?? ""),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
 export class WriterStore {
   readonly database: DatabaseSync;
   private closed = false;
@@ -251,8 +277,10 @@ export class WriterStore {
       this.migrateCharacterCardsToJsonl();
       this.migrateSimpleCharacterCardsToJsonl();
       this.reindex();
-      // Close trails left "running" by a crashed process (in-memory jobs are gone).
+      // Close trails / jobs left "running" by a crashed process (in-memory runners are gone).
       this.finalizeOrphanedStepTrails("进程异常退出：未完成的任务已标记失败，可从原指令续跑。");
+      this.finalizeOrphanedBackgroundJobs("进程异常退出：未完成的任务已标记失败，可从原指令续跑。");
+      this.finalizeOrphanedAgentRuns("进程异常退出：运行状态已挂起，可从原指令续跑。");
     } catch (error) {
       this.database.close();
       throw error;
@@ -579,6 +607,22 @@ export class WriterStore {
       );
       CREATE INDEX IF NOT EXISTS agent_runs_session
         ON agent_runs(session_id, created_at);
+      -- Durable local job ledger: survives process restart (runner itself does not).
+      CREATE TABLE IF NOT EXISTS background_jobs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'agent',
+        prompt_preview TEXT NOT NULL DEFAULT '',
+        source_message_id INTEGER,
+        terminal_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS background_jobs_session
+        ON background_jobs(session_id, updated_at);
+      CREATE INDEX IF NOT EXISTS background_jobs_status
+        ON background_jobs(status, updated_at);
       CREATE TABLE IF NOT EXISTS agent_run_events (
         run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
         sequence INTEGER NOT NULL,
@@ -951,6 +995,170 @@ export class WriterStore {
     if (!options.preserveContextArtifacts) {
       this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
     }
+  }
+
+  upsertBackgroundJob(job: {
+    id: string;
+    sessionId: string;
+    status: string;
+    kind?: string;
+    promptPreview?: string;
+    sourceMessageId?: number;
+    terminalMessage?: string;
+    createdAt?: string;
+    updatedAt?: string;
+  }): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO background_jobs(
+      id,session_id,status,kind,prompt_preview,source_message_id,terminal_message,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET
+      session_id=excluded.session_id,
+      status=excluded.status,
+      kind=excluded.kind,
+      prompt_preview=CASE WHEN excluded.prompt_preview!='' THEN excluded.prompt_preview ELSE background_jobs.prompt_preview END,
+      source_message_id=COALESCE(excluded.source_message_id, background_jobs.source_message_id),
+      terminal_message=CASE WHEN excluded.terminal_message!='' THEN excluded.terminal_message ELSE background_jobs.terminal_message END,
+      updated_at=excluded.updated_at`).run(
+      job.id,
+      job.sessionId,
+      job.status,
+      job.kind ?? "agent",
+      (job.promptPreview ?? "").slice(0, 500),
+      job.sourceMessageId ?? null,
+      job.terminalMessage ?? "",
+      job.createdAt ?? now,
+      job.updatedAt ?? now,
+    );
+  }
+
+  finishBackgroundJob(id: string, status: string, terminalMessage = ""): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`UPDATE background_jobs
+      SET status=?, terminal_message=CASE WHEN ?!='' THEN ? ELSE terminal_message END, updated_at=?
+      WHERE id=?`).run(status, terminalMessage, terminalMessage, now, id);
+  }
+
+  patchBackgroundJob(id: string, patch: {
+    sourceMessageId?: number;
+    promptPreview?: string;
+    status?: string;
+  }): void {
+    const row = this.database.prepare("SELECT 1 AS ok FROM background_jobs WHERE id=?").get(id) as Row | undefined;
+    if (!row) return;
+    const now = new Date().toISOString();
+    if (patch.sourceMessageId !== undefined) {
+      this.database.prepare(`UPDATE background_jobs SET source_message_id=?, updated_at=? WHERE id=?`)
+        .run(patch.sourceMessageId, now, id);
+    }
+    if (patch.promptPreview !== undefined) {
+      this.database.prepare(`UPDATE background_jobs SET prompt_preview=?, updated_at=? WHERE id=?`)
+        .run(patch.promptPreview.slice(0, 500), now, id);
+    }
+    if (patch.status !== undefined) {
+      this.database.prepare(`UPDATE background_jobs SET status=?, updated_at=? WHERE id=?`)
+        .run(patch.status, now, id);
+    }
+  }
+
+  backgroundJob(id: string): {
+    id: string;
+    sessionId: string;
+    status: string;
+    kind: string;
+    promptPreview: string;
+    sourceMessageId?: number;
+    terminalMessage: string;
+    createdAt: string;
+    updatedAt: string;
+  } | undefined {
+    const row = this.database.prepare(`SELECT id,session_id,status,kind,prompt_preview,source_message_id,terminal_message,created_at,updated_at
+      FROM background_jobs WHERE id=?`).get(id) as Row | undefined;
+    if (!row) return undefined;
+    return backgroundJobFromRow(row);
+  }
+
+  listBackgroundJobs(options: {
+    sessionId?: string;
+    statuses?: string[];
+    limit?: number;
+  } = {}): Array<{
+    id: string;
+    sessionId: string;
+    status: string;
+    kind: string;
+    promptPreview: string;
+    sourceMessageId?: number;
+    terminalMessage: string;
+    createdAt: string;
+    updatedAt: string;
+  }> {
+    const limit = Math.min(200, Math.max(1, options.limit ?? 40));
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.sessionId) {
+      clauses.push("session_id=?");
+      params.push(options.sessionId);
+    }
+    if (options.statuses?.length) {
+      clauses.push(`status IN (${options.statuses.map(() => "?").join(",")})`);
+      params.push(...options.statuses);
+    }
+    params.push(limit);
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.database.prepare(
+      `SELECT id,session_id,status,kind,prompt_preview,source_message_id,terminal_message,created_at,updated_at
+       FROM background_jobs ${where}
+       ORDER BY updated_at DESC LIMIT ?`,
+    ).all(...params) as Row[];
+    return rows.map(backgroundJobFromRow);
+  }
+
+  /**
+   * After process restart, any background job still marked `running` cannot resume
+   * its in-memory runner. Mark them failed so the ledger matches reality.
+   */
+  finalizeOrphanedBackgroundJobs(reason = "任务已中断"): number {
+    const now = new Date().toISOString();
+    const result = this.database.prepare(
+      `UPDATE background_jobs SET status='failed', terminal_message=?, updated_at=?
+       WHERE status='running'`,
+    ).run(reason, now);
+    return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Agent runs left mid-flight after a crash become suspended so resume can reuse evidence.
+   */
+  finalizeOrphanedAgentRuns(reason = "任务已中断"): number {
+    const now = new Date().toISOString();
+    const rows = this.database.prepare(
+      `SELECT id,snapshot_json FROM agent_runs WHERE status IN ('running','active','in_progress')`,
+    ).all() as Row[];
+    let updated = 0;
+    for (const row of rows) {
+      try {
+        const snapshot = typeof row.snapshot_json === "string" && row.snapshot_json.trim()
+          ? JSON.parse(row.snapshot_json) as Record<string, unknown>
+          : {};
+        const next = {
+          ...snapshot,
+          status: "suspended",
+          updatedAt: now,
+          terminalMessage: reason,
+        };
+        this.database.prepare(
+          `UPDATE agent_runs SET status='suspended', snapshot_json=?, updated_at=? WHERE id=?`,
+        ).run(JSON.stringify(next), now, String(row.id));
+        updated += 1;
+      } catch {
+        this.database.prepare(
+          `UPDATE agent_runs SET status='suspended', updated_at=? WHERE id=?`,
+        ).run(now, String(row.id));
+        updated += 1;
+      }
+    }
+    return updated;
   }
 
   /**

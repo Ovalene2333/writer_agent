@@ -10,9 +10,13 @@ import {
   parseProviderModelEntries,
   parseProviderModelIds,
   PROVIDERS_BACKUP_SUFFIX,
+  PROVIDERS_FILENAME,
   ProviderManager,
 } from "./provider_catalog.js";
 import { WriterProject } from "./project.js";
+import { isSealedSecret } from "./secret_box.js";
+import { createProjectBackup, restoreProjectBackup } from "./project_backup.js";
+import { join as pathJoin } from "node:path";
 
 test("DeepSeek Thinking omits unsupported tool_choice", () => {
   assert.equal(modelSupportsToolChoice({ provider: "deepseek", baseUrl: "https://proxy.example/v1" }), false);
@@ -57,6 +61,64 @@ test("provider model entries pick up heterogeneous context window fields", () =>
     { name: "plain-c" },
     { name: "vllm-b", contextWindow: 16_384 },
   ]);
+});
+
+test("providers.json seals API keys at rest while runtime still uses plaintext", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-provider-seal-"));
+  try {
+    const project = WriterProject.init(root, "密钥密封");
+    const providers = new ProviderManager(project);
+    const seeded = providers.catalog().providers[0];
+    providers.saveProfile({
+      id: seeded.id,
+      name: seeded.name,
+      provider: seeded.provider,
+      baseUrl: seeded.baseUrl,
+      apiKey: "sk-plain-secret-key",
+      models: [{ id: seeded.models[0].id, name: seeded.models[0].name }],
+    });
+    const onDisk = readFileSync(join(project.privateDir, PROVIDERS_FILENAME), "utf8");
+    assert.equal(onDisk.includes("sk-plain-secret-key"), false);
+    assert.match(onDisk, /enc:v1:/);
+    const reloaded = new ProviderManager(project);
+    assert.equal(reloaded.modelConfig("agent").apiKey, "sk-plain-secret-key");
+    assert.equal(isSealedSecret(reloaded.modelConfig("agent").apiKey), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project backup round-trips resource files and .writer ledger", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-backup-src-"));
+  const restoreRoot = mkdtempSync(join(tmpdir(), "writer-backup-dst-"));
+  try {
+    const project = WriterProject.init(root, "备份作品");
+    project.writeRaw("chapters/one.md", "# 第一章\n正文\n");
+    const providers = new ProviderManager(project);
+    const seeded = providers.catalog().providers[0];
+    providers.saveProfile({
+      id: seeded.id,
+      name: seeded.name,
+      provider: seeded.provider,
+      baseUrl: seeded.baseUrl,
+      apiKey: "sk-backup-key",
+      models: [{ id: seeded.models[0].id, name: seeded.models[0].name }],
+    });
+    const backup = await createProjectBackup(project.root);
+    rmSync(restoreRoot, { recursive: true, force: true });
+    const restored = await restoreProjectBackup(backup.path, restoreRoot);
+    assert.equal(restored.manifest.title, "备份作品");
+    assert.ok(
+      existsSync(pathJoin(restoreRoot, "resource", "chapters", "one.md"))
+      || existsSync(pathJoin(restoreRoot, "chapters", "one.md")),
+    );
+    assert.ok(existsSync(pathJoin(restoreRoot, ".writer", PROVIDERS_FILENAME)));
+    const restoredProviders = new ProviderManager(new WriterProject(restoreRoot));
+    assert.equal(restoredProviders.modelConfig("agent").apiKey, "sk-backup-key");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(restoreRoot, { recursive: true, force: true });
+  }
 });
 
 test("scanModels uses a saved key, returns default pricing, and does not mutate the catalog", async () => {

@@ -14,6 +14,7 @@ import { ProviderManager } from "./provider_catalog.js";
 import { startGrokBuildProxy } from "./grok_proxy.js";
 import { startWriterServer } from "./server.js";
 import { startShareTunnel } from "./share_tunnel.js";
+import { createProjectBackup, restoreProjectBackup } from "./project_backup.js";
 import { WriterStore } from "./store.js";
 import type { PermissionMode } from "./types.js";
 
@@ -271,6 +272,36 @@ program.command("export")
     const content = project.export(options.format);
     if (options.output) writeFileSync(resolve(options.output), content, "utf8");
     else process.stdout.write(content);
+  });
+
+program.command("backup")
+  .description("备份写作项目（含正文、.writer 数据库与加密密钥）")
+  .option("-p, --project <directory>", "项目目录", ".")
+  .option("-o, --output <file>", "输出 .tgz 路径；省略时写入 .writer/backups/")
+  .option("--dir <directory>", "输出目录（与 --output 二选一）")
+  .action(async (options: { project: string; output?: string; dir?: string }) => {
+    const project = new WriterProject(options.project);
+    if (!project.exists()) throw new Error("当前目录不是写作项目，请先执行 writer init");
+    const result = await createProjectBackup(project.root, {
+      ...(options.output ? { outputPath: resolve(options.output) } : {}),
+      ...(options.dir ? { outputDir: resolve(options.dir) } : {}),
+      title: project.config().title,
+    });
+    process.stdout.write(
+      `备份完成：${result.path}\n文件 ${result.manifest.fileCount} 个，约 ${result.manifest.totalBytes} 字节，sha256=${result.manifest.sha256}\n`,
+    );
+  });
+
+program.command("restore")
+  .description("从备份恢复写作项目到空目录")
+  .argument("<archive>", "backup 生成的 .tgz")
+  .option("-o, --output <directory>", "恢复目标目录（须为空或不存在）")
+  .action(async (archive: string, options: { output?: string }) => {
+    if (!options.output?.trim()) throw new Error("请用 -o 指定恢复目标目录");
+    const result = await restoreProjectBackup(resolve(archive), resolve(options.output));
+    process.stdout.write(
+      `恢复完成：${result.targetRoot}\n清单标题：${result.manifest.title}，文件 ${result.fileCount} 个\n`,
+    );
   });
 
 program.command("cache")

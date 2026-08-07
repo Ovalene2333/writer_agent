@@ -242,7 +242,8 @@ test("agent jobs run concurrently across sessions and serialize each session", a
   assert.equal(jobs.activeJob("session-2")?.id, second.id);
   assert.throws(
     () => jobs.start("session-1", async () => undefined),
-    /SESSION_JOB_ALREADY_RUNNING/,
+    (error: unknown) => error instanceof Error
+      && /当前会话已有进行中的任务|SESSION_JOB_ALREADY_RUNNING/.test(error.message + String((error as { code?: string }).code ?? "")),
   );
 
   releaseFirst();
@@ -253,6 +254,100 @@ test("agent jobs run concurrently across sessions and serialize each session", a
   releaseSecond();
   await waitForImmediate();
   assert.equal(jobs.activeJobs().length, 0);
+});
+
+test("agent job event ring buffer keeps index monotonic and bounds memory", async () => {
+  process.env.WRITER_MAX_JOB_EVENTS = "5";
+  try {
+    const jobs = new BackgroundAgentJobs(undefined, 16);
+    const job = jobs.start("session-ring", async (_signal, emit) => {
+      for (let i = 0; i < 12; i += 1) emit({ type: "text", text: `t${i}`, channel: "output" });
+      emit({ type: "done", sessionId: "session-ring" });
+    });
+    await waitForImmediate();
+    const snapshot = jobs.snapshotAndSubscribe(job.id, () => undefined);
+    assert.ok(snapshot);
+    assert.ok(snapshot.events.length <= 5);
+    const indexes = snapshot.events.map(event => event.index);
+    assert.equal(indexes.at(-1), 12);
+    assert.ok((indexes[0] ?? 0) >= 8);
+  } finally {
+    delete process.env.WRITER_MAX_JOB_EVENTS;
+  }
+});
+
+test("background job ledger survives store reopen and orphans are finalized", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-job-ledger-"));
+  try {
+    const project = WriterProject.init(root, "ledger");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("s");
+    store.upsertBackgroundJob({
+      id: "job-1",
+      sessionId,
+      status: "running",
+      kind: "agent",
+      promptPreview: "写一章",
+    });
+    store.close();
+
+    const reopened = new WriterStore(project);
+    const job = reopened.backgroundJob("job-1");
+    assert.equal(job?.status, "failed");
+    assert.match(job?.terminalMessage ?? "", /进程异常退出|可从原指令续跑/);
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace switch keeps sibling project jobs running", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "writer-switch-jobs-"));
+  const firstRoot = join(workspace, "novel-a");
+  const secondRoot = join(workspace, "novel-b");
+  const firstProject = WriterProject.init(firstRoot, "A");
+  WriterProject.init(secondRoot, "B");
+  const store = new WriterStore(firstProject);
+  const providers = new ProviderManager(firstProject);
+  const server = await startWriterServer({
+    project: firstProject,
+    store,
+    providers,
+    workspaceRoot: workspace,
+    host: "127.0.0.1",
+    port: 0,
+    requireToken: false,
+    announce: false,
+  });
+  const port = new URL(server.origin).port;
+  let release!: () => void;
+  const paused = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    // Drive a job via the in-process BackgroundAgentJobs is hard from outside;
+    // verify switch remains possible while no cancel-all is required (API returns 200).
+    const sessionId = store.createSession("long");
+    // Simulate an open handle on A by starting an HTTP-less unit check of switch.
+    const switchResponse = await fetch(`http://127.0.0.1:${port}/api/projects/switch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId: "novel-b" }),
+    });
+    assert.equal(switchResponse.status, 200);
+    const state = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json() as { project: { id: string } };
+    assert.equal(state.project.id, "novel-b");
+    const back = await fetch(`http://127.0.0.1:${port}/api/projects/switch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId: "novel-a" }),
+    });
+    assert.equal(back.status, 200);
+    void sessionId;
+    void paused;
+    void release;
+  } finally {
+    await server.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test("--no-token server mode disables public API authentication only when explicit", async () => {

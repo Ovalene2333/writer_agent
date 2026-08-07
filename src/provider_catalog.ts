@@ -11,6 +11,12 @@ import {
   syncProviderConcurrencyRegistry,
 } from "./model_fetch.js";
 import { WriterProject } from "./project.js";
+import {
+  isSealedSecret,
+  loadOrCreateProjectSecretKey,
+  openSecretLoose,
+  sealSecret,
+} from "./secret_box.js";
 
 type SavedModel = ProviderModelPublic;
 type SavedProfile = {
@@ -57,9 +63,14 @@ export class ProviderManager {
   /** Absolute path of the providers file (override with WRITER_PROVIDERS_FILE). */
   readonly path: string;
   private saved: SavedCatalog;
+  /** Project-local AES key used only when writing providers.json to disk. */
+  private readonly secretKey: Buffer;
+  private readonly privateDir: string;
 
   constructor(project: WriterProject) {
     this.path = resolveProvidersPath(project);
+    this.privateDir = project.privateDir;
+    this.secretKey = loadOrCreateProjectSecretKey(project.privateDir);
     this.saved = this.load();
     this.syncConcurrencyRegistry();
   }
@@ -357,8 +368,14 @@ export class ProviderManager {
     if (!sourcePath) return defaultCatalog();
     try {
       const catalog = parseCatalog(readFileSync(sourcePath, "utf8"));
-      // Migrate legacy `.writer/provider.json` → `providers.json` (or custom path)
-      if (sourcePath !== this.path) {
+      let needsSealMigration = sourcePath !== this.path;
+      for (const profile of catalog.providers) {
+        const raw = profile.apiKey ?? "";
+        if (raw && !isSealedSecret(raw)) needsSealMigration = true;
+        profile.apiKey = openSecretLoose(raw, this.secretKey);
+      }
+      // Migrate legacy path and/or plaintext keys → sealed providers.json
+      if (needsSealMigration) {
         this.saved = catalog;
         this.persist();
       }
@@ -376,6 +393,8 @@ export class ProviderManager {
 
   private persist() {
     mkdirSync(dirname(this.path), { recursive: true });
+    // Ensure a project-local master key exists before writing sealed secrets.
+    loadOrCreateProjectSecretKey(this.privateDir);
     // Best-effort previous snapshot for recovery after accidental overwrites.
     if (existsSync(this.path)) {
       try {
@@ -385,7 +404,14 @@ export class ProviderManager {
       }
     }
     const temporary = `${this.path}.tmp-${process.pid}`;
-    const text = `${JSON.stringify(this.saved, null, 2)}\n`;
+    const sealed: SavedCatalog = {
+      ...this.saved,
+      providers: this.saved.providers.map(profile => ({
+        ...profile,
+        apiKey: profile.apiKey ? sealSecret(profile.apiKey, this.secretKey) : "",
+      })),
+    };
+    const text = `${JSON.stringify(sealed, null, 2)}\n`;
     writeFileSync(temporary, text, { encoding: "utf8", mode: 0o600 });
     try {
       renameSync(temporary, this.path);

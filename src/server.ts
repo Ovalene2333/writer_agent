@@ -106,6 +106,7 @@ import {
   type AuthorPolicyFeedbackDisposition,
   type AuthorPolicyStatus,
 } from "./author_policies.js";
+import { createProjectBackup } from "./project_backup.js";
 
 type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -153,6 +154,11 @@ export type AgentJobInfo = {
   status: AgentJobStatus;
   createdAt: string;
   updatedAt: string;
+  projectId?: string;
+  kind?: string;
+  promptPreview?: string;
+  sourceMessageId?: number;
+  terminalMessage?: string;
 };
 
 export type ProjectSummary = {
@@ -204,15 +210,31 @@ type AgentJob = {
   status: AgentJobStatus;
   createdAt: string;
   updatedAt: string;
+  /** Monotonic index assigned to the next emitted event (survives ring-buffer eviction). */
+  nextEventIndex: number;
+  /** Ring buffer of recent events for SSE replay (bounded). */
   events: StoredAgentEvent[];
   controller: AbortController;
   listeners: Set<(event: StoredAgentEvent) => void>;
   /** The store this job started with. It must never follow a workspace switch. */
   store?: WriterStore;
+  projectId?: string;
+  kind: string;
+  promptPreview: string;
+  sourceMessageId?: number;
+  terminalMessage?: string;
 };
 
 const STEP_TRAIL_TEXT_MAX = 12_000;
 const STEP_TRAIL_FLUSH_MS = 1_500;
+
+export function maxJobEventBuffer(): number {
+  const raw = process.env.WRITER_MAX_JOB_EVENTS?.trim();
+  const parsed = raw ? Number(raw) : 1_500;
+  if (!Number.isFinite(parsed)) return 1_500;
+  // Floor at 5 so long SSE streams stay bounded while tests can shrink the ring.
+  return Math.min(20_000, Math.max(5, Math.round(parsed)));
+}
 
 function compactStepTrailText(value: string): string {
   if (value.length <= STEP_TRAIL_TEXT_MAX) return value;
@@ -302,27 +324,41 @@ export function maxProcessAgentJobs(): number {
   return Math.min(64, Math.max(1, Math.round(parsed)));
 }
 
+export type StartAgentJobOptions = {
+  store?: WriterStore;
+  projectId?: string;
+  kind?: string;
+  promptPreview?: string;
+};
+
 export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
   private trails = new Map<string, JobTrailState>();
   private runners = new Map<string, Promise<void>>();
   private readonly maxJobs: number;
+  private readonly maxEvents: number;
 
-  constructor(private store?: WriterStore, maxJobs = maxProcessAgentJobs()) {
+  constructor(private defaultStore?: WriterStore, maxJobs = maxProcessAgentJobs()) {
     this.maxJobs = maxJobs;
+    this.maxEvents = maxJobEventBuffer();
   }
 
+  /** Default store used when start() does not pass an explicit store. */
   setStore(store: WriterStore): void {
-    this.store = store;
+    this.defaultStore = store;
   }
 
   /** Process-level occupancy for health/metrics. */
-  occupancy(): { active: number; max: number; totalTracked: number } {
+  occupancy(): { active: number; max: number; totalTracked: number; maxEvents: number } {
     const active = [...this.jobs.values()].filter(job => job.status === "running").length;
-    return { active, max: this.maxJobs, totalTracked: this.jobs.size };
+    return { active, max: this.maxJobs, totalTracked: this.jobs.size, maxEvents: this.maxEvents };
   }
 
-  start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
+  start(
+    sessionId: string,
+    run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>,
+    options: StartAgentJobOptions = {},
+  ): AgentJob {
     if (this.activeJob(sessionId)) {
       throw new ProviderError(
         "SESSION_JOB_ALREADY_RUNNING",
@@ -338,19 +374,26 @@ export class BackgroundAgentJobs {
         { retryable: true },
       );
     }
+    const store = options.store ?? this.defaultStore;
+    const createdAt = new Date().toISOString();
     const job: AgentJob = {
       id: randomBytes(12).toString("base64url"),
       sessionId,
       status: "running",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt,
+      updatedAt: createdAt,
+      nextEventIndex: 0,
       events: [],
       controller: new AbortController(),
       listeners: new Set(),
-      store: this.store,
+      store,
+      projectId: options.projectId,
+      kind: options.kind ?? "agent",
+      promptPreview: (options.promptPreview ?? "").slice(0, 500),
     };
     this.jobs.set(job.id, job);
     this.trails.set(job.id, { steps: [], lastFlushAt: 0, dirty: false });
+    this.persistJob(job);
     const emit = (event: AgentEvent) => this.emit(job.id, event);
     // Defer so callers can finish `const job = start(...)` before the runner touches `job`.
     const runner = new Promise<void>((settle) => {
@@ -375,7 +418,7 @@ export class BackgroundAgentJobs {
               ? { code: error.code, retryable: error.retryable, action: error.action }
               : {}),
           });
-          this.finish(job, "failed");
+          this.finish(job, "failed", message);
         }
         }).finally(settle);
       });
@@ -385,15 +428,22 @@ export class BackgroundAgentJobs {
     return job;
   }
 
-  activeJobs(sessionId?: string): AgentJobInfo[] {
+  activeJobs(sessionId?: string, projectId?: string): AgentJobInfo[] {
     return [...this.jobs.values()]
-      .filter(job => job.status === "running" && (sessionId === undefined || job.sessionId === sessionId))
+      .filter(job => job.status === "running"
+        && (sessionId === undefined || job.sessionId === sessionId)
+        && (projectId === undefined || job.projectId === projectId))
       .map(jobInfo);
   }
 
   activeJob(sessionId: string): AgentJobInfo | undefined {
     const job = [...this.jobs.values()].find(item => item.sessionId === sessionId && item.status === "running");
     return job ? jobInfo(job) : undefined;
+  }
+
+  /** Whether any in-memory runner still holds this store (blocks closing it). */
+  hasRunningJobsForStore(store: WriterStore): boolean {
+    return [...this.jobs.values()].some(job => job.status === "running" && job.store === store);
   }
 
   get(id: string): AgentJob | undefined {
@@ -407,14 +457,24 @@ export class BackgroundAgentJobs {
     return true;
   }
 
-  /** Stop all current jobs before their project resources are released. */
+  /** Stop all current jobs before process shutdown. */
   async cancelAllAndWait(): Promise<void> {
     const active = [...this.jobs.values()].filter(job => job.status === "running");
     for (const job of active) job.controller.abort();
     await Promise.all(active.map(job => this.runners.get(job.id)).filter((runner): runner is Promise<void> => Boolean(runner)));
   }
 
-  /** Discard old project job history after every runner has stopped. */
+  /** Drop finished in-memory jobs for a store that is about to close. Running jobs must be gone first. */
+  dropJobsForStore(store: WriterStore): void {
+    for (const [id, job] of this.jobs) {
+      if (job.store !== store) continue;
+      if (job.status === "running") continue;
+      this.jobs.delete(id);
+      this.trails.delete(id);
+    }
+  }
+
+  /** Discard all in-memory job history (process shutdown). */
   clear(): void {
     this.jobs.clear();
     this.trails.clear();
@@ -443,15 +503,47 @@ export class BackgroundAgentJobs {
   private emit(id: string, event: AgentEvent): void {
     const job = this.jobs.get(id);
     if (!job) return;
-    const stored = { ...event, index: job.events.length } as StoredAgentEvent;
+    const stored = { ...event, index: job.nextEventIndex } as StoredAgentEvent;
+    job.nextEventIndex += 1;
     job.events.push(stored);
+    while (job.events.length > this.maxEvents) job.events.shift();
     job.updatedAt = new Date().toISOString();
+    if (event.type === "source_message" && typeof event.messageId === "number" && Number.isFinite(event.messageId)) {
+      job.sourceMessageId = event.messageId;
+      try {
+        job.store?.patchBackgroundJob(job.id, { sourceMessageId: event.messageId });
+      } catch { /* best-effort ledger */ }
+    }
     this.applyTrailEvent(job, event);
     if (event.type === "done") this.finish(job, "completed");
-    if (event.type === "cancelled") this.finish(job, "cancelled");
-    if (event.type === "waiting_for_input") this.finish(job, "completed");
-    if (event.type === "error") this.finish(job, "failed");
+    else if (event.type === "cancelled") this.finish(job, "cancelled");
+    else if (event.type === "waiting_for_input") this.finish(job, "completed");
+    else if (event.type === "error") {
+      const message = typeof (event as { message?: string }).message === "string"
+        ? (event as { message: string }).message
+        : "";
+      this.finish(job, "failed", message);
+    }
     for (const listener of job.listeners) listener(stored);
+  }
+
+  private persistJob(job: AgentJob): void {
+    if (!job.store) return;
+    try {
+      job.store.upsertBackgroundJob({
+        id: job.id,
+        sessionId: job.sessionId,
+        status: job.status,
+        kind: job.kind,
+        promptPreview: job.promptPreview,
+        sourceMessageId: job.sourceMessageId,
+        terminalMessage: job.terminalMessage,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+      });
+    } catch {
+      /* ledger is best-effort relative to the live runner */
+    }
   }
 
   private applyTrailEvent(job: AgentJob, event: AgentEvent): void {
@@ -563,11 +655,18 @@ export class BackgroundAgentJobs {
     }
   }
 
-  private finish(job: AgentJob, status: Exclude<AgentJobStatus, "running">): void {
+  private finish(job: AgentJob, status: Exclude<AgentJobStatus, "running">, terminalMessage = ""): void {
+    if (job.status !== "running") return;
     job.status = status;
     job.updatedAt = new Date().toISOString();
+    if (terminalMessage) job.terminalMessage = terminalMessage;
     this.flushTrail(job, true);
     this.trails.delete(job.id);
+    if (job.store) {
+      try {
+        job.store.finishBackgroundJob(job.id, status, job.terminalMessage ?? terminalMessage);
+      } catch { /* best-effort ledger */ }
+    }
   }
 }
 
@@ -578,9 +677,27 @@ function activeTrailStepIndex(steps: PersistedStreamStep[]): number {
   return -1;
 }
 
-function jobInfo({ id, sessionId, status, createdAt, updatedAt }: AgentJob): AgentJobInfo {
-  return { id, sessionId, status, createdAt, updatedAt };
+function jobInfo(job: AgentJob): AgentJobInfo {
+  return {
+    id: job.id,
+    sessionId: job.sessionId,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    ...(job.projectId ? { projectId: job.projectId } : {}),
+    kind: job.kind,
+    ...(job.promptPreview ? { promptPreview: job.promptPreview } : {}),
+    ...(job.sourceMessageId !== undefined ? { sourceMessageId: job.sourceMessageId } : {}),
+    ...(job.terminalMessage ? { terminalMessage: job.terminalMessage } : {}),
+  };
 }
+
+type ProjectHandle = {
+  id: string;
+  project: WriterProject;
+  store: WriterStore;
+  providers: ProviderManager;
+};
 
 type ProjectWorkspace = {
   realRoot: string;
@@ -704,15 +821,35 @@ export async function startWriterServer(options: {
   let readonlyToken = "";
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs(options.store);
-  // Process restart cannot resume in-memory runners; close any trails left "running".
+  // Open project handles stay alive while their jobs run across workspace switches.
+  const projectHandles = new Map<string, ProjectHandle>();
+  projectHandles.set(activeProject.id, {
+    id: activeProject.id,
+    project: options.project,
+    store: options.store,
+    providers: options.providers,
+  });
+  // Process restart cannot resume in-memory runners; ledger + trails are finalized in WriterStore ctor.
   try {
     options.store.finalizeOrphanedStepTrails("进程重启：未完成的任务已标记失败，可从原指令续跑。");
+    options.store.finalizeOrphanedBackgroundJobs("进程重启：未完成的任务已标记失败，可从原指令续跑。");
+    options.store.finalizeOrphanedAgentRuns("进程重启：运行状态已挂起，可从原指令续跑。");
   } catch {
     /* best-effort recovery */
   }
   const startedAt = Date.now();
   const styleExampleReviews = new Map<string, StyleExampleReviewState>();
   let publicOrigin: string | null | undefined;
+
+  const releaseIdleProjectHandles = () => {
+    for (const [id, handle] of projectHandles) {
+      if (id === activeProject.id) continue;
+      if (agentJobs.hasRunningJobsForStore(handle.store)) continue;
+      agentJobs.dropJobsForStore(handle.store);
+      try { handle.store.close(); } catch { /* ignore */ }
+      projectHandles.delete(id);
+    }
+  };
 
   const scheduleStyleExampleReview = (template: StyleTemplate) => {
     // Reviews run asynchronously. Capture the resource set so a delayed review
@@ -800,21 +937,28 @@ export async function startWriterServer(options: {
       if (inFlightWorkspaceRequests > 0) {
         await new Promise<void>((resolveIdle) => workspaceRequestWaiters.add(resolveIdle));
       }
-      // Running jobs carry their original store, and must finish before it closes.
-      await agentJobs.cancelAllAndWait();
-      const nextStore = new WriterStore(nextProject);
-      const nextProviders = new ProviderManager(nextProject);
-      const previousStore = options.store;
-      options.project = nextProject;
-      options.store = nextStore;
-      options.providers = nextProviders;
-      agentJobs.setStore(nextStore);
-      agentJobs.clear();
+      // Keep sibling projects open while their jobs still run; only swap the active handle.
+      let nextHandle = projectHandles.get(nextSummary.id);
+      if (!nextHandle) {
+        const nextStore = new WriterStore(nextProject);
+        const nextProviders = new ProviderManager(nextProject);
+        nextHandle = {
+          id: nextSummary.id,
+          project: nextProject,
+          store: nextStore,
+          providers: nextProviders,
+        };
+        projectHandles.set(nextSummary.id, nextHandle);
+      }
+      options.project = nextHandle.project;
+      options.store = nextHandle.store;
+      options.providers = nextHandle.providers;
+      agentJobs.setStore(nextHandle.store);
       styleExampleReviews.clear();
       readonlyToken = "";
       activeProject = nextSummary;
       projectEpoch += 1;
-      previousStore.close();
+      releaseIdleProjectHandles();
       return activeProject;
     } finally {
       switchingProject = false;
@@ -886,7 +1030,8 @@ export async function startWriterServer(options: {
       ts: Date.now(),
       uptimeMs: Date.now() - startedAt,
       jobs,
-      activeJobs: agentJobs.activeJobs(),
+      activeJobs: agentJobs.activeJobs(undefined, activeProject.id),
+      openProjects: [...projectHandles.keys()],
       provider: {
         gates: providerConcurrencySnapshot(),
         metrics: providerTransportMetrics(),
@@ -986,7 +1131,7 @@ export async function startWriterServer(options: {
         resources: skill.resources,
         validationErrors: skill.validationErrors,
       })),
-      activeJobs: agentJobs.activeJobs(),
+      activeJobs: agentJobs.activeJobs(undefined, activeProject.id),
       characterDirectory: "characters/",
       styleTemplates: styleTemplatesForClient(options.project, options.store, styleExampleReviews),
     });
@@ -2154,6 +2299,11 @@ export async function startWriterServer(options: {
       } finally {
         stepDebug.flush();
       }
+    }, {
+      store,
+      projectId: activeProject.id,
+      kind: jobLabel,
+      promptPreview: (body.prompt ?? "").trim().slice(0, 500),
     });
     } catch (error) {
       if (error instanceof ProviderError) {
@@ -2175,7 +2325,40 @@ export async function startWriterServer(options: {
   });
 
   app.get("/api/chat/jobs", (context) => {
-    return context.json({ activeJobs: agentJobs.activeJobs() });
+    const sessionId = context.req.query("session") || undefined;
+    const activeJobs = agentJobs.activeJobs(sessionId, activeProject.id);
+    // Durable ledger: failed/interrupted jobs from the last process for one-click resume UX.
+    let recentJobs: ReturnType<WriterStore["listBackgroundJobs"]> = [];
+    try {
+      recentJobs = options.store.listBackgroundJobs({
+        sessionId,
+        statuses: ["failed", "cancelled", "completed"],
+        limit: 30,
+      });
+    } catch { /* ignore */ }
+    return context.json({ activeJobs, recentJobs });
+  });
+
+  app.post("/api/backup", async (context) => {
+    try {
+      const body = await context.req.json().catch(() => ({})) as { outputDir?: unknown };
+      const outputDir = typeof body.outputDir === "string" && body.outputDir.trim()
+        ? body.outputDir.trim()
+        : undefined;
+      const result = await createProjectBackup(options.project.root, {
+        ...(outputDir ? { outputDir } : {}),
+        title: options.project.config().title,
+      });
+      return context.json({
+        path: result.path,
+        fileCount: result.manifest.fileCount,
+        totalBytes: result.manifest.totalBytes,
+        createdAt: result.manifest.createdAt,
+        sha256: result.manifest.sha256,
+      });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
   });
 
   app.get("/api/chat/jobs/:id/events", (context) => {
@@ -2533,7 +2716,10 @@ export async function startWriterServer(options: {
       try {
         await Promise.all([closeServer(server), ...(localServer ? [closeServer(localServer)] : [])]);
       } finally {
-        options.store.close();
+        for (const handle of projectHandles.values()) {
+          try { handle.store.close(); } catch { /* ignore */ }
+        }
+        projectHandles.clear();
       }
     },
   };
