@@ -59,14 +59,65 @@ test("universal visibility is separated from contract side-effect authorization"
     planning: "direct",
     capabilities: ["research"],
   };
+  const characterContract: AgentTaskContract = {
+    mode: "character",
+    outcome: "character",
+    evidence: "project",
+    mutation: "character",
+    planning: "adaptive",
+    capabilities: ["research", "characters"],
+  };
   assert.equal(contractAllowsTool(answerContract, "ask", "search_files"), true);
   assert.equal(contractAllowsTool(answerContract, "ask", "write_file"), false);
+  assert.equal(contractAllowsTool(answerContract, "ask", "save_character"), false);
   assert.equal(contractAllowsTool(documentContract, "ask", "edit_file"), true);
+  // Precompiled document mutation no longer freezes out character writes.
   assert.equal(contractAllowsTool(documentContract, "ask", "apply_character_changes"), true);
+  assert.equal(contractAllowsTool(documentContract, "ask", "save_character"), true);
+  assert.equal(contractAllowsTool(characterContract, "ask", "write_file"), true);
   assert.equal(contractAllowsTool(documentContract, "plan", "edit_file"), false);
+  assert.equal(contractAllowsTool(documentContract, "plan", "save_character"), false);
   assert.equal(contractAllowsTool(answerContract, "ask", "generate_image"), false);
   assert.equal(contractAllowsTool({ ...answerContract, capabilities: ["images"] }, "ask", "generate_image"), true);
   assert.equal(contractAllowsTool({ ...answerContract, capabilities: ["images"] }, "plan", "generate_image"), false);
+});
+
+test("document-hint completion accepts a character artifact when no multi-doc obligation remains", () => {
+  const progress = createAgentExecutionProgress(true);
+  assert.deepEqual(agentCompletionGaps(documentContract, progress, []), [
+    "尚未成功提交文件变更",
+  ]);
+  recordAgentToolResult(progress, "save_character", { status: "saved" });
+  assert.deepEqual(agentCompletionGaps(documentContract, progress, []), []);
+});
+
+test("character-hint completion accepts a document artifact as alternate delivery", () => {
+  const progress = createAgentExecutionProgress(true);
+  const contract: AgentTaskContract = {
+    mode: "character",
+    outcome: "character",
+    evidence: "none",
+    mutation: "character",
+    planning: "adaptive",
+    capabilities: ["characters", "documents"],
+  };
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "尚未成功保存或更新角色卡",
+  ]);
+  recordAgentToolResult(progress, "write_file", { status: "pending", proposalId: 77 });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), []);
+});
+
+test("multi-document obligations are not waived by a character save", () => {
+  const progress = createAgentExecutionProgress(true);
+  const contract: AgentTaskContract = {
+    ...documentContract,
+    documentDeliverables: ["第一章", "第二章"],
+  };
+  recordAgentToolResult(progress, "save_character", { status: "saved" });
+  assert.deepEqual(agentCompletionGaps(contract, progress, []), [
+    "文件交付尚未完成：要求 2 份，已有 0 份可验证提交",
+  ]);
 });
 
 test("image capability requires a successful generated attachment", () => {

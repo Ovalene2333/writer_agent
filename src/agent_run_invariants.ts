@@ -30,7 +30,13 @@ export function agentRunInvariantViolations(snapshot: AgentRunSnapshotV2): strin
     }
   }
   if (snapshot.status === "completed" && pendingAgentRunDeliverables(snapshot).length) {
-    violations.push("运行已完成但仍有未完成交付项");
+    // Document-hint tasks may finish via a character card when evidence shows no file target.
+    const characterSatisfiesDocument = snapshot.contract.mutation === "document"
+      && snapshot.progress.characterArtifactProduced
+      && snapshot.deliverables.length <= 1;
+    if (!characterSatisfiesDocument) {
+      violations.push("运行已完成但仍有未完成交付项");
+    }
   }
   if (snapshot.status === "suspended" && !snapshot.nextAction?.trim()) {
     violations.push("暂停运行缺少可执行的 nextAction");

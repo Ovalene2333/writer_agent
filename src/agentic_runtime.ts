@@ -20,8 +20,9 @@ export type AgentCapability = "research" | "documents" | "files" | "outline" | "
 
 /**
  * A semantic contract, not a fixed workflow. The executor may revise its plan and
- * combine any visible capabilities, while the harness owns these completion and
- * mutation boundaries.
+ * combine any visible capabilities, while the harness owns completion checks.
+ * Precompiled mutation is a write-intent hint: non-none authorizes both document and
+ * character side effects so tool facts can redirect delivery.
  */
 export interface AgentTaskContract {
   mode: string;
@@ -158,6 +159,26 @@ function hasEvidence(contract: AgentTaskContract, progress: AgentExecutionProgre
   return [...progress.successfulTools].some(name => required.has(name));
 }
 
+/**
+ * Precompiled mutation is a hint, not a frozen write path. When evidence shows the
+ * change lives only on a character card (or only in a file), a successful alternate
+ * artifact may satisfy a single-family obligation. Multi-document and mixed tasks
+ * keep their explicit multi-artifact requirements.
+ */
+export function alternateMutationArtifactSatisfies(
+  contract: AgentTaskContract,
+  progress: AgentExecutionProgress,
+): boolean {
+  if (contract.mutation === "document") {
+    const required = Math.max(1, contract.documentDeliverables?.length ?? 0);
+    return required <= 1 && progress.characterArtifactProduced;
+  }
+  if (contract.mutation === "character") {
+    return progress.documentArtifactProduced || progress.documentArtifactKeys.size > 0;
+  }
+  return false;
+}
+
 export function agentCompletionGaps(
   contract: AgentTaskContract,
   progress: AgentExecutionProgress,
@@ -171,16 +192,19 @@ export function agentCompletionGaps(
         ? "尚未定位并读取目标资料"
         : "尚未取得可承接的正文末尾或工作记忆");
   }
+  const alternateSatisfied = alternateMutationArtifactSatisfies(contract, progress);
   if (contract.mutation === "document" || contract.mutation === "mixed") {
     const required = Math.max(1, contract.documentDeliverables?.length ?? 0);
     const completed = progress.documentArtifactKeys.size;
-    if (completed < required) {
+    if (completed < required && !(contract.mutation === "document" && alternateSatisfied)) {
       gaps.push(required === 1
         ? "尚未成功提交文件变更"
         : `文件交付尚未完成：要求 ${required} 份，已有 ${completed} 份可验证提交`);
     }
   }
-  if ((contract.mutation === "character" || contract.mutation === "mixed") && !progress.characterArtifactProduced) {
+  if ((contract.mutation === "character" || contract.mutation === "mixed")
+    && !progress.characterArtifactProduced
+    && !(contract.mutation === "character" && alternateSatisfied)) {
     gaps.push("尚未成功保存或更新角色卡");
   }
   if (contract.capabilities.includes("images") && !progress.imageArtifactProduced) {
@@ -253,7 +277,12 @@ export function completionRecoveryPrompt(gaps: string[], progress: AgentExecutio
   ].join("\n");
 }
 
-/** Tools remain visible in a stable catalog; this policy only guards side effects. */
+/**
+ * Tools remain visible in a stable catalog; this policy only guards side effects.
+ * Precompiled mutation is a write-intent hint: any non-none mutation authorizes both
+ * document and character writes so the agent can follow tool facts. plan still freezes
+ * all writes; images still require an explicit capability.
+ */
 export function contractAllowsTool(
   contract: AgentTaskContract,
   permissionMode: PermissionMode,
@@ -263,14 +292,8 @@ export function contractAllowsTool(
     return false;
   }
   if (IMAGE_MUTATION_TOOLS.has(toolName)) return contract.capabilities.includes("images");
-  if (DOCUMENT_MUTATION_TOOLS.has(toolName)) {
-    return contract.mutation === "document" || contract.mutation === "mixed";
-  }
-  if (CHARACTER_MUTATION_TOOLS.has(toolName)) {
-    // Narrative documents may apply evidence-backed character evolution as part
-    // of the same requested artifact, but cannot create unrelated cards.
-    if (toolName === "apply_character_changes" && contract.mutation === "document") return true;
-    return contract.mutation === "character" || contract.mutation === "mixed";
+  if (DOCUMENT_MUTATION_TOOLS.has(toolName) || CHARACTER_MUTATION_TOOLS.has(toolName)) {
+    return contract.mutation !== "none";
   }
   return true;
 }

@@ -4549,7 +4549,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         ensureThinkingTranscriptCanContinue();
         continue;
       }
-      if (characterMutationSubmitted && task.mutation === "character") {
+      // Character saves may complete document-hint tasks when evidence led to a card-only fix.
+      if (characterMutationSubmitted && task.mutation !== "none") {
         persistCompletedCharacterTaskTodos(store, sessionId, emit);
         const gaps = agentLoop.completionGaps(store.sessionTodos(sessionId));
         if (!gaps.length) {

@@ -1,6 +1,7 @@
 import type { WriterStore } from "./store.js";
 import {
   agentCompletionGaps,
+  alternateMutationArtifactSatisfies,
   type AgentExecutionProgress,
   type AgentTaskContract,
 } from "./agentic_runtime.js";
@@ -291,9 +292,16 @@ export class AgentRunController {
   }
 
   completionGaps(task: AgentTaskContract, todos: AgentTodoItem[]): string[] {
-    const gaps = agentCompletionGaps(task, this.executionProgress(), todos);
+    const progress = this.executionProgress();
+    const gaps = agentCompletionGaps(task, progress, todos);
     const pending = pendingAgentRunDeliverables(this.snapshotValue);
-    if (pending.length && !gaps.some(gap => gap.includes("文件交付") || gap.includes("文档交付") || gap.includes("文档提案"))) {
+    // When a document-hint task is actually completed via character mutation (or the
+    // reverse), do not re-open pending document deliverables that the compiler pre-seeded.
+    if (
+      pending.length
+      && !alternateMutationArtifactSatisfies(task, progress)
+      && !gaps.some(gap => gap.includes("文件交付") || gap.includes("文档交付") || gap.includes("文档提案"))
+    ) {
       gaps.push(`文档交付尚未达到所需状态：${pending.map(item => item.label).join("、")}`);
     }
     return gaps;

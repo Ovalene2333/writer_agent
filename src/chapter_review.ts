@@ -1,14 +1,108 @@
-import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
-import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
-import { modelFetch, modelRequestOptions } from "./model_fetch.js";
-import { parseModelTokenUsage } from "./model_usage.js";
+import { nonThinkingRequestOptions, modelSupportsToolChoice } from "./model_compat.js";
+import { completeProviderCompletion, type ProviderToolCall } from "./model_api.js";
 import { documentSpans, type DocumentSpan } from "./document_spans.js";
 import {
   proposalRevisionIssueId,
   type ProposalRevisionIssue,
 } from "./proposal_retry.js";
+import { ProviderError } from "./provider_error.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
+
+/** Internal tool used to deliver a machine-validated chapter review payload. */
+export const SUBMIT_CHAPTER_REVIEW_TOOL_NAME = "submit_chapter_review";
+
+/**
+ * Output budget for the final review call. Reasoning is disabled for this
+ * extractor; 16k covers multi-issue JSON with verbatim evidence quotes.
+ */
+export const CHAPTER_REVIEW_MAX_OUTPUT_TOKENS = 16_000;
+
+const CHAPTER_REVIEW_ISSUE_KINDS = [
+  "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
+  "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship", "capability_scope",
+  "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose",
+  "field_verbalization", "voice_macro_reuse", "template_reuse",
+  "voice_homogenization", "dialogue_format", "dialogue_telegraphic",
+  "theme_stated", "resolution_too_smooth", "dialogue_frictionless",
+  "drive_flat", "stakes_absent",
+] as const;
+
+const SUBMIT_CHAPTER_REVIEW_TOOL = {
+  type: "function" as const,
+  function: {
+    name: SUBMIT_CHAPTER_REVIEW_TOOL_NAME,
+    description:
+      "提交整章终审结论。研究结束后必须调用此工具交付最终结果；不要用纯文本、Markdown 或 content JSON 代替。",
+    parameters: {
+      type: "object",
+      properties: {
+        verdict: {
+          type: "string",
+          enum: ["pass", "revise"],
+          description: "pass=可交付；revise=存在须修的 blocker",
+        },
+        chapterChange: {
+          type: "string",
+          description: "本章相对目标的变化摘要（短句）",
+        },
+        reviewNotes: {
+          type: "string",
+          description: "终审总评（可含结构/表达观察）",
+        },
+        issues: {
+          type: "array",
+          description: "最多 8 项问题；revise 时至少一项可定位 blocker",
+          items: {
+            type: "object",
+            properties: {
+              severity: { type: "string", enum: ["blocker", "warning"] },
+              kind: { type: "string", enum: [...CHAPTER_REVIEW_ISSUE_KINDS] },
+              sceneId: { type: "string" },
+              evidence: {
+                type: "array",
+                items: { type: "string" },
+                description: "逐字引用 fullChapter 最短连续原文，最多 3 条",
+              },
+              oldText: {
+                type: "string",
+                description: "可选：唯一可整段替换的句/段",
+              },
+              changeEvidence: {
+                type: "array",
+                items: { type: "string" },
+                description: "修订模式：changes 中直接造成问题的 before/after 摘录",
+              },
+              problem: { type: "string" },
+              action: { type: "string" },
+              priorIssueId: { type: "string" },
+              origin: {
+                type: "string",
+                enum: ["unresolved_prior", "introduced_by_revision", "pre_existing_unrelated"],
+              },
+            },
+            required: ["severity", "kind", "evidence", "problem", "action"],
+            additionalProperties: false,
+          },
+        },
+        priorBlockerDispositions: {
+          type: "array",
+          description: "修订模式：对每个 priorBlocker 恰好一项 resolved|still_present",
+          items: {
+            type: "object",
+            properties: {
+              priorIssueId: { type: "string" },
+              status: { type: "string", enum: ["resolved", "still_present"] },
+            },
+            required: ["priorIssueId", "status"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["verdict", "chapterChange", "reviewNotes", "issues"],
+      additionalProperties: false,
+    },
+  },
+};
 
 export type ChapterReviewScene = {
   sceneId: string;
@@ -135,8 +229,9 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 
 分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。register_leak、field_verbalization、voice_macro_reuse 若有至少两处可定位正文证据且发生在普通对白或贴身叙述（非正式汇报），应判 blocker 并要求局部改写措辞、保留事实；不得因“只是文风”而一律 warning。主题直陈、声线趋同、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。proseSignals.cardRegister 只定位候选人设词泄漏，不能单独成为证据；判 blocker 仍须引用 fullChapter 原文。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
 
-单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
-字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
+单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。
+
+交付方式：完成审读后必须调用工具 submit_chapter_review 提交结论；不要用 assistant 纯文本、Markdown 代码块或 content 内嵌 JSON 代替。工具参数：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -728,6 +823,96 @@ function normalizedSourceOffsets(source: string): {
   return { text, starts, ends };
 }
 
+/**
+ * Prefer submit_chapter_review tool arguments; fall back to content JSON for
+ * providers that ignore tool_choice (e.g. official DeepSeek rejects tool_choice).
+ */
+export function extractChapterReviewPayload(result: {
+  content: string;
+  toolCalls: readonly ProviderToolCall[];
+}): { raw: string; via: "tool" | "content" } | undefined {
+  const preferred = result.toolCalls.find(call => call.name === SUBMIT_CHAPTER_REVIEW_TOOL_NAME);
+  const anyTool = preferred
+    ?? result.toolCalls.find(call => typeof call.arguments === "string" && call.arguments.trim());
+  if (anyTool?.arguments?.trim()) {
+    return { raw: anyTool.arguments.trim(), via: "tool" };
+  }
+  const content = result.content.trim();
+  if (content) return { raw: content, via: "content" };
+  return undefined;
+}
+
+function usageFromProviderResult(usage: {
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+} | undefined): ModelTokenUsage | undefined {
+  if (!usage) return undefined;
+  return {
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    cacheHitTokens: usage.cacheHitTokens,
+    cacheMissTokens: usage.cacheMissTokens,
+    ...(usage.cacheWriteTokens !== undefined ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
+    ...(usage.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+  };
+}
+
+function chapterReviewTransportError(
+  error: unknown,
+  signal: AbortSignal | undefined,
+  durationMs: number,
+): ChapterReviewRequestError {
+  if (error instanceof ChapterReviewRequestError) return error;
+  if (error instanceof ProviderError) {
+    const failureClass = error.code === "PROVIDER_TIMEOUT"
+      ? "timeout" as const
+      : error.code === "PROVIDER_ABORTED"
+        ? "aborted" as const
+        : error.code === "PROVIDER_RATE_LIMIT"
+          ? "rate_limit" as const
+          : error.code === "PROVIDER_AUTH" || error.code === "PROVIDER_CONFIG"
+            ? "auth" as const
+            : error.code === "PROVIDER_NETWORK" || error.code === "PROVIDER_UNAVAILABLE"
+              || error.code === "PROVIDER_CIRCUIT_OPEN" || error.code === "PROVIDER_QUEUE_TIMEOUT"
+              ? "network" as const
+              : error.code === "PROVIDER_INVALID_RESPONSE"
+                ? "invalid_output" as const
+                : "http" as const;
+    const message = failureClass === "timeout"
+      ? `整章终审请求超时（${durationMs}ms）`
+      : failureClass === "aborted"
+        ? `整章终审请求被中止（${durationMs}ms）`
+        : `整章终审请求失败：${error.message.slice(0, 240)}`;
+    return new ChapterReviewRequestError(message, undefined, {
+      cause: error,
+      failureClass,
+      ...(error.httpStatus !== undefined ? { httpStatus: error.httpStatus } : {}),
+      durationMs,
+    });
+  }
+  const aborted = signal?.aborted
+    || (error instanceof Error && (error.name === "AbortError" || /abort/iu.test(error.message)));
+  const timedOut = error instanceof Error
+    && (error.name === "TimeoutError" || /timeout|timed out|超时/iu.test(error.message));
+  return new ChapterReviewRequestError(
+    timedOut
+      ? `整章终审请求超时（${durationMs}ms）`
+      : aborted
+        ? `整章终审请求被中止（${durationMs}ms）`
+        : `整章终审网络请求失败：${error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)}`,
+    undefined,
+    {
+      cause: error,
+      failureClass: timedOut ? "timeout" : aborted ? "aborted" : "network",
+      durationMs,
+    },
+  );
+}
+
 export async function reviewChapterDraft(
   model: ModelConfig,
   input: ChapterReviewInput,
@@ -738,91 +923,54 @@ export async function reviewChapterDraft(
       failureClass: "config",
     });
   }
-  const { endpoint, body } = serializeProviderChatBody(model, {
-    model: model.model,
-    messages: buildChapterReviewMessages(input),
-    stream: false,
-    ...samplingRequestOptions(model, { temperature: 0 }),
-    response_format: { type: "json_object" },
-    ...thinkingRequestOptions(model),
-  });
-  logModelRequest(endpoint, body);
   const startedAt = Date.now();
-  let response: Response;
+  let completed: Awaited<ReturnType<typeof completeProviderCompletion>>;
   try {
-    response = await modelFetch(endpoint, {
-      method: "POST",
-      signal,
-      headers: {
-        "content-type": "application/json",
-        ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-      },
-      body,
-    }, modelRequestOptions(model));
+    completed = await completeProviderCompletion({
+      model,
+      messages: buildChapterReviewMessages(input),
+      tools: [SUBMIT_CHAPTER_REVIEW_TOOL],
+      // Official DeepSeek rejects tool_choice; OpenAI-compatible / OpenCode Go accept force.
+      ...(modelSupportsToolChoice(model)
+        ? {
+            toolChoice: {
+              type: "function",
+              function: { name: SUBMIT_CHAPTER_REVIEW_TOOL_NAME },
+            },
+          }
+        : {}),
+      maxTokens: CHAPTER_REVIEW_MAX_OUTPUT_TOKENS,
+      temperature: 0,
+      // Extractor path: disable thinking so reasoning cannot consume the output budget
+      // or leave empty content (OpenCode Go / DeepSeek-style providers).
+      ...nonThinkingRequestOptions(model),
+    }, signal);
   } catch (error) {
-    const durationMs = Date.now() - startedAt;
-    const aborted = signal?.aborted
-      || (error instanceof Error && (error.name === "AbortError" || /abort/iu.test(error.message)));
-    const timedOut = error instanceof Error
-      && (error.name === "TimeoutError" || /timeout|timed out|超时/iu.test(error.message));
-    throw new ChapterReviewRequestError(
-      timedOut
-        ? `整章终审请求超时（${durationMs}ms）`
-        : aborted
-          ? `整章终审请求被中止（${durationMs}ms）`
-          : `整章终审网络请求失败：${error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)}`,
-      undefined,
-      {
-        cause: error,
-        failureClass: timedOut ? "timeout" : aborted ? "aborted" : "network",
-        durationMs,
-      },
-    );
+    throw chapterReviewTransportError(error, signal, Date.now() - startedAt);
   }
-  const responseBody = await response.text();
-  logModelResponse(endpoint, responseBody);
-  const durationMs = Date.now() - startedAt;
-  let payload: {
-    choices?: Array<{ message?: { content?: string | null } }>;
-    usage?: unknown;
-  };
-  try {
-    payload = JSON.parse(responseBody) as typeof payload;
-  } catch (error) {
-    throw new ChapterReviewRequestError(
-      `整章终审返回的响应不是 JSON（${response.status}）`,
-      undefined,
-      {
-        cause: error,
-        failureClass: "invalid_output",
-        httpStatus: response.status,
-        durationMs,
-      },
-    );
-  }
-  const usage = parseModelTokenUsage(payload.usage);
-  if (!response.ok) {
-    const failureClass = response.status === 429
-      ? "rate_limit" as const
-      : response.status === 401 || response.status === 403
-        ? "auth" as const
-        : "http" as const;
-    throw new ChapterReviewRequestError(
-      `整章终审请求失败（${response.status}）：${responseBody.slice(0, 240)}`,
-      usage,
-      { failureClass, httpStatus: response.status, durationMs },
-    );
-  }
-  const content = parseProviderCompletionPayload(payload).content;
-  if (!content?.trim()) {
-    throw new ChapterReviewRequestError("整章终审返回空内容", usage, {
-      failureClass: "empty_response",
+  const durationMs = completed.durationMs ?? Math.max(0, Date.now() - startedAt);
+  const usage = usageFromProviderResult(completed.usage);
+  if (completed.finishReason === "length") {
+    throw new ChapterReviewRequestError("整章终审输出达到长度上限", usage, {
+      failureClass: "invalid_output",
       durationMs,
     });
   }
+  const extracted = extractChapterReviewPayload(completed);
+  if (!extracted) {
+    throw new ChapterReviewRequestError(
+      "整章终审未调用 submit_chapter_review 工具且未返回可解析正文",
+      usage,
+      { failureClass: "empty_response", durationMs },
+    );
+  }
   let review: ChapterReviewResult;
   try {
-    review = parseChapterReview(content, new Set(input.scenes.map(scene => scene.sceneId)), input.content);
+    review = parseChapterReview(
+      extracted.raw,
+      new Set(input.scenes.map(scene => scene.sceneId)),
+      input.content,
+    );
     if (input.revisionReview) {
       review = constrainChapterRevisionReview(
         review,

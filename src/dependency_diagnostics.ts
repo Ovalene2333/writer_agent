@@ -52,12 +52,12 @@ export const ZERO_MODEL_USAGE: ModelTokenUsage = {
   cacheMissTokens: 0,
 };
 
-const PARSE_FAILURE_RE = /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker|不是 JSON|invalid json|json_object/iu;
+const PARSE_FAILURE_RE = /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker|不是 JSON|invalid json|json_object|长度上限|submit_chapter_review/iu;
 const RATE_LIMIT_RE = /rate limit|too many requests|429|配额|额度|usage limit|quota/iu;
 const AUTH_RE = /api key|unauthorized|401|403|forbidden|未配置.*api key|authentication/iu;
 const HTTP_RE = /请求失败（(\d{3})）|http\s*(\d{3})|status\s*(\d{3})/iu;
 const NETWORK_RE = /fetch failed|econnreset|econnrefused|enotfound|socket|network|tls|cert|dns|und_err/iu;
-const EMPTY_RE = /空内容|empty (content|response)|没有返回正文|no content/iu;
+const EMPTY_RE = /空内容|empty (content|response)|没有返回正文|no content|未调用 submit_chapter_review/iu;
 const CONFIG_RE = /未配置|无独立回退|仅配置 1 个/iu;
 
 export function classifyDependencyError(error: unknown): DependencyFailureClass {

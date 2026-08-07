@@ -4,7 +4,9 @@ import {
   buildChapterReviewMessages,
   buildChapterReviewRevisionContext,
   constrainChapterRevisionReview,
+  extractChapterReviewPayload,
   parseChapterReview,
+  SUBMIT_CHAPTER_REVIEW_TOOL_NAME,
   type ChapterReviewResult,
 } from "./chapter_review.js";
 import { proposalRevisionIssueId, type ProposalRevisionIssue } from "./proposal_retry.js";
@@ -497,4 +499,36 @@ test("修订复审保持 system 前缀不变并只在 user JSON 增加动态包"
   assert.equal("revisionBaselineContent" in payload, false);
   assert.match(retry[2].content, /changeEvidence/);
   assert.match(retry[2].content, /priorBlockerDispositions/);
+});
+
+test("终审提示要求通过 submit_chapter_review 工具交付", () => {
+  const messages = buildChapterReviewMessages({
+    chapterGoal: "测试",
+    content: "正文。",
+    scenes: [{ sceneId: "document", title: "文档", plannedTurn: "", plannedOutcome: "", actualState: null }],
+  });
+  assert.match(messages[0].content, new RegExp(SUBMIT_CHAPTER_REVIEW_TOOL_NAME));
+  assert.match(messages[0].content, /必须调用工具/);
+  assert.doesNotMatch(messages[0].content, /只输出一个 JSON 对象/);
+});
+
+test("extractChapterReviewPayload 优先工具参数并回退 content", () => {
+  const fromTool = extractChapterReviewPayload({
+    content: '{"verdict":"pass"}',
+    toolCalls: [{
+      id: "1",
+      name: SUBMIT_CHAPTER_REVIEW_TOOL_NAME,
+      arguments: review([], "pass"),
+    }],
+  });
+  assert.equal(fromTool?.via, "tool");
+  assert.ok(fromTool?.raw.includes("chapterChange"));
+
+  const fromContent = extractChapterReviewPayload({
+    content: review([], "pass"),
+    toolCalls: [],
+  });
+  assert.equal(fromContent?.via, "content");
+
+  assert.equal(extractChapterReviewPayload({ content: "  ", toolCalls: [] }), undefined);
 });
