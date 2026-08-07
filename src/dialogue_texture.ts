@@ -179,7 +179,7 @@ const DIALOGUE_ACTS: ReadonlyArray<{ act: DialogueAct; pattern: RegExp }> = [
 const PRONOUN_PREFIX = /^[你我他她它咱您]们?/u;
 
 /** Quoted spans. Nested/unclosed quotes are skipped rather than guessed at. */
-const QUOTE_SPAN = /「([^」\n]{1,400})」|『([^』\n]{1,400})』|“([^”\n]{1,400})”/gu;
+const QUOTE_SPAN = /「([^」\n]{1,400})」|『([^』\n]{1,400})』|“([^”\n]{1,400})”|"([^"\n]{1,400})"/gu;
 
 /**
  * Speech tags, used for attribution only, and only when no cast roster was
@@ -264,20 +264,6 @@ export function formatDialogueSummary(stats: DialogueTextureStats): string {
 }
 
 /**
- * Positive-direction guidance for the NEXT scene. Same contract as
- * sceneVividnessFeedback: measured from what the chapter has accumulated,
- * advisory only, silent when the chapter has too little dialogue to measure.
- */
-export function sceneDialogueFeedback(chapterSoFar: string): string[] {
-  const { stats, issues } = analyzeDialogueTexture(chapterSoFar);
-  if (!issues.length) return [];
-  return [
-    `本章至今的对白计量（参考项，不构成拦截）：${formatDialogueSummary(stats)}`,
-    ...issues.map(issue => issue.message),
-  ];
-}
-
-/**
  * Share of paragraphs opening with a dialogue line that says something, rather
  * than merely acknowledging. prose_vividness scores against this instead of raw
  * dialogue-paragraph count so a wall of "知道。" cannot buy the dialogue term.
@@ -292,7 +278,7 @@ export function substantiveDialogueParagraphRatio(text: string): number {
   const items = text.split(/\n\s*\n/).map(item => item.trim()).filter(Boolean);
   if (!items.length) return 0;
   const substantive = items.filter(item => {
-    const match = /^[「『“]([^」』”\n]*)/u.exec(item);
+    const match = /^[「『“"]([^」』”"\n]*)/u.exec(item);
     if (!match) return false;
     return match[1].replace(/[\s，,。！？!?…、；;：:]/gu, "").length > ACKNOWLEDGEMENT_CHARS;
   }).length;
@@ -310,7 +296,7 @@ function extractDialogueLines(text: string, roster: readonly string[]): Dialogue
     QUOTE_SPAN.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = QUOTE_SPAN.exec(trimmed)) !== null) {
-      const raw = match[1] ?? match[2] ?? match[3] ?? "";
+      const raw = match[1] ?? match[2] ?? match[3] ?? match[4] ?? "";
       const content = raw.replace(/\s/g, "");
       if (!content) continue;
       const before = trimmed.slice(Math.max(0, match.index - 14), match.index);
@@ -493,7 +479,7 @@ function parallelHead(content: string): string | undefined {
 
 function classifyAct(content: string): DialogueAct {
   // Anchored patterns must see the bare line: "我知道。" has to reach ^我知道$.
-  const bare = content.replace(/^[「『“]+|[」』”]+$/gu, "").replace(/[。！!…、，,]+$/u, "");
+  const bare = content.replace(/^[「『“"]+|[」』”"]+$/gu, "").replace(/[。！!…、，,]+$/u, "");
   for (const entry of DIALOGUE_ACTS) {
     if (entry.pattern.test(bare)) return entry.act;
   }

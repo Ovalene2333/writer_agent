@@ -3,7 +3,12 @@
  * Call sites keep a chat-style messages/tools shape; this module maps to the selected protocol.
  */
 import type { ModelConfig } from "./types.js";
-import { samplingRequestOptions } from "./model_compat.js";
+import {
+  applyProviderReasoningToChatBody,
+  providerReasoningWire,
+  reasoningIntentFromThinkingField,
+  samplingRequestOptions,
+} from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { parseModelTokenUsage } from "./model_usage.js";
@@ -25,6 +30,7 @@ export type ProviderUsage = {
   cacheHitTokens: number;
   cacheMissTokens: number;
   cacheWriteTokens?: number;
+  reasoningTokens?: number;
 };
 
 export type ProviderCompletionResult = {
@@ -33,6 +39,8 @@ export type ProviderCompletionResult = {
   toolCalls: ProviderToolCall[];
   finishReason?: string;
   usage?: ProviderUsage;
+  /** Wall-clock time for the provider request (ms). */
+  durationMs?: number;
 };
 
 export type ProviderCompletionRequest = {
@@ -186,6 +194,14 @@ export function buildProviderCompletionBody(request: ProviderCompletionRequest):
     frequencyPenalty: request.frequencyPenalty,
     presencePenalty: request.presencePenalty,
   });
+  // Formal boundary: map logical thinking intent + model effort by ProviderId only.
+  // deepseek → thinking; openai-compatible / openai-responses → reasoning_effort.
+  const reasoning = providerReasoningWire(model, reasoningIntentFromThinkingField(request.thinking));
+  const {
+    reasoning_effort: _samplingEffort,
+    verbosity: _samplingVerbosity,
+    ...samplingRest
+  } = sampling;
 
   if (!usesResponsesApi(model)) {
     return {
@@ -196,16 +212,18 @@ export function buildProviderCompletionBody(request: ProviderCompletionRequest):
       ...(request.stream ? { stream: true, stream_options: { include_usage: true } } : {}),
       ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
       ...(request.responseFormat ? { response_format: request.responseFormat } : {}),
-      ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.userId ? { user_id: request.userId } : {}),
-      ...sampling,
+      ...samplingRest,
+      ...(reasoning.thinking ? { thinking: reasoning.thinking } : {}),
+      ...(reasoning.reasoning_effort !== undefined ? { reasoning_effort: reasoning.reasoning_effort } : {}),
+      ...(reasoning.verbosity !== undefined ? { verbosity: reasoning.verbosity } : {}),
       ...(request.extra ?? {}),
     };
   }
 
   const { instructions, input } = messagesToResponsesPayload(request.messages);
   const text: Record<string, unknown> = {};
-  if (sampling.verbosity) text.verbosity = sampling.verbosity;
+  if (reasoning.verbosity) text.verbosity = reasoning.verbosity;
   if (request.responseFormat?.type === "json_object") {
     text.format = { type: "json_object" };
   } else if (request.responseFormat?.type === "text") {
@@ -221,10 +239,11 @@ export function buildProviderCompletionBody(request: ProviderCompletionRequest):
     ...(request.tools?.length ? { tools: toolsToResponsesFormat(request.tools) } : {}),
     ...(request.toolChoice !== undefined ? { tool_choice: request.toolChoice } : {}),
     ...(request.userId ? { user: request.userId, prompt_cache_key: request.userId } : {}),
-    ...(sampling.temperature === undefined ? {} : { temperature: sampling.temperature }),
-    ...(sampling.top_p === undefined ? {} : { top_p: sampling.top_p }),
+    ...(samplingRest.temperature === undefined ? {} : { temperature: samplingRest.temperature }),
+    ...(samplingRest.top_p === undefined ? {} : { top_p: samplingRest.top_p }),
     // Responses does not use frequency/presence penalties in the same way; omit them.
-    ...(sampling.reasoning_effort ? { reasoning: { effort: sampling.reasoning_effort } } : {}),
+    // Responses also has no DeepSeek-style thinking field; effort covers the budget.
+    ...(reasoning.reasoning_effort ? { reasoning: { effort: reasoning.reasoning_effort } } : {}),
     ...(Object.keys(text).length ? { text } : {}),
     ...(request.extra ?? {}),
   };
@@ -240,6 +259,7 @@ export function usageFromProviderPayload(raw: unknown): ProviderUsage | undefine
     cacheHitTokens: parsed.cacheHitTokens,
     cacheMissTokens: parsed.cacheMissTokens,
     ...(parsed.cacheWriteTokens !== undefined ? { cacheWriteTokens: parsed.cacheWriteTokens } : {}),
+    ...(parsed.reasoningTokens !== undefined ? { reasoningTokens: parsed.reasoningTokens } : {}),
   };
 }
 
@@ -475,6 +495,7 @@ export async function streamProviderCompletion(
     signal?: AbortSignal;
   } = {},
 ): Promise<ProviderCompletionResult> {
+  const startedAt = Date.now();
   const endpoint = modelCompletionEndpoint(request.model);
   const body = buildProviderCompletionBody({ ...request, stream: true });
   const requestBody = JSON.stringify(body);
@@ -526,10 +547,12 @@ export async function streamProviderCompletion(
     .sort(([a], [b]) => a - b)
     .map(([, call]) => call)
     .filter(call => call.name || call.arguments || call.id);
+  const durationMs = Math.max(0, Date.now() - startedAt);
   const result: ProviderCompletionResult = {
     content: state.content,
     reasoningContent: state.reasoningContent,
     toolCalls,
+    durationMs,
     ...(state.finishReason ? { finishReason: state.finishReason } : {}),
     ...(state.usage ? { usage: state.usage } : {}),
   };
@@ -546,32 +569,34 @@ export function serializeProviderChatBody(
   chatBody: Record<string, unknown>,
 ): { endpoint: string; body: string } {
   const endpoint = modelCompletionEndpoint(model);
+  // Normalize reasoning wire fields at the formal boundary (chat and responses).
+  const normalized = applyProviderReasoningToChatBody(model, chatBody);
   if (!usesResponsesApi(model)) {
-    return { endpoint, body: JSON.stringify(chatBody) };
+    return { endpoint, body: JSON.stringify(normalized) };
   }
-  const responseFormat = chatBody.response_format && typeof chatBody.response_format === "object"
-    ? chatBody.response_format as { type: string }
+  const responseFormat = normalized.response_format && typeof normalized.response_format === "object"
+    ? normalized.response_format as { type: string }
     : undefined;
-  const thinking = chatBody.thinking && typeof chatBody.thinking === "object"
-    ? chatBody.thinking as { type: string }
+  const thinking = normalized.thinking && typeof normalized.thinking === "object"
+    ? normalized.thinking as { type: string }
     : undefined;
   const converted = buildProviderCompletionBody({
     model,
-    messages: Array.isArray(chatBody.messages) ? chatBody.messages as ProviderWireMessage[] : [],
-    tools: Array.isArray(chatBody.tools) ? chatBody.tools : undefined,
-    toolChoice: chatBody.tool_choice,
-    stream: chatBody.stream === true,
-    maxTokens: typeof chatBody.max_tokens === "number" ? chatBody.max_tokens : undefined,
-    temperature: typeof chatBody.temperature === "number" ? chatBody.temperature : undefined,
-    topP: typeof chatBody.top_p === "number" ? chatBody.top_p : undefined,
-    frequencyPenalty: typeof chatBody.frequency_penalty === "number" ? chatBody.frequency_penalty : undefined,
-    presencePenalty: typeof chatBody.presence_penalty === "number" ? chatBody.presence_penalty : undefined,
+    messages: Array.isArray(normalized.messages) ? normalized.messages as ProviderWireMessage[] : [],
+    tools: Array.isArray(normalized.tools) ? normalized.tools : undefined,
+    toolChoice: normalized.tool_choice,
+    stream: normalized.stream === true,
+    maxTokens: typeof normalized.max_tokens === "number" ? normalized.max_tokens : undefined,
+    temperature: typeof normalized.temperature === "number" ? normalized.temperature : undefined,
+    topP: typeof normalized.top_p === "number" ? normalized.top_p : undefined,
+    frequencyPenalty: typeof normalized.frequency_penalty === "number" ? normalized.frequency_penalty : undefined,
+    presencePenalty: typeof normalized.presence_penalty === "number" ? normalized.presence_penalty : undefined,
     responseFormat,
     thinking,
-    userId: typeof chatBody.user_id === "string"
-      ? chatBody.user_id
-      : typeof chatBody.user === "string"
-        ? chatBody.user
+    userId: typeof normalized.user_id === "string"
+      ? normalized.user_id
+      : typeof normalized.user === "string"
+        ? normalized.user
         : undefined,
   });
   return { endpoint, body: JSON.stringify(converted) };
@@ -590,6 +615,7 @@ export async function completeProviderCompletion(
   request: ProviderCompletionRequest,
   signal?: AbortSignal,
 ): Promise<ProviderCompletionResult> {
+  const startedAt = Date.now();
   const endpoint = modelCompletionEndpoint(request.model);
   const body = buildProviderCompletionBody({ ...request, stream: false });
   const requestBody = JSON.stringify(body);
@@ -614,5 +640,9 @@ export async function completeProviderCompletion(
   } catch {
     throw new Error("模型响应不是有效 JSON");
   }
-  return parseProviderCompletionPayload(payload);
+  const parsed = parseProviderCompletionPayload(payload);
+  return {
+    ...parsed,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  };
 }

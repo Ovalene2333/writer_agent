@@ -10,13 +10,12 @@
  * - analyzeChapterProseMetrics → inspect_chapter_draft (errors block, warnings ship
  *   as an actionable checklist).
  * - findAdjacentDuplicateSentences → write_chapter_scene hard gate (AA-repeat bug).
- * - sceneAntiFormulaFeedback / priorChapterNegativeList → zero-cost anti-self-imitation
- *   hints injected into scene-pipeline tool results (mirrors roleplay anti-formula slot).
+ * - Metrics remain diagnostic inputs for final review; they are deliberately not
+ *   fed back into prose-generation requests or used to select prose candidates.
  */
 
 import { findProseConstructionMatches } from "./prose_construction_rules.js";
 import { analyzeProseStyle } from "./prose_quality.js";
-import { proseVividnessScore } from "./prose_vividness.js";
 
 export type ChapterMetricSeverity = "error" | "warning";
 
@@ -80,10 +79,6 @@ const DASH_UNIT = /(?:[—–―﹘]{1,2}|-{2})/gu;
 const SAMENESS_FRAME = /和[^，。！？；、\n]{1,12}一样/gu;
 const NUMERIC_READOUT =
   /(?:\d+(?:\.\d+)?|[零一二三四五六七八九十百千两]+(?:点[零一二三四五六七八九]+)?)\s*(?:秒|分钟|小时|毫米|厘米|米|公里|次|赫兹|分贝|度|克|公斤|吨|伏|瓦|％|%)/gu;
-/** Common micro-action / filler tokens that read templated when hammered (superset of roleplay GESTURE_RE). */
-const MICRO_ACTION_LEXICON =
-  /目光|眼神|视线|呼吸|嘴角|指尖|手指|攥紧|收紧|握拳|沉默|顿了|停顿|停了一下|抬眼|低头|偏头|皱眉|眯眼|肩膀|微微|轻轻|很轻|很细|然后/gu;
-
 export function analyzeChapterProseMetrics(
   text: string,
   options?: { priorText?: string },
@@ -248,11 +243,11 @@ function formatRhythmFlatMessage(rhythm: {
 }
 
 function collectShortSentenceExamples(text: string, limit: number): string[] {
-  const narrative = text.replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”/gu, " ");
+  const narrative = text.replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”|"[^"\n]*"/gu, " ");
   const out: string[] = [];
   const seen = new Set<string>();
   for (const sentence of splitSentences(narrative)) {
-    const trimmed = sentence.trim().replace(/^[」』”’]+/u, "");
+    const trimmed = sentence.trim().replace(/^[」』”’"]+/u, "");
     const length = normalizeSentence(trimmed).length;
     if (length <= 0 || length > 6) continue;
     const key = normalizeSentence(trimmed);
@@ -323,7 +318,7 @@ export function findEchoDialogueParagraphs(text: string): string[] {
   const found: string[] = [];
   for (let index = 0; index + 1 < items.length; index += 1) {
     const current = items[index].trim();
-    if (!/^[「『“]/u.test(current)) continue;
+    if (!/^[「『“"]/u.test(current)) continue;
     if (normalizeSentence(current) === normalizeSentence(items[index + 1])) found.push(current);
   }
   return found;
@@ -343,181 +338,9 @@ export function findRecycledSentences(text: string, priorText: string): string[]
     const normalized = normalizeSentence(sentence);
     if (normalized.length < 8 || seen.has(normalized) || !prior.has(normalized)) continue;
     seen.add(normalized);
-    found.push(sentence.trim().replace(/^[」』”’]+/u, ""));
+    found.push(sentence.trim().replace(/^[」』”’"]+/u, ""));
   }
   return found;
-}
-
-/**
- * Anti-self-imitation feedback for the NEXT scene, computed from what the chapter
- * has accumulated so far. Pure string statistics — no model call, no state.
- */
-export function sceneAntiFormulaFeedback(options: {
-  chapterSoFar: string;
-  priorChapterText?: string;
-}): string[] {
-  const body = stripStructuralLines(options.chapterSoFar);
-  const characters = Math.max(1, body.replace(/\s/g, "").length);
-  const per10k = (count: number) => Math.round((count / characters) * 10_000);
-  const lines: string[] = [];
-
-  const dashPer10k = per10k(countMatches(body, DASH_UNIT));
-  const contrastCount = collectContrastFrames(body).length;
-  const samenessCount = (body.match(SAMENESS_FRAME) ?? []).length;
-  const numericPer10k = per10k(countMatches(body, NUMERIC_READOUT));
-  const contrastBudget = Math.max(1, Math.round((CONTRAST_PER_10K_LIMIT * characters) / 10_000));
-  lines.push(
-    `本章至今：破折号 ${dashPer10k}/万字（上限 ${DASH_PER_10K_LIMIT}）；否定—改判句式家族 ${contrastCount} 次（全章额度约 ${contrastBudget}，含“没有A只有B”等衍生式）；「和X一样」${samenessCount} 次；数值读数 ${numericPer10k}/万字（上限 ${NUMERIC_PER_10K_LIMIT}）。已超或将超的项在下一场必须压降。`,
-  );
-
-  const openings = repeatedParagraphOpenings(body, 3);
-  if (openings.length) {
-    lines.push(`下一场禁用段首起笔（本章已用 ≥3 次）：${openings.map(item => `「${item.prefix}」×${item.count}`).join("、")}。`);
-  }
-
-  const motifs = repeatedShortSentences(body, 3);
-  if (motifs.length) {
-    lines.push(`已用尽的母题句（下一场勿再逐字复用，需召回时变形）：${motifs.slice(0, 5).map(item => `「${item.sentence}」×${item.count}`).join("、")}。`);
-  }
-
-  const rhythm = narrativeRhythm(body);
-  if (rhythm.sentenceCount >= 40 && (rhythm.shortSentenceRatio >= 0.35 || rhythm.fragmentRuns >= 4)) {
-    lines.push(
-      `下一场避免电报体：本章叙述碎句已偏高（均长 ${rhythm.meanSentenceLength} 字、≤6 字 ${Math.round(rhythm.shortSentenceRatio * 100)}%、连发串 ${rhythm.fragmentRuns}）。静场给绵延句，恢复双音节用词，勿单字成句。`,
-    );
-  }
-
-  const lexicon = overusedLexiconWords(body, 4);
-  if (lexicon.length) {
-    lines.push(`高频微动作/填充词，下一场尽量避开：${lexicon.slice(0, 8).map(item => `${item.word}×${item.count}`).join("、")}。`);
-  }
-
-  if (options.priorChapterText) {
-    const recycled = findRecycledSentences(body, options.priorChapterText);
-    if (recycled.length) {
-      lines.push(`已与既有正文逐字重合 ${recycled.length} 句（如「${clip(recycled[0], 24)}」）；超过 ${RECYCLE_ERROR_LIMIT} 句将在终审硬拦，下一场禁止再回收旧章语料。`);
-    }
-  }
-
-  return lines;
-}
-
-export type SceneScoreBreakdown = {
-  /** Accumulated mannerism / reuse / rhythm penalty (0 = nothing wrong found). */
-  penalty: number;
-  /** 0–100 additive vividness (see prose_vividness.ts). */
-  vividness: number;
-  /** 100 − penalty + vividness adjustment. */
-  total: number;
-};
-
-/** Vividness maps into roughly [−15, +10] so it can separate two clean candidates
- * without ever outweighing a real defect (an adjacent duplicate alone costs 40). */
-export function vividnessAdjustment(vividness: number): number {
-  return Math.round(Math.max(-15, Math.min(10, (vividness - 60) * 0.25)) * 10) / 10;
-}
-
-/**
- * Deterministic prose score for best-of-N scene candidate reranking (higher is
- * better). Purely rule-based so ranking is reproducible and free.
- *
- * Two terms: a penalty ledger for the failure modes the chapter metrics measure,
- * and an additive vividness term. The penalty half alone tops out at exactly 100
- * for any clean prose — including flat, correct, unreadable prose — which is why
- * the vividness term exists: without it every clean candidate ties and best-of-N
- * silently degenerates into "keep the original".
- */
-export function sceneProseScoreBreakdown(text: string): SceneScoreBreakdown {
-  const body = stripStructuralLines(text);
-  const characters = Math.max(1, body.replace(/\s/g, "").length);
-  const per10k = (count: number) => (count / characters) * 10_000;
-  let penalty = 0;
-  penalty += Math.max(0, per10k(countMatches(body, DASH_UNIT)) - DASH_PER_10K_LIMIT) * 0.2;
-  penalty += Math.max(0, per10k(collectContrastFrames(body).length) - CONTRAST_PER_10K_LIMIT) * 2;
-  penalty += Math.max(0, per10k((body.match(SAMENESS_FRAME) ?? []).length) - SAMENESS_PER_10K_LIMIT) * 1.5;
-  penalty += Math.max(0, per10k(countMatches(body, NUMERIC_READOUT)) - NUMERIC_PER_10K_LIMIT) * 0.3;
-  const rhythm = narrativeRhythm(body);
-  penalty += per10k(rhythm.fragmentRuns) * 1.2;
-  // Staccato overload still costs; the former long-sentence *bonus* moved into the
-  // vividness term (rhythm spread) so this ledger stays monotonically non-negative.
-  if (rhythm.sentenceCount >= 20) {
-    penalty += Math.max(0, rhythm.shortSentenceRatio - 0.45) * 100;
-  }
-  penalty += findAdjacentDuplicateSentences(body).length * 40;
-  penalty += repeatedShortSentences(body, 3).length * 5;
-  penalty += analyzeProseStyle(body).filter(issue => issue.severity === "error").length * 25;
-  penalty = Math.round(penalty * 10) / 10;
-  const vividness = proseVividnessScore(text);
-  return {
-    penalty,
-    vividness,
-    total: Math.round((100 - penalty + vividnessAdjustment(vividness)) * 10) / 10,
-  };
-}
-
-export function sceneProseScore(text: string): number {
-  return sceneProseScoreBreakdown(text).total;
-}
-
-/** Negative list from the previous chapter, injected once at begin_chapter_draft. */
-export function priorChapterNegativeList(priorText: string): string[] {
-  const body = stripStructuralLines(priorText);
-  const lines: string[] = [];
-  const signature = repeatedShortSentences(body, 2).slice(0, 6);
-  if (signature.length) {
-    lines.push(`上一章高频签名句（本章除刻意母题召回外避免逐字复用，召回需变形且最多 1 次）：${signature.map(item => `「${item.sentence}」×${item.count}`).join("、")}。`);
-  }
-  const openings = repeatedParagraphOpenings(body, 4).slice(0, 5);
-  if (openings.length) {
-    lines.push(`上一章高频段首：${openings.map(item => `「${item.prefix}」`).join("、")}；本章换用不同的开场形态。`);
-  }
-  const lexicon = overusedLexiconWords(body, 6).slice(0, 6);
-  if (lexicon.length) {
-    lines.push(`上一章高频微动作词：${lexicon.map(item => `${item.word}×${item.count}`).join("、")}；本章降低其密度或换具体动作。`);
-  }
-  return lines;
-}
-
-function repeatedParagraphOpenings(text: string, minCount: number): Array<{ prefix: string; count: number }> {
-  const counts = new Map<string, number>();
-  for (const paragraph of paragraphs(text)) {
-    const trimmed = paragraph.trim();
-    if (!trimmed || /^[「『“]/u.test(trimmed)) continue;
-    const prefix = [...trimmed.replace(/\s/g, "")].slice(0, 2).join("");
-    if (prefix.length < 2) continue;
-    counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
-  }
-  return [...counts.entries()]
-    .filter(([, count]) => count >= minCount)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 4)
-    .map(([prefix, count]) => ({ prefix, count }));
-}
-
-function repeatedShortSentences(text: string, minCount: number): Array<{ sentence: string; count: number }> {
-  const counts = new Map<string, { sentence: string; count: number }>();
-  for (const sentence of splitSentences(text)) {
-    const normalized = normalizeSentence(sentence);
-    if (normalized.length < 4 || normalized.length > 20) continue;
-    const entry = counts.get(normalized);
-    if (entry) entry.count += 1;
-    else counts.set(normalized, { sentence: sentence.trim(), count: 1 });
-  }
-  return [...counts.values()]
-    .filter(entry => entry.count >= minCount)
-    .sort((a, b) => b.count - a.count);
-}
-
-function overusedLexiconWords(text: string, minCount: number): Array<{ word: string; count: number }> {
-  const counts = new Map<string, number>();
-  MICRO_ACTION_LEXICON.lastIndex = 0;
-  for (const match of text.matchAll(MICRO_ACTION_LEXICON)) {
-    counts.set(match[0], (counts.get(match[0]) ?? 0) + 1);
-  }
-  return [...counts.entries()]
-    .filter(([, count]) => count >= minCount)
-    .sort((a, b) => b[1] - a[1])
-    .map(([word, count]) => ({ word, count }));
 }
 
 function narrativeRhythm(text: string): {
@@ -528,7 +351,7 @@ function narrativeRhythm(text: string): {
   microSentenceRatio: number;
   fragmentRuns: number;
 } {
-  const narrative = text.replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”/gu, "");
+  const narrative = text.replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”|"[^"\n]*"/gu, "");
   const lengths = splitSentences(narrative).map(sentence => normalizeSentence(sentence).length).filter(length => length > 0);
   const total = lengths.length;
   if (!total) {
@@ -571,7 +394,7 @@ function openingMonotony(text: string): { prefix: string; ratio: number } | unde
   let narrativeParagraphs = 0;
   for (const paragraph of paragraphs(text)) {
     const trimmed = paragraph.trim();
-    if (!trimmed || /^[「『“]/u.test(trimmed)) continue;
+    if (!trimmed || /^[「『“"]/u.test(trimmed)) continue;
     narrativeParagraphs += 1;
     const prefix = [...trimmed.replace(/\s/g, "")].slice(0, 2).join("");
     if (prefix.length < 2) continue;

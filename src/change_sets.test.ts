@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { emptyCharacter } from "./characters.js";
 import { OutlineStore } from "./outline.js";
-import { orderedChapterPaths, WriterProject } from "./project.js";
+import { isArchivePath, normalizeResourcePath, orderedChapterPaths, WriterProject } from "./project.js";
 import { beginChapterSceneDraft, writeChapterScene } from "./scene_pipeline.js";
 import { WriterStore } from "./store.js";
 import {
@@ -61,6 +61,43 @@ test("text workspace stays inside resource and reads non-Markdown files", () => 
     assert.throws(() => handleReadFile(args({ path: "notes/research.txt", sourceHash: "stale", block: 1 })), /快照已变化/);
     assert.throws(() => project.readTextFile("../outside.txt"), /resource|相对路径|范围外/);
     assert.throws(() => project.readTextFile("assets/fake.txt"), /纯文本|UTF-8/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("archive paths stay agent-hidden even with . / .. / case aliases", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-archive-block-"));
+  try {
+    const project = WriterProject.init(root, "archive block");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("files");
+    project.writeRaw("archive/secret.md", "# SECRET_ARCHIVE\nleaked?\n");
+    const args = (input: Record<string, unknown>): ToolHandlerArgs => ({
+      input, project, store, sessionId, emit: () => undefined, context: { permissionMode: "ask" },
+    });
+
+    assert.equal(normalizeResourcePath("./archive/secret.md"), "archive/secret.md");
+    assert.equal(normalizeResourcePath("chapters/../archive/secret.md"), "archive/secret.md");
+    assert.equal(normalizeResourcePath("resource/archive/secret.md"), "archive/secret.md");
+    assert.equal(isArchivePath("Archive/secret.md"), true);
+    assert.equal(isArchivePath("chapters/../archive/secret.md"), true);
+    assert.equal(project.isDocumentHidden("./archive/secret.md"), true);
+
+    const listed = JSON.parse(handleListFiles(args({ limit: 100 }))) as { files: string[] };
+    assert.equal(listed.files.some(path => path.toLowerCase().includes("archive")), false);
+
+    for (const path of [
+      "archive/secret.md",
+      "./archive/secret.md",
+      "resource/archive/secret.md",
+      "chapters/../archive/secret.md",
+      "archive/./secret.md",
+    ]) {
+      assert.throws(() => handleReadFile(args({ path })), /已对 Agent 屏蔽/);
+    }
+
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

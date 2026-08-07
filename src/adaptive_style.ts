@@ -13,8 +13,6 @@ import {
 import { analyzeAiTells } from "./ai_tells.js";
 import {
   analyzeChapterProseMetrics,
-  priorChapterNegativeList,
-  sceneAntiFormulaFeedback,
 } from "./prose_metrics.js";
 import {
   analyzeProseVividness,
@@ -33,10 +31,6 @@ export type AdaptiveStyleIssue = {
   examples: string[];
   /** Raw warning codes replaced by this semantic diagnosis in the final report. */
   relatedCodes: string[];
-  /** Only compound, high-signal issues may trigger the grounded second pass. */
-  reviseCurrentDraft: boolean;
-  /** Internal candidate comparison only; never exposed as a writing quota. */
-  strength: number;
 };
 
 export type AdaptiveStyleAnalysis = {
@@ -45,7 +39,6 @@ export type AdaptiveStyleAnalysis = {
   aiTells: ReturnType<typeof analyzeAiTells>;
   dialogue: ReturnType<typeof analyzeDialogueTexture>;
   issues: AdaptiveStyleIssue[];
-  revisionScore: number;
 };
 
 export type AdaptiveQualityWarning = {
@@ -84,12 +77,6 @@ export function analyzeAdaptiveStyle(
         .flatMap(issue => issue.examples)
         .slice(0, 4),
       relatedCodes: ["dialogue_clipped", "dialogue_monotone", "dialogue_homogeneous", "dialogue_bookish"],
-      reviseCurrentDraft: true,
-      strength: roundStrength(
-        1
-        + Math.max(0, dialogue.stats.shortRatio - SHORT_RATIO_LIMIT)
-        + Math.max(0, DIALOGUE_SPREAD_TARGET - dialogue.stats.lengthSpread) / DIALOGUE_SPREAD_TARGET,
-      ),
     });
   }
 
@@ -109,12 +96,6 @@ export function analyzeAdaptiveStyle(
         .flatMap(issue => issue.examples)
         .slice(0, 4),
       relatedCodes: ["rhythm_flat", "rhythm_uniform", "sentence_uniform"],
-      reviseCurrentDraft: true,
-      strength: roundStrength(
-        1
-        + Math.max(0, RHYTHM_SPREAD_TARGET - vividness.stats.sentenceLengthSpread) / RHYTHM_SPREAD_TARGET
-        + Math.max(0, 0.08 - vividness.stats.longSentenceRatio),
-      ),
     });
   }
 
@@ -126,8 +107,6 @@ export function analyzeAdaptiveStyle(
       message: `${openingIssue.message}不要轮流替换同义主语来做表面变化；让段落从此刻真正进入人物注意力的环境变化、对方动作、对白压力或未完成动作起笔。`,
       examples: openingIssue.examples,
       relatedCodes: ["opening_monotony"],
-      reviseCurrentDraft: true,
-      strength: 1,
     });
   }
 
@@ -137,61 +116,7 @@ export function analyzeAdaptiveStyle(
     aiTells,
     dialogue,
     issues,
-    revisionScore: roundStrength(issues.reduce((sum, issue) => sum + issue.strength, 0)),
   };
-}
-
-/**
- * Dynamic feedback for the next scene. It is recomputed from stored prose, so
- * the main Agent and the delegated Writer receive the same diagnosis.
- */
-export function chapterAdaptiveStyleFeedback(options: {
-  chapterSoFar: string;
-  priorChapterText?: string;
-  priorNotes?: string[];
-}): string[] {
-  const priorNotes = options.priorNotes?.length
-    ? options.priorNotes
-    : options.priorChapterText
-      ? priorChapterNegativeList(options.priorChapterText)
-      : [];
-  if (!options.chapterSoFar.trim()) return dedupe(priorNotes);
-
-  const analysis = analyzeAdaptiveStyle(
-    options.chapterSoFar,
-    options.priorChapterText ? { priorText: options.priorChapterText } : undefined,
-  );
-  const related = new Set(analysis.issues.flatMap(issue => issue.relatedCodes));
-  const semanticFeedback = [
-    ...analysis.issues.map(issue => issue.message),
-    ...analysis.vividness.issues
-      .filter(issue => !related.has(issue.code))
-      .map(issue => issue.message),
-    ...analysis.dialogue.issues
-      .filter(issue => !related.has(issue.code))
-      .map(issue => issue.message),
-    ...analysis.aiTells.issues
-      .filter(issue => issue.code !== "thematic_uplift" && !related.has(issue.code))
-      .map(issue => issue.message),
-  ];
-  const antiFormula = sceneAntiFormulaFeedback({
-    chapterSoFar: options.chapterSoFar,
-    priorChapterText: options.priorChapterText,
-  });
-  const lines = dedupe([...priorNotes, ...antiFormula, ...semanticFeedback]);
-  return lines.length
-    ? [
-      "既有正文的自适应文风反馈（结构统计只负责定位；按上下文处理真实问题，不为数值或配额改写）：",
-      ...lines,
-    ]
-    : [];
-}
-
-/** Instructions that justify one evidence-preserving rewrite of the current draft. */
-export function groundedAdaptiveRevisionInstructions(text: string): string[] {
-  return analyzeAdaptiveStyle(text).issues
-    .filter(issue => issue.reviseCurrentDraft)
-    .map(issue => issue.message);
 }
 
 /**
@@ -244,17 +169,4 @@ export function adaptiveQualityWarnings(analysis: AdaptiveStyleAnalysis): Adapti
         examples: issue.examples.slice(0, 5),
       })),
   ];
-}
-
-export function adaptiveRevisionImproved(before: AdaptiveStyleAnalysis, after: AdaptiveStyleAnalysis): boolean {
-  if (!before.issues.some(issue => issue.reviseCurrentDraft)) return false;
-  return after.revisionScore + 0.05 < before.revisionScore;
-}
-
-function roundStrength(value: number): number {
-  return Math.round(value * 100) / 100;
-}
-
-function dedupe(values: readonly string[]): string[] {
-  return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }

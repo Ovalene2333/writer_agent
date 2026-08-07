@@ -336,10 +336,25 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       scenePipeline: {
         enabled: false,
         preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5,
-        notesMaxCharacters: 3_000, candidateCount: 2,
+        notesMaxCharacters: 3_000, candidateCount: 1,
       },
       proseLength: { chapterTargetCharacters: 3_000, mode: "bounded", enforceMinimum: false },
       proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
+      roleplay: {
+        performanceReasoningEffort: "inherit",
+        jsonReasoningEffort: "none",
+        qualityFinalizeEnabled: true,
+        recentMessages: 8,
+        replyMaxOutputTokens: 8_000,
+        jsonMaxOutputTokens: 8_000,
+        lengthBlockBudgets: {
+          "-2": { minBlocks: 1, maxBlocks: 1 },
+          "-1": { minBlocks: 2, maxBlocks: 2 },
+          "0": { minBlocks: 2, maxBlocks: 3 },
+          "1": { minBlocks: 3, maxBlocks: 4 },
+          "2": { minBlocks: 4, maxBlocks: 5 },
+        },
+      },
     });
     saveAgentSettings(project, {
       permissionMode: "plan",
@@ -363,10 +378,53 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       scenePipeline: {
         enabled: true,
         preferredMinScenes: 2, preferredMaxScenes: 4, maxScenes: 6,
-        notesMaxCharacters: 4_200, candidateCount: 2,
+        notesMaxCharacters: 4_200, candidateCount: 1,
       },
       proseLength: { chapterTargetCharacters: 3_000, mode: "bounded", enforceMinimum: false },
       proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
+      roleplay: {
+        performanceReasoningEffort: "inherit",
+        jsonReasoningEffort: "none",
+        qualityFinalizeEnabled: true,
+        recentMessages: 8,
+        replyMaxOutputTokens: 8_000,
+        jsonMaxOutputTokens: 8_000,
+        lengthBlockBudgets: {
+          "-2": { minBlocks: 1, maxBlocks: 1 },
+          "-1": { minBlocks: 2, maxBlocks: 2 },
+          "0": { minBlocks: 2, maxBlocks: 3 },
+          "1": { minBlocks: 3, maxBlocks: 4 },
+          "2": { minBlocks: 4, maxBlocks: 5 },
+        },
+      },
+    });
+    saveAgentSettings(project, {
+      roleplay: {
+        performanceReasoningEffort: "low",
+        jsonReasoningEffort: "none",
+        qualityFinalizeEnabled: false,
+        recentMessages: 12,
+        replyMaxOutputTokens: 4_000,
+        jsonMaxOutputTokens: 2_000,
+        lengthBlockBudgets: {
+          "0": { minBlocks: 3, maxBlocks: 5 },
+        },
+      },
+    });
+    assert.deepEqual(loadAgentSettings(project).roleplay, {
+      performanceReasoningEffort: "low",
+      jsonReasoningEffort: "none",
+      qualityFinalizeEnabled: false,
+      recentMessages: 12,
+      replyMaxOutputTokens: 4_000,
+      jsonMaxOutputTokens: 2_000,
+      lengthBlockBudgets: {
+        "-2": { minBlocks: 1, maxBlocks: 1 },
+        "-1": { minBlocks: 2, maxBlocks: 2 },
+        "0": { minBlocks: 3, maxBlocks: 5 },
+        "1": { minBlocks: 3, maxBlocks: 4 },
+        "2": { minBlocks: 4, maxBlocks: 5 },
+      },
     });
     // 终审跟随正文模型：默认开，是显式的可选覆盖而不是推断出来的。
     saveAgentSettings(project, { reviewFollowsProseModel: false });
@@ -388,7 +446,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
     assert.deepEqual(loadAgentSettings(project).proseLength, { chapterTargetCharacters: 50_000, mode: "guidance", enforceMinimum: true });
     saveAgentSettings(project, { proseLength: { chapterTargetCharacters: 100 } });
     assert.equal(loadAgentSettings(project).proseLength.chapterTargetCharacters, 500);
-    // Best-of-N switch: persisted, clamped to 1—3 (2 by default).
+    // Best-of-N switch: persisted, clamped to 1—3 (1 by default).
     saveAgentSettings(project, { scenePipeline: { candidateCount: 9 } });
     assert.equal(loadAgentSettings(project).scenePipeline.candidateCount, 3);
     saveAgentSettings(project, { scenePipeline: { candidateCount: 1 } });

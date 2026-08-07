@@ -5,6 +5,21 @@ import { callKindLabel } from "./types";
 import { Markdown } from "./markdown";
 import { formatGraphTokens, shortProviderName } from "./format_utils";
 
+/** Pure visible completion (completion − reasoning when nested). */
+export function pureOutputTokens(usage: { completionTokens: number; reasoningTokens?: number }): number {
+  const reasoning = Math.max(0, Math.round(usage.reasoningTokens ?? 0));
+  return Math.max(0, usage.completionTokens - Math.min(reasoning, usage.completionTokens));
+}
+
+export function formatDurationMs(ms: number | undefined): string | null {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return null;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
+}
+
 export function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -107,11 +122,16 @@ export function formatStepCost(usage: StepUsage): string | null {
 export function stepUsageTitle(usage: StepUsage): string {
   const multi = (usage.callBreakdown?.length ?? 0) > 1 || usage.model === "多个模型";
   const cache = stepCacheRates(usage);
+  const pureOut = pureOutputTokens(usage);
+  const duration = formatDurationMs(usage.durationMs);
   const parts = [
     usage.estimated ? "估算" : null,
     multi ? "多模型合计" : usage.model ?? null,
     `输入 ${usage.promptTokens.toLocaleString()}`,
-    `输出 ${usage.completionTokens.toLocaleString()}`,
+    `输出 ${pureOut.toLocaleString()}`,
+    usage.reasoningTokens !== undefined
+      ? `推理 ${usage.reasoningTokens.toLocaleString()}`
+      : null,
     `缓存命中 ${usage.cacheHitTokens.toLocaleString()}`,
     cache.primary !== undefined && multi
       ? `Agent 主步命中率 ${(cache.primary * 100).toFixed(1)}%`
@@ -119,6 +139,7 @@ export function stepUsageTitle(usage: StepUsage): string {
     cache.total !== undefined
       ? `${multi ? "全调用合计命中率" : "命中率"} ${(cache.total * 100).toFixed(1)}%`
       : null,
+    duration ? `耗时 ${duration}` : null,
     usage.cost > 0
       ? `费用 ${usage.currency === "CNY" ? "¥" : "$"}${usage.cost.toFixed(6)}`
       : null,
@@ -175,9 +196,14 @@ export function StepTokenBadge({ usage, pending }: { usage?: StepUsage; pending?
         <span className="tok-ico" aria-hidden="true">I</span>
         {formatTokenCount(usage.promptTokens)}
       </span>
-      <span className="tok-metric tok-out" title={`输出 ${usage.completionTokens.toLocaleString()}`}>
+      <span
+        className="tok-metric tok-out"
+        title={usage.reasoningTokens !== undefined
+          ? `输出 ${pureOutputTokens(usage).toLocaleString()}（纯） · 推理 ${usage.reasoningTokens.toLocaleString()}`
+          : `输出 ${usage.completionTokens.toLocaleString()}`}
+      >
         <span className="tok-ico" aria-hidden="true">O</span>
-        {formatTokenCount(usage.completionTokens)}
+        {formatTokenCount(pureOutputTokens(usage))}
       </span>
       <span className="tok-metric tok-cache" title={cacheTitle}>
         <span className="tok-ico" aria-hidden="true">C</span>
@@ -448,10 +474,16 @@ export function AgentStepCard({
                   ：总计 {step.usage.totalTokens.toLocaleString()}
                   {" · "}
                   输入 {step.usage.promptTokens.toLocaleString()}
-                  {" · "}输出 {step.usage.completionTokens.toLocaleString()}
+                  {" · "}输出 {pureOutputTokens(step.usage).toLocaleString()}
+                  {step.usage.reasoningTokens !== undefined
+                    ? ` · 推理 ${step.usage.reasoningTokens.toLocaleString()}`
+                    : ""}
                   {" · "}缓存 {step.usage.cacheHitTokens.toLocaleString()}
                   {step.usage.cacheHitRate !== undefined
                     ? ` · 合计命中 ${(step.usage.cacheHitRate * 100).toFixed(1)}%`
+                    : ""}
+                  {formatDurationMs(step.usage.durationMs)
+                    ? ` · 耗时 ${formatDurationMs(step.usage.durationMs)}`
                     : ""}
                   {step.usage.cost > 0
                     ? ` · ${step.usage.currency === "CNY" ? "¥" : "$"}${step.usage.cost.toFixed(6)}`
@@ -484,10 +516,18 @@ export function AgentStepCard({
                       cacheMissTokens: step.usage.cacheMissTokens,
                       cost: step.usage.cost,
                       currency: step.usage.currency,
+                      ...(step.usage.reasoningTokens !== undefined
+                        ? { reasoningTokens: step.usage.reasoningTokens }
+                        : {}),
+                      ...(step.usage.durationMs !== undefined
+                        ? { durationMs: step.usage.durationMs }
+                        : {}),
                     }]).map((call, index) => {
                   const measured = call.cacheHitTokens + call.cacheMissTokens;
                   const rate = measured > 0 ? call.cacheHitTokens / measured : 0;
                   const kind = callKindLabel(call.callKind);
+                  const pureOut = pureOutputTokens(call);
+                  const duration = formatDurationMs(call.durationMs);
                   return (
                     <div className="agent-step-context-row agent-step-model-call-row" key={`${call.model ?? "unknown"}-${call.callKind}-${index}`}>
                       <div className="agent-step-model-call-heading">
@@ -496,12 +536,21 @@ export function AgentStepCard({
                         </span>
                         <strong title={call.model ?? "未知模型"}>{call.model && call.model !== "多个模型" ? call.model : "未知模型"}</strong>
                         <span title={call.callKind}>{kind}</span>
+                        {duration ? <span className="agent-step-call-duration" title="本次模型调用耗时">{duration}</span> : null}
                       </div>
                       <div className="agent-step-model-call-metrics">
                         <span><small>总计</small>{(call.promptTokens + call.completionTokens).toLocaleString()}</span>
                         <span><small>输入</small>{call.promptTokens.toLocaleString()}</span>
-                        <span><small>输出</small>{call.completionTokens.toLocaleString()}</span>
+                        <span title={call.reasoningTokens !== undefined ? `completion ${call.completionTokens.toLocaleString()} = 输出 ${pureOut.toLocaleString()} + 推理 ${call.reasoningTokens.toLocaleString()}` : undefined}>
+                          <small>输出</small>{pureOut.toLocaleString()}
+                        </span>
+                        {call.reasoningTokens !== undefined
+                          ? <span><small>推理</small>{call.reasoningTokens.toLocaleString()}</span>
+                          : null}
                         <span><small>缓存</small>{call.cacheHitTokens.toLocaleString()} <em>{(rate * 100).toFixed(1)}%</em></span>
+                        {duration
+                          ? <span><small>耗时</small>{duration}</span>
+                          : null}
                         {call.cost > 0
                           ? <span><small>费用</small>{call.currency === "CNY" ? "¥" : "$"}{call.cost.toFixed(6)}</span>
                           : null}
@@ -605,6 +654,8 @@ export function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsa
         cost: next.cost,
         currency: next.currency,
         ...(next.estimated ? { estimated: true } : {}),
+        ...(next.reasoningTokens !== undefined ? { reasoningTokens: next.reasoningTokens } : {}),
+        ...(next.durationMs !== undefined ? { durationMs: next.durationMs } : {}),
       }];
   if (!current) return { ...next, callBreakdown: nextCalls };
   const cacheHitTokens = current.cacheHitTokens + next.cacheHitTokens;
@@ -618,6 +669,12 @@ export function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsa
     [...(current.callBreakdown ?? []).map(call => call.providerName), ...nextCalls.map(call => call.providerName), current.providerName, next.providerName]
       .filter((value): value is string => Boolean(value?.trim())),
   )];
+  const hasReasoning = current.reasoningTokens !== undefined || next.reasoningTokens !== undefined
+    || nextCalls.some(call => call.reasoningTokens !== undefined)
+    || (current.callBreakdown ?? []).some(call => call.reasoningTokens !== undefined);
+  const hasDuration = current.durationMs !== undefined || next.durationMs !== undefined
+    || nextCalls.some(call => call.durationMs !== undefined)
+    || (current.callBreakdown ?? []).some(call => call.durationMs !== undefined);
   return {
     model: models.length <= 1 ? (models[0] ?? current.model ?? next.model) : "多个模型",
     ...(providers.length
@@ -633,6 +690,12 @@ export function mergeStepCallUsage(current: StepUsage | undefined, next: StepUsa
     ...(estimated ? { estimated: true } : {}),
     ...(!estimated && cacheHitTokens + cacheMissTokens > 0
       ? { cacheHitRate: cacheHitTokens / (cacheHitTokens + cacheMissTokens) }
+      : {}),
+    ...(hasReasoning
+      ? { reasoningTokens: (current.reasoningTokens ?? 0) + (next.reasoningTokens ?? 0) }
+      : {}),
+    ...(hasDuration
+      ? { durationMs: (current.durationMs ?? 0) + (next.durationMs ?? 0) }
       : {}),
     requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
     callBreakdown: [...(current.callBreakdown ?? []), ...nextCalls],

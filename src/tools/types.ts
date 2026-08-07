@@ -22,6 +22,7 @@ import type {
   SceneStateExtractionResult,
 } from "../evidence_grounded_writer.js";
 import type { WritePack } from "../write_pack.js";
+import type { RegisterRisk } from "../register_risks.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -233,6 +234,11 @@ export type ToolExecutionContext = {
       signal?: AbortSignal,
     ) => Promise<SceneStateExtractionResult>;
   };
+  /**
+   * Character-card phrasing that must not be quoted into lived prose.
+   * Accumulated when get_character serves voice/competencies/psychology/features.
+   */
+  registerRisks?: RegisterRisk[];
   /** Semantic repair baselines, keyed by run + deliverable + path. */
   proposalReviewRevisions?: Map<string, ProposalReviewRevisionContext>;
   /** Paths whose latest blocked full draft is not the persisted project version. */
@@ -291,13 +297,14 @@ export type ToolExecutionContext = {
   /**
    * Experimental best-of-N scene prose sampling (scenePipeline.candidateCount > 1):
    * model used for fact-preserving plain-text rewrites of each submitted scene.
-   * Absent = feature off; rewrite failures always fall back to the original prose.
+   * A reader judge is required to select a rewrite; otherwise the original prose
+   * stays. Rewrite failures always fall back to the original prose.
    */
   sceneCandidates?: {
     model: ModelConfig;
     /**
-     * Reader-side selector: picks the winning candidate by judgment rather than by
-     * rule score. Absent = deterministic rerank only.
+     * Reader-side selector: picks the winning candidate by judgment. Absent means
+     * candidate sampling preserves the original.
      */
     judgeModel?: ModelConfig;
     signal?: AbortSignal;
@@ -307,12 +314,6 @@ export type ToolExecutionContext = {
    * sampled per draft and shared by every scene's rewrite calls. Reset per chapter.
    */
   sceneStyleEvidence?: { forPath: string; text: string };
-  /**
-   * stylePriorNotes returned by begin_chapter_draft, stashed so the agent loop can
-   * re-inject them into each scene-boundary handoff after the begin exchange has
-   * been truncated out of the request. Reset per chapter.
-   */
-  chapterStylePriorNotes?: string[];
   /**
    * Cross-round Flash verdict memory for the style gate (sentence+subtype → verdict).
    * Keeps repeat inspects stable/cheap and powers the sync re-gate inside

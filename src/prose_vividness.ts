@@ -9,10 +9,9 @@
  *
  * This module measures the positive side: does the page carry dialogue, more
  * than one sensory channel, objects that only exist in this room, and a rhythm
- * that shifts? It NEVER blocks. Output feeds three places:
- * - sceneVividnessFeedback → next-scene guidance in the scene-pipeline result
- * - proseVividnessScore    → additive term in sceneProseScore (best-of-N rerank)
- * - chapter-level stats    → inspect_chapter_draft checklist + chapter_review signals
+ * that shifts? It NEVER blocks. Its chapter-level stats feed the
+ * inspect_chapter_draft checklist and chapter_review signals only; they never
+ * select a prose candidate or steer the next scene.
  *
  * Deliberately orthogonal to prose_metrics' MICRO_ACTION_LEXICON: that list
  * penalizes body-tic filler (目光/呼吸/指尖), this one rewards perception of the
@@ -192,10 +191,7 @@ export function analyzeProseVividness(text: string): ProseVividness {
   return { stats, issues };
 }
 
-/**
- * 0–100 additive vividness score. Unlike sceneProseScore's penalty ledger this
- * starts near zero and is earned, so flat-but-clean prose cannot top out.
- */
+/** Convenience projection of the 0–100 final-review diagnostic score. */
 export function proseVividnessScore(text: string): number {
   return analyzeProseVividness(text).stats.score;
 }
@@ -211,22 +207,6 @@ function compositeScore(stats: ProseVividnessStats): number {
   const abstractPenalty = Math.min(20, Math.max(0, stats.abstractPer10k - ABSTRACT_PER_10K_LIMIT) * 0.6);
   const total = 10 + dialogue + channels + sensory + concrete + rhythm - abstractPenalty;
   return Math.round(Math.max(0, Math.min(100, total)) * 10) / 10;
-}
-
-/**
- * Positive-direction guidance for the NEXT scene, computed from what the chapter
- * has accumulated so far. Counterpart to prose_metrics' sceneAntiFormulaFeedback:
- * that one says what to stop doing, this one says what is missing.
- */
-export function sceneVividnessFeedback(chapterSoFar: string): string[] {
-  const { stats, issues } = analyzeProseVividness(chapterSoFar);
-  if (stats.characters < MIN_MEASURABLE_CHARACTERS) return [];
-  const lines = issues.map(issue => issue.message);
-  if (!lines.length) return [];
-  return [
-    `本章至今的现场感计量（生动度 ${stats.score}/100，加分项，不构成拦截）：`,
-    ...lines,
-  ];
 }
 
 /** Compact one-line summary for tool results and reviewer signals. */
@@ -249,7 +229,7 @@ function narrativeRhythm(text: string): {
   spread: number;
   longRatio: number;
 } {
-  const narrative = text.replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”/gu, "");
+  const narrative = text.replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”|"[^"\n]*"/gu, "");
   const lengths = splitSentences(narrative)
     .map(sentence => normalizeSentence(sentence).length)
     .filter(length => length > 0)

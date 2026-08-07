@@ -33,7 +33,7 @@ import {
 import { OutlineStore } from "./outline.js";
 import { comparePathNames } from "./path_sort.js";
 import { calculateUsageCost } from "./pricing.js";
-import { WriterProject } from "./project.js";
+import { normalizeResourcePath, WriterProject } from "./project.js";
 import {
   WRITING_MEMORY_KINDS,
   type WritingMemoryCandidate,
@@ -4245,7 +4245,7 @@ function headingAtLine(lines: string[], line: number): string | undefined {
 }
 
 function canonicalTextPath(path: string): string {
-  return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "").replace(/^resource(?:\/|$)/, "");
+  return normalizeResourcePath(path);
 }
 
 function writingMemoryEvidenceAnchor(content: string, sourceHash: string, evidence: string): string {

@@ -97,6 +97,11 @@ export interface ModelTokenUsage {
   cacheMissTokens: number;
   /** Provider-reported tokens written into an explicit/ephemeral prompt cache. */
   cacheWriteTokens?: number;
+  /**
+   * Reasoning / thinking tokens when the provider reports them separately
+   * (usually a subset of completionTokens). Pure visible output ≈ completion − reasoning.
+   */
+  reasoningTokens?: number;
 }
 
 export type ProviderId = "deepseek" | "openai-compatible" | "openai-responses";
@@ -503,6 +508,10 @@ export interface StepUsageCall {
   cost: number;
   currency: string;
   estimated?: boolean;
+  /** Reasoning tokens when reported; pure output = max(0, completion − reasoning). */
+  reasoningTokens?: number;
+  /** Wall-clock duration of this provider request in milliseconds. */
+  durationMs?: number;
 }
 
 export interface StepUsage {
@@ -521,6 +530,10 @@ export interface StepUsage {
   estimated?: boolean;
   /** Undefined for estimated calls; otherwise cacheHit/(cacheHit+cacheMiss). */
   cacheHitRate?: number;
+  /** Sum of per-call reasoning tokens when any call reports them. */
+  reasoningTokens?: number;
+  /** Sum of per-call wall-clock durations when known. */
+  durationMs?: number;
   /**
    * Per-call rows for this step. Required to diagnose mixed-model steps
    * (agent_step + prose_gate + chapter_review); aggregate model may be「多个模型」.

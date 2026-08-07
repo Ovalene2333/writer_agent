@@ -12,12 +12,14 @@ export const MULTIMODAL_MIME_TYPES = new Set([
 
 const WRITER_ATTACHMENT_SCHEME = "writer-attachment://";
 
-export function isDeepSeekModel(model: Pick<ModelConfig, "provider" | "baseUrl">): boolean {
+export function isDeepSeekModel(model: Partial<Pick<ModelConfig, "provider" | "baseUrl">>): boolean {
   if (model.provider === "deepseek") return true;
+  const baseUrl = model.baseUrl?.trim() ?? "";
+  if (!baseUrl) return false;
   try {
-    return new URL(model.baseUrl).hostname.toLowerCase() === "api.deepseek.com";
+    return new URL(baseUrl).hostname.toLowerCase() === "api.deepseek.com";
   } catch {
-    return model.baseUrl.toLowerCase().includes("api.deepseek.com");
+    return baseUrl.toLowerCase().includes("api.deepseek.com");
   }
 }
 
@@ -182,11 +184,117 @@ export function modelSupportsToolChoice(model: Pick<ModelConfig, "provider" | "b
   return !isDeepSeekModel(model);
 }
 
-/** Make DeepSeek's default explicit so a multi-step tool job cannot drift modes. */
+/**
+ * Internal reasoning protocol shared by every model call site.
+ *
+ * Call sites express intent only (`thinking` on / off, plus ModelConfig.reasoningEffort).
+ * Wire fields are produced later by `providerReasoningWire` from the three ProviderId values:
+ * - deepseek → `thinking: { type }`
+ * - openai-compatible → `reasoning_effort` (+ verbosity)
+ * - openai-responses → same intermediate fields; Responses body maps effort to `reasoning.effort`
+ *
+ * Model name / proxy hostname must not fork the protocol. Hosting DeepSeek weights behind
+ * an OpenAI-compatible gateway still uses the openai-compatible parameter set.
+ */
+export type ReasoningThinkingIntent = "enabled" | "disabled";
+
+export type ReasoningIntent = {
+  /** Logical thinking switch for this call. Undefined = derive only from model config. */
+  thinking?: ReasoningThinkingIntent;
+};
+
+/** Wire shape for Chat Completions-style bodies (Responses remaps effort separately). */
+export type ProviderReasoningWire = {
+  thinking?: { type: ReasoningThinkingIntent };
+  reasoning_effort?: ModelConfig["reasoningEffort"];
+  verbosity?: ModelConfig["verbosity"];
+};
+
+/**
+ * Map internal reasoning intent + model config → provider wire fields.
+ * Branched only on ProviderId (via isDeepSeekModel / usesResponses-compatible openai path).
+ */
+export function providerReasoningWire(
+  model: Partial<Pick<ModelConfig, "provider" | "baseUrl" | "model" | "reasoningEffort" | "verbosity">>,
+  intent: ReasoningIntent = {},
+): ProviderReasoningWire {
+  let thinking = intent.thinking;
+  let effort = model.reasoningEffort;
+
+  if (thinking === "disabled") {
+    // Deterministic / JSON extractors must not inherit a medium role budget.
+    effort = "none";
+  } else if (thinking === undefined && (effort === "none" || effort === "minimal")) {
+    thinking = "disabled";
+  }
+
+  // Provider type only: deepseek uses its thinking control; openai-compatible and
+  // openai-responses share the OpenAI reasoning_effort (+ verbosity) surface.
+  if (isDeepSeekModel(model)) {
+    if (thinking) return { thinking: { type: thinking } };
+    return {};
+  }
+
+  const wire: ProviderReasoningWire = {};
+  if (effort !== undefined) wire.reasoning_effort = effort;
+  if (model.verbosity !== undefined) wire.verbosity = model.verbosity;
+  return wire;
+}
+
+/** Parse a chat-body or request `thinking` field into logical intent. */
+export function reasoningIntentFromThinkingField(
+  thinking: unknown,
+): ReasoningIntent {
+  if (!thinking || typeof thinking !== "object" || Array.isArray(thinking)) return {};
+  const type = (thinking as { type?: unknown }).type;
+  if (type === "enabled" || type === "disabled") return { thinking: type };
+  return {};
+}
+
+/**
+ * Strip any pre-spread reasoning wire fields and re-apply provider mapping.
+ * Used at the formal request boundary so earlier spreads cannot leave mixed params.
+ */
+export function applyProviderReasoningToChatBody(
+  model: Pick<ModelConfig, "provider" | "baseUrl" | "model" | "reasoningEffort" | "verbosity">,
+  chatBody: Record<string, unknown>,
+): Record<string, unknown> {
+  const intent = reasoningIntentFromThinkingField(chatBody.thinking);
+  const {
+    thinking: _thinking,
+    reasoning_effort: _effort,
+    verbosity: _verbosity,
+    reasoning: _reasoning,
+    ...rest
+  } = chatBody;
+  const wire = providerReasoningWire(model, intent);
+  return {
+    ...rest,
+    ...(wire.thinking ? { thinking: wire.thinking } : {}),
+    ...(wire.reasoning_effort !== undefined ? { reasoning_effort: wire.reasoning_effort } : {}),
+    ...(wire.verbosity !== undefined ? { verbosity: wire.verbosity } : {}),
+  };
+}
+
+/**
+ * Logical intent: enable thinking for this call.
+ * Wire fields are applied at the formal request boundary (buildProviderCompletionBody /
+ * serializeProviderChatBody / applyProviderReasoningToChatBody).
+ */
 export function thinkingRequestOptions(
-  model: Pick<ModelConfig, "provider" | "baseUrl">,
-): { thinking: { type: "enabled" } } | Record<string, never> {
-  return isDeepSeekModel(model) ? { thinking: { type: "enabled" } } : {};
+  _model?: Partial<Pick<ModelConfig, "provider" | "baseUrl" | "model" | "reasoningEffort" | "verbosity">>,
+): { thinking: { type: "enabled" } } {
+  return { thinking: { type: "enabled" } };
+}
+
+/**
+ * Logical intent: disable thinking / lowest effort for deterministic extractors.
+ * Provider-specific params are resolved only at the formal request boundary.
+ */
+export function nonThinkingRequestOptions(
+  _model?: Partial<Pick<ModelConfig, "provider" | "baseUrl" | "model" | "reasoningEffort" | "verbosity">>,
+): { thinking: { type: "disabled" } } {
+  return { thinking: { type: "disabled" } };
 }
 
 export type SamplingRequest = {
@@ -215,22 +323,23 @@ export type SamplingRequestBody = {
  * and every other call still sent a value the provider had deprecated.
  *
  * Passing `disableSampling` drops the sampling group rather than just temperature;
- * configured reasoning effort and verbosity remain independent.
+ * configured reasoning effort and verbosity remain independent (via providerReasoningWire).
  * Models that reject `temperature` reject `top_p` and the penalties too, and an
  * omitted parameter simply falls back to the provider default — omitting can
  * never fail a request, so the safe superset costs nothing.
  */
 export function samplingRequestOptions(
-  model: Partial<Pick<ModelConfig, "provider" | "baseUrl" | "temperature" | "topP" | "frequencyPenalty" | "presencePenalty" | "reasoningEffort" | "verbosity" | "disableSampling">>,
+  model: Partial<Pick<ModelConfig, "provider" | "baseUrl" | "model" | "temperature" | "topP" | "frequencyPenalty" | "presencePenalty" | "reasoningEffort" | "verbosity" | "disableSampling">>,
   requested: SamplingRequest = {},
 ): SamplingRequestBody {
-  // DeepSeek uses its own thinking controls; Chat Completions + Responses both accept effort/verbosity.
-  const openAiOptions = model.provider === "deepseek" || (model.baseUrl && isDeepSeekModel(model as Pick<ModelConfig, "provider" | "baseUrl">))
-    ? {}
-    : {
-        ...(model.reasoningEffort === undefined ? {} : { reasoning_effort: model.reasoningEffort }),
-        ...(model.verbosity === undefined ? {} : { verbosity: model.verbosity }),
-      };
+  // Model-config effort/verbosity only — no per-call thinking intent here.
+  // thinkingRequestOptions / nonThinkingRequestOptions / applyProviderReasoningToChatBody
+  // own the thinking switch.
+  const reasoning = providerReasoningWire(model, {});
+  const openAiOptions: SamplingRequestBody = {
+    ...(reasoning.reasoning_effort !== undefined ? { reasoning_effort: reasoning.reasoning_effort } : {}),
+    ...(reasoning.verbosity !== undefined ? { verbosity: reasoning.verbosity } : {}),
+  };
   if (model.disableSampling) return openAiOptions;
   const temperature = requested.temperature ?? model.temperature;
   const topP = requested.topP ?? model.topP;
@@ -243,11 +352,4 @@ export function samplingRequestOptions(
     ...(frequencyPenalty === undefined ? {} : { frequency_penalty: frequencyPenalty }),
     ...(presencePenalty === undefined ? {} : { presence_penalty: presencePenalty }),
   };
-}
-
-/** Keep deterministic extraction calls from spending their output budget on reasoning. */
-export function nonThinkingRequestOptions(
-  model: Pick<ModelConfig, "provider" | "baseUrl">,
-): { thinking: { type: "disabled" } } | Record<string, never> {
-  return isDeepSeekModel(model) ? { thinking: { type: "disabled" } } : {};
 }

@@ -91,6 +91,48 @@ test("buildProviderCompletionBody shapes chat vs responses", () => {
   assert.equal(responses.messages, undefined);
 });
 
+test("buildProviderCompletionBody maps thinking intent by ProviderId only", () => {
+  const deepseek = buildProviderCompletionBody({
+    model: {
+      provider: "deepseek",
+      baseUrl: "https://api.deepseek.com",
+      apiKey: "sk",
+      model: "deepseek-chat",
+      reasoningEffort: "medium",
+    } as ModelConfig,
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { type: "disabled" },
+  });
+  assert.deepEqual(deepseek.thinking, { type: "disabled" });
+  assert.equal(deepseek.reasoning_effort, undefined);
+
+  // openai-compatible protocol is identical whether the model id is gpt or deepseek.
+  const openAiDeepseekWeights = buildProviderCompletionBody({
+    model: {
+      provider: "openai-compatible",
+      baseUrl: "https://opencode.example/v1",
+      apiKey: "sk",
+      model: "deepseek-v4-flash",
+      reasoningEffort: "medium",
+    } as ModelConfig,
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { type: "disabled" },
+  });
+  assert.equal(openAiDeepseekWeights.thinking, undefined);
+  assert.equal(openAiDeepseekWeights.reasoning_effort, "none");
+
+  const openAi = buildProviderCompletionBody({
+    model: {
+      ...chatModel,
+      reasoningEffort: "medium",
+    },
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { type: "disabled" },
+  });
+  assert.equal(openAi.thinking, undefined);
+  assert.equal(openAi.reasoning_effort, "none");
+});
+
 test("parseProviderCompletionPayload reads both protocols", () => {
   const chat = parseProviderCompletionPayload({
     choices: [{ finish_reason: "stop", message: { content: "回答", tool_calls: [] } }],

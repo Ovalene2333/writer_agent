@@ -41,6 +41,17 @@ export type WritePack = {
   factAtoms?: FactAtom[];
   /** Optional viewpoint/register guidance; never a forced synonym replacement. */
   realizationBoundaries?: RealizationBoundary[];
+  /**
+   * Optional card-derived phrasing that must not be quoted into dialogue/narration.
+   * Populated at compile/runtime from read characters; never a synonym table.
+   */
+  registerRisks?: Array<{
+    term: string;
+    characterName: string;
+    source: string;
+    scope: string;
+    reason: string;
+  }>;
 };
 
 export type FactPrecision = "exact" | "normal" | "sensory";
@@ -285,12 +296,12 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
  */
 export function formatWritePackForWriter(pack: WritePack): string {
   const lines: string[] = [
-    "本场写作材料（仅故事世界内信息。禁止在正文用文档标题、路径、大纲或流程字样指称先前情节；改用故事内时间、对白或物件回忆。）",
+    "本场写作材料（这是事实边界与创作简报，不是逐项展开的作文提纲。硬约束是【已成立的事实】【须自然落地】【勿擅自补写】；其余栏目用于找准人物行动和场景方向，可合并承载，不必逐条复述或各占一段。正文只用故事世界内的时间、动作、对白或物件指称先前情节。）",
   ];
 
-  if (pack.sceneGoal) lines.push(`【本场要完成】\n${pack.sceneGoal}`);
+  if (pack.sceneGoal) lines.push(`【本场方向】\n${pack.sceneGoal}`);
   if (pack.characterState.length) lines.push(`【人物当下】\n${bullets(pack.characterState)}`);
-  if (pack.beatOrder.length) lines.push(`【事件顺序】\n${numbered(pack.beatOrder)}`);
+  if (pack.beatOrder.length) lines.push(`【推进顺序】\n${numbered(pack.beatOrder)}\n（保持因果先后，但可写成连续动作，不为每项补解释或独立段落。）`);
   if (pack.knownFacts.length) lines.push(`【已成立的事实】\n${bullets(pack.knownFacts)}`);
   if (pack.mustLand.length) lines.push(`【须自然落地】\n${bullets(pack.mustLand)}`);
   if (pack.doNotInvent.length) lines.push(`【勿擅自补写】\n${bullets(pack.doNotInvent)}`);
@@ -301,6 +312,15 @@ export function formatWritePackForWriter(pack: WritePack): string {
   if (pack.realizationBoundaries?.length) {
     lines.push(
       `【事实表达边界】\n${pack.realizationBoundaries.map(formatRealizationBoundary).join("\n")}\n（以上是语域和信息精度提示，不是固定替换表；以当前视角、人物知识和行动需要决定最终说法。）`,
+    );
+  }
+  if (pack.registerRisks?.length) {
+    lines.push(
+      `【慎用措辞·不得直出】\n下列词句来自本轮角色卡线索，不是正文默认词表；普通对白与贴身叙述须换成本场自然说法，正式汇报或对方追问术语时除外。\n${
+        pack.registerRisks.slice(0, 24).map(risk =>
+          `- ${risk.term}（${risk.characterName}/${risk.source}/${risk.scope}）：${risk.reason}`
+        ).join("\n")
+      }`,
     );
   }
 

@@ -132,7 +132,10 @@ export function buildNarrativeEvidencePacket(options: {
     const character = cards.get(characterId);
     return character ? [characterEvidence(character, context, sceneScopes.get(characterId), outlineNodes, targetNodeId)] : [];
   });
-  const coverageGaps = characters.flatMap(character => characterCoverageGaps(character, context));
+  const coverageGaps = characters.flatMap(evidence => {
+    const card = cards.get(evidence.id);
+    return card ? characterCoverageGaps(evidence, card, context) : [];
+  });
   const sources = buildEvidenceSources(project, context, path, rawMemory);
   const sourceByPath = new Map(sources.map(source => [source.path, source]));
   const writingMemory = rawMemory.map(entry => ({
@@ -285,31 +288,40 @@ function characterEvidence(
   };
 }
 
+/** Dialogue writing requires these card sections when the role may speak. */
+export function requiredDialogueEvidenceSections(character: Character): string[] {
+  // Empty relationship lists carry no dialogue constraints; do not force a no-op read.
+  return character.relationships.length > 0
+    ? ["voice", "motivations", "relationships", "storyState"]
+    : ["voice", "motivations", "storyState"];
+}
+
 function characterCoverageGaps(
-  character: NarrativeCharacterEvidence,
+  evidence: NarrativeCharacterEvidence,
+  card: Character,
   context: ToolExecutionContext,
 ): NarrativeEvidenceGap[] {
   const gaps: NarrativeEvidenceGap[] = [];
-  const read = context.characterEvidenceReads?.get(character.id);
+  const read = context.characterEvidenceReads?.get(evidence.id);
   const readCompetencies = read?.competencyIds ?? new Set<string>();
-  const missingCompetencies = character.allowedCompetencyIds.filter(id => !readCompetencies.has(id));
+  const missingCompetencies = evidence.allowedCompetencyIds.filter(id => !readCompetencies.has(id));
   if (missingCompetencies.length) {
     gaps.push({
       code: "competency_evidence_missing",
-      characterId: character.id,
-      characterName: character.name,
+      characterId: evidence.id,
+      characterName: evidence.name,
       missing: missingCompetencies,
       action: `先 get_character(view=sections, sections=[\"competencies\"], competencyIds=${JSON.stringify(missingCompetencies)}) 读取能力原文。`,
     });
   }
-  if (character.dialogueAllowed) {
-    const required = ["voice", "motivations", "relationships", "storyState"];
-    const missing = required.filter(section => !character.availableSections.includes(section));
+  if (evidence.dialogueAllowed) {
+    const required = requiredDialogueEvidenceSections(card);
+    const missing = required.filter(section => !evidence.availableSections.includes(section));
     if (missing.length) {
       gaps.push({
         code: "character_sections_missing",
-        characterId: character.id,
-        characterName: character.name,
+        characterId: evidence.id,
+        characterName: evidence.name,
         missing,
         action: `先 get_character(view=sections, sections=${JSON.stringify(missing)}) 读取对白所需原始分区。`,
       });

@@ -17,6 +17,7 @@ import {
   type SceneCompetencyUse,
 } from "../competency_state.js";
 import { recordCharacterEvidenceRead } from "../narrative_evidence.js";
+import { extractRegisterRisksFromCharacter, rememberRegisterRisks } from "../register_risks.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { assertWritableMode, optionalPositiveInteger, requireString } from "./helpers.js";
 
@@ -152,6 +153,20 @@ export function handleGetCharacter({ input, store, project, sessionId, character
   }
   if (view === "sections") {
     recordCharacterEvidenceRead(context, character.id, sections, resolvedCompetencyIds);
+  }
+  // Accumulate do-not-quote phrasing for later write-pack / naturalness gates.
+  if (sections.some(section =>
+    section === "voice" || section === "competencies" || section === "psychology" || section === "features"
+  )) {
+    rememberRegisterRisks(context, extractRegisterRisksFromCharacter(character));
+    const riskCount = (context.registerRisks ?? []).filter(risk => risk.characterId === character.id).length;
+    if (riskCount > 0) {
+      selected.registerRiskNotice = {
+        characterId: character.id,
+        riskCount,
+        rule: "本角色卡的示例句、能力学名与心理标签不得直接写入对白或贴身叙述；保留事实，换成本场自然说法。正式汇报除外。",
+      };
+    }
   }
   return JSON.stringify(selected);
 }

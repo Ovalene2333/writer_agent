@@ -16,8 +16,7 @@
  * 角色声线同质、叙述者直接点明主题、对白哲学化、三元并列堆叠、
  * 身体情绪计量器、段落长度均齐（burstiness）、四字套话洪水。
  *
- * 本模块 **永不拦截**。输出去三个地方：
- * - sceneAiTellFeedback  → 下一场的负面提示（与 sceneVividnessFeedback 并列）
+ * 本模块 **永不拦截**。输出去两个地方：
  * - formatAiTellSummary  → inspect_chapter_draft / 提案结果里的质量画像
  * - stats                → chapter_review 的 proseSignals，供终审模型参考
  *
@@ -120,8 +119,8 @@ const MIN_DIALOGUE_LINES = 8;
 /** 段落少于此数时不判段落均齐。 */
 const MIN_PARAGRAPHS = 12;
 
-/** 引号内片段：中英文引号都收。 */
-const QUOTED_SPAN = /「([^」\n]{1,200})」|『([^』\n]{1,200})』|“([^”\n]{1,200})”/gu;
+/** 引号内片段：「」『』“”与 ASCII " 都收。 */
+const QUOTED_SPAN = /「([^」\n]{1,200})」|『([^』\n]{1,200})』|“([^”\n]{1,200})”|"([^"\n]{1,200})"/gu;
 
 /** 口语标记：语气词、省略、改口、半句。人写的对白里这些不会消失。 */
 const COLLOQUIAL_MARKER = /[吧呢嘛啊呀哦噢嗯诶哎唉嘿喂咦哈]\s*[。？！…，]?$|[吧呢嘛啊呀]/u;
@@ -313,19 +312,6 @@ export function formatAiTellSummary(stats: AiTellStats, profile: AiTellProfile =
     + `事件堆叠句 ${Math.round(stats.packingRatio * 100)}%；句长起伏 ${stats.sentenceLengthSpread} 字；段长起伏 ${stats.paragraphLengthSpread} 字`;
 }
 
-/**
- * 下一场的负面提示，与 prose_metrics 的 sceneAntiFormulaFeedback、
- * prose_vividness 的 sceneVividnessFeedback 并列进 avoidNotes。
- * 收尾升华只在整章收口时才有意义，写作途中不提示。
- */
-export function sceneAiTellFeedback(chapterSoFar: string): string[] {
-  const { stats, issues } = analyzeAiTells(chapterSoFar);
-  if (stats.characters < MIN_MEASURABLE_CHARACTERS) return [];
-  const lines = issues.filter(issue => issue.code !== "thematic_uplift").map(issue => issue.message);
-  if (!lines.length) return [];
-  return [`本章至今的 AI 味计量（${stats.score}/100，越低越好；只提示不拦截）：`, ...lines];
-}
-
 function compositeScore(stats: AiTellStats, profile: AiTellProfile): number {
   if (profile === "reference") {
     const tricolon = Math.min(14, over(stats.tricolonPer10k, TRICOLON_PER_10K_LIMIT) * 0.35);
@@ -364,7 +350,7 @@ function packingProfile(text: string): {
   examples: string[];
 } {
   const narrative = text
-    .replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”/gu, " ")
+    .replace(/「[^」\n]*」|『[^』\n]*』|“[^”\n]*”|"[^"\n]*"/gu, " ")
     .replace(/\r\n?/g, "\n");
   const sentences = narrative
     .split(/(?<=[。！？!?…])\s*/u)
@@ -423,7 +409,7 @@ function dialogueProfile(text: string): {
   const lines: string[] = [];
   QUOTED_SPAN.lastIndex = 0;
   for (const match of text.matchAll(QUOTED_SPAN)) {
-    const value = (match[1] ?? match[2] ?? match[3] ?? "").trim();
+    const value = (match[1] ?? match[2] ?? match[3] ?? match[4] ?? "").trim();
     if (value.length >= 2) lines.push(value);
   }
   if (!lines.length) {
@@ -462,7 +448,7 @@ function closingUplift(text: string): { hits: string[] } {
   const hits: string[] = [];
   for (const paragraph of closing) {
     if (paragraph.replace(/\s/g, "").length < 12) continue;
-    if (/[「『“]/u.test(paragraph)) continue;
+    if (/[「『“"]/u.test(paragraph)) continue;
     if (CONCRETE_ANCHOR.test(paragraph)) continue;
     const framed = CLOSING_THEMATIC_FRAME.test(paragraph);
     const abstract = CLOSING_ABSTRACT.test(paragraph);

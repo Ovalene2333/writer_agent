@@ -1,12 +1,11 @@
-import { documentKind, type WriterProject } from "../project.js";
+import { documentKind, normalizeResourcePath, type WriterProject } from "../project.js";
 import type { ToolExecutionContext } from "./types.js";
 
 export type DocumentWriteMode = "create" | "replace" | "append";
 
 /** Canonical resource-relative form shared by text-file tools and audits. */
 export function normalizeTextFilePath(path: string): string {
-  return path.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
-    .replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "");
+  return normalizeResourcePath(path);
 }
 
 export function isNarrativeReferencePath(path: string): boolean {

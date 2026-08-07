@@ -177,7 +177,9 @@ export function classifyProposalFailure(result: Record<string, unknown>): Propos
   if (result.status === "final_review_revision_required" || code === "DIRECT_CHAPTER_REVIEW_BLOCKED") {
     return { kind: "gate", gate: "semantic_review" };
   }
-  if (code.includes("STYLE")) return { kind: "gate", gate: "style" };
+  if (code.includes("STYLE") || code.includes("CARD_REGISTER") || code.includes("DIALOGUE_FORMAT")) {
+    return { kind: "gate", gate: "style" };
+  }
   if (code.includes("RHYTHM")) return { kind: "gate", gate: "rhythm" };
   if (code.includes("LENGTH")) return { kind: "gate", gate: "length" };
   return { kind: "gate", gate: "proposal" };

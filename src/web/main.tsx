@@ -63,7 +63,8 @@ import {
   type ConnectionProbeResults,
   type ConnectionPreference,
 } from "./connection";
-import type { ProseLengthSettings, ProviderCatalog, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
+import type { ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
+import { DEFAULT_ROLEPLAY_SETTINGS } from "./model_config";
 import {
   AGENT_HIDDEN_CHARACTER_CARDS_KEY,
   DEFAULT_ROLEPLAY_RERUN_CONTROLS,
@@ -247,6 +248,7 @@ const ModelConfig = React.lazy(async () => {
 
 /** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
 const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, mode: "bounded", enforceMinimum: false };
+const DEFAULT_ROLEPLAY: RoleplaySettings = DEFAULT_ROLEPLAY_SETTINGS;
 
 function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
   const [open, setOpen] = useState(false);
@@ -531,6 +533,16 @@ function formatVersionTime(iso: string): string {
     return iso;
   }
 }
+
+/** Startup / project-switch default: open project instructions when present. */
+function defaultBrowserDocument(documents: readonly string[]): string | undefined {
+  const writer = documents.find((path) => {
+    const base = path.split("/").pop() ?? path;
+    return base.toLowerCase() === "writer.md";
+  });
+  return writer ?? documents[0];
+}
+
 function App() {
   const [state, setState] = useState<State>();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -984,7 +996,10 @@ function App() {
           }
         }
       }
-      if (!activePathRef.current && next.documents[0]) setActivePath(next.documents[0]);
+      if (!activePathRef.current) {
+        const fallback = defaultBrowserDocument(next.documents);
+        if (fallback) setActivePath(fallback);
+      }
       return next;
     },
     [mergeConversationMessages, reconcileStreamStepsAnchor, updateStreamStepsAnchorId],
@@ -7043,6 +7058,7 @@ function App() {
           scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 }}
           proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
           proseGateTimeouts={state.agentSettings?.proseGateTimeouts ?? { primarySeconds: 60, finalSeconds: 180 }}
+          roleplay={state.agentSettings?.roleplay ?? DEFAULT_ROLEPLAY_SETTINGS}
           writingMode={state.agentSettings?.writingMode ?? "fast"}
           characterEvolutionEnabled={state.agentSettings?.characterEvolutionEnabled ?? true}
           reviewFollowsProseModel={state.agentSettings?.reviewFollowsProseModel ?? true}
@@ -7223,6 +7239,22 @@ function App() {
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           proseGateTimeouts,
+          roleplay: previous.agentSettings?.roleplay ?? DEFAULT_ROLEPLAY,
+          },
+          } : previous)}
+          onRoleplayChanged={roleplay => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          proseGateTimeouts: previous.agentSettings?.proseGateTimeouts ?? { primarySeconds: 60, finalSeconds: 180 },
+          roleplay,
           },
           } : previous)}
           onCharacterEvolutionChanged={characterEvolutionEnabled => setState(previous => previous ? {

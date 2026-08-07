@@ -24,14 +24,25 @@ import {
   isAgentStepBudgetMode,
   isProseLengthMode,
   isPermissionMode,
+  isReasoningEffort,
+  isRoleplayReasoningChoice,
   listProjectSkills,
   loadAgentSettings,
   loadProjectInstructions,
   saveAgentSettings,
   isWritingExecutionMode,
+  MIN_ROLEPLAY_RECENT_MESSAGES,
+  MAX_ROLEPLAY_RECENT_MESSAGES,
+  MIN_ROLEPLAY_OUTPUT_TOKENS,
+  MAX_ROLEPLAY_OUTPUT_TOKENS,
+  MIN_ROLEPLAY_LENGTH_BLOCKS,
+  MAX_ROLEPLAY_LENGTH_BLOCKS,
+  ROLEPLAY_LENGTH_LEVEL_KEYS,
   type AgentStepBudgetMode,
   type ProseLengthSettings,
   type ProseGateTimeoutSettings,
+  type RoleplayLengthBlockBudgets,
+  type RoleplaySettings,
   type ScenePipelineSettings,
   type WritingExecutionMode,
 } from "./agent_runtime.js";
@@ -217,6 +228,8 @@ function toStepUsageCall(call: StepUsage, callKind = "unspecified"): NonNullable
     cost: call.cost,
     currency: call.currency,
     ...(call.estimated ? { estimated: true } : {}),
+    ...(call.reasoningTokens !== undefined ? { reasoningTokens: call.reasoningTokens } : {}),
+    ...(call.durationMs !== undefined ? { durationMs: call.durationMs } : {}),
   };
 }
 
@@ -243,6 +256,8 @@ function mergePersistedStepUsage(
     [...(current.callBreakdown ?? []).map(call => call.providerName), ...nextCalls.map(call => call.providerName), current.providerName, next.providerName]
       .filter((value): value is string => Boolean(value?.trim())),
   )];
+  const hasReasoning = current.reasoningTokens !== undefined || next.reasoningTokens !== undefined;
+  const hasDuration = current.durationMs !== undefined || next.durationMs !== undefined;
   return {
     ...(models.length ? { model: models.length === 1 ? models[0] : "多个模型" } : {}),
     ...(providerNames.length
@@ -257,6 +272,12 @@ function mergePersistedStepUsage(
     currency: current.cost > 0 ? current.currency : next.currency || current.currency,
     ...(estimated ? { estimated: true } : {}),
     ...(!estimated && hits + misses > 0 ? { cacheHitRate: hits / (hits + misses) } : {}),
+    ...(hasReasoning
+      ? { reasoningTokens: (current.reasoningTokens ?? 0) + (next.reasoningTokens ?? 0) }
+      : {}),
+    ...(hasDuration
+      ? { durationMs: (current.durationMs ?? 0) + (next.durationMs ?? 0) }
+      : {}),
     requestComponents: [...(current.requestComponents ?? []), ...(next.requestComponents ?? [])],
     callBreakdown: [...(current.callBreakdown ?? []), ...nextCalls],
   };
@@ -1471,6 +1492,7 @@ export async function startWriterServer(options: {
       scenePipeline: settings.scenePipeline,
       proseLength: settings.proseLength,
       proseGateTimeouts: settings.proseGateTimeouts,
+      roleplay: settings.roleplay,
       instructionsPath: instructions?.path ?? null,
       skills: listProjectSkills(options.project).map(skill => ({
         id: skill.id, name: skill.name, description: skill.description, path: skill.path,
@@ -1493,6 +1515,9 @@ export async function startWriterServer(options: {
         scenePipeline?: Partial<ScenePipelineSettings>;
         proseLength?: Partial<ProseLengthSettings>;
         proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
+        roleplay?: Partial<Omit<RoleplaySettings, "lengthBlockBudgets">> & {
+          lengthBlockBudgets?: Partial<RoleplayLengthBlockBudgets>;
+        };
       }>();
       if (body.permissionMode !== undefined && !isPermissionMode(body.permissionMode)) {
         return context.json({ error: "permissionMode 仅支持 ask、auto、plan" }, 400);
@@ -1576,6 +1601,75 @@ export async function startWriterServer(options: {
           return context.json({ error: "最终审核超时不能小于首选审核超时" }, 400);
         }
       }
+      if (body.roleplay !== undefined) {
+        if (body.roleplay.performanceReasoningEffort !== undefined
+          && (typeof body.roleplay.performanceReasoningEffort !== "string"
+            || !isRoleplayReasoningChoice(body.roleplay.performanceReasoningEffort))) {
+          return context.json({ error: "performanceReasoningEffort 须为 inherit 或 none/minimal/low/medium/high/xhigh" }, 400);
+        }
+        if (body.roleplay.jsonReasoningEffort !== undefined
+          && (typeof body.roleplay.jsonReasoningEffort !== "string"
+            || !isReasoningEffort(body.roleplay.jsonReasoningEffort))) {
+          return context.json({ error: "jsonReasoningEffort 须为 none/minimal/low/medium/high/xhigh" }, 400);
+        }
+        if (body.roleplay.qualityFinalizeEnabled !== undefined
+          && typeof body.roleplay.qualityFinalizeEnabled !== "boolean") {
+          return context.json({ error: "qualityFinalizeEnabled 必须是布尔值" }, 400);
+        }
+        if (body.roleplay.recentMessages !== undefined && (
+          !Number.isInteger(body.roleplay.recentMessages)
+          || Number(body.roleplay.recentMessages) < MIN_ROLEPLAY_RECENT_MESSAGES
+          || Number(body.roleplay.recentMessages) > MAX_ROLEPLAY_RECENT_MESSAGES
+        )) {
+          return context.json({
+            error: `recentMessages 须为 ${MIN_ROLEPLAY_RECENT_MESSAGES}—${MAX_ROLEPLAY_RECENT_MESSAGES} 的整数`,
+          }, 400);
+        }
+        for (const key of ["replyMaxOutputTokens", "jsonMaxOutputTokens"] as const) {
+          const value = body.roleplay[key];
+          if (value !== undefined && (
+            !Number.isInteger(value)
+            || Number(value) < MIN_ROLEPLAY_OUTPUT_TOKENS
+            || Number(value) > MAX_ROLEPLAY_OUTPUT_TOKENS
+          )) {
+            return context.json({
+              error: `${key} 须为 ${MIN_ROLEPLAY_OUTPUT_TOKENS}—${MAX_ROLEPLAY_OUTPUT_TOKENS} 的整数`,
+            }, 400);
+          }
+        }
+        if (body.roleplay.lengthBlockBudgets !== undefined) {
+          if (!body.roleplay.lengthBlockBudgets || typeof body.roleplay.lengthBlockBudgets !== "object"
+            || Array.isArray(body.roleplay.lengthBlockBudgets)) {
+            return context.json({ error: "lengthBlockBudgets 须为对象" }, 400);
+          }
+          const budgets = body.roleplay.lengthBlockBudgets as Partial<RoleplayLengthBlockBudgets>;
+          for (const level of ROLEPLAY_LENGTH_LEVEL_KEYS) {
+            const entry = budgets[level];
+            if (entry === undefined) continue;
+            if (!entry || typeof entry !== "object") {
+              return context.json({ error: `lengthBlockBudgets[${level}] 无效` }, 400);
+            }
+            for (const field of ["minBlocks", "maxBlocks"] as const) {
+              const n = entry[field];
+              if (n !== undefined && (
+                !Number.isInteger(n)
+                || Number(n) < MIN_ROLEPLAY_LENGTH_BLOCKS
+                || Number(n) > MAX_ROLEPLAY_LENGTH_BLOCKS
+              )) {
+                return context.json({
+                  error: `lengthBlockBudgets[${level}].${field} 须为 ${MIN_ROLEPLAY_LENGTH_BLOCKS}—${MAX_ROLEPLAY_LENGTH_BLOCKS} 的整数`,
+                }, 400);
+              }
+            }
+            if (entry.minBlocks !== undefined && entry.maxBlocks !== undefined
+              && entry.maxBlocks < entry.minBlocks) {
+              return context.json({
+                error: `lengthBlockBudgets[${level}] 的 maxBlocks 不能小于 minBlocks`,
+              }, 400);
+            }
+          }
+        }
+      }
       const settings = saveAgentSettings(options.project, {
         ...(body.permissionMode ? { permissionMode: body.permissionMode as PermissionMode } : {}),
         ...(body.writingMode ? { writingMode: body.writingMode as WritingExecutionMode } : {}),
@@ -1586,6 +1680,7 @@ export async function startWriterServer(options: {
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
         ...(body.proseLength ? { proseLength: body.proseLength } : {}),
         ...(body.proseGateTimeouts ? { proseGateTimeouts: body.proseGateTimeouts } : {}),
+        ...(body.roleplay ? { roleplay: body.roleplay } : {}),
       });
       return context.json({
         permissionMode: settings.permissionMode,
@@ -1597,6 +1692,7 @@ export async function startWriterServer(options: {
         scenePipeline: settings.scenePipeline,
         proseLength: settings.proseLength,
         proseGateTimeouts: settings.proseGateTimeouts,
+        roleplay: settings.roleplay,
       });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);

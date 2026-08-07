@@ -3,7 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { buildEvidenceGroundedWriterMessages, parseSceneActualState } from "./evidence_grounded_writer.js";
+import {
+  buildEvidenceGroundedWriterMessages,
+  mergeProseContinuation,
+  parseSceneActualState,
+} from "./evidence_grounded_writer.js";
 import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 import { assembleChapterSceneDraft, blockChapterSceneReview } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
@@ -14,6 +18,15 @@ import { handleBeginChapterDraft, handleWriteChapterScene } from "./tools/scene_
 import type { ToolExecutionContext, ToolHandlerArgs } from "./tools/types.js";
 
 const MODEL = { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" };
+
+test("length-limited writer continuations keep prose and remove a repeated seam", () => {
+  const first = "风压把沙粒推过靶沟。林千夏压低枪口，等最后一辆车越过标杆。";
+  const next = "林千夏压低枪口，等最后一辆车越过标杆。车尾刚沉进热浪，她便抬手示意全组前移。";
+  assert.equal(
+    mergeProseContinuation(first, next),
+    "风压把沙粒推过靶沟。林千夏压低枪口，等最后一辆车越过标杆。车尾刚沉进热浪，她便抬手示意全组前移。",
+  );
+});
 
 test("dialogue naturalness guidance stays in the dynamic writer request", () => {
   const pack = {
@@ -385,14 +398,14 @@ test("delegated scene never sends grounded prose through an ungrounded style rep
   }
 });
 
-test("delegated writer receives the same adaptive feedback returned at the scene boundary", async () => {
+test("delegated writer does not receive prior-scene metric feedback", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-grounded-adaptive-"));
   let store: WriterStore | undefined;
   try {
     const project = WriterProject.init(root, "自适应反馈");
     store = new WriterStore(project);
     const sessionId = store.createSession("自适应反馈");
-    const receivedFeedback: string[][] = [];
+    const receivedMetricFeedback: boolean[] = [];
     let writerCalls = 0;
     const context: ToolExecutionContext = {
       permissionMode: "ask",
@@ -408,7 +421,7 @@ test("delegated writer receives the same adaptive feedback returned at the scene
         model: MODEL,
         stateModel: MODEL,
         run: async (_model, input) => {
-          receivedFeedback.push(input.styleFeedback ?? []);
+          receivedMetricFeedback.push("styleFeedback" in input);
           writerCalls += 1;
           return {
             content: writerCalls === 1
@@ -453,14 +466,13 @@ test("delegated writer receives the same adaptive feedback returned at the scene
       input: { sceneId: "confirm", notes: "## 场景目标\n双方确认记录已经交接。" },
     })) as Record<string, unknown>;
     assert.equal(first.status, "written");
-    assert.match(JSON.stringify(first.styleFeedback), /对白有.*很短的应答/u);
+    assert.equal("styleFeedback" in first, false);
 
     await handleWriteChapterScene({
       ...baseArgs,
       input: { sceneId: "read", notes: "## 场景目标\n林觉核对记录并暂不回应门外的人。" },
     });
-    assert.equal(receivedFeedback.length, 2);
-    assert.match(receivedFeedback[1].join("\n"), /对白有.*很短的应答/u);
+    assert.deepEqual(receivedMetricFeedback, [false, false]);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

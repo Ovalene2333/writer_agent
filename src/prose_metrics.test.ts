@@ -6,10 +6,8 @@ import {
   findAdjacentDuplicateSentences,
   findEchoDialogueParagraphs,
   findRecycledSentences,
-  priorChapterNegativeList,
   RECYCLE_ERROR_LIMIT,
   removeAdjacentDuplicateSentences,
-  sceneAntiFormulaFeedback,
 } from "./prose_metrics.js";
 
 test("findAdjacentDuplicateSentences catches the AA generation bug and ignores rhythmic short repeats", () => {
@@ -125,37 +123,4 @@ test("clean varied prose produces no issues", () => {
   const metrics = analyzeChapterProseMetrics(text);
   assert.deepEqual(metrics.issues, []);
   assert.equal(chapterMetricsBlockError(metrics), undefined);
-});
-
-test("sceneAntiFormulaFeedback reports budgets, banned openings and exhausted motif sentences", () => {
-  const scene = [
-    "千夏推开舱门。走廊尽头没有人。",
-    "千夏看了一眼仪表。脚掌外侧先落地。",
-    "千夏收回视线。脚掌外侧先落地。",
-    "千夏握住扶手。脚掌外侧先落地。",
-  ].join("\n\n");
-  const lines = sceneAntiFormulaFeedback({ chapterSoFar: scene });
-  assert.ok(lines.length >= 3);
-  assert.match(lines[0], /破折号.*否定—改判句式家族.*和X一样/u);
-  assert.ok(lines.some(line => line.includes("千夏") && line.includes("段首")));
-  assert.ok(lines.some(line => line.includes("脚掌外侧先落地")));
-});
-
-test("sceneAntiFormulaFeedback surfaces verbatim overlap with prior prose", () => {
-  const prior = "剑格上的状态灯从青到橙到灭。她把手套摘下来放在桌上。";
-  const scene = "训练结束了。剑格上的状态灯从青到橙到灭。她转身离开训练区。";
-  const lines = sceneAntiFormulaFeedback({ chapterSoFar: scene, priorChapterText: prior });
-  assert.ok(lines.some(line => line.includes("逐字重合")));
-});
-
-test("priorChapterNegativeList extracts signature sentences and frequent openings", () => {
-  const prior = [
-    "千夏在六点十五分醒来。纳米核心每分钟四十次。",
-    "千夏走进走廊。纳米核心每分钟四十次。",
-    "千夏推开门。纳米核心每分钟四十次。",
-    "千夏坐下。纳米核心每分钟四十次。",
-  ].join("\n\n");
-  const lines = priorChapterNegativeList(prior);
-  assert.ok(lines.some(line => line.includes("纳米核心每分钟四十次")));
-  assert.ok(lines.some(line => line.includes("千夏")));
 });

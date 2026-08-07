@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   Character,
   ModelConfig,
+  ReasoningEffort,
   RoleplayContentRating,
   RoleplayInputMode,
   RoleplayInterlocutor,
@@ -12,10 +13,17 @@ import type {
   RoleplaySessionMemory,
   RoleplayWorkingState,
 } from "./types.js";
+import {
+  loadAgentSettings,
+  type RoleplayLengthBlockBudgets,
+  type RoleplayLengthLevelKey,
+  type RoleplaySettings,
+  DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS,
+} from "./agent_runtime.js";
 import { characterName, characterPromptCard, characterPromptViews } from "./characters.js";
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelSupportsToolChoice, nonThinkingRequestOptions, samplingRequestOptions } from "./model_compat.js";
+import { modelSupportsToolChoice, samplingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody, streamProviderCompletion } from "./model_api.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
@@ -128,6 +136,71 @@ export const ROLEPLAY_LENGTH_PRESETS: readonly RoleplayLengthPreset[] = [
   { level: 2, label: "展开", minChars: 450, maxChars: 700, rangeLabel: "450–700 字", minBlocks: 4, maxBlocks: 5, preferredMinCharsPerBlock: 100, preferredMaxCharsPerBlock: 140 },
 ] as const;
 
+// Defaults when settings are unavailable; runtime prefers project roleplay settings.
+export const ROLEPLAY_JSON_MAX_OUTPUT_TOKENS = 8_000;
+export const ROLEPLAY_REPLY_MAX_OUTPUT_TOKENS = 8_000;
+
+/** Apply performance reasoning override; `inherit` keeps the assigned model config. */
+export function applyRoleplayPerformanceModel(
+  model: ModelConfig,
+  settings: Pick<RoleplaySettings, "performanceReasoningEffort">,
+): ModelConfig {
+  const choice = settings.performanceReasoningEffort;
+  if (choice === "inherit") return model;
+  return { ...model, reasoningEffort: choice };
+}
+
+/** Force JSON-helper reasoning effort (typically none/low). */
+export function applyRoleplayJsonModel(
+  model: ModelConfig,
+  settings: Pick<RoleplaySettings, "jsonReasoningEffort">,
+): ModelConfig {
+  return { ...model, reasoningEffort: settings.jsonReasoningEffort };
+}
+
+function roleplayThinkingForEffort(
+  effort: ReasoningEffort | undefined,
+): { type: "enabled" | "disabled" } | undefined {
+  if (effort === "none" || effort === "minimal") return { type: "disabled" };
+  if (effort === undefined) return undefined;
+  return { type: "enabled" };
+}
+
+export function resolveRoleplaySettings(project?: WriterProject, override?: Partial<RoleplaySettings>): RoleplaySettings {
+  const base = project ? loadAgentSettings(project).roleplay : loadAgentSettingsFallback();
+  return override ? { ...base, ...override } : base;
+}
+
+function loadAgentSettingsFallback(): RoleplaySettings {
+  return {
+    performanceReasoningEffort: "inherit",
+    jsonReasoningEffort: "none",
+    qualityFinalizeEnabled: true,
+    recentMessages: ROLEPLAY_RECENT_MESSAGES,
+    replyMaxOutputTokens: ROLEPLAY_REPLY_MAX_OUTPUT_TOKENS,
+    jsonMaxOutputTokens: ROLEPLAY_JSON_MAX_OUTPUT_TOKENS,
+    lengthBlockBudgets: { ...DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS },
+  };
+}
+
+export function roleplayLengthLevelKey(level: unknown): RoleplayLengthLevelKey {
+  const normalized = normalizeRoleplayLengthLevel(level);
+  return String(normalized) as RoleplayLengthLevelKey;
+}
+
+/** Resolve min/max blocks for a length level, using settings when provided. */
+export function resolveRoleplayLengthBlockBudget(
+  length: unknown,
+  budgets?: RoleplayLengthBlockBudgets,
+): { minBlocks: number; maxBlocks: number } {
+  const preset = roleplayLengthPreset(length);
+  const key = roleplayLengthLevelKey(preset.level);
+  const override = budgets?.[key];
+  const minBlocks = override?.minBlocks ?? preset.minBlocks;
+  const maxBlocks = Math.max(minBlocks, override?.maxBlocks ?? preset.maxBlocks);
+  return { minBlocks, maxBlocks };
+}
+
 function normalizedRerunLevel(value: unknown): number {
   const numeric = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : 0;
   return Math.max(-2, Math.min(2, numeric));
@@ -143,21 +216,29 @@ export function roleplayLengthPreset(value: unknown): RoleplayLengthPreset {
 }
 
 /** Presentation block budget for ordinary turns, scaled by the ongoing length preference. */
-export function roleplayTurnPresentationBudget(length: unknown): RoleplayPresentationBudget {
+export function roleplayTurnPresentationBudget(
+  length: unknown,
+  budgets?: RoleplayLengthBlockBudgets,
+): RoleplayPresentationBudget {
   const preset = roleplayLengthPreset(length);
+  const blocks = resolveRoleplayLengthBlockBudget(length, budgets);
   return {
-    minBlocks: preset.minBlocks,
-    maxBlocks: preset.maxBlocks,
+    minBlocks: blocks.minBlocks,
+    maxBlocks: blocks.maxBlocks,
     preferredMinCharsPerBlock: preset.preferredMinCharsPerBlock,
     preferredMaxCharsPerBlock: preset.preferredMaxCharsPerBlock,
   };
 }
 
-export function formatRoleplayLengthGuidance(value: unknown): string {
+export function formatRoleplayLengthGuidance(
+  value: unknown,
+  budgets?: RoleplayLengthBlockBudgets,
+): string {
   const preset = roleplayLengthPreset(value);
-  const blockRange = preset.minBlocks === preset.maxBlocks
-    ? `${preset.minBlocks} 个`
-    : `${preset.minBlocks}–${preset.maxBlocks} 个`;
+  const blocks = resolveRoleplayLengthBlockBudget(value, budgets);
+  const blockRange = blocks.minBlocks === blocks.maxBlocks
+    ? `${blocks.minBlocks} 个`
+    : `${blocks.minBlocks}–${blocks.maxBlocks} 个`;
   return `篇幅：${preset.label}。本轮安排 ${blockRange}相互连贯的演出块，每块尽量写到约 ${preset.preferredMinCharsPerBlock}–${preset.preferredMaxCharsPerBlock} 字，以完整承载该块的现场作用；必要时可随自然表达小幅浮动，不要为达数字注水。长档在同一核心反应内依次展开观察、动作、停顿、台词或收束，短档只保留最关键部分。不要把长档合并成一两个块，也不要用重复描写凑块。`;
 }
 
@@ -183,7 +264,10 @@ function rerunLevelLine(value: number, negative: string, positive: string): stri
 }
 
 /** Performance controls for both ordinary turns and reruns (length is always applied). */
-export function formatRoleplayRerunControls(value: RoleplayRerunControls | undefined): string {
+export function formatRoleplayRerunControls(
+  value: RoleplayRerunControls | undefined,
+  budgets?: RoleplayLengthBlockBudgets,
+): string {
   const controls = normalizeRoleplayRerunControls(value);
   const ratingLine = controls.contentRating === "sfw"
     ? "强制 SFW：本轮不得出现露骨性内容、裸露细节或色情化描写；亲密互动保持非露骨。"
@@ -191,7 +275,7 @@ export function formatRoleplayRerunControls(value: RoleplayRerunControls | undef
       ? "强制 NSFW：本轮采用成人向露骨尺度，不淡出、不规避身体与欲望细节；仍须保持角色人设、双方自愿和既有边界。"
       : "";
   const lines = [
-    formatRoleplayLengthGuidance(controls.length),
+    formatRoleplayLengthGuidance(controls.length, budgets),
     rerunLevelLine(controls.pace, "放慢节奏，保留有意义的停顿。", "加快节奏，尽快落到决定或反应。"),
     rerunLevelLine(controls.emotion, "收敛外露情绪，以克制和留白表达。", "增强情绪外显，但不要解释情绪。"),
     rerunLevelLine(controls.action, "降低动作占比，以台词或沉默为主。", "提高动作占比，用角色自身动作承载反应。"),
@@ -722,10 +806,14 @@ export function buildRoleplayPerceptionMessages(input: string): ChatMessage[] {
   ];
 }
 
+/**
+ * True when the first-pass classification needs a coverage finalizer.
+ * Primary channels empty (all-empty, or everything dumped into unknowableFacts)
+ * is the misroute the second call is meant to repair.
+ */
 export function roleplayPerceptionNeedsSemanticRetry(projection: RoleplayPerceptionProjection): boolean {
   return projection.speech.length === 0
     && projection.knowableFacts.length === 0
-    && projection.unknowableFacts.length === 0
     && projection.potentialSensations.length === 0;
 }
 
@@ -878,22 +966,40 @@ export async function compileRoleplayPerception(options: {
   input: string;
   signal?: AbortSignal;
   usageReporter?: ModelUsageReporter;
+  maxTokens?: number;
 }): Promise<RoleplayPerceptionProjection> {
+  const jsonOptions = {
+    strictJson: true as const,
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+  };
   const completed = await completeJsonText(
     options.model,
     buildRoleplayPerceptionMessages(options.input),
     options.signal,
-    { strictJson: true },
+    { ...jsonOptions, errorLabel: "角色感知编译" },
   );
-  if (completed.usage) options.usageReporter?.(options.model, completed.usage, { callKind: "roleplay_perception" });
+  if (completed.usage) {
+    options.usageReporter?.(options.model, completed.usage, {
+      callKind: "roleplay_perception",
+      ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+    });
+  }
   const initial = parseRoleplayPerception(completed.content);
+  // Skip the second call when primary channels already have content.
+  if (!roleplayPerceptionNeedsSemanticRetry(initial)) return initial;
+
   const retried = await completeJsonText(
     options.model,
     buildRoleplayPerceptionRetryMessages(options.input, initial),
     options.signal,
-    { strictJson: true },
+    { ...jsonOptions, errorLabel: "角色感知覆盖终审" },
   );
-  if (retried.usage) options.usageReporter?.(options.model, retried.usage, { callKind: "roleplay_perception_finalize" });
+  if (retried.usage) {
+    options.usageReporter?.(options.model, retried.usage, {
+      callKind: "roleplay_perception_finalize",
+      ...(retried.durationMs !== undefined ? { durationMs: retried.durationMs } : {}),
+    });
+  }
   const projection = parseRoleplayPerception(retried.content);
   if (roleplayPerceptionNeedsSemanticRetry(projection)) {
     throw new Error("角色感知仍无法确定本轮可感知内容，请检查或手动修正感知后重试");
@@ -1037,6 +1143,7 @@ async function finalizeRoleplayPerformance(options: {
   budget: RoleplayPresentationBudget;
   signal?: AbortSignal;
   usageReporter?: ModelUsageReporter;
+  maxTokens?: number;
 }): Promise<RoleplayPresentationBlock[]> {
   const completed = await completeJsonText(options.model, [
     { role: "system", content: `你是即时角色对戏的终审剪辑器，不续写剧情。依据 currentPerception、定向要求和候选演出，返回可以直接展示的最终演出块。
@@ -1053,15 +1160,22 @@ async function finalizeRoleplayPerformance(options: {
       requestedControls: normalizeRoleplayRerunControls(options.rerunControls),
       candidatePerformance: options.source,
     }) },
-  ], options.signal);
-  if (completed.usage) options.usageReporter?.(options.model, completed.usage, { callKind: "roleplay_quality_finalize" });
+  ], options.signal, {
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+  });
+  if (completed.usage) {
+    options.usageReporter?.(options.model, completed.usage, {
+      callKind: "roleplay_quality_finalize",
+      ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+    });
+  }
   const cleaned = completed.content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
-  if (start < 0 || end <= start) return [];
+  if (start < 0 || end <= start) throw new Error("角色演出终审没有返回有效 JSON");
   try {
     const value = JSON.parse(cleaned.slice(start, end + 1)) as { blocks?: unknown };
-    if (!Array.isArray(value.blocks)) return [];
+    if (!Array.isArray(value.blocks)) throw new Error("角色演出终审缺少 blocks");
     const blocks = value.blocks.flatMap(item => {
       if (!item || typeof item !== "object" || Array.isArray(item)) return [];
       const raw = item as Record<string, unknown>;
@@ -1071,11 +1185,11 @@ async function finalizeRoleplayPerformance(options: {
         : [];
     });
     if (roleplayPresentationWithinBudget(blocks, options.budget)) return blocks;
-    return blocks.length > options.budget.maxBlocks
-      ? clampRoleplayPresentationBlocks(blocks, options.budget)
-      : [];
-  } catch {
-    return [];
+    if (blocks.length > options.budget.maxBlocks) return clampRoleplayPresentationBlocks(blocks, options.budget);
+    throw new Error("角色演出终审返回的 blocks 不满足展示预算");
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("角色演出终审")) throw error;
+    throw new Error("角色演出终审 JSON 无法解析");
   }
 }
 
@@ -1210,6 +1324,7 @@ export function buildRoleplayChatMessages(parts: {
   userText: string;
   rerunDirections?: RoleplayRerunDirection[];
   rerunControls?: RoleplayRerunControls;
+  lengthBlockBudgets?: RoleplayLengthBlockBudgets;
   /** True when the current turn is a silent spectator continuation (角色续演). */
   spectatorContinuation?: boolean;
 }): ChatMessage[] {
@@ -1218,7 +1333,7 @@ export function buildRoleplayChatMessages(parts: {
       spectatorContinuation: parts.spectatorContinuation === true,
     }),
     formatRoleplayRerunDirections(parts.rerunDirections ?? []),
-    formatRoleplayRerunControls(parts.rerunControls),
+    formatRoleplayRerunControls(parts.rerunControls, parts.lengthBlockBudgets),
   ].filter(Boolean).join("\n");
   const dynamicContext = [
     ROLEPLAY_DYNAMIC_CONTEXT_MARKER + formatRoleplaySummarySlot(parts.summary),
@@ -1296,10 +1411,26 @@ export async function runRoleplayChat(options: {
   qualityModel?: ModelConfig;
   /** Optional cheaper model for rolling summary / working-state refresh. */
   summarizer?: ModelConfig;
+  /** Optional project roleplay settings override (tests / advanced callers). */
+  roleplaySettings?: Partial<RoleplaySettings>;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }): Promise<void> {
   const emit = options.onEvent ?? (() => undefined);
+  const roleplaySettings = resolveRoleplaySettings(options.project, options.roleplaySettings);
+  const performanceModel = applyRoleplayPerformanceModel(options.model, roleplaySettings);
+  const perceptionModel = applyRoleplayJsonModel(
+    options.perceptionModel ?? options.model,
+    roleplaySettings,
+  );
+  const qualityModel = applyRoleplayJsonModel(
+    options.qualityModel ?? options.summarizer ?? options.model,
+    roleplaySettings,
+  );
+  const memoryModel = applyRoleplayJsonModel(
+    options.summarizer ?? options.model,
+    roleplaySettings,
+  );
   const reportInternalUsage: ModelUsageReporter = (callModel, callUsage, meta) => {
     emit(buildRecordedUsageEvent(options.store, options.sessionId, callModel, callUsage, {
       ...meta,
@@ -1396,10 +1527,11 @@ export async function runRoleplayChat(options: {
     storedPerception = modelUserText;
   } else {
     const projection = options.perceptionOverride ?? await compileRoleplayPerception({
-        model: options.perceptionModel ?? options.summarizer ?? options.model,
+        model: perceptionModel,
         input: userText,
         signal: options.signal,
         usageReporter: reportInternalUsage,
+        maxTokens: roleplaySettings.jsonMaxOutputTokens,
       });
     modelUserText = formatRoleplayPerceptionForModel(projection);
     storedPerception = serializeRoleplayPerception(projection);
@@ -1420,7 +1552,7 @@ export async function runRoleplayChat(options: {
   const memoryPrior = projectedPrior.map(message => message.role === "user"
     ? { ...message, content: roleplayPerceptionForMemory(message.content) }
     : message);
-  const recent = projectedPrior.slice(-ROLEPLAY_RECENT_MESSAGES);
+  const recent = projectedPrior.slice(-roleplaySettings.recentMessages);
   // Keep the whole unsummarized batch stable and append-only. The history resets only
   // when summarizedThroughId advances, instead of sliding left on every mature turn.
   const cacheBatch = roleplayCacheBatch(projectedPrior, memory.summarizedThroughId);
@@ -1462,6 +1594,7 @@ export async function runRoleplayChat(options: {
     userText: modelUserText,
     rerunDirections: options.rerunDirections,
     rerunControls: options.rerunControls,
+    lengthBlockBudgets: roleplaySettings.lengthBlockBudgets,
     spectatorContinuation: performerAutoReply,
   });
   const currentModelInput = messages.at(-1)?.content;
@@ -1477,11 +1610,23 @@ export async function runRoleplayChat(options: {
   }
 
   try {
-    const budget = roleplayTurnPresentationBudget(options.rerunControls?.length);
-    const result = await streamRoleplayText(options.model, messages, options.signal, () => undefined);
+    const budget = roleplayTurnPresentationBudget(
+      options.rerunControls?.length,
+      roleplaySettings.lengthBlockBudgets,
+    );
+    const result = await streamRoleplayText(
+      performanceModel,
+      messages,
+      options.signal,
+      () => undefined,
+      { maxTokens: roleplaySettings.replyMaxOutputTokens },
+    );
+    if (result.finishReason === "length") {
+      throw new Error("角色演出输出达到长度上限；当前进度未落库，请重试本回合");
+    }
     const rawReply = result.content.trim();
-    const qualityModel = options.qualityModel ?? options.summarizer ?? options.model;
-    const finalized = rawReply
+    let finalizationError = "";
+    const finalized = rawReply && roleplaySettings.qualityFinalizeEnabled
       ? await finalizeRoleplayPerformance({
           model: qualityModel,
           source: rawReply,
@@ -1491,13 +1636,29 @@ export async function runRoleplayChat(options: {
           budget,
           signal: options.signal,
           usageReporter: reportInternalUsage,
-        }).catch(() => [])
+          maxTokens: roleplaySettings.jsonMaxOutputTokens,
+        }).catch((error) => {
+          finalizationError = error instanceof Error ? error.message : String(error);
+          return [];
+        })
       : [];
     const rendered = renderRoleplayWirePresentation(rawReply);
     const fallbackBlocks = rendered.valid ? clampRoleplayPresentationBlocks(rendered.blocks, budget) : [];
     let reply = (finalized.length ? finalized : fallbackBlocks)
       .map(renderRoleplayPresentationBlock).filter(Boolean).join("\n\n");
-    if (!reply) reply = `*${participant.name} 沉默了一会儿。*`;
+    if (!reply) {
+      const primaryState = rawReply
+        ? `主模型返回 ${rawReply.length} 字，但演出 wire 格式无效`
+        : `主模型 content 为空（finish_reason=${result.finishReason ?? "unknown"}，reasoning=${result.reasoningCharacters} 字符）`;
+      const qualityState = rawReply
+        ? !roleplaySettings.qualityFinalizeEnabled
+          ? "演出终审已关闭，且主模型 wire 无法渲染"
+          : finalizationError
+            ? `终审失败：${finalizationError.slice(0, 300)}`
+            : "终审没有返回满足展示预算的有效 blocks"
+        : "主回复为空，未执行终审";
+      throw new Error(`角色演出没有可展示内容：${primaryState}；${qualityState}`);
+    }
     // Lightweight post-turn bookkeeping (no extra model call).
     // Spectator continuations are still the same action chain when state.beat is stale;
     // do not inflate sameBeatTurns into a forced "换话题" pressure between continues.
@@ -1512,7 +1673,7 @@ export async function runRoleplayChat(options: {
     options.store.saveRoleplayMemory(options.sessionId, memory);
 
     if (result.usage) {
-      emitUsage(emit, options.store, options.sessionId, options.model, result.usage, 1, "roleplay_reply", options.jobId);
+      emitUsage(emit, options.store, options.sessionId, performanceModel, result.usage, 1, "roleplay_reply", options.jobId);
     }
 
     // Refresh rolling summary / working-state now that the reply is out (best-effort).
@@ -1528,10 +1689,12 @@ export async function runRoleplayChat(options: {
           memory,
           prior: memoryPrior,
           firstRecentId,
-          model: options.summarizer ?? options.model,
+          model: memoryModel,
           signal: memorySignal,
           forceStateOnly: !needsSummary && dueStateRefresh,
           usageReporter: reportInternalUsage,
+          maxTokens: roleplaySettings.jsonMaxOutputTokens,
+          recentMessages: roleplaySettings.recentMessages,
         });
       } catch {
         if (needsSummary) {
@@ -1632,6 +1795,7 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
       model: options.model.model, messages, tools,
       ...(modelSupportsToolChoice(options.model) ? { tool_choice: "auto" } : {}),
       stream: false,
+      max_tokens: ROLEPLAY_JSON_MAX_OUTPUT_TOKENS,
       ...samplingRequestOptions(options.model, { temperature: options.model.temperature ?? 0.4 }),
     });
     endpoint = wire.endpoint;
@@ -1729,7 +1893,12 @@ export async function generateRoleplayScene(options: {
       }),
     },
   ], options.signal, { strictJson: true, errorLabel: "场景生成" });
-  if (completed.usage) options.usageReporter?.(options.model, completed.usage, { callKind: "roleplay_scene_generation" });
+  if (completed.usage) {
+    options.usageReporter?.(options.model, completed.usage, {
+      callKind: "roleplay_scene_generation",
+      ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+    });
+  }
   return parseGeneratedRoleplayScene(completed.content);
 }
 
@@ -1848,7 +2017,12 @@ async function retrieveRoleplayLore(options: {
         `[${index}] ${item.path}${item.bound ? "（场景绑定）" : ""}\n${item.excerpt}`,
       ).join("\n\n")}` },
     ], options.signal);
-    if (completed.usage) options.usageReporter?.(options.model, completed.usage, { callKind: "roleplay_lore_rerank" });
+    if (completed.usage) {
+      options.usageReporter?.(options.model, completed.usage, {
+        callKind: "roleplay_lore_rerank",
+        ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+      });
+    }
     const content = completed.content;
     const parsed = JSON.parse(content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")) as { selected?: Array<{ index?: unknown; reason?: unknown }> };
     const selected = (parsed.selected ?? []).flatMap(item => {
@@ -1877,8 +2051,10 @@ async function streamRoleplayText(
   messages: ChatMessage[],
   signal: AbortSignal | undefined,
   onText: (text: string) => void,
-): Promise<{ content: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number } }> {
+  options?: { maxTokens?: number },
+): Promise<{ content: string; reasoningCharacters: number; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number; reasoningTokens?: number } }> {
   const sampling = roleplaySampling(model);
+  const thinking = roleplayThinkingForEffort(model.reasoningEffort);
   const completed = await streamProviderCompletion({
     model,
     messages,
@@ -1886,9 +2062,13 @@ async function streamRoleplayText(
     topP: sampling.topP,
     frequencyPenalty: 0.3,
     presencePenalty: 0.15,
+    maxTokens: options?.maxTokens ?? ROLEPLAY_REPLY_MAX_OUTPUT_TOKENS,
+    ...(thinking ? { thinking } : {}),
   }, { signal, onText });
   return {
     content: completed.content,
+    reasoningCharacters: completed.reasoningContent.length,
+    ...(completed.finishReason ? { finishReason: completed.finishReason } : {}),
     ...(completed.usage ? { usage: completed.usage } : {}),
   };
 }
@@ -1903,11 +2083,14 @@ async function refreshRoleplayMemory(options: {
   signal?: AbortSignal;
   forceStateOnly?: boolean;
   usageReporter?: ModelUsageReporter;
+  maxTokens?: number;
+  recentMessages?: number;
 }): Promise<RoleplaySessionMemory> {
   const { memory, prior, firstRecentId, model } = options;
+  const recentWindow = options.recentMessages ?? ROLEPLAY_RECENT_MESSAGES;
   const older = prior.filter(message => message.id < firstRecentId && message.id > memory.summarizedThroughId);
   const batch = older.slice(0, ROLEPLAY_SUMMARY_BATCH);
-  const recentForState = prior.slice(-ROLEPLAY_RECENT_MESSAGES);
+  const recentForState = prior.slice(-recentWindow);
   const sourceMessages = options.forceStateOnly ? recentForState : batch.length ? batch : recentForState;
   const transcript = sourceMessages
     .map(message => `#${message.id} ${message.role === "user" ? "玩家输入（可能混合可见与不可见叙述）" : "扮演角色输出"}: ${message.content.replace(/\s+/g, " ").slice(0, 220)}`)
@@ -1948,8 +2131,15 @@ ${transcript}`;
   const completed = await completeJsonText(model, [
     { role: "system", content: system },
     { role: "user", content: user },
-  ], options.signal);
-  if (completed.usage) options.usageReporter?.(model, completed.usage, { callKind: "roleplay_memory_refresh" });
+  ], options.signal, {
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+  });
+  if (completed.usage) {
+    options.usageReporter?.(model, completed.usage, {
+      callKind: "roleplay_memory_refresh",
+      ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+    });
+  }
   const content = completed.content;
 
   const parsed = parseMemoryRefresh(content, memory);
@@ -2088,30 +2278,47 @@ function parseExtractedFacts(
   }
 }
 
+/**
+ * Roleplay JSON helpers (perception / quality finalize / memory / scene draft) are short
+ * structured extractors. Express intent only: lowest effort + thinking off.
+ * Provider-specific wire fields are applied in model_api / model_compat.
+ */
 async function completeJsonText(
   model: ModelConfig,
   messages: ChatMessage[],
   signal?: AbortSignal,
-  options?: { strictJson?: boolean; errorLabel?: string },
-): Promise<{ content: string; usage?: import("./types.js").ModelTokenUsage }> {
+  options?: { strictJson?: boolean; errorLabel?: string; maxTokens?: number },
+): Promise<{ content: string; usage?: import("./types.js").ModelTokenUsage; durationMs?: number }> {
   try {
+    const effort = model.reasoningEffort ?? "none";
+    const thinking = roleplayThinkingForEffort(effort) ?? { type: "disabled" as const };
     const completed = await completeProviderCompletion({
-      model,
+      model: { ...model, reasoningEffort: effort },
       messages,
       temperature: 0.2,
-      maxTokens: 1_800,
+      maxTokens: options?.maxTokens ?? ROLEPLAY_JSON_MAX_OUTPUT_TOKENS,
       responseFormat: options?.strictJson ? { type: "json_object" } : undefined,
-      thinking: nonThinkingRequestOptions(model).thinking,
+      thinking,
     }, signal);
+    if (completed.finishReason === "length") {
+      throw new Error(`${options?.errorLabel ?? "角色扮演 JSON 调用"}输出达到长度上限`);
+    }
     const usage = completed.usage
       ? {
           promptTokens: completed.usage.promptTokens,
           completionTokens: completed.usage.completionTokens,
           cacheHitTokens: completed.usage.cacheHitTokens,
           cacheMissTokens: completed.usage.cacheMissTokens,
+          ...(completed.usage.reasoningTokens !== undefined
+            ? { reasoningTokens: completed.usage.reasoningTokens }
+            : {}),
         }
       : undefined;
-    return { content: completed.content, ...(usage ? { usage } : {}) };
+    return {
+      content: completed.content,
+      ...(usage ? { usage } : {}),
+      ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`${options?.errorLabel ?? "扮演记忆刷新"}失败：${message.slice(0, 300)}`);

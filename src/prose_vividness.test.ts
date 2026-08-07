@@ -3,10 +3,7 @@ import { test } from "node:test";
 import {
   analyzeProseVividness,
   proseVividnessScore,
-  sceneVividnessFeedback,
 } from "./prose_vividness.js";
-import { sceneProseScoreBreakdown, vividnessAdjustment } from "./prose_metrics.js";
-import { shouldSkipSceneCandidates } from "./scene_candidates.js";
 
 /**
  * The failure this whole module exists for: prose with no mannerism, no dash
@@ -50,30 +47,4 @@ test("a real scene raises no vividness issues", () => {
 
 test("short passages report nothing (statistics are noise below the floor)", () => {
   assert.deepEqual(analyzeProseVividness("他走了。").issues, []);
-  assert.deepEqual(sceneVividnessFeedback("他走了。"), []);
-});
-
-test("the penalty ledger alone cannot separate two clean scenes; vividness can", () => {
-  const flat = sceneProseScoreBreakdown(FLAT);
-  const vivid = sceneProseScoreBreakdown(VIVID);
-  // Both are "clean" by every subtractive gate — that is exactly the blind spot.
-  assert.equal(flat.penalty, 0);
-  assert.equal(vivid.penalty, 0);
-  assert.ok(vivid.total > flat.total, `vivid=${vivid.total} should beat flat=${flat.total}`);
-});
-
-test("vividness adjustment stays small enough never to outweigh a real defect", () => {
-  assert.equal(vividnessAdjustment(100), 10);
-  assert.equal(vividnessAdjustment(0), -15);
-  // An adjacent duplicate sentence costs 40 — no vividness swing can pay for it.
-  assert.ok(vividnessAdjustment(100) - vividnessAdjustment(0) < 40);
-});
-
-test("best-of-N skips vivid scenes but still samples flat ones", () => {
-  assert.equal(shouldSkipSceneCandidates(sceneProseScoreBreakdown(VIVID)), true);
-  assert.equal(
-    shouldSkipSceneCandidates(sceneProseScoreBreakdown(FLAT)),
-    false,
-    "flat-but-clean prose must not be skipped — it is the case sampling exists for",
-  );
 });

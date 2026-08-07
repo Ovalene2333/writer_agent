@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DEFAULT_WRITER_INSTRUCTIONS, type WriterProject } from "./project.js";
+import type { ReasoningEffort } from "./types.js";
 export {
   listProjectSkills,
   loadSkillById,
@@ -50,6 +51,78 @@ export interface ProseGateTimeoutSettings {
   finalSeconds: number;
 }
 
+/** Live performance reasoning: inherit the assigned roleplay model, or force a level. */
+export type RoleplayReasoningChoice = ReasoningEffort | "inherit";
+
+/** Length slider levels used by roleplay presentation budgets (-2 极简 … 2 展开). */
+export const ROLEPLAY_LENGTH_LEVEL_KEYS = ["-2", "-1", "0", "1", "2"] as const;
+export type RoleplayLengthLevelKey = typeof ROLEPLAY_LENGTH_LEVEL_KEYS[number];
+
+/** Min/max presentation blocks for one length level. */
+export type RoleplayLengthBlockBudget = {
+  minBlocks: number;
+  maxBlocks: number;
+};
+
+/** Per-level block budgets keyed as strings for stable JSON. */
+export type RoleplayLengthBlockBudgets = Record<RoleplayLengthLevelKey, RoleplayLengthBlockBudget>;
+
+/**
+ * Project-level roleplay runtime knobs (not per-turn UI sliders).
+ * Model assignment stays in provider roles; these control effort/budget/finalize behavior.
+ */
+export interface RoleplaySettings {
+  /**
+   * Reasoning for the streamed character performance.
+   * `inherit` keeps the roleplay role's model.reasoningEffort.
+   */
+  performanceReasoningEffort: RoleplayReasoningChoice;
+  /**
+   * Reasoning for JSON helpers (perception / quality finalize / memory / scene draft).
+   * Defaults to none so classifiers do not burn a medium thinking budget.
+   */
+  jsonReasoningEffort: ReasoningEffort;
+  /** Run structural quality finalize after each performance. */
+  qualityFinalizeEnabled: boolean;
+  /** Recent full user/assistant messages kept in the roleplay prompt window. */
+  recentMessages: number;
+  /** Max output tokens for the streamed character reply. */
+  replyMaxOutputTokens: number;
+  /** Max output tokens for roleplay JSON helper calls. */
+  jsonMaxOutputTokens: number;
+  /**
+   * Presentation block counts for each length slider level.
+   * Character-range guidance stays in code defaults; only block counts are author-tunable.
+   */
+  lengthBlockBudgets: RoleplayLengthBlockBudgets;
+}
+
+export const MIN_ROLEPLAY_RECENT_MESSAGES = 4;
+export const MAX_ROLEPLAY_RECENT_MESSAGES = 24;
+export const DEFAULT_ROLEPLAY_RECENT_MESSAGES = 8;
+export const MIN_ROLEPLAY_OUTPUT_TOKENS = 1_000;
+export const MAX_ROLEPLAY_OUTPUT_TOKENS = 16_000;
+export const DEFAULT_ROLEPLAY_OUTPUT_TOKENS = 8_000;
+export const MIN_ROLEPLAY_LENGTH_BLOCKS = 1;
+export const MAX_ROLEPLAY_LENGTH_BLOCKS = 8;
+
+/** Built-in defaults aligned with ROLEPLAY_LENGTH_PRESETS in roleplay.ts. */
+export const DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS: RoleplayLengthBlockBudgets = {
+  "-2": { minBlocks: 1, maxBlocks: 1 },
+  "-1": { minBlocks: 2, maxBlocks: 2 },
+  "0": { minBlocks: 2, maxBlocks: 3 },
+  "1": { minBlocks: 3, maxBlocks: 4 },
+  "2": { minBlocks: 4, maxBlocks: 5 },
+};
+
+export const ROLEPLAY_LENGTH_LEVEL_LABELS: Record<RoleplayLengthLevelKey, string> = {
+  "-2": "极简",
+  "-1": "精简",
+  "0": "适中",
+  "1": "充分",
+  "2": "展开",
+};
+
 /** 篇幅控制：范围验收保留现有门禁，弱引导只把目标作为参考。 */
 export type ProseLengthMode = "bounded" | "guidance";
 
@@ -79,13 +152,13 @@ export interface ScenePipelineSettings {
   /** Maximum Agent-authored scene packet size before compilation. */
   notesMaxCharacters: number;
   /**
-   * Best-of-N scene prose sampling: 1 = off; 2–3 = per scene, request
-   * candidateCount-1 fact-preserving rewrites and keep the winner (judge model if
-   * configured, deterministic score otherwise). Adds one plain-text model call per
+   * Optional reader-evaluated scene sampling: 1 = off; 2–3 = per scene, request
+   * candidateCount-1 fact-preserving rewrites and keep a reader-judged winner.
+   * Without that judgment, the original stays. Adds one plain-text model call per
    * extra candidate per scene, plus one cheap judging call when a rewrite survives.
    *
-   * Defaults to 2: sampling is skipped outright for scenes that are already clean
-   * and vivid, so the cost only lands where a second draft has something to win.
+   * Defaults to 1 so an initial draft is not automatically rewritten by a
+   * quality proxy. Enable it deliberately when a second reader pass is wanted.
    */
   candidateCount: number;
 }
@@ -117,6 +190,8 @@ export interface AgentRuntimeSettings {
   /** 作者的篇幅偏好：默认目标字数与下限执行强度。 */
   proseLength: ProseLengthSettings;
   proseGateTimeouts: ProseGateTimeoutSettings;
+  /** 角色扮演试演：推理档位、终审与输出预算。 */
+  roleplay: RoleplaySettings;
 }
 
 export interface AgentTodoItem {
@@ -175,7 +250,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     preferredMaxScenes: 5,
     maxScenes: 5,
     notesMaxCharacters: DEFAULT_SCENE_NOTES_CHARACTERS,
-    candidateCount: 2,
+    candidateCount: 1,
   },
   proseLength: {
     chapterTargetCharacters: DEFAULT_CHAPTER_TARGET_CHARACTERS,
@@ -186,6 +261,15 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     primarySeconds: DEFAULT_PRIMARY_PROSE_GATE_TIMEOUT_SECONDS,
     finalSeconds: DEFAULT_FINAL_PROSE_GATE_TIMEOUT_SECONDS,
   },
+  roleplay: {
+    performanceReasoningEffort: "inherit",
+    jsonReasoningEffort: "none",
+    qualityFinalizeEnabled: true,
+    recentMessages: DEFAULT_ROLEPLAY_RECENT_MESSAGES,
+    replyMaxOutputTokens: DEFAULT_ROLEPLAY_OUTPUT_TOKENS,
+    jsonMaxOutputTokens: DEFAULT_ROLEPLAY_OUTPUT_TOKENS,
+    lengthBlockBudgets: { ...DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS },
+  },
 };
 
 export const MAX_SCENE_CANDIDATES = 3;
@@ -194,6 +278,10 @@ const PERMISSION_MODES = new Set<PermissionMode>(["ask", "auto", "plan"]);
 const WRITING_EXECUTION_MODES = new Set<WritingExecutionMode>(["delegated", "fast"]);
 const STEP_BUDGET_MODES = new Set<AgentStepBudgetMode>(["hard", "experimental"]);
 const PROSE_LENGTH_MODES = new Set<ProseLengthMode>(["bounded", "guidance"]);
+const REASONING_EFFORTS = new Set<ReasoningEffort>(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const ROLEPLAY_REASONING_CHOICES = new Set<RoleplayReasoningChoice>([
+  "inherit", "none", "minimal", "low", "medium", "high", "xhigh",
+]);
 
 export function isPermissionMode(value: string): value is PermissionMode {
   return PERMISSION_MODES.has(value as PermissionMode);
@@ -209,6 +297,14 @@ export function isAgentStepBudgetMode(value: string): value is AgentStepBudgetMo
 
 export function isProseLengthMode(value: string): value is ProseLengthMode {
   return PROSE_LENGTH_MODES.has(value as ProseLengthMode);
+}
+
+export function isReasoningEffort(value: string): value is ReasoningEffort {
+  return REASONING_EFFORTS.has(value as ReasoningEffort);
+}
+
+export function isRoleplayReasoningChoice(value: string): value is RoleplayReasoningChoice {
+  return ROLEPLAY_REASONING_CHOICES.has(value as RoleplayReasoningChoice);
 }
 
 export function normalizeMaxAgentSteps(value: unknown, fallback = DEFAULT_AGENT_STEPS): number {
@@ -255,6 +351,87 @@ export function normalizeProseLengthSettings(value?: Partial<ProseLengthSettings
   };
 }
 
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.round(Math.min(max, Math.max(min, raw)));
+}
+
+export function normalizeRoleplayLengthBlockBudget(
+  value: unknown,
+  fallback: RoleplayLengthBlockBudget,
+): RoleplayLengthBlockBudget {
+  const raw = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const minBlocks = clampInt(
+    raw.minBlocks,
+    MIN_ROLEPLAY_LENGTH_BLOCKS,
+    MAX_ROLEPLAY_LENGTH_BLOCKS,
+    fallback.minBlocks,
+  );
+  const maxBlocks = Math.max(
+    minBlocks,
+    clampInt(
+      raw.maxBlocks,
+      MIN_ROLEPLAY_LENGTH_BLOCKS,
+      MAX_ROLEPLAY_LENGTH_BLOCKS,
+      Math.max(minBlocks, fallback.maxBlocks),
+    ),
+  );
+  return { minBlocks, maxBlocks };
+}
+
+export function normalizeRoleplayLengthBlockBudgets(
+  value?: Partial<RoleplayLengthBlockBudgets> | null,
+): RoleplayLengthBlockBudgets {
+  const defaults = DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS;
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    "-2": normalizeRoleplayLengthBlockBudget(raw["-2"], defaults["-2"]),
+    "-1": normalizeRoleplayLengthBlockBudget(raw["-1"], defaults["-1"]),
+    "0": normalizeRoleplayLengthBlockBudget(raw["0"], defaults["0"]),
+    "1": normalizeRoleplayLengthBlockBudget(raw["1"], defaults["1"]),
+    "2": normalizeRoleplayLengthBlockBudget(raw["2"], defaults["2"]),
+  };
+}
+
+export function normalizeRoleplaySettings(value?: Partial<RoleplaySettings>): RoleplaySettings {
+  const defaults = DEFAULT_SETTINGS.roleplay;
+  return {
+    performanceReasoningEffort: typeof value?.performanceReasoningEffort === "string"
+      && isRoleplayReasoningChoice(value.performanceReasoningEffort)
+      ? value.performanceReasoningEffort
+      : defaults.performanceReasoningEffort,
+    jsonReasoningEffort: typeof value?.jsonReasoningEffort === "string"
+      && isReasoningEffort(value.jsonReasoningEffort)
+      ? value.jsonReasoningEffort
+      : defaults.jsonReasoningEffort,
+    qualityFinalizeEnabled: value?.qualityFinalizeEnabled !== false,
+    recentMessages: clampInt(
+      value?.recentMessages,
+      MIN_ROLEPLAY_RECENT_MESSAGES,
+      MAX_ROLEPLAY_RECENT_MESSAGES,
+      defaults.recentMessages,
+    ),
+    replyMaxOutputTokens: clampInt(
+      value?.replyMaxOutputTokens,
+      MIN_ROLEPLAY_OUTPUT_TOKENS,
+      MAX_ROLEPLAY_OUTPUT_TOKENS,
+      defaults.replyMaxOutputTokens,
+    ),
+    jsonMaxOutputTokens: clampInt(
+      value?.jsonMaxOutputTokens,
+      MIN_ROLEPLAY_OUTPUT_TOKENS,
+      MAX_ROLEPLAY_OUTPUT_TOKENS,
+      defaults.jsonMaxOutputTokens,
+    ),
+    lengthBlockBudgets: normalizeRoleplayLengthBlockBudgets(
+      value?.lengthBlockBudgets ?? defaults.lengthBlockBudgets,
+    ),
+  };
+}
+
 export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings {
   const path = settingsPath(project);
   if (!existsSync(path)) return { ...DEFAULT_SETTINGS };
@@ -277,9 +454,10 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
       proseLength: normalizeProseLengthSettings(raw.proseLength),
       proseGateTimeouts: normalizeProseGateTimeoutSettings(raw.proseGateTimeouts),
+      roleplay: normalizeRoleplaySettings(raw.roleplay),
     };
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    return { ...DEFAULT_SETTINGS, roleplay: { ...DEFAULT_SETTINGS.roleplay } };
   }
 }
 
@@ -295,6 +473,9 @@ export function saveAgentSettings(
     scenePipeline?: Partial<ScenePipelineSettings>;
     proseLength?: Partial<ProseLengthSettings>;
     proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
+    roleplay?: Partial<Omit<RoleplaySettings, "lengthBlockBudgets">> & {
+      lengthBlockBudgets?: Partial<RoleplayLengthBlockBudgets>;
+    };
   },
 ): AgentRuntimeSettings {
   const current = loadAgentSettings(project);
@@ -326,6 +507,16 @@ export function saveAgentSettings(
     proseGateTimeouts: patch.proseGateTimeouts
       ? normalizeProseGateTimeoutSettings({ ...current.proseGateTimeouts, ...patch.proseGateTimeouts })
       : current.proseGateTimeouts,
+    roleplay: patch.roleplay
+      ? normalizeRoleplaySettings({
+          ...current.roleplay,
+          ...patch.roleplay,
+          lengthBlockBudgets: {
+            ...current.roleplay.lengthBlockBudgets,
+            ...(patch.roleplay.lengthBlockBudgets ?? {}),
+          },
+        })
+      : current.roleplay,
   };
   mkdirSync(project.privateDir, { recursive: true });
   writeFileSync(settingsPath(project), `${JSON.stringify(next, null, 2)}\n`, "utf8");

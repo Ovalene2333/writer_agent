@@ -2574,6 +2574,78 @@ button.agent-orb:focus-visible {
 .agent-step-model-call-heading span {
   min-width: 0; overflow-wrap: anywhere; color: var(--text-faint); font-size: 10.5px;
 }
+.agent-step-model-call-heading .agent-step-call-duration {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--text-faint) 8%, transparent);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.roleplay-length-budget-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.roleplay-length-budget-row {
+  display: grid;
+  grid-template-columns: 3.5rem 4.5rem minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px 12px;
+  align-items: end;
+  padding: 8px 10px;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel, transparent) 70%, transparent);
+}
+.roleplay-length-budget-row strong {
+  font-size: 13px;
+  line-height: 1.2;
+  padding-bottom: 6px;
+}
+.roleplay-length-budget-level {
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.2;
+  padding-bottom: 8px;
+}
+.roleplay-length-budget-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.roleplay-length-budget-row label span {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.roleplay-length-budget-row input[type="number"] {
+  width: 100%;
+  min-width: 0;
+}
+.roleplay-length-budget-row.field-invalid {
+  border-color: color-mix(in srgb, #e35d6a 55%, var(--border-light));
+}
+.roleplay-length-budget-hint {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.45;
+}
+@media (max-width: 720px) {
+  .roleplay-length-budget-row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .roleplay-length-budget-row strong,
+  .roleplay-length-budget-level {
+    grid-column: 1 / -1;
+    padding-bottom: 0;
+  }
+}
 .agent-step-model-call-heading .agent-step-provider-chip {
   justify-content: center;
   flex: 0 0 auto; max-width: none; padding: 3px 6px 1px; white-space: nowrap;

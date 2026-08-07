@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Bot, CheckCircle2, LoaderCircle, Palette, Pencil, Plus, Radar, ShieldCheck, WandSparkles, Wifi, X, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, LoaderCircle, MessageSquare, Palette, Pencil, Plus, Radar, ShieldCheck, WandSparkles, Wifi, X, XCircle } from "lucide-react";
 
 export type Pricing = {
   billingMode?: "metered" | "unmetered";
@@ -49,7 +49,45 @@ export type ProseLengthSettings = {
 };
 export type WritingExecutionMode = "delegated" | "fast";
 export type AgentStepBudgetMode = "hard" | "experimental";
-export type SettingsSection = "models" | "writing" | "style" | "prose-gates" | "connection" | "appearance";
+export type RoleplayReasoningChoice = ReasoningEffort | "inherit";
+export type RoleplayLengthLevelKey = "-2" | "-1" | "0" | "1" | "2";
+export type RoleplayLengthBlockBudget = { minBlocks: number; maxBlocks: number };
+export type RoleplayLengthBlockBudgets = Record<RoleplayLengthLevelKey, RoleplayLengthBlockBudget>;
+export type RoleplaySettings = {
+  performanceReasoningEffort: RoleplayReasoningChoice;
+  jsonReasoningEffort: ReasoningEffort;
+  qualityFinalizeEnabled: boolean;
+  recentMessages: number;
+  replyMaxOutputTokens: number;
+  jsonMaxOutputTokens: number;
+  lengthBlockBudgets: RoleplayLengthBlockBudgets;
+};
+export type SettingsSection = "models" | "writing" | "roleplay" | "style" | "prose-gates" | "connection" | "appearance";
+
+export const ROLEPLAY_LENGTH_LEVEL_KEYS: RoleplayLengthLevelKey[] = ["-2", "-1", "0", "1", "2"];
+export const ROLEPLAY_LENGTH_LEVEL_LABELS: Record<RoleplayLengthLevelKey, string> = {
+  "-2": "极简",
+  "-1": "精简",
+  "0": "适中",
+  "1": "充分",
+  "2": "展开",
+};
+export const DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS: RoleplayLengthBlockBudgets = {
+  "-2": { minBlocks: 1, maxBlocks: 1 },
+  "-1": { minBlocks: 2, maxBlocks: 2 },
+  "0": { minBlocks: 2, maxBlocks: 3 },
+  "1": { minBlocks: 3, maxBlocks: 4 },
+  "2": { minBlocks: 4, maxBlocks: 5 },
+};
+export const DEFAULT_ROLEPLAY_SETTINGS: RoleplaySettings = {
+  performanceReasoningEffort: "inherit",
+  jsonReasoningEffort: "none",
+  qualityFinalizeEnabled: true,
+  recentMessages: 8,
+  replyMaxOutputTokens: 8_000,
+  jsonMaxOutputTokens: 8_000,
+  lengthBlockBudgets: { ...DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS },
+};
 
 type ModelDraft = Omit<ProviderModel, "id"> & { id?: string };
 type ProfileDraft = Omit<ProviderProfile, "id" | "apiKeyConfigured" | "apiKeyHint" | "models"> & { id?: string; apiKey: string; models: ModelDraft[] };
@@ -114,6 +152,7 @@ type ModelConfigProps = {
   scenePipeline: ScenePipelineSettings;
   proseLength: ProseLengthSettings;
   proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
+  roleplay: RoleplaySettings;
   writingMode: WritingExecutionMode;
   characterEvolutionEnabled: boolean;
   reviewFollowsProseModel: boolean;
@@ -132,6 +171,7 @@ type ModelConfigProps = {
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onProseLengthChanged: (settings: ProseLengthSettings) => void;
   onProseGateTimeoutsChanged: (settings: { primarySeconds: number; finalSeconds: number }) => void;
+  onRoleplayChanged: (settings: RoleplaySettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
   onReviewFollowsProseModelChanged: (enabled: boolean) => void;
   onStepBudgetChanged: (settings: { stepBudgetMode: AgentStepBudgetMode; maxAgentSteps: number }) => void;
@@ -142,6 +182,7 @@ export function ModelConfig({
   scenePipeline,
   proseLength,
   proseGateTimeouts,
+  roleplay,
   writingMode,
   characterEvolutionEnabled,
   reviewFollowsProseModel,
@@ -160,6 +201,7 @@ export function ModelConfig({
   onScenePipelineChanged,
   onProseLengthChanged,
   onProseGateTimeoutsChanged,
+  onRoleplayChanged,
   onCharacterEvolutionChanged,
   onReviewFollowsProseModelChanged,
   onStepBudgetChanged,
@@ -168,6 +210,7 @@ export function ModelConfig({
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [lengthDraft, setLengthDraft] = useState(proseLength);
   const [proseGateTimeoutsDraft, setProseGateTimeoutsDraft] = useState(proseGateTimeouts);
+  const [roleplayDraft, setRoleplayDraft] = useState(roleplay);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
   const [reviewFollowsProseDraft, setReviewFollowsProseDraft] = useState(reviewFollowsProseModel);
   const [stepBudgetModeDraft, setStepBudgetModeDraft] = useState(stepBudgetMode);
@@ -185,6 +228,14 @@ export function ModelConfig({
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setLengthDraft(proseLength), [proseLength]);
   useEffect(() => setProseGateTimeoutsDraft(proseGateTimeouts), [proseGateTimeouts]);
+  useEffect(() => setRoleplayDraft({
+    ...DEFAULT_ROLEPLAY_SETTINGS,
+    ...roleplay,
+    lengthBlockBudgets: {
+      ...DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS,
+      ...roleplay?.lengthBlockBudgets,
+    },
+  }), [roleplay]);
   useEffect(() => setCharacterEvolutionDraft(characterEvolutionEnabled), [characterEvolutionEnabled]);
   useEffect(() => setReviewFollowsProseDraft(reviewFollowsProseModel), [reviewFollowsProseModel]);
   useEffect(() => setStepBudgetModeDraft(stepBudgetMode), [stepBudgetMode]);
@@ -197,6 +248,37 @@ export function ModelConfig({
   const stepsDraftInvalid = !Number.isInteger(maxAgentStepsDraft)
     || maxAgentStepsDraft < 8
     || maxAgentStepsDraft > 100;
+  const lengthBudgetsInvalid = ROLEPLAY_LENGTH_LEVEL_KEYS.some((level) => {
+    const budget = roleplayDraft.lengthBlockBudgets?.[level] ?? DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS[level];
+    return !Number.isInteger(budget.minBlocks)
+      || !Number.isInteger(budget.maxBlocks)
+      || budget.minBlocks < 1
+      || budget.maxBlocks > 8
+      || budget.maxBlocks < budget.minBlocks;
+  });
+  const roleplayDraftInvalid = !Number.isInteger(roleplayDraft.recentMessages)
+    || roleplayDraft.recentMessages < 4
+    || roleplayDraft.recentMessages > 24
+    || !Number.isInteger(roleplayDraft.replyMaxOutputTokens)
+    || roleplayDraft.replyMaxOutputTokens < 1_000
+    || roleplayDraft.replyMaxOutputTokens > 16_000
+    || !Number.isInteger(roleplayDraft.jsonMaxOutputTokens)
+    || roleplayDraft.jsonMaxOutputTokens < 1_000
+    || roleplayDraft.jsonMaxOutputTokens > 16_000
+    || lengthBudgetsInvalid;
+  const roleplaySettingsDirty = roleplayDraft.performanceReasoningEffort !== roleplay.performanceReasoningEffort
+    || roleplayDraft.jsonReasoningEffort !== roleplay.jsonReasoningEffort
+    || roleplayDraft.qualityFinalizeEnabled !== roleplay.qualityFinalizeEnabled
+    || roleplayDraft.recentMessages !== roleplay.recentMessages
+    || roleplayDraft.replyMaxOutputTokens !== roleplay.replyMaxOutputTokens
+    || roleplayDraft.jsonMaxOutputTokens !== roleplay.jsonMaxOutputTokens
+    || ROLEPLAY_LENGTH_LEVEL_KEYS.some((level) => {
+      const draft = roleplayDraft.lengthBlockBudgets?.[level];
+      const saved = roleplay.lengthBlockBudgets?.[level] ?? DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS[level];
+      return !draft
+        || draft.minBlocks !== saved.minBlocks
+        || draft.maxBlocks !== saved.maxBlocks;
+    });
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
     || lengthDraft.mode !== proseLength.mode
@@ -431,8 +513,32 @@ export function ModelConfig({
     setMessage("");
   }
 
+  async function saveRoleplaySettings() {
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const result = await request("/api/agent-settings", {
+        method: "POST",
+        body: JSON.stringify({ roleplay: roleplayDraft }),
+      }) as { roleplay: RoleplaySettings };
+      setRoleplayDraft(result.roleplay);
+      onRoleplayChanged(result.roleplay);
+      setMessage("角色扮演设置已保存，将从下一轮试演开始生效");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function resetRoleplaySettings() {
+    setRoleplayDraft(roleplay);
+    setError("");
+    setMessage("");
+  }
+
   function closeSettings() {
     if (writingSettingsDirty && !confirm("写作设置尚未保存，确定要放弃这些修改并返回工作区吗？")) return;
+    if (roleplaySettingsDirty && !confirm("角色扮演设置尚未保存，确定要放弃这些修改并返回工作区吗？")) return;
     onClose();
   }
 
@@ -440,6 +546,9 @@ export function ModelConfig({
     if (section === "writing" && nextSection !== "writing" && writingSettingsDirty
       && !confirm("写作设置尚未保存，确定要放弃这些修改并切换分类吗？")) return;
     if (section === "writing" && nextSection !== "writing") resetWritingSettings();
+    if (section === "roleplay" && nextSection !== "roleplay" && roleplaySettingsDirty
+      && !confirm("角色扮演设置尚未保存，确定要放弃这些修改并切换分类吗？")) return;
+    if (section === "roleplay" && nextSection !== "roleplay") resetRoleplaySettings();
     onSectionChanged(nextSection);
     setError("");
     setMessage("");
@@ -448,6 +557,7 @@ export function ModelConfig({
   const sectionMeta: Record<SettingsSection, { eyebrow: string; title: string; description: string }> = {
     models: { eyebrow: "Model routing", title: "模型与分工", description: "管理模型连接，并为写作流程的不同环节分配模型。" },
     writing: { eyebrow: "Writing behavior", title: "写作行为", description: "调整角色演进、可选场景链与正文生成策略。" },
+    roleplay: { eyebrow: "Roleplay", title: "角色扮演", description: "调整试演推理档位、终审与输出预算。模型分配仍在「模型与分工」。" },
     style: { eyebrow: "Writing style", title: "写作风格", description: "管理写作模板、范文与采样建议。" },
     "prose-gates": { eyebrow: "Author policies", title: "作者政策与复审", description: "管理长期写作要求、试运行和门禁。" },
     connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
@@ -468,6 +578,11 @@ export function ModelConfig({
             <Pencil size={17}/>
             <span><strong>写作行为</strong><small>角色演进与场景生成</small></span>
             {writingSettingsDirty && <i className="settings-dirty-dot" title="有未保存的修改"/>}
+          </button>
+          <button className={section === "roleplay" ? "active" : ""} aria-current={section === "roleplay" ? "page" : undefined} onClick={() => selectSection("roleplay")}>
+            <MessageSquare size={17}/>
+            <span><strong>角色扮演</strong><small>推理档位、终审与预算</small></span>
+            {roleplaySettingsDirty && <i className="settings-dirty-dot" title="有未保存的修改"/>}
           </button>
           <button className={section === "style" ? "active" : ""} aria-current={section === "style" ? "page" : undefined} onClick={() => selectSection("style")}>
             <WandSparkles size={17}/>
@@ -685,6 +800,225 @@ export function ModelConfig({
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
           <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>
           <button className="primary" onClick={() => void saveWritingSettings()} disabled={busy || !sceneDraftValid || proseGateTimeoutsInvalid || !writingSettingsDirty}>{busy ? "保存中…" : "保存修改"}</button>
+        </div>
+          </div>}
+          {section === "roleplay" && <div className="scene-settings">
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>推理档位</h4><p>控制演出与辅助 JSON 调用的 reasoning 强度。OpenAI 兼容走 reasoning_effort；DeepSeek 供应商映射为 thinking。</p></div></div>
+          <div className="scene-settings-grid compact">
+            <label>
+              <span>演出推理</span>
+              <select
+                value={roleplayDraft.performanceReasoningEffort}
+                onChange={event => setRoleplayDraft(current => ({
+                  ...current,
+                  performanceReasoningEffort: event.target.value as RoleplayReasoningChoice,
+                }))}
+              >
+                <option value="inherit">跟随模型配置</option>
+                <option value="none">none · 关闭</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+              </select>
+              <small>角色流式演出用。默认跟随「角色演出」模型上的 Reasoning effort。</small>
+            </label>
+            <label>
+              <span>JSON 辅助推理</span>
+              <select
+                value={roleplayDraft.jsonReasoningEffort}
+                onChange={event => setRoleplayDraft(current => ({
+                  ...current,
+                  jsonReasoningEffort: event.target.value as ReasoningEffort,
+                }))}
+              >
+                <option value="none">none · 关闭（推荐）</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+              </select>
+              <small>感知编译、演出终审、现场记忆等短 JSON 调用。默认 none，避免把预算花在 thinking。</small>
+            </label>
+          </div>
+        </section>
+
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>终审与上下文</h4><p>演出后是否再跑终审剪辑，以及提示词里保留多少近期对白。</p></div></div>
+          <label className="writing-setting-row">
+            <input
+              type="checkbox"
+              checked={roleplayDraft.qualityFinalizeEnabled}
+              onChange={event => setRoleplayDraft(current => ({
+                ...current,
+                qualityFinalizeEnabled: event.target.checked,
+              }))}
+            />
+            <span>
+              <strong>启用演出终审</strong>
+              <small>关闭后直接渲染主模型 wire 输出，省一次模型调用；开启时由「演出终审」角色清理越权与解释腔。</small>
+            </span>
+          </label>
+          <div className="scene-settings-grid compact">
+            <label className={roleplayDraftInvalid ? "field-invalid" : ""}>
+              <span>近期消息窗口</span>
+              <input
+                aria-invalid={roleplayDraftInvalid}
+                type="number"
+                min={4}
+                max={24}
+                step={1}
+                value={roleplayDraft.recentMessages}
+                onChange={event => setRoleplayDraft(current => ({
+                  ...current,
+                  recentMessages: Number(event.target.value),
+                }))}
+              />
+              <small>4—24 条完整 user/assistant 消息进入提示与反模板统计。</small>
+            </label>
+          </div>
+        </section>
+
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>输出预算</h4><p>限制单次调用 max_tokens。推理 token 会计入此上限（尤其 OpenAI 兼容网关）。</p></div></div>
+          <div className="scene-settings-grid compact">
+            <label className={roleplayDraftInvalid ? "field-invalid" : ""}>
+              <span>演出 max tokens</span>
+              <input
+                aria-invalid={roleplayDraftInvalid}
+                type="number"
+                min={1000}
+                max={16000}
+                step={500}
+                value={roleplayDraft.replyMaxOutputTokens}
+                onChange={event => setRoleplayDraft(current => ({
+                  ...current,
+                  replyMaxOutputTokens: Number(event.target.value),
+                }))}
+              />
+              <small>1000—16000；含推理时请留足纯输出余量。</small>
+            </label>
+            <label className={roleplayDraftInvalid ? "field-invalid" : ""}>
+              <span>JSON max tokens</span>
+              <input
+                aria-invalid={roleplayDraftInvalid}
+                type="number"
+                min={1000}
+                max={16000}
+                step={500}
+                value={roleplayDraft.jsonMaxOutputTokens}
+                onChange={event => setRoleplayDraft(current => ({
+                  ...current,
+                  jsonMaxOutputTokens: Number(event.target.value),
+                }))}
+              />
+              <small>感知 / 终审 / 记忆等 JSON 调用共用。</small>
+            </label>
+          </div>
+        </section>
+
+        <section className="writing-settings-section">
+          <div className="writing-settings-section-head">
+            <div>
+              <h4>篇幅档块数</h4>
+              <p>对应试演面板「篇幅」滑杆五档（极简→展开）。每档设置最少/最多演出块；字数建议区间仍用内置默认。</p>
+            </div>
+          </div>
+          <div className="roleplay-length-budget-list">
+            {ROLEPLAY_LENGTH_LEVEL_KEYS.map((level) => {
+              const budget = roleplayDraft.lengthBlockBudgets?.[level] ?? DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS[level];
+              const invalid = !Number.isInteger(budget.minBlocks)
+                || !Number.isInteger(budget.maxBlocks)
+                || budget.minBlocks < 1
+                || budget.maxBlocks > 8
+                || budget.maxBlocks < budget.minBlocks;
+              return (
+                <div className={`roleplay-length-budget-row${invalid ? " field-invalid" : ""}`} key={level}>
+                  <strong>{ROLEPLAY_LENGTH_LEVEL_LABELS[level]}</strong>
+                  <span className="roleplay-length-budget-level">档位 {level}</span>
+                  <label>
+                    <span>最少块</span>
+                    <input
+                      aria-invalid={invalid}
+                      type="number"
+                      min={1}
+                      max={8}
+                      step={1}
+                      value={budget.minBlocks}
+                      onChange={event => {
+                        const minBlocks = Number(event.target.value);
+                        setRoleplayDraft(current => {
+                          const previous = current.lengthBlockBudgets?.[level]
+                            ?? DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS[level];
+                          return {
+                            ...current,
+                            lengthBlockBudgets: {
+                              ...DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS,
+                              ...current.lengthBlockBudgets,
+                              [level]: {
+                                minBlocks,
+                                maxBlocks: Math.max(minBlocks, previous.maxBlocks),
+                              },
+                            },
+                          };
+                        });
+                      }}
+                    />
+                  </label>
+                  <label>
+                    <span>最多块</span>
+                    <input
+                      aria-invalid={invalid}
+                      type="number"
+                      min={1}
+                      max={8}
+                      step={1}
+                      value={budget.maxBlocks}
+                      onChange={event => {
+                        const maxBlocks = Number(event.target.value);
+                        setRoleplayDraft(current => {
+                          const previous = current.lengthBlockBudgets?.[level]
+                            ?? DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS[level];
+                          return {
+                            ...current,
+                            lengthBlockBudgets: {
+                              ...DEFAULT_ROLEPLAY_LENGTH_BLOCK_BUDGETS,
+                              ...current.lengthBlockBudgets,
+                              [level]: {
+                                minBlocks: Math.min(previous.minBlocks, maxBlocks),
+                                maxBlocks,
+                              },
+                            },
+                          };
+                        });
+                      }}
+                    />
+                  </label>
+                </div>
+              );
+            })}
+          </div>
+          <small className="roleplay-length-budget-hint">每档 1—8 块；最多块不能小于最少块。改完后下一轮试演生效。</small>
+        </section>
+
+        <div className={roleplayDraftInvalid ? "scene-settings-summary invalid" : "scene-settings-summary"} role={roleplayDraftInvalid ? "alert" : "status"}>
+          {roleplayDraftInvalid
+            ? "请检查近期消息窗口、max tokens 与各档块数范围。"
+            : `当前：演出推理 ${roleplayDraft.performanceReasoningEffort}；JSON 推理 ${roleplayDraft.jsonReasoningEffort}；终审 ${roleplayDraft.qualityFinalizeEnabled ? "开" : "关"}；窗口 ${roleplayDraft.recentMessages} 条；演出 ${roleplayDraft.replyMaxOutputTokens} / JSON ${roleplayDraft.jsonMaxOutputTokens} tokens。`}
+        </div>
+        <div className="scene-settings-actions">
+          <span>{roleplaySettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
+          <button onClick={resetRoleplaySettings} disabled={busy || !roleplaySettingsDirty}>放弃修改</button>
+          <button
+            className="primary"
+            onClick={() => void saveRoleplaySettings()}
+            disabled={busy || roleplayDraftInvalid || !roleplaySettingsDirty}
+          >
+            {busy ? "保存中…" : "保存修改"}
+          </button>
         </div>
           </div>}
           {section === "style" && styleContent}

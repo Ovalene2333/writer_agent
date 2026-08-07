@@ -1,6 +1,7 @@
 import { documentBlocks } from "../document_blocks.js";
 import { isScenePipelineDocument } from "../project.js";
 import { buildNarrativeEvidencePacket } from "../narrative_evidence.js";
+import { collectRegisterRisksForContext } from "../register_risks.js";
 import { requestEvidenceGroundedProse } from "../evidence_grounded_writer.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { styleGroundingPrompt } from "../style_grounding.js";
@@ -338,6 +339,16 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
   args.context.narrativeEvidencePackets?.set(path, evidence);
   const existingText = args.project.textFileExists(path) ? args.project.readTextFile(path) : "";
   const run = writer.run ?? requestEvidenceGroundedProse;
+  const registerRisks = collectRegisterRisksForContext(args.store, args.context);
+  if (registerRisks.length && !pack.registerRisks?.length) {
+    pack.registerRisks = registerRisks.map(risk => ({
+      term: risk.term,
+      characterName: risk.characterName,
+      source: risk.source,
+      scope: risk.scope,
+      reason: risk.reason,
+    }));
+  }
   const generated = await run(writer.model, {
     path,
     outputKind: "document",
@@ -352,6 +363,7 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
     }),
     targetCharacters: args.context.proseLength?.targetCharacters,
     lengthMode: args.context.proseLength?.mode,
+    registerRisks,
   }, { project: args.project, context: args.context }, writer.signal);
   if (generated.usage) {
     args.context.modelUsageReporter?.(writer.model, generated.usage, {

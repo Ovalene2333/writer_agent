@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { samplingRequestOptions } from "./model_compat.js";
+import {
+  applyProviderReasoningToChatBody,
+  nonThinkingRequestOptions,
+  providerReasoningWire,
+  samplingRequestOptions,
+  thinkingRequestOptions,
+} from "./model_compat.js";
 
 test("sampling options fall back to the model config, then to omission", () => {
   assert.deepEqual(samplingRequestOptions({ temperature: 0.7, topP: 0.9 }), { temperature: 0.7, top_p: 0.9 });
@@ -52,16 +58,114 @@ test("configured OpenAI request parameters share the request choke point", () =>
   );
 });
 
-test("DeepSeek never receives OpenAI-only request parameters", () => {
+test("deepseek provider sampling omits OpenAI reasoning_effort/verbosity", () => {
   assert.deepEqual(
     samplingRequestOptions({
       provider: "deepseek",
       baseUrl: "https://api.deepseek.com",
+      model: "deepseek-chat",
       reasoningEffort: "high",
       verbosity: "low",
     }),
     {},
   );
+  // Same protocol when deepseek provider points at a proxy — still thinking-only wire.
+  assert.deepEqual(
+    samplingRequestOptions({
+      provider: "deepseek",
+      baseUrl: "https://proxy.example/v1",
+      model: "deepseek-v4-flash",
+      reasoningEffort: "high",
+    }),
+    {},
+  );
+});
+
+test("provider reasoning wire branches only on ProviderId protocol", () => {
+  assert.deepEqual(
+    providerReasoningWire(
+      { provider: "deepseek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", reasoningEffort: "medium" },
+      { thinking: "disabled" },
+    ),
+    { thinking: { type: "disabled" } },
+  );
+  assert.deepEqual(
+    providerReasoningWire(
+      { provider: "deepseek", baseUrl: "https://proxy.example/v1", model: "deepseek-v4-flash", reasoningEffort: "high" },
+      { thinking: "enabled" },
+    ),
+    { thinking: { type: "enabled" } },
+  );
+  // openai-compatible is one protocol regardless of model id (including deepseek weights).
+  assert.deepEqual(
+    providerReasoningWire(
+      {
+        provider: "openai-compatible",
+        baseUrl: "https://opencode.example/v1",
+        model: "deepseek-v4-flash",
+        reasoningEffort: "medium",
+      },
+      { thinking: "disabled" },
+    ),
+    { reasoning_effort: "none" },
+  );
+  assert.deepEqual(
+    providerReasoningWire(
+      {
+        provider: "openai-compatible",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-4.1-mini",
+        reasoningEffort: "medium",
+        verbosity: "low",
+      },
+      { thinking: "disabled" },
+    ),
+    { reasoning_effort: "none", verbosity: "low" },
+  );
+  assert.deepEqual(
+    providerReasoningWire(
+      {
+        provider: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5",
+        reasoningEffort: "medium",
+        verbosity: "low",
+      },
+      {},
+    ),
+    { reasoning_effort: "medium", verbosity: "low" },
+  );
+  // Call-site helpers are logical intent only.
+  assert.deepEqual(thinkingRequestOptions({ provider: "openai-compatible" }), {
+    thinking: { type: "enabled" },
+  });
+  assert.deepEqual(nonThinkingRequestOptions({ provider: "openai-compatible" }), {
+    thinking: { type: "disabled" },
+  });
+});
+
+test("applyProviderReasoningToChatBody rewrites mixed pre-spread fields", () => {
+  const body = applyProviderReasoningToChatBody(
+    {
+      provider: "openai-compatible",
+      baseUrl: "https://opencode.example/v1",
+      model: "deepseek-v4-flash",
+      reasoningEffort: "medium",
+    },
+    {
+      model: "deepseek-v4-flash",
+      messages: [],
+      thinking: { type: "disabled" },
+      reasoning_effort: "medium",
+      temperature: 0.2,
+    },
+  );
+  assert.deepEqual(body, {
+    model: "deepseek-v4-flash",
+    messages: [],
+    temperature: 0.2,
+    reasoning_effort: "none",
+  });
 });
 
 /**

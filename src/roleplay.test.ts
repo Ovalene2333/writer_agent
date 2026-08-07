@@ -327,6 +327,25 @@ describe("roleplay prompts", () => {
     assert.equal(roleplayTurnPresentationBudget(2).minBlocks, 4);
     assert.match(formatRoleplayLengthGuidance(1), /3–4 个相互连贯的演出块/);
     assert.match(formatRoleplayLengthGuidance(1), /每块尽量写到约 90–120 字/);
+    assert.deepEqual(roleplayTurnPresentationBudget(0, {
+      "-2": { minBlocks: 1, maxBlocks: 1 },
+      "-1": { minBlocks: 2, maxBlocks: 2 },
+      "0": { minBlocks: 3, maxBlocks: 5 },
+      "1": { minBlocks: 3, maxBlocks: 4 },
+      "2": { minBlocks: 4, maxBlocks: 5 },
+    }), {
+      minBlocks: 3,
+      maxBlocks: 5,
+      preferredMinCharsPerBlock: 80,
+      preferredMaxCharsPerBlock: 110,
+    });
+    assert.match(formatRoleplayLengthGuidance(0, {
+      "-2": { minBlocks: 1, maxBlocks: 1 },
+      "-1": { minBlocks: 2, maxBlocks: 2 },
+      "0": { minBlocks: 3, maxBlocks: 5 },
+      "1": { minBlocks: 3, maxBlocks: 4 },
+      "2": { minBlocks: 4, maxBlocks: 5 },
+    }), /3–5 个相互连贯的演出块/);
   });
 
   test("quality review parsing and rewrite instructions stay structural", () => {
@@ -451,14 +470,17 @@ describe("roleplay prompts", () => {
     assert.doesNotMatch(messages[1].content, /observableWorkingState|establishedScene|performer|playerIdentity/);
   });
 
-  test("four-way perception receives a semantic coverage finalizer", () => {
+  test("four-way perception finalizer is only required when primary channels are empty", () => {
     const input = "千夏，根据上面的安排，现在你已经和 bci 和超算适应了一段时间了，是时候展开一些压测了，过程可能会不舒服。";
     const empty = {
       speech: [], knowableFacts: [], unknowableFacts: [], potentialSensations: [],
     };
     assert.equal(roleplayPerceptionNeedsSemanticRetry(empty), true);
-    assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, unknowableFacts: [input] }), false);
+    // All content dumped into unknowableFacts is a classic misroute — still finalizes.
+    assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, unknowableFacts: [input] }), true);
     assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, speech: [input] }), false);
+    assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, knowableFacts: ["对方递过杯子"] }), false);
+    assert.equal(roleplayPerceptionNeedsSemanticRetry({ ...empty, potentialSensations: ["手臂发麻"] }), false);
 
     const messages = buildRoleplayPerceptionRetryMessages(input, empty);
     assert.deepEqual(messages.map(message => message.role), ["system", "user", "assistant", "user"]);

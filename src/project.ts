@@ -49,15 +49,41 @@ export function isSupportedTextFilePath(path: string): boolean {
 }
 
 /**
+ * Collapse a resource-relative path: unify separators, strip `resource/` prefix,
+ * drop empty/`.` segments, and resolve `..` without escaping the resource root.
+ * All Agent path checks (including archive hard-block) must go through this form.
+ */
+export function normalizeResourcePath(path: string): string {
+  let value = path.trim().replace(/\\/g, "/");
+  value = value.replace(/^(?:\.\/)+/u, "").replace(/^\/+/u, "").replace(/\/+$/u, "");
+  value = value.replace(/\/{2,}/gu, "/");
+  while (value === "resource" || value.startsWith("resource/")) {
+    value = value === "resource" ? "" : value.slice("resource/".length);
+  }
+  const parts: string[] = [];
+  for (const part of value.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length) parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join("/");
+}
+
+/**
  * Archive / 屏蔽区路径：仅供人工浏览，Agent 一律不可 list/search/read。
  * 不依赖 agent-visibility 开关，取消「对 Agent 隐藏」也不能放行。
+ * `archive` 根段大小写不敏感，避免 Archive/ARCHIVE 旁路。
  */
 export function isArchivePath(path: string): boolean {
-  const normalized = normalizeDocumentPath(path);
-  return normalized === "archive"
-    || normalized.startsWith("archive/")
-    || normalized === "屏蔽"
-    || normalized.startsWith("屏蔽/");
+  const normalized = normalizeResourcePath(path);
+  if (!normalized) return false;
+  const root = normalized.split("/", 1)[0] ?? "";
+  if (root.toLowerCase() === "archive") return true;
+  if (root === "屏蔽") return true;
+  return false;
 }
 
 export function documentKind(path: string): DocumentKind {
@@ -680,9 +706,9 @@ function isUtf8TextBuffer(buffer: Buffer): boolean {
 }
 
 function normalizeFolderPath(path: string): string {
-  return path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/").replace(/^resource(?:\/|$)/, "");
+  return normalizeResourcePath(path);
 }
 
 function normalizeDocumentPath(path: string): string {
-  return normalizeFolderPath(path).replace(/^resource(?:\/|$)/, "");
+  return normalizeResourcePath(path);
 }

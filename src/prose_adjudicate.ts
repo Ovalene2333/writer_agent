@@ -125,7 +125,10 @@ const MAX_ITEMS = 15;
 const MAX_DISCOVERY_PASSAGES = 8;
 const MAX_LEARNED_GATE_PASSAGES = 48;
 const DEFAULT_TIMEOUT_MS = 12_000;
-const PROSE_REVIEW_MAX_OUTPUT_TOKENS = 2_400;
+// OpenCode-compatible reasoning tokens share this budget with the JSON verdict.
+// 2.4k was enough for the object but not for medium reasoning, which could leave
+// a valid 200 response with finish_reason=length and empty message content.
+const PROSE_REVIEW_MAX_OUTPUT_TOKENS = 8_000;
 const DISCOVERY_SIGNAL = /(?:这(?:说明|意味着|表明)|显然|无疑|根本|其实|当然|换句话说|也就是说|说到底|归根结底|真正(?:重要|关键|可怕)的|感到|意识到|明白|害怕|恐惧|愤怒|悲伤|绝望|在乎|信任|拒绝|意味着|标志着|是因为)/gu;
 
 /**
@@ -609,11 +612,11 @@ export function deterministicLearnedProseGateIssues(
 ): ProseStyleIssue[] {
   const rule = rules.find(item => item.id === QUOTED_TEXT_COUNT_RULE_ID && item.enabled);
   if (!rule) return [];
-  const pattern = /(?:“([^”\n]{1,40})”|「([^」\n]{1,40})」|『([^』\n]{1,40})』)([^\n]{0,40}?)(?:这|那)(\d+|[零一二两三四五六七八九十]+)个字/gu;
+  const pattern = /(?:“([^”\n]{1,40})”|「([^」\n]{1,40})」|『([^』\n]{1,40})』|"([^"\n]{1,40})")([^\n]{0,40}?)(?:这|那)(\d+|[零一二两三四五六七八九十]+)个字/gu;
   const issues: ProseStyleIssue[] = [];
   for (const match of text.matchAll(pattern)) {
-    const quoted = match[1] ?? match[2] ?? match[3] ?? "";
-    const declaredText = match[5] ?? "";
+    const quoted = match[1] ?? match[2] ?? match[3] ?? match[4] ?? "";
+    const declaredText = match[6] ?? "";
     const declared = parseWrittenCount(declaredText);
     const actual = [...quoted].filter(character => !/[\s\p{P}\p{S}]/u.test(character)).length;
     if (declared === undefined || actual === 0 || declared === actual) continue;
@@ -799,37 +802,63 @@ async function completeJsonChat(
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
     throw new Error("未配置 API Key");
   }
-  const { endpoint, body } = serializeProviderChatBody(model, {
-    model: model.model,
-    messages,
-    stream: false,
-    max_tokens: PROSE_REVIEW_MAX_OUTPUT_TOKENS,
-    response_format: { type: "json_object" },
-    ...nonThinkingRequestOptions(model),
-    ...samplingRequestOptions(model, { temperature: 0 }),
-  });
-  logModelRequest(endpoint, body);
+  let combinedUsage: ModelTokenUsage | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const retryMessages = attempt === 0
+      ? messages
+      : [...messages, {
+          role: "user" as const,
+          content: "上一次响应为空。请重新完成同一审核，只输出约定的 JSON 对象。",
+        }];
+    const { endpoint, body } = serializeProviderChatBody(model, {
+      model: model.model,
+      messages: retryMessages,
+      stream: false,
+      max_tokens: PROSE_REVIEW_MAX_OUTPUT_TOKENS,
+      response_format: { type: "json_object" },
+      ...nonThinkingRequestOptions(model),
+      ...samplingRequestOptions(model, { temperature: 0 }),
+    });
+    logModelRequest(endpoint, body);
 
-  const timeout = AbortSignal.timeout(timeoutMs);
-  const signal = outerSignal ? AbortSignal.any([outerSignal, timeout]) : timeout;
-  const response = await modelFetch(endpoint, {
-    method: "POST",
-    signal,
-    headers: {
-      "content-type": "application/json",
-      ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-    },
-    body,
-  }, model.proxyUrl);
-  const responseBody = await response.text();
-  logModelResponse(endpoint, responseBody);
-  if (!response.ok) throw new Error(`句式二审请求失败（${response.status}）：${responseBody.slice(0, 240)}`);
-  const payload = JSON.parse(responseBody) as {
-    choices?: Array<{ message?: { content?: string | null } }>;
-    usage?: unknown;
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const signal = outerSignal ? AbortSignal.any([outerSignal, timeout]) : timeout;
+    const response = await modelFetch(endpoint, {
+      method: "POST",
+      signal,
+      headers: {
+        "content-type": "application/json",
+        ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
+      },
+      body,
+    }, model.proxyUrl);
+    const responseBody = await response.text();
+    logModelResponse(endpoint, responseBody);
+    if (!response.ok) throw new Error(`句式二审请求失败（${response.status}）：${responseBody.slice(0, 240)}`);
+    const payload = JSON.parse(responseBody) as {
+      choices?: Array<{ message?: { content?: string | null } }>;
+      usage?: unknown;
+    };
+    combinedUsage = mergeModelUsage(combinedUsage, parseModelTokenUsage(payload.usage));
+    const content = parseProviderCompletionPayload(payload).content;
+    if (content.trim()) return { content, ...(combinedUsage ? { usage: combinedUsage } : {}) };
+  }
+  throw new Error("句式二审连续两次返回空内容");
+}
+
+function mergeModelUsage(
+  current: ModelTokenUsage | undefined,
+  next: ModelTokenUsage | undefined,
+): ModelTokenUsage | undefined {
+  if (!next) return current;
+  if (!current) return next;
+  return {
+    promptTokens: current.promptTokens + next.promptTokens,
+    completionTokens: current.completionTokens + next.completionTokens,
+    cacheHitTokens: current.cacheHitTokens + next.cacheHitTokens,
+    cacheMissTokens: current.cacheMissTokens + next.cacheMissTokens,
+    ...((current.cacheWriteTokens ?? 0) + (next.cacheWriteTokens ?? 0) > 0
+      ? { cacheWriteTokens: (current.cacheWriteTokens ?? 0) + (next.cacheWriteTokens ?? 0) }
+      : {}),
   };
-  const content = parseProviderCompletionPayload(payload).content;
-  if (!content.trim()) throw new Error("句式二审无内容");
-  const usage = parseModelTokenUsage(payload.usage);
-  return { content, ...(usage ? { usage } : {}) };
 }

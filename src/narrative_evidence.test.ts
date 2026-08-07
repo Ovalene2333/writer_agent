@@ -45,10 +45,15 @@ test("narrative evidence blocks a scene until scoped character source sections w
       "competency_evidence_missing",
     ]));
 
+    const sectionGap = missing.coverageGaps.find(gap => gap.code === "character_sections_missing");
+    assert.ok(sectionGap);
+    assert.deepEqual(new Set(sectionGap!.missing), new Set(["voice", "motivations", "storyState"]));
+    assert.equal(sectionGap!.missing.includes("relationships"), false);
+
     recordCharacterEvidenceRead(
       context,
       card.id,
-      ["voice", "motivations", "relationships", "storyState", "competencies"],
+      ["voice", "motivations", "storyState", "competencies"],
       ["trace"],
     );
     const complete = buildNarrativeEvidencePacket({ project, store, context, path: "chapters/new.md", scene });
@@ -57,6 +62,56 @@ test("narrative evidence blocks a scene until scoped character source sections w
     assert.equal(complete.characters[0]?.allowedCompetencyIds[0], "trace");
     assert.deepEqual(complete.characters[0]?.allowedCompetencyUses, [{ competencyId: "trace", mode: "use" }]);
     assert.deepEqual(complete.characters[0]?.constraints.competencies.map(item => item.id), ["trace"]);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dialogue coverage still requires relationships when the card has relation rows", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-evidence-relationships-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "关系必读");
+    store = new WriterStore(project);
+    const other = store.saveCharacter(emptyCharacter("对方"));
+    const card = store.saveCharacter({
+      ...emptyCharacter("闻溪"),
+      voice: { ...emptyCharacter().voice, summary: "说话克制" },
+      relationships: [{
+        id: "rel-other",
+        characterId: other.id,
+        type: "同盟",
+        attitude: "信任",
+        status: "active",
+        description: "并肩行动",
+      }],
+    });
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      reviewCharacterIds: [card.id],
+      characterEvidenceReads: new Map(),
+    };
+    const scene: ChapterSceneCard = {
+      id: "gate", title: "", goal: "交涉", entryState: [], characterIntent: [],
+      obstacle: "对方迟疑", turn: "摊牌", outcome: "达成默契", handoff: "",
+      dividerBefore: false, targetCharacters: 800,
+      characterScopes: [{ characterId: card.id, competencyIds: [], dialogue: true }],
+    };
+    const missing = buildNarrativeEvidencePacket({ project, store, context, path: "chapters/new.md", scene });
+    const sectionGap = missing.coverageGaps.find(gap => gap.code === "character_sections_missing");
+    assert.ok(sectionGap?.missing.includes("relationships"));
+
+    recordCharacterEvidenceRead(context, card.id, ["voice", "motivations", "storyState"]);
+    const stillMissing = buildNarrativeEvidencePacket({ project, store, context, path: "chapters/new.md", scene });
+    assert.deepEqual(
+      stillMissing.coverageGaps.find(gap => gap.code === "character_sections_missing")?.missing,
+      ["relationships"],
+    );
+
+    recordCharacterEvidenceRead(context, card.id, ["relationships"]);
+    const complete = buildNarrativeEvidencePacket({ project, store, context, path: "chapters/new.md", scene });
+    assert.equal(complete.coverageGaps.some(gap => gap.code === "character_sections_missing"), false);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

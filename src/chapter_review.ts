@@ -112,13 +112,13 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 - voice_macro_reuse：角色卡中的例句、短句节拍、反问、吐槽、术语或动作锚点被近邻改写后反复充当角色签名，出现时缺少当前触发条件和现场功能。相同动作若每次由不同压力触发并改变现场，不应判错；必须引用至少两处当前正文，说明复用的是句法/动作宏而非稳定的交际策略。
 - template_reuse：若提供 comparisonMaterials，只检查当前正文是否复用了旧章的事件槽位顺序、角色分工、道具功能、对白功能和收束方式；共享世界观事实、自然母题、地点或同一人物本身不构成复刻。evidence 仍必须逐字引用当前 fullChapter 至少两处连续证据，problem 可点明对照路径与结构，但不得把 comparisonMaterials 原句冒充当前正文证据。comparisonMaterials 仅供审查，绝不是写作范文。
 - voice_homogenization：主要人物的措辞、信息取舍和说话目的长期无法区分。若 evidence packet 有 dialogueCharacters，先对照其 voice、目标、关系与当前状态；判断两人是否因想达成不同事情而选择不同信息、回避角度和谈话策略（追问、换题、还价、拒绝、解释、威胁等）。报此项必须引用至少两名人物各自的逐字台词，并在 problem 说明可互换的原因；口语标记比例、短句或统计接近都不能单独成立。不要以口头禅、固定句长或强行回避作为角色声线模板；
-- dialogue_format：说出口的直接对白应使用「……」，对白内嵌引用使用『……』。独立格式门禁会处理可见的混用与错配；只有明显的裸台词逃过该门禁时才报此项，并引用原文。不要把转述、内心或引文误当作直接对白；
+- dialogue_format：说出口的直接对白应有可见引号（「……」、“……”或"……"均可，同章宜一致；嵌套可用『……』）。独立格式门禁只拦截不成对与开闭错配，不强制引号样式；只有明显的裸台词逃过该门禁时才报此项，并引用原文。不要把转述、内心或引文误当作直接对白，也不要因引号样式不同而报告；
 - dialogue_telegraphic：只在相邻对白反复压成名词/状态播报、或省掉施事、对象、因果承接后无法由近邻语境自然补全时报告。检查它是否仍像人在当下为某事说话，而非把提纲字段逐项念出；书面、完整的句子不自动自然，短命令、紧张、沉默、改口及上下文充分的口语省略也不自动有错。必须引用连续原文，说明缺失了什么承接；
 - theme_stated：本应由行动和后果成立的意义，被成段总结替代；resolution_too_smooth：人物立场或阻力无新依据地改变，抹掉了正文已经建立的矛盾；
 - dialogue_frictionless：仅当本章需要谈判、冲突、试探或隐瞒时，检查对白是否回避了应有的利益差异。直接回答、解释、配合、沉默和日常交流本身都有效，不因缺少“交锋动作”判错；
 - drive_flat / stakes_absent：结合 chapterGoal 判断本章是否承诺了未定结果或显著代价。若目标本来是休整、交代、确认或收束，不得要求每场都有主动阻力、不可逆代价或新钩子。
 
-分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。风格、声线、主题直陈、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
+分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。register_leak、field_verbalization、voice_macro_reuse 若有至少两处可定位正文证据且发生在普通对白或贴身叙述（非正式汇报），应判 blocker 并要求局部改写措辞、保留事实；不得因“只是文风”而一律 warning。主题直陈、声线趋同、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。proseSignals.cardRegister 只定位候选人设词泄漏，不能单独成为证据；判 blocker 仍须引用 fullChapter 原文。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
 
 单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。只输出一个 JSON 对象，不要 Markdown、分析过程或改写后的正文。
 字段：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
@@ -275,11 +275,13 @@ export function parseChapterReview(
   // Incomplete blockers must not invalidate sibling locatable blockers (old `.some` did that).
   const locatableBlockers = issues.filter(
     issue => issue.severity === "blocker" && issue.sceneId && issue.evidence.length > 0
-      && (!["voice_homogenization", "register_leak", "compressed_prose"].includes(issue.kind) || issue.evidence.length >= 2),
+      && (!["voice_homogenization", "register_leak", "compressed_prose", "field_verbalization", "voice_macro_reuse", "dialogue_telegraphic"].includes(issue.kind)
+        || issue.evidence.length >= 2),
   );
   const normalizedIssues = issues.map(issue => {
     if (issue.severity === "blocker" && (!issue.sceneId || !issue.evidence.length
-      || (["voice_homogenization", "register_leak", "compressed_prose"].includes(issue.kind) && issue.evidence.length < 2))) {
+      || (["voice_homogenization", "register_leak", "compressed_prose", "field_verbalization", "voice_macro_reuse", "dialogue_telegraphic"].includes(issue.kind)
+        && issue.evidence.length < 2))) {
       return { ...issue, severity: "warning" as const };
     }
     return issue;

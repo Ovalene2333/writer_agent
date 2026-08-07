@@ -10,7 +10,9 @@ import { IconButton, RowOverflowMenu } from "./ui_primitives";
 export const ARCHIVE_ROOT = "archive";
 
 export function isArchivedPath(path: string): boolean {
-  return path === ARCHIVE_ROOT || path.startsWith(`${ARCHIVE_ROOT}/`);
+  const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const root = normalized.split("/", 1)[0] ?? "";
+  return root.toLowerCase() === ARCHIVE_ROOT;
 }
 
 /** Move under archive/ while preserving the original relative path. */

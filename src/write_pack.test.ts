@@ -33,8 +33,6 @@ import {
   submitFullDocumentProposal,
 } from "./tools/proposals.js";
 import type { ToolExecutionContext } from "./tools/types.js";
-import { sceneProseScoreBreakdown } from "./prose_metrics.js";
-import { shouldSkipSceneCandidates } from "./scene_candidates.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
 import { proposalRevisionIssueId, proposalRevisionScopeKey } from "./proposal_retry.js";
 import { documentSpans } from "./document_spans.js";
@@ -154,7 +152,8 @@ test("formatWritePackForWriter does not expose draft chrome or paths", () => {
 `);
   const formatted = formatWritePackForWriter(pack);
   assert.match(formatted, /本场写作材料/);
-  assert.match(formatted, /【本场要完成】/);
+  assert.match(formatted, /【本场方向】/);
+  assert.match(formatted, /不是逐项展开的作文提纲/);
   assert.doesNotMatch(formatted, /比序章|写作前草案|chapters\//u);
   assert.doesNotMatch(formatted, /【已成立的事实】[\s\S]*序章/u);
   assert.match(formatted, /比先前/);
@@ -1236,7 +1235,7 @@ test("scene gate skips local repair when blockers exceed one repair batch", asyn
   }
 });
 
-test("scene candidate sampling skips clean originals without extra model calls", async () => {
+test("scene candidate sampling keeps the original without a reader judge", async () => {
   const root = mkdtempSync(join(tmpdir(), "writer-scene-skip-"));
   let store: WriterStore | undefined;
   try {
@@ -1251,7 +1250,7 @@ test("scene candidate sampling skips clean originals without extra model calls",
         preferredMinScenes: 1, preferredMaxScenes: 3, maxScenes: 5,
         notesMaxCharacters: 3_000, candidateCount: 2,
       },
-      // Unreachable endpoint: the test fails with skipped=rewrite_error if a rewrite call is ever attempted.
+      // No reader judge means no rewrite request may be sent to this endpoint.
       sceneCandidates: { model: { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "test" } },
     };
     const call = (name: string, input: Record<string, unknown>) => executeTool(
@@ -1267,10 +1266,6 @@ test("scene candidate sampling skips clean originals without extra model calls",
       "他没有立刻回答，先把一根柴推进去，看着火苗舔上来，才说：「去。」",
       "夜里下了点雨，屋檐滴水的声音断断续续，到天亮才停。",
     ].join("\n\n");
-    assert.ok(
-      shouldSkipSceneCandidates(sceneProseScoreBreakdown(clean)),
-      "fixture must be both clean and vivid enough to skip sampling",
-    );
     const written = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival",
       notes: "## 场景目标\n主角违规进入训练区。",
@@ -1279,7 +1274,7 @@ test("scene candidate sampling skips clean originals without extra model calls",
     })) as Record<string, unknown>;
     assert.equal(written.status, "written");
     const sampling = written.candidateSampling as Record<string, unknown>;
-    assert.equal(sampling.skipped, "original_clean_and_vivid");
+    assert.equal(sampling.skipped, "no_reader_judge");
     assert.equal(sampling.chosen, "original");
     assert.equal(sampling.generated, 0);
   } finally {

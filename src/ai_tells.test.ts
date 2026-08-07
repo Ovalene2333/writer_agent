@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { aiTellScore, analyzeAiTells, sceneAiTellFeedback } from "./ai_tells.js";
+import { aiTellScore, analyzeAiTells } from "./ai_tells.js";
 import { newProseStyleIssues } from "./prose_quality.js";
 import { analyzeChapterProseMetrics } from "./prose_metrics.js";
 
@@ -97,13 +97,6 @@ test("这一层测的东西，前面的规则层一个都发现不了", () => {
 
 test("short passages report nothing (statistics are noise below the floor)", () => {
   assert.deepEqual(analyzeAiTells("他走了。").issues, []);
-  assert.deepEqual(sceneAiTellFeedback("他走了。"), []);
-});
-
-test("scene feedback withholds closing uplift — 章还没写完，收尾还不存在", () => {
-  const feedback = sceneAiTellFeedback(AI_ISH).join("\n");
-  assert.ok(feedback.includes("AI 味计量"), feedback);
-  assert.ok(!feedback.includes("收尾有"), "写作途中不该因为章尾升华提示");
 });
 
 test("事件堆叠句被单独计量（AI 网剧旁白腔）", () => {

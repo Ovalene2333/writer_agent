@@ -7,7 +7,7 @@ import {
   buildStableSystemPrefix,
   projectCacheUserId,
 } from "./agent.js";
-import { isDeepSeekModel, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
+import { applyProviderReasoningToChatBody, isDeepSeekModel, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { modelFetch } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { WriterProject } from "./project.js";
@@ -127,7 +127,7 @@ async function requestProbe(
   options: { model: ModelConfig; tools: readonly unknown[]; userId: string; timeoutMs: number },
 ): Promise<ProbeResult> {
   const endpoint = `${options.model.baseUrl.replace(/\/+$/u, "")}/chat/completions`;
-  const body = JSON.stringify({
+  const body = JSON.stringify(applyProviderReasoningToChatBody(options.model, {
     model: options.model.model,
     messages,
     tools: options.tools,
@@ -136,7 +136,7 @@ async function requestProbe(
     max_tokens: 96,
     ...thinkingRequestOptions(options.model),
     ...samplingRequestOptions(options.model),
-  });
+  }));
   const started = Date.now();
   const response = await modelFetch(endpoint, {
     method: "POST",

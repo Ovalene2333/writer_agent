@@ -1,11 +1,6 @@
 import { completeProviderCompletion, type ProviderUsage, type ProviderWireMessage } from "./model_api.js";
 import { samplingRequestOptions } from "./model_compat.js";
 import {
-  adaptiveRevisionImproved,
-  analyzeAdaptiveStyle,
-  type AdaptiveStyleCode,
-} from "./adaptive_style.js";
-import {
   narrativeEvidenceForPrompt,
   readNarrativeEvidenceSource,
   type NarrativeEvidencePacket,
@@ -16,9 +11,7 @@ import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import type { WriterProject } from "./project.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { formatWritePackForWriter, type WritePack } from "./write_pack.js";
-import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
-import { proseCompressionGuidance } from "./prose_quality.js";
-import { proseRealizationContract } from "./prose_realization.js";
+import { formatRegisterRisksForWriter, type RegisterRisk } from "./register_risks.js";
 
 export type EvidenceGroundedWriterInput = {
   path: string;
@@ -29,8 +22,6 @@ export type EvidenceGroundedWriterInput = {
   previousTail?: string;
   existingText?: string;
   styleEvidence: string;
-  /** Dynamic diagnosis of already-written prose; never part of the stable style slot. */
-  styleFeedback?: string[];
   /** Evidence-backed semantic blockers for a bounded rewrite of existing prose. */
   reviewIssues?: Array<{
     id: string;
@@ -42,6 +33,8 @@ export type EvidenceGroundedWriterInput = {
   targetCharacters?: number;
   /** Per-turn prose control; omitted legacy callers use bounded behavior. */
   lengthMode?: ProseLengthMode;
+  /** Card phrasing that must not be quoted into lived prose. */
+  registerRisks?: RegisterRisk[];
 };
 
 export type EvidenceGroundedWriterResult = {
@@ -50,12 +43,6 @@ export type EvidenceGroundedWriterResult = {
   requestCharacters: number;
   evidenceHash: string;
   evidenceReads: string[];
-  styleRevision?: {
-    triggeredBy: AdaptiveStyleCode[];
-    applied: boolean;
-    remaining: AdaptiveStyleCode[];
-    error?: string;
-  };
 };
 
 export type EvidenceGroundedWriterAccess = {
@@ -75,11 +62,11 @@ const WRITER_SYSTEM = `你是成熟的中文小说作者，只负责把已经取
 
 一场戏从人物眼前想完成的事情生长。让行动得到回应，并在局面、理解、关系或选择中留下变化。场景目标和事件顺序是控制材料，不是需要逐项复述的清单。
 
+创作时先抓住本场最有牵引力的动作、关系压力或发现，让其他材料围绕它自然进入；没有承担现场作用的材料可以保持隐含。硬事实、人物知识边界和明确须落地的信息必须成立，场景卡中的规划字段不要求各占一句、各占一段，也不要求制造感官、物件、对白或句长配额。
+
 对白是人物在关系中采取的行动。每一轮都承接前一轮带来的信息和压力；直答、解释、回避、沉默、误解、玩笑或让步均可。差异来自人物想得到、知道和不愿承认的内容，不靠口头禅、固定句长或随机口语词。
 
-只输出可直接入稿的正文。不要标题、前言、总结、引用标记、JSON 或代码围栏。直接对白使用项目声线证据所采用的引号；证据不一致时使用「……」。`;
-const WRITER_REALIZATION_RULE = proseRealizationContract();
-
+只输出可直接入稿的正文。不要标题、前言、总结、引用标记、JSON 或代码围栏。直接对白使用项目声线证据所采用的引号；「……」、“……”与"……"均可，证据不一致时任选一种并在本章保持一致。`;
 const STATE_SYSTEM = `你是小说场景状态提取器。只根据 previousState 与 sceneContent，提取正文结束时仍会约束后续场景的最小事实。nextScene 只用于相关性筛选，不是已经发生的事实。
 
 只输出 JSON 对象：situation 最多3项、physical 2项、knowledge 3项、relationships 2项、goals 2项、openLoops 3项、usedMotifs 3项。不得把计划、推测、修辞、普通动作或未发生事项写成事实。`;
@@ -124,12 +111,16 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
   const sections = [
     `写作材料：\n${formatWritePackForWriter(input.writePack)}`,
     `共享事实证据（hash=${input.evidence.hash}）：\n${JSON.stringify(narrativeEvidenceForPrompt(input.evidence))}`,
-    `正文缩句契约：\n${proseCompressionGuidance()}`,
   ];
   if (input.writePack.realizationBoundaries?.length) {
     sections.push(
       "表达边界执行规则：先保证事实和本场变化，再按视角、人物知识、说话目的和专业程度选择表达。边界中的词语只是允许或倾向，不是逐字替换表；普通对白和贴身叙述不要为了“忠实设定”强行复述技术术语。",
     );
+  }
+  // Pack-attached risks already render inside formatWritePackForWriter; add live context risks once.
+  if (input.registerRisks?.length && !input.writePack.registerRisks?.length) {
+    const registerRiskText = formatRegisterRisksForWriter(input.registerRisks);
+    if (registerRiskText) sections.push(registerRiskText);
   }
   if (input.previousTail?.trim()) {
     sections.push(`故事刚停在这里。不要复述，接住动作、语气和未完成的压力：\n${input.previousTail.trim().slice(-2_000)}`);
@@ -149,21 +140,12 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
       cost: input.scene.cost,
       oppositionMove: input.scene.oppositionMove,
     })}`);
-    sections.push(`本场对白执行契约：\n${dialogueNaturalnessGuidance()}\n把 scene.goal、characterIntent、obstacle 和 oppositionMove 转成说话人的即时目标与回避点；没有谈话必要时不要为了制造口语感添加对白。`);
+    sections.push("场景卡是当前导航，不是正文模板。先保证入场事实与本场变化成立；goal、characterIntent、obstacle、turn、outcome、readerQuestion、cost 和 oppositionMove 可在同一动作链中合并实现，不要逐字段分段、逐项解释或为可选字段补戏。");
   }
   if (input.targetCharacters) {
     sections.push(input.lengthMode === "guidance"
       ? `篇幅参考约 ${input.targetCharacters} 字（弱引导）。保持场景自然完整，不因偏离参考而缩句、扩句或重写；不用总结、复述和无关支线凑字。`
       : `目标约 ${input.targetCharacters} 字。篇幅服从场景变化，不用总结、复述和无关支线凑字。`);
-  }
-  if (input.styleFeedback?.length) {
-    sections.push(
-      "既有正文暴露出的动态文风问题如下。它们只定位风险，不是要求凑齐的数字配额；结合本场语义避免继续复制：\n"
-        + input.styleFeedback.join("\n"),
-    );
-  }
-  if (!input.scene) {
-    sections.push(`对白执行契约：\n${dialogueNaturalnessGuidance()}`);
   }
   if (input.reviewIssues?.length) {
     sections.push(
@@ -173,7 +155,7 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
   }
   const style = input.styleEvidence.trim();
   return [
-    { role: "system", content: `${WRITER_SYSTEM}\n\n${WRITER_REALIZATION_RULE}` },
+    { role: "system", content: WRITER_SYSTEM },
     { role: "system", content: style },
     { role: "user", content: sections.join("\n\n") },
   ];
@@ -193,12 +175,18 @@ export async function requestEvidenceGroundedProse(
   let hasUsage = false;
   const evidenceReads: string[] = [];
   const completePhase = async (): Promise<string> => {
-    for (let turn = 0; turn < 6; turn += 1) {
+    let evidenceTurns = 0;
+    let continuationTurns = 0;
+    let accumulated = "";
+    while (evidenceTurns < 6) {
+      const remainingCharacters = input.targetCharacters
+        ? Math.max(600, input.targetCharacters - accumulated.length)
+        : undefined;
       const result = await completeProviderCompletion({
         model,
         messages,
         tools: WRITER_TOOLS,
-        maxTokens: writerMaxTokens(input.targetCharacters),
+        maxTokens: writerMaxTokens(remainingCharacters ?? input.targetCharacters),
         ...samplingRequestOptions(model),
       }, signal);
       if (result.usage) {
@@ -206,11 +194,28 @@ export async function requestEvidenceGroundedProse(
         hasUsage = true;
       }
       if (!result.toolCalls.length) {
-        if (result.finishReason === "length") throw new Error("证据型 Writer 输出达到长度上限");
         const content = cleanProse(result.content);
         if (!content) throw new Error("证据型 Writer 没有返回正文");
-        return content;
+        accumulated = mergeProseContinuation(accumulated, content);
+        if (result.finishReason !== "length") return accumulated;
+        if (continuationTurns >= 2) {
+          throw new Error("证据型 Writer 连续三段输出均达到长度上限；需要缩小单次正文范围");
+        }
+        continuationTurns += 1;
+        messages.push({
+          role: "assistant",
+          content: result.content,
+          ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
+        });
+        const target = input.targetCharacters ?? 3_000;
+        const remaining = Math.max(600, target - accumulated.length);
+        messages.push({
+          role: "user",
+          content: `上一次正文因输出长度上限中断。只从截断处继续，不要重写、概括或重复已经输出的内容。当前累计约 ${accumulated.length} 字，全文目标约 ${target} 字；请在约 ${remaining} 字内完成剩余动作并自然收束。只输出续写正文。`,
+        });
+        continue;
       }
+      evidenceTurns += 1;
       messages.push({
         role: "assistant",
         content: result.content,
@@ -230,52 +235,21 @@ export async function requestEvidenceGroundedProse(
     throw new Error("证据型 Writer 取证轮次超过上限；需要主 Agent 缩小场景或补齐证据");
   };
 
-  const firstDraft = await completePhase();
-  const firstAnalysis = analyzeAdaptiveStyle(firstDraft);
-  const triggeredBy = firstAnalysis.issues
-    .filter(issue => issue.reviseCurrentDraft)
-    .map(issue => issue.code);
-  if (!triggeredBy.length) {
-    return writerResult(firstDraft, input, messages, evidenceReads, hasUsage ? usage : undefined);
-  }
-
-  messages.push(
-    { role: "assistant", content: firstDraft },
-    { role: "user", content: buildGroundedAdaptiveRevisionPrompt(
-      firstAnalysis.issues.filter(issue => issue.reviseCurrentDraft).map(issue => issue.message),
-    ) },
-  );
-  try {
-    const revisedDraft = await completePhase();
-    const revisedAnalysis = analyzeAdaptiveStyle(revisedDraft);
-    const improved = adaptiveRevisionImproved(firstAnalysis, revisedAnalysis)
-      && groundedRevisionLengthSafe(firstDraft, revisedDraft, input.targetCharacters, input.lengthMode);
-    const content = improved ? revisedDraft : firstDraft;
-    return writerResult(content, input, messages, evidenceReads, hasUsage ? usage : undefined, {
-      triggeredBy,
-      applied: improved,
-      remaining: (improved ? revisedAnalysis : firstAnalysis).issues
-        .filter(issue => issue.reviseCurrentDraft)
-        .map(issue => issue.code),
-    });
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    return writerResult(firstDraft, input, messages, evidenceReads, hasUsage ? usage : undefined, {
-      triggeredBy,
-      applied: false,
-      remaining: triggeredBy,
-      error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
-    });
-  }
+  const content = await completePhase();
+  return writerResult(content, input, messages, evidenceReads, hasUsage ? usage : undefined);
 }
 
-export function buildGroundedAdaptiveRevisionPrompt(instructions: readonly string[]): string {
-  return [
-    "上面是已经完成取证的首稿。现在只做一次完整文风修订。身份、关系、能力、知识来源、时间地点、物品、事件顺序、信息释放、因果、场景结果和所有不确定项必须原样成立；不得增加新事实，也不得删掉承载这些事实的动作或对白。",
-    "机器统计只定位可能有问题的形状。逐段通读后只改语义上真实命中的地方，不为阈值凑长句、短句、口语词或段落变化；命令、停顿、克制和必要复沓都可以保留。",
-    `本次需要复核：\n${instructions.map(item => `- ${item}`).join("\n")}`,
-    "输出修订后的完整正文，不要解释修改，不要输出标题或清单。",
-  ].join("\n\n");
+/** Join a length-limited continuation without duplicating the model's repeated seam. */
+export function mergeProseContinuation(current: string, continuation: string): string {
+  const left = current.trimEnd();
+  const right = continuation.trimStart();
+  if (!left) return right;
+  if (!right) return left;
+  const maximumOverlap = Math.min(400, left.length, right.length);
+  for (let overlap = maximumOverlap; overlap >= 8; overlap -= 1) {
+    if (left.endsWith(right.slice(0, overlap))) return left + right.slice(overlap);
+  }
+  return `${left}\n\n${right}`;
 }
 
 export async function requestSceneStateExtraction(
@@ -382,31 +356,12 @@ function writerMaxTokens(targetCharacters?: number): number {
   return Math.min(16_000, Math.max(2_400, Math.ceil(characters * 2.4)));
 }
 
-function groundedRevisionLengthSafe(
-  original: string,
-  revised: string,
-  targetCharacters?: number,
-  lengthMode?: ProseLengthMode,
-): boolean {
-  const before = original.replace(/\s/g, "").length;
-  const after = revised.replace(/\s/g, "").length;
-  if (!before || after < before * 0.7) return false;
-  // Weak guidance must not turn a style pass into a target-driven rewrite;
-  // preserve only a reasonable relationship with the submitted draft.
-  if (lengthMode === "guidance") return after <= before * 1.3;
-  if (targetCharacters && before < targetCharacters * 0.7) {
-    return after <= targetCharacters * 1.2;
-  }
-  return after <= before * 1.3;
-}
-
 function writerResult(
   content: string,
   input: EvidenceGroundedWriterInput,
   messages: ProviderWireMessage[],
   evidenceReads: string[],
   usage?: ModelTokenUsage,
-  styleRevision?: NonNullable<EvidenceGroundedWriterResult["styleRevision"]>,
 ): EvidenceGroundedWriterResult {
   return {
     content,
@@ -414,7 +369,6 @@ function writerResult(
     requestCharacters: messages.reduce((sum, message) => sum + messageText(message).length, 0),
     evidenceHash: input.evidence.hash,
     evidenceReads,
-    ...(styleRevision ? { styleRevision } : {}),
   };
 }
 

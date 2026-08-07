@@ -1,6 +1,6 @@
 /** Shared web types & pure constants extracted from main.tsx. */
 
-import type { AgentStepBudgetMode, ProseLengthSettings, ProviderCatalog, ScenePipelineSettings, WritingExecutionMode } from "./model_config";
+import type { AgentStepBudgetMode, ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, WritingExecutionMode } from "./model_config";
 
 /** Rule-layer writing-quality picture. Absent on非正文提案与旧提案 —— 渲染时必须容忍。 */
 export type ProseQualityReport = {
@@ -300,6 +300,8 @@ export type StepUsageCall = {
   cost: number;
   currency: string;
   estimated?: boolean;
+  reasoningTokens?: number;
+  durationMs?: number;
 };
 export type StepUsage = {
   model?: string;
@@ -313,6 +315,8 @@ export type StepUsage = {
   currency: string;
   estimated?: boolean;
   cacheHitRate?: number;
+  reasoningTokens?: number;
+  durationMs?: number;
   callBreakdown?: StepUsageCall[];
   requestComponents?: Array<{
     kind: "stable_system" | "dynamic_system" | "tool_schema" | "user" | "assistant" | "tool_result" | "other";
@@ -604,6 +608,7 @@ export type State = {
     scenePipeline: ScenePipelineSettings;
     proseLength?: ProseLengthSettings;
     proseGateTimeouts?: { primarySeconds: number; finalSeconds: number };
+    roleplay?: RoleplaySettings;
   };
   proseGateRules?: ProseGateRule[];
   authorPolicies?: AuthorPolicy[];

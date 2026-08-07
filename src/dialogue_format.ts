@@ -1,17 +1,16 @@
 /**
  * Deterministic punctuation audit for written dialogue.
  *
- * This deliberately validates only visible delimiters. Whether an unquoted
- * sentence is spoken dialogue is a contextual judgment left to chapter review;
- * guessing it from nearby speech verbs would turn a format gate into a brittle
- * semantic parser.
+ * Accepts multiple direct-speech delimiter styles without forcing one:
+ *   「...」  『...』 (nestable)  “...”  "..."
+ * Only reports unmatched / misnested pairs. Whether an unquoted sentence is
+ * spoken dialogue remains a contextual judgment for chapter review.
  */
 
-export type DialogueFormatIssueCode = "nonstandard_quote" | "unmatched_quote" | "misnested_quote";
+export type DialogueFormatIssueCode = "unmatched_quote" | "misnested_quote";
 
 export type DialogueFormatIssue = {
   code: DialogueFormatIssueCode;
-  /** False when a noncanonical pair may be a written quotation rather than speech. */
   blocksProposal: boolean;
   line: number;
   column: number;
@@ -20,7 +19,7 @@ export type DialogueFormatIssue = {
   suggestion: string;
 };
 
-type QuoteKind = "direct" | "nested" | "curly" | "ascii";
+type QuoteKind = "corner" | "nested" | "curly" | "ascii";
 type OpenQuote = {
   kind: QuoteKind;
   start: number;
@@ -28,22 +27,21 @@ type OpenQuote = {
   column: number;
   opener: string;
   closer: string;
-  insideDirect: boolean;
 };
 
 const OPEN_QUOTES: Record<string, { kind: QuoteKind; closer: string }> = {
-  "「": { kind: "direct", closer: "」" },
+  "「": { kind: "corner", closer: "」" },
   "『": { kind: "nested", closer: "』" },
   "“": { kind: "curly", closer: "”" },
 };
 
 const CLOSE_QUOTES = new Set(["」", "』", "”"]);
 
+const ALLOWED_STYLES = `「……」、“……”、"……" 均可；对白内嵌引文可用『……』`;
+
 /**
- * Direct spoken dialogue uses 「...」. 『...』 remains available for a quotation
- * nested inside a line. Curly and ASCII double quotes are always reported, but
- * only block when their context clearly makes them spoken dialogue. They can
- * also quote a note, screen or written text, which requires semantic context.
+ * Validate that quote openers and closers pair correctly. Style choice among
+ * corner, curly, and ASCII double quotes is not enforced.
  */
 export function auditDialogueFormat(text: string): DialogueFormatIssue[] {
   const issues: DialogueFormatIssue[] = [];
@@ -73,23 +71,11 @@ export function auditDialogueFormat(text: string): DialogueFormatIssue[] {
         "misnested_quote",
         character,
         `引号 ${character} 与 ${open.opener} 不配对；此处应先闭合 ${open.closer}。`,
-        "按嵌套顺序闭合引号；直接对白用「……」，其内引用用『……』。",
+        `按嵌套顺序闭合引号，并使开闭类型一致。${ALLOWED_STYLES}。`,
       );
       return;
     }
     stack.pop();
-    if (open.kind === "curly" || open.kind === "ascii") {
-      const span = text.slice(open.start, offset + character.length);
-      report(
-        "nonstandard_quote",
-        span.length <= 160 ? span : `${span.slice(0, 157)}...`,
-        `${open.opener}${character} 不是正文对白的统一引号。`,
-        "把这组引号改为「……」；只有对白中的嵌套引文使用『……』。",
-        open.insideDirect || looksLikeSpokenDialogue(text, open.start, offset + character.length),
-        open.line,
-        open.column,
-      );
-    }
   };
 
   for (const character of text) {
@@ -103,13 +89,11 @@ export function auditDialogueFormat(text: string): DialogueFormatIssue[] {
       if (stack.at(-1)?.kind === "ascii") close(character);
       else stack.push({
         kind: "ascii", start: offset, line, column, opener: character, closer: character,
-        insideDirect: stack.some(item => item.kind === "direct"),
       });
     } else if (OPEN_QUOTES[character]) {
       const descriptor = OPEN_QUOTES[character];
       stack.push({
         kind: descriptor.kind, start: offset, line, column, opener: character, closer: descriptor.closer,
-        insideDirect: stack.some(item => item.kind === "direct"),
       });
     } else if (CLOSE_QUOTES.has(character)) {
       close(character);
@@ -141,17 +125,8 @@ export function dialogueFormatGateError(text: string): string | undefined {
   );
   const remaining = issues.length - details.length;
   return [
-    "对白引号格式拦截：直接对白统一使用「……」，对白内嵌引用使用『……』。",
+    `对白引号格式拦截：引号须成对且开闭一致；${ALLOWED_STYLES}，不强制统一样式。`,
     ...details,
     ...(remaining > 0 ? [`另有 ${remaining} 处同类问题。`] : []),
   ].join("\n");
-}
-
-/** A narrow audit heuristic, never used to infer any other dialogue semantics. */
-function looksLikeSpokenDialogue(text: string, start: number, end: number): boolean {
-  const before = text.slice(Math.max(0, start - 16), start);
-  const after = text.slice(end, end + 20);
-  const speechBefore = /(?:说|问|道|答|喊|叫|开口|低声|沉声|补充|回答|反问|打断)[：:\s]*$/u;
-  const speechAfter = /^[，,。！？!?…\s]*[一-鿿]{0,6}(?:说|问|道|答|喊|叫|开口|低声|沉声|补充|回答|反问|打断)/u;
-  return speechBefore.test(before) || speechAfter.test(after);
 }

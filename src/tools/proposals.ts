@@ -41,11 +41,21 @@ import {
   type ProposalRevisionIssue,
 } from "../proposal_retry.js";
 import { boundedRepairPacket, type RepairPacket } from "../repair_packet.js";
-import { ToolRevisionRequiredError } from "../tool_failure.js";
+import { ToolDependencyError, ToolRevisionRequiredError } from "../tool_failure.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import { dialogueFormatGateError } from "../dialogue_format.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
+import {
+  assessCardRegisterHits,
+  cardRegisterGateError,
+  cardRegisterRepairPacket,
+  cardRegisterReportForTool,
+  collectRegisterRisksForContext,
+  proseSignalsFromCardRegister,
+  scanCardRegisterHits,
+  type CardRegisterAssessment,
+} from "../register_risks.js";
 import type { ToolExecutionContext, ToolHandlerArgs } from "./types.js";
 import {
   assertCreativeOutlineDesigned,
@@ -620,6 +630,14 @@ export async function proseStyleGateIssues(
     if (learnedIssues) {
       issues.push(...learnedIssues);
     } else if (learnedFailure) {
+      if (adjudicatorModels.length === 1) {
+        const detail = learnedFailure instanceof Error ? learnedFailure.message : String(learnedFailure);
+        throw new ToolDependencyError(
+          "PROSE_GATE_UNAVAILABLE",
+          `语义正文门控暂时不可用（仅配置 1 个唯一审核模型，无独立回退）：${detail}`,
+          { cause: learnedFailure },
+        );
+      }
       throw learnedFailure;
     }
   }
@@ -763,8 +781,28 @@ export async function submitFullDocumentProposal(
       throw new ToolRevisionRequiredError("DIALOGUE_FORMAT_REVISION_REQUIRED", dialogueFormatError);
     }
   }
+  let cardRegisterAssessment: CardRegisterAssessment | undefined;
+  if (isScenePipelineDocument(path)) {
+    const risks = collectRegisterRisksForContext(store, context);
+    cardRegisterAssessment = assessCardRegisterHits(scanCardRegisterHits(proposedBody, risks));
+    const registerError = cardRegisterGateError(cardRegisterAssessment);
+    if (registerError) {
+      throw new ToolRevisionRequiredError("CARD_REGISTER_REVISION_REQUIRED", registerError, {
+        repairPacket: cardRegisterRepairPacket(proposedBody, cardRegisterAssessment, {
+          path,
+          sourceHash: draftSourceHash,
+        }),
+      });
+    }
+  }
   if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
-    const blocked = await reviewDirectNarrativeProposal(args, path, proposedBody, summary);
+    const blocked = await reviewDirectNarrativeProposal(
+      args,
+      path,
+      proposedBody,
+      summary,
+      cardRegisterAssessment,
+    );
     if (blocked) return blocked;
   }
   const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
@@ -800,6 +838,9 @@ export async function submitFullDocumentProposal(
     submissionKind: existed ? "new_version" : "new_document",
     ...(lengthNotice ? { lengthNotice } : {}),
     ...(qualityReport ? { qualityReport: formatQualityReportLines(qualityReport) } : {}),
+    ...(cardRegisterAssessment && cardRegisterAssessment.status === "warn"
+      ? { cardRegister: cardRegisterReportForTool(cardRegisterAssessment) }
+      : {}),
     ...(policyObservations?.length ? { policyObservations } : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
@@ -813,6 +854,7 @@ async function reviewDirectNarrativeProposal(
   path: string,
   content: string,
   summary: string,
+  cardRegisterAssessment?: CardRegisterAssessment,
 ): Promise<string | undefined> {
   const reviewer = args.context.chapterReviewer!;
   const runReview = reviewer.run ?? reviewChapterDraft;
@@ -884,6 +926,9 @@ async function reviewDirectNarrativeProposal(
           revisionReview,
           revisionBaselineContent: revisionContext!.previousContent,
         } : {}),
+        ...(cardRegisterAssessment
+          ? { proseSignals: proseSignalsFromCardRegister(cardRegisterAssessment) }
+          : {}),
         scenes: [{
           sceneId: "document",
           title: path,

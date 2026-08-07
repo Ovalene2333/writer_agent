@@ -25,6 +25,7 @@ describe("naturalProseCraftPrompt", () => {
   it("grounds naturalness in positive scene-level craft without numeric recipes", () => {
     const prompt = naturalProseCraftPrompt();
     assert.match(prompt, /视角人物的注意力/);
+    assert.match(prompt, /不是逐项展开的段落模板/);
     assert.match(prompt, /场景从人物此刻想完成/);
     assert.match(prompt, /对白/);
     assert.match(prompt, /物件、环境、技术与感官/);

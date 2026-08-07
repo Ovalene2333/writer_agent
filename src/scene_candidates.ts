@@ -2,7 +2,6 @@ import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelFetch } from "./model_fetch.js";
 import { samplingRequestOptions } from "./model_compat.js";
 import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
-import { sceneProseScore, type SceneScoreBreakdown } from "./prose_metrics.js";
 import type { ModelConfig } from "./types.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 
@@ -16,32 +15,13 @@ import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js"
  * the same gates as the original; on any model failure the original ships
  * unchanged, so the feature can never block a scene.
  *
- * Selection is a two-tier decision. When a judge model is configured the winner
- * is chosen by reading — which draft makes a reader want the next page — because
- * the thing best-of-N is meant to buy is exactly the thing no rule can score.
- * The deterministic rerank is the fallback, not the default.
+ * A reader model chooses the winner by reading — which draft makes a reader want
+ * the next page — because the thing best-of-N is meant to buy is exactly the
+ * thing no rule can score. Without a reader judgment, the original ships.
  */
 
 const REWRITE_TIMEOUT_MS = 120_000;
 const JUDGE_TIMEOUT_MS = 90_000;
-
-/** Penalty at or below this counts as "no defect worth rewriting for". */
-export const SCENE_CANDIDATE_SKIP_PENALTY = 1;
-/** …and the scene must already read as a scene before we skip sampling. */
-export const SCENE_CANDIDATE_SKIP_VIVIDNESS = 72;
-
-/**
- * Skip sampling only when the scene is BOTH clean and vivid.
- *
- * The previous single-threshold form (total score ≥ 99) silently disabled the
- * feature in the case it exists for: the penalty ledger tops out at 100 for any
- * clean prose, so a flat-but-correct scene always scored above the bar and never
- * sampled. Cleanliness is a floor, not a reason to stop.
- */
-export function shouldSkipSceneCandidates(breakdown: SceneScoreBreakdown): boolean {
-  return breakdown.penalty <= SCENE_CANDIDATE_SKIP_PENALTY
-    && breakdown.vividness >= SCENE_CANDIDATE_SKIP_VIVIDNESS;
-}
 
 export type SceneRewriteRequest = {
   model: ModelConfig;
@@ -53,16 +33,6 @@ export type SceneRewriteRequest = {
   timeoutMs?: number;
   usageReporter?: ModelUsageReporter;
 };
-
-/** Deterministic rerank: original first; a rewrite must strictly beat it to win. */
-export function pickBestSceneCandidate(candidates: string[]): { index: number; scores: number[] } {
-  const scores = candidates.map(candidate => sceneProseScore(candidate));
-  let index = 0;
-  for (let i = 1; i < scores.length; i += 1) {
-    if (scores[i] > scores[index]) index = i;
-  }
-  return { index, scores };
-}
 
 export type SceneJudgeRequest = {
   model: ModelConfig;
@@ -161,17 +131,17 @@ export function sceneRewriteLengthOk(original: string, rewrite: string): boolean
 }
 
 export function buildSceneRewriteMessages(request: Pick<SceneRewriteRequest, "styleEvidence" | "sceneBrief" | "original">): Array<{ role: "system" | "user"; content: string }> {
-  const system = `你是中文小说家，正在重写自己刚写完的一场戏，让文字更有质感。
+const system = `你是中文小说家，正在判断自己刚写完的一场戏是否需要更自然、更有阅读牵引力的表达。如果原稿已经成立，保留它的好句和节奏；只有确有僵硬、字段化或失去现场感的地方才重写。
 
 ${request.styleEvidence}
 
-重写要求：
+重写边界：
 - 完整保留原稿的每一个事件、信息揭示、动作次序、离场状态与对白意图；对白措辞可微调，含义与说话人不变。
 - 篇幅与原稿相当。
-- 长短句交替，段落有呼吸；静场与情感段落给出绵延的长句；补充说明并入叙述或写成独立句。
-- 感官与数据转译为人物可感的后果或准确的比喻；现场不只被看见，也被听见、摸到或闻到。
-- 让人物拿得起、躲得开、弄得坏的实物留在场上，并让其中一件参与动作；泛化氛围词（气氛、仿佛、某种、一切）换成此时此地才成立的说法。
-- 对白是人物对彼此采取的行动，不是信息交接；情绪落在动作、时机与没说出口的话里，不由叙述者命名。
+- 句子和段落跟随人物注意、行动压力与信息落点自然变化，不追求长短句比例、感官数量、物件数量或对白占比。
+- 只有能改变人物感知、选择或局面的细节才补入；不要为了“更有画面”制造感官、比喻、道具或口语词。
+- 对白保留人物各自的目的、知识和回避；情绪优先落在动作、时机与没说出口的话里，不替读者总结。
+- 句式边界只处理成片复现、重复解释和关系含混；孤立且符合人物、现场或文体的表达保留。
 - 只输出重写后的正文：不要标题、说明、围栏或任何正文以外的字。`;
   const user = `本场要点：${request.sceneBrief}
 

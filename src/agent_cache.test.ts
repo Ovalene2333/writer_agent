@@ -36,6 +36,7 @@ import {
   proposalRevisionDraftCacheKey,
   proposalFailureDraft,
   proposalFailurePauseResult,
+  appendTerminalJobReference,
   proposalFailureShouldPersistRevisionCase,
   saveProposalRevisionCase,
   chapterDraftNeedsReview,
@@ -549,6 +550,18 @@ test("provider usage parsing and tagged persistence include hidden model calls",
     cacheHitTokens: 80,
     cacheMissTokens: 40,
     cacheWriteTokens: 12,
+  });
+  assert.deepEqual(parseModelTokenUsage({
+    prompt_tokens: 50,
+    completion_tokens: 8000,
+    completion_tokens_details: { reasoning_tokens: 7800 },
+    prompt_tokens_details: { cached_tokens: 10 },
+  }), {
+    promptTokens: 50,
+    completionTokens: 8000,
+    cacheHitTokens: 10,
+    cacheMissTokens: 40,
+    reasoningTokens: 7800,
   });
 
   const root = mkdtempSync(join(tmpdir(), "writer-usage-"));
@@ -1113,6 +1126,22 @@ test("proposal pause display includes exact blocker evidence, problem and action
   assert.equal("artifactId" in paused, false);
 });
 
+test("abnormal terminal output carries the database-indexable job id", () => {
+  assert.equal(
+    appendTerminalJobReference("审核依赖暂时不可用。", "job-abc123"),
+    "审核依赖暂时不可用。\n\nJob ID: job-abc123",
+  );
+  assert.equal(appendTerminalJobReference("内容", undefined), "内容");
+});
+
+test("proposal pause reports when no independent review fallback exists", () => {
+  const paused = proposalFailurePauseResult({
+    error: "语义正文门控暂时不可用（仅配置 1 个唯一审核模型，无独立回退）：句式二审连续两次返回空内容",
+  }, "dependency");
+  assert.match(String(paused.displayMessage), /仅配置了一个唯一模型/u);
+  assert.doesNotMatch(String(paused.displayMessage), /审核模型及回退模型均不可用/u);
+});
+
 test("scene continuation handoff carries seam tail, states and next card without full prose", () => {
   let draft = beginChapterSceneDraft({
     path: "chapters/第1章.md", mode: "create", heading: "第1章", chapterGoal: "关系反转",
@@ -1132,18 +1161,14 @@ test("scene continuation handoff carries seam tail, states and next card without
   draft = writeChapterScene(draft, "s1", sceneBody, {
     situation: ["警报已触发"], physical: [], knowledge: [], relationships: [], goals: [], openLoops: [], usedMotifs: [],
   }).draft;
-  const prompt = sceneContinuationPrompt(draft, {
-    styleFeedback: ["下一场禁用段首起笔：「她沿」×30"],
-    stylePriorNotes: ["上一章高频微动作词：目光×8"],
-  });
+  const prompt = sceneContinuationPrompt(draft, {});
   assert.match(prompt, /已完成 1\/2 场/);
   assert.match(prompt, /警报在头顶炸开/);
   assert.match(prompt, /警报已触发/);
   assert.match(prompt, /"id":"s2"/);
   assert.match(prompt, /sceneId=s2/);
   assert.match(prompt, /revise_chapter_scene_guide/);
-  assert.match(prompt, /禁用段首起笔/);
-  assert.match(prompt, /目光×8/);
+  assert.doesNotMatch(prompt, /styleFeedback|stylePriorNotes|禁用段首起笔/u);
   assert.match(prompt, /不要输出计划说明/);
   // Only the bounded tail of the finished scene survives — never its full prose.
   assert.doesNotMatch(prompt, /钥匙句/);
