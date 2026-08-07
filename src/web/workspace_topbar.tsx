@@ -174,7 +174,7 @@ export function WorkspaceTopbar({
         </nav>
         <button
           type="button"
-          className="usage-strip"
+          className={`usage-strip${usagePct >= 85 ? " usage-hot" : usagePct >= 60 ? " usage-warm" : ""}`}
           onClick={onUsage}
           title={`${model} · 上下文 ${usagePct}% · ${usageUnmetered ? "非按量计费" : `费用 ${usageLabel}`}`}
         >
@@ -183,7 +183,11 @@ export function WorkspaceTopbar({
             <i style={{ width: `${Math.min(100, Math.max(2, usagePct))}%` }} />
           </span>
           <span className="usage-pct">{usagePct}%</span>
-          <span className="usage-cost">{usageUnmetered ? "非按量计费" : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost.toFixed(4)}`}</span>
+          <span className="usage-cost">
+            {usageUnmetered
+              ? "非按量"
+              : `${usageCurrency === "CNY" ? "¥" : "$"}${usageCost >= 1 ? usageCost.toFixed(2) : usageCost.toFixed(3)}`}
+          </span>
           <ChevronDown size={13} className="usage-chevron-icon" aria-hidden="true" />
         </button>
         <div className="header-utility">

@@ -3,7 +3,7 @@
  * 从 main.tsx 抽出，避免工作台主文件继续膨胀。
  */
 import React, { useMemo, useState } from "react";
-import { ChevronRight, FileText } from "lucide-react";
+import { Check, ChevronRight, FileText, Layers, X } from "lucide-react";
 import { documentDiff, renderDiffHtml } from "../diff";
 import {
   QUALITY_GRADE_LABEL,
@@ -27,6 +27,16 @@ const CHANGE_SET_STATUS_LABEL: Record<string, string> = {
   stale: "已过期",
   "rolled back": "已回滚",
 };
+
+function pathBase(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+
+function pathDir(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx > 0 ? path.slice(0, idx) : "";
+}
 
 /** Track-changes view: deletions strikethrough + fill, insertions background fill. */
 export function DocumentDiffView({ before, after }: { before: string; after: string }) {
@@ -100,18 +110,33 @@ export function ChangeSetCard({ value, onAction, onOpenPath }: {
 }) {
   const stateKey = value.status === "accepted" && value.undone ? "rolled back" : value.status;
   const stateLabel = CHANGE_SET_STATUS_LABEL[stateKey] ?? stateKey;
+  const fileCount = value.files.length;
+  const charCount = value.characterChanges.length;
   return (
-    <div className="proposal-card change-set-card">
-      <h3>批量改动 #{value.id}</h3>
-      <p>{value.summary}</p>
-      <span className="change-set-status">{stateLabel}</span>
+    <div className={`proposal-card change-set-card status-${value.status}${value.undone ? " undone" : ""}`}>
+      <div className="proposal-card-head">
+        <div className="proposal-card-title">
+          <span className="proposal-card-icon" aria-hidden="true"><Layers size={14} /></span>
+          <div className="proposal-card-title-text">
+            <h3>批量改动 #{value.id}</h3>
+            <span className="proposal-card-meta">
+              {fileCount > 0 ? `${fileCount} 个文件` : ""}
+              {fileCount > 0 && charCount > 0 ? " · " : ""}
+              {charCount > 0 ? `${charCount} 项角色` : ""}
+            </span>
+          </div>
+        </div>
+        <span className={`change-set-status status-${stateKey.replace(/\s+/g, "-")}`}>{stateLabel}</span>
+      </div>
+      {value.summary ? <p className="proposal-card-summary">{value.summary}</p> : null}
       {value.files.map((file) => (
         <details className="change-set-file" key={file.id} open={value.files.length === 1}>
           <summary>
-            <strong>{OPERATION_LABEL[file.operation] ?? file.operation}</strong>
-            {" "}
-            {file.path}
-            {file.targetPath ? ` → ${file.targetPath}` : ""}
+            <span className="change-set-op">{OPERATION_LABEL[file.operation] ?? file.operation}</span>
+            <span className="change-set-file-name" title={file.path}>
+              {pathBase(file.path)}
+              {file.targetPath ? ` → ${pathBase(file.targetPath)}` : ""}
+            </span>
             {onOpenPath && file.operation !== "delete" && (
               <button
                 type="button"
@@ -143,8 +168,12 @@ export function ChangeSetCard({ value, onAction, onOpenPath }: {
       <div className="proposal-actions">
         {value.status === "pending" && (
           <>
-            <button type="button" onClick={() => onAction(value, "reject")}>拒绝</button>
-            <button type="button" className="primary" onClick={() => onAction(value, "accept")}>全部接受</button>
+            <button type="button" className="proposal-reject" onClick={() => onAction(value, "reject")}>
+              <X size={13} aria-hidden="true" />拒绝
+            </button>
+            <button type="button" className="primary" onClick={() => onAction(value, "accept")}>
+              <Check size={13} aria-hidden="true" />全部接受
+            </button>
           </>
         )}
         {value.status === "accepted" && !value.undone && (
@@ -170,10 +199,18 @@ function ProposalCard({
   const hasDiff = value.beforeContent !== value.afterContent
     || Boolean(value.beforeContent)
     || Boolean(value.afterContent);
+  const base = pathBase(value.path);
+  const dir = pathDir(value.path);
   return (
     <div className="proposal-card">
       <div className="proposal-card-head">
-        <h3 title={value.path}>{value.path}</h3>
+        <div className="proposal-card-title">
+          <span className="proposal-card-icon" aria-hidden="true"><FileText size={14} /></span>
+          <div className="proposal-card-title-text">
+            <h3 title={value.path}>{base}</h3>
+            {dir ? <span className="proposal-card-meta" title={value.path}>{dir}</span> : null}
+          </div>
+        </div>
         {onOpenPath && (
           <button
             type="button"
@@ -181,11 +218,11 @@ function ProposalCard({
             title="在正文区打开该文档"
             onClick={() => onOpenPath(value.path)}
           >
-            <FileText size={12} aria-hidden="true" />打开文档
+            <FileText size={12} aria-hidden="true" />打开
           </button>
         )}
       </div>
-      <p>{value.summary}</p>
+      {value.summary ? <p className="proposal-card-summary">{value.summary}</p> : null}
       {value.qualityReport && <ProposalQualityCard report={value.qualityReport} />}
       {hasDiff && (
         <details className="change-set-file proposal-diff" open>
@@ -194,8 +231,12 @@ function ProposalCard({
         </details>
       )}
       <div className="proposal-actions">
-        <button type="button" onClick={() => onDecide(value, "reject")}>拒绝</button>
-        <button type="button" className="primary" onClick={() => onDecide(value, "accept")}>接受</button>
+        <button type="button" className="proposal-reject" onClick={() => onDecide(value, "reject")}>
+          <X size={13} aria-hidden="true" />拒绝
+        </button>
+        <button type="button" className="primary" onClick={() => onDecide(value, "accept")}>
+          <Check size={13} aria-hidden="true" />接受
+        </button>
       </div>
     </div>
   );
@@ -223,14 +264,14 @@ export function ReviewDock({
 }) {
   const total = changeSets.length + proposals.length;
   return (
-    <section className={`review-drawer${open ? " open" : ""}`} aria-label="待审阅的改动">
+    <section className={`review-drawer${open ? " open" : ""}${pendingCount > 0 ? " has-pending" : ""}`} aria-label="待审阅的改动">
       <button type="button" className="review-drawer-toggle" onClick={onToggle} aria-expanded={open}>
         <span className="review-drawer-chevron" aria-hidden="true">
           <ChevronRight size={12} />
         </span>
-        <span className="review-drawer-title">审阅</span>
+        <span className="review-drawer-title">待审阅</span>
         {pendingCount > 0 && <span className="proposal-count">{pendingCount}</span>}
-        <span className="review-drawer-hint">{open ? "收起" : `${total} 项`}</span>
+        <span className="review-drawer-hint">{open ? "收起" : total > 0 ? `${total} 项改动` : "暂无"}</span>
       </button>
       {open && (
         <div className="review-drawer-body">

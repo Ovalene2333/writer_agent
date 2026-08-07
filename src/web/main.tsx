@@ -33,8 +33,10 @@ import {
   Search,
   Share2,
   Save,
+  SendHorizontal,
   Settings,
   ShieldCheck,
+  Square,
   Sun,
   Trash2,
   WandSparkles,
@@ -3436,8 +3438,36 @@ function App() {
 
   if (!state) {
     return (
-      <main className="app-shell">
-        <p>{error || "正在加载工作台…"}</p>
+      <main className="app-shell boot-shell" aria-busy={!error} aria-live="polite">
+        {error ? (
+          <div className="boot-error-card" role="alert">
+            <strong>无法加载工作台</strong>
+            <p>{error}</p>
+          </div>
+        ) : (
+          <div className="boot-skeleton" aria-label="正在加载工作台">
+            <div className="boot-skel-header">
+              <i className="boot-skel-logo" />
+              <i className="boot-skel-line short" />
+              <i className="boot-skel-line" />
+            </div>
+            <div className="boot-skel-body">
+              <div className="boot-skel-col narrow">
+                <i className="boot-skel-block" />
+                <i className="boot-skel-block" />
+                <i className="boot-skel-block short" />
+              </div>
+              <div className="boot-skel-col wide">
+                <i className="boot-skel-block tall" />
+              </div>
+              <div className="boot-skel-col">
+                <i className="boot-skel-block" />
+                <i className="boot-skel-block short" />
+              </div>
+            </div>
+            <p className="boot-skel-caption">正在加载工作台…</p>
+          </div>
+        )}
       </main>
     );
   }
@@ -4453,7 +4483,7 @@ function App() {
                 onClick={() => void toggleFastWritingMode()}
               >
                 <Zap size={11} aria-hidden="true" />
-                Fast
+                快速
               </button>
               <button
                 type="button"
@@ -4569,42 +4599,40 @@ function App() {
                   </div>
                 </details>
                 <div className="roleplay-action-group roleplay-action-group-secondary">
-                  <button type="button" disabled={busy} onClick={() => setRoleplaySceneManagerOpen(true)} title="场景管理与场景序列">
-                    <ListOrdered size={13} aria-hidden="true" /><span>场景</span>
-                  </button>
-                  <details className={`roleplay-rating-menu rating-${roleplay.contentRating ?? "default"}`}>
-                    <summary title={`内容分级：${(roleplay.contentRating ?? "default") === "default" ? "默认" : (roleplay.contentRating ?? "default").toUpperCase()}`}>
-                      <ShieldCheck size={13} aria-hidden="true" /><span>分级</span>
+                  <details className="roleplay-more-menu">
+                    <summary title="场景、分级、记忆与设定">
+                      <Menu size={13} aria-hidden="true" /><span>更多</span>
                     </summary>
-                    <div role="menu" aria-label="角色扮演内容分级">
-                      {(["default", "sfw", "nsfw"] as RoleplayContentRating[]).map(contentRating => {
-                        const active = (roleplay.contentRating ?? "default") === contentRating;
-                        return (
-                          <button
-                            key={contentRating}
-                            type="button"
-                            role="menuitemradio"
-                            aria-checked={active}
-                            className={active ? "active" : ""}
-                            disabled={busy}
-                            title={contentRating === "default" ? "沿用角色与场景设定" : contentRating === "sfw" ? "强制非露骨内容" : "强制成人向内容；仅限明确成年角色"}
-                            onClick={(event) => {
-                              event.currentTarget.closest("details")?.removeAttribute("open");
-                              void updateRoleplayContentRating(contentRating);
-                            }}
-                          >
-                            <span>{contentRating === "default" ? "默认" : contentRating.toUpperCase()}</span>
-                          </button>
-                        );
-                      })}
+                    <div className="roleplay-more-panel" role="menu" aria-label="扮演更多选项">
+                      <button type="button" role="menuitem" disabled={busy} onClick={() => setRoleplaySceneManagerOpen(true)} title="场景管理与场景序列">
+                        <ListOrdered size={13} aria-hidden="true" /><span>场景</span>
+                      </button>
+                      <div className="roleplay-more-rating" role="group" aria-label="内容分级">
+                        <span className="roleplay-more-label">分级</span>
+                        {(["default", "sfw", "nsfw"] as RoleplayContentRating[]).map(contentRating => {
+                          const active = (roleplay.contentRating ?? "default") === contentRating;
+                          return (
+                            <button
+                              key={contentRating}
+                              type="button"
+                              className={active ? "active" : ""}
+                              disabled={busy}
+                              title={contentRating === "default" ? "沿用角色与场景设定" : contentRating === "sfw" ? "强制非露骨内容" : "强制成人向内容；仅限明确成年角色"}
+                              onClick={() => void updateRoleplayContentRating(contentRating)}
+                            >
+                              {contentRating === "default" ? "默认" : contentRating.toUpperCase()}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <button type="button" role="menuitem" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
+                        <History size={13} aria-hidden="true" /><span>记忆</span>
+                      </button>
+                      <button type="button" role="menuitem" disabled={busy} onClick={() => beginRoleplaySetup()} title="更换角色与场景设定">
+                        <Settings size={13} aria-hidden="true" /><span>设定</span>
+                      </button>
                     </div>
                   </details>
-                  <button type="button" disabled={busy} onClick={() => setRoleplayMemoryOpen(true)} title="事实记忆">
-                    <History size={13} aria-hidden="true" /><span>记忆</span>
-                  </button>
-                  <button type="button" disabled={busy} onClick={() => beginRoleplaySetup()} title="更换角色与场景设定">
-                    <Settings size={13} aria-hidden="true" /><span>设定</span>
-                  </button>
                   <button type="button" className="roleplay-exit-button" disabled={busy} onClick={() => void exitRoleplay()} title="退出角色扮演">
                     <X size={13} aria-hidden="true" /><span>退出</span>
                   </button>
@@ -4920,10 +4948,32 @@ function App() {
             </>
           )}
           {state.messages.length === 0 && streamSteps.length === 0 && !(state.stepTrails?.length) && (
-            <div className="empty-state">
+            <div className="empty-state agent-empty">
               <div className="empty-orb" aria-hidden="true" />
-              <p>Agent 已就绪</p>
-              <span className="empty-hint">描述写作任务：列大纲、改稿或续写场景</span>
+              <p>准备好协作写作</p>
+              <span className="empty-hint">描述任务，或点下面一键填入</span>
+              {!readOnly && (
+                <div className="empty-suggestions" role="group" aria-label="推荐任务">
+                  {[
+                    "根据大纲写下一章开场，约 1500 字",
+                    "检查最近一章的人物一致性与节奏",
+                    "把当前选中章节润色得更有现场感",
+                  ].map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      type="button"
+                      className="empty-suggestion-chip"
+                      disabled={busy}
+                      onClick={() => {
+                        setPrompt(suggestion);
+                        requestAnimationFrame(() => composerRef.current?.focus());
+                      }}
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {notice && <article className="notice">{notice}</article>}
@@ -5110,11 +5160,14 @@ function App() {
                   </>
                 )}
                 <button
+                  type="button"
                   className={`composer-send ${busy ? "stop" : "primary"}`}
                   onClick={busy ? stop : () => void sendChat()}
                   disabled={readOnly || Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim() && !pendingAttachments.length)}
                 >
-                  {busy ? "停止" : "发送"}
+                  {busy
+                    ? <><Square size={13} fill="currentColor" aria-hidden="true" />停止</>
+                    : <><SendHorizontal size={14} aria-hidden="true" />发送</>}
                 </button>
               </div>
             </div>

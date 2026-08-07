@@ -629,9 +629,9 @@ export type State = {
 };
 
 export const PERMISSION_MODES: Array<{ id: PermissionMode; label: string; hint: string }> = [
-  { id: "ask", label: "Ask", hint: "提案需审批" },
-  { id: "auto", label: "Auto", hint: "提案自动写入" },
-  { id: "plan", label: "Plan", hint: "只读规划" },
+  { id: "ask", label: "审批", hint: "提案需人工审批后写入" },
+  { id: "auto", label: "自动", hint: "提案自动写入磁盘" },
+  { id: "plan", label: "规划", hint: "只读规划，不改文件" },
 ];
 
 export function todoStatusMark(status: AgentTodoItem["status"]): string {
