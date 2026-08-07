@@ -1796,8 +1796,23 @@ function App() {
           : s)),
       );
     }
+    if (event.type === "provider_status") {
+      const detail = event.message
+        || (event.phase === "queued" && event.position
+          ? `供应商队列中（第 ${event.position} 位）`
+          : event.phase === "rate_limited"
+            ? "等待供应商 RPM 限额"
+            : event.phase === "retrying"
+              ? `重试供应商请求${event.attempt && event.maxAttempts ? `（${event.attempt}/${event.maxAttempts}）` : ""}`
+              : event.phase === "circuit_open"
+                ? "供应商熔断中"
+                : "");
+      if (detail) setNotice(detail);
+    }
     if (event.type === "error") {
-      setError(event.message || "Agent failed");
+      const codeHint = event.code ? ` [${event.code}]` : "";
+      const retryHint = event.retryable ? "（可重试）" : "";
+      setError(`${event.message || "Agent failed"}${codeHint}${retryHint}`);
       updateStreamSteps((current) =>
         current.map((s) => (s.status === "running" ? { ...s, status: "failed", expanded: false } : s)),
       );
@@ -3386,6 +3401,8 @@ function App() {
 
   function openSettings(section: SettingsSection = "models") {
     setSettingsMenuOpen(false);
+    // 与 SETTINGS_NAV_ITEMS 对齐：打开作者复审时清掉未完成的规则草稿，避免侧栏/下拉入口状态分叉
+    if (section === "prose-gates") setProseGateDraft(null);
     setSettingsSection(section);
     setManagementView("models");
   }
@@ -3395,7 +3412,6 @@ function App() {
   }
 
   function openProseGateRules() {
-    setProseGateDraft(null);
     openSettings("prose-gates");
   }
 

@@ -42,6 +42,15 @@ import {
 } from "../proposal_retry.js";
 import { boundedRepairPacket, type RepairPacket } from "../repair_packet.js";
 import { ToolDependencyError, ToolRevisionRequiredError } from "../tool_failure.js";
+import {
+  buildDependencyAttempt,
+  buildDependencyFailureBundle,
+  dependencyAttemptRole,
+  dependencyFailureGuidance,
+  dependencyFailureUserSummary,
+  reportModelCallUsage,
+  type DependencyAttemptDiagnostic,
+} from "../dependency_diagnostics.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import { dialogueFormatGateError } from "../dialogue_format.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
@@ -630,12 +639,32 @@ export async function proseStyleGateIssues(
     if (learnedIssues) {
       issues.push(...learnedIssues);
     } else if (learnedFailure) {
+      const sole = adjudicatorModels[0];
+      const diagnostics = sole
+        ? buildDependencyFailureBundle({
+            stage: "prose_gate",
+            uniqueModelCount: adjudicatorModels.length,
+            attempts: [buildDependencyAttempt({
+              model: sole,
+              role: adjudicatorModels.length <= 1 ? "sole" : "primary",
+              error: learnedFailure,
+              recordedUsage: false,
+            })],
+          })
+        : undefined;
       if (adjudicatorModels.length === 1) {
         const detail = learnedFailure instanceof Error ? learnedFailure.message : String(learnedFailure);
         throw new ToolDependencyError(
           "PROSE_GATE_UNAVAILABLE",
           `语义正文门控暂时不可用（仅配置 1 个唯一审核模型，无独立回退）：${detail}`,
-          { cause: learnedFailure },
+          { cause: learnedFailure, ...(diagnostics ? { diagnostics } : {}) },
+        );
+      }
+      if (diagnostics) {
+        throw new ToolDependencyError(
+          "PROSE_GATE_UNAVAILABLE",
+          `语义正文门控暂时不可用：${diagnostics.errors.join(" | ")}`,
+          { cause: learnedFailure, diagnostics },
         );
       }
       throw learnedFailure;
@@ -914,8 +943,34 @@ async function reviewDirectNarrativeProposal(
   const requestCharacters = content.length + reviewContext.length + summary.length
     + comparisonMaterials.reduce((sum, item) => sum + item.path.length + item.content.length, 0)
     + (revisionReview ? JSON.stringify(revisionReview).length : 0) + 1_200;
-  const errors: string[] = [];
-  for (const model of models) {
+  const failedRequestComponents = [{
+    kind: "other" as const,
+    label: "失败的直接整章终审请求",
+    characters: requestCharacters,
+    estimatedTokens: Math.ceil(requestCharacters * 0.75),
+    callKind: "direct_chapter_review_failed",
+  }];
+  if (!models.length) {
+    const bundle = buildDependencyFailureBundle({
+      stage: "final_review",
+      uniqueModelCount: 0,
+      attempts: [buildDependencyAttempt({
+        model: {
+          provider: "openai-compatible",
+          baseUrl: "",
+          model: "(unset)",
+          apiKey: "",
+        },
+        role: "sole",
+        error: new Error("未配置终审模型"),
+        recordedUsage: false,
+        failureClass: "config",
+      })],
+    });
+    return JSON.stringify(finalReviewUnavailablePayload(path, bundle));
+  }
+  const attempts: DependencyAttemptDiagnostic[] = [];
+  for (const [modelIndex, model] of models.entries()) {
     try {
       const reviewed = await runReview(model, {
         chapterGoal: summary,
@@ -937,16 +992,18 @@ async function reviewDirectNarrativeProposal(
           actualState: null,
         }],
       }, reviewer.signal);
-      if (reviewed.usage) args.context.modelUsageReporter?.(model, reviewed.usage, {
-        callKind: "direct_chapter_review",
-        requestComponents: [{
-          kind: "other",
-          label: "直接整章终审请求",
-          characters: requestCharacters,
-          estimatedTokens: Math.ceil(requestCharacters * 0.75),
+      if (reviewed.usage) {
+        reportModelCallUsage(args.context.modelUsageReporter, model, reviewed.usage, {
           callKind: "direct_chapter_review",
-        }],
-      });
+          requestComponents: [{
+            kind: "other",
+            label: "直接整章终审请求",
+            characters: requestCharacters,
+            estimatedTokens: Math.ceil(requestCharacters * 0.75),
+            callKind: "direct_chapter_review",
+          }],
+        });
+      }
       const constrainedReview = revisionReview
         ? constrainChapterRevisionReview(
             reviewed.review,
@@ -968,36 +1025,60 @@ async function reviewDirectNarrativeProposal(
         message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
       });
     } catch (error) {
-      if (error instanceof ChapterReviewRequestError && error.usage) {
-        args.context.modelUsageReporter?.(model, error.usage, {
+      const usage = error instanceof ChapterReviewRequestError ? error.usage : undefined;
+      const durationMs = error instanceof ChapterReviewRequestError ? error.durationMs : undefined;
+      const recordedUsage = reportModelCallUsage(
+        args.context.modelUsageReporter,
+        model,
+        usage,
+        {
           callKind: "direct_chapter_review_failed",
-          requestComponents: [{
-            kind: "other",
-            label: "失败的直接整章终审请求",
-            characters: requestCharacters,
-            estimatedTokens: Math.ceil(requestCharacters * 0.75),
-            callKind: "direct_chapter_review_failed",
-          }],
-        });
-      }
-      errors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+          requestComponents: failedRequestComponents,
+          ...(durationMs !== undefined ? { durationMs } : {}),
+        },
+      );
+      attempts.push(buildDependencyAttempt({
+        model,
+        role: dependencyAttemptRole(modelIndex, models.length),
+        error,
+        recordedUsage,
+        ...(error instanceof ChapterReviewRequestError
+          ? {
+              failureClass: error.failureClass,
+              httpStatus: error.httpStatus,
+              durationMs: error.durationMs,
+            }
+          : {}),
+      }));
     }
   }
   // Parse/schema failures (e.g. revise without locatable evidence) are not outages; jn3
   // sessions were empty-retrying the same draft under a misleading "服务暂时不可用" line.
-  const parseOnly = errors.length > 0 && errors.every(isChapterReviewParseFailure);
-  return JSON.stringify({
+  const bundle = buildDependencyFailureBundle({
+    stage: "final_review",
+    attempts,
+    uniqueModelCount: models.length,
+  });
+  return JSON.stringify(finalReviewUnavailablePayload(path, bundle));
+}
+
+function finalReviewUnavailablePayload(
+  path: string,
+  bundle: ReturnType<typeof buildDependencyFailureBundle>,
+): Record<string, unknown> {
+  const summary = dependencyFailureUserSummary(bundle);
+  const guidance = dependencyFailureGuidance(bundle);
+  return {
     status: "final_review_unavailable",
-    code: parseOnly ? "DIRECT_CHAPTER_REVIEW_INVALID" : "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
-    failureKind: parseOnly ? "invalid_output" : "dependency",
-    retryable: !parseOnly,
+    code: bundle.parseOnly ? "DIRECT_CHAPTER_REVIEW_INVALID" : "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    failureKind: bundle.parseOnly ? "invalid_output" : "dependency",
+    retryable: !bundle.parseOnly,
     path,
     proposalCreated: false,
-    errors,
-    message: parseOnly
-      ? "终审已响应但结论无法解析或缺少可定位证据，未创建提案（非服务故障）。请按 errors 自检事实/认知边界后做最小修订再提交；不要原样空重试。"
-      : "终审模型及回退模型均不可用，未创建提案。请重试；不得在未完成事实与认知边界审核时绕过终审。",
-  });
+    errors: bundle.errors,
+    diagnostics: bundle,
+    message: `${summary}${guidance ? ` ${guidance}` : ""}`.trim(),
+  };
 }
 
 function directReviewComparisonMaterials(
@@ -1027,12 +1108,6 @@ function directReviewComparisonMaterials(
       return [];
     }
   });
-}
-
-/** Transport/API failures vs review JSON / evidence validation failures. */
-function isChapterReviewParseFailure(message: string): boolean {
-  return /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i
-    .test(message);
 }
 
 export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {

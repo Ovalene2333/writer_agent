@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { samplingRequestOptions } from "./model_compat.js";
 import { modelCompletionEndpoint, parseProviderCompletionPayload } from "./model_api.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
@@ -158,7 +158,7 @@ export async function extractWritingMemory(options: {
       ...(options.model.apiKey ? { authorization: `Bearer ${options.model.apiKey}` } : {}),
     },
     body,
-  }, options.model.proxyUrl);
+  }, modelRequestOptions(options.model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) throw new Error(`写作记忆提取失败（${response.status}）：${responseBody.slice(0, 240)}`);

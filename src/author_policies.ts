@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { samplingRequestOptions } from "./model_compat.js";
 import { modelCompletionEndpoint, parseProviderCompletionPayload } from "./model_api.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import type { DocumentKind, WriterProject } from "./project.js";
 import type { ModelConfig } from "./types.js";
 import type { ProseGateRule, ProseGateTargetKind } from "./prose_gate_rules.js";
@@ -358,7 +358,7 @@ export async function compileAuthorPolicyDraft(options: {
       ...(options.model.apiKey ? { authorization: `Bearer ${options.model.apiKey}` } : {}),
     },
     body,
-  }, options.model.proxyUrl);
+  }, modelRequestOptions(options.model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) throw new Error(`作者政策编译失败（${response.status}）：${responseBody.slice(0, 240)}`);

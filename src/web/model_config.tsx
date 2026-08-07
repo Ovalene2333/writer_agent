@@ -1,5 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Bot, CheckCircle2, LoaderCircle, MessageSquare, Palette, Pencil, Plus, Radar, ShieldCheck, WandSparkles, Wifi, X, XCircle } from "lucide-react";
+import {
+  Bot, CheckCircle2, LoaderCircle, type LucideIcon, MessageSquare, Palette, Pencil, Plus, Radar,
+  ShieldCheck, WandSparkles, Wifi, X, XCircle,
+} from "lucide-react";
 
 export type Pricing = {
   billingMode?: "metered" | "unmetered";
@@ -19,7 +22,20 @@ export type Pricing = {
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ResponseVerbosity = "low" | "medium" | "high";
 export type ProviderModel = { id: string; name: string; pricing: Pricing; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean; supportsMultimodal?: boolean };
-export type ProviderProfile = { id: string; name: string; provider: "deepseek" | "openai-compatible" | "openai-responses"; baseUrl: string; proxyUrl?: string; apiKeyConfigured: boolean; apiKeyHint: string; models: ProviderModel[] };
+export type ProviderProfile = {
+  id: string;
+  name: string;
+  provider: "deepseek" | "openai-compatible" | "openai-responses";
+  baseUrl: string;
+  proxyUrl?: string;
+  apiKeyConfigured: boolean;
+  apiKeyHint: string;
+  /** Max in-flight HTTP requests for this provider (default 5). */
+  maxConcurrent?: number;
+  /** Optional requests-per-minute cap. */
+  maxRpm?: number;
+  models: ProviderModel[];
+};
 export type ModelRole =
   | "agent"
   | "image"
@@ -63,6 +79,45 @@ export type RoleplaySettings = {
   lengthBlockBudgets: RoleplayLengthBlockBudgets;
 };
 export type SettingsSection = "models" | "writing" | "roleplay" | "style" | "prose-gates" | "connection" | "appearance";
+
+/**
+ * SETTINGS NAV CONTRACT
+ * -------------------------------------------------------------------------
+ * 设置入口有两处 UI，必须共用本清单，禁止各自 hardcode 标签/顺序：
+ *   1. 展开设置页侧栏 `settings-tabs`（ModelConfigView）
+ *   2. 顶栏齿轮下拉 `SettingsMenu`（ui_primitives.tsx）
+ * 新增/改名/重排子项时只改 SETTINGS_NAV_ITEMS，并同步 sectionMeta 的文案。
+ * connection 项在 dualMode 关闭时禁用；菜单分隔用 menuSeparatorBefore。
+ */
+export type SettingsNavItem = {
+  id: SettingsSection;
+  /** 侧栏与下拉共用的显示名 */
+  label: string;
+  /** 侧栏副标题（下拉不展示） */
+  detail: string;
+  Icon: LucideIcon;
+  /** 下拉菜单在此项前插入分隔线（分组视觉） */
+  menuSeparatorBefore?: boolean;
+  /** 仅双通道时可选：连接设置 */
+  requiresDualConnection?: boolean;
+};
+
+export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
+  { id: "models", label: "模型与分工", detail: "供应商、模型和流程角色", Icon: Bot },
+  { id: "writing", label: "写作行为", detail: "角色演进与场景生成", Icon: Pencil },
+  { id: "roleplay", label: "角色扮演", detail: "推理档位、终审与预算", Icon: MessageSquare },
+  { id: "style", label: "写作风格", detail: "模板、范文与采样建议", Icon: WandSparkles },
+  { id: "prose-gates", label: "作者复审规则", detail: "语义门禁与长期偏好", Icon: ShieldCheck, menuSeparatorBefore: true },
+  {
+    id: "connection",
+    label: "连接设置",
+    detail: "局域网与公网通道",
+    Icon: Wifi,
+    menuSeparatorBefore: true,
+    requiresDualConnection: true,
+  },
+  { id: "appearance", label: "外观与动效", detail: "主题、动画与性能模式", Icon: Palette },
+] as const;
 
 export const ROLEPLAY_LENGTH_LEVEL_KEYS: RoleplayLengthLevelKey[] = ["-2", "-1", "0", "1", "2"];
 export const ROLEPLAY_LENGTH_LEVEL_LABELS: Record<RoleplayLengthLevelKey, string> = {
@@ -116,7 +171,16 @@ const ROLEPLAY_ROLES: RoleDefinition[] = [
 
 const EMPTY_PRICING: Pricing = { cacheHit: 0, cacheMiss: 0, output: 0, currency: "CNY", contextWindow: 128000 };
 const newModel = (): ModelDraft => ({ name: "", pricing: { ...EMPTY_PRICING } });
-const emptyProfile = (): ProfileDraft => ({ name: "", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", proxyUrl: "", apiKey: "", models: [newModel()] });
+const emptyProfile = (): ProfileDraft => ({
+  name: "",
+  provider: "openai-compatible",
+  baseUrl: "https://api.openai.com/v1",
+  proxyUrl: "",
+  apiKey: "",
+  maxConcurrent: 5,
+  maxRpm: undefined,
+  models: [newModel()],
+});
 const optionalNumber = (value: string): number | undefined => value.trim() === "" ? undefined : Number(value);
 /** Compact context label for scan results, e.g. 128k / 1.05M. */
 function formatContextWindowLabel(contextWindow: number | undefined): string {
@@ -319,9 +383,19 @@ export function ModelConfig({
   const addProfile = () => { resetScan(); setEditing(emptyProfile()); };
   const editProfile = (profile: ProviderProfile) => {
     resetScan();
-    setEditing({ id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, proxyUrl: profile.proxyUrl ?? "", apiKey: "", models: profile.models.map(model => ({ ...model, pricing: { ...model.pricing } })) });
+    setEditing({
+      id: profile.id,
+      name: profile.name,
+      provider: profile.provider,
+      baseUrl: profile.baseUrl,
+      proxyUrl: profile.proxyUrl ?? "",
+      apiKey: "",
+      maxConcurrent: profile.maxConcurrent ?? 5,
+      maxRpm: profile.maxRpm,
+      models: profile.models.map(model => ({ ...model, pricing: { ...model.pricing } })),
+    });
   };
-  const updateConnection = (change: Partial<Pick<ProfileDraft, "provider" | "baseUrl" | "proxyUrl" | "apiKey">>) => {
+  const updateConnection = (change: Partial<Pick<ProfileDraft, "provider" | "baseUrl" | "proxyUrl" | "apiKey" | "maxConcurrent" | "maxRpm">>) => {
     resetScan();
     setEditing(current => current ? { ...current, ...change } : current);
   };
@@ -339,7 +413,15 @@ export function ModelConfig({
     if (!editing || !editing.name.trim() || !editing.baseUrl.trim() || editing.models.some(model => !model.name.trim())) return;
     setBusy(true); setError(""); setEditorFeedback(null);
     try {
-      const result = await request("/api/providers", { method: "PUT", body: JSON.stringify({ ...editing, apiKey: editing.apiKey || undefined }) });
+      const result = await request("/api/providers", {
+        method: "PUT",
+        body: JSON.stringify({
+          ...editing,
+          apiKey: editing.apiKey || undefined,
+          // Always send so clearing the field removes a previously saved cap.
+          maxRpm: editing.maxRpm ?? null,
+        }),
+      });
       setCatalog(result.catalog); setEditing(null); setMessage("供应商配置已保存"); await onChanged();
     } catch (cause) { setEditorFeedback({ error: true, text: cause instanceof Error ? cause.message : String(cause) }); }
     finally { setBusy(false); }
@@ -554,12 +636,13 @@ export function ModelConfig({
     setMessage("");
   }
 
+  // 内容页头文案：title 应与 SETTINGS_NAV_ITEMS[].label 一致；改导航时同步改这里
   const sectionMeta: Record<SettingsSection, { eyebrow: string; title: string; description: string }> = {
     models: { eyebrow: "Model routing", title: "模型与分工", description: "管理模型连接，并为写作流程的不同环节分配模型。" },
     writing: { eyebrow: "Writing behavior", title: "写作行为", description: "调整角色演进、可选场景链与正文生成策略。" },
     roleplay: { eyebrow: "Roleplay", title: "角色扮演", description: "调整试演推理档位、终审与输出预算。模型分配仍在「模型与分工」。" },
     style: { eyebrow: "Writing style", title: "写作风格", description: "管理写作模板、范文与采样建议。" },
-    "prose-gates": { eyebrow: "Author policies", title: "作者政策与复审", description: "管理长期写作要求、试运行和门禁。" },
+    "prose-gates": { eyebrow: "Author policies", title: "作者复审规则", description: "管理长期写作要求、试运行和门禁。" },
     connection: { eyebrow: "Network", title: "连接设置", description: "查看当前通道并调整局域网与公网偏好。" },
     appearance: { eyebrow: "Appearance", title: "外观与动效", description: "选择工作区主题，并按设备性能控制全局动态效果。" },
   };
@@ -569,37 +652,38 @@ export function ModelConfig({
     <section className="model-config-view">
       <div className="management-head settings-page-head"><div><span className="eyebrow">Settings</span><h2>设置</h2></div><button className="icon" title="返回工作区" aria-label="返回工作区" onClick={closeSettings}><X size={17} /></button></div>
       <div className="settings-layout">
+        {/* 侧栏项来自 SETTINGS_NAV_ITEMS，与顶栏 SettingsMenu 共用清单 */}
         <nav className="settings-tabs" aria-label="设置分类">
-          <button className={section === "models" ? "active" : ""} aria-current={section === "models" ? "page" : undefined} onClick={() => selectSection("models")}>
-            <Bot size={17}/>
-            <span><strong>模型与分工</strong><small>供应商、模型和流程角色</small></span>
-          </button>
-          <button className={section === "writing" ? "active" : ""} aria-current={section === "writing" ? "page" : undefined} onClick={() => selectSection("writing")}>
-            <Pencil size={17}/>
-            <span><strong>写作行为</strong><small>角色演进与场景生成</small></span>
-            {writingSettingsDirty && <i className="settings-dirty-dot" title="有未保存的修改"/>}
-          </button>
-          <button className={section === "roleplay" ? "active" : ""} aria-current={section === "roleplay" ? "page" : undefined} onClick={() => selectSection("roleplay")}>
-            <MessageSquare size={17}/>
-            <span><strong>角色扮演</strong><small>推理档位、终审与预算</small></span>
-            {roleplaySettingsDirty && <i className="settings-dirty-dot" title="有未保存的修改"/>}
-          </button>
-          <button className={section === "style" ? "active" : ""} aria-current={section === "style" ? "page" : undefined} onClick={() => selectSection("style")}>
-            <WandSparkles size={17}/>
-            <span><strong>写作风格</strong><small>模板、范文与采样建议</small></span>
-          </button>
-          <button className={section === "prose-gates" ? "active" : ""} aria-current={section === "prose-gates" ? "page" : undefined} onClick={() => selectSection("prose-gates")}>
-            <ShieldCheck size={17}/>
-            <span><strong>作者复审规则</strong><small>语义门禁与长期偏好</small></span>
-          </button>
-          <button className={section === "connection" ? "active" : ""} aria-current={section === "connection" ? "page" : undefined} disabled={!connectionAvailable} onClick={() => selectSection("connection")}>
-            <Wifi size={17}/>
-            <span><strong>连接设置</strong><small>{connectionAvailable ? "局域网与公网通道" : "当前仅有单一通道"}</small></span>
-          </button>
-          <button className={section === "appearance" ? "active" : ""} aria-current={section === "appearance" ? "page" : undefined} onClick={() => selectSection("appearance")}>
-            <Palette size={17}/>
-            <span><strong>外观与动效</strong><small>主题、动画与性能模式</small></span>
-          </button>
+          {SETTINGS_NAV_ITEMS.map((item) => {
+            const Icon = item.Icon;
+            const active = section === item.id;
+            const disabled = Boolean(item.requiresDualConnection && !connectionAvailable);
+            const detail = item.id === "connection" && !connectionAvailable
+              ? "当前仅有单一通道"
+              : item.detail;
+            const dirty = item.id === "writing"
+              ? writingSettingsDirty
+              : item.id === "roleplay"
+                ? roleplaySettingsDirty
+                : false;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={active ? "active" : ""}
+                aria-current={active ? "page" : undefined}
+                disabled={disabled}
+                onClick={() => selectSection(item.id)}
+              >
+                <Icon size={17} />
+                <span>
+                  <strong>{item.label}</strong>
+                  <small>{detail}</small>
+                </span>
+                {dirty && <i className="settings-dirty-dot" title="有未保存的修改" />}
+              </button>
+            );
+          })}
         </nav>
         <main className="settings-content">
           <div className="settings-content-head">
@@ -618,7 +702,7 @@ export function ModelConfig({
             const batchStatus = statusOf(providerBatchKey(provider.id));
             return <article className="provider-card" key={provider.id}>
             <div className="provider-card-head">
-              <div><strong>{provider.name}</strong><span>{provider.provider === "deepseek" ? "DeepSeek" : provider.provider === "openai-responses" ? "OpenAI Responses" : "OpenAI 兼容"} · {provider.apiKeyConfigured ? provider.apiKeyHint : "未配置密钥"}</span></div>
+              <div><strong>{provider.name}</strong><span>{provider.provider === "deepseek" ? "DeepSeek" : provider.provider === "openai-responses" ? "OpenAI Responses" : "OpenAI 兼容"} · 并发 {provider.maxConcurrent ?? 5}{provider.maxRpm ? ` · RPM ${provider.maxRpm}` : ""} · {provider.apiKeyConfigured ? provider.apiKeyHint : "未配置密钥"}</span></div>
               <div>
                 <button
                   className={`ghost test-action-btn status-${batchStatus}`}
@@ -1030,7 +1114,49 @@ export function ModelConfig({
     </section>
     {editing && <div className="modal-backdrop nested" onMouseDown={() => setEditing(null)}><section className="modal provider-editor" onMouseDown={event => event.stopPropagation()}>
       <div className="provider-editor-head"><div><span className="eyebrow">Provider</span><h2>{editing.id ? "编辑供应商" : "添加供应商"}</h2></div><button className="icon" title="关闭" aria-label="关闭" onClick={() => setEditing(null)}><X size={17} /></button></div>
-      <div className="character-form-grid"><label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label><span>协议类型</span><select value={editing.provider} onChange={e => updateConnection({ provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容（Chat Completions）</option><option value="openai-responses">OpenAI Responses</option><option value="deepseek">DeepSeek</option></select></label><label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => updateConnection({ baseUrl: e.target.value })} placeholder={editing.provider === "openai-responses" ? "https://api.openai.com/v1" : undefined}/></label><label className="wide"><span>代理 URL（可选）</span><input placeholder="http://127.0.0.1:7890" value={editing.proxyUrl ?? ""} onChange={e => updateConnection({ proxyUrl: e.target.value })}/></label><label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => updateConnection({ apiKey: e.target.value })}/></label></div>
+      <div className="character-form-grid">
+        <label><span>显示名称</span><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label>
+        <label><span>协议类型</span><select value={editing.provider} onChange={e => updateConnection({ provider: e.target.value as ProfileDraft["provider"] })}><option value="openai-compatible">OpenAI 兼容（Chat Completions）</option><option value="openai-responses">OpenAI Responses</option><option value="deepseek">DeepSeek</option></select></label>
+        <label className="wide"><span>API Base URL</span><input value={editing.baseUrl} onChange={e => updateConnection({ baseUrl: e.target.value })} placeholder={editing.provider === "openai-responses" ? "https://api.openai.com/v1" : undefined}/></label>
+        <label className="wide"><span>代理 URL（可选）</span><input placeholder="http://127.0.0.1:7890" value={editing.proxyUrl ?? ""} onChange={e => updateConnection({ proxyUrl: e.target.value })}/></label>
+        <label className="wide"><span>API Key（留空保留现有密钥）</span><input type="password" value={editing.apiKey} onChange={e => updateConnection({ apiKey: e.target.value })}/></label>
+        <label>
+          <span>最大并发请求</span>
+          <input
+            type="number"
+            min={1}
+            max={64}
+            step={1}
+            value={editing.maxConcurrent ?? 5}
+            onChange={e => {
+              const value = Number(e.target.value);
+              updateConnection({ maxConcurrent: Number.isFinite(value) ? value : 5 });
+            }}
+          />
+          <em className="field-unit">默认 5；含流式整段占用</em>
+        </label>
+        <label>
+          <span>每分钟请求上限（RPM）</span>
+          <input
+            type="number"
+            min={0}
+            max={10000}
+            step={1}
+            placeholder="不限制"
+            value={editing.maxRpm ?? ""}
+            onChange={e => {
+              const raw = e.target.value.trim();
+              if (!raw) {
+                updateConnection({ maxRpm: undefined });
+                return;
+              }
+              const value = Number(raw);
+              updateConnection({ maxRpm: Number.isFinite(value) && value > 0 ? value : undefined });
+            }}
+          />
+          <em className="field-unit">可选；0/空=不限制</em>
+        </label>
+      </div>
       <div className="model-list-head"><h3>模型</h3><div className="model-list-actions"><button className="ghost" disabled={!canScanModels || scanning || busy} title={canScanModels ? "从供应商读取模型列表" : "请先填写 API Base URL 和 API Key"} onClick={() => void scanProviderModels()}>{scanning ? <LoaderCircle className="test-icon-spin" size={15} /> : <Radar size={15} />}{scanning ? "扫描中…" : "扫描模型"}</button><button disabled={busy || scanning} onClick={() => setEditing({ ...editing, models: [...editing.models, newModel()] })}><Plus size={15} />添加模型</button></div></div>
       {editorFeedback && <div className={editorFeedback.error ? "editor-feedback error" : "editor-feedback"}>{editorFeedback.text}</div>}
       {scannedModels.length > 0 && <section className="model-scan-results">

@@ -1,5 +1,5 @@
-import { setTimeout as delay } from "node:timers/promises";
-import { modelFetch } from "../model_fetch.js";
+import { modelFetch, modelRequestOptions } from "../model_fetch.js";
+import { ProviderError, isProviderError } from "../provider_error.js";
 import { ToolDependencyError } from "../tool_failure.js";
 import type { ModelConfig } from "../types.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -12,8 +12,6 @@ type ImageGenerationResponse = {
 const IMAGE_SIZES = new Set(["auto", "1024x1024", "1536x1024", "1024x1536"]);
 const IMAGE_QUALITIES = new Set(["auto", "low", "medium", "high"]);
 const IMAGE_REFERENCE_MAX_ATTACHMENTS = 4;
-const RETRYABLE_IMAGE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
-const DEFAULT_RETRY_DELAYS_MS = [1_500, 3_000, 7_000, 15_000] as const;
 
 class NonRetryableImageRequestError extends Error {
   constructor(message: string) {
@@ -48,53 +46,48 @@ function parseImageResponse(text: string): ImageGenerationResponse {
   return {};
 }
 
-async function sleepBeforeRetry(ms: number, signal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return;
-  await delay(ms, undefined, { signal });
-}
-
 async function postImageGeneration(
   model: ModelConfig,
   endpoint: string,
   body: BodyInit,
   signal: AbortSignal | undefined,
-  retryDelaysMs: readonly number[],
 ): Promise<ImageGenerationResponse> {
-  const attempts = retryDelaysMs.length + 1;
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      const response = await modelFetch(endpoint, {
-        method: "POST",
-        headers: {
-          ...(typeof body === "string" ? { "content-type": "application/json" } : {}),
-          ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-        },
-        body,
-        signal,
-      }, model.proxyUrl);
-      const responseText = await response.text();
-      const parsed = parseImageResponse(responseText);
-      if (response.ok) return parsed;
-      const message = imageErrorMessage(parsed, response.status);
-      if (!RETRYABLE_IMAGE_STATUSES.has(response.status)) {
-        throw new NonRetryableImageRequestError(message);
-      }
-      lastError = new Error(message);
-    } catch (error) {
-      if (error instanceof NonRetryableImageRequestError) throw error;
-      lastError = error;
+  try {
+    // 429/5xx/network retries are handled by modelFetch transport.
+    const response = await modelFetch(endpoint, {
+      method: "POST",
+      headers: {
+        ...(typeof body === "string" ? { "content-type": "application/json" } : {}),
+        ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
+      },
+      body,
+      signal,
+    }, modelRequestOptions(model, { priority: "low" }));
+    const responseText = await response.text();
+    const parsed = parseImageResponse(responseText);
+    if (response.ok) return parsed;
+    const message = imageErrorMessage(parsed, response.status);
+    if (response.status === 400 || response.status === 401 || response.status === 403 || response.status === 404 || response.status === 422) {
+      throw new NonRetryableImageRequestError(message);
     }
-    if (attempt < retryDelaysMs.length) {
-      await sleepBeforeRetry(retryDelaysMs[attempt] ?? 0, signal);
+    throw new ProviderError(
+      response.status === 429 ? "PROVIDER_RATE_LIMIT" : "PROVIDER_UNAVAILABLE",
+      message,
+      { httpStatus: response.status, retryable: true },
+    );
+  } catch (error) {
+    if (error instanceof NonRetryableImageRequestError) throw error;
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    if (isProviderError(error) && error.code === "PROVIDER_AUTH") {
+      throw new NonRetryableImageRequestError(error.message);
     }
+    const message = error instanceof Error ? error.message : String(error || "生图服务未返回结果");
+    throw new ToolDependencyError(
+      "IMAGE_PROVIDER_UNAVAILABLE",
+      `${message}；生图请求经供应商传输层重试后仍未成功。`,
+      error instanceof Error ? { cause: error } : undefined,
+    );
   }
-  const message = lastError instanceof Error ? lastError.message : String(lastError || "生图服务未返回结果");
-  throw new ToolDependencyError(
-    "IMAGE_PROVIDER_UNAVAILABLE",
-    `${message}；已在生图工具内重试 ${attempts} 次，仍未成功。`,
-    lastError instanceof Error ? { cause: lastError } : undefined,
-  );
 }
 
 type ReferenceImage = { id: string; mimeType: string; bytes: Buffer };
@@ -173,7 +166,7 @@ async function readGeneratedImage(
   if (dataUrl) return dataUrl;
   const url = new URL(result.url, `${model.baseUrl.replace(/\/+$/, "")}/`);
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("生图模型返回了不安全的图片 URL");
-  const response = await modelFetch(url, { method: "GET", signal }, model.proxyUrl);
+  const response = await modelFetch(url, { method: "GET", signal }, modelRequestOptions(model, { priority: "low" }));
   if (!response.ok) throw new Error(`下载生成图片失败（HTTP ${response.status}）`);
   return { bytes: Buffer.from(await response.arrayBuffer()), mimeType: imageMime(response) };
 }
@@ -205,7 +198,6 @@ export async function handleGenerateImage({ input, store, sessionId, context }: 
       ? imageRequestForm(model, prompt, size, quality, references)
       : JSON.stringify({ model: model.model, prompt, size, quality, output_format: "png", n: 1 }),
     generator.signal,
-    generator.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS,
   );
   const item = body.data?.[0];
   if (!item) throw new Error("生图模型没有返回图片");

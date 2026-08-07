@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import {
   escalateHardMannerisms,
   HARD_BLOCK_SUBTYPES,
@@ -831,7 +831,7 @@ async function completeJsonChat(
         ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
       },
       body,
-    }, model.proxyUrl);
+    }, modelRequestOptions(model));
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`句式二审请求失败（${response.status}）：${responseBody.slice(0, 240)}`);

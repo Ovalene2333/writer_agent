@@ -161,6 +161,12 @@ export async function executeTool(
         failureKind: error.failureKind,
         error: error.message,
         retryable: error.retryable,
+        ...(error.diagnostics
+          ? {
+              diagnostics: error.diagnostics,
+              errors: error.diagnostics.errors,
+            }
+          : {}),
       });
     }
     if (isToolDependencyTimeout(error)) {

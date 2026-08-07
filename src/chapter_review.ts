@@ -1,7 +1,7 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { documentSpans, type DocumentSpan } from "./document_spans.js";
 import {
@@ -86,9 +86,24 @@ export type ChapterReviewRevisionContext = {
 };
 
 export class ChapterReviewRequestError extends Error {
-  constructor(message: string, readonly usage?: ModelTokenUsage, options?: ErrorOptions) {
+  readonly failureClass?: import("./dependency_diagnostics.js").DependencyFailureClass;
+  readonly httpStatus?: number;
+  readonly durationMs?: number;
+
+  constructor(
+    message: string,
+    readonly usage?: ModelTokenUsage,
+    options?: ErrorOptions & {
+      failureClass?: import("./dependency_diagnostics.js").DependencyFailureClass;
+      httpStatus?: number;
+      durationMs?: number;
+    },
+  ) {
     super(message, options);
     this.name = "ChapterReviewRequestError";
+    this.failureClass = options?.failureClass;
+    this.httpStatus = options?.httpStatus;
+    this.durationMs = options?.durationMs;
   }
 }
 
@@ -719,7 +734,9 @@ export async function reviewChapterDraft(
   signal?: AbortSignal,
 ): Promise<{ review: ChapterReviewResult; usage?: ModelTokenUsage }> {
   if (!model.apiKey && !model.baseUrl.includes("localhost") && !model.baseUrl.includes("127.0.0.1")) {
-    throw new Error("未配置整章终审模型 API Key");
+    throw new ChapterReviewRequestError("未配置整章终审模型 API Key", undefined, {
+      failureClass: "config",
+    });
   }
   const { endpoint, body } = serializeProviderChatBody(model, {
     model: model.model,
@@ -730,17 +747,41 @@ export async function reviewChapterDraft(
     ...thinkingRequestOptions(model),
   });
   logModelRequest(endpoint, body);
-  const response = await modelFetch(endpoint, {
-    method: "POST",
-    signal,
-    headers: {
-      "content-type": "application/json",
-      ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
-    },
-    body,
-  }, model.proxyUrl);
+  const startedAt = Date.now();
+  let response: Response;
+  try {
+    response = await modelFetch(endpoint, {
+      method: "POST",
+      signal,
+      headers: {
+        "content-type": "application/json",
+        ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
+      },
+      body,
+    }, modelRequestOptions(model));
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const aborted = signal?.aborted
+      || (error instanceof Error && (error.name === "AbortError" || /abort/iu.test(error.message)));
+    const timedOut = error instanceof Error
+      && (error.name === "TimeoutError" || /timeout|timed out|超时/iu.test(error.message));
+    throw new ChapterReviewRequestError(
+      timedOut
+        ? `整章终审请求超时（${durationMs}ms）`
+        : aborted
+          ? `整章终审请求被中止（${durationMs}ms）`
+          : `整章终审网络请求失败：${error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)}`,
+      undefined,
+      {
+        cause: error,
+        failureClass: timedOut ? "timeout" : aborted ? "aborted" : "network",
+        durationMs,
+      },
+    );
+  }
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
+  const durationMs = Date.now() - startedAt;
   let payload: {
     choices?: Array<{ message?: { content?: string | null } }>;
     usage?: unknown;
@@ -751,17 +792,34 @@ export async function reviewChapterDraft(
     throw new ChapterReviewRequestError(
       `整章终审返回的响应不是 JSON（${response.status}）`,
       undefined,
-      { cause: error },
+      {
+        cause: error,
+        failureClass: "invalid_output",
+        httpStatus: response.status,
+        durationMs,
+      },
     );
   }
   const usage = parseModelTokenUsage(payload.usage);
   if (!response.ok) {
+    const failureClass = response.status === 429
+      ? "rate_limit" as const
+      : response.status === 401 || response.status === 403
+        ? "auth" as const
+        : "http" as const;
     throw new ChapterReviewRequestError(
       `整章终审请求失败（${response.status}）：${responseBody.slice(0, 240)}`,
       usage,
+      { failureClass, httpStatus: response.status, durationMs },
     );
   }
   const content = parseProviderCompletionPayload(payload).content;
+  if (!content?.trim()) {
+    throw new ChapterReviewRequestError("整章终审返回空内容", usage, {
+      failureClass: "empty_response",
+      durationMs,
+    });
+  }
   let review: ChapterReviewResult;
   try {
     review = parseChapterReview(content, new Set(input.scenes.map(scene => scene.sceneId)), input.content);
@@ -777,7 +835,7 @@ export async function reviewChapterDraft(
     throw new ChapterReviewRequestError(
       error instanceof Error ? error.message : String(error),
       usage,
-      { cause: error },
+      { cause: error, failureClass: "invalid_output", durationMs },
     );
   }
   return { review, ...(usage ? { usage } : {}) };

@@ -74,6 +74,11 @@ import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
 import { documentKind, WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
+import {
+  providerConcurrencySnapshot,
+  providerTransportMetrics,
+} from "./model_fetch.js";
+import { ProviderError, providerErrorCodeMatrix } from "./provider_error.js";
 import { WriterStore } from "./store.js";
 import { getStyleTemplate, normalizeStyleTemplate } from "./templates.js";
 import type { AgentEvent, Message, MessageStepTrail, ModelUsageRole, PermissionMode, PersistedStreamStep, RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayParticipant, RoleplayScene, StepUsage, StyleTemplate } from "./types.js";
@@ -290,19 +295,49 @@ type JobTrailState = {
   dirty: boolean;
 };
 
+export function maxProcessAgentJobs(): number {
+  const raw = process.env.WRITER_MAX_AGENT_JOBS?.trim();
+  const parsed = raw ? Number(raw) : 16;
+  if (!Number.isFinite(parsed)) return 16;
+  return Math.min(64, Math.max(1, Math.round(parsed)));
+}
+
 export class BackgroundAgentJobs {
   private jobs = new Map<string, AgentJob>();
   private trails = new Map<string, JobTrailState>();
   private runners = new Map<string, Promise<void>>();
+  private readonly maxJobs: number;
 
-  constructor(private store?: WriterStore) {}
+  constructor(private store?: WriterStore, maxJobs = maxProcessAgentJobs()) {
+    this.maxJobs = maxJobs;
+  }
 
   setStore(store: WriterStore): void {
     this.store = store;
   }
 
+  /** Process-level occupancy for health/metrics. */
+  occupancy(): { active: number; max: number; totalTracked: number } {
+    const active = [...this.jobs.values()].filter(job => job.status === "running").length;
+    return { active, max: this.maxJobs, totalTracked: this.jobs.size };
+  }
+
   start(sessionId: string, run: (signal: AbortSignal, emit: (event: AgentEvent) => void) => Promise<void>): AgentJob {
-    if (this.activeJob(sessionId)) throw new Error("SESSION_JOB_ALREADY_RUNNING");
+    if (this.activeJob(sessionId)) {
+      throw new ProviderError(
+        "SESSION_JOB_ALREADY_RUNNING",
+        "当前会话已有进行中的任务",
+        { retryable: false },
+      );
+    }
+    const activeCount = [...this.jobs.values()].filter(job => job.status === "running").length;
+    if (activeCount >= this.maxJobs) {
+      throw new ProviderError(
+        "PROCESS_JOB_LIMIT",
+        `进程级任务并发已满（${activeCount}/${this.maxJobs}），请等待其他任务结束或提高 WRITER_MAX_AGENT_JOBS`,
+        { retryable: true },
+      );
+    }
     const job: AgentJob = {
       id: randomBytes(12).toString("base64url"),
       sessionId,
@@ -332,7 +367,14 @@ export class BackgroundAgentJobs {
         }
         }).catch((error) => {
         if (job.status === "running") {
-          this.emit(job.id, { type: "error", message: errorMessage(error) });
+          const message = errorMessage(error);
+          this.emit(job.id, {
+            type: "error",
+            message,
+            ...(error instanceof ProviderError
+              ? { code: error.code, retryable: error.retryable, action: error.action }
+              : {}),
+          });
           this.finish(job, "failed");
         }
         }).finally(settle);
@@ -662,6 +704,13 @@ export async function startWriterServer(options: {
   let readonlyToken = "";
   const app = new Hono();
   const agentJobs = new BackgroundAgentJobs(options.store);
+  // Process restart cannot resume in-memory runners; close any trails left "running".
+  try {
+    options.store.finalizeOrphanedStepTrails("进程重启：未完成的任务已标记失败，可从原指令续跑。");
+  } catch {
+    /* best-effort recovery */
+  }
+  const startedAt = Date.now();
   const styleExampleReviews = new Map<string, StyleExampleReviewState>();
   let publicOrigin: string | null | undefined;
 
@@ -799,11 +848,52 @@ export async function startWriterServer(options: {
     }
   });
 
-  app.get("/api/health", (context) => context.json({
-    ok: true,
-    ts: Date.now(),
-    ...(publicOrigin !== undefined ? { publicOrigin } : {}),
-  }));
+  app.get("/api/health", (context) => {
+    let dbOk = true;
+    let dbError: string | undefined;
+    try {
+      options.store.database.prepare("SELECT 1").get();
+    } catch (error) {
+      dbOk = false;
+      dbError = errorMessage(error);
+    }
+    const jobs = agentJobs.occupancy();
+    const transport = providerTransportMetrics();
+    return context.json({
+      ok: dbOk,
+      ts: Date.now(),
+      uptimeMs: Date.now() - startedAt,
+      ...(publicOrigin !== undefined ? { publicOrigin } : {}),
+      project: {
+        root: options.project.root,
+        title: options.project.config().title,
+      },
+      database: {
+        ok: dbOk,
+        ...(dbError ? { error: dbError } : {}),
+      },
+      jobs,
+      provider: {
+        gates: providerConcurrencySnapshot(),
+        metrics: transport,
+      },
+    });
+  });
+
+  app.get("/api/metrics", (context) => {
+    const jobs = agentJobs.occupancy();
+    return context.json({
+      ts: Date.now(),
+      uptimeMs: Date.now() - startedAt,
+      jobs,
+      activeJobs: agentJobs.activeJobs(),
+      provider: {
+        gates: providerConcurrencySnapshot(),
+        metrics: providerTransportMetrics(),
+      },
+      errorCodes: providerErrorCodeMatrix(),
+    });
+  });
 
   app.post("/api/share/readonly", (context) => {
     if (!requireToken) {
@@ -1887,7 +1977,20 @@ export async function startWriterServer(options: {
       return context.json({ error: "Session not found" }, 404);
     }
     if (agentJobs.activeJob(body.sessionId)) {
-      return context.json({ error: "This session already has a running Agent job" }, 409);
+      return context.json({
+        error: "当前会话已有进行中的任务",
+        code: "SESSION_JOB_ALREADY_RUNNING",
+        retryable: false,
+      }, 409);
+    }
+    const occupancy = agentJobs.occupancy();
+    if (occupancy.active >= occupancy.max) {
+      return context.json({
+        error: `进程级任务并发已满（${occupancy.active}/${occupancy.max}）`,
+        code: "PROCESS_JOB_LIMIT",
+        retryable: true,
+        action: "wait_and_retry",
+      }, 429);
     }
     const chatAttachments = normalizeChatAttachments(body.attachments);
     // Model-initiated roleplay turns legitimately carry no player prompt.
@@ -1912,7 +2015,9 @@ export async function startWriterServer(options: {
       ? body.permissionMode
       : runtimeSettings.permissionMode;
     const jobLabel = body.mode === "character" ? "character" : body.mode === "roleplay" ? "roleplay" : "agent";
-    const job = agentJobs.start(body.sessionId, async (signal, emit) => {
+    let job: ReturnType<BackgroundAgentJobs["start"]>;
+    try {
+      job = agentJobs.start(body.sessionId, async (signal, emit) => {
       const stepDebug = createAgentStepDebugLogger({
         sessionId: body.sessionId,
         jobId: job.id,
@@ -2039,11 +2144,33 @@ export async function startWriterServer(options: {
       } catch (error) {
         const message = errorMessage(error);
         stepDebug.onEvent({ type: "error", message });
-        emit({ type: "error", message });
+        emit({
+          type: "error",
+          message,
+          ...(error instanceof ProviderError
+            ? { code: error.code, retryable: error.retryable, action: error.action }
+            : {}),
+        });
       } finally {
         stepDebug.flush();
       }
     });
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        const status = error.code === "SESSION_JOB_ALREADY_RUNNING"
+          ? 409
+          : error.code === "PROCESS_JOB_LIMIT"
+            ? 429
+            : 400;
+        return context.json({
+          error: error.message,
+          code: error.code,
+          retryable: error.retryable,
+          action: error.action,
+        }, status);
+      }
+      return context.json({ error: errorMessage(error) }, 400);
+    }
     return context.json({ jobId: job.id, job: jobInfo(job) });
   });
 
@@ -2311,7 +2438,12 @@ export async function startWriterServer(options: {
     });
   });
 
-  app.get("/health", (context) => context.json({ ok: true }));
+  app.get("/health", (context) => context.json({
+    ok: true,
+    ts: Date.now(),
+    uptimeMs: Date.now() - startedAt,
+    jobs: agentJobs.occupancy(),
+  }));
   app.get("/manifest.webmanifest", (context) => context.json({
     name: "Writer Agent",
     short_name: "Writer",

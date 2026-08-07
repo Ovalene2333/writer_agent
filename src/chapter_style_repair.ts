@@ -1,7 +1,7 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
 import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { proseRealizationContract } from "./prose_realization.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
@@ -107,7 +107,7 @@ export async function requestChapterStyleRepair(
       ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
     },
     body,
-  }, model.proxyUrl);
+  }, modelRequestOptions(model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   const requestCharacters = messages.reduce((sum, message) => sum + message.content.length, 0);

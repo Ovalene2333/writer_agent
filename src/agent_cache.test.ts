@@ -1142,6 +1142,54 @@ test("proposal pause reports when no independent review fallback exists", () => 
   assert.doesNotMatch(String(paused.displayMessage), /审核模型及回退模型均不可用/u);
 });
 
+test("proposal pause surfaces structured final-review diagnostics", () => {
+  const paused = proposalFailurePauseResult({
+    status: "final_review_unavailable",
+    code: "DIRECT_CHAPTER_REVIEW_UNAVAILABLE",
+    failureKind: "dependency",
+    message: "终审模型调用失败（仅配置 1 个唯一模型，无独立回退），未创建提案。依赖恢复后可续跑；不得在未完成事实与认知边界审核时绕过终审。",
+    errors: ["[timeout] 唯一模型 OpenCode Go / deepseek-v4-flash · 300012ms · 整章终审请求超时（300012ms）"],
+    diagnostics: {
+      stage: "final_review",
+      uniqueModelCount: 1,
+      parseOnly: false,
+      timedOut: true,
+      hasIndependentFallback: false,
+      errors: ["[timeout] 唯一模型 OpenCode Go / deepseek-v4-flash · 300012ms · 整章终审请求超时（300012ms）"],
+      attempts: [{
+        model: "deepseek-v4-flash",
+        providerName: "OpenCode Go",
+        role: "sole",
+        class: "timeout",
+        message: "整章终审请求超时（300012ms）",
+        durationMs: 300_012,
+        recordedUsage: true,
+        at: "2026-08-07T13:49:28.000Z",
+      }],
+    },
+  }, "dependency", { artifactId: 1, path: "chapters/02-满载.md", sourceHash: "abc" });
+  const text = String(paused.displayMessage);
+  assert.match(text, /响应超时/u);
+  assert.match(text, /唯一模型/u);
+  assert.match(text, /deepseek-v4-flash/u);
+  assert.match(text, /300012ms/u);
+  assert.match(text, /chapters\/02-满载\.md/u);
+  assert.doesNotMatch(text, /审核模型及回退模型均不可用/u);
+});
+
+test("proposal pause falls back to errors[] when diagnostics missing", () => {
+  const paused = proposalFailurePauseResult({
+    status: "final_review_unavailable",
+    failureKind: "dependency",
+    message: "终审模型及回退模型均不可用，未创建提案。",
+    errors: ["整章终审请求失败（502）：bad gateway", "fallback also failed"],
+  }, "dependency");
+  const text = String(paused.displayMessage);
+  assert.match(text, /诊断/u);
+  assert.match(text, /502/u);
+  assert.match(text, /fallback also failed/u);
+});
+
 test("scene continuation handoff carries seam tail, states and next card without full prose", () => {
   let draft = beginChapterSceneDraft({
     path: "chapters/第1章.md", mode: "create", heading: "第1章", chapterGoal: "关系反转",

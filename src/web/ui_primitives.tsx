@@ -1,10 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  BookOpenText, Bot, Columns3, Drama, IdCard, Menu, MessageSquare, MoreHorizontal,
-  PanelLeftClose, PanelLeftOpen, PanelRight, Pencil, RefreshCw, Settings, Share2, ShieldCheck,
-  Sun, WandSparkles, Wifi, X,
+  BookOpenText, Columns3, Drama, IdCard, Menu, MessageSquare, MoreHorizontal,
+  PanelLeftClose, PanelLeftOpen, PanelRight, RefreshCw, Settings, Share2, X,
 } from "lucide-react";
-import type { SettingsSection } from "./model_config";
+import { SETTINGS_NAV_ITEMS, type SettingsSection } from "./model_config";
 import type { UiThemeId, WorkspaceMode } from "./types";
 import { AGENT_HIDDEN_CHARACTER_CARDS_KEY, UI_THEMES, UI_THEME_IDS } from "./types";
 
@@ -186,12 +185,17 @@ export function LayoutControls({ mode, documentsCollapsed, onModeChange, onToggl
   );
 }
 
-export function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onReviewRules }: {
+/**
+ * 顶栏设置下拉：条目必须与展开设置页侧栏一致。
+ * 数据源：SETTINGS_NAV_ITEMS（model_config.tsx），勿在此硬编码子项。
+ */
+export function SettingsMenu({ open, connectionAvailable, onClose, onSelect }: {
   open: boolean;
   connectionAvailable: boolean;
   onClose: () => void;
   onSelect: (section: SettingsSection) => void;
-  onReviewRules: () => void;
+  /** @deprecated 保留 prop 兼容旧调用；作者复审已并入 SETTINGS_NAV_ITEMS → onSelect("prose-gates") */
+  onReviewRules?: () => void;
 }) {
   if (!open) return null;
   const pick = (action: () => void) => () => {
@@ -201,14 +205,24 @@ export function SettingsMenu({ open, connectionAvailable, onClose, onSelect, onR
   return (
     <div className="settings-menu-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="settings-menu" role="menu" aria-label="设置快捷入口" onMouseDown={(event) => event.stopPropagation()}>
-        <button type="button" role="menuitem" onClick={pick(() => onSelect("models"))}><Bot size={16} aria-hidden="true" />模型与分工</button>
-        <button type="button" role="menuitem" onClick={pick(() => onSelect("writing"))}><Pencil size={16} aria-hidden="true" />写作行为</button>
-        <button type="button" role="menuitem" onClick={pick(() => onSelect("style"))}><WandSparkles size={16} aria-hidden="true" />写作风格</button>
-        <i className="settings-menu-separator" aria-hidden="true" />
-        <button type="button" role="menuitem" onClick={pick(onReviewRules)}><ShieldCheck size={16} aria-hidden="true" />作者复审规则</button>
-        <i className="settings-menu-separator" aria-hidden="true" />
-        <button type="button" role="menuitem" disabled={!connectionAvailable} onClick={pick(() => onSelect("connection"))}><Wifi size={16} aria-hidden="true" />连接设置</button>
-        <button type="button" role="menuitem" onClick={pick(() => onSelect("appearance"))}><Sun size={16} aria-hidden="true" />外观与动效</button>
+        {SETTINGS_NAV_ITEMS.map((item) => {
+          const Icon = item.Icon;
+          const disabled = Boolean(item.requiresDualConnection && !connectionAvailable);
+          return (
+            <React.Fragment key={item.id}>
+              {item.menuSeparatorBefore ? <i className="settings-menu-separator" aria-hidden="true" /> : null}
+              <button
+                type="button"
+                role="menuitem"
+                disabled={disabled}
+                onClick={pick(() => onSelect(item.id))}
+              >
+                <Icon size={16} aria-hidden="true" />
+                {item.label}
+              </button>
+            </React.Fragment>
+          );
+        })}
       </div>
     </div>
   );

@@ -26,7 +26,11 @@ import { PROSE_TARGET_BAND_TEXT, resolveTurnProseLength, type TurnProseLength } 
 import { dynamicStyleGroundingPrompt, isIntensiveWritingMode, stableStyleGroundingPrompt } from "./style_grounding.js";
 import { calculateUsageCost } from "./pricing.js";
 import { buildRecordedUsageEvent } from "./model_usage.js";
-import { modelFetch } from "./model_fetch.js";
+import {
+  dependencyBundleFromToolResult,
+  formatDependencyDiagnosticsForDisplay,
+} from "./dependency_diagnostics.js";
+import { isProviderError } from "./provider_error.js";
 import { loadProseGateRules } from "./prose_gate_rules.js";
 import { authorPoliciesForTarget, loadAuthorPolicies } from "./author_policies.js";
 import { extractWritingMemory } from "./writing_memory.js";
@@ -2434,13 +2438,24 @@ export function proposalFailurePauseResult(
 ): Record<string, unknown> {
   const dependency = reason === "dependency";
   const exhausted = reason === "revision_exhausted";
-  const dependencyTimedOut = dependency && [result.error, result.message]
-    .some(value => typeof value === "string" && /timeout|timed out|超时|未响应/iu.test(value));
-  const dependencyHasNoFallback = dependency && [result.error, result.message]
-    .some(value => typeof value === "string" && /仅配置 1 个唯一审核模型|无独立回退/iu.test(value));
+  const diagnostics = dependency
+    ? dependencyBundleFromToolResult(result, stageFromToolResult(result))
+    : undefined;
+  const dependencyTimedOut = dependency && (
+    diagnostics?.timedOut
+    || [result.error, result.message]
+      .some(value => typeof value === "string" && /timeout|timed out|超时|未响应/iu.test(value))
+  );
+  const dependencyHasNoFallback = dependency && (
+    (diagnostics ? !diagnostics.hasIndependentFallback : false)
+    || [result.error, result.message]
+      .some(value => typeof value === "string" && /仅配置 1 个唯一审核模型|无独立回退|仅配置 1 个唯一模型/iu.test(value))
+  );
   const summary = dependency
     ? dependencyTimedOut
-      ? "提案审核依赖在允许时限内没有返回结果。"
+      ? dependencyHasNoFallback
+        ? "提案审核依赖响应超时（仅配置了一个唯一模型，无独立回退）。"
+        : "提案审核依赖在允许时限内没有返回结果。"
       : dependencyHasNoFallback
         ? "提案审核仅配置了一个唯一模型，且该模型连续调用失败。"
         : "提案依赖的审核模型及回退模型均不可用。"
@@ -2457,12 +2472,27 @@ export function proposalFailurePauseResult(
     `problem: ${issue.problem}`,
     `action: ${issue.action}`,
   ]) ?? [];
+  const diagnosticLines = diagnostics
+    ? formatDependencyDiagnosticsForDisplay(diagnostics)
+    : legacyErrorLinesFromToolResult(result);
+  const primaryDetail = typeof result.error === "string"
+    ? result.error
+    : typeof result.message === "string"
+      ? result.message
+      : "";
+  // Prefer structured diagnostics over a second copy of the same summary line.
+  const detailLine = diagnosticLines.length && primaryDetail
+    && (primaryDetail === summary || diagnosticLines.some(line => primaryDetail.includes(line.slice(0, 24))))
+    ? ""
+    : primaryDetail;
   return {
     ...result,
     status: "waiting",
+    ...(diagnostics ? { diagnostics } : {}),
     displayMessage: [
       summary,
-      typeof result.error === "string" ? result.error : typeof result.message === "string" ? result.message : "",
+      detailLine,
+      ...diagnosticLines,
       ...blockerDetails,
       draft
         ? `当前正文已持久化为 ${draft.path ?? "目标文件"} 的工作副本，未丢失。`
@@ -2488,6 +2518,22 @@ export function proposalFailurePauseResult(
   };
 }
 
+function stageFromToolResult(result: Record<string, unknown>): import("./dependency_diagnostics.js").DependencyFailureBundle["stage"] {
+  const code = typeof result.code === "string" ? result.code : "";
+  if (/CHAPTER_REVIEW/i.test(code)) return "isolated_final_review";
+  if (/DIRECT_CHAPTER_REVIEW|FINAL_REVIEW/i.test(code)) return "final_review";
+  if (/PROSE_GATE/i.test(code)) return "prose_gate";
+  return "other";
+}
+
+function legacyErrorLinesFromToolResult(result: Record<string, unknown>): string[] {
+  const errors = Array.isArray(result.errors)
+    ? result.errors.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  if (!errors.length) return [];
+  return ["诊断：", ...errors.slice(0, 4).map((line, index) => `${index + 1}. ${line.replace(/\s+/g, " ").trim().slice(0, 400)}`)];
+}
+
 /**
  * Keep an actionable database lookup key beside every abnormal terminal turn.
  * The same value is already persisted on message_step_trails/model_usage/context_nodes.
@@ -2505,6 +2551,7 @@ function toolResultRequestsPause(result: Record<string, unknown> | undefined): b
 
 function genericDependencyPauseResult(toolName: string, result: Record<string, unknown>): Record<string, unknown> {
   if (result.status === "waiting") return result;
+  const diagnostics = dependencyBundleFromToolResult(result, stageFromToolResult(result));
   const message = typeof result.error === "string"
     ? result.error
     : typeof result.message === "string"
@@ -2512,14 +2559,24 @@ function genericDependencyPauseResult(toolName: string, result: Record<string, u
       : "外部工具依赖暂时不可用。";
   const summary = toolName === "generate_image"
     ? "生图服务暂时不可用，已停止自动重试。"
-    : "工具依赖暂时不可用，已暂停 AgentRun。";
+    : diagnostics?.timedOut
+      ? "工具依赖响应超时，已暂停 AgentRun。"
+      : diagnostics && !diagnostics.hasIndependentFallback
+        ? "工具依赖调用失败（无独立回退），已暂停 AgentRun。"
+        : "工具依赖暂时不可用，已暂停 AgentRun。";
+  const diagnosticLines = diagnostics
+    ? formatDependencyDiagnosticsForDisplay(diagnostics)
+    : legacyErrorLinesFromToolResult(result);
   return {
     ...result,
     status: "waiting",
-    displayMessage: [summary, message, "依赖恢复后可续跑。"].filter(Boolean).join("\n"),
-    question: toolName === "generate_image"
-      ? "生图服务暂时不可用；恢复后可续跑。"
-      : "外部依赖暂时不可用；恢复后可续跑。",
+    ...(diagnostics ? { diagnostics } : {}),
+    displayMessage: [summary, message, ...diagnosticLines].filter(Boolean).join("\n"),
+    question: diagnostics?.timedOut
+      ? "依赖响应超时；恢复后可续跑。"
+      : toolName === "generate_image"
+        ? "生图服务暂时不可用；恢复后可续跑。"
+        : "工具依赖暂时不可用；恢复后可续跑。",
     options: ["续跑"],
   };
 }
@@ -3740,6 +3797,20 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         ...(isDeepSeekModel(stepModel) || usesResponsesApi(stepModel)
           ? { userId: projectCacheUserId(project.root) }
           : {}),
+        onProviderStatus: (status) => {
+          // Skip high-frequency "dispatched" chatter; surface queue/retry/circuit only.
+          if (status.phase === "dispatched") return;
+          emit({
+            type: "provider_status",
+            phase: status.phase,
+            ...(status.key ? { key: status.key } : {}),
+            ...(status.position !== undefined ? { position: status.position } : {}),
+            ...(status.attempt !== undefined ? { attempt: status.attempt } : {}),
+            ...(status.maxAttempts !== undefined ? { maxAttempts: status.maxAttempts } : {}),
+            ...(status.waitMs !== undefined ? { waitMs: status.waitMs } : {}),
+            ...(status.message ? { message: status.message } : {}),
+          });
+        },
         prefixCache: {
           projectRoot: project.root,
           sessionId,
@@ -4995,7 +5066,13 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       store.addSystemMessage(sessionId, appendTerminalJobReference("Agent 任务异常结束：" + message, options.jobId));
     } catch { /* 错误持久化失败不遮蔽原始错误。 */ }
     persistRunTerminal("failed", message);
-    emit({ type: "error", message: appendTerminalJobReference(message, options.jobId) });
+    emit({
+      type: "error",
+      message: appendTerminalJobReference(message, options.jobId),
+      ...(isProviderError(error)
+        ? { code: error.code, retryable: error.retryable, action: error.action }
+        : {}),
+    });
     throw error;
   }
 }
@@ -6802,6 +6879,16 @@ type CompletionRequestOptions = {
   resolveAttachment?: (sessionId: string, id: string) => { mimeType: string; bytes: Buffer } | undefined;
   /** Observation-only metadata. Never serialized into the provider request. */
   prefixCache?: PrefixCacheRequestContext;
+  /** Provider transport queue / retry visibility (SSE provider_status). */
+  onProviderStatus?: (status: {
+    phase: "queued" | "rate_limited" | "retrying" | "circuit_open" | "dispatched";
+    key: string;
+    position?: number;
+    attempt?: number;
+    maxAttempts?: number;
+    waitMs?: number;
+    message?: string;
+  }) => void;
 };
 
 async function streamCompletion(
@@ -6863,6 +6950,7 @@ async function streamCompletion(
       signal,
       onText: (text) => visibleText.push(text),
       onReasoning,
+      onStatus: options.onProviderStatus,
     });
     visibleText.flush();
     const textual = extractDsmlToolCalls(streamed.content);

@@ -1,5 +1,6 @@
 /** Stable machine-readable failure kinds shared by model-backed tool handlers. */
 import type { RepairPacket } from "./repair_packet.js";
+import type { DependencyFailureBundle } from "./dependency_diagnostics.js";
 
 export type ToolFailureKind = "dependency" | "invalid_output" | "validation" | "semantic_revision";
 
@@ -10,14 +11,16 @@ export type ToolFailureKind = "dependency" | "invalid_output" | "validation" | "
 export class ToolDependencyError extends Error {
   readonly failureKind = "dependency" as const;
   readonly retryable = true;
+  readonly diagnostics?: DependencyFailureBundle;
 
   constructor(
     readonly code: string,
     message: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { diagnostics?: DependencyFailureBundle },
   ) {
     super(message, options);
     this.name = "ToolDependencyError";
+    this.diagnostics = options?.diagnostics;
   }
 }
 

@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { samplingRequestOptions } from "./model_compat.js";
 import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
 import type { ModelConfig } from "./types.js";
@@ -112,7 +112,7 @@ export async function judgeSceneCandidates(request: SceneJudgeRequest): Promise<
       ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
     },
     body,
-  }, model.proxyUrl);
+  }, modelRequestOptions(model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) throw new Error(`候选评选请求失败（${response.status}）：${responseBody.slice(0, 240)}`);
@@ -181,7 +181,7 @@ export async function rewriteSceneCandidate(request: SceneRewriteRequest): Promi
       ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
     },
     body,
-  }, model.proxyUrl);
+  }, modelRequestOptions(model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) throw new Error(`场景重写请求失败（${response.status}）：${responseBody.slice(0, 240)}`);

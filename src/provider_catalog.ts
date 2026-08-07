@@ -3,11 +3,29 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSy
 import { dirname, isAbsolute, resolve } from "node:path";
 import type { ModelConfig, ModelUsageRole, ProviderCatalogPublic, ProviderId, ProviderModelPublic, ProviderProfilePublic, ProviderPublicConfig, ReasoningEffort, ResponseVerbosity, TokenPricing } from "./types.js";
 import { defaultPricing, normalizePricing } from "./pricing.js";
-import { modelFetch, normalizeProxyUrl } from "./model_fetch.js";
+import {
+  modelFetch,
+  normalizeMaxConcurrent,
+  normalizeMaxRpm,
+  normalizeProxyUrl,
+  syncProviderConcurrencyRegistry,
+} from "./model_fetch.js";
 import { WriterProject } from "./project.js";
 
 type SavedModel = ProviderModelPublic;
-type SavedProfile = { id: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey: string; models: SavedModel[] };
+type SavedProfile = {
+  id: string;
+  name: string;
+  provider: ProviderId;
+  baseUrl: string;
+  proxyUrl?: string;
+  apiKey: string;
+  /** Max in-flight requests for this provider profile (default 5). */
+  maxConcurrent?: number;
+  /** Optional requests-per-minute cap. */
+  maxRpm?: number;
+  models: SavedModel[];
+};
 type ModelReference = { providerId: string; modelId: string };
 type SavedCatalog = { version: 2; activeProviderId: string; activeModelId: string; assignments: Record<ModelUsageRole, ModelReference>; providers: SavedProfile[] };
 type LegacyConfig = { provider: ProviderId; baseUrl: string; proxyUrl?: string; model: string; apiKey: string; pricing?: TokenPricing; temperature?: number; topP?: number };
@@ -43,6 +61,7 @@ export class ProviderManager {
   constructor(project: WriterProject) {
     this.path = resolveProvidersPath(project);
     this.saved = this.load();
+    this.syncConcurrencyRegistry();
   }
 
   modelConfig(role: ModelUsageRole = "agent"): ModelConfig {
@@ -52,21 +71,107 @@ export class ProviderManager {
     const environmentConfigured = imageRole
       ? Boolean(process.env.WRITER_IMAGE_BASE_URL || process.env.WRITER_IMAGE_API_KEY || process.env.WRITER_IMAGE_MODEL)
       : Boolean(process.env.WRITER_BASE_URL || process.env.WRITER_API_KEY || process.env.WRITER_MODEL);
-    return { provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider, providerName: environmentConfigured ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置") : profile.name, baseUrl, proxyUrl: (imageRole ? process.env.WRITER_IMAGE_PROXY_URL : undefined) || process.env.WRITER_PROXY_URL || profile.proxyUrl, apiKey: (imageRole ? process.env.WRITER_IMAGE_API_KEY : undefined) || process.env.WRITER_API_KEY || profile.apiKey, model: (imageRole ? process.env.WRITER_IMAGE_MODEL : process.env.WRITER_MODEL) || model.name, pricing: model.pricing, temperature: model.temperature, topP: model.topP, frequencyPenalty: model.frequencyPenalty, presencePenalty: model.presencePenalty, reasoningEffort: model.reasoningEffort, verbosity: model.verbosity, disableSampling: model.disableSampling, supportsMultimodal: model.supportsMultimodal };
+    return {
+      provider: baseUrl.includes("api.deepseek.com") ? "deepseek" : profile.provider,
+      providerId: profile.id,
+      providerName: environmentConfigured
+        ? (baseUrl.includes("api.deepseek.com") ? "DeepSeek" : "环境配置")
+        : profile.name,
+      baseUrl,
+      proxyUrl: (imageRole ? process.env.WRITER_IMAGE_PROXY_URL : undefined) || process.env.WRITER_PROXY_URL || profile.proxyUrl,
+      apiKey: (imageRole ? process.env.WRITER_IMAGE_API_KEY : undefined) || process.env.WRITER_API_KEY || profile.apiKey,
+      model: (imageRole ? process.env.WRITER_IMAGE_MODEL : process.env.WRITER_MODEL) || model.name,
+      maxConcurrent: normalizeMaxConcurrent(profile.maxConcurrent),
+      ...(normalizeMaxRpm(profile.maxRpm) !== undefined ? { maxRpm: normalizeMaxRpm(profile.maxRpm) } : {}),
+      requestPriority: requestPriorityForRole(role),
+      pricing: model.pricing,
+      temperature: model.temperature,
+      topP: model.topP,
+      frequencyPenalty: model.frequencyPenalty,
+      presencePenalty: model.presencePenalty,
+      reasoningEffort: model.reasoningEffort,
+      verbosity: model.verbosity,
+      disableSampling: model.disableSampling,
+      supportsMultimodal: model.supportsMultimodal,
+    };
   }
   imageModelConfig(): ModelConfig { return this.modelConfig("image"); }
   summaryModelConfig(): ModelConfig { return this.modelConfig("summarizer"); }
   publicConfig(): ProviderPublicConfig {
     const { profile, model } = this.active(); const config = this.modelConfig();
     const environmentConfigured = Boolean(process.env.WRITER_API_KEY || process.env.WRITER_BASE_URL || process.env.WRITER_MODEL);
-    return { profileId: profile.id, modelId: model.id, provider: config.provider ?? profile.provider, baseUrl: config.baseUrl, proxyUrl: config.proxyUrl, model: config.model, apiKeyConfigured: Boolean(config.apiKey), apiKeyHint: maskKey(config.apiKey), source: environmentConfigured ? "environment" : "project", pricing: config.pricing ?? model.pricing, temperature: config.temperature, topP: config.topP, frequencyPenalty: config.frequencyPenalty, presencePenalty: config.presencePenalty, reasoningEffort: config.reasoningEffort, verbosity: config.verbosity, disableSampling: config.disableSampling, supportsMultimodal: config.supportsMultimodal };
+    return {
+      profileId: profile.id,
+      modelId: model.id,
+      provider: config.provider ?? profile.provider,
+      baseUrl: config.baseUrl,
+      proxyUrl: config.proxyUrl,
+      model: config.model,
+      apiKeyConfigured: Boolean(config.apiKey),
+      apiKeyHint: maskKey(config.apiKey),
+      source: environmentConfigured ? "environment" : "project",
+      maxConcurrent: normalizeMaxConcurrent(profile.maxConcurrent),
+      ...(normalizeMaxRpm(profile.maxRpm) !== undefined ? { maxRpm: normalizeMaxRpm(profile.maxRpm) } : {}),
+      pricing: config.pricing ?? model.pricing,
+      temperature: config.temperature,
+      topP: config.topP,
+      frequencyPenalty: config.frequencyPenalty,
+      presencePenalty: config.presencePenalty,
+      reasoningEffort: config.reasoningEffort,
+      verbosity: config.verbosity,
+      disableSampling: config.disableSampling,
+      supportsMultimodal: config.supportsMultimodal,
+    };
   }
   catalog(): ProviderCatalogPublic { return { activeProviderId: this.saved.activeProviderId, activeModelId: this.saved.activeModelId, assignments: this.saved.assignments, providers: this.saved.providers.map(profile => this.publicProfile(profile)) }; }
 
-  saveProfile(input: { id?: string; name: string; provider: ProviderId; baseUrl: string; proxyUrl?: string; apiKey?: string; models: Array<{ id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean; supportsMultimodal?: boolean }> }): ProviderCatalogPublic {
+  saveProfile(input: {
+    id?: string;
+    name: string;
+    provider: ProviderId;
+    baseUrl: string;
+    proxyUrl?: string;
+    apiKey?: string;
+    maxConcurrent?: number;
+    /** Pass null to clear a previously saved RPM cap. */
+    maxRpm?: number | null;
+    models: Array<{
+      id?: string;
+      name: string;
+      pricing?: Partial<TokenPricing>;
+      temperature?: number;
+      topP?: number;
+      frequencyPenalty?: number;
+      presencePenalty?: number;
+      reasoningEffort?: ReasoningEffort;
+      verbosity?: ResponseVerbosity;
+      disableSampling?: boolean;
+      supportsMultimodal?: boolean;
+    }>;
+  }): ProviderCatalogPublic {
     if (!input.models?.length) throw new Error("每个供应商至少需要一个模型");
     const existing = input.id ? this.saved.providers.find(item => item.id === input.id) : undefined;
-    const profile: SavedProfile = { id: existing?.id ?? randomUUID(), name: input.name.trim() || providerLabel(input.provider), provider: validateProvider(input.provider), baseUrl: normalizeBaseUrl(input.baseUrl), proxyUrl: normalizeProxyUrl(input.proxyUrl), apiKey: input.apiKey?.trim() || existing?.apiKey || "", models: [] };
+    const maxConcurrent = input.maxConcurrent !== undefined
+      ? normalizeMaxConcurrent(input.maxConcurrent)
+      : existing?.maxConcurrent !== undefined
+        ? normalizeMaxConcurrent(existing.maxConcurrent)
+        : undefined;
+    const maxRpm = Object.prototype.hasOwnProperty.call(input, "maxRpm")
+      ? normalizeMaxRpm(input.maxRpm)
+      : existing?.maxRpm !== undefined
+        ? normalizeMaxRpm(existing.maxRpm)
+        : undefined;
+    const profile: SavedProfile = {
+      id: existing?.id ?? randomUUID(),
+      name: input.name.trim() || providerLabel(input.provider),
+      provider: validateProvider(input.provider),
+      baseUrl: normalizeBaseUrl(input.baseUrl),
+      proxyUrl: normalizeProxyUrl(input.proxyUrl),
+      apiKey: input.apiKey?.trim() || existing?.apiKey || "",
+      ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
+      ...(maxRpm !== undefined ? { maxRpm } : {}),
+      models: [],
+    };
     if (!profile.apiKey) throw new Error("API Key 不能为空");
     profile.models = input.models.map(item => normalizeModel(item, profile.provider, existing?.models.find(model => model.id === item.id)));
     const index = this.saved.providers.findIndex(item => item.id === profile.id);
@@ -74,11 +179,25 @@ export class ProviderManager {
     if (!this.saved.providers.some(item => item.id === this.saved.activeProviderId)) { this.saved.activeProviderId = profile.id; this.saved.activeModelId = profile.models[0].id; }
     if (this.saved.activeProviderId === profile.id && !profile.models.some(item => item.id === this.saved.activeModelId)) this.saved.activeModelId = profile.models[0].id;
     for (const role of modelRoles()) { const ref = this.saved.assignments[role]; if (ref.providerId === profile.id && !profile.models.some(item => item.id === ref.modelId)) this.saved.assignments[role] = { providerId: profile.id, modelId: profile.models[0].id }; }
-    this.persist(); return this.catalog();
+    this.persist();
+    return this.catalog();
   }
   select(profileId: string, modelId: string): ProviderPublicConfig { const profile = this.saved.providers.find(item => item.id === profileId); if (!profile?.models.some(item => item.id === modelId)) throw new Error("供应商或模型不存在"); this.saved.activeProviderId = profileId; this.saved.activeModelId = modelId; this.persist(); return this.publicConfig(); }
   assign(role: ModelUsageRole, providerId: string, modelId: string): ProviderCatalogPublic { if (!modelRoles().includes(role)) throw new Error("模型用途无效"); const profile = this.saved.providers.find(item => item.id === providerId); if (!profile?.models.some(item => item.id === modelId)) throw new Error("供应商或模型不存在"); this.saved.assignments[role] = { providerId, modelId }; if (role === "agent") { this.saved.activeProviderId = providerId; this.saved.activeModelId = modelId; } this.persist(); return this.catalog(); }
-  deleteProfile(id: string): ProviderCatalogPublic { if (this.saved.providers.length <= 1) throw new Error("至少保留一个供应商"); this.saved.providers = this.saved.providers.filter(item => item.id !== id); const fallback = { providerId: this.saved.providers[0].id, modelId: this.saved.providers[0].models[0].id }; if (this.saved.activeProviderId === id) { this.saved.activeProviderId = fallback.providerId; this.saved.activeModelId = fallback.modelId; } for (const role of modelRoles()) if (this.saved.assignments[role].providerId === id) this.saved.assignments[role] = fallback; this.persist(); return this.catalog(); }
+  deleteProfile(id: string): ProviderCatalogPublic {
+    if (this.saved.providers.length <= 1) throw new Error("至少保留一个供应商");
+    this.saved.providers = this.saved.providers.filter(item => item.id !== id);
+    const fallback = { providerId: this.saved.providers[0].id, modelId: this.saved.providers[0].models[0].id };
+    if (this.saved.activeProviderId === id) {
+      this.saved.activeProviderId = fallback.providerId;
+      this.saved.activeModelId = fallback.modelId;
+    }
+    for (const role of modelRoles()) {
+      if (this.saved.assignments[role].providerId === id) this.saved.assignments[role] = fallback;
+    }
+    this.persist();
+    return this.catalog();
+  }
   /**
    * Legacy single-model update (style temperature, TUI /model, PUT /api/provider).
    * Only patches the active model — sibling models on the same provider are preserved.
@@ -121,6 +240,8 @@ export class ProviderManager {
       provider: input.provider,
       baseUrl: input.baseUrl,
       apiKey: input.apiKey,
+      maxConcurrent: profile.maxConcurrent,
+      maxRpm: profile.maxRpm,
       models,
     });
     return this.publicConfig();
@@ -136,7 +257,11 @@ export class ProviderManager {
     const response = await modelFetch(`${base}/models`, {
       headers: { authorization: `Bearer ${profile.apiKey}` },
       signal: AbortSignal.timeout(15_000),
-    }, profile.proxyUrl);
+    }, {
+      proxyUrl: profile.proxyUrl,
+      concurrencyKey: profile.id,
+      maxConcurrent: profile.maxConcurrent,
+    });
     if (!response.ok) {
       throw new Error(`${profile.name} / ${model.name} 不可达（${response.status}）：${(await response.text()).slice(0, 300)}`);
     }
@@ -176,7 +301,11 @@ export class ProviderManager {
     const response = await modelFetch(`${baseUrl}/models`, {
       headers: { authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(15_000),
-    }, proxyUrl);
+    }, {
+      proxyUrl,
+      concurrencyKey: profile?.id,
+      maxConcurrent: profile?.maxConcurrent,
+    });
     if (!response.ok) {
       throw new Error(`扫描模型失败（${response.status}）：${(await response.text()).slice(0, 300)}`);
     }
@@ -197,7 +326,28 @@ export class ProviderManager {
 
   private active() { const profile = this.saved.providers.find(item => item.id === this.saved.activeProviderId) ?? this.saved.providers[0]; const model = profile.models.find(item => item.id === this.saved.activeModelId) ?? profile.models[0]; return { profile, model }; }
   private assigned(role: ModelUsageRole) { const ref = this.saved.assignments[role]; const profile = this.saved.providers.find(item => item.id === ref?.providerId) ?? this.active().profile; const model = profile.models.find(item => item.id === ref?.modelId) ?? profile.models[0]; return { profile, model }; }
-  private publicProfile(profile: SavedProfile): ProviderProfilePublic { return { id: profile.id, name: profile.name, provider: profile.provider, baseUrl: profile.baseUrl, proxyUrl: profile.proxyUrl, apiKeyConfigured: Boolean(profile.apiKey), apiKeyHint: maskKey(profile.apiKey), models: profile.models }; }
+  private publicProfile(profile: SavedProfile): ProviderProfilePublic {
+    return {
+      id: profile.id,
+      name: profile.name,
+      provider: profile.provider,
+      baseUrl: profile.baseUrl,
+      proxyUrl: profile.proxyUrl,
+      apiKeyConfigured: Boolean(profile.apiKey),
+      apiKeyHint: maskKey(profile.apiKey),
+      maxConcurrent: normalizeMaxConcurrent(profile.maxConcurrent),
+      ...(normalizeMaxRpm(profile.maxRpm) !== undefined ? { maxRpm: normalizeMaxRpm(profile.maxRpm) } : {}),
+      models: profile.models,
+    };
+  }
+  private syncConcurrencyRegistry(): void {
+    syncProviderConcurrencyRegistry(this.saved.providers.map(profile => ({
+      id: profile.id,
+      baseUrl: profile.baseUrl,
+      maxConcurrent: profile.maxConcurrent,
+      maxRpm: profile.maxRpm,
+    })));
+  }
   private load(): SavedCatalog {
     const sourcePath = existsSync(this.path)
       ? this.path
@@ -244,6 +394,7 @@ export class ProviderManager {
       writeFileSync(this.path, text, { encoding: "utf8", mode: 0o600 });
       try { unlinkSync(temporary); } catch { /* Windows 可能短暂锁定临时文件。 */ }
     }
+    this.syncConcurrencyRegistry();
   }
 }
 
@@ -394,6 +545,14 @@ function parseCatalog(raw: string): SavedCatalog {
     for (const role of modelRoles()) parsed.assignments[role] ??= fallback;
     for (const profile of parsed.providers) {
       profile.proxyUrl = normalizeProxyUrl(profile.proxyUrl);
+      if (profile.maxConcurrent !== undefined) {
+        profile.maxConcurrent = normalizeMaxConcurrent(profile.maxConcurrent);
+      }
+      if (profile.maxRpm !== undefined) {
+        const rpm = normalizeMaxRpm(profile.maxRpm);
+        if (rpm !== undefined) profile.maxRpm = rpm;
+        else delete profile.maxRpm;
+      }
       for (const model of profile.models) {
         model.pricing = normalizePricing(profile.provider, model.name, undefined, model.pricing);
         model.temperature = optional(model.temperature, 0, 2);
@@ -529,6 +688,21 @@ function modelRoles(): ModelUsageRole[] {
     "agent", "image", "flash", "drafter", "inline", "writer", "reviewer", "summarizer",
     "roleplay", "roleplay_perception", "roleplay_quality", "roleplay_memory",
   ];
+}
+
+/** Short / latency-sensitive roles jump ahead of long agent streams in the provider queue. */
+function requestPriorityForRole(role: ModelUsageRole): "high" | "normal" | "low" {
+  if (
+    role === "flash"
+    || role === "inline"
+    || role === "summarizer"
+    || role === "roleplay_perception"
+    || role === "roleplay_memory"
+  ) {
+    return "high";
+  }
+  if (role === "image") return "low";
+  return "normal";
 }
 function normalizeModel(input: { id?: string; name: string; pricing?: Partial<TokenPricing>; temperature?: number; topP?: number; frequencyPenalty?: number; presencePenalty?: number; reasoningEffort?: ReasoningEffort; verbosity?: ResponseVerbosity; disableSampling?: boolean; supportsMultimodal?: boolean }, provider: ProviderId, existing?: SavedModel): SavedModel {
   const name = input.name.trim();

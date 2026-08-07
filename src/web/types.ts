@@ -390,6 +390,17 @@ export type AgentStreamEvent = {
   callKind?: string;
   todos?: AgentTodoItem[];
   mode?: PermissionMode;
+  /** provider_status */
+  phase?: "queued" | "rate_limited" | "retrying" | "circuit_open" | "dispatched";
+  key?: string;
+  position?: number;
+  attempt?: number;
+  maxAttempts?: number;
+  waitMs?: number;
+  /** error */
+  code?: string;
+  retryable?: boolean;
+  action?: string;
 };
 export type Usage = {
   promptTokens: number;

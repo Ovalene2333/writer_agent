@@ -245,11 +245,14 @@ export class WriterStore {
     mkdirSync(project.privateDir, { recursive: true });
     this.database = new DatabaseSync(resolve(project.privateDir, "writer.db"));
     try {
-      this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+      // busy_timeout: multi-process readers/writers wait instead of failing immediately.
+      this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
       this.migrate();
       this.migrateCharacterCardsToJsonl();
       this.migrateSimpleCharacterCardsToJsonl();
       this.reindex();
+      // Close trails left "running" by a crashed process (in-memory jobs are gone).
+      this.finalizeOrphanedStepTrails("进程异常退出：未完成的任务已标记失败，可从原指令续跑。");
     } catch (error) {
       this.database.close();
       throw error;
@@ -948,6 +951,40 @@ export class WriterStore {
     if (!options.preserveContextArtifacts) {
       this.database.prepare("DELETE FROM context_artifacts WHERE session_id=?").run(sessionId);
     }
+  }
+
+  /**
+   * After process restart, any step trail still marked `running` cannot resume its
+   * in-memory job. Mark those steps failed so the UI does not show a zombie run.
+   */
+  finalizeOrphanedStepTrails(_reason = "任务已中断"): number {
+    const rows = this.database.prepare(
+      `SELECT session_id,source_message_id,steps_json FROM message_step_trails`,
+    ).all() as Array<{ session_id: string; source_message_id: number; steps_json: string }>;
+    let updated = 0;
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      try {
+        const steps = JSON.parse(String(row.steps_json ?? "[]")) as unknown;
+        if (!Array.isArray(steps) || !steps.length) continue;
+        let dirty = false;
+        const next = steps.map((item) => {
+          if (!item || typeof item !== "object") return item;
+          const step = item as Record<string, unknown>;
+          if (step.status !== "running") return item;
+          dirty = true;
+          return { ...step, status: "failed" };
+        });
+        if (!dirty) continue;
+        this.database.prepare(
+          `UPDATE message_step_trails SET steps_json=?, updated_at=? WHERE session_id=? AND source_message_id=?`,
+        ).run(JSON.stringify(next), now, row.session_id, row.source_message_id);
+        updated += 1;
+      } catch {
+        /* skip corrupt trail rows */
+      }
+    }
+    return updated;
   }
 
   upsertMessageStepTrail(

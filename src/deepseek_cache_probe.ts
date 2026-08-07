@@ -8,7 +8,7 @@ import {
   projectCacheUserId,
 } from "./agent.js";
 import { applyProviderReasoningToChatBody, isDeepSeekModel, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -146,7 +146,7 @@ async function requestProbe(
     },
     body,
     signal: AbortSignal.timeout(options.timeoutMs),
-  }, options.model.proxyUrl);
+  }, modelRequestOptions(options.model));
   const raw = await response.text();
   if (!response.ok) throw new Error(`${name} 请求失败（${response.status}）：${raw.slice(0, 300)}`);
   const payload = JSON.parse(raw) as {

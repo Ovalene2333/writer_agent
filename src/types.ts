@@ -10,8 +10,19 @@ export interface ModelConfig {
   apiKey: string;
   model: string;
   provider?: ProviderId;
+  /** Stable provider profile id used for per-provider concurrency pooling. */
+  providerId?: string;
   /** User-facing provider profile name for per-call usage attribution. */
   providerName?: string;
+  /**
+   * Max in-flight HTTP requests for this provider profile (default 5).
+   * Held for the full response lifetime, including streams.
+   */
+  maxConcurrent?: number;
+  /** Optional requests-per-minute cap (sliding 60s window). Omitted = unlimited. */
+  maxRpm?: number;
+  /** Fair-queue priority when this model shares a provider pool. */
+  requestPriority?: "high" | "normal" | "low";
   pricing?: TokenPricing;
   temperature?: number;
   topP?: number;
@@ -118,6 +129,10 @@ export interface ProviderPublicConfig {
   apiKeyConfigured: boolean;
   apiKeyHint: string;
   source: "project" | "environment";
+  /** Max in-flight requests for this provider profile (default 5). */
+  maxConcurrent?: number;
+  /** Optional requests-per-minute cap. */
+  maxRpm?: number;
   pricing: TokenPricing;
   temperature?: number;
   topP?: number;
@@ -153,6 +168,10 @@ export interface ProviderProfilePublic {
   proxyUrl?: string;
   apiKeyConfigured: boolean;
   apiKeyHint: string;
+  /** Max in-flight HTTP requests against this provider (default 5). */
+  maxConcurrent?: number;
+  /** Optional requests-per-minute cap (sliding window). */
+  maxRpm?: number;
   models: ProviderModelPublic[];
 }
 
@@ -815,4 +834,25 @@ export type AgentEvent =
   | { type: "cancelled"; sessionId: string }
   | { type: "waiting_for_input"; sessionId: string; question: string; options?: string[] }
   | { type: "usage"; usage: UsageSummary; step?: number; call?: StepUsage; callKind?: string; jobId?: string }
-  | { type: "error"; message: string };
+  /**
+   * Transport visibility: provider concurrency queue, RPM wait, retry, or circuit open.
+   * Non-terminal; clients may show a status line without failing the run.
+   */
+  | {
+      type: "provider_status";
+      phase: "queued" | "rate_limited" | "retrying" | "circuit_open" | "dispatched";
+      key?: string;
+      position?: number;
+      attempt?: number;
+      maxAttempts?: number;
+      waitMs?: number;
+      message?: string;
+    }
+  | {
+      type: "error";
+      message: string;
+      /** Stable machine code from ProviderError / job scheduler. */
+      code?: string;
+      retryable?: boolean;
+      action?: string;
+    };

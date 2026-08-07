@@ -19,7 +19,7 @@ import {
   projectCacheUserId,
 } from "./agent.js";
 import { applyProviderReasoningToChatBody, isDeepSeekModel, samplingRequestOptions, thinkingRequestOptions } from "./model_compat.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -325,7 +325,7 @@ async function requestProbe(
     },
     body,
     signal: AbortSignal.timeout(options.timeoutMs),
-  }, options.model.proxyUrl);
+  }, modelRequestOptions(options.model));
   if (!response.ok) {
     const raw = await response.text();
     throw new Error(`${name} 失败（${response.status}）：${raw.slice(0, 280)}`);

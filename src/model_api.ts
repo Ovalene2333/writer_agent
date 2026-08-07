@@ -9,9 +9,10 @@ import {
   reasoningIntentFromThinkingField,
   samplingRequestOptions,
 } from "./model_compat.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions, throwProviderHttpError, type ProviderTransportStatus } from "./model_fetch.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { parseModelTokenUsage } from "./model_usage.js";
+import { ProviderError } from "./provider_error.js";
 
 export type ProviderWireMessage = {
   role: string;
@@ -492,6 +493,7 @@ export async function streamProviderCompletion(
   handlers: {
     onText?: (text: string) => void;
     onReasoning?: (text: string) => void;
+    onStatus?: (status: ProviderTransportStatus) => void;
     signal?: AbortSignal;
   } = {},
 ): Promise<ProviderCompletionResult> {
@@ -508,13 +510,15 @@ export async function streamProviderCompletion(
       ...(request.model.apiKey ? { authorization: `Bearer ${request.model.apiKey}` } : {}),
     },
     body: requestBody,
-  }, request.model.proxyUrl);
+  }, modelRequestOptions(request.model, { onStatus: handlers.onStatus }));
   if (!response.ok) {
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
-    throw new Error(`模型请求失败（${response.status}）：${responseBody.slice(0, 600)}`);
+    throwProviderHttpError(response.status, responseBody, request.model.providerId);
   }
-  if (!response.body) throw new Error("模型响应没有可读取的数据流");
+  if (!response.body) {
+    throw new ProviderError("PROVIDER_INVALID_RESPONSE", "模型响应没有可读取的数据流", { retryable: false });
+  }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -628,17 +632,17 @@ export async function completeProviderCompletion(
       ...(request.model.apiKey ? { authorization: `Bearer ${request.model.apiKey}` } : {}),
     },
     body: requestBody,
-  }, request.model.proxyUrl);
+  }, modelRequestOptions(request.model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   if (!response.ok) {
-    throw new Error(`模型请求失败（${response.status}）：${responseBody.slice(0, 600)}`);
+    throwProviderHttpError(response.status, responseBody, request.model.providerId);
   }
   let payload: unknown;
   try {
     payload = JSON.parse(responseBody);
   } catch {
-    throw new Error("模型响应不是有效 JSON");
+    throw new ProviderError("PROVIDER_INVALID_RESPONSE", "模型响应不是有效 JSON", { retryable: false });
   }
   const parsed = parseProviderCompletionPayload(payload);
   return {

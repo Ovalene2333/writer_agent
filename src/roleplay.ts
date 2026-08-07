@@ -24,7 +24,7 @@ import { characterName, characterPromptCard, characterPromptViews } from "./char
 import { OutlineStore } from "./outline.js";
 import { logModelRequest, logModelResponse } from "./model_debug.js";
 import { modelSupportsToolChoice, samplingRequestOptions } from "./model_compat.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody, streamProviderCompletion } from "./model_api.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { documentKind, WriterProject } from "./project.js";
@@ -817,6 +817,34 @@ export function roleplayPerceptionNeedsSemanticRetry(projection: RoleplayPercept
     && projection.potentialSensations.length === 0;
 }
 
+/** Any of the four channels has content — enough to continue the turn without hard-fail. */
+export function roleplayPerceptionHasUsableContent(projection: RoleplayPerceptionProjection): boolean {
+  return projection.speech.length > 0
+    || projection.knowableFacts.length > 0
+    || projection.potentialSensations.length > 0
+    || projection.unknowableFacts.length > 0;
+}
+
+/**
+ * After coverage finalize, pick a projection that can still drive the turn.
+ * Prefer primary-channel content; if still empty, keep other-facts (soft cues)
+ * from either pass rather than aborting with a hard error.
+ */
+export function resolveRoleplayPerceptionAfterFinalize(
+  initial: RoleplayPerceptionProjection,
+  finalized: RoleplayPerceptionProjection,
+): RoleplayPerceptionProjection {
+  if (!roleplayPerceptionNeedsSemanticRetry(finalized)) return finalized;
+  // Primary still empty: other facts are intentional soft fallback for the performer.
+  if (finalized.unknowableFacts.length > 0) return finalized;
+  if (initial.unknowableFacts.length > 0) return initial;
+  // Prefer any usable content from either pass.
+  if (roleplayPerceptionHasUsableContent(finalized)) return finalized;
+  if (roleplayPerceptionHasUsableContent(initial)) return initial;
+  // Soft empty perception — formatRoleplayPerceptionForModel supplies a neutral line.
+  return finalized;
+}
+
 export function buildRoleplayPerceptionRetryMessages(
   input: string,
   initial: RoleplayPerceptionProjection,
@@ -877,7 +905,11 @@ export function formatRoleplayPerception(projection: RoleplayPerceptionProjectio
     lines.push("潜在感受：", ...projection.potentialSensations.map(item => `- ${item}`));
   }
   if (roleplayPerceptionNeedsSemanticRetry(projection)) {
-    lines.push("本回合没有可分类内容。");
+    if (projection.unknowableFacts.length) {
+      lines.push("（主通道为空；仅有不优先使用的其他事实，已作为弱线索保留。）");
+    } else {
+      lines.push("本回合没有可分类内容。");
+    }
   }
   return lines.join("\n");
 }
@@ -1001,10 +1033,8 @@ export async function compileRoleplayPerception(options: {
     });
   }
   const projection = parseRoleplayPerception(retried.content);
-  if (roleplayPerceptionNeedsSemanticRetry(projection)) {
-    throw new Error("角色感知仍无法确定本轮可感知内容，请检查或手动修正感知后重试");
-  }
-  return projection;
+  // Do not hard-fail when only other facts remain: they still carry player intent as weak cues.
+  return resolveRoleplayPerceptionAfterFinalize(initial, projection);
 }
 
 export const ROLEPLAY_QUALITY_ISSUES = [
@@ -1805,7 +1835,7 @@ ${JSON.stringify("schemaVersion" in target ? characterPromptViews(target, new Ou
       method: "POST", signal: options.signal,
       headers: { "content-type": "application/json", ...(options.model.apiKey ? { authorization: `Bearer ${options.model.apiKey}` } : {}) },
       body: requestBody,
-    }, options.model.proxyUrl);
+    }, modelRequestOptions(options.model));
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`对话者设定失败（${response.status}）：${responseBody.slice(0, 500)}`);

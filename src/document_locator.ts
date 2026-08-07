@@ -1,5 +1,5 @@
 import { logModelRequest, logModelResponse } from "./model_debug.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { parseModelTokenUsage } from "./model_usage.js";
 import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import { samplingRequestOptions } from "./model_compat.js";
@@ -71,7 +71,7 @@ export async function requestDocumentLocator(
       ...(model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {}),
     },
     body,
-  }, model.proxyUrl);
+  }, modelRequestOptions(model));
   const responseBody = await response.text();
   logModelResponse(endpoint, responseBody);
   let payload: { choices?: Array<{ message?: { content?: string | null } }>; usage?: unknown };

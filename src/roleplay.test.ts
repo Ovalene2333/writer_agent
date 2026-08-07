@@ -44,7 +44,9 @@ import {
   ROLEPLAY_EPISTEMIC_MEMORY_VERSION,
   roleplayContextKey,
   roleplayCacheBatch,
+  roleplayPerceptionHasUsableContent,
   roleplayPerceptionNeedsSemanticRetry,
+  resolveRoleplayPerceptionAfterFinalize,
   roleplayPerceptionForMemory,
   roleplayPerformerKey,
   roleplaySampling,
@@ -489,6 +491,39 @@ describe("roleplay prompts", () => {
     assert.match(messages[3].content, /semantic_coverage_finalize/);
     assert.match(messages[3].content, /每个实质语义单元恰好进入四类之一/);
     assert.match(messages[3].content, /连续发言的尾随解释和列表仍属于 speech/);
+  });
+
+  test("after finalize, other facts soft-fallback instead of hard error", () => {
+    const empty = {
+      speech: [] as string[],
+      knowableFacts: [] as string[],
+      unknowableFacts: [] as string[],
+      potentialSensations: [] as string[],
+    };
+    const onlyOther = { ...empty, unknowableFacts: ["对话者心里认定对方已经适应"] };
+    const withSpeech = { ...empty, speech: ["你好"] };
+
+    assert.equal(roleplayPerceptionHasUsableContent(empty), false);
+    assert.equal(roleplayPerceptionHasUsableContent(onlyOther), true);
+
+    // Finalizer still primary-empty but kept other facts → accept as soft cues.
+    assert.deepEqual(resolveRoleplayPerceptionAfterFinalize(onlyOther, onlyOther), onlyOther);
+    // Finalizer emptied everything; keep first-pass other facts.
+    assert.deepEqual(resolveRoleplayPerceptionAfterFinalize(onlyOther, empty), onlyOther);
+    // Finalizer recovered speech → prefer that.
+    assert.deepEqual(resolveRoleplayPerceptionAfterFinalize(onlyOther, withSpeech), withSpeech);
+    // Truly empty either way → soft empty, no throw.
+    assert.deepEqual(resolveRoleplayPerceptionAfterFinalize(empty, empty), empty);
+
+    const modelPayload = formatRoleplayPerceptionForModel(onlyOther);
+    assert.match(modelPayload, /不优先采用的附加线索/);
+    assert.match(modelPayload, /已经适应/);
+    assert.doesNotMatch(modelPayload, /没有接收到新的可确认/);
+
+    const display = formatRoleplayPerception(onlyOther);
+    assert.match(display, /其他事实（不优先使用）/);
+    assert.match(display, /主通道为空/);
+    assert.doesNotMatch(display, /本回合没有可分类内容/);
   });
 
   test("perception projection exposes an opaque bodily effect without its hidden mechanism", () => {

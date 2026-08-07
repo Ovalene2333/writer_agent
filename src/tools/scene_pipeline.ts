@@ -63,6 +63,15 @@ import {
   type ChapterReviewIssue,
   type ChapterReviewResult,
 } from "../chapter_review.js";
+import {
+  buildDependencyAttempt,
+  buildDependencyFailureBundle,
+  dependencyAttemptRole,
+  dependencyFailureGuidance,
+  dependencyFailureUserSummary,
+  reportModelCallUsage,
+  type DependencyAttemptDiagnostic,
+} from "../dependency_diagnostics.js";
 import { proposalIssueTransition, proposalRevisionIssueId } from "../proposal_retry.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import {
@@ -1377,7 +1386,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     message: issue.message,
     examples: issue.examples.slice(0, 5),
   }));
-  let reviewFailure: { attempts: number; errors: string[] } | undefined;
+  let reviewDiagnostics: ReturnType<typeof buildDependencyFailureBundle> | undefined;
   if (context.chapterReviewer) {
     const reviewer = context.chapterReviewer;
     const runReview = reviewer.run ?? reviewChapterDraft;
@@ -1386,7 +1395,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
       .filter((model, index, models) => models.findIndex(candidate =>
         candidate.baseUrl === model.baseUrl && candidate.model === model.model
       ) === index);
-    const reviewErrors: string[] = [];
+    const attempts: DependencyAttemptDiagnostic[] = [];
     const reviewContext = buildFactualChapterReviewContext({
       project,
       store: args.store,
@@ -1408,7 +1417,12 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     const reviewRequestCharacters = content.length + JSON.stringify(ledger).length
       + draft.chapterGoal.length + reviewContext.length
       + (revisionReview ? JSON.stringify(revisionReview).length : 0) + 1_200;
-    for (const reviewModel of reviewModels) {
+    const failedComponents = isolatedRequestComponent(
+      "失败的隔离整章终审请求",
+      reviewRequestCharacters,
+      "chapter_review_failed",
+    );
+    for (const [modelIndex, reviewModel] of reviewModels.entries()) {
       try {
         const reviewed = await runReview(reviewModel, {
           chapterGoal: draft.chapterGoal,
@@ -1433,7 +1447,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           },
         }, reviewer.signal);
         if (reviewed.usage) {
-          context.modelUsageReporter?.(reviewModel, reviewed.usage, {
+          reportModelCallUsage(context.modelUsageReporter, reviewModel, reviewed.usage, {
             callKind: "chapter_review",
             requestComponents: isolatedRequestComponent("隔离整章终审请求", reviewRequestCharacters, "chapter_review"),
           });
@@ -1520,37 +1534,88 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
           policyObservations: styleRepair.policyObservations,
         });
       } catch (error) {
-        if (error instanceof ChapterReviewRequestError && error.usage) {
-          context.modelUsageReporter?.(reviewModel, error.usage, {
+        const usage = error instanceof ChapterReviewRequestError ? error.usage : undefined;
+        const durationMs = error instanceof ChapterReviewRequestError ? error.durationMs : undefined;
+        const recordedUsage = reportModelCallUsage(
+          context.modelUsageReporter,
+          reviewModel,
+          usage,
+          {
             callKind: "chapter_review_failed",
-            requestComponents: isolatedRequestComponent("失败的隔离整章终审请求", reviewRequestCharacters, "chapter_review_failed"),
-          });
-        }
-        reviewErrors.push(error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+            requestComponents: failedComponents,
+            ...(durationMs !== undefined ? { durationMs } : {}),
+          },
+        );
+        attempts.push(buildDependencyAttempt({
+          model: reviewModel,
+          role: dependencyAttemptRole(modelIndex, reviewModels.length),
+          error,
+          recordedUsage,
+          ...(error instanceof ChapterReviewRequestError
+            ? {
+                failureClass: error.failureClass,
+                httpStatus: error.httpStatus,
+                durationMs: error.durationMs,
+              }
+            : {}),
+        }));
       }
     }
-    reviewFailure = { attempts: reviewModels.length, errors: reviewErrors };
+    reviewDiagnostics = buildDependencyFailureBundle({
+      stage: "isolated_final_review",
+      attempts: attempts.length
+        ? attempts
+        : [buildDependencyAttempt({
+            model: {
+              provider: "openai-compatible",
+              baseUrl: "",
+              model: "(unset)",
+              apiKey: "",
+            },
+            role: "sole",
+            error: new Error(reviewModels.length ? "终审未返回结论" : "未配置隔离终审模型"),
+            recordedUsage: false,
+            failureClass: "config",
+          })],
+      uniqueModelCount: Math.max(1, reviewModels.length),
+    });
   }
-  const parseOnly = Boolean(reviewFailure?.errors.length)
-    && reviewFailure!.errors.every(error =>
-      /没有返回 JSON|无法解析|格式无效|缺少有效|缺少 chapterChange|可定位的 blocker/i.test(error),
-    );
+  const bundle = reviewDiagnostics ?? buildDependencyFailureBundle({
+    stage: "isolated_final_review",
+    uniqueModelCount: 0,
+    attempts: [buildDependencyAttempt({
+      model: {
+        provider: "openai-compatible",
+        baseUrl: "",
+        model: "(unset)",
+        apiKey: "",
+      },
+      role: "sole",
+      error: new Error("未配置隔离终审模型"),
+      recordedUsage: false,
+      failureClass: "config",
+    })],
+  });
+  const summary = dependencyFailureUserSummary(bundle).replace(/^终审/, "隔离终审");
+  const guidance = dependencyFailureGuidance(bundle);
   return JSON.stringify({
     status: "final_review_unavailable",
-    code: parseOnly ? "CHAPTER_REVIEW_INVALID" : "CHAPTER_REVIEW_UNAVAILABLE",
-    failureKind: parseOnly ? "invalid_output" : "dependency",
-    retryable: !parseOnly,
+    code: bundle.parseOnly ? "CHAPTER_REVIEW_INVALID" : "CHAPTER_REVIEW_UNAVAILABLE",
+    failureKind: bundle.parseOnly ? "invalid_output" : "dependency",
+    retryable: !bundle.parseOnly,
     reviewCompleted: false,
     proposalCreated: false,
-    ...(reviewFailure ? { reviewFailure } : {}),
+    errors: bundle.errors,
+    diagnostics: bundle,
+    reviewFailure: { attempts: bundle.attempts.length, errors: bundle.errors },
     path: draft.path,
     chapterGoal: draft.chapterGoal,
     contentCharacters: content.length,
     sceneCount: draft.completed.length,
     ...(styleRepair.policyObservations.length ? { policyObservations: styleRepair.policyObservations } : {}),
-    message: parseOnly
-      ? "隔离终审已响应，但输出无法形成带场景和逐字证据的有效结论。草稿与审阅事务已保留，未标记通过；可重试终审，不要改写正文来猜测审核意见。"
-      : "隔离终审及回退模型均不可用。草稿与审阅事务已保留，未标记通过；依赖恢复后重新 inspect，不能由主 Agent 自审后绕过终审。",
+    message: bundle.parseOnly
+      ? `${summary} 草稿与审阅事务已保留，未标记通过；可重试终审，不要改写正文来猜测审核意见。`
+      : `${summary} 草稿与审阅事务已保留，未标记通过；${guidance} 不能由主 Agent 自审后绕过终审。`,
   });
 }
 

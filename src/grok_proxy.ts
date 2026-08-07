@@ -668,7 +668,7 @@ async function requestOAuthToken(form: URLSearchParams, proxyUrl?: string): Prom
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", "user-agent": "writer-agent-grok-oauth/1.0" },
       body: form.toString(),
-    }, proxyUrl);
+    }, { proxyUrl, bypassConcurrency: true });
   } catch (error) {
     throw new Error(`无法连接 xAI OAuth token 端点（${proxyUrl ? "已启用网络代理" : "直连"}）：${errorMessage(error)}`);
   }

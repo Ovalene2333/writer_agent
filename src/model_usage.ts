@@ -110,9 +110,24 @@ export function buildRecordedUsageEvent(
       ? { requestComponents: meta.requestComponents.map(component => ({ ...component, callKind: meta.callKind })) }
       : {}),
   };
-  const summary = model.pricing
-    ? store.recordUsage(sessionId, model.model, normalized, model.pricing, new Date(), { ...meta, providerName })
-    : store.usage(sessionId);
+  // Always persist a row — failed dependency calls often have 0 tokens but must remain
+  // queryable by job_id / call_kind for product diagnostics.
+  const pricing = model.pricing ?? {
+    billingMode: "unmetered" as const,
+    cacheHit: 0,
+    cacheMiss: 0,
+    output: 0,
+    currency: "CNY" as const,
+    contextWindow: 128_000,
+  };
+  const summary = store.recordUsage(
+    sessionId,
+    model.model,
+    normalized,
+    pricing,
+    new Date(),
+    { ...meta, providerName },
+  );
   return {
     type: "usage",
     usage: summary,

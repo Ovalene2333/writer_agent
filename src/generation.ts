@@ -13,7 +13,7 @@ import {
 import { adjudicateProseStyleForAudit } from "./prose_adjudicate.js";
 import { isIntensiveWritingMode, styleGroundingPrompt } from "./style_grounding.js";
 import { modelSupportsToolChoice, samplingRequestOptions } from "./model_compat.js";
-import { modelFetch } from "./model_fetch.js";
+import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody, streamProviderCompletion } from "./model_api.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
@@ -464,7 +464,7 @@ ${writePackDraftContractPrompt()}
     endpoint = wire.endpoint;
     const requestBody = wire.body;
     logModelRequest(endpoint, requestBody);
-    const response = await modelFetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody }, options.draftModel.proxyUrl);
+    const response = await modelFetch(endpoint, { method: "POST", signal: options.signal, headers: { "content-type": "application/json", ...(options.draftModel.apiKey ? { authorization: `Bearer ${options.draftModel.apiKey}` } : {}) }, body: requestBody }, modelRequestOptions(options.draftModel));
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`草案模型请求失败（${response.status}）：${responseBody.slice(0, 500)}`);
@@ -893,7 +893,7 @@ async function runReadOnlyToolLoop(
       method: "POST", signal,
       headers: { "content-type": "application/json", authorization: `Bearer ${model.apiKey}` },
       body: requestBody,
-    }, model.proxyUrl);
+    }, modelRequestOptions(model));
     const responseBody = await response.text();
     logModelResponse(endpoint, responseBody);
     if (!response.ok) throw new Error(`角色卡上下文读取失败（${response.status}）：${responseBody.slice(0, 500)}`);
