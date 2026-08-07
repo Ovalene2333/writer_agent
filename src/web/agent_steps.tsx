@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, RotateCw } from "lucide-react";
 import type { MessageStepTrail, StepUsage, StepUsageCall, StoredStepTrail, StreamStep, Usage } from "./types";
 import { callKindLabel } from "./types";
 import { Markdown } from "./markdown";
+import { assistantPreviewText } from "./assistant_display";
 import { formatGraphTokens, shortProviderName } from "./format_utils";
 
 /** Pure visible completion (completion − reasoning when nested). */
@@ -307,17 +308,7 @@ export function realCacheHitRate(usage: Pick<Usage, "cacheHitRate" | "cacheHitTo
 
 
 export function messagePreview(content: string, max = 140): string {
-  const plain = content
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/`[^`\n]+`/g, " ")
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/[*_~>#`|-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!plain) return "（空回复）";
-  return plain.length <= max ? plain : `${plain.slice(0, max)}…`;
+  return assistantPreviewText(content, max);
 }
 
 export function stepsFromServerTrail(trail: MessageStepTrail): StreamStep[] {

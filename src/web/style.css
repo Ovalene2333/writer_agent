@@ -1858,6 +1858,36 @@ button.agent-orb:focus-visible {
   overflow: hidden;
   word-break: break-word;
 }
+.assistant-message-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.assistant-meta-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin: 0;
+}
+.assistant-meta-chip {
+  display: inline-flex; align-items: center;
+  max-width: 100%;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-faint);
+  font: 11px/1.35 var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.assistant-meta-chip.kind-id {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent-light) 55%, var(--surface));
+  color: var(--accent);
+}
+.assistant-meta-chip.kind-time {
+  border-color: color-mix(in srgb, var(--text-faint) 35%, var(--border));
+}
+.assistant-meta-chip.kind-field,
+.assistant-meta-chip.kind-hash {
+  color: var(--text-dim);
+}
 .conversation .assistant.collapsed {
   padding-top: 12px;
   padding-bottom: 12px;

@@ -63,6 +63,7 @@ import {
 import type { ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
 import { DEFAULT_ROLEPLAY_SETTINGS } from "./model_config";
 import { attachmentImageUrl, fileToPendingAttachment, isSupportedComposerImage } from "./composer_media";
+import { AssistantMessageBody } from "./assistant_display";
 import { DocumentDiffView, mergeProposalEvent, ProposalQualityCard, ReviewDock } from "./review_dock";
 import { RoleplayPerceptionDetails } from "./roleplay_perception";
 import {
@@ -4758,9 +4759,11 @@ function App() {
                 </div>
               ) : null}
               {msg.role === "assistant" ? (
-                assistantCollapsed
-                  ? <p className="msg-preview">{messagePreview(displayContent)}</p>
-                  : <Markdown content={displayContent} />
+                msg.channel === "roleplay"
+                  ? (assistantCollapsed
+                      ? <p className="msg-preview">{messagePreview(displayContent)}</p>
+                      : <Markdown content={displayContent} />)
+                  : <AssistantMessageBody content={displayContent} collapsed={assistantCollapsed} />
               ) : (
                 <>
                   {msg.channel === "roleplay"

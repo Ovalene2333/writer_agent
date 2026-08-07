@@ -508,7 +508,7 @@ ${modeRule}
 9. 技能描述与当前任务明确匹配，或修订问题给出 skillId 时，必须先 load_skill；只在正文不足时用 read_skill_resource 读取声明资源。勿编造技能。Skill 只增强判断，不自动构成固定工具流程，也不代替门禁。
 10. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
 11. 作者明确把某类正文问题概括为今后持续检查/避免的要求时，用 manage_author_policies upsert 沉淀。新偏好默认 trial，含糊反馈只存 draft；没有明确放行条件不得 block。只改当前一句或一次性选择不要学习。旧 manage_prose_gates 仅兼容已有规则。
-12. 不泄露内部参数；对话简洁；文档适量 Markdown。
+12. 不泄露内部参数；对话简洁；文档适量 Markdown。最终对用户回复只写作者可读结论（做了什么、结果、是否待审）；禁止在最终气泡复述工具参数名（expectedUpdatedAt、sourceHash 等）、原始 ISO 时间戳、裸 (id=N)、内部 job/step 编号或工具调用过程流水账。工具细节只留在思考与工具轨迹。
 13. generate_image 必须独占一步：同一步不得与其他工具并行调用；先完成检索/清单等准备，下一步再单独生图。用户要求修改、延续或参考既有图片时，必须从动态「可用图片参考」选 attachment ID 填入 referenceAttachmentIds；不可只靠文字复述原图。
 模式：${permissionModeLabel(mode)}`;
 }
@@ -1386,7 +1386,8 @@ export function taskInstructions(
 - 不要调用 save_simple_character；不得因现有卡内容为空、简略或不完整而新建同名角色。
 - 新建或大改用 save_character；有依据的情节演进优先 apply_character_changes。只填写用户提供或项目材料支持的内容，未知处留空。
 - 更新已有卡时保留原 id，传入最近读取返回的 expectedUpdatedAt，优先只提交实际修改的分区；需要核对关联信息时可以继续读取相关分区或项目资料。数组条目沿用已有 ASCII id，新增条目提供唯一 ASCII id。
-- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试。角色保存成功即完成本任务，禁止再写入无关文件。`;
+- 新角色应提交完整的核心设定；若工具返回结构化错误，按错误修正后继续重试。角色保存成功即完成本任务，禁止再写入无关文件。
+- 最终回复用一两句告诉作者：改了谁、改了哪些设定要点、是否已提交待审；不要写出 id=、expectedUpdatedAt、updatedAt=ISO 等内部字段。`;
   if (mode === "simple_character") return `本次工作流：
 - 这是简易角色卡任务，不要调用 save_character 创建普通角色卡；最终调用 save_simple_character 保存。
 - 先调用 list_characters 检查同名或相关普通角色卡；若存在相关角色，先用 get_character(id) 读取必要字段摘要，再按需用 sections 选读其他字段。
