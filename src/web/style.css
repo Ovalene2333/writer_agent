@@ -3107,6 +3107,53 @@ input.composer-file-input[type="file"] {
   margin: 0 0 10px; font-size: var(--fs-meta); color: var(--text-dim); line-height: 1.5;
 }
 .review-drawer .proposal-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.proposal-card-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+  margin-bottom: 4px;
+}
+.proposal-card-head h3 { margin: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.proposal-open-doc {
+  display: inline-flex; align-items: center; gap: 4px;
+  flex-shrink: 0; margin-left: 6px; padding: 2px 8px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface2); color: var(--text-dim);
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  vertical-align: middle;
+}
+.proposal-open-doc:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
+.proposal-open-doc.standalone { margin-left: 0; margin-top: 1px; }
+details.change-set-file > summary .proposal-open-doc { float: right; margin-top: -1px; }
+.proposal-diff { margin: 0 0 10px; }
+.pending-review-banner {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: color-mix(in srgb, var(--accent-light) 80%, var(--surface));
+  color: var(--accent); font-size: 13px; font-weight: 650; cursor: pointer;
+}
+.pending-review-banner:hover { background: color-mix(in srgb, var(--accent-light) 95%, var(--surface)); }
+.pending-review-banner .proposal-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 6px;
+  border-radius: 999px; font-size: 10px; font-weight: 700;
+  background: var(--accent); color: var(--accent-text);
+}
+.tab-badge {
+  position: absolute; top: 4px; right: calc(50% - 22px);
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 16px;
+  background: var(--accent); color: var(--accent-text);
+}
+.review-nav-btn {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.review-nav-btn .proposal-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 16px; padding: 0 5px;
+  border-radius: 999px; font-size: 10px; font-weight: 700;
+  background: var(--accent); color: var(--accent-text);
+}
 /* Advisory quality report — accent for good, warn only when the rule layer is uneasy. */
 .proposal-quality {
   margin: 0 0 10px; padding: 7px 8px; border-radius: 8px;
@@ -6250,6 +6297,19 @@ body::before {
   font-size: 12px;
   pointer-events: none;
 }
+/* 非 Agent 区域可见的待审入口，避免漏批 */
+.pending-review-banner {
+  position: absolute;
+  z-index: 43;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(420px, calc(100vw - 32px));
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+}
+.app.readonly .pending-review-banner { top: 100px; }
 
 /* Settings gear dropdown (must be absolute/fixed — without these rules items spill into the topbar) */
 .settings-anchor {

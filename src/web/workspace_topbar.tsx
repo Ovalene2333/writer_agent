@@ -1,7 +1,7 @@
 import React from "react";
 import {
   BookOpenText, Check, ChevronDown, Drama, FolderKanban, IdCard, Library, LockKeyhole, MessageSquare,
-  MoreHorizontal, RefreshCw, Settings, Share2, Sun, Wifi, Zap,
+  MoreHorizontal, RefreshCw, Settings, Share2, ShieldCheck, Sun, Wifi, Zap,
 } from "lucide-react";
 import type { ConnectionInfo } from "./connection";
 import type { SettingsSection } from "./model_config";
@@ -27,6 +27,7 @@ export function WorkspaceTopbar({
   moreOpen,
   workspaceMode,
   documentsCollapsed,
+  pendingReviewCount = 0,
   onCharacters,
   onSwitchProject,
   onRoleplay,
@@ -38,6 +39,7 @@ export function WorkspaceTopbar({
   onCloseSettings,
   onSelectSettings,
   onReviewRules,
+  onOpenReview,
   onToggleMore,
   onCloseMore,
   onRefresh,
@@ -60,6 +62,8 @@ export function WorkspaceTopbar({
   moreOpen: boolean;
   workspaceMode: WorkspaceMode;
   documentsCollapsed: boolean;
+  /** 待审阅提案 + 批量改动数量；>0 时在顶栏显示入口 */
+  pendingReviewCount?: number;
   onCharacters: () => void;
   onSwitchProject: (projectId: string) => void;
   onRoleplay: () => void;
@@ -71,6 +75,7 @@ export function WorkspaceTopbar({
   onCloseSettings: () => void;
   onSelectSettings: (section: SettingsSection) => void;
   onReviewRules: () => void;
+  onOpenReview?: () => void;
   onToggleMore: () => void;
   onCloseMore: () => void;
   onRefresh: () => void;
@@ -145,6 +150,18 @@ export function WorkspaceTopbar({
           onToggleDocuments={onToggleDocuments}
         />
         <nav className="nav-cluster nav-workspace" aria-label="工作区入口">
+          {pendingReviewCount > 0 && onOpenReview && (
+            <button
+              type="button"
+              className="ghost nav-action review-nav-btn"
+              aria-label={`${pendingReviewCount} 条改动待审阅`}
+              title={`${pendingReviewCount} 条改动待审阅`}
+              onClick={onOpenReview}
+            >
+              <ShieldCheck size={17} aria-hidden="true" /><span>审阅</span>
+              <span className="proposal-count">{pendingReviewCount}</span>
+            </button>
+          )}
           <button type="button" className="ghost nav-action" aria-label="角色" title="角色" onClick={onCharacters}>
             <IdCard size={17} aria-hidden="true" /><span>角色</span>
           </button>

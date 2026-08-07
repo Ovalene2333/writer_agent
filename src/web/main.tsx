@@ -7,7 +7,7 @@ import {
   BookOpenText,
   ChevronDown,
   ChevronLeft,
-  ChevronRight,
+
   Copy,
   Download,
   Drama,
@@ -42,16 +42,13 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { documentDiff, renderDiffHtml } from "../diff";
 import { characterEditorSaveInput } from "../character_editor_payload";
 import type { CharacterSummaryKind } from "./character_editor";
 import {
-  apiUrl,
   buildReadonlyEntryUrl,
   buildEntryUrl,
   ensureConnection,
   failoverFrom,
-  getAccessToken,
   getActiveBase,
   getConnectionInfo,
   initConnection,
@@ -65,16 +62,15 @@ import {
 } from "./connection";
 import type { ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
 import { DEFAULT_ROLEPLAY_SETTINGS } from "./model_config";
+import { attachmentImageUrl, fileToPendingAttachment, isSupportedComposerImage } from "./composer_media";
+import { DocumentDiffView, mergeProposalEvent, ProposalQualityCard, ReviewDock } from "./review_dock";
+import { RoleplayPerceptionDetails } from "./roleplay_perception";
 import {
   AGENT_HIDDEN_CHARACTER_CARDS_KEY,
   DEFAULT_ROLEPLAY_RERUN_CONTROLS,
   EMPTY_CHARACTER,
   MULTIMODAL_MAX_ATTACHMENTS,
-  MULTIMODAL_MAX_BYTES,
-  MULTIMODAL_MIME,
   PERMISSION_MODES,
-  QUALITY_GRADE_LABEL,
-  QUALITY_SOURCE_LABEL,
   ROLEPLAY_CONTINUATION_PLACEHOLDER,
   ROLEPLAY_LENGTH_OPTIONS,
   ROLEPLAY_RERUN_DIRECTION_OPTIONS,
@@ -113,7 +109,6 @@ import {
   type ProjectSummary,
   type ProseGateRule,
   type ProseGateRuleDraft,
-  type ProseQualityReport,
   type Provider,
   type Proposal,
   type RoleplayBranchSummary,
@@ -195,7 +190,7 @@ import {
   STEP_TRAIL_STORAGE_KEY,
 } from "./agent_steps";
 import { Markdown, documentWordCount, renderedMarkdownWordCount, markdownHeadings, loadReadingProgress, saveReadingProgress, readingProgressStorageKey, originalOffsetForNormalized, normalizeMarkdownSource, type DocumentContextSelection, type ReaderTextSelection } from "./markdown";
-import { shortProviderName, formatGraphTokens } from "./format_utils";
+import { shortProviderName, formatGraphTokens, formatVersionTime, defaultBrowserDocument } from "./format_utils";
 import {
   ContextGraphCanvas,
   humanizeContextCopy,
@@ -249,299 +244,6 @@ const ModelConfig = React.lazy(async () => {
 /** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
 const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, mode: "bounded", enforceMinimum: false };
 const DEFAULT_ROLEPLAY: RoleplaySettings = DEFAULT_ROLEPLAY_SETTINGS;
-
-function ProposalQualityCard({ report }: { report: ProseQualityReport }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className={`proposal-quality grade-${report.grade}`}>
-      <div className="proposal-quality-head">
-        <span className="proposal-quality-grade">{QUALITY_GRADE_LABEL[report.grade]}</span>
-        <span className="proposal-quality-metric" title={report.vividness.summary}>
-          现场感 {report.vividness.score}
-        </span>
-        <span className="proposal-quality-metric" title={report.aiTells.summary}>
-          模式风险 {report.aiTells.score}
-        </span>
-        {report.length
-          ? <span
-              className={`proposal-quality-chars length-${report.length.status}`}
-              title={`目标 ${report.length.target} 字${report.length.status === "too_short" ? "；偏短，想更长直接说一句" : report.length.status === "too_long" ? "；偏长" : ""}`}
-            >{report.length.actual} / {report.length.target} 字</span>
-          : <span className="proposal-quality-chars">{report.characters} 字</span>}
-      </div>
-      {report.warnings.length > 0 && (
-        <>
-          <button type="button" className="proposal-quality-toggle" onClick={() => setOpen(value => !value)} aria-expanded={open}>
-            {open ? "收起" : `${report.warnings.length} 条提示`}
-          </button>
-          {open && (
-            <ul className="proposal-quality-warnings">
-              {report.warnings.map((warning, index) => (
-                <li key={`${warning.source}-${warning.code}-${index}`}>
-                  <span className="proposal-quality-source">{QUALITY_SOURCE_LABEL[warning.source] ?? warning.source}</span>
-                  <span className="proposal-quality-message">{warning.message}</span>
-                  {warning.examples.length > 0 && (
-                    <span className="proposal-quality-examples">{warning.examples.join(" / ")}</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-function mergeProposalEvent(current: Proposal[], incoming: Proposal): Proposal[] {
-  // Rhythm/style gate drafts are working copies, not author approvals. They may
-  // still arrive through the live stream before the final proposal is submitted.
-  if (incoming.status === "pending" && !incoming.deliveryReady) return current;
-  const existing = current.find(item => item.id === incoming.id);
-  // Replayed SSE history may contain the original pending event after a refresh
-  // has already observed the terminal database state. Never downgrade it.
-  if (incoming.status === "pending" && existing && existing.status !== "pending") return current;
-  return [incoming, ...current.filter(item => item.id !== incoming.id)];
-}
-function isSupportedComposerImage(file: File): boolean {
-  return MULTIMODAL_MIME.has(file.type.toLowerCase());
-}
-
-async function fileToPendingAttachment(file: File): Promise<PendingAttachment> {
-  if (!isSupportedComposerImage(file)) throw new Error(`不支持的图片类型：${file.type || file.name}`);
-  if (file.size > MULTIMODAL_MAX_BYTES) throw new Error("单张图片不能超过 4MB");
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return {
-    localId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    name: file.name || "image.png",
-    mimeType: file.type === "image/jpg" ? "image/jpeg" : file.type,
-    size: file.size,
-    dataBase64: btoa(binary),
-    previewUrl: URL.createObjectURL(file),
-  };
-}
-
-function attachmentImageUrl(sessionId: string, attachmentId: string): string {
-  const token = getAccessToken() || "";
-  const query = token ? `?token=${encodeURIComponent(token)}` : "";
-  return apiUrl(`/api/session/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}${query}`);
-}
-
-function RoleplayPerceptionDetails({ content, data, disabled, onSave, onReplay }: {
-  content: string;
-  data?: RoleplayPerceptionProjection;
-  disabled?: boolean;
-  onSave: (value: RoleplayPerceptionProjection) => Promise<void>;
-  onReplay: (value: RoleplayPerceptionProjection) => Promise<void>;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState<RoleplayPerceptionProjection | null>(null);
-  const [saving, setSaving] = useState(false);
-  const beginEdit = () => {
-    if (!data) return;
-    setDraft({ ...data, speech: [...data.speech], knowableFacts: [...data.knowableFacts], unknowableFacts: [...data.unknowableFacts], potentialSensations: [...data.potentialSensations] });
-    setEditing(true);
-  };
-  const setLines = (key: keyof RoleplayPerceptionProjection, value: string) => {
-    setDraft(current => current ? { ...current, [key]: value.split("\n").map(item => item.trim()).filter(Boolean) } : current);
-  };
-  const submit = async (replay: boolean) => {
-    if (!draft || saving) return;
-    setSaving(true);
-    try {
-      if (replay) await onReplay(draft);
-      else await onSave(draft);
-      setEditing(false);
-    } finally { setSaving(false); }
-  };
-  const perceptionGroups = data ? [
-    { key: "speech", label: "话语", items: data.speech },
-    { key: "knowable", label: "可知事实", items: data.knowableFacts },
-    { key: "unknowable", label: "其他事实（不优先使用）", items: data.unknowableFacts },
-    { key: "sensations", label: "潜在感受", items: data.potentialSensations },
-  ].filter(group => group.items.length > 0) : [];
-  return (
-    <details className="roleplay-perception-details">
-      <summary>角色感知</summary>
-      {!editing ? (
-        <>
-          {data ? (
-            <div className="roleplay-perception-content">
-              {perceptionGroups.length ? perceptionGroups.map(group => (
-                <div className="roleplay-perception-group" key={group.key}>
-                  <span>{group.label}</span>
-                  <div>{group.items.map((item, index) => <p key={`${group.key}-${index}`}>{item}</p>)}</div>
-                </div>
-              )) : (
-                <p className="roleplay-perception-empty">没有可确认的可感知内容</p>
-              )}
-            </div>
-          ) : (
-            <Markdown content={content} className="roleplay-perception-content roleplay-perception-legacy" />
-          )}
-          {data && <button className="roleplay-perception-edit" type="button" disabled={disabled} onClick={beginEdit} title="修正角色实际能够感知的内容">
-            <Pencil size={13} aria-hidden="true" />编辑感知
-          </button>}
-        </>
-      ) : draft ? (
-        <div className="roleplay-perception-editor">
-          <label><span>话语</span><textarea value={draft.speech.join("\n")} onChange={event => setLines("speech", event.target.value)} /></label>
-          <label><span>可知事实</span><textarea value={draft.knowableFacts.join("\n")} onChange={event => setLines("knowableFacts", event.target.value)} /></label>
-          <label><span>其他事实（不优先使用）</span><textarea value={draft.unknowableFacts.join("\n")} onChange={event => setLines("unknowableFacts", event.target.value)} /></label>
-          <label><span>潜在感受</span><textarea value={draft.potentialSensations.join("\n")} onChange={event => setLines("potentialSensations", event.target.value)} /></label>
-          <div className="roleplay-perception-actions">
-            <button type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
-            <button type="button" disabled={saving} onClick={() => void submit(false)}><Save size={13} aria-hidden="true" />保存</button>
-            <button type="button" className="primary" disabled={saving} onClick={() => void submit(true)}><RefreshCw size={13} aria-hidden="true" />保存并重演</button>
-          </div>
-        </div>
-      ) : null}
-    </details>
-  );
-}
-
-/** Track-changes view: deletions strikethrough + fill, insertions background fill. */
-function DocumentDiffView({ before, after }: { before: string; after: string }) {
-  const html = useMemo(() => {
-    const parts = documentDiff(before, after);
-    return renderDiffHtml(parts) || "（空文档）";
-  }, [before, after]);
-  return (
-    <div
-      className="markdown document-diff"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  );
-}
-
-function ChangeSetCard({ value, onAction }: {
-  value: ChangeSet;
-  onAction: (changeSet: ChangeSet, action: "accept" | "reject" | "undo" | "redo") => void;
-}) {
-  const stateLabel = value.status === "accepted" && value.undone ? "rolled back" : value.status;
-  return (
-    <div className="proposal-card change-set-card">
-      <h3>Change set #{value.id}</h3>
-      <p>{value.summary}</p>
-      <span className="change-set-status">{stateLabel}</span>
-      {value.files.map((file) => (
-        <details className="change-set-file" key={file.id}>
-          <summary>
-            <strong>{file.operation}</strong> {file.path}{file.targetPath ? ` -> ${file.targetPath}` : ""}
-          </summary>
-          {file.operation !== "move" && <DocumentDiffView before={file.beforeContent} after={file.afterContent} />}
-        </details>
-      ))}
-      {value.characterChanges.length > 0 && (
-        <details className="change-set-file">
-          <summary><strong>characters</strong> {value.characterChanges.length}</summary>
-          {value.characterChanges.map((change) => (
-            <p key={change.characterId}>#{change.characterId}: {change.reason} ({change.changes.map(item => item.op).join(", ")})</p>
-          ))}
-        </details>
-      )}
-      <div className="proposal-actions">
-        {value.status === "pending" && <>
-          <button onClick={() => onAction(value, "reject")}>Reject</button>
-          <button className="primary" onClick={() => onAction(value, "accept")}>Accept all</button>
-        </>}
-        {value.status === "accepted" && !value.undone && <button onClick={() => onAction(value, "undo")}>Roll back all</button>}
-        {value.status === "accepted" && value.undone && <button onClick={() => onAction(value, "redo")}>Reapply all</button>}
-      </div>
-    </div>
-  );
-}
-
-/** Collapsible review dock (pending change-sets + proposals) docked in the agent panel. */
-function ReviewDock({
-  changeSets,
-  proposals,
-  pendingCount,
-  open,
-  onToggle,
-  onChangeSetAction,
-  onProposalDecide,
-}: {
-  changeSets: ChangeSet[];
-  proposals: Proposal[];
-  pendingCount: number;
-  open: boolean;
-  onToggle: () => void;
-  onChangeSetAction: (changeSet: ChangeSet, action: "accept" | "reject" | "undo" | "redo") => void;
-  onProposalDecide: (proposal: Proposal, action: "accept" | "reject") => void;
-}) {
-  const total = changeSets.length + proposals.length;
-  return (
-    <section className={`review-drawer${open ? " open" : ""}`} aria-label="待审阅的改动">
-      <button type="button" className="review-drawer-toggle" onClick={onToggle} aria-expanded={open}>
-        <span className="review-drawer-chevron" aria-hidden="true">
-          <ChevronRight size={12} />
-        </span>
-        <span className="review-drawer-title">审阅</span>
-        {pendingCount > 0 && <span className="proposal-count">{pendingCount}</span>}
-        <span className="review-drawer-hint">{open ? "收起" : `${total} 项`}</span>
-      </button>
-      {open && (
-        <div className="review-drawer-body">
-          {changeSets.length > 0 && (
-            <div className="review-group">
-              <h4 className="review-group-head">Change sets</h4>
-              {changeSets.map((changeSet) => (
-                <ChangeSetCard key={changeSet.id} value={changeSet} onAction={onChangeSetAction} />
-              ))}
-            </div>
-          )}
-          {proposals.length > 0 && (
-            <div className="review-group">
-              <h4 className="review-group-head">Proposals</h4>
-              {proposals.map((p) => (
-                <div className="proposal-card" key={p.id}>
-                  <h3>{p.path}</h3>
-                  <p>{p.summary}</p>
-                  {p.qualityReport && <ProposalQualityCard report={p.qualityReport} />}
-                  <div className="proposal-actions">
-                    <button onClick={() => onProposalDecide(p, "reject")}>Reject</button>
-                    <button className="primary" onClick={() => onProposalDecide(p, "accept")}>Accept</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function formatVersionTime(iso: string): string {
-  try {
-    const date = new Date(iso);
-    if (Number.isNaN(date.getTime())) return iso;
-    return date.toLocaleString(undefined, {
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
-}
-
-/** Startup / project-switch default: open project instructions when present. */
-function defaultBrowserDocument(documents: readonly string[]): string | undefined {
-  const writer = documents.find((path) => {
-    const base = path.split("/").pop() ?? path;
-    return base.toLowerCase() === "writer.md";
-  });
-  return writer ?? documents[0];
-}
 
 function App() {
   const [state, setState] = useState<State>();
@@ -1812,7 +1514,7 @@ function App() {
     if (event.type === "error") {
       const codeHint = event.code ? ` [${event.code}]` : "";
       const retryHint = event.retryable ? "（可重试）" : "";
-      setError(`${event.message || "Agent failed"}${codeHint}${retryHint}`);
+      setError(`${event.message || "Agent 执行失败"}${codeHint}${retryHint}`);
       updateStreamSteps((current) =>
         current.map((s) => (s.status === "running" ? { ...s, status: "failed", expanded: false } : s)),
       );
@@ -1841,8 +1543,8 @@ function App() {
         return { ...prev, changeSets: [event.changeSet!, ...rest] };
       });
       setNotice(event.changeSet.status === "accepted"
-        ? `Auto: change set #${event.changeSet.id} applied`
-        : `Change set #${event.changeSet.id} awaiting approval`);
+        ? `Auto：批量改动 #${event.changeSet.id} 已写入`
+        : `批量改动 #${event.changeSet.id} 待审批`);
     }
     if (event.type === "todos" && event.todos) {
       setState((prev) => (prev ? { ...prev, todos: event.todos } : prev));
@@ -1985,7 +1687,7 @@ function App() {
       }
     } catch (cause) {
       if (!(cause instanceof Error && cause.name === "AbortError")) {
-        setNotice("Connection interrupted. The background job is still running on the server.");
+        setNotice("连接中断。后台任务仍在服务器上运行。");
         await refresh(sessionId).catch((e) => setError(String(e)));
       }
     } finally {
@@ -3669,21 +3371,21 @@ function App() {
   }
 
   async function deleteCharacter(character: Character) {
-    if (!confirm(`Delete character “${character.identity.name}”?`)) return;
+    if (!confirm(`确定删除角色「${character.identity.name}」？`)) return;
     await api(`/api/characters/${character.id}`, { method: "DELETE" });
     setCharacterDraft(null);
     await refresh(state?.sessionId);
   }
 
   async function renameSession(id: string, currentTitle: string) {
-    const title = window.prompt("Session title", currentTitle)?.trim();
+    const title = window.prompt("会话标题", currentTitle)?.trim();
     if (!title || title === currentTitle) return;
     await api(`/api/session/${id}`, { method: "PUT", body: JSON.stringify({ title }) });
     await refresh(state?.sessionId);
   }
 
   async function deleteSession(id: string) {
-    if (!confirm("Delete this session? This cannot be undone.")) return;
+    if (!confirm("确定删除此会话？此操作不可撤销。")) return;
     await api(`/api/session/${id}`, { method: "DELETE" });
     await refresh(id === state?.sessionId ? undefined : state?.sessionId);
   }
@@ -3734,7 +3436,7 @@ function App() {
   if (!state) {
     return (
       <main className="app-shell">
-        <p>{error || "Loading..."}</p>
+        <p>{error || "正在加载工作台…"}</p>
       </main>
     );
   }
@@ -3742,6 +3444,17 @@ function App() {
   const pendingProposals = state.proposals.filter((p) => p.status === "pending" && p.deliveryReady);
   const readOnly = state.accessMode === "readonly";
   const pendingChangeSets = state.changeSets.filter((item) => item.status === "pending");
+  const pendingReviewCount = pendingChangeSets.length + pendingProposals.length;
+  const openPendingReview = () => {
+    setManagementView(null);
+    setMobileTab("agent");
+    setReviewOpen(true);
+  };
+  const openReviewDocument = (path: string) => {
+    setActivePath(path);
+    setMobileTab("editor");
+    setManagementView(null);
+  };
   const visibleMessages = state.messages.filter((msg) =>
     (msg.role === "user" || msg.role === "assistant")
     && (msg.content.trim() || Boolean(msg.attachments?.length)),
@@ -4151,6 +3864,7 @@ function App() {
         moreOpen={headerMoreOpen}
         workspaceMode={workspaceMode}
         documentsCollapsed={documentsCollapsed}
+        pendingReviewCount={pendingReviewCount}
         onCharacters={() => {
           setHeaderMoreOpen(false);
           setSessionBatchMode(false);
@@ -4181,6 +3895,7 @@ function App() {
         onCloseSettings={() => setSettingsMenuOpen(false)}
         onSelectSettings={openSettings}
         onReviewRules={openProseGateRules}
+        onOpenReview={openPendingReview}
         onToggleMore={() => {
           setSettingsMenuOpen(false);
           setHeaderMoreOpen((value) => !value);
@@ -4195,6 +3910,12 @@ function App() {
           <LockKeyhole size={14} />
           只读模式：可以浏览和导出内容，不能聊天、编辑、审批或修改项目设置。
         </div>
+      )}
+      {pendingReviewCount > 0 && mobileTab !== "agent" && !managementView && (
+        <button type="button" className="pending-review-banner" onClick={openPendingReview}>
+          <span className="proposal-count">{pendingReviewCount}</span>
+          条改动待审阅 · 点击打开
+        </button>
       )}
 
       <nav className="mobile-tabs" aria-label="主区域">
@@ -4224,9 +3945,11 @@ function App() {
           onClick={() => {
             setManagementView(null);
             setMobileTab("agent");
+            if (pendingReviewCount > 0) setReviewOpen(true);
           }}
         >
           <Bot className="tab-icon" size={19} aria-hidden="true" /><span>Agent</span>
+          {pendingReviewCount > 0 && <span className="tab-badge" aria-label={`${pendingReviewCount} 条待审`}>{pendingReviewCount}</span>}
         </button>
       </nav>
 
@@ -4416,7 +4139,7 @@ function App() {
       <main className={`editor ${mobileTab === "editor" ? "mobile-active" : ""}`}>
         <div className="editor-bar">
           <span className="doc-path">
-            {activePath || "No document selected"}
+            {activePath || "未选择文档"}
             {activePath && (
               <span className="document-reading-stats">
                 {visibleDocumentWordCount.toLocaleString("zh-CN")} 字
@@ -4602,14 +4325,14 @@ function App() {
                     </section>
                   )}
                   {headings.length > 0 && (
-                    <nav className={`document-outline ${outlineCollapsed ? "collapsed" : ""}`} aria-label="Document sections">
+                    <nav className={`document-outline ${outlineCollapsed ? "collapsed" : ""}`} aria-label="文档大纲">
                       <div className="document-outline-head">
-                        {!outlineCollapsed && <strong>Sections</strong>}
+                        {!outlineCollapsed && <strong>大纲</strong>}
                         <button
                           className="document-outline-toggle"
                           onClick={() => setOutlineCollapsed((value) => !value)}
-                          title={outlineCollapsed ? "Expand sections" : "Collapse sections"}
-                          aria-label={outlineCollapsed ? "Expand sections" : "Collapse sections"}
+                          title={outlineCollapsed ? "展开大纲" : "折叠大纲"}
+                          aria-label={outlineCollapsed ? "展开大纲" : "折叠大纲"}
                           aria-expanded={!outlineCollapsed}
                         >
                           {outlineCollapsed ? <Menu size={15} /> : <ChevronLeft size={15} />}
@@ -4631,8 +4354,8 @@ function App() {
                 </div>
               ) : (
                 <div className="empty-state reader-empty">
-                  <p>Select a document</p>
-                  <span className="empty-hint">Open a file from the workspace to read or edit</span>
+                  <p>请选择文档</p>
+                  <span className="empty-hint">从左侧工作区打开文件以阅读或编辑</span>
                 </div>
               )}
             </div>
@@ -4667,7 +4390,7 @@ function App() {
             <h2>
               Agent
               <small>
-                {busy ? "Thinking & writing…" : "Ready for your task"}
+                {busy ? "思考与写作中…" : "准备接收任务"}
               </small>
             </h2>
           </div>
@@ -4691,17 +4414,17 @@ function App() {
                 })()}
               ><Plus size={16} /></IconButton>
             )}
-            <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "Running" : "Idle"}</span>
+            <span className={`agent-status ${busy ? "running" : ""}`}>{busy ? "运行中" : "空闲"}</span>
             {busy && (
               <button className="agent-stop-btn" onClick={stop}>
-                Stop
+                停止
               </button>
             )}
           </div>
         </div>
         <div className="agent-control-bar">
           <div className="agent-mode-controls">
-            <div className="permission-mode-switch" role="group" aria-label="Permission mode">
+            <div className="permission-mode-switch" role="group" aria-label="权限模式">
               {PERMISSION_MODES.map((mode) => {
                 const active = (state.agentSettings?.permissionMode ?? "ask") === mode.id;
                 return (
@@ -4890,14 +4613,14 @@ function App() {
           </div>
         )}
         {(state.todos?.length ?? 0) > 0 && (
-          <div className="agent-todos" aria-label="Agent task list">
+          <div className="agent-todos" aria-label="Agent 任务清单">
             <button
               type="button"
               className="agent-todos-head"
               aria-expanded={!todosCollapsed}
               onClick={() => setTodosCollapsed(value => !value)}
             >
-              <strong>Tasks</strong>
+              <strong>任务</strong>
               <span>
                 {state.todos!.filter((item) => item.status === "completed").length}/{state.todos!.length}
               </span>
@@ -4954,7 +4677,7 @@ function App() {
                     })
                   }
                 >
-                  <span>{msg.channel === "roleplay" ? "角色" : "Assistant"}</span>
+                  <span>{msg.channel === "roleplay" ? "角色" : "助手"}</span>
                   {msg.channel === "roleplay" ? <span className="msg-channel-tag" title="角色扮演试演；写作 Agent 可读，扮演模式不读写作对话">扮演</span> : null}
                   {msg.channel === "roleplay" ? (
                     <span
@@ -4970,7 +4693,7 @@ function App() {
                 <div className="msg-label">
                   {directorMessage
                     ? <><Drama size={12} aria-hidden="true" /><span>导演指令</span></>
-                    : <span>You</span>}
+                    : <span>你</span>}
                   {msg.channel === "roleplay" && !directorMessage ? (
                     <span
                       className="msg-channel-tag"
@@ -5196,8 +4919,8 @@ function App() {
           {state.messages.length === 0 && streamSteps.length === 0 && !(state.stepTrails?.length) && (
             <div className="empty-state">
               <div className="empty-orb" aria-hidden="true" />
-              <p>Agent is ready</p>
-              <span className="empty-hint">Describe a writing task — outline, revise, or continue a scene</span>
+              <p>Agent 已就绪</p>
+              <span className="empty-hint">描述写作任务：列大纲、改稿或续写场景</span>
             </div>
           )}
           {notice && <article className="notice">{notice}</article>}
@@ -5219,11 +4942,12 @@ function App() {
           <ReviewDock
             changeSets={pendingChangeSets}
             proposals={pendingProposals}
-            pendingCount={pendingChangeSets.length + pendingProposals.length}
+            pendingCount={pendingReviewCount}
             open={reviewOpen}
             onToggle={() => setReviewOpen((v) => !v)}
             onChangeSetAction={(value, action) => void decideChangeSet(value, action)}
             onProposalDecide={(p, action) => void decide(p, action)}
+            onOpenPath={openReviewDocument}
           />
         )}
         <div className="composer">
@@ -5341,7 +5065,7 @@ function App() {
             <div className="composer-actions">
               <span className="composer-hint">
                 {busy
-                  ? "Esc to stop"
+                  ? "Esc 停止"
                   : roleplay
                     ? `${roleplayInputMode === "director" ? "导演指示" : "角色内"} · Ctrl+Enter`
                     : agentSupportsMultimodal
@@ -5387,7 +5111,7 @@ function App() {
                   onClick={busy ? stop : () => void sendChat()}
                   disabled={readOnly || Boolean(roleplayAutoReplyBusy) || (!busy && !prompt.trim() && !pendingAttachments.length)}
                 >
-                  {busy ? "Stop" : "Send"}
+                  {busy ? "停止" : "发送"}
                 </button>
               </div>
             </div>
@@ -6863,8 +6587,8 @@ function App() {
                         </strong>
                         <span>{new Date(session.updatedAt).toLocaleString()}</span>
                       </button>
-                      {session.id === state.sessionId && <span className="current-badge">Current</span>}
-                      {running && <span className="session-running-badge"><span aria-hidden="true" />Running</span>}
+                      {session.id === state.sessionId && <span className="current-badge">当前</span>}
+                      {running && <span className="session-running-badge"><span aria-hidden="true" />运行中</span>}
                       {!sessionBatchMode && (
                         <>
                           <button className="icon" aria-label="重命名会话" title="重命名" onClick={() => void renameSession(session.id, session.title)}><Pencil size={15} /></button>
