@@ -5,9 +5,16 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   buildEvidenceGroundedWriterMessages,
+  classifyEmptyWriterProse,
+  emptyProseRetryPrompt,
+  EvidenceGroundedWriterError,
+  formatEvidenceWriterAgentMessage,
   mergeProseContinuation,
   parseSceneActualState,
+  reportAndWrapEvidenceWriterError,
+  requestEvidenceGroundedProse,
 } from "./evidence_grounded_writer.js";
+import type { ProviderCompletionResult } from "./model_api.js";
 import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 import { assembleChapterSceneDraft, blockChapterSceneReview } from "./scene_pipeline.js";
 import { WriterProject } from "./project.js";
@@ -485,4 +492,258 @@ test("scene state parser keeps bounded factual arrays", () => {
     relationships: [], goals: [], openLoops: [], usedMotifs: [],
   }));
   assert.deepEqual(state.situation, ["一", "二", "三"]);
+});
+
+const EMPTY_EVIDENCE = {
+  version: 1 as const,
+  path: "chapters/empty.md",
+  instructions: "",
+  writingMemory: [],
+  characters: [],
+  sources: [],
+  coverageGaps: [],
+  hash: "empty-hash",
+};
+
+const EMPTY_PACK = {
+  sourceDraft: "",
+  sceneGoal: "取得线索",
+  beatOrder: [],
+  knownFacts: [],
+  mustLand: [],
+  characterState: [],
+  narrationNotes: [],
+  doNotInvent: [],
+  narrativeBrief: "",
+  structured: true,
+  strippedMeta: [],
+};
+
+function writerAccess(): { project: WriterProject; context: ToolExecutionContext } {
+  const root = mkdtempSync(join(tmpdir(), "writer-empty-prose-"));
+  const project = WriterProject.init(root, "空正文");
+  return {
+    project,
+    context: {
+      permissionMode: "ask",
+      reviewCharacterIds: [],
+      characterEvidenceReads: new Map(),
+      narrativeEvidencePackets: new Map(),
+    },
+  };
+}
+
+test("empty prose with long reasoning is classified productively", () => {
+  assert.equal(classifyEmptyWriterProse({ content: "", reasoningContent: "x".repeat(20) }), "empty_content");
+  assert.equal(
+    classifyEmptyWriterProse({ content: "  ", reasoningContent: "思考".repeat(50) }),
+    "empty_content_with_reasoning",
+  );
+  assert.match(emptyProseRetryPrompt({
+    emptyKind: "empty_content_with_reasoning",
+    reasoningCharacters: 200,
+    accumulatedCharacters: 0,
+  }), /思考内容/);
+});
+
+test("empty prose auto-retries once then succeeds", async () => {
+  const access = writerAccess();
+  let calls = 0;
+  const complete = async (): Promise<ProviderCompletionResult> => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        content: "",
+        reasoningContent: "我先梳理证据与人物关系，再决定如何写开场。".repeat(8),
+        toolCalls: [],
+        finishReason: "stop",
+        durationMs: 1200,
+        usage: {
+          promptTokens: 100, completionTokens: 50, cacheHitTokens: 10, cacheMissTokens: 90, reasoningTokens: 40,
+        },
+      };
+    }
+    return {
+      content: "雨停以后，废站台上的积水仍在往轨缝里退。林觉踩过散落的票根，沿墙摸向检修通道。",
+      reasoningContent: "",
+      toolCalls: [],
+      finishReason: "stop",
+      durationMs: 800,
+      usage: {
+        promptTokens: 120, completionTokens: 40, cacheHitTokens: 20, cacheMissTokens: 100,
+      },
+    };
+  };
+  try {
+    const result = await requestEvidenceGroundedProse(
+      MODEL,
+      {
+        path: "chapters/empty.md",
+        outputKind: "document",
+        writePack: EMPTY_PACK,
+        evidence: EMPTY_EVIDENCE,
+        styleEvidence: "稳定文风",
+      },
+      access,
+      undefined,
+      { complete },
+    );
+    assert.equal(calls, 2);
+    assert.equal(result.emptyAutoRetryUsed, true);
+    assert.match(result.content, /废站台/);
+    assert.equal(result.usage?.promptTokens, 220);
+    assert.equal(result.usage?.reasoningTokens, 40);
+  } finally {
+    rmSync(access.project.root, { recursive: true, force: true });
+  }
+});
+
+test("empty prose failure stores diagnostics and reports usage", async () => {
+  const access = writerAccess();
+  let calls = 0;
+  const complete = async (): Promise<ProviderCompletionResult> => {
+    calls += 1;
+    return {
+      content: "",
+      reasoningContent: "仅有思考没有正文。".repeat(20),
+      toolCalls: [],
+      finishReason: "stop",
+      durationMs: 500,
+      usage: {
+        promptTokens: 80, completionTokens: 60, cacheHitTokens: 0, cacheMissTokens: 80, reasoningTokens: 55,
+      },
+    };
+  };
+  const reported: Array<{ callKind: string; usage: { promptTokens: number }; preview?: string }> = [];
+  try {
+    await assert.rejects(
+      () => requestEvidenceGroundedProse(
+        MODEL,
+        {
+          path: "chapters/empty.md",
+          outputKind: "document",
+          writePack: EMPTY_PACK,
+          evidence: EMPTY_EVIDENCE,
+          styleEvidence: "稳定文风",
+        },
+        access,
+        undefined,
+        { complete },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof EvidenceGroundedWriterError);
+        assert.equal(error.diagnostics.code, "EMPTY_PROSE");
+        assert.equal(error.diagnostics.emptyKind, "empty_content_with_reasoning");
+        assert.equal(error.diagnostics.emptyAutoRetryUsed, true);
+        assert.equal(error.diagnostics.providerCalls, 2);
+        assert.equal(error.diagnostics.durationMs, 1000);
+        assert.equal(error.usage?.promptTokens, 160);
+        const agentMessage = formatEvidenceWriterAgentMessage(error);
+        assert.match(agentMessage, /writePack 仍有效/);
+        assert.match(agentMessage, /禁止改由主 Agent 全文手写/);
+        const wrapped = reportAndWrapEvidenceWriterError(
+          error,
+          { ...MODEL, providerName: "test-provider" },
+          "evidence_grounded_document_writer",
+          (model, usage, meta) => {
+            reported.push({
+              callKind: meta.callKind,
+              usage: { promptTokens: usage.promptTokens },
+              preview: meta.requestComponents?.[0]?.preview,
+            });
+            void model;
+          },
+        );
+        assert.equal(wrapped.code, "EVIDENCE_WRITER_EMPTY_PROSE");
+        assert.equal(wrapped.failureKind, "dependency");
+        assert.equal(wrapped.diagnostics?.attempts[0]?.class, "empty_response");
+        assert.equal(wrapped.diagnostics?.attempts[0]?.recordedUsage, true);
+        return true;
+      },
+    );
+    assert.equal(calls, 2);
+    assert.equal(reported.length, 1);
+    assert.equal(reported[0]?.callKind, "evidence_grounded_document_writer");
+    assert.equal(reported[0]?.usage.promptTokens, 160);
+    assert.match(String(reported[0]?.preview), /empty_content_with_reasoning/);
+  } finally {
+    rmSync(access.project.root, { recursive: true, force: true });
+  }
+});
+
+test("delegated write_file keeps writePack after empty writer failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-grounded-retry-pack-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "保留 pack");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("空正文重试");
+    let calls = 0;
+    const reported: string[] = [];
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      reviewCharacterIds: [],
+      characterEvidenceReads: new Map(),
+      narrativeEvidencePackets: new Map(),
+      proseLength: { targetCharacters: 500, enforceMinimum: false },
+      modelUsageReporter: (_model, _usage, meta) => {
+        reported.push(meta.callKind);
+      },
+      evidenceGroundedWriter: {
+        model: MODEL,
+        stateModel: MODEL,
+        run: async () => {
+          calls += 1;
+          throw new EvidenceGroundedWriterError("证据型 Writer 没有返回正文", {
+            code: "EMPTY_PROSE",
+            usage: {
+              promptTokens: 50, completionTokens: 10, cacheHitTokens: 0, cacheMissTokens: 50,
+            },
+            diagnostics: {
+              path: "chapters/retry.md",
+              outputKind: "document",
+              code: "EMPTY_PROSE",
+              contentCharacters: 0,
+              reasoningCharacters: 200,
+              finishReason: "stop",
+              toolCallCount: 0,
+              durationMs: 900,
+              providerCalls: 2,
+              emptyKind: "empty_content_with_reasoning",
+              emptyAutoRetryUsed: true,
+              evidenceTurns: 0,
+              continuationTurns: 0,
+            },
+          });
+        },
+      },
+    };
+    const baseArgs = { project, store, sessionId, emit: () => undefined, context };
+    handleCompileWritePack({
+      ...baseArgs,
+      input: { notes: "## 场景目标\n林觉发现有人刚离开废站。\n## 勿擅自补写\n不确定对方身份。", targetPath: "chapters/retry.md" },
+    });
+    assert.equal(context.writePackCompiled, true);
+    await assert.rejects(
+      () => handleWriteFile({ ...baseArgs, input: { path: "chapters/retry.md" } }),
+      (error: unknown) => {
+        assert.ok(error && typeof error === "object");
+        const err = error as { code?: string; failureKind?: string; retryable?: boolean; message?: string };
+        assert.equal(err.code, "EVIDENCE_WRITER_EMPTY_PROSE");
+        assert.equal(err.failureKind, "dependency");
+        assert.equal(err.retryable, true);
+        assert.match(String(err.message), /writePack 仍有效/);
+        assert.match(String(err.message), /禁止改由主 Agent 全文手写/);
+        return true;
+      },
+    );
+    assert.equal(calls, 1);
+    // Pack must remain for a second omit-content attempt.
+    assert.equal(context.writePackCompiled, true);
+    assert.ok(context.lastWritePackData);
+    assert.deepEqual(reported, ["evidence_grounded_document_writer"]);
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

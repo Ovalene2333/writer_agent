@@ -27,6 +27,8 @@ import {
 import { dynamicStyleGroundingPrompt, stableStyleGroundingPrompt } from "../style_grounding.js";
 import { buildNarrativeEvidencePacket } from "../narrative_evidence.js";
 import {
+  EvidenceGroundedWriterError,
+  reportAndWrapEvidenceWriterError,
   requestEvidenceGroundedProse,
   requestSceneStateExtraction,
 } from "../evidence_grounded_writer.js";
@@ -334,40 +336,51 @@ export async function handleWriteChapterScene({ input, project, store, sessionId
     });
     context.narrativeEvidencePackets?.set(`${draft.path}#${sceneId}`, evidence);
     const runWriter = writer.run ?? requestEvidenceGroundedProse;
-    const generated = await runWriter(writer.model, {
-      path: draft.path,
-      outputKind: "scene",
-      writePack: pack,
-      evidence,
-      scene,
-      ...(previous?.content ? { previousTail: previous.content.slice(-2_000) } : {}),
-      ...(existingScene?.content ? { existingText: existingScene.content } : {}),
-      styleEvidence: [
-        stableStyleGroundingPrompt(project, store),
-        chapterStyleEvidence({ project, store, context }, draft),
-      ].filter(Boolean).join("\n\n"),
-      ...(activeReviewCycle
-        ? {
-            reviewIssues: activeReviewCycle.unresolvedIssues
-              .filter(issue => issue.sceneId === sceneId)
-              .map(issue => ({
-                id: issue.id,
-                kind: issue.kind,
-                evidence: issue.evidence,
-                problem: issue.problem,
-                action: issue.action,
-              })),
-          }
-        : {}),
-      targetCharacters: scene.targetCharacters,
-      lengthMode: context.proseLength?.mode,
-      registerRisks: sceneRegisterRisks,
-    }, { project, context }, writer.signal);
-    if (generated.usage) {
-      context.modelUsageReporter?.(writer.model, generated.usage, {
-        callKind: "evidence_grounded_scene_writer",
-      });
+    let generated;
+    try {
+      generated = await runWriter(writer.model, {
+        path: draft.path,
+        outputKind: "scene",
+        writePack: pack,
+        evidence,
+        scene,
+        ...(previous?.content ? { previousTail: previous.content.slice(-2_000) } : {}),
+        ...(existingScene?.content ? { existingText: existingScene.content } : {}),
+        styleEvidence: [
+          stableStyleGroundingPrompt(project, store),
+          chapterStyleEvidence({ project, store, context }, draft),
+        ].filter(Boolean).join("\n\n"),
+        ...(activeReviewCycle
+          ? {
+              reviewIssues: activeReviewCycle.unresolvedIssues
+                .filter(issue => issue.sceneId === sceneId)
+                .map(issue => ({
+                  id: issue.id,
+                  kind: issue.kind,
+                  evidence: issue.evidence,
+                  problem: issue.problem,
+                  action: issue.action,
+                })),
+            }
+          : {}),
+        targetCharacters: scene.targetCharacters,
+        lengthMode: context.proseLength?.mode,
+        registerRisks: sceneRegisterRisks,
+      }, { project, context }, writer.signal);
+    } catch (error) {
+      if (error instanceof EvidenceGroundedWriterError) {
+        throw reportAndWrapEvidenceWriterError(
+          error,
+          writer.model,
+          "evidence_grounded_scene_writer",
+          context.modelUsageReporter,
+        );
+      }
+      throw error;
     }
+    reportModelCallUsage(context.modelUsageReporter, writer.model, generated.usage, {
+      callKind: "evidence_grounded_scene_writer",
+    });
     submitted = generated.content;
     const extractState = writer.extractState ?? requestSceneStateExtraction;
     const extracted = await extractState(writer.stateModel, {

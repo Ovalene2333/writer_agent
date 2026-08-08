@@ -1,4 +1,10 @@
-import { completeProviderCompletion, type ProviderUsage, type ProviderWireMessage } from "./model_api.js";
+import {
+  completeProviderCompletion,
+  type ProviderCompletionRequest,
+  type ProviderCompletionResult,
+  type ProviderUsage,
+  type ProviderWireMessage,
+} from "./model_api.js";
 import { samplingRequestOptions } from "./model_compat.js";
 import {
   narrativeEvidenceForPrompt,
@@ -7,11 +13,19 @@ import {
 } from "./narrative_evidence.js";
 import type { ProseLengthMode } from "./agent_runtime.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
-import type { ModelConfig, ModelTokenUsage } from "./types.js";
+import type { ModelConfig, ModelTokenUsage, RequestComponentUsage } from "./types.js";
 import type { WriterProject } from "./project.js";
 import type { ToolExecutionContext } from "./tools/types.js";
+import { DIALOGUE_HARD_BANS } from "./dialogue_texture.js";
 import { formatWritePackForWriter, type WritePack } from "./write_pack.js";
 import { formatRegisterRisksForWriter, type RegisterRisk } from "./register_risks.js";
+import {
+  buildDependencyAttempt,
+  buildDependencyFailureBundle,
+  reportModelCallUsage,
+} from "./dependency_diagnostics.js";
+import type { ModelUsageReporter } from "./model_usage.js";
+import { ToolDependencyError } from "./tool_failure.js";
 
 export type EvidenceGroundedWriterInput = {
   path: string;
@@ -43,12 +57,168 @@ export type EvidenceGroundedWriterResult = {
   requestCharacters: number;
   evidenceHash: string;
   evidenceReads: string[];
+  /** True when an empty-content auto-retry was consumed before success. */
+  emptyAutoRetryUsed?: boolean;
 };
 
 export type EvidenceGroundedWriterAccess = {
   project: WriterProject;
   context: ToolExecutionContext;
 };
+
+/** Provider-visible empty-prose classification for product diagnostics. */
+export type EvidenceWriterEmptyKind = "empty_content" | "empty_content_with_reasoning";
+
+export type EvidenceWriterFailureCode =
+  | "EMPTY_PROSE"
+  | "CONTINUATION_LIMIT"
+  | "EVIDENCE_TURN_LIMIT";
+
+export type EvidenceGroundedWriterDiagnostics = {
+  path: string;
+  outputKind: "document" | "scene";
+  code: EvidenceWriterFailureCode;
+  contentCharacters: number;
+  reasoningCharacters: number;
+  finishReason?: string;
+  toolCallCount: number;
+  /** Sum of provider wall-clock ms across all writer calls in this attempt. */
+  durationMs: number;
+  /** Number of completeProviderCompletion invocations. */
+  providerCalls: number;
+  emptyKind?: EvidenceWriterEmptyKind;
+  emptyAutoRetryUsed: boolean;
+  evidenceTurns: number;
+  continuationTurns: number;
+};
+
+/** Structured writer failure: carries usage + diagnostics for product storage. */
+export class EvidenceGroundedWriterError extends Error {
+  readonly name = "EvidenceGroundedWriterError";
+  readonly code: EvidenceWriterFailureCode;
+  readonly diagnostics: EvidenceGroundedWriterDiagnostics;
+  readonly usage?: ModelTokenUsage;
+
+  constructor(
+    message: string,
+    options: {
+      code: EvidenceWriterFailureCode;
+      diagnostics: EvidenceGroundedWriterDiagnostics;
+      usage?: ModelTokenUsage;
+      cause?: unknown;
+    },
+  ) {
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
+    this.code = options.code;
+    this.diagnostics = options.diagnostics;
+    this.usage = options.usage;
+  }
+}
+
+/** Classify an empty terminal prose response (no tool calls). */
+export function classifyEmptyWriterProse(input: {
+  content: string;
+  reasoningContent?: string;
+}): EvidenceWriterEmptyKind {
+  const reasoningCharacters = (input.reasoningContent ?? "").trim().length;
+  return reasoningCharacters >= 80 ? "empty_content_with_reasoning" : "empty_content";
+}
+
+/** Agent-facing guidance: keep pack, retry omit-content write; avoid freehand full draft. */
+export function formatEvidenceWriterAgentMessage(error: EvidenceGroundedWriterError): string {
+  const d = error.diagnostics;
+  const parts = [
+    d.code === "EMPTY_PROSE"
+      ? `证据型 Writer 没有返回正文（${d.emptyKind ?? "empty_content"}）`
+      : d.code === "CONTINUATION_LIMIT"
+        ? "证据型 Writer 连续三段输出均达到长度上限；需要缩小单次正文范围"
+        : "证据型 Writer 取证轮次超过上限；需要主 Agent 缩小场景或补齐证据",
+    `contentChars=${d.contentCharacters}`,
+    `reasoningChars=${d.reasoningCharacters}`,
+    d.finishReason ? `finishReason=${d.finishReason}` : "",
+    `toolCalls=${d.toolCallCount}`,
+    `providerCalls=${d.providerCalls}`,
+    `emptyAutoRetry=${d.emptyAutoRetryUsed ? 1 : 0}`,
+    `durationMs=${d.durationMs}`,
+    d.path ? `path=${d.path}` : "",
+  ].filter(Boolean);
+  const head = parts.join("；");
+  if (d.code === "EMPTY_PROSE") {
+    return (
+      `${head}。writePack 仍有效：请再次 write_file/write_chapter_scene 并省略 content 重试；`
+      + "禁止改由主 Agent 全文手写。仅当同路径再次空返回后，才可改用带 content 的交付。"
+    );
+  }
+  if (d.code === "CONTINUATION_LIMIT") {
+    return `${head}。writePack 仍有效：缩小目标篇幅或拆场后再次省略 content 交付。`;
+  }
+  return `${head}。writePack 仍有效：缩小场景或补齐证据后再次省略 content 交付。`;
+}
+
+export function evidenceWriterDiagnosticComponent(
+  diagnostics: EvidenceGroundedWriterDiagnostics,
+  callKind: string,
+): RequestComponentUsage {
+  const preview = JSON.stringify({
+    code: diagnostics.code,
+    emptyKind: diagnostics.emptyKind,
+    contentCharacters: diagnostics.contentCharacters,
+    reasoningCharacters: diagnostics.reasoningCharacters,
+    finishReason: diagnostics.finishReason,
+    toolCallCount: diagnostics.toolCallCount,
+    providerCalls: diagnostics.providerCalls,
+    emptyAutoRetryUsed: diagnostics.emptyAutoRetryUsed,
+    evidenceTurns: diagnostics.evidenceTurns,
+    continuationTurns: diagnostics.continuationTurns,
+    durationMs: diagnostics.durationMs,
+    path: diagnostics.path,
+    outputKind: diagnostics.outputKind,
+  }).slice(0, 500);
+  return {
+    kind: "other",
+    label: `证据型 Writer · ${diagnostics.code}${diagnostics.emptyKind ? ` · ${diagnostics.emptyKind}` : ""}`,
+    characters: diagnostics.contentCharacters + diagnostics.reasoningCharacters,
+    estimatedTokens: 0,
+    preview,
+    callKind,
+  };
+}
+
+/** Persist usage (including zero-token failures) and convert to ToolDependencyError for the agent. */
+export function reportAndWrapEvidenceWriterError(
+  error: EvidenceGroundedWriterError,
+  model: ModelConfig,
+  callKind: string,
+  reporter?: ModelUsageReporter,
+): ToolDependencyError {
+  const recorded = reportModelCallUsage(reporter, model, error.usage, {
+    callKind,
+    durationMs: error.diagnostics.durationMs,
+    requestComponents: [evidenceWriterDiagnosticComponent(error.diagnostics, callKind)],
+  });
+  return new ToolDependencyError(
+    `EVIDENCE_WRITER_${error.diagnostics.code}`,
+    formatEvidenceWriterAgentMessage(error),
+    {
+      diagnostics: buildDependencyFailureBundle({
+        stage: "other",
+        attempts: [buildDependencyAttempt({
+          model,
+          role: "sole",
+          error,
+          durationMs: error.diagnostics.durationMs,
+          recordedUsage: recorded,
+          failureClass: error.diagnostics.code === "EMPTY_PROSE" ? "empty_response" : "invalid_output",
+        })],
+      }),
+    },
+  );
+}
+
+export type EvidenceWriterCompleteFn = (
+  request: ProviderCompletionRequest,
+  signal?: AbortSignal,
+) => Promise<ProviderCompletionResult>;
 
 export type SceneStateExtractionResult = {
   actualState: SceneActualState;
@@ -65,6 +235,8 @@ const WRITER_SYSTEM = `你是成熟的中文小说作者，只负责把已经取
 创作时先抓住本场最有牵引力的动作、关系压力或发现，让其他材料围绕它自然进入；没有承担现场作用的材料可以保持隐含。硬事实、人物知识边界和明确须落地的信息必须成立，场景卡中的规划字段不要求各占一句、各占一段，也不要求制造感官、物件、对白或句长配额。
 
 对白是人物在关系中采取的行动。每一轮都承接前一轮带来的信息和压力；直答、解释、回避、沉默、误解、玩笑或让步均可。差异来自人物想得到、知道和不愿承认的内容，不靠口头禅、固定句长或随机口语词。
+
+${DIALOGUE_HARD_BANS}
 
 只输出可直接入稿的正文。不要标题、前言、总结、引用标记、JSON 或代码围栏。直接对白使用项目声线证据所采用的引号；「……」、“……”与"……"均可，证据不一致时任选一种并在本章保持一致。`;
 const STATE_SYSTEM = `你是小说场景状态提取器。只根据 previousState 与 sceneContent，提取正文结束时仍会约束后续场景的最小事实。nextScene 只用于相关性筛选，不是已经发生的事实。
@@ -142,6 +314,11 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
     })}`);
     sections.push("场景卡是当前导航，不是正文模板。先保证入场事实与本场变化成立；goal、characterIntent、obstacle、turn、outcome、readerQuestion、cost 和 oppositionMove 可在同一动作链中合并实现，不要逐字段分段、逐项解释或为可选字段补戏。");
   }
+  // Beats are the length knob when the pack carries them; the character count
+  // stays as a bound so a beat budget cannot silently double the scene.
+  if (input.writePack.beats?.length) {
+    sections.push(`篇幅按节拍走：本场 ${input.writePack.beats.length} 拍，每拍完整落地（意图、尝试、阻碍或错位回应各自可见）后再进入下一拍。字数是上限参考，不是目标；不要为凑字数补铺垫，也不要为压字数把一拍写成一句交代。`);
+  }
   if (input.targetCharacters) {
     sections.push(input.lengthMode === "guidance"
       ? `篇幅参考约 ${input.targetCharacters} 字（弱引导）。保持场景自然完整，不因偏离参考而缩句、扩句或重写；不用总结、复述和无关支线凑字。`
@@ -166,40 +343,105 @@ export async function requestEvidenceGroundedProse(
   input: EvidenceGroundedWriterInput,
   access: EvidenceGroundedWriterAccess,
   signal?: AbortSignal,
+  options?: { complete?: EvidenceWriterCompleteFn },
 ): Promise<EvidenceGroundedWriterResult> {
   if (input.evidence.coverageGaps.length) {
     throw new Error(`EVIDENCE_COVERAGE_REQUIRED：${input.evidence.coverageGaps.map(gap => gap.action).join("；")}`);
   }
+  const complete = options?.complete ?? completeProviderCompletion;
   const messages = buildEvidenceGroundedWriterMessages(input);
   const usage = emptyUsage();
   let hasUsage = false;
   const evidenceReads: string[] = [];
+  let evidenceTurns = 0;
+  let continuationTurns = 0;
+  let emptyAutoRetryUsed = false;
+  let providerCalls = 0;
+  let durationMs = 0;
+  let lastContentCharacters = 0;
+  let lastReasoningCharacters = 0;
+  let lastFinishReason: string | undefined;
+  let lastToolCallCount = 0;
+  let lastEmptyKind: EvidenceWriterEmptyKind | undefined;
+
+  const fail = (code: EvidenceWriterFailureCode, message: string): never => {
+    throw new EvidenceGroundedWriterError(message, {
+      code,
+      usage: hasUsage ? { ...usage } : undefined,
+      diagnostics: {
+        path: input.path,
+        outputKind: input.outputKind,
+        code,
+        contentCharacters: lastContentCharacters,
+        reasoningCharacters: lastReasoningCharacters,
+        ...(lastFinishReason ? { finishReason: lastFinishReason } : {}),
+        toolCallCount: lastToolCallCount,
+        durationMs,
+        providerCalls,
+        ...(lastEmptyKind ? { emptyKind: lastEmptyKind } : {}),
+        emptyAutoRetryUsed,
+        evidenceTurns,
+        continuationTurns,
+      },
+    });
+  };
+
   const completePhase = async (): Promise<string> => {
-    let evidenceTurns = 0;
-    let continuationTurns = 0;
     let accumulated = "";
     while (evidenceTurns < 6) {
       const remainingCharacters = input.targetCharacters
         ? Math.max(600, input.targetCharacters - accumulated.length)
         : undefined;
-      const result = await completeProviderCompletion({
+      const result = await complete({
         model,
         messages,
         tools: WRITER_TOOLS,
         maxTokens: writerMaxTokens(remainingCharacters ?? input.targetCharacters),
         ...samplingRequestOptions(model),
       }, signal);
+      providerCalls += 1;
+      if (typeof result.durationMs === "number" && Number.isFinite(result.durationMs)) {
+        durationMs += Math.max(0, Math.round(result.durationMs));
+      }
       if (result.usage) {
         addUsage(usage, result.usage);
         hasUsage = true;
       }
+      lastContentCharacters = (result.content ?? "").length;
+      lastReasoningCharacters = (result.reasoningContent ?? "").length;
+      lastFinishReason = result.finishReason;
+      lastToolCallCount = result.toolCalls.length;
+
       if (!result.toolCalls.length) {
         const content = cleanProse(result.content);
-        if (!content) throw new Error("证据型 Writer 没有返回正文");
+        if (!content) {
+          lastEmptyKind = classifyEmptyWriterProse({
+            content: result.content ?? "",
+            reasoningContent: result.reasoningContent,
+          });
+          if (!emptyAutoRetryUsed) {
+            emptyAutoRetryUsed = true;
+            messages.push({
+              role: "assistant",
+              content: result.content ?? "",
+              ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
+            });
+            messages.push({
+              role: "user",
+              content: emptyProseRetryPrompt({
+                emptyKind: lastEmptyKind,
+                reasoningCharacters: lastReasoningCharacters,
+                accumulatedCharacters: accumulated.length,
+              }),
+            });
+            continue;
+          }
+          return fail("EMPTY_PROSE", "证据型 Writer 没有返回正文");
+        }
         accumulated = mergeProseContinuation(accumulated, content);
         if (result.finishReason !== "length") return accumulated;
         if (continuationTurns >= 2) {
-          throw new Error("证据型 Writer 连续三段输出均达到长度上限；需要缩小单次正文范围");
+          return fail("CONTINUATION_LIMIT", "证据型 Writer 连续三段输出均达到长度上限；需要缩小单次正文范围");
         }
         continuationTurns += 1;
         messages.push({
@@ -232,11 +474,32 @@ export async function requestEvidenceGroundedProse(
         messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
       }
     }
-    throw new Error("证据型 Writer 取证轮次超过上限；需要主 Agent 缩小场景或补齐证据");
+    return fail("EVIDENCE_TURN_LIMIT", "证据型 Writer 取证轮次超过上限；需要主 Agent 缩小场景或补齐证据");
   };
 
   const content = await completePhase();
-  return writerResult(content, input, messages, evidenceReads, hasUsage ? usage : undefined);
+  return {
+    ...writerResult(content, input, messages, evidenceReads, hasUsage ? usage : undefined),
+    ...(emptyAutoRetryUsed ? { emptyAutoRetryUsed: true } : {}),
+  };
+}
+
+/** User nudge after a terminal empty prose response (internal auto-retry). */
+export function emptyProseRetryPrompt(input: {
+  emptyKind: EvidenceWriterEmptyKind;
+  reasoningCharacters: number;
+  accumulatedCharacters: number;
+}): string {
+  const reasonNote = input.emptyKind === "empty_content_with_reasoning"
+    ? `（检测到约 ${input.reasoningCharacters} 字思考内容，但正文 content 为空）`
+    : "";
+  const prefix = input.accumulatedCharacters > 0
+    ? `当前已累计约 ${input.accumulatedCharacters} 字正文，但本轮未追加新正文${reasonNote}。`
+    : `上一次模型结束时没有输出可入稿正文${reasonNote}。`;
+  return (
+    `${prefix}请直接输出可入稿的正文；证据预览不足时先调用 read_evidence_source / read_character_evidence 补读，`
+    + "再输出正文。禁止只写思考、元说明、JSON 或代码围栏。"
+  );
 }
 
 /** Join a length-limited continuation without duplicating the model's repeated seam. */
@@ -386,6 +649,9 @@ function addUsage(target: ModelTokenUsage, source: ProviderUsage): void {
   target.cacheHitTokens += source.cacheHitTokens;
   target.cacheMissTokens += source.cacheMissTokens;
   if (source.cacheWriteTokens) target.cacheWriteTokens = (target.cacheWriteTokens ?? 0) + source.cacheWriteTokens;
+  if (source.reasoningTokens !== undefined) {
+    target.reasoningTokens = (target.reasoningTokens ?? 0) + source.reasoningTokens;
+  }
 }
 
 function modelUsage(source: ProviderUsage): ModelTokenUsage {
@@ -395,5 +661,6 @@ function modelUsage(source: ProviderUsage): ModelTokenUsage {
     cacheHitTokens: source.cacheHitTokens,
     cacheMissTokens: source.cacheMissTokens,
     ...(source.cacheWriteTokens ? { cacheWriteTokens: source.cacheWriteTokens } : {}),
+    ...(source.reasoningTokens !== undefined ? { reasoningTokens: source.reasoningTokens } : {}),
   };
 }

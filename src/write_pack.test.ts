@@ -97,6 +97,64 @@ test("compileWritePack parses structured draft sections", () => {
   assert.match(formatWritePackForWriter(pack), /【叙述提醒】/u);
 });
 
+test("scene viewpoint and knowledge gates compile into hard constraints", () => {
+  const pack = compileWritePack(`## 本场视角
+千夏。贴着她，只写她能看到和听到的。
+
+## 认知边界
+- 千夏 | 知道=自己是第三号 | 不知道=第四号的下落；李彦收到过撤离令 | 在隐瞒=她昨夜私自读了值班记录
+- 李彦 | 知道=撤离令已下达 | 不知道=千夏读过值班记录 | 在隐瞒=撤离令的签发人
+`);
+  assert.equal(pack.structured, true);
+  assert.match(pack.viewpoint ?? "", /千夏/u);
+  assert.equal(pack.knowledgeGates?.length, 2);
+  assert.deepEqual(pack.knowledgeGates?.[0].unknown, ["第四号的下落", "李彦收到过撤离令"]);
+  assert.deepEqual(pack.knowledgeGates?.[1].concealing, ["撤离令的签发人"]);
+  const formatted = formatWritePackForWriter(pack);
+  assert.match(formatted, /【本场视角】/u);
+  assert.match(formatted, /【认知边界】[\s\S]*不知道：第四号的下落、李彦收到过撤离令/u);
+  assert.match(formatted, /硬约束是【已成立的事实】【须自然落地】【勿擅自补写】【本场视角】【认知边界】/u);
+});
+
+test("knowledge gate rows without an epistemic field are dropped", () => {
+  const pack = compileWritePack("## 认知边界\n- 千夏 | 备注=只是个名字\n");
+  assert.equal(pack.knowledgeGates, undefined);
+  const formatted = formatWritePackForWriter(pack);
+  // The heading itself must not fall through into 情节提要 as raw draft chrome.
+  assert.doesNotMatch(formatted, /千夏|备注/u);
+  assert.doesNotMatch(formatted, /【认知边界】\n/u);
+});
+
+test("structured beats replace the event list and become the length knob", () => {
+  const pack = compileWritePack(`## 事件顺序
+- 意图=李彦想在不解释原因的情况下让千夏签字 | 尝试=他把表格推过来只说例行 | 阻碍=千夏没有接笔，反而看向日期栏
+- 意图=千夏想确认第四号还在 | 尝试=她问起同批的适应度 | 阻碍=李彦答的是全批平均值
+- 意图=李彦想结束这场谈话 | 尝试=他起身去关百叶窗 | 阻碍=窗外正好停着一辆没有编号的车
+`);
+  assert.equal(pack.beats?.length, 3);
+  assert.equal(pack.beats?.[1].obstacle, "李彦答的是全批平均值");
+  const formatted = formatWritePackForWriter(pack);
+  assert.match(formatted, /【本场节拍】共 3 拍/u);
+  assert.match(formatted, /拍数是篇幅旋钮，不是字数/u);
+  assert.doesNotMatch(formatted, /【推进顺序】/u);
+});
+
+test("unstructured event rows keep the legacy beat order", () => {
+  const pack = compileWritePack("## 事件顺序\n1. 通报指标\n2. 追问编号\n");
+  assert.equal(pack.beats, undefined);
+  assert.equal(pack.beatOrder.length, 2);
+  assert.match(formatWritePackForWriter(pack), /【推进顺序】/u);
+});
+
+test("draft contract asks for a viewpoint, knowledge gates and beat rows", () => {
+  const prompt = writePackDraftContractPrompt();
+  assert.match(prompt, /## 本场视角/u);
+  assert.match(prompt, /## 认知边界/u);
+  assert.match(prompt, /知道=… \| 不知道=… \| 在隐瞒=…/u);
+  assert.match(prompt, /每场 3—5 拍/u);
+  assert.match(prompt, /意图=… \| 尝试=… \| 阻碍=…/u);
+});
+
 test("compileWritePack separates fact precision from contextual realization", () => {
   const pack = compileWritePack(`## 已知事实
 - 千夏的神经组织仍在工作

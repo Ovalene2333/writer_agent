@@ -21,6 +21,24 @@ export type WritePack = {
   sceneGoal: string;
   /** Ordered beats / event sequence. */
   beatOrder: string[];
+  /**
+   * Optional viewpoint character for this scene. Absent in legacy packs.
+   * Present = narration may not exceed what this character can perceive.
+   */
+  viewpoint?: string;
+  /**
+   * Optional per-character epistemic gate (knows / does not know / is concealing).
+   * The scene-level, lower-frequency form of the roleplay perception compiler:
+   * information asymmetry is what makes an exchange a negotiation rather than a
+   * mutual confirmation, which is exactly what compliantActRatio measures.
+   */
+  knowledgeGates?: KnowledgeGate[];
+  /**
+   * Optional structured beats parsed out of beatOrder rows. Beat count — not a
+   * character count — is the length knob: each beat is one intent, one attempt,
+   * one obstacle or mismatched reply.
+   */
+  beats?: SceneBeat[];
   /** Established facts the prose must obey (diegetic phrasing). */
   knownFacts: string[];
   /** Information that must land naturally in prose. */
@@ -54,6 +72,25 @@ export type WritePack = {
   }>;
 };
 
+export type SceneBeat = {
+  /** What a character wants to get done right now. */
+  intent: string;
+  /** The one thing they actually do about it in this beat. */
+  attempt: string;
+  /** What blocks it, or the reply that lands somewhere other than the intent. */
+  obstacle: string;
+};
+
+export type KnowledgeGate = {
+  character: string;
+  /** Established for this character at scene entry. */
+  knows: string[];
+  /** Not available to them — may not be spoken, thought or narrated close to them. */
+  unknown: string[];
+  /** Known but withheld; may only surface as evasion, deflection or a partial answer. */
+  concealing: string[];
+};
+
 export type FactPrecision = "exact" | "normal" | "sensory";
 
 export type FactAtom = {
@@ -80,7 +117,7 @@ export type CompileWritePackOptions = {
   instruction?: string;
 };
 
-type WritePackSectionField = keyof Pick<WritePack, "sceneGoal" | "beatOrder" | "knownFacts" | "mustLand" | "characterState" | "narrationNotes" | "doNotInvent"> | "realizationBoundaries" | "discard";
+type WritePackSectionField = keyof Pick<WritePack, "sceneGoal" | "beatOrder" | "knownFacts" | "mustLand" | "characterState" | "narrationNotes" | "doNotInvent"> | "realizationBoundaries" | "viewpoint" | "knowledgeGates" | "discard";
 
 const SECTION_MAP: Array<{ keys: RegExp; field: WritePackSectionField }> = [
   { keys: /^(?:场景目标|本次场景目标|场景推进|推进目标|目标与推进|本场目标)$/u, field: "sceneGoal" },
@@ -88,6 +125,8 @@ const SECTION_MAP: Array<{ keys: RegExp; field: WritePackSectionField }> = [
   { keys: /^(?:已知事实|必须保持|既有事实|资料已确认|确认事实|事实约束)$/u, field: "knownFacts" },
   { keys: /^(?:必要信息|须带出|需要自然带出|须自然落地|自然带出|信息落地|必须落地)$/u, field: "mustLand" },
   { keys: /^(?:人物|人物状态|动机|关系张力|人物当下|角色状态)$/u, field: "characterState" },
+  { keys: /^(?:本场视角|视角人物|视角归属|限知视角)$/u, field: "viewpoint" },
+  { keys: /^(?:认知边界|知情边界|信息边界|人物认知|知道与不知道)$/u, field: "knowledgeGates" },
   { keys: /^(?:叙述提醒|叙事视角|视角与叙述|文风提醒)$/u, field: "narrationNotes" },
   { keys: /^(?:表达边界|事实表达|术语表达|语域实现|表达策略)$/u, field: "realizationBoundaries" },
   // An unqualified 声线 section is normally a character card fragment. Discard it
@@ -240,6 +279,11 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
   const characterState = sanitizeList(splitList(take("characterState").join("\n")));
   const narrationNotes = sanitizeList(splitList(take("narrationNotes").join("\n")));
   const doNotInvent = sanitizeList(splitList(take("doNotInvent").join("\n")));
+  const viewpoint = sanitize(take("viewpoint").join("\n")).trim();
+  const knowledgeGates = parseKnowledgeGates(
+    sanitizeList(splitList(take("knowledgeGates").join("\n"))),
+  );
+  const beats = parseSceneBeats(beatOrder);
   const factAtoms = knownFacts.slice(0, 12).map((claim, index) => ({
     id: `fact-${index + 1}`,
     claim,
@@ -261,6 +305,10 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
   const structured = Boolean(
     sceneGoal || beatOrder.length || knownFacts.length || mustLand.length
     || characterState.length || narrationNotes.length || doNotInvent.length
+    // Raw section presence, not the parsed result: a section whose rows all fail
+    // to parse must still count as structured, or the whole draft falls back to
+    // narrativeBrief and leaks its own heading into the writer prompt.
+    || take("viewpoint").length || take("knowledgeGates").length
     || take("realizationBoundaries").length
     || [...sections.values()].some(entry => entry.field === "discard"),
   );
@@ -278,6 +326,9 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
     sourceDraft,
     sceneGoal,
     beatOrder,
+    ...(viewpoint ? { viewpoint } : {}),
+    ...(knowledgeGates.length ? { knowledgeGates } : {}),
+    ...(beats.length ? { beats } : {}),
     knownFacts,
     mustLand,
     characterState,
@@ -296,12 +347,34 @@ export function compileWritePack(draft: string, options: CompileWritePackOptions
  */
 export function formatWritePackForWriter(pack: WritePack): string {
   const lines: string[] = [
-    "本场写作材料（这是事实边界与创作简报，不是逐项展开的作文提纲。硬约束是【已成立的事实】【须自然落地】【勿擅自补写】；其余栏目用于找准人物行动和场景方向，可合并承载，不必逐条复述或各占一段。正文只用故事世界内的时间、动作、对白或物件指称先前情节。）",
+    "本场写作材料（这是事实边界与创作简报，不是逐项展开的作文提纲。硬约束是【已成立的事实】【须自然落地】【勿擅自补写】【本场视角】【认知边界】；其余栏目用于找准人物行动和场景方向，可合并承载，不必逐条复述或各占一段。正文只用故事世界内的时间、动作、对白或物件指称先前情节。）",
   ];
 
+  if (pack.viewpoint) {
+    lines.push(
+      `【本场视角】\n${pack.viewpoint}\n（硬约束：叙述只写该人物此刻能看到、听到、感觉到和据此判断到的内容。其他人物的想法、动机和未说出口的盘算只能通过对方的动作、语气、停顿和说了什么来呈现，不得由叙述直接说明。）`,
+    );
+  }
+  if (pack.knowledgeGates?.length) {
+    lines.push(
+      `【认知边界】\n${pack.knowledgeGates.map(formatKnowledgeGate).join("\n")}\n`
+      + "（硬约束：「不知道」的内容，该人物不得说出、想到，贴着他的叙述也不得点破；他只能猜错、问偏或绕开。"
+      + "「在隐瞒」的内容只能以回避、转移话题、给出不完整答案或答非所问呈现，不得由叙述交代他为什么隐瞒。"
+      + "本场的谈话压力就来自这些差额——不要让双方在同一信息水平上互相确认。）",
+    );
+  }
   if (pack.sceneGoal) lines.push(`【本场方向】\n${pack.sceneGoal}`);
   if (pack.characterState.length) lines.push(`【人物当下】\n${bullets(pack.characterState)}`);
-  if (pack.beatOrder.length) lines.push(`【推进顺序】\n${numbered(pack.beatOrder)}\n（保持因果先后，但可写成连续动作，不为每项补解释或独立段落。）`);
+  if (pack.beats?.length) {
+    lines.push(
+      `【本场节拍】共 ${pack.beats.length} 拍。每拍写成：某个人物此刻想达成的事 → 他为此做出的一次尝试 → 一次阻碍或落在别处的回应。\n`
+      + pack.beats.map((beat, index) =>
+        `${index + 1}. 意图：${beat.intent}／尝试：${beat.attempt}／阻碍：${beat.obstacle}`).join("\n")
+      + "\n（拍数是篇幅旋钮，不是字数。不要把两拍并成一句带过，也不要把一拍拆成多轮重复确认；每一拍都要让局面、理解或关系出现可见的变化，再进入下一拍。这些字段是本拍要发生的事，不是要写进正文的说法。）",
+    );
+  } else if (pack.beatOrder.length) {
+    lines.push(`【推进顺序】\n${numbered(pack.beatOrder)}\n（保持因果先后，但可写成连续动作，不为每项补解释或独立段落。）`);
+  }
   if (pack.knownFacts.length) lines.push(`【已成立的事实】\n${bullets(pack.knownFacts)}`);
   if (pack.mustLand.length) lines.push(`【须自然落地】\n${bullets(pack.mustLand)}`);
   if (pack.doNotInvent.length) lines.push(`【勿擅自补写】\n${bullets(pack.doNotInvent)}`);
@@ -334,6 +407,8 @@ export function formatWritePackForWriter(pack: WritePack): string {
 export function writePackDraftContractPrompt(): string {
   return `最终输出「写作草案」（供作者审阅，确认后再编译给正文模型）。使用以下小标题（缺段可省略，不要写小说正文）：
 ## 场景目标
+## 本场视角
+## 认知边界
 ## 人物当下
 ## 事件顺序
 ## 已知事实
@@ -345,6 +420,9 @@ export function writePackDraftContractPrompt(): string {
 约束：
 - 全部用故事世界内说法写事实与回忆；禁止出现「序章/第N章/大纲/草案/lore/outline/chapters」等文档或流程标签。
 - 指称先前情节时写清故事内锚点（如「门缝里那句预估」「入院当晚」），不要写「比序章里…」。
+- 「本场视角」写一名视角人物，一句话说明叙述贴他多近。本场叙述不得越过他的感知；他没看到、没听到的事不能进叙述。
+- 「认知边界」为本场视角人物和他的主要对手方各写一行：角色 | 知道=… | 不知道=… | 在隐瞒=…（同栏多项用「；」分隔，确无内容留空）。只写本场会被触碰到的信息，这三栏决定了这场戏还有什么可谈；双方都知道的事不构成场景。
+- 「事件顺序」按节拍写，每场 3—5 拍，每行使用：意图=… | 尝试=… | 阻碍=…。意图是某个人物此刻想达成的事，尝试是他为此做的一次行动或一句话，阻碍是挡住它的东西或落在别处的回应。一拍只放一个意图，不要把整场压成一拍，也不要用重复确认凑拍。
 - 「已知事实」只列已核实内容；不确定标「待定」并放入「勿擅自补写」。
 - 「叙述提醒」只写叙述距离、视角、段落密度等全局叙事选择。不得写某个角色的说话方式、口头禅、句长或对白示例；角色对白必须回到该角色的原始角色卡读取。
 - 「表达边界」只在设定术语容易污染普通叙述或对白时填写。每行使用：事实 | 用途=… | 精度=exact/normal/sensory | 叙述=… | 对白=… | 技术对白=… | 避免=…。它是语域和信息精度提示，不是固定同义词替换；未填写的栏目留空。
@@ -368,6 +446,71 @@ function emptyPack(sourceDraft: string, instruction?: string): WritePack {
     factAtoms: [],
     realizationBoundaries: [],
   };
+}
+
+/** Split a pipe row into normalized `key=value` pairs plus a leading bare label. */
+function parsePipeRow(raw: string): { label: string; values: Map<string, string> } {
+  const values = new Map<string, string>();
+  let label = "";
+  for (const piece of raw.split("|").map(item => item.trim()).filter(Boolean)) {
+    const separator = piece.indexOf("=");
+    if (separator < 0) {
+      if (!label) label = piece;
+      continue;
+    }
+    const key = piece.slice(0, separator).trim().toLocaleLowerCase();
+    const value = piece.slice(separator + 1).trim();
+    if (value) values.set(key, value);
+  }
+  return { label, values };
+}
+
+/** 知道／不知道／在隐瞒 are lists inside one cell; authors separate them freely. */
+function splitGateItems(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(/[；;、,，]+/u)
+    .map(item => item.trim().replace(/^无$|^没有$/u, ""))
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+/**
+ * Rows shaped `角色 | 知道=… | 不知道=… | 在隐瞒=…`. A row with a name but no
+ * epistemic field is dropped rather than rendered as an empty gate — a gate that
+ * says nothing would still read to the writer as a hard constraint.
+ */
+function parseKnowledgeGates(rows: string[]): KnowledgeGate[] {
+  const gates: KnowledgeGate[] = [];
+  for (const raw of rows.slice(0, 6)) {
+    const { label, values } = parsePipeRow(raw);
+    const character = (values.get("角色") ?? values.get("人物") ?? label).trim();
+    if (!character) continue;
+    const knows = splitGateItems(values.get("知道"));
+    const unknown = splitGateItems(values.get("不知道") ?? values.get("未知"));
+    const concealing = splitGateItems(values.get("在隐瞒") ?? values.get("隐瞒"));
+    if (!knows.length && !unknown.length && !concealing.length) continue;
+    gates.push({ character: character.slice(0, 40), knows, unknown, concealing });
+  }
+  return gates;
+}
+
+/**
+ * Rows shaped `意图=… | 尝试=… | 阻碍=…`. Unstructured event-order rows stay in
+ * beatOrder untouched, so an older draft model degrades to the previous behavior
+ * instead of losing its event sequence.
+ */
+function parseSceneBeats(rows: string[]): SceneBeat[] {
+  const beats: SceneBeat[] = [];
+  for (const raw of rows.slice(0, 8)) {
+    const { values } = parsePipeRow(raw);
+    const intent = values.get("意图") ?? values.get("intent") ?? "";
+    const attempt = values.get("尝试") ?? values.get("attempt") ?? "";
+    const obstacle = values.get("阻碍") ?? values.get("错位") ?? values.get("obstacle") ?? "";
+    if (!intent || !attempt || !obstacle) continue;
+    beats.push({ intent, attempt, obstacle });
+  }
+  return beats;
 }
 
 function parseRealizationBoundaries(
@@ -420,6 +563,15 @@ function parseRealizationBoundaries(
 function normalizeFactPrecision(value: string | undefined): FactPrecision | undefined {
   if (value === "exact" || value === "normal" || value === "sensory") return value;
   return undefined;
+}
+
+function formatKnowledgeGate(gate: KnowledgeGate): string {
+  const fields = [
+    gate.knows.length ? `知道：${gate.knows.join("、")}` : "",
+    gate.unknown.length ? `不知道：${gate.unknown.join("、")}` : "",
+    gate.concealing.length ? `在隐瞒：${gate.concealing.join("、")}` : "",
+  ].filter(Boolean);
+  return `- ${gate.character}｜${fields.join("；")}`;
 }
 
 function formatRealizationBoundary(boundary: RealizationBoundary): string {

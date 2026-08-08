@@ -35,7 +35,9 @@ export type DialogueTextureCode =
   | "dialogue_monotone"
   | "voice_uniform"
   | "construction_shared"
-  | "act_compliant";
+  | "act_compliant"
+  | "dialogue_question_hook"
+  | "dialogue_echo";
 
 export type DialogueTextureIssue = {
   code: DialogueTextureCode;
@@ -102,9 +104,21 @@ export type DialogueTexture = {
   issues: DialogueTextureIssue[];
 };
 
+/**
+ * Three bans carried over from the roleplay path's performance rules, where they
+ * are what keeps an exchange from collapsing into mutual confirmation. Kept as a
+ * module constant so both writing paths embed byte-identical text in their stable
+ * system slots rather than drifting apart.
+ */
+export const DIALOGUE_HARD_BANS = "对白硬禁令（三条，无例外）："
+  + "一、不把问句当续聊钩子。人物在眼前目标、关系或信息缺口确有需要时才提问；不得为确认理解、索取态度、把选择推给对方、镜像对方原话或维持对话而连发问题。没有必要追问时，用陈述、动作或留白收住。"
+  + "二、不复述对方原句。不得引用、改写或概括对方刚说过的话，也不得先汇报自己听懂了什么再回应；直接从这句话给自己造成的处境往下接。"
+  + "三、不解释情绪与动机。不写「她感到愤怒」「他意识到这意味着…」「这句话的意思是…」这类由叙述代为命名、翻译或总结的句子；情绪只经由动作、语速、停顿、看向哪里和说了什么呈现，让读者自己得出结论。";
+
 /** Dynamic craft contract shared by direct writing and evidence-grounded scenes. */
 export function dialogueNaturalnessGuidance(): string {
-  return "对白自然度契约（按本场语义选择，不是配额）：每个说话人先明确此刻想得到什么、知道什么、在回避什么，以及对上一句施加了什么压力；对白要承接或有意错开上一轮的信息。优先用答非所问、追问、让步、反问、改口、停顿、半句和省略表达关系变化，必要时才使用吧/啊/呢等语气词。省略要像人物在现场自然省掉双方已知成分，不能只为显得干脆、冷淡或机灵而把正常句子压成连续的“名词短语＋谓词”；上下文能猜懂不自动等于口语自然。不要批量补助词、随机换同义词、把所有人改成碎句，保留克制、正式或紧张场景中没有助词的自然说法。修订时只改有证据的对白及其最小邻近上下文，保持事实、知识和人物声线不变。";
+  return "对白自然度契约（按本场语义选择，不是配额）：每个说话人先明确此刻想得到什么、知道什么、在回避什么，以及对上一句施加了什么压力；对白要承接或有意错开上一轮的信息。优先用答非所问、追问、让步、反问、改口、停顿、半句和省略表达关系变化，必要时才使用吧/啊/呢等语气词。省略要像人物在现场自然省掉双方已知成分，不能只为显得干脆、冷淡或机灵而把正常句子压成连续的“名词短语＋谓词”；上下文能猜懂不自动等于口语自然。不要批量补助词、随机换同义词、把所有人改成碎句，保留克制、正式或紧张场景中没有助词的自然说法。修订时只改有证据的对白及其最小邻近上下文，保持事实、知识和人物声线不变。\n"
+    + DIALOGUE_HARD_BANS;
 }
 
 /** At or below this many chars a line is a beat, not an exchange. */
@@ -142,6 +156,25 @@ export const SHARED_CONSTRUCTION_MIN_LINES = 2;
  * one whose dialogue reads as everyone agreeing with everyone.
  */
 export const COMPLIANT_ACT_LIMIT = 0.18;
+
+/**
+ * Echo detection: a reply that reuses a run of the previous line verbatim.
+ *
+ * Three guards together, because a short repeat is a legitimate move — 「他没来
+ * 过？」 thrown back in disbelief is dialogue doing work, while a long reply built
+ * around the other speaker's own wording is the model restating before answering.
+ * So the run must be substantial (MIN chars), must dominate the shorter line
+ * (COVERAGE), and the echoing line must itself be long enough that it is not the
+ * short incredulous repeat. Only adjacent lines are compared; a callback three
+ * exchanges later is deliberate.
+ */
+const ECHO_MIN_RUN_CHARS = 4;
+const ECHO_MIN_COVERAGE = 0.4;
+const ECHO_MIN_LINE_CHARS = 8;
+/** Under this many hits it is a choice, not a habit. */
+const ECHO_REPORT_MIN = 2;
+/** Consecutive question pairs at or above this count read as a stalling hook. */
+const QUESTION_HOOK_REPORT_MIN = 3;
 
 /**
  * Act lexicon. Ordered by priority — the first category a line matches wins,
@@ -236,6 +269,25 @@ export function analyzeDialogueTexture(text: string, knownSpeakers: readonly str
       code: "act_compliant",
       message: `全章对白有 ${pct(stats.compliantActRatio)}% 是应答或承诺（分布：${stats.acts.join("、")}，参考上限 ${pct(COMPLIANT_ACT_LIMIT)}%）；人物大多在接受和表态，很少在争取自己的东西。让对白承担别的动作：有人索取，有人隐瞒，有人挑衅，有人答非所问，有人说了一件对方没问的事——尤其别让"我会/我去/我签/我认"这类表忠心的句子替代真正的谈判。`,
       examples: [],
+    });
+  }
+  const exchange = analyzeExchangeMoves(lines);
+  if (exchange.echoes.length >= ECHO_REPORT_MIN) {
+    issues.push({
+      code: "dialogue_echo",
+      message: `本章有 ${exchange.echoes.length} 处对白在回应前先复述了对方刚说过的话（原句成段照搬或换词转述）。`
+        + "人物不会向刚说完话的人重复他的话；他直接从这句话给自己造成的处境往下接——追问缺口、绕开、讨价还价或干脆不接。"
+        + "把复述那半句删掉，看剩下的部分是否还成立；若删掉后无话可说，说明这一轮本身没有推进，应改成对方真正抗拒或索取的内容。",
+      examples: exchange.echoes.slice(0, 4),
+    });
+  }
+  if (exchange.questionHooks.length >= QUESTION_HOOK_REPORT_MIN) {
+    issues.push({
+      code: "dialogue_question_hook",
+      message: `本章有 ${exchange.questionHooks.length} 处问句被用作续聊钩子（问句紧接问句，或用问句复述对方原话）。`
+        + "提问只在人物确有信息缺口、且这个缺口挡住他眼前目标时才成立；用来确认理解、索取态度、把选择推给对方或单纯维持对话的问句应当删掉。"
+        + "改成陈述、动作或留白：不追问时人物做点别的，让对方在沉默里自己补上。",
+      examples: exchange.questionHooks.slice(0, 4),
     });
   }
   const profiled = stats.speakers.filter(profile => profile.lines >= MIN_SPEAKER_LINES);
@@ -346,6 +398,64 @@ function attributeSpeaker(fragment: string): string | undefined {
     if (candidate.length >= 2 && !NON_NAME_TAG.test(candidate)) found = candidate;
   }
   return found;
+}
+
+/**
+ * Adjacent-pair moves that a whole-text regex sweep structurally cannot express:
+ * both bans are about what line N does to line N−1, so they need the ordered
+ * array rather than a pattern over the chapter.
+ *
+ * A pair is only examined when the two lines could plausibly be different
+ * speakers — when attribution is available and both lines belong to the same
+ * speaker, a repeated run is one character circling their own point, which is
+ * voice rather than echo.
+ */
+function analyzeExchangeMoves(lines: DialogueLine[]): { echoes: string[]; questionHooks: string[] } {
+  const echoes: string[] = [];
+  const questionHooks: string[] = [];
+  for (let index = 1; index < lines.length; index += 1) {
+    const previous = lines[index - 1];
+    const current = lines[index];
+    if (previous.speaker && current.speaker && previous.speaker === current.speaker) continue;
+    const isQuestion = /[？?]/u.test(current.content);
+    if (isQuestion && /[？?]/u.test(previous.content)) {
+      questionHooks.push(`${previous.content.slice(0, 24)} → ${current.content.slice(0, 24)}`);
+      continue;
+    }
+    if (current.content.length < ECHO_MIN_LINE_CHARS) continue;
+    const run = longestCommonRun(comparable(previous.content), comparable(current.content));
+    const shorter = Math.min(previous.content.length, current.content.length);
+    if (run.length < ECHO_MIN_RUN_CHARS || !shorter || run.length / shorter < ECHO_MIN_COVERAGE) continue;
+    const sample = `${previous.content.slice(0, 24)} → ${current.content.slice(0, 24)}（重复「${run}」）`;
+    if (isQuestion) questionHooks.push(sample);
+    else echoes.push(sample);
+  }
+  return { echoes, questionHooks };
+}
+
+/** Punctuation carries no wording, and long lines are capped to bound the DP. */
+function comparable(content: string): string {
+  return content.replace(/[\s，,。！!？?…、；;：:—–\-“”"「」『』（）()]/gu, "").slice(0, 120);
+}
+
+function longestCommonRun(a: string, b: string): string {
+  if (!a || !b) return "";
+  let best = 0;
+  let end = 0;
+  let previousRow = new Array<number>(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i += 1) {
+    const row = new Array<number>(b.length + 1).fill(0);
+    for (let j = 1; j <= b.length; j += 1) {
+      if (a[i - 1] !== b[j - 1]) continue;
+      row[j] = previousRow[j - 1] + 1;
+      if (row[j] > best) {
+        best = row[j];
+        end = i;
+      }
+    }
+    previousRow = row;
+  }
+  return a.slice(end - best, end);
 }
 
 function buildStats(lines: DialogueLine[], lengths: number[]): DialogueTextureStats {

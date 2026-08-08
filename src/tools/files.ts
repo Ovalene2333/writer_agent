@@ -2,7 +2,12 @@ import { documentBlocks } from "../document_blocks.js";
 import { isScenePipelineDocument } from "../project.js";
 import { buildNarrativeEvidencePacket } from "../narrative_evidence.js";
 import { collectRegisterRisksForContext } from "../register_risks.js";
-import { requestEvidenceGroundedProse } from "../evidence_grounded_writer.js";
+import {
+  EvidenceGroundedWriterError,
+  reportAndWrapEvidenceWriterError,
+  requestEvidenceGroundedProse,
+} from "../evidence_grounded_writer.js";
+import { reportModelCallUsage } from "../dependency_diagnostics.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { styleGroundingPrompt } from "../style_grounding.js";
 import type { ChangeSetFileOperation } from "../types.js";
@@ -349,27 +354,39 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
       reason: risk.reason,
     }));
   }
-  const generated = await run(writer.model, {
-    path,
-    outputKind: "document",
-    writePack: pack,
-    evidence,
-    ...(existingText ? { existingText } : {}),
-    styleEvidence: styleGroundingPrompt(args.project, args.store, {
-      intensive: true,
-      targetPath: path,
-      excludeProjectVoice: Boolean(existingText),
-      projectSampleRole: "continuity",
-    }),
-    targetCharacters: args.context.proseLength?.targetCharacters,
-    lengthMode: args.context.proseLength?.mode,
-    registerRisks,
-  }, { project: args.project, context: args.context }, writer.signal);
-  if (generated.usage) {
-    args.context.modelUsageReporter?.(writer.model, generated.usage, {
-      callKind: "evidence_grounded_document_writer",
-    });
+  let generated;
+  try {
+    generated = await run(writer.model, {
+      path,
+      outputKind: "document",
+      writePack: pack,
+      evidence,
+      ...(existingText ? { existingText } : {}),
+      styleEvidence: styleGroundingPrompt(args.project, args.store, {
+        intensive: true,
+        targetPath: path,
+        excludeProjectVoice: Boolean(existingText),
+        projectSampleRole: "continuity",
+      }),
+      targetCharacters: args.context.proseLength?.targetCharacters,
+      lengthMode: args.context.proseLength?.mode,
+      registerRisks,
+    }, { project: args.project, context: args.context }, writer.signal);
+  } catch (error) {
+    // Keep writePack compiled so the Agent can omit content and retry the same pack.
+    if (error instanceof EvidenceGroundedWriterError) {
+      throw reportAndWrapEvidenceWriterError(
+        error,
+        writer.model,
+        "evidence_grounded_document_writer",
+        args.context.modelUsageReporter,
+      );
+    }
+    throw error;
   }
+  reportModelCallUsage(args.context.modelUsageReporter, writer.model, generated.usage, {
+    callKind: "evidence_grounded_document_writer",
+  });
   const content = ensureDocumentHeading(path, existingText, generated.content);
   args.context.writePackCompiled = false;
   args.context.lastWritePack = undefined;
@@ -382,6 +399,7 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
     generationMode: "evidence_grounded_writer",
     evidenceHash: generated.evidenceHash,
     evidenceReads: generated.evidenceReads.length,
+    ...(generated.emptyAutoRetryUsed ? { emptyAutoRetryUsed: true } : {}),
   });
 }
 
