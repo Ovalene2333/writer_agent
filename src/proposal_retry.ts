@@ -4,8 +4,10 @@ import type { RepairPacket } from "./repair_packet.js";
 /** Compatibility name for the old scalar window; no longer used as a mixed-gate budget. */
 export const MAX_PROPOSAL_SUBMISSIONS_PER_REVISION_WINDOW = 3;
 export const MAX_REPEATED_SEMANTIC_NO_PROGRESS = 2;
-export const MAX_DETERMINISTIC_GATE_ATTEMPTS = 3;
-export const MAX_PROPOSAL_SUBMISSIONS_PER_DELIVERABLE = 12;
+/** Per deterministic gate (style/rhythm/length): stop auto-retry sooner; prefer deliver + optional skill repair. */
+export const MAX_DETERMINISTIC_GATE_ATTEMPTS = 2;
+/** Absolute per-deliverable rail against oscillation across gates. */
+export const MAX_PROPOSAL_SUBMISSIONS_PER_DELIVERABLE = 6;
 export const PROPOSAL_REVISION_MISSING_DOCUMENT_HASH = "__missing__";
 
 export type ProposalRetryGate = "style" | "rhythm" | "length" | "semantic_review" | "proposal";

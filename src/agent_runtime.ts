@@ -8,6 +8,7 @@ export {
   readSkillResource,
   routeProjectSkills,
   skillsCatalogPrompt,
+  styleSkillBriefPrompt,
 } from "./skill_runtime.js";
 export type {
   ProjectSkill,

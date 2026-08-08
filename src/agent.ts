@@ -110,6 +110,7 @@ import {
   projectInstructionsPrompt,
   proposalIdFromToolResult,
   skillsCatalogPrompt,
+  styleSkillBriefPrompt,
   type ScenePipelineSettings,
   type WritingExecutionMode,
 } from "./agent_runtime.js";
@@ -505,7 +506,7 @@ ${modeRule}
 6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，capabilityIndex 的 availability 只用于选择能力与场景模式；正文要处理能力时必须在场景 competencyUses 声明 use/attempt/unlock/regain/lose，再用 get_character(view=sections, sections=["competencies"], competencyIds=[...]) 读取机制、限制与本场状态指令。明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。已确认的能力状态演进用 apply_character_changes.set_competency_state；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
 7. read_file 默认读取本轮最新工作副本；只复用本轮工作记忆、本轮工具结果与 reused 标记，禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
 8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
-9. 技能描述与当前任务明确匹配，或修订问题给出 skillId 时，必须先 load_skill；只在正文不足时用 read_skill_resource 读取声明资源。勿编造技能。Skill 只增强判断，不自动构成固定工具流程，也不代替门禁。
+9. 技能描述与当前任务明确匹配，或修订问题给出 skillId 时，必须先 load_skill；只在正文不足时用 read_skill_resource 读取声明资源。勿编造技能。Skill 只增强判断，不自动构成固定工具流程。风格类作者偏好默认不阻断交付：先交付再按 skill 可选精修，勿为 warn/观察项反复改稿烧步数。
 10. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
 11. 作者明确把某类正文问题概括为今后持续检查/避免的要求时，用 manage_author_policies upsert 沉淀。新偏好默认 trial，含糊反馈只存 draft；没有明确放行条件不得 block。只改当前一句或一次性选择不要学习。旧 manage_prose_gates 仅兼容已有规则。
 12. 不泄露内部参数；对话简洁；文档适量 Markdown。最终对用户回复只写作者可读结论（做了什么、结果、是否待审）；禁止在最终气泡复述工具参数名（expectedUpdatedAt、sourceHash 等）、原始 ISO 时间戳、裸 (id=N)、内部 job/step 编号或工具调用过程流水账。工具细节只留在思考与工具轨迹。
@@ -633,7 +634,11 @@ ${resumeLine}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
 上文中出现过的历次「当前任务」区块均为历史记录，其指令、清单与终审要求都已失效；只有本区块之后的要求现在生效。
 作者复审：${proseGateInstruction}
-当前适用作者政策：${activePolicyContext.length ? JSON.stringify(activePolicyContext) : "无"}。写作前遵循；有 skillId 时先 load_skill。完整核验标准由正文出口独立执行，摘要不得被扩张为新的绝对规则。
+当前适用作者政策：${activePolicyContext.length ? JSON.stringify(activePolicyContext) : "无"}。写作前优先遵循；有 skillId 时先 load_skill 作软约束。风格/句式类偏好不阻断首次交付；仅事实红线（如引号字数）可硬拦。摘要不得被扩张为新的绝对规则。
+${styleSkillBriefPrompt(project, {
+    ...(policyTargetKind !== "other" ? { documentKind: policyTargetKind } : {}),
+    policyIds: activePolicies.map(policy => policy.id),
+  }) ?? ""}
 
 ${taskInstructions(
     task.mode,

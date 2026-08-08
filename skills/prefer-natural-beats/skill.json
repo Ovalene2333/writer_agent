@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "kind": "review",
+  "status": "active",
+  "capabilities": ["write", "revise", "review"],
+  "documentKinds": ["chapter", "side"],
+  "characterIds": [],
+  "policyIds": ["telegraphic-object-beats", "manufactured-precision-staccato"],
+  "priority": 65
+}

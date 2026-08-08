@@ -3,9 +3,22 @@
   "version": 1,
   "kind": "workflow",
   "status": "active",
-  "capabilities": ["review", "revise", "audit"],
-  "documentKinds": ["chapter", "side", "lore", "outline", "archive", "other"],
+  "capabilities": [
+    "review",
+    "revise",
+    "audit"
+  ],
+  "documentKinds": [
+    "chapter",
+    "side",
+    "lore",
+    "outline",
+    "archive",
+    "other"
+  ],
   "characterIds": [],
-  "policyIds": [],
+  "policyIds": [
+    "quoted-text-count-consistency"
+  ],
   "priority": 90
 }

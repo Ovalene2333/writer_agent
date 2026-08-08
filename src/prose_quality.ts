@@ -329,7 +329,8 @@ export function newProseStyleIssues(before: string, after: string): ProseStyleIs
 
 /**
  * 提案硬拦截：只拦“新增且被升级为 error”的硬说明问题。
- * 普通 warning（含多数破折号）不拦截提交。
+ * 普通 warning（含多数破折号、作者风格偏好 learned_rule）不拦截提交。
+ * 风格偏好改为交付后可选修订，避免把自动修订预算烧在句式偏好上。
  */
 export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undefined {
   const errors = hardProseStyleErrors(issues);
@@ -342,8 +343,33 @@ export function proseStyleIssuesError(issues: ProseStyleIssue[]): string | undef
   return formatProseStyleBlockError(errors, headline);
 }
 
+/**
+ * Delivery hard errors only.
+ * `learned_rule` is advisory unless it is a factual red-line with severity=error
+ * (currently only quoted-text-count-consistency can be error-level).
+ */
 function hardProseStyleErrors(issues: readonly ProseStyleIssue[]): ProseStyleIssue[] {
-  return issues.filter(issue => issue.severity === "error" && HARD_BLOCK_SUBTYPES.has(issue.subtype));
+  return issues.filter(issue => {
+    if (issue.severity !== "error" || !HARD_BLOCK_SUBTYPES.has(issue.subtype)) return false;
+    // Aesthetic learned preferences must never block first delivery.
+    if (issue.subtype === "learned_rule" && issue.policyId && issue.policyId !== "quoted-text-count-consistency") {
+      return false;
+    }
+    if (issue.subtype === "learned_rule" && !issue.policyId) {
+      // Built-in style preferences projected as learned without policyId: never block.
+      const redLine = /quoted-text-count-consistency/u.test(issue.id) || /quoted-text-count/u.test(issue.reason);
+      return redLine;
+    }
+    return true;
+  });
+}
+
+/** Non-blocking style / author-preference hits for optional post-delivery repair. */
+export function proseStyleAdvisoryIssues(issues: readonly ProseStyleIssue[]): ProseStyleIssue[] {
+  return issues.filter(issue => {
+    if (issue.severity === "error" && hardProseStyleErrors([issue]).length) return false;
+    return issue.severity === "warning" || issue.severity === "error" || issue.subtype === "learned_rule";
+  }).slice(0, 40);
 }
 
 /**

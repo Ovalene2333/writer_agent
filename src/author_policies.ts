@@ -272,35 +272,49 @@ export function loadAuthorPolicyFeedback(project: WriterProject, policyIdValue?:
   return (value as AuthorPolicyFeedback[]).filter(row => !id || row.policyId === id).slice(-500);
 }
 
+/**
+ * Compile author policies into gate rules.
+ * Delivery hard-block is reserved for factual red lines (see DELIVERY_HARD_BLOCK_RULE_IDS).
+ * Aesthetic / cadence policies stay advisory even when the author set enforcement=block:
+ * they feed skills and style observations, not automatic revision loops.
+ */
 export function authorPolicyGateRules(project: WriterProject): ProseGateRule[] {
   return loadAuthorPolicies(project)
     .filter(policy => policy.status === "trial" || policy.status === "active")
     .slice(0, MAX_ACTIVE_AUTHOR_POLICIES)
-    .map(policy => ({
-      id: `policy-${policy.id}`,
-      label: policy.title,
-      instruction: [
-        policy.semanticCriterion,
-        `证据要求：${policy.evidenceRequirement}`,
-        policy.allowConditions.length ? `放行条件：${policy.allowConditions.join("；")}` : "",
-        policy.status === "trial" ? "当前为试运行：只记录确定命中，不得阻断交付。" : "",
-      ].filter(Boolean).join("\n").slice(0, 2_400),
-      revisionIntent: policy.revisionIntent,
-      kind: policy.enforcement === "block" && policy.status === "active" ? "hard_gate" : "style_preference",
-      severity: policy.enforcement === "block" && policy.status === "active" ? "block" : "warn",
-      enabled: true,
-      builtIn: false,
-      documentKinds: policy.scope.documentKinds,
-      pathPrefixes: policy.scope.pathPrefixes,
-      sourceFeedback: policy.sourceFeedback,
-      createdAt: policy.createdAt,
-      updatedAt: policy.updatedAt,
-      policyId: policy.id,
-      policyVersion: policy.version,
-      ...(policy.skillId ? { skillId: policy.skillId } : {}),
-      enforcement: policy.enforcement,
-      policyStatus: policy.status as "trial" | "active",
-    }));
+    .map(policy => {
+      const redLine = policy.id === "quoted-text-count-consistency"
+        && policy.enforcement === "block"
+        && policy.status === "active";
+      return {
+        id: `policy-${policy.id}`,
+        label: policy.title,
+        instruction: [
+          policy.semanticCriterion,
+          `证据要求：${policy.evidenceRequirement}`,
+          policy.allowConditions.length ? `放行条件：${policy.allowConditions.join("；")}` : "",
+          policy.status === "trial" ? "当前为试运行：只记录确定命中，不得阻断交付。" : "",
+          !redLine && policy.enforcement === "block"
+            ? "交付策略：风格类偏好不阻断首次交付，仅作观察与可选修订。"
+            : "",
+        ].filter(Boolean).join("\n").slice(0, 2_400),
+        revisionIntent: policy.revisionIntent,
+        kind: redLine ? "hard_gate" as const : "style_preference" as const,
+        severity: redLine ? "block" as const : "warn" as const,
+        enabled: true,
+        builtIn: false,
+        documentKinds: policy.scope.documentKinds,
+        pathPrefixes: policy.scope.pathPrefixes,
+        sourceFeedback: policy.sourceFeedback,
+        createdAt: policy.createdAt,
+        updatedAt: policy.updatedAt,
+        policyId: policy.id,
+        policyVersion: policy.version,
+        ...(policy.skillId ? { skillId: policy.skillId } : {}),
+        enforcement: policy.enforcement,
+        policyStatus: policy.status as "trial" | "active",
+      };
+    });
 }
 
 const POLICY_COMPILER_SYSTEM = `你是小说作者政策编译器。把作者的自然语言反馈整理成一项可确认、可试运行的写作政策，不直接修改正文。

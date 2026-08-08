@@ -3,9 +3,18 @@
   "version": 1,
   "kind": "review",
   "status": "active",
-  "capabilities": ["write", "review", "revise", "audit"],
-  "documentKinds": ["chapter", "side"],
+  "capabilities": [
+    "write",
+    "review",
+    "revise"
+  ],
+  "documentKinds": [
+    "chapter",
+    "side"
+  ],
   "characterIds": [],
-  "policyIds": [],
-  "priority": 75
+  "policyIds": [
+    "manufactured-precision-staccato"
+  ],
+  "priority": 68
 }

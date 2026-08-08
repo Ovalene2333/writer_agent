@@ -35,6 +35,23 @@ export interface ProseGateRule {
   policyStatus?: "trial" | "active";
 }
 
+/**
+ * Only factual / countable red lines may hard-block delivery.
+ * Aesthetic, cadence, and “generation smell” rules stay as soft preferences:
+ * they advise writing/skills, and never burn automatic revision budgets.
+ */
+export const DELIVERY_HARD_BLOCK_RULE_IDS = new Set<string>([
+  "quoted-text-count-consistency",
+]);
+
+/** Whether a gate rule may refuse document delivery (vs advisory-only). */
+export function proseGateRuleBlocksDelivery(rule: Pick<ProseGateRule, "id" | "policyId" | "severity" | "enabled" | "kind">): boolean {
+  if (rule.enabled === false) return false;
+  if (rule.severity !== "block") return false;
+  const id = rule.policyId ?? rule.id.replace(/^policy-/u, "");
+  return DELIVERY_HARD_BLOCK_RULE_IDS.has(id) || DELIVERY_HARD_BLOCK_RULE_IDS.has(rule.id);
+}
+
 export const BUILT_IN_PROSE_GATE_RULES: readonly ProseGateRule[] = [
   {
     id: "quoted-text-count-consistency",
@@ -56,30 +73,31 @@ export const BUILT_IN_PROSE_GATE_RULES: readonly ProseGateRule[] = [
     label: "电报式物件短拍",
     instruction: "复审正文（叙述和对白）的缩句生成味。以下任一情况违规：同一段或相邻段反复把物件、环境或人物名词加一个裸动作/状态切成独立节拍，以机械播报代替人物感知、反应、因果或局面变化；连续把本可自然说清的主谓、动作对象、感受来源或比较维度压成“名词短语＋一个谓词”，即使读者能靠上下文猜出关系，成片出现后仍像提纲字段；对白为了显得干脆、冷淡或机灵，反复省掉正常承接，或把抽象归属、责任、资格式判断硬扣到具体物件上制造短梗；省略必要成分后无法从紧邻上下文唯一还原。不要因为句子短、没有宾语或使用汉语零形回指就单独判错；不及物句、偶发重音、紧张高潮、自然问答，以及人物身份和当下压力真正支持的省略应放行。连续命中时 evidence 引用能呈现该模式的最短连续原文，不能只摘一个短句。",
     revisionIntent: "恢复自然的人物感知、主谓关系、动作对象、比较维度或对白承接；至少展开一处被连续压扁的关系，删除只为制造机锋的抽象归属，但保留紧张处重音和自然口语省略。",
-    kind: "hard_gate",
-    severity: "block",
+    // Soft preference: guides skills / pre-write brief; never hard-blocks delivery.
+    kind: "style_preference",
+    severity: "warn",
     enabled: true,
     builtIn: true,
     documentKinds: ["chapter", "side", "writing_example"],
     pathPrefixes: [],
     sourceFeedback: "作者反馈：限制连续物件短拍，以及“局部能猜懂、整体仍像提纲”的关系压缩；包括为冷淡机锋把正常对白压成名词短语加谓词，或把抽象归属硬扣到物件上。",
     createdAt: "2026-07-31T00:00:00.000Z",
-    updatedAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-08-08T00:00:00.000Z",
   },
   {
     id: "characterization-proof-stacking",
     label: "人物特质堆叠证明",
     instruction: "逐段复审人物塑造是否在相邻一至三句中，连续用多个高光成绩或机敏动作、群体围观认可、无具体身份和目的的旁人点题对白，反复证明同一个人物特质。只有后续项没有引入新的阻力、后果、关系行动或必要事实，而主要在为同一标签加码时才违规。每项行动确实改变不同条件、人物互动有独立目的、作品明确需要简短概述或蒙太奇时应放行。命中时 evidence 引用能呈现“行动证明→外部背书→点题定性”的最短连续二至四句，不得只摘一个普通句式。",
     revisionIntent: "保留一处最能改变现场的具体选择及其后果；删除重复的高光罗列、群体背书或点题定性，必要设定应落到有身份和目的的人物互动。",
-    kind: "hard_gate",
-    severity: "block",
+    kind: "style_preference",
+    severity: "warn",
     enabled: true,
     builtIn: true,
     documentKinds: ["chapter", "side", "writing_example"],
     pathPrefixes: [],
     sourceFeedback: "作者反馈：连续用能力展示、群体认可和路人点题对白为同一人物标签盖章，会形成履历式、宣传文案式生成感。",
     createdAt: "2026-08-02T00:00:00.000Z",
-    updatedAt: "2026-08-02T00:00:00.000Z",
+    updatedAt: "2026-08-08T00:00:00.000Z",
   },
   {
     id: "manufactured-precision-staccato",
@@ -194,6 +212,23 @@ function loadPersistedProseGateRules(project: WriterProject): ProseGateRule[] {
   return [...merged.values()].slice(0, PROSE_GATE_PROJECT_RULE_CAPACITY + BUILT_IN_PROSE_GATE_RULES.length);
 }
 
+/** Soft-demote aesthetic hard gates so legacy prose-gates.json cannot re-arm delivery blocks. */
+export function normalizeDeliverySeverity(rule: ProseGateRule): ProseGateRule {
+  if (proseGateRuleBlocksDelivery(rule)) return rule;
+  if (rule.severity !== "block" && rule.kind !== "hard_gate") return rule;
+  return {
+    ...rule,
+    kind: "style_preference",
+    severity: "warn",
+  };
+}
+
+/** Soft style preference rules for write-pack / skill briefs (never delivery-blocking). */
+export function listStylePreferenceRules(project: WriterProject): ProseGateRule[] {
+  return loadProseGateRules(project).filter(rule =>
+    rule.enabled && rule.kind === "style_preference" && rule.severity !== "block");
+}
+
 export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
   const policyRules = authorPolicyGateRules(project);
   // AuthorPolicy is the single runtime authority. A legacy rule with the same
@@ -203,7 +238,9 @@ export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
   return [
     ...loadPersistedProseGateRules(project).filter(rule => !rule.retired && !policyIds.has(rule.id)),
     ...policyRules,
-  ].slice(0, MAX_PROSE_GATE_RULES);
+  ]
+    .map(normalizeDeliverySeverity)
+    .slice(0, MAX_PROSE_GATE_RULES);
 }
 
 function saveProseGateRules(project: WriterProject, rules: ProseGateRule[]): void {

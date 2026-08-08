@@ -101,7 +101,9 @@ test("policy projection is the single runtime authority over duplicate legacy ru
     const effective = loadProseGateRules(project).filter(rule => rule.policyId === "telegraphic-object-beats");
     assert.equal(effective.length, 1);
     assert.equal(effective[0]?.policyId, "telegraphic-object-beats");
-    assert.equal(effective[0]?.severity, "block");
+    // Aesthetic preferences never hard-block delivery even if enforcement=block.
+    assert.equal(effective[0]?.severity, "warn");
+    assert.equal(effective[0]?.kind, "style_preference");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

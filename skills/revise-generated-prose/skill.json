@@ -3,9 +3,20 @@
   "version": 1,
   "kind": "review",
   "status": "active",
-  "capabilities": ["write", "review", "revise", "audit"],
-  "documentKinds": ["chapter", "side"],
+  "capabilities": [
+    "write",
+    "review",
+    "revise",
+    "audit"
+  ],
+  "documentKinds": [
+    "chapter",
+    "side"
+  ],
   "characterIds": [],
-  "policyIds": [],
+  "policyIds": [
+    "telegraphic-object-beats",
+    "characterization-proof-stacking"
+  ],
   "priority": 70
 }

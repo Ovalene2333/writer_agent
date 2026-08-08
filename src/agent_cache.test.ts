@@ -865,18 +865,10 @@ test("proposal retry policy counts only same semantic blockers as no progress", 
     error: "句式门禁",
   }, style.state);
   assert.equal(styleTwice.state.gateAttempts.style, 2);
+  assert.equal(styleTwice.action, "pause", "style auto-retry stops at MAX_DETERMINISTIC_GATE_ATTEMPTS");
+  assert.equal(styleTwice.action === "pause" ? styleTwice.exhaustion : "", "gate_attempts");
 
-  const repairedStyle = decideProposalFailure({
-    code: "PROSE_STYLE_REVISION_REQUIRED",
-    failureKind: "semantic_revision",
-    error: "修订后出现新的句式候选",
-  }, styleTwice.state, proposalIssueTransition(
-    [{ id: "style:old" }],
-    [{ id: "style:new" }],
-  ));
-  assert.equal(repairedStyle.action, "revise");
-  assert.equal(repairedStyle.state.gateAttempts.style, 1, "resolved style blockers restart the failure streak");
-
+  // After a style pause, reaching semantic review on a later path still clears deterministic streaks.
   const issueA = { id: "issue:a" };
   const firstSemantic = decideProposalFailure({
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",

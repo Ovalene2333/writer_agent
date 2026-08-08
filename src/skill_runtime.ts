@@ -267,13 +267,27 @@ export function loadSkillById(project: WriterProject, id: string): ProjectSkill 
 
 export function skillsCatalogPrompt(project: WriterProject): string | undefined {
   const skills = listProjectSkills(project)
-    .filter(skill => skill.manifest.status === "active" || skill.manifest.status === "trial");
+    .filter(skill => skill.manifest.status === "active" || skill.manifest.status === "trial")
+    .sort((left, right) => right.manifest.priority - left.manifest.priority || left.id.localeCompare(right.id));
   if (!skills.length) return undefined;
   const lines = skills.map(skill => {
-    const state = skill.manifest.status === "trial" ? " [试运行]" : "";
-    return `- ${skill.id}${state}：${skill.description}`;
+    const state = skill.manifest.status === "trial" ? "试运行" : "可用";
+    const caps = skill.manifest.capabilities.join("/");
+    const when = skill.manifest.kind === "workflow"
+      ? "流程"
+      : skill.manifest.kind === "review" || skill.manifest.kind === "voice"
+        ? "写前/精修"
+        : skill.manifest.kind;
+    const policies = skill.manifest.policyIds.length
+      ? `；政策 ${skill.manifest.policyIds.slice(0, 4).join(",")}`
+      : "";
+    return `- ${skill.id} [${state}|${when}|${caps}${policies}]：${skill.description}`;
   });
-  return `可用项目技能（技能描述与任务匹配或修订问题指定 skillId 时，调用 load_skill；资源按需分页读取）：\n${lines.join("\n")}`;
+  return [
+    "可用项目技能（描述匹配任务、交付后可选精修、或修订问题给出 skillId 时，调用 load_skill；资源用 read_skill_resource 分页读取）：",
+    "选用原则：先交付正文；风格偏好用 write/revise 类 skill 软约束，勿把 warn 当硬门禁反复改稿。",
+    ...lines,
+  ].join("\n");
 }
 
 /** Deterministic scope stage. The Agent performs the semantic choice among candidates. */
@@ -305,11 +319,50 @@ export function routeProjectSkills(project: WriterProject, input: SkillRouteInpu
     }
     const forced = explicit.has(skill.id)
       || skill.manifest.policyIds.some(id => policyIds.has(id));
+    // Write/revise soft-preference skills surface as candidates, never auto-required
+    // solely by policy link, unless the Agent explicitly asked for that skillId.
+    // This keeps delivery-first: policy hits suggest skills; they don't mandate a workflow.
+    if (forced && !explicit.has(skill.id) && (input.capability === "write" || input.capability === "revise")
+      && skill.manifest.kind !== "workflow") {
+      candidates.push(skill);
+      continue;
+    }
     (forced ? required : candidates).push(skill);
   }
   const byPriority = (left: ProjectSkill, right: ProjectSkill) => right.manifest.priority - left.manifest.priority
     || left.id.localeCompare(right.id);
   return { required: required.sort(byPriority), candidates: candidates.sort(byPriority), excluded };
+}
+
+/** Compact pre-write brief from active style-preference skills (soft constraints). */
+export function styleSkillBriefPrompt(project: WriterProject, input?: {
+  documentKind?: DocumentKind;
+  policyIds?: string[];
+}): string | undefined {
+  const routed = routeProjectSkills(project, {
+    capability: "write",
+    ...(input?.documentKind ? { documentKind: input.documentKind } : {}),
+    ...(input?.policyIds?.length ? { policyIds: input.policyIds } : {}),
+  });
+  const picks = [...routed.required, ...routed.candidates]
+    .filter(skill => skill.manifest.kind === "review" || skill.manifest.kind === "voice"
+      || skill.manifest.policyIds.length > 0
+      || skill.id === "prefer-natural-beats"
+      || skill.id === "chapter-delivery")
+    .slice(0, 4);
+  if (!picks.length) return undefined;
+  const lines = picks.map(skill => {
+    const bodyLines = skill.body.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+    const firstPositive = bodyLines.find(line =>
+      (/^[-*]\s+/u.test(line) || /^\d+\.\s+/u.test(line))
+      && !/不要|禁止|勿/u.test(line));
+    const tip = (firstPositive?.replace(/^[-*]\s+|^\d+\.\s+/u, "") || skill.description).slice(0, 160);
+    return `- ${skill.id}：${tip}`;
+  });
+  return [
+    "写前风格 skill 摘要（软约束，不阻断交付；需要细则时 load_skill）：",
+    ...lines,
+  ].join("\n");
 }
 
 function safeResourcePath(skill: ProjectSkill, resourcePath: string): string {

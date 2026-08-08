@@ -12,7 +12,7 @@ import type { ModelConfig, ModelTokenUsage } from "./types.js";
 import { parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { nonThinkingRequestOptions, samplingRequestOptions } from "./model_compat.js";
 import { buildProviderCompletionBody, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody } from "./model_api.js";
-import { MAX_PROSE_GATE_RULES, type ProseGateRule } from "./prose_gate_rules.js";
+import { MAX_PROSE_GATE_RULES, proseGateRuleBlocksDelivery, type ProseGateRule } from "./prose_gate_rules.js";
 import { ToolDependencyError } from "./tool_failure.js";
 import {
   PROSE_CONSTRUCTION_RULES,
@@ -547,7 +547,8 @@ evidence 必须逐字复制自对应 passage：单句足以证明时只引一句
         id: `learned:${rule.id}:${start}`,
         kind: "learned" as const,
         subtype: "learned_rule" as const,
-        severity: rule.severity === "block" ? "error" as const : "warning" as const,
+        // Soft preferences stay warnings even if a legacy rule still says "block".
+        severity: proseGateRuleBlocksDelivery(rule) ? "error" as const : "warning" as const,
         confidence: 0.98,
         start,
         end: start + finding.evidence.length,
@@ -631,7 +632,7 @@ export function deterministicLearnedProseGateIssues(
       id: `learned:${rule.id}:${start}`,
       kind: "learned",
       subtype: "learned_rule",
-      severity: rule.severity === "block" ? "error" : "warning",
+      severity: proseGateRuleBlocksDelivery(rule) ? "error" : "warning",
       confidence: 1,
       start,
       end: start + evidence.length,
