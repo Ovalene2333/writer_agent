@@ -2055,6 +2055,38 @@ function proposalRevisionIssues(
   return issues.slice(0, 8);
 }
 
+/** Normalize deterministic gate packets into the same stable issue ledger used
+ * by semantic review. Raw scanner IDs often contain line offsets; using the
+ * evidence/problem fingerprint prevents a repaired line move from looking like
+ * an entirely unrelated blocker on the next retry. */
+function proposalRepairPacketIssues(
+  packet: RepairPacket | undefined,
+  previous: readonly ProposalRevisionIssue[] = [],
+): ProposalRevisionIssue[] {
+  if (!packet?.issues.length) return [];
+  return packet.issues.slice(0, 8).map(issue => {
+    const evidence = issue.oldText ?? issue.evidence ?? "";
+    const kind = issue.policyId ? `policy:${issue.policyId}` : issue.kind;
+    const stableId = proposalRevisionIssueId({
+      kind,
+      evidence: evidence ? [evidence] : [issue.id],
+      problem: issue.problem ?? issue.action ?? issue.suggestion ?? issue.id,
+    });
+    const prior = previous.find(item => item.id === stableId
+      || (evidence.length > 0 && item.evidence.some(value => value === evidence)));
+    return {
+      id: prior?.id ?? stableId,
+      severity: "blocker",
+      kind,
+      evidence: evidence ? [evidence] : [],
+      ...(issue.oldText ? { oldText: issue.oldText } : {}),
+      problem: issue.problem ?? "门禁要求局部修订",
+      action: issue.action ?? issue.suggestion ?? "按修订包做最小改动",
+      ...(prior ? { priorIssueId: prior.id, origin: "unresolved_prior" as const } : {}),
+    };
+  });
+}
+
 function semanticRepairPacket(
   draft: { path?: string; sourceHash: string },
   issues: readonly ProposalRevisionIssue[] | undefined,
@@ -2124,9 +2156,7 @@ export function saveProposalRevisionCase(
     throw new Error("首次创建提案修订案例前未捕获目标文档基线");
   }
   const semanticVerdict = options?.semanticVerdict === true;
-  const unresolvedIssues = semanticVerdict
-    ? semanticIssues ?? []
-    : previous?.unresolvedIssues ?? [];
+  const unresolvedIssues = semanticIssues ?? previous?.unresolvedIssues ?? [];
   const repairPacket = repairPacketForDraft(
     options?.repairPacket ? normalizeRepairPacket(options.repairPacket) : undefined,
     draft,
@@ -2164,11 +2194,9 @@ export function saveProposalRevisionCase(
     retryState,
     unresolvedIssues,
     ...(repairPacket ? { repairPacket } : {}),
-    resolvedIssueIds: semanticVerdict ? transition?.resolvedIssueIds ?? [] : previous?.resolvedIssueIds ?? [],
-    stillPresentIssueIds: semanticVerdict ? transition?.stillPresentIssueIds ?? [] : previous?.stillPresentIssueIds ?? [],
-    newlyIntroducedIssueIds: semanticVerdict
-      ? transition?.newlyIntroducedIssueIds ?? []
-      : previous?.newlyIntroducedIssueIds ?? [],
+    resolvedIssueIds: transition?.resolvedIssueIds ?? previous?.resolvedIssueIds ?? [],
+    stillPresentIssueIds: transition?.stillPresentIssueIds ?? previous?.stillPresentIssueIds ?? [],
+    newlyIntroducedIssueIds: transition?.newlyIntroducedIssueIds ?? previous?.newlyIntroducedIssueIds ?? [],
     status: "blocked" as const,
     retention: "executable" as const,
   };
@@ -2536,14 +2564,45 @@ function legacyErrorLinesFromToolResult(result: Record<string, unknown>): string
 }
 
 /**
- * Keep an actionable database lookup key beside every abnormal terminal turn.
- * The same value is already persisted on message_step_trails/model_usage/context_nodes.
+ * Terminal user-visible text only. Job id / timestamps stay off the message body
+ * and are exposed via the UI job metadata menu (message_step_trails.job_id).
  */
-export function appendTerminalJobReference(content: string, jobId?: string): string {
-  const body = content.trim();
-  const id = jobId?.trim();
-  if (!id) return body;
-  return `${body}${body ? "\n\n" : ""}Job ID: ${id}`;
+export function appendTerminalJobReference(content: string, _jobId?: string): string {
+  return content.trim();
+}
+
+const HIDDEN_ASSISTANT_PLACEHOLDERS = new Set([
+  "[工具调用已隐藏]",
+  "[本步未调用工具]",
+  "[本步未调用终审工具]",
+]);
+
+export function isVisibleAssistantText(text: string): boolean {
+  const trimmed = text.trim();
+  return Boolean(trimmed) && !HIDDEN_ASSISTANT_PLACEHOLDERS.has(trimmed);
+}
+
+/** Compact user-visible summary when a document-delivery job finishes without prose. */
+export function documentDeliveryCompletionMessage(
+  deliverables: ReadonlyArray<{ label?: string; evidence?: { path?: string } | null }>,
+  fallbackPath?: string,
+): string {
+  const paths = deliverables
+    .map(item => item.evidence?.path?.trim())
+    .filter((path): path is string => Boolean(path));
+  if (paths.length > 1) {
+    return `已交付 ${paths.length} 份文档：\n${paths.map(path => `- ${path}`).join("\n")}`;
+  }
+  if (paths.length === 1) return `已交付 ${paths[0]}。`;
+  if (fallbackPath?.trim()) return `已交付 ${fallbackPath.trim()}。`;
+  const labels = deliverables
+    .map(item => item.label?.trim())
+    .filter((label): label is string => Boolean(label));
+  if (labels.length > 1) {
+    return `已交付 ${labels.length} 份文档：\n${labels.map(label => `- ${label}`).join("\n")}`;
+  }
+  if (labels.length === 1) return `已交付 ${labels[0]}。`;
+  return "文档交付已完成。";
 }
 
 function toolResultRequestsPause(result: Record<string, unknown> | undefined): boolean {
@@ -4358,11 +4417,11 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
               const gate = proposalFailureGate(parsed);
               const reviewResult = parsed;
               const repairPacket = normalizeRepairPacket(reviewResult.repairPacket);
-              const semanticIssues = gate === "semantic_review"
+              const gateIssues = gate === "semantic_review"
                 ? proposalRevisionIssues(reviewResult, proposalRevisionBeforeCall?.unresolvedIssues)
-                : undefined;
-              const issueTransition = gate === "semantic_review"
-                ? proposalIssueTransition(proposalRevisionBeforeCall?.unresolvedIssues ?? [], semanticIssues ?? [])
+                : proposalRepairPacketIssues(repairPacket, proposalRevisionBeforeCall?.unresolvedIssues);
+              const issueTransition = gate && (gateIssues.length || proposalRevisionBeforeCall?.unresolvedIssues.length)
+                ? proposalIssueTransition(proposalRevisionBeforeCall?.unresolvedIssues ?? [], gateIssues)
                 : undefined;
               const decision = decideProposalFailure(parsed, currentRetryState, issueTransition);
               const retryStateChanged = decision.state.absoluteSubmissions !== currentRetryState.absoluteSubmissions
@@ -4393,7 +4452,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                     caseGate,
                     decision.state,
                     caseAttempt,
-                    semanticIssues,
+                    gateIssues,
                     issueTransition,
                     proposalDocumentBaseBeforeCall,
                     store,
@@ -4917,16 +4976,33 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       return;
     }
     if (documentProposalSubmitted) {
+      let persistedVisibleReply = false;
       try {
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
           if (msg.role === "assistant") {
             const text = messageContentText(msg.content).trim();
-            if (text) persistAssistantMessage(text);
+            if (isVisibleAssistantText(text)) {
+              persistAssistantMessage(text);
+              persistedVisibleReply = true;
+            }
           }
         }
-        if (toolContext.generatedAttachments?.length) persistAssistantMessage("图片已生成。");
+        if (toolContext.generatedAttachments?.length) {
+          persistAssistantMessage("图片已生成。");
+          persistedVisibleReply = true;
+        }
       } catch { /* 消息保存失败不影响流程 */ }
+      const deliverySummary = documentDeliveryCompletionMessage(
+        agentLoop.snapshot.deliverables,
+        submittedProposalRef?.path,
+      );
+      if (!persistedVisibleReply) {
+        try {
+          persistAssistantMessage(deliverySummary);
+          persistedVisibleReply = true;
+        } catch { /* 消息保存失败不影响流程 */ }
+      }
       // Last proposal with no further writing steps: persist the same compact
       // continuity handoff as an in-job chapter boundary, then replace the raw
       // cross-job tool chain with one compact terminal block.
@@ -4954,7 +5030,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         });
         messages.push({
           role: "assistant",
-          content: `已交付 ${submittedProposalRef.path}。`,
+          content: deliverySummary,
         });
         store.clearAgentTurnBlocks(sessionId);
       }

@@ -179,13 +179,16 @@ import {
   downloadBlob,
   formatStepCost,
   formatTokenCount,
+  JobMetaMenu,
   mergeStepCallUsage,
   messagePreview,
   realCacheHitRate,
   readStepTrailMap,
+  resolveJobMeta,
   saveStepTrail,
   stepsFromServerTrail,
   stepUsageTitle,
+  stripExposedJobIdFooter,
   sumStepUsage,
   AgentStepCard,
   AgentStepContextResetBanner,
@@ -4684,12 +4687,38 @@ function App() {
           {visibleMessages.map((msg) => (
             <React.Fragment key={msg.id}>
             {(() => {
-              const displayContent = messageVersionViews[msg.id]?.versions[messageVersionViews[msg.id].current]?.content ?? msg.content;
+              const rawDisplayContent = messageVersionViews[msg.id]?.versions[messageVersionViews[msg.id].current]?.content ?? msg.content;
+              const displayContent = msg.role === "assistant" || msg.role === "system"
+                ? stripExposedJobIdFooter(rawDisplayContent)
+                : rawDisplayContent;
               const assistantCollapsed = msg.role === "assistant" && collapsedAssistantIds.has(msg.id);
               const directorMessage = msg.role === "user" && msg.channel === "roleplay" && msg.roleplayInputMode === "director";
               const continuationMessage = msg.role === "user" && msg.channel === "roleplay"
                 && displayContent === ROLEPLAY_CONTINUATION_PLACEHOLDER;
+              // Job metadata is keyed by the user source message; resolve once for actions + steps.
+              const liveHere = streamStepsAnchorId === msg.id && streamSteps.length > 0;
+              const serverTrail = state.stepTrails?.find((trail) => trail.sourceMessageId === msg.id);
+              const stepsHere = liveHere
+                ? streamSteps
+                : serverTrail
+                  ? stepsFromServerTrail(serverTrail).map((step) => {
+                      const key = `${msg.id}:${step.id}`;
+                      return stepTrailExpanded[key] !== undefined
+                        ? { ...step, expanded: stepTrailExpanded[key] }
+                        : step;
+                    })
+                  : [];
+              const liveJobForMsg = liveHere && activeJobId
+                ? state.activeJobs?.find((job) => job.id === activeJobId)
+                : state.activeJobs?.find((job) => job.sourceMessageId === msg.id && job.sessionId === state.sessionId);
+              const jobMeta = resolveJobMeta({
+                trail: serverTrail,
+                liveJob: liveJobForMsg,
+                sourceMessageId: msg.id,
+                stepCount: stepsHere.length || undefined,
+              });
               return (
+            <>
             <article className={`${msg.role}${msg.channel === "roleplay" ? " roleplay-msg" : ""}${directorMessage ? " roleplay-director-msg" : ""}${continuationMessage ? " roleplay-continuation-msg" : ""}${assistantCollapsed ? " collapsed" : ""}`}>
               {msg.role === "assistant" ? (
                 <button
@@ -4851,28 +4880,12 @@ function App() {
                   ? <button disabled={busy} onClick={() => void openRoleplayBranchTimeline(msg)} title="查看并切换这一轮保存的完整对话分支">分支</button>
                   : null}
                 {msg.channel === "roleplay" && msg.roleplayInputMode !== "director" && !continuationMessage && <button disabled={busy} onClick={() => { setRoleplayFactDraft(newFactDraft(msg)); setRoleplayMemoryOpen(true); }} title="把这条消息保存为可纠错的事实记忆">记住</button>}
+                {msg.role === "user" && msg.channel !== "roleplay" && jobMeta
+                  ? <JobMetaMenu meta={jobMeta} />
+                  : null}
               </div>}
             </article>
-              );
-            })()}
-            {(() => {
-              // Live buffer only for the turn currently streaming (or the brief
-              // post-complete gap before stepTrails catches up). Never let live
-              // steps shadow a different message's server trail.
-              const liveHere = streamStepsAnchorId === msg.id && streamSteps.length > 0;
-              const serverTrail = state.stepTrails?.find((trail) => trail.sourceMessageId === msg.id);
-              const stepsHere = liveHere
-                ? streamSteps
-                : serverTrail
-                  ? stepsFromServerTrail(serverTrail).map((step) => {
-                      const key = `${msg.id}:${step.id}`;
-                      return stepTrailExpanded[key] !== undefined
-                        ? { ...step, expanded: stepTrailExpanded[key] }
-                        : step;
-                    })
-                  : [];
-              if (!stepsHere.length) return null;
-              return (
+            {stepsHere.length > 0 ? (
               <>
                 {stepsHere.map((step, index) => {
                   const isLastStep = index === stepsHere.length - 1;
@@ -4925,6 +4938,8 @@ function App() {
                   );
                 })()}
               </>
+            ) : null}
+            </>
               );
             })()}
             </React.Fragment>
@@ -4945,6 +4960,27 @@ function App() {
                   }
                 />
               ))}
+              {(() => {
+                const total = sumStepUsage(streamSteps);
+                const orphanJob = activeJobId
+                  ? state.activeJobs?.find((job) => job.id === activeJobId)
+                  : undefined;
+                const orphanMeta = resolveJobMeta({
+                  liveJob: orphanJob,
+                  sourceMessageId: streamStepsAnchorId ?? undefined,
+                  stepCount: streamSteps.length,
+                });
+                if (!total && !orphanMeta) return null;
+                return (
+                  <div className="agent-step-trail-total" title={total ? stepUsageTitle(total) : "本轮任务"}>
+                    <span>本轮合计{total?.estimated ? "（含估算）" : ""}</span>
+                    <span className="agent-step-trail-total-end">
+                      {total ? <StepTokenBadge usage={total} /> : null}
+                      {orphanMeta ? <JobMetaMenu meta={orphanMeta} /> : null}
+                    </span>
+                  </div>
+                );
+              })()}
             </>
           )}
           {state.messages.length === 0 && streamSteps.length === 0 && !(state.stepTrails?.length) && (

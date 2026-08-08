@@ -1222,14 +1222,20 @@ export class WriterStore {
           if (!ids.length) return [] as Row[];
           const placeholders = ids.map(() => "?").join(",");
           return this.database.prepare(
-            `SELECT source_message_id,job_id,steps_json,updated_at FROM message_step_trails
-              WHERE session_id=? AND source_message_id IN (${placeholders})
-              ORDER BY source_message_id ASC`,
+            `SELECT t.source_message_id,t.job_id,t.steps_json,t.updated_at,
+              j.status AS job_status,j.kind AS job_kind,j.created_at AS job_created_at,j.updated_at AS job_updated_at
+              FROM message_step_trails t
+              LEFT JOIN background_jobs j ON j.id = t.job_id
+              WHERE t.session_id=? AND t.source_message_id IN (${placeholders})
+              ORDER BY t.source_message_id ASC`,
           ).all(sessionId, ...ids) as Row[];
         })()
       : this.database.prepare(
-          `SELECT source_message_id,job_id,steps_json,updated_at FROM message_step_trails
-            WHERE session_id=? ORDER BY source_message_id DESC LIMIT 50`,
+          `SELECT t.source_message_id,t.job_id,t.steps_json,t.updated_at,
+            j.status AS job_status,j.kind AS job_kind,j.created_at AS job_created_at,j.updated_at AS job_updated_at
+            FROM message_step_trails t
+            LEFT JOIN background_jobs j ON j.id = t.job_id
+            WHERE t.session_id=? ORDER BY t.source_message_id DESC LIMIT 50`,
         ).all(sessionId) as Row[];
     return rows.flatMap(row => {
       try {
@@ -1255,9 +1261,19 @@ export class WriterStore {
         const withBreakdown = jobId
           ? this.attachStepCallBreakdownFromUsage(normalized, jobId)
           : normalized;
+        const jobStatus = typeof row.job_status === "string" && row.job_status ? row.job_status : undefined;
+        const jobKind = typeof row.job_kind === "string" && row.job_kind ? row.job_kind : undefined;
+        const jobCreatedAt = typeof row.job_created_at === "string" && row.job_created_at ? row.job_created_at : undefined;
+        const jobUpdatedAt = typeof row.job_updated_at === "string" && row.job_updated_at
+          ? row.job_updated_at
+          : undefined;
         return [{
           sourceMessageId: Number(row.source_message_id),
           ...(jobId ? { jobId } : {}),
+          ...(jobStatus ? { jobStatus } : {}),
+          ...(jobKind ? { jobKind } : {}),
+          ...(jobCreatedAt ? { jobCreatedAt } : {}),
+          ...(jobUpdatedAt ? { jobUpdatedAt } : {}),
           steps: withBreakdown,
           updatedAt: String(row.updated_at ?? ""),
         }];

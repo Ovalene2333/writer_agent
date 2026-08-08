@@ -179,7 +179,15 @@ export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
 export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]): ProseStyleIssue[] {
   for (const issue of issues) {
     if (issue.constructionRuleId) {
-      issue.severity = issue.subtype === "dialogue_correction" ? "info" : "warning";
+      // Flash's semantic verdict is authoritative for whether a candidate is
+      // actually a violation. Density may discover a crowded family, but it
+      // must not turn an explicitly allowed sentence into a hard error (or
+      // downgrade an explicit block to a warning).
+      issue.severity = issue.semanticVerdict === "allow"
+        ? "info"
+        : issue.semanticVerdict === "block"
+          ? "error"
+          : issue.subtype === "dialogue_correction" ? "info" : "warning";
       continue;
     }
     if (issue.severity === "error"
@@ -210,9 +218,9 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     }
   }
   // Registered constructions have two independent axes. Flash decides whether an
-  // occurrence is semantically justified; the deterministic family budget decides
-  // whether the same skeleton has monopolised the chapter. An `allow` therefore
-  // receives preservation priority but does not disappear from the count.
+  // occurrence is semantically justified; the deterministic family budget is a
+  // review signal for unresolved/warned repetitions. An explicitly allowed
+  // occurrence is preserved and does not consume a hard budget slot.
   const characters = Math.max(1, text.replace(/\s/g, "").length);
   const familyRules = new Map(PROSE_CONSTRUCTION_RULES.map(rule => [rule.familyId, rule]));
   for (const [familyId, budgetRule] of familyRules) {
@@ -220,6 +228,7 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     const counted = issues.filter(issue =>
       issue.constructionRuleId !== undefined
       && familyRuleIds.has(issue.constructionRuleId as typeof budgetRule.id)
+      && issue.semanticVerdict !== "allow"
       && issue.countsTowardFamilyBudget !== false,
     );
     const allowed = budgetRule.allowedOccurrences(characters);
@@ -231,9 +240,11 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
       .map(issue => issue.id));
     for (const issue of counted) {
       if (keep.has(issue.id)) continue;
+      // Only unresolved/warned occurrences reach this branch; explicit allows
+      // were excluded above, while explicit blocks remain actionable.
       issue.severity = "error";
       issue.confidence = Math.max(issue.confidence, 0.95);
-      issue.reason = `${issue.reason}（句式家族 ${counted.length}/${allowed}，语义成立也不豁免密度）`;
+      issue.reason = `${issue.reason}（未放行的句式家族 ${counted.length}/${allowed}，需减少成片重复）`;
       issue.suggestions = ["保留更不可替代的少数实例；本句改为直接事实、动作、感受或人物特有说法", ...issue.suggestions].slice(0, 4);
     }
   }

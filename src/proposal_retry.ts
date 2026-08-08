@@ -272,6 +272,16 @@ export function decideProposalFailure(
   const next = proposalRetryStateAtGate(current, gate);
   next.gateAttempts[gate] += 1;
   next.absoluteSubmissions += 1;
+  // Deterministic style/rhythm/length gates can legitimately expose a new
+  // blocker after the previous one was repaired. Count a consecutive failure
+  // streak only when the issue set makes no progress; otherwise restart the
+  // streak at this submission and rely on the absolute rail for oscillation.
+  if (gate !== "semantic_review" && transition) {
+    const progressed = transition.resolvedIssueIds.length > 0
+      || transition.previousIssueIds.length === 0
+      || transition.currentIssueIds.length < transition.previousIssueIds.length;
+    if (progressed) next.gateAttempts[gate] = 1;
+  }
   if (gate === "semantic_review") {
     const hadPriorBlockers = Boolean(transition?.previousIssueIds.length);
     const resolvedPriorBlocker = Boolean(transition?.resolvedIssueIds.length);

@@ -362,9 +362,13 @@ export type StoredStepTrail = {
 export type AgentJob = {
   id: string;
   sessionId: string;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: "running" | "waiting" | "completed" | "failed" | "cancelled";
   createdAt: string;
   updatedAt: string;
+  kind?: string;
+  promptPreview?: string;
+  sourceMessageId?: number;
+  terminalMessage?: string;
 };
 export type PermissionMode = "ask" | "auto" | "plan";
 export type AgentTodoItem = {
@@ -525,6 +529,10 @@ export type AuthorPolicyFeedback = {
 export type MessageStepTrail = {
   sourceMessageId: number;
   jobId?: string;
+  jobStatus?: string;
+  jobKind?: string;
+  jobCreatedAt?: string;
+  jobUpdatedAt?: string;
   steps: Array<{
     id: number;
     output: string;

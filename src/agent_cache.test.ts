@@ -37,6 +37,8 @@ import {
   proposalFailureDraft,
   proposalFailurePauseResult,
   appendTerminalJobReference,
+  documentDeliveryCompletionMessage,
+  isVisibleAssistantText,
   proposalFailureShouldPersistRevisionCase,
   saveProposalRevisionCase,
   chapterDraftNeedsReview,
@@ -864,6 +866,17 @@ test("proposal retry policy counts only same semantic blockers as no progress", 
   }, style.state);
   assert.equal(styleTwice.state.gateAttempts.style, 2);
 
+  const repairedStyle = decideProposalFailure({
+    code: "PROSE_STYLE_REVISION_REQUIRED",
+    failureKind: "semantic_revision",
+    error: "修订后出现新的句式候选",
+  }, styleTwice.state, proposalIssueTransition(
+    [{ id: "style:old" }],
+    [{ id: "style:new" }],
+  ));
+  assert.equal(repairedStyle.action, "revise");
+  assert.equal(repairedStyle.state.gateAttempts.style, 1, "resolved style blockers restart the failure streak");
+
   const issueA = { id: "issue:a" };
   const firstSemantic = decideProposalFailure({
     code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
@@ -1126,12 +1139,25 @@ test("proposal pause display includes exact blocker evidence, problem and action
   assert.equal("artifactId" in paused, false);
 });
 
-test("abnormal terminal output carries the database-indexable job id", () => {
-  assert.equal(
-    appendTerminalJobReference("审核依赖暂时不可用。", "job-abc123"),
-    "审核依赖暂时不可用。\n\nJob ID: job-abc123",
-  );
+test("terminal text stays free of job ids (metadata lives in the job menu)", () => {
+  assert.equal(appendTerminalJobReference("审核依赖暂时不可用。", "job-abc123"), "审核依赖暂时不可用。");
   assert.equal(appendTerminalJobReference("内容", undefined), "内容");
+});
+
+test("document delivery completion summary covers multi-path and placeholder filtering", () => {
+  assert.equal(
+    documentDeliveryCompletionMessage([
+      { label: "第1章", evidence: { path: "chapters/a.md" } },
+      { label: "第2章", evidence: { path: "chapters/b.md" } },
+    ]),
+    "已交付 2 份文档：\n- chapters/a.md\n- chapters/b.md",
+  );
+  assert.equal(
+    documentDeliveryCompletionMessage([], "chapters/only.md"),
+    "已交付 chapters/only.md。",
+  );
+  assert.equal(isVisibleAssistantText("[工具调用已隐藏]"), false);
+  assert.equal(isVisibleAssistantText("已交付 chapters/a.md。"), true);
 });
 
 test("proposal pause reports when no independent review fallback exists", () => {

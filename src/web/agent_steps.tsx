@@ -1,6 +1,7 @@
-import React, { useEffect, useRef } from "react";
-import { ChevronDown, ChevronUp, RotateCw } from "lucide-react";
-import type { MessageStepTrail, StepUsage, StepUsageCall, StoredStepTrail, StreamStep, Usage } from "./types";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Check, ChevronDown, ChevronUp, Copy, MoreHorizontal, RotateCw } from "lucide-react";
+import type { AgentJob, MessageStepTrail, StepUsage, StepUsageCall, StoredStepTrail, StreamStep, Usage } from "./types";
 import { callKindLabel } from "./types";
 import { Markdown } from "./markdown";
 import { assistantPreviewText } from "./assistant_display";
@@ -323,6 +324,267 @@ export function stepsFromServerTrail(trail: MessageStepTrail): StreamStep[] {
     expanded: step.status === "running",
     ...(step.usage ? { usage: step.usage } : {}),
   }));
+}
+
+/** Strip legacy in-body Job ID footers so chat stays clean; ids live in JobMetaMenu. */
+export function stripExposedJobIdFooter(content: string): string {
+  return content.replace(/(?:\n\n|\n)?Job ID:\s*\S+\s*$/u, "").trimEnd();
+}
+
+export type JobMetaView = {
+  id: string;
+  status?: string;
+  kind?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  sourceMessageId?: number;
+  stepCount?: number;
+};
+
+export function resolveJobMeta(input: {
+  trail?: MessageStepTrail;
+  liveJob?: AgentJob;
+  sourceMessageId?: number;
+  stepCount?: number;
+}): JobMetaView | undefined {
+  const id = input.liveJob?.id ?? input.trail?.jobId;
+  if (!id) return undefined;
+  return {
+    id,
+    status: input.liveJob?.status ?? input.trail?.jobStatus,
+    kind: input.liveJob?.kind ?? input.trail?.jobKind,
+    createdAt: input.liveJob?.createdAt ?? input.trail?.jobCreatedAt,
+    updatedAt: input.liveJob?.updatedAt ?? input.trail?.jobUpdatedAt ?? input.trail?.updatedAt,
+    sourceMessageId: input.liveJob?.sourceMessageId ?? input.trail?.sourceMessageId ?? input.sourceMessageId,
+    stepCount: input.stepCount ?? input.trail?.steps.length,
+  };
+}
+
+function formatJobMetaTime(value?: string): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  try {
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(date);
+  } catch {
+    return value;
+  }
+}
+
+const JOB_STATUS_LABEL: Record<string, string> = {
+  running: "运行中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+  suspended: "已暂停",
+};
+
+type JobMetaMenuPlacement = {
+  top: number;
+  left: number;
+  width: number;
+  maxHeight: number;
+  placement: "above" | "below";
+};
+
+const JOB_META_MENU_GAP = 6;
+const JOB_META_MENU_EST_HEIGHT = 220;
+const JOB_META_MENU_MIN_HEIGHT = 96;
+const JOB_META_MENU_VIEW_PAD = 8;
+const JOB_META_MENU_WIDTH = 260;
+
+function computeJobMetaMenuPlacement(
+  trigger: DOMRect,
+  measuredHeight = JOB_META_MENU_EST_HEIGHT,
+): JobMetaMenuPlacement {
+  const viewportH = window.innerHeight;
+  const viewportW = window.innerWidth;
+  const spaceAbove = Math.max(0, trigger.top - JOB_META_MENU_VIEW_PAD);
+  const spaceBelow = Math.max(0, viewportH - trigger.bottom - JOB_META_MENU_VIEW_PAD);
+  // Prefer below near the chat top (first message); otherwise open above the actions row.
+  const placement: "above" | "below" =
+    spaceAbove < measuredHeight && spaceBelow >= Math.min(measuredHeight, spaceAbove + 1)
+      ? "below"
+      : spaceAbove >= measuredHeight
+        ? "above"
+        : spaceBelow >= spaceAbove ? "below" : "above";
+  const available = placement === "below" ? spaceBelow : spaceAbove;
+  const maxHeight = Math.max(
+    JOB_META_MENU_MIN_HEIGHT,
+    Math.min(measuredHeight, available > 0 ? available - JOB_META_MENU_GAP : JOB_META_MENU_EST_HEIGHT),
+  );
+  const width = Math.min(JOB_META_MENU_WIDTH, Math.max(200, viewportW - JOB_META_MENU_VIEW_PAD * 2));
+  let left = trigger.right - width;
+  left = Math.max(JOB_META_MENU_VIEW_PAD, Math.min(left, viewportW - width - JOB_META_MENU_VIEW_PAD));
+  const top = placement === "below"
+    ? Math.min(trigger.bottom + JOB_META_MENU_GAP, viewportH - maxHeight - JOB_META_MENU_VIEW_PAD)
+    : Math.max(JOB_META_MENU_VIEW_PAD, trigger.top - JOB_META_MENU_GAP - maxHeight);
+  return { top, left, width, maxHeight, placement };
+}
+
+/** Compact ⋯ control: job id/time stay hidden until opened. */
+export function JobMetaMenu({ meta }: { meta: JobMetaView }) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [placement, setPlacement] = useState<JobMetaMenuPlacement | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const updatePlacement = useCallback((measuredHeight?: number) => {
+    const trigger = triggerRef.current?.getBoundingClientRect();
+    if (!trigger) return;
+    setPlacement(computeJobMetaMenuPlacement(trigger, measuredHeight));
+  }, []);
+
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    setPlacement(null);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    let onPointer: ((event: MouseEvent) => void) | undefined;
+    // Defer outside-dismiss so the opening click cannot immediately close the menu.
+    const dismissTimer = window.setTimeout(() => {
+      onPointer = (event: MouseEvent) => {
+        const target = event.target as Node | null;
+        if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+        closeMenu();
+      };
+      document.addEventListener("mousedown", onPointer);
+    }, 0);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMenu();
+    };
+    const onReposition = () => {
+      const natural = menuRef.current?.scrollHeight;
+      updatePlacement(natural && natural > 0 ? natural : undefined);
+    };
+    const frame = window.requestAnimationFrame(() => {
+      const natural = menuRef.current?.scrollHeight;
+      if (natural && natural > 0) updatePlacement(natural);
+    });
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", onReposition);
+    document.addEventListener("scroll", onReposition, true);
+    return () => {
+      window.clearTimeout(dismissTimer);
+      window.cancelAnimationFrame(frame);
+      if (onPointer) document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", onReposition);
+      document.removeEventListener("scroll", onReposition, true);
+    };
+  }, [open, closeMenu, updatePlacement]);
+
+  const statusLabel = meta.status
+    ? (JOB_STATUS_LABEL[meta.status] ?? meta.status)
+    : "—";
+  const rows: Array<{ label: string; value: string; mono?: boolean }> = [
+    { label: "Job ID", value: meta.id, mono: true },
+    { label: "状态", value: statusLabel },
+    { label: "类型", value: meta.kind?.trim() || "agent" },
+    { label: "开始", value: formatJobMetaTime(meta.createdAt) },
+    { label: "更新", value: formatJobMetaTime(meta.updatedAt) },
+  ];
+  if (meta.sourceMessageId != null && meta.sourceMessageId > 0) {
+    rows.push({ label: "消息", value: String(meta.sourceMessageId), mono: true });
+  }
+  if (meta.stepCount != null && meta.stepCount > 0) {
+    rows.push({ label: "步骤", value: String(meta.stepCount) });
+  }
+
+  const menu = open && placement
+    ? createPortal(
+      <div
+        ref={menuRef}
+        className={`agent-job-meta-menu placement-${placement.placement}`}
+        role="menu"
+        style={{
+          top: placement.top,
+          left: placement.left,
+          width: placement.width,
+          maxHeight: placement.maxHeight,
+        }}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="agent-job-meta-head">
+          <strong>任务元数据</strong>
+          <button
+            type="button"
+            className="agent-job-meta-copy"
+            title="复制 Job ID"
+            onClick={() => {
+              void navigator.clipboard?.writeText(meta.id).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1200);
+              }).catch(() => undefined);
+            }}
+          >
+            {copied ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
+            <span>{copied ? "已复制" : "复制 ID"}</span>
+          </button>
+        </div>
+        <dl className="agent-job-meta-list">
+          {rows.map(row => (
+            <div key={row.label} className="agent-job-meta-row">
+              <dt>{row.label}</dt>
+              <dd className={row.mono ? "mono" : undefined} title={row.value}>{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>,
+      document.body,
+    )
+    : null;
+
+  return (
+    <div className={`agent-job-meta${open ? " open" : ""}`} ref={rootRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="agent-job-meta-trigger"
+        title="任务元数据"
+        aria-label="任务元数据"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (open) {
+            closeMenu();
+            return;
+          }
+          const rect = triggerRef.current?.getBoundingClientRect();
+          if (rect) setPlacement(computeJobMetaMenuPlacement(rect));
+          else {
+            // Fallback so the card still mounts even if layout rect is momentarily unavailable.
+            setPlacement({
+              top: Math.max(JOB_META_MENU_VIEW_PAD, 72),
+              left: Math.max(JOB_META_MENU_VIEW_PAD, window.innerWidth - JOB_META_MENU_WIDTH - JOB_META_MENU_VIEW_PAD),
+              width: JOB_META_MENU_WIDTH,
+              maxHeight: JOB_META_MENU_EST_HEIGHT,
+              placement: "below",
+            });
+          }
+          setOpen(true);
+        }}
+      >
+        <MoreHorizontal size={14} aria-hidden="true" />
+      </button>
+      {menu}
+    </div>
+  );
 }
 
 /** One-line plain preview for collapsed assistant bubbles. */

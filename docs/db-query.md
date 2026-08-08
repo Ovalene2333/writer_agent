@@ -1,179 +1,289 @@
-# 项目数据库查询指南（协作文档）
+# 智能体：项目索引与 `writer.db` 查询
 
-每个写作项目的运行数据都存放在项目目录下的 SQLite 数据库中：
+给排障 / 审计 Agent 用的**最短操作手册**。库结构细节以 `src/store.ts` 为准。
 
+---
+
+## 0. 改代码后
+
+```bash
+npm run build          # 或至少 npm run typecheck
 ```
-<项目根>/.writer/writer.db        # 例：D:/Code/jn/.writer/writer.db
-<项目根>/.writer/writer.db-wal    # WAL 日志（服务运行时存在，勿删）
+
+整体改完再 build；不要只改 `src/` 就宣称可用。`dist/` 不提交。
+
+---
+
+## 1. 项目在哪
+
+本仓库常见布局：
+
+| 路径 | 含义 |
+|------|------|
+| `p/<name>/` | 本仓库内项目，例 `p/jn3` |
+| `p/<name>/.writer/writer.db` | **该项目的主库** |
+| `p/<name>/resource/` | 正文/设定 Markdown 源文件 |
+| `p/<name>/writer.yaml` | 项目配置 |
+
+启动示例：`writer web --share -p ./p/jn3`。
+
+先确认库文件存在：
+
+```bash
+ls p/jn3/.writer/writer.db*
 ```
 
-数据库由 [src/store.ts](../src/store.ts) 创建和迁移，WAL 模式，**服务运行中也可以安全地并发只读查询**。
+可能同时有 `writer.db`、`writer.db-wal`、`writer.db-shm`（WAL 模式，正常）。
 
-## 查询方式
+---
 
-Node 22+ 自带 `node:sqlite`，无需安装任何依赖（`better-sqlite3` 未随项目安装）：
+## 2. 怎么安全打开（只读）
+
+**原则：只读；写操作走应用。**
+
+### 推荐：复制后再查（避免占用 / disk I/O error）
+
+服务在跑时直接 `sqlite3` 偶发 `disk I/O error`。先拷贝：
+
+```bash
+cp p/jn3/.writer/writer.db /tmp/jn3-writer.db
+cp p/jn3/.writer/writer.db-wal /tmp/jn3-writer.db-wal 2>/dev/null
+cp p/jn3/.writer/writer.db-shm /tmp/jn3-writer.db-shm 2>/dev/null
+sqlite3 /tmp/jn3-writer.db ".tables"
+```
+
+### Node 22+（`node:sqlite`，只读）
 
 ```bash
 node -e "
 const { DatabaseSync } = require('node:sqlite');
-const db = new DatabaseSync('D:/Code/jn/.writer/writer.db', { readOnly: true });
-const rows = db.prepare('select id, title, updated_at from sessions order by updated_at desc limit 10').all();
-for (const r of rows) console.log(JSON.stringify(r));
+const db = new DatabaseSync('p/jn3/.writer/writer.db', { readOnly: true });
+const rows = db.prepare('select id, status, substr(prompt_preview,1,80), created_at from background_jobs order by created_at desc limit 5').all();
+console.log(JSON.stringify(rows, null, 2));
 " 2>/dev/null
 ```
 
 约定：
 
-- **始终传 `{ readOnly: true }`**。写操作一律通过应用完成；确需手工修数据时先停服务并备份 `writer.db*` 三个文件。
-- `2>/dev/null` 用于吞掉 `node:sqlite` 的 ExperimentalWarning，不影响结果。
-- 所有 `created_at`/`updated_at` 均为 **ISO UTC** 字符串；本地时间（UTC+8）需自行 +8 小时。
+- 始终 `readOnly: true`（或只拷贝副本）。
+- 时间戳为 **ISO UTC**；本地东八区自行 +8h。
+- 列名不确定时：`pragma table_info(messages);`
 
-## 表概览
+---
 
-### 会话与消息
+## 3. 表索引（先认这些）
 
-| 表 | 说明 |
-|---|---|
-| `sessions` | 会话（id 为 UUID，title 自动生成） |
-| `messages` | 对话消息。`channel`：`agent`（写作）/ `roleplay`（扮演）；`role`：user/assistant/system |
-| `message_variants` | 同一条用户指令重跑产生的多版本回答（按 `group_id` 分组） |
-| `session_context` | 每会话一行：活动文档、当前意图、`todos_json`（任务清单快照） |
-| `agent_runs` | AgentRun v2 当前快照与语义终态（running/suspended/completed/failed/cancelled） |
-| `agent_run_events` | AgentRun v2 追加式状态事件；按 `(run_id, sequence)` 重放 |
+### 排障主链
 
-**关键行为**：Agent 任务的 assistant 消息**在 run 结束时才落库**——正在运行的任务在 `messages` 里只能看到 user 指令；「撤销用户指令」会连带删除该指令之后的消息与修订（`ON DELETE CASCADE` + 撤销逻辑），所以被撤销的 run 在库里搜不到。
+```
+用户请求 → background_jobs / agent_runs
+         → messages（source_message_id）
+         → message_step_trails（逐步输出）
+         → agent_run_events（语义事件）
+         → proposals / revisions（落盘）
+```
 
-### 写作产物
+| 表 | 用途 |
+|----|------|
+| `background_jobs` | **HTTP/SSE Job**：id、session、status、prompt_preview、source_message_id、terminal_message、时间 |
+| `agent_runs` | **语义 Run**：original_request、status、snapshot_json（交付项/进度） |
+| `agent_run_events` | Run 事件流：`type` + `payload_json`，按 `sequence` 排 |
+| `messages` | 对话。`channel`=`agent`\|`roleplay`；`role`=user/assistant/system |
+| `message_step_trails` | 按 **user source_message_id** 存步骤 JSON；含 `job_id` |
+| `proposals` | 文档提案；`status` pending/accepted/rejected/stale；含 path、全文 |
+| `revisions` | 已应用修订；`undone=1` 已撤销 |
+| `model_usage` | 每次模型调用 token/缓存/费用；可带 `job_id` |
+| `session_context` | 活动文档、intent、todos_json |
+| `context_nodes` / `context_edges` | 上下文图（诊断用） |
 
-| 表 | 说明 |
-|---|---|
-| `proposals` | 文档提案（`status`：pending/accepted/rejected；含 `source_message_id`、before/after 全文） |
-| `proposal_applications` | 提案落盘意图（prepared/committed），用于进程中断后按 hash 恢复 |
-| `change_set_applications` | 多文件 change set 的应用意图；文件已写但事务未提交时用于恢复 |
-| `revisions` | 已应用的文件修订（`undone=1` 表示已被撤销） |
-| `character_revisions` | 角色卡修订历史 |
-| `writing_examples` | 范文库 |
-| `chapter_runner_checkpoints` | 章节流水线断点（`draft_json` 是完整的场景草稿：场景卡 + 各场正文 + actualState） |
-| `document_index` | FTS5 全文索引（用 `MATCH` 查询，不要 LIKE 扫大文本） |
+### 次要
 
-### 观测与成本
+- `change_sets` / `change_set_*`：多文件变更集  
+- `character_revisions`：角色卡历史  
+- `document_index`：FTS5（中文子串用 `instr`，见下）  
+- `roleplay_*`：扮演链路，写作排障一般不碰  
 
-| 表 | 说明 |
-|---|---|
-| `model_usage` | **每次模型调用一行**：prompt/completion tokens、缓存命中/未命中、按价目折算的 cost。只记录主循环与规划器调用；工具内部调用（候选采样等）不记录 |
-| `context_artifacts` | 工具结果缓存（按 `cache_key` 去重，含读取的文档内容摘要） |
+---
 
-### 扮演（roleplay_*）
+## 4. 标准排查流程（按请求文本）
 
-`roleplay_interlocutors` / `active_roleplays` / `roleplay_memory` / `roleplay_scenes` / `roleplay_memory_facts` / `roleplay_memory_snapshots`——扮演会话的人设、工作记忆与事实库，写作调试一般用不到。
-
-## 常用查询配方
-
-以下均为实际排障中验证过的查询，替换路径与 session_id 即可复用。
-
-### 1. 找一次提案对应的 run
+### 4.1 用提示词找最新 Job
 
 ```sql
-select id, session_id, path, status, created_at, substr(summary,1,120)
-from proposals where id = 353;
+SELECT id, session_id, status, source_message_id,
+       substr(prompt_preview,1,100) AS preview,
+       length(terminal_message) AS tlen,
+       created_at, updated_at
+FROM background_jobs
+WHERE prompt_preview LIKE '%林千夏%' OR prompt_preview LIKE '%戈壁%'
+ORDER BY updated_at DESC
+LIMIT 10;
 ```
 
-### 2. 看某个 run 的逐步 token / 缓存命中（性能排障主力）
+### 4.2 对齐 Agent Run
 
 ```sql
-select id, created_at, prompt_tokens, completion_tokens,
-       cache_hit_tokens, cache_miss_tokens, cost
-from model_usage
-where session_id = '<sessionId>' and created_at > '2026-07-17T04:00'
-order by id;
+SELECT id, status, source_message_id,
+       substr(original_request,1,80),
+       created_at, updated_at
+FROM agent_runs
+WHERE original_request LIKE '%戈壁%'
+ORDER BY updated_at DESC
+LIMIT 5;
 ```
 
-读法要点：
-
-- `prompt_tokens` 相比上一步**下降** → 发生了场景/章节边界截断；
-- 截断后一步的 `cache_miss_tokens` 应约等于交接消息大小（1.5–3k）。若接近全量 miss，说明缓存前缀被破坏（历史教训：中途注入 system 角色消息会让 DeepSeek 整体换模板渲染，见 agent.ts 缓存合同 §4）；
-- `completion_tokens` 3–5k 的是写场步（thinking 模型含 reasoning），几十的是纯工具调用步（如 inspect）。
-
-### 2.1 查看真正的工作流终态与未完成交付物
+快照（交付是否完成）：
 
 ```sql
-select id, session_id, source_message_id, status, updated_at,
-       json_extract(snapshot_json, '$.terminalReason') as reason,
-       json_extract(snapshot_json, '$.nextAction') as next_action,
-       json_extract(snapshot_json, '$.deliverables') as deliverables
-from agent_runs
-order by created_at desc limit 20;
+SELECT json(snapshot_json) FROM agent_runs WHERE id = '<runId>';
+-- 或只看交付
+SELECT json_extract(snapshot_json, '$.status'),
+       json_extract(snapshot_json, '$.deliverables'),
+       json_extract(snapshot_json, '$.progress')
+FROM agent_runs WHERE id = '<runId>';
 ```
 
-某次运行的完整状态转换：
+### 4.3 看消息有没有「可见回复」
 
 ```sql
-select sequence, type, event_key, created_at, payload_json
-from agent_run_events
-where run_id = '<runId>'
-order by sequence;
+SELECT id, role, channel, length(content),
+       substr(content,1,120), created_at
+FROM messages
+WHERE session_id = '<sessionId>'
+  AND id >= <source_message_id>
+ORDER BY id
+LIMIT 30;
 ```
 
-`waiting_for_input` 会结束本次 HTTP/SSE job，但 `agent_runs.status` 是 `suspended`；二者分别表示传输任务结束和语义工作流尚可恢复，不应混为一次成功完成。
+**常见坑**：
 
-### 3. 按时间聚合各 run 的成本（间隔 >5 分钟视为新 run）
+- Job `status=completed`、提案已 `accepted`，但 **user 之后没有 assistant** → 历史 bug：文档交付捷径未 `persistAssistantMessage`（现应有「已交付 …」摘要）。
+- `terminal_message` 为空仍可能成功（UI 以消息 + 提案为准；Job ID 不进聊天正文，在消息 ⋯ 元数据里）。
 
-```js
-const rows = db.prepare("select model, prompt_tokens as pin, completion_tokens as out, cache_hit_tokens as hit, cost, created_at from model_usage where created_at > '2026-07-14' order by id").all();
-const runs = [];
-let cur = null;
-for (const r of rows) {
-  const t = new Date(r.created_at).getTime();
-  if (!cur || t - cur.end > 5 * 60 * 1000) { cur = { start: r.created_at, end: t, calls: 0, pin: 0, out: 0, hit: 0, cost: 0 }; runs.push(cur); }
-  cur.end = t; cur.calls++; cur.pin += r.pin; cur.out += r.out; cur.hit += r.hit; cur.cost += r.cost;
-}
-```
-
-### 4. 搜消息内容（定位某句话出自哪次对话）
+### 4.4 步骤轨迹
 
 ```sql
-select id, session_id, role, channel, created_at, substr(content,1,120)
-from messages
-where content like '%场景链%'
-order by id desc limit 20;
+SELECT source_message_id, job_id, length(steps_json), updated_at
+FROM message_step_trails
+WHERE session_id = '<sessionId>' AND source_message_id = <id>;
 ```
 
-### 5. 全文检索项目文档
+解析 steps（Node/Python 均可）：
 
-`document_index` 是 FTS5 虚表，但默认分词器切不开连续中文——`MATCH '警报'` 对中文正文通常返回空（应用内的 `searchDocuments` 也因此带了子串回退，见 store.ts）。手查中文直接用子串扫描，该表正好存有全部已索引文档的全文：
+```bash
+python3 - <<'PY'
+import json, sqlite3
+con = sqlite3.connect("/tmp/jn3-writer.db")
+row = con.execute(
+  "SELECT steps_json FROM message_step_trails WHERE source_message_id=?",
+  (2665,),
+).fetchone()
+steps = json.loads(row[0])
+for s in steps[-5:]:
+    print(s.get("id"), s.get("status"),
+          [t.get("name") if isinstance(t, dict) else t for t in (s.get("tools") or [])],
+          repr((s.get("output") or "")[:80]))
+PY
+```
+
+### 4.5 提案 / 落盘
 
 ```sql
-select path, substr(content, max(1, instr(content, '警报') - 40), 100) as excerpt
-from document_index
-where instr(content, '警报') > 0
-limit 10;
+SELECT id, path, status, substr(summary,1,80), created_at
+FROM proposals
+WHERE session_id = '<sessionId>'
+  AND created_at >= '2026-08-07T16:52'
+ORDER BY id;
 ```
 
-英文/代码类关键词才适合 `MATCH`：
+### 4.6 Run 事件时间线
 
 ```sql
-select path from document_index where document_index match 'chapter' limit 10;
+SELECT sequence, type, created_at, substr(payload_json,1,160)
+FROM agent_run_events
+WHERE run_id = '<runId>'
+ORDER BY sequence;
 ```
 
-注意：该索引在应用触发重建时才刷新（全删全插），可能落后于磁盘上的最新文件。
+`waiting_for_input` 会结束 SSE job，但 `agent_runs.status` 可能是 `suspended`（可续跑），不要当成「写失败」。
 
-### 6. 查看进行中/中断的章节草稿状态
+---
+
+## 5. 其他常用配方
+
+### Token / 缓存
 
 ```sql
-select session_id, path, status, updated_at, length(draft_json)
-from chapter_runner_checkpoints;
+SELECT id, created_at, prompt_tokens, completion_tokens,
+       cache_hit_tokens, cache_miss_tokens, cost, job_id
+FROM model_usage
+WHERE session_id = '<sessionId>' AND created_at > '2026-08-07T16:00'
+ORDER BY id;
 ```
 
-`draft_json` 解析后可看到 `scenes`（场景卡）与 `completed`（各场正文与 actualState），用于判断章节写到第几场。
+- `prompt_tokens` 相对上一步**明显下降** → 章/场边界截断。  
+- 截断后若 `cache_miss` 接近全量 → 怀疑前缀被破坏（见 `agent.ts` 缓存合同）。
 
-### 7. 当前会话的任务清单
+### 搜对话原文
 
 ```sql
-select todos_json, updated_at from session_context where session_id = '<sessionId>';
+SELECT id, session_id, role, channel, created_at, substr(content,1,120)
+FROM messages
+WHERE content LIKE '%软垫%'
+ORDER BY id DESC LIMIT 20;
 ```
 
-## 注意事项
+### 正文全文（中文）
 
-- 表结构以 `store.ts` 的 `CREATE TABLE` + 后续 `ALTER TABLE` 迁移为准；手查列名用 `pragma table_info(<表名>)`。
-- `writer.db-wal` 可能包含最新写入，`node:sqlite` 打开时会自动读 WAL，无需 checkpoint。
-- 单元测试使用内存库，不会写入项目 db；`.writer/providers.json` 含 API Key，与 db 同目录，导出/分享数据时注意剔除。
+`document_index` 的 FTS5 对连续中文常无效，用子串：
+
+```sql
+SELECT path, substr(content, max(1, instr(content, '警报') - 40), 100)
+FROM document_index
+WHERE instr(content, '警报') > 0
+LIMIT 10;
+```
+
+磁盘上的 `resource/` 才是最终真相；索引可能滞后。
+
+### 会话 todos
+
+```sql
+SELECT todos_json, updated_at FROM session_context WHERE session_id = '<sessionId>';
+```
+
+---
+
+## 6. UI 与库的对应
+
+| UI | 库 |
+|----|-----|
+| 用户气泡下的步骤卡片 | `message_step_trails.steps_json` |
+| 用户消息操作栏 ⋯「任务元数据」 | `job_id` + `background_jobs`（id/状态/时间） |
+| 聊天正文 | `messages`（**不再**拼接 `Job ID:` 脚注） |
+| 审阅/已接受文件 | `proposals` / `revisions` + `resource/` 文件 |
+
+---
+
+## 7. 注意
+
+1. **不要**在未备份时手工改库；修数据先停服务并备份 `writer.db*`。  
+2. `.writer/providers.json` 含密钥，导出/分享时剔除。  
+3. 单元测试用内存库，不会写项目 db。  
+4. 表结构以 `store.ts` 的 `CREATE` + `ALTER` 迁移为准；旧副本可能缺列。  
+5. 撤销用户指令会删后续消息与相关状态；被撤销的 run 可能「搜不到」。
+
+---
+
+## 8. 一页速查
+
+```text
+1. 定位项目  →  p/<name>/.writer/writer.db
+2. 拷贝只读  →  /tmp/...-writer.db
+3. 找 job    →  background_jobs WHERE prompt_preview LIKE ...
+4. 找 run    →  agent_runs WHERE original_request LIKE ...
+5. 看交付    →  snapshot_json.deliverables + proposals
+6. 看回复    →  messages after source_message_id
+7. 看步骤    →  message_step_trails
+8. 看事件    →  agent_run_events
+```

@@ -31,8 +31,9 @@
 
 ## npm 与运行环境
 
-- 整体修改完成之后才进行 `npm run build`,不要做非必要的测试
+- 整体修改完成之后才进行 `npm run build`，不要做非必要的测试；改完源码后须编译再交付/验收
 - 项目采用 ESM（`"type": "module"`）。TypeScript 源码中的本地运行时导入继续使用 `.js` 后缀，并遵循现有模块风格。
+- 排查会话/Job/提案时只读查询项目库：见 `docs/db-query.md`（`p/<name>/.writer/writer.db`）
 
 ## 修改原则
 

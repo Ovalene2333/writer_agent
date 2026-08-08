@@ -218,7 +218,7 @@ test("split not-A-is-B narration is semantically adjudicated instead of hard-cod
   assert.equal(selectAdjudicationCandidates(issues).some(item => item.id === split.id), true);
 
   const blocked = applyProseVerdicts(text, issues, [{ id: split.id, verdict: "block", reason: "刻意拆句重定义" }]);
-  assert.equal(blocked.find(item => item.id === split.id)?.severity, "warning");
+  assert.equal(blocked.find(item => item.id === split.id)?.severity, "error");
 
   const fresh = analyzeProseStyle(text);
   const freshSplit = fresh.find(item => item.subtype === "split_redefinition");
@@ -254,7 +254,16 @@ test("semantic allow and deterministic construction-family budget stay independe
     { id: freshCandidates[0].id, verdict: "allow", reason: "必要客观排除" },
     { id: freshCandidates[1].id, verdict: "block", reason: "模板化重述" },
   ]);
-  assert.ok(proseStyleIssuesError(mixed), "semantic allow receives keep priority but does not exempt the family count");
+  assert.ok(proseStyleIssuesError(mixed), "the explicit semantic block remains actionable");
+
+  const allAllowed = analyzeProseStyle(text);
+  const allowedCandidates = allAllowed.filter(item => item.constructionRuleId === "negation_redefinition");
+  const allowedOnly = applyProseVerdicts(text, allAllowed, allowedCandidates.map(item => ({
+    id: item.id,
+    verdict: "allow" as const,
+    reason: "必要客观排除",
+  })));
+  assert.equal(proseStyleIssuesError(allowedOnly), undefined, "semantic allow must not be overturned by density");
 });
 
 test("prose diagnosis gives Agent stable evidence and revision intent", () => {

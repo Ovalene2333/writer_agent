@@ -79,6 +79,34 @@ test("hard policies without release conditions are downgraded", () => {
   }
 });
 
+test("policy projection is the single runtime authority over duplicate legacy rules", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-policy-"));
+  try {
+    const project = WriterProject.init(root, "测试");
+    upsertProseGateRule(project, {
+      id: "telegraphic-object-beats",
+      label: "旧规则",
+      instruction: "旧规则内容",
+      revisionIntent: "旧修订",
+      severity: "warn",
+      enabled: true,
+      sourceFeedback: "旧来源",
+    });
+    upsertAuthorPolicy(project, {
+      ...policyInput("telegraphic-object-beats"),
+      title: "新政策",
+      status: "active",
+      enforcement: "block",
+    });
+    const effective = loadProseGateRules(project).filter(rule => rule.policyId === "telegraphic-object-beats");
+    assert.equal(effective.length, 1);
+    assert.equal(effective[0]?.policyId, "telegraphic-object-beats");
+    assert.equal(effective[0]?.severity, "block");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy project gates migrate to trial policies and become retired", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-policy-"));
   try {

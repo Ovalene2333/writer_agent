@@ -195,9 +195,14 @@ function loadPersistedProseGateRules(project: WriterProject): ProseGateRule[] {
 }
 
 export function loadProseGateRules(project: WriterProject): ProseGateRule[] {
+  const policyRules = authorPolicyGateRules(project);
+  // AuthorPolicy is the single runtime authority. A legacy rule with the same
+  // stable id must not remain active beside its policy projection, otherwise
+  // the UI can show "disabled" while the effective gate still blocks.
+  const policyIds = new Set(policyRules.flatMap(rule => rule.policyId ? [rule.policyId] : []));
   return [
-    ...loadPersistedProseGateRules(project).filter(rule => !rule.retired),
-    ...authorPolicyGateRules(project),
+    ...loadPersistedProseGateRules(project).filter(rule => !rule.retired && !policyIds.has(rule.id)),
+    ...policyRules,
   ].slice(0, MAX_PROSE_GATE_RULES);
 }
 

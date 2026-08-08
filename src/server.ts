@@ -108,7 +108,7 @@ import {
 } from "./author_policies.js";
 import { createProjectBackup } from "./project_backup.js";
 
-type AgentJobStatus = "running" | "completed" | "failed" | "cancelled";
+type AgentJobStatus = "running" | "completed" | "waiting" | "failed" | "cancelled";
 
 export type WebConversationMessage = Message & {
   roleplayPerception?: string;
@@ -517,7 +517,10 @@ export class BackgroundAgentJobs {
     this.applyTrailEvent(job, event);
     if (event.type === "done") this.finish(job, "completed");
     else if (event.type === "cancelled") this.finish(job, "cancelled");
-    else if (event.type === "waiting_for_input") this.finish(job, "completed");
+    // Waiting for a user decision is a terminal SSE state, but it is not a
+    // successful completion. Keep that distinction in the persisted Job
+    // ledger so partial delivery and resumable revisions are visible.
+    else if (event.type === "waiting_for_input") this.finish(job, "waiting");
     else if (event.type === "error") {
       const message = typeof (event as { message?: string }).message === "string"
         ? (event as { message: string }).message

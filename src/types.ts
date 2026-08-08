@@ -576,6 +576,11 @@ export interface PersistedStreamStep {
 export interface MessageStepTrail {
   sourceMessageId: number;
   jobId?: string;
+  /** From background_jobs when available; UI shows these only in the job ⋯ menu. */
+  jobStatus?: string;
+  jobKind?: string;
+  jobCreatedAt?: string;
+  jobUpdatedAt?: string;
   steps: PersistedStreamStep[];
   updatedAt: string;
 }
