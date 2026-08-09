@@ -45,6 +45,22 @@ export interface AgentRunProgressV2 {
   gateAttempts: Record<string, number>;
 }
 
+export interface AgentRunIntentReviewV2 {
+  status: "satisfied" | "unsatisfied" | "unavailable";
+  checkedAt: string;
+  reason?: string;
+  missing?: string;
+  nextStep?: string;
+}
+
+export interface AgentRunExecutionPlanV2 {
+  /** Bounded semantic commitment adopted by the Agent, not raw reasoning text. */
+  commitment: string;
+  /** Current unfinished portion of that commitment. Local nextStep advice cannot replace it. */
+  remaining: string;
+  updatedAt: string;
+}
+
 export interface AgentRunSnapshotV2 {
   version: 2;
   id: string;
@@ -54,6 +70,10 @@ export interface AgentRunSnapshotV2 {
   contract: AgentRunContractRecord;
   deliverables: AgentRunDeliverableV2[];
   progress: AgentRunProgressV2;
+  /** Latest review against the immutable originalRequest. Cleared when execution resumes. */
+  intentReview?: AgentRunIntentReviewV2;
+  /** Durable global plan inferred from explicit Agent commitments and delivery evidence. */
+  executionPlan?: AgentRunExecutionPlanV2;
   status: AgentRunStatus;
   step: number;
   terminalReason?: string;
@@ -111,6 +131,8 @@ export type AgentRunEventV2 =
     }
   | { type: "proposal_revision_set"; at: string; deliverableId: string; revision: ProposalRevisionCase }
   | { type: "proposal_revision_cleared"; at: string; deliverableId: string }
+  | { type: "intent_reviewed"; at: string; review: AgentRunIntentReviewV2 }
+  | { type: "execution_plan_updated"; at: string; plan: AgentRunExecutionPlanV2 }
   | { type: "run_suspended"; at: string; reason: string; nextAction: string }
   /** `reason` names which terminal gate fired, so a finished run is explainable. */
   | { type: "run_completed"; at: string; reason?: string }

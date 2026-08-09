@@ -70,10 +70,11 @@ import {
 import { AgentLoopRuntime } from "./agent_loop.js";
 import {
   parseRunFulfillmentVerdict,
+  advanceRunFulfillmentStagnation,
+  runFulfillmentEvidenceFingerprint,
   runFulfillmentContinuationPrompt,
   runFulfillmentMessages,
   runFulfillmentPauseReason,
-  shouldReviewFulfillment,
   type RunFulfillmentVerdict,
 } from "./run_completion.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
@@ -160,6 +161,88 @@ type SubmittedProposalRef = {
   afterContent: string;
 };
 
+export type SemanticDocumentSnapshot = {
+  path: string;
+  sourceHash: string;
+  body: string;
+  digest: string;
+  source: "read" | "generated";
+};
+
+export function isNarrativeDocumentDelivery(path: string): boolean {
+  const kind = documentKind(path);
+  return kind === "chapter" || kind === "side";
+}
+
+function cleanSemanticArtifactBody(content: string): string | undefined {
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    for (const key of ["content", "markdown", "text", "excerpt"]) {
+      if (typeof parsed[key] === "string" && parsed[key].trim()) return parsed[key].trim();
+    }
+  } catch { /* Non-JSON read artifacts are already semantic text. */ }
+  const plain = content.trim();
+  return plain && !plain.startsWith("{") ? plain : undefined;
+}
+
+/** Build process-free document context, compacting oldest bodies only at the budget edge. */
+export function semanticDocumentContextMessages(
+  snapshots: readonly SemanticDocumentSnapshot[],
+  maxTokens: number,
+): ApiMessage[] {
+  const unique: SemanticDocumentSnapshot[] = [];
+  const indexes = new Map<string, number>();
+  for (const item of snapshots) {
+    const key = `${item.path}\0${item.sourceHash}`;
+    const index = indexes.get(key);
+    if (index === undefined) {
+      indexes.set(key, unique.length);
+      unique.push(item);
+      continue;
+    }
+    const existing = unique[index];
+    if (item.source === "generated") {
+      unique[index] = item;
+    } else if (!existing.body.includes(item.body)) {
+      unique[index] = {
+        ...existing,
+        body: `${existing.body}\n\n[同一文档的补充读取片段]\n${item.body}`,
+        digest: `${existing.digest}；${item.digest}`.slice(0, 800),
+      };
+    }
+  }
+  const fullMessages = unique.map(item => ({
+    role: "user" as const,
+    content: [
+      `语义文档快照（${item.source === "generated" ? "本轮已交付" : "本轮已读"}）：${item.path}`,
+      `sourceHash=${item.sourceHash}`,
+      "以下是正文事实，不包含工具调用、重试或推理过程：",
+      item.body,
+    ].join("\n"),
+  }));
+  const fullCosts = fullMessages.map(message => approximateMessageTokens([message]));
+  const keepFull = new Set<number>();
+  let used = 0;
+  for (let index = fullMessages.length - 1; index >= 0; index -= 1) {
+    if (used + fullCosts[index] > maxTokens) continue;
+    keepFull.add(index);
+    used += fullCosts[index];
+  }
+  return fullMessages.map((message, index) => {
+    if (keepFull.has(index)) return message;
+    const item = unique[index];
+    return {
+      role: "user" as const,
+      content: [
+        `语义文档摘要（正文因上下文预算卸下）：${item.path}`,
+        `sourceHash=${item.sourceHash}`,
+        item.digest,
+        "需要精确正文时按路径或对应 artifactId 定点读取。",
+      ].join("\n"),
+    };
+  });
+}
+
 export { agentToolNames, agentToolSchemaHash, agentToolsForTask } from "./tools/index.js";
 export type { ProposalRevisionCase, ProposalRevisionIssue } from "./proposal_retry.js";
 
@@ -225,10 +308,12 @@ export type { ProposalRevisionCase, ProposalRevisionIssue } from "./proposal_ret
  *    owning source_message ancestor before deleting dialogue rows.
  *    Sole exceptions — boundary truncations (never rewrites, so the surviving
  *    prefix still cache-hits):
- *    a) Chapter boundary: after a successful proposal with further writing steps,
- *       truncate back to the initial stable+dynamic prefix and append one compact
- *       handoff (chapterContinuationPrompt), so the next chapter stops paying the
- *       previous chapter's scene transcript every step.
+ *    a) Chapter boundary: after a successful narrative proposal with further writing
+ *       steps, truncate back to the initial stable+dynamic prefix, then append clean
+ *       semantic document snapshots plus one compact handoff. Tool calls, raw tool
+ *       envelopes, retries and reasoning are dropped; read/generated document bodies
+ *       and the durable execution plan survive. Each document is a separate user
+ *       message in first-seen order so earlier bytes remain a cacheable prefix.
  *    b) Scene boundary: after each successful scene-write tool, truncate back
  *       to the post-begin context base (prep reads + initial scene guide survive) and
  *       append one compact handoff (sceneContinuationPrompt), so later scenes stop
@@ -619,7 +704,7 @@ export function dynamicContextPrompt(
             : proseLength.source === "prompt_relative"
               ? "用户本轮要求相对项目默认调整"
               : "项目默认篇幅档"
-        }）。这是弱引导参考，不是本轮所有章节合计；保持场景自然完整，不因偏离目标而缩句、扩句或发起重写。场景链仍按实际故事选择每场目标。`
+        }）。这是每章各自的初稿目标，不是本轮所有章节合计。弱引导只表示运行时不为差额强制返工，不表示可以预先忽略目标：动笔前应安排足够的事件、阻力、选择与余波，主动写到接近目标；不得明知只完成目标的一半就因“不会硬拦”提前收束。章节已经自然完整时不要事后用总结、复述或无效支线机械凑字。场景链仍按实际故事选择每场目标。`
       : `\n单章篇幅目标：本轮涉及的每一章都分别约 ${proseLength.targetCharacters} 字（${
           proseLength.source === "prompt_exact"
             ? "用户本轮指定"
@@ -1385,9 +1470,9 @@ export function taskInstructions(
 - 主 Agent 对成品负责，自主决定先读什么、是否构思、是否分场、何时修订；不要为了展示流程而调用工具或创建清单。
 - 对齐「风格锚定」与动态声线证据。大纲不是前置条件；只有存在精确匹配的 outlineNode ID 或用户明确指定时才读取一次，不得为写单章创建或扩写大纲。需要衔接时只读上一章末尾的最小范围；若目标之后已有成稿，只读下一章开头的最小范围作为离场边界，不提前代演下一章；需要人物约束时读取相关角色分区。
 - 角色卡原始分区是人物事实的唯一依据：能力、知识、关系、身体状态与对白声线不得压缩进 write pack 后替代原卡。确实要写某角色的对白时，按需读取该角色 voice、motivations、storyState；该角色 relationships 非空时才读取 relationships；涉及价值、恐惧或内在冲突才读取 psychology，只读会开口的角色。对白声线遵守「正文底线」的角色归属规则。
-- ${fastWritingMode ? "快速模式下优先走最短的单 Agent 路径，由你提交正文。" : "分工模式下你负责检索、角色原卡取证与编排；正文交给证据型 Writer。直接完整成稿先 compile_write_pack，再调用 write_file(path) 并省略 content；资料不足时工具会返回必须补读的原始分区。局部 edit_file 仍由你完成。"}${scenePipelineEnabled ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "场景链已关闭，直接成稿。"}
-- 根据任务选择最小有效路径：新建或完整成稿用 write_file，修改既有局部用 edit_file；约束复杂时可先 compile_write_pack；${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}运行时自动处理篇幅、审查与审批，只使用当前公开文件工具。
-- 单章篇幅按动态块中的「篇幅控制模式」处理，不擅自改变已成立事实，也不把目标当作多章总额均分。范围验收模式按目标的 ${PROSE_TARGET_BAND_TEXT} 处理：超出上限会被拒收，不足下限是否拦截由设置决定；弱引导模式只把目标作为参考，不因偏离目标重写。无论哪种模式，都禁止用总结、同义复述、额外支线或元说明凑字。
+- ${fastWritingMode ? "快速模式下优先走最短的单 Agent 路径，由你提交正文。" : "分工模式下你负责检索、角色原卡取证与编排；正文交给证据型 Writer。每个新章节都是独立交付单元：必须为该章重新调用 compile_write_pack，再调用 write_file(path) 并省略 content；上一章的 write pack 已失效，不得沿用，也不得直接在 write_file 中提交整章 content 绕过 Writer。资料不足时工具会返回必须补读的原始分区。局部 edit_file 仍由你完成。"}${scenePipelineEnabled ? (fastWritingMode ? "能够整体把握时可直接成稿，不要为了展示流程而建立场景链。" : "不要求为了展示流程建立场景链；但不使用场景链也不能跳过本章 write pack。") : (fastWritingMode ? "场景链已关闭，直接成稿。" : "场景链已关闭，按本章 write pack 直接委托完整成稿。")}
+- 根据任务选择最小有效路径：新建或完整成稿用 write_file，修改既有局部用 edit_file；${fastWritingMode ? "约束复杂时可先 compile_write_pack；" : "分工模式的每份新章节在 write_file 前都要先 compile_write_pack；"}${scenePipelineEnabled ? "只有长篇连续状态、跨场修订或逐场反馈确有价值时，才 begin_chapter_draft 并使用场景草稿链。" : "场景链已关闭，禁止调用章节场景链工具。"}运行时自动处理篇幅、审查与审批，只使用当前公开文件工具。
+- 单章篇幅按动态块中的「篇幅控制模式」处理，不擅自改变已成立事实，也不把目标当作多章总额均分。范围验收模式按目标的 ${PROSE_TARGET_BAND_TEXT} 处理：超出上限会被拒收，不足下限是否拦截由设置决定。弱引导仍是写前目标：先为本章安排足够的有效场面，主动接近目标；它只免除成稿后的机械扩写，不授权在目标一半处提前结束。无论哪种模式，都禁止用总结、同义复述、额外支线或元说明凑字。
 - 目标路径已经存在时保持原路径，系统会把工作副本记录为该文件的新版本；不要为避开同名另起副本或改写章节路径。局部修改用 edit_file，完整替换用 write_file。
 ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每场 characterScopes 是本场角色卡使用合同：只保存角色 ID、可兑现的能力 ID 与 dialogue 权限；能力详情、限制与代价仍须按需读原卡。未列入的能力不得在正文使用或点名；要增加能力/声线许可，先 revise_chapter_scene_guide 修改尚未写场。dialogue=true 时，写前须读取该角色 voice、motivations、storyState（relationships 非空才读），且声线只约束该角色说出口的对白。${fastWritingMode ? `write_chapter_scene 提交不超过 ${notesMaxCharacters} 字的故事内 notes、正文与从成稿归纳的 actualState。` : `write_chapter_scene 只提交 sceneId 与不超过 ${notesMaxCharacters} 字的故事内 notes，省略 content/actualState，由证据型 Writer 和状态提取器完成。`}readerQuestion、cost 与 oppositionMove 是可修订的场景假设，不是每场必须套用的剧情公式；按章节目标填写真正适用的项，并依据成稿调整未写引导。门禁反馈是诊断证据：少量孤立问题通常适合精确修订；若问题密集，或节奏、叙述距离与结构彼此牵连，可以重写受影响场景乃至全文。完整后 inspect_chapter_draft。` : ""}
 - 对白服从人物目的、知识与关系。直说、回避、解释、沉默或打断都可以；人物差异来自他们关注和不愿承认的内容，不要为了制造“摩擦”给每场套同一组停顿与答非所问。
@@ -1736,8 +1821,13 @@ export function buildDynamicTurnMessages(parts: {
  * state. Keep it compact — it is re-sent on every remaining step of the job.
  */
 export function chapterContinuationPrompt(parts: {
-  /** The terminal gate's instruction for what is still owed — the only source of「还要写什么」。 */
+  /** Local repair/delivery advice from the terminal review. */
   nextStep: string;
+  /** Durable global commitment survives chapter cuts and outranks local nextStep wording. */
+  executionPlan?: { commitment: string; remaining: string };
+  deliveredPaths?: readonly string[];
+  proseLength?: TurnProseLength;
+  delegatedWriting?: boolean;
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
   /** Paths/characters already on the session materials shelf — do not re-read. */
@@ -1751,6 +1841,29 @@ export function chapterContinuationPrompt(parts: {
   const lines: string[] = [
     "上一份文件变更已成功提交，禁止重复提交同一章；为控制上下文，此前章节的场景写作过程已从本轮对话移除。",
   ];
+  if (parts.executionPlan) {
+    lines.push(
+      `已锁定的全局执行承诺：${parts.executionPlan.commitment}`,
+      `全局剩余计划：${parts.executionPlan.remaining || "无"}`,
+      "局部复审建议只能推进上述计划，不得缩减、改写或替代全局承诺。",
+    );
+  }
+  if (parts.deliveredPaths?.length) {
+    lines.push(`本轮已交付路径（按交付顺序）：${parts.deliveredPaths.join("、")}`);
+  }
+  if (parts.proseLength) {
+    lines.push(
+      `下一章篇幅${parts.proseLength.mode === "guidance" ? "参考" : "目标"}：约 ${parts.proseLength.targetCharacters} 字；这是下一章单独的目标，不与已交付章节均分。`,
+      parts.proseLength.mode === "guidance"
+        ? "弱引导只免除成稿后的机械凑字，不允许写前忽略目标或在目标一半处提前收束；先安排足够的有效场面，主动接近目标。"
+        : `按 ${PROSE_TARGET_BAND_TEXT} 范围组织完整章节，提交前核对篇幅与场面完整性。`,
+    );
+  }
+  if (parts.delegatedWriting) {
+    lines.push(
+      "分工模式：这是新的章节交付单元，上一章 write pack 已失效。必须先为下一章重新 compile_write_pack，再调用 write_file(path) 并省略 content，禁止直接提交整章 content 绕过证据型 Writer。",
+    );
+  }
   if (parts.proposal) {
     lines.push(`已交付：${parts.proposal.path} — ${parts.proposal.summary.replace(/\s+/g, " ").slice(0, 200)}`);
     const tail = parts.proposal.afterContent.trimEnd().slice(-800).trimStart();
@@ -1779,7 +1892,7 @@ export function chapterContinuationPrompt(parts: {
   }
   lines.push(
     parts.nextStep,
-    "根据下一份正文的篇幅、连续性风险和现有材料重新选择 write_file、局部 edit_file、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
+    "根据下一份正文的连续性风险和现有材料重新选择 write_file 章节委托或场景草稿链；局部修订仍用 edit_file。不要为「再确认设定」重复开局检索。",
   );
   return lines.join("\n");
 }
@@ -2556,6 +2669,13 @@ const HIDDEN_ASSISTANT_PLACEHOLDERS = new Set([
 export function isVisibleAssistantText(text: string): boolean {
   const trimmed = text.trim();
   return Boolean(trimmed) && !HIDDEN_ASSISTANT_PLACEHOLDERS.has(trimmed);
+}
+
+/** Tool-call narration is progress text, never the persisted terminal reply. */
+export function terminalAssistantText(message: ApiMessage): string | undefined {
+  if (message.role !== "assistant" || message.tool_calls?.length) return undefined;
+  const text = messageContentText(message.content).trim();
+  return isVisibleAssistantText(text) ? text : undefined;
 }
 
 /** Compact user-visible summary when a document-delivery job finishes without prose. */
@@ -3547,18 +3667,107 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   /** Proposal that actually succeeded this step (never "latest in store" alone). */
   let submittedProposalRef: SubmittedProposalRef | undefined;
   let completedDocumentDeliverables = agentLoop.completedDocumentDeliverables;
+  const semanticDocuments: SemanticDocumentSnapshot[] = [];
+  const semanticDocumentIndexes = new Map<string, number>();
+  const rememberSemanticDocument = (snapshot: SemanticDocumentSnapshot): void => {
+    const key = `${snapshot.path}\0${snapshot.sourceHash}`;
+    const existingIndex = semanticDocumentIndexes.get(key);
+    if (existingIndex !== undefined) {
+      const existing = semanticDocuments[existingIndex];
+      if (snapshot.source === "generated") {
+        semanticDocuments[existingIndex] = snapshot;
+      } else if (!existing.body.includes(snapshot.body)) {
+        semanticDocuments[existingIndex] = {
+          ...existing,
+          body: `${existing.body}\n\n[同一文档的补充读取片段]\n${snapshot.body}`,
+          digest: `${existing.digest}；${snapshot.digest}`.slice(0, 800),
+        };
+      }
+      return;
+    }
+    semanticDocumentIndexes.set(key, semanticDocuments.length);
+    semanticDocuments.push(snapshot);
+  };
+  const rememberReadSemanticDocuments = (): void => {
+    for (const [path, snapshot] of toolContext.readSnapshots ?? []) {
+      for (const range of snapshot.ranges) {
+        if (range.artifactId === undefined) continue;
+        const artifact = store.contextArtifactById(sessionId, range.artifactId);
+        if (!artifact || artifact.sourceHash !== snapshot.sourceHash) continue;
+        const body = cleanSemanticArtifactBody(artifact.content);
+        if (!body) continue;
+        rememberSemanticDocument({
+          path,
+          sourceHash: snapshot.sourceHash,
+          body,
+          digest: artifact.digest,
+          source: "read",
+        });
+      }
+    }
+    for (const entry of toolContext.materialsShelf?.values() ?? []) {
+      if (!entry.path) continue;
+      const artifact = [...(entry.artifactIds ?? [])]
+        .reverse()
+        .map(id => store.contextArtifactById(sessionId, id))
+        .find(item => item?.sourceHash === entry.sourceHash);
+      if (!artifact) continue;
+      const body = cleanSemanticArtifactBody(artifact.content);
+      if (!body) continue;
+      rememberSemanticDocument({
+        path: entry.path,
+        sourceHash: entry.sourceHash,
+        body,
+        digest: entry.digest,
+        source: "read",
+      });
+    }
+  };
+  const rememberGeneratedSemanticDocument = (proposal: SubmittedProposalRef): void => {
+    rememberSemanticDocument({
+      path: proposal.path,
+      sourceHash: project.hash(proposal.afterContent),
+      body: proposal.afterContent,
+      digest: proposal.summary.replace(/\s+/g, " ").slice(0, 400),
+      source: "generated",
+    });
+  };
+  for (const deliverable of agentLoop.snapshot.deliverables) {
+    const proposalId = deliverable.evidence?.proposalId;
+    if (proposalId === undefined) continue;
+    try {
+      const proposal = store.proposal(proposalId);
+      if (proposal.sessionId !== sessionId) continue;
+      rememberGeneratedSemanticDocument({
+        id: proposal.id,
+        path: proposal.path,
+        summary: proposal.summary,
+        afterContent: proposal.afterContent,
+      });
+    } catch { /* A missing historical proposal remains represented by delivery evidence. */ }
+  }
   let characterMutationSubmitted = false;
-  let characterMutationName = "";
   let lastCharacterMutationDiagnostic = "";
   let waitingForUser = false;
   const toolCallCounts = new Map<string, number>();
   const requiresCharacterMutation = permissionMode !== "plan"
     && (task.mutation === "character" || task.mutation === "mixed");
   let executionProgress = agentLoop.executionProgress();
-  /** Tool calls issued this run; a zero-tool turn has nothing to audit. */
-  let toolCallsMade = 0;
-  let fulfillmentContinuations = 0;
-  let lastUnsatisfiedFulfillment: Extract<RunFulfillmentVerdict, { satisfied: false }> | undefined;
+  let lastUnsatisfiedEvidenceFingerprint = "";
+  let stagnantFulfillmentReviews = 0;
+  let intentReviewAttempts = 0;
+  const deliveredIntentEvidence = (): string[] => agentLoop.snapshot.deliverables
+    .filter(item => item.evidence)
+    .map(item => {
+      const evidence = item.evidence!;
+      const label = evidence.path ?? item.label;
+      let summary = "";
+      try {
+        if (evidence.proposalId !== undefined) summary = store.proposal(evidence.proposalId).summary;
+        else if (evidence.changeSetId !== undefined) summary = store.changeSet(evidence.changeSetId).summary;
+      } catch { /* evidence remains usable by path when metadata is unavailable */ }
+      return summary.trim() ? `${label}：${summary.trim().slice(0, 300)}` : label;
+    });
   /**
    * The single terminal gate.
    *
@@ -3572,8 +3781,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
    *    计数，所以它只在这里问，而且由模型答。
    *
    * Returning `continue` never fabricates work: the loop's step budget still bounds
-   * it, and after `RUN_FULFILLMENT_MAX_CONTINUATIONS` refusals the run pauses for
-   * 续跑 instead of claiming a success it cannot show.
+   * it. Productive deliveries reset the convergence counter; only repeated refusals
+   * against unchanged semantic evidence consume the bounded stagnation budget.
    */
   const terminalDecision = async (): Promise<
     | { kind: "complete"; reason: string }
@@ -3587,31 +3796,33 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     if (gaps.length) {
       return { kind: "continue", source: "invariant", prompt: completionRecoveryPrompt(gaps, executionProgress) };
     }
-    if (!shouldReviewFulfillment({ permissionMode, toolCallsMade, continuations: fulfillmentContinuations })) {
-      return {
-        kind: lastUnsatisfiedFulfillment ? "pause" : "complete",
-        reason: lastUnsatisfiedFulfillment
-          ? runFulfillmentPauseReason(lastUnsatisfiedFulfillment)
-          : "契约不变量已满足",
-      };
-    }
+    intentReviewAttempts += 1;
+    const reviewEventKey = `intent-review:${sourceMessageId}:${intentReviewAttempts}`;
     let verdict: RunFulfillmentVerdict | undefined;
+    const fulfillmentSnapshot = {
+      originalRequest: agentLoop.snapshot.originalRequest,
+      finalText: stripDsmlText(transcript, "").trim(),
+      delivered: deliveredIntentEvidence(),
+      stalled: agentLoop.stalledDeliverableLabels(),
+      otherArtifacts: [
+        ...(executionProgress.characterArtifactProduced ? ["角色卡已保存"] : []),
+        ...(executionProgress.imageArtifactProduced ? ["图片已生成"] : []),
+        ...(executionProgress.proseGateRuleSaved ? ["作者复审规则已保存"] : []),
+      ],
+      permissionMode,
+      ...(agentLoop.snapshot.executionPlan
+        ? {
+            executionPlan: {
+              commitment: agentLoop.snapshot.executionPlan.commitment,
+              remaining: agentLoop.snapshot.executionPlan.remaining,
+            },
+          }
+        : {}),
+    };
     try {
       const review = await streamCompletion(
         plannerModel,
-        runFulfillmentMessages({
-          originalRequest: prompt,
-          finalText: stripDsmlText(transcript, "").trim(),
-          delivered: agentLoop.snapshot.deliverables
-            .filter(item => item.evidence)
-            .map(item => item.evidence?.path ?? item.label),
-          stalled: agentLoop.stalledDeliverableLabels(),
-          otherArtifacts: [
-            ...(executionProgress.characterArtifactProduced ? ["角色卡已保存"] : []),
-            ...(executionProgress.imageArtifactProduced ? ["图片已生成"] : []),
-            ...(executionProgress.proseGateRuleSaved ? ["作者复审规则已保存"] : []),
-          ],
-        }),
+        runFulfillmentMessages(fulfillmentSnapshot),
         signal,
         () => undefined,
         () => undefined,
@@ -3624,18 +3835,52 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         );
       }
       verdict = parseRunFulfillmentVerdict(review.content);
-    } catch {
-      // A review that could not run must not strand a finished run. The invariants
-      // above already passed; falling through to completion is the honest default.
-      verdict = undefined;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      agentLoop.recordIntentReview({
+        status: "unavailable",
+        reason: reason.slice(0, 400) || "意图验收调用失败",
+      }, reviewEventKey);
+      return { kind: "pause", reason: "原始意图验收暂时不可用，已保留上下文，可点「续跑」重试。" };
     }
-    if (!verdict || verdict.satisfied) {
-      lastUnsatisfiedFulfillment = undefined;
-      return { kind: "complete", reason: verdict?.reason ?? "交付复审未给出结论，按不变量通过" };
+    if (!verdict) {
+      agentLoop.recordIntentReview({
+        status: "unavailable",
+        reason: "意图验收未返回可解析结论",
+      }, reviewEventKey);
+      return { kind: "pause", reason: "原始意图验收未返回有效结论，已保留上下文，可点「续跑」重试。" };
     }
-    lastUnsatisfiedFulfillment = verdict;
-    const prompt_ = runFulfillmentContinuationPrompt(verdict, fulfillmentContinuations);
-    fulfillmentContinuations += 1;
+    const existingPlan = agentLoop.snapshot.executionPlan;
+    const commitment = existingPlan?.commitment || verdict.planCommitment;
+    if (commitment) {
+      const remaining = verdict.satisfied
+        ? ""
+        : verdict.remainingPlan || existingPlan?.remaining || verdict.missing;
+      agentLoop.recordExecutionPlan(
+        { commitment, remaining },
+        `execution-plan:${sourceMessageId}:${intentReviewAttempts}`,
+      );
+    }
+    if (verdict.satisfied) {
+      agentLoop.recordIntentReview({ status: "satisfied", reason: verdict.reason }, reviewEventKey);
+      return { kind: "complete", reason: verdict.reason };
+    }
+    agentLoop.recordIntentReview({
+      status: "unsatisfied",
+      missing: verdict.missing,
+      nextStep: verdict.nextStep,
+    }, reviewEventKey);
+    const evidenceFingerprint = runFulfillmentEvidenceFingerprint(fulfillmentSnapshot);
+    const stagnation = advanceRunFulfillmentStagnation({
+      fingerprint: lastUnsatisfiedEvidenceFingerprint,
+      stagnantReviews: stagnantFulfillmentReviews,
+    }, evidenceFingerprint);
+    lastUnsatisfiedEvidenceFingerprint = stagnation.fingerprint;
+    stagnantFulfillmentReviews = stagnation.stagnantReviews;
+    if (stagnation.shouldPause) {
+      return { kind: "pause", reason: runFulfillmentPauseReason(verdict) };
+    }
+    const prompt_ = runFulfillmentContinuationPrompt(verdict, stagnantFulfillmentReviews);
     return { kind: "continue", source: "fulfillment", prompt: prompt_ };
   };
   const replannedFailures = new Set<string>();
@@ -4351,7 +4596,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
               || (Array.isArray(parsed.applied) && parsed.applied.length > 0);
             if (!("error" in parsed) && appliedCharacterChange) {
               characterMutationSubmitted = true;
-              characterMutationName = typeof parsed.name === "string" ? parsed.name : "";
             } else {
               characterMutationFailedThisStep = true;
               lastCharacterMutationDiagnostic = characterMutationDiagnostic(parsed);
@@ -4702,26 +4946,6 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         ensureThinkingTranscriptCanContinue();
         continue;
       }
-      // Character saves may complete document-hint tasks when evidence led to a card-only fix.
-      // The same terminal gate decides: a saved card that still leaves the request
-      // unfulfilled (“建卡顺便补设定文件”) keeps running instead of ending here.
-      if (characterMutationSubmitted && task.mutation !== "none" && !waitingForUser) {
-        const decision = await terminalDecision();
-        if (decision.kind === "complete") {
-          const answer = stripDsmlText(transcript, "").trim()
-            || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
-          persistAssistantMessage(answer);
-          persistRunTerminal("completed", decision.reason);
-          emit({ type: "done", sessionId });
-          return;
-        }
-        if (decision.kind === "continue") {
-          messages.push({ role: "user", content: decision.prompt });
-        } else if (decision.kind === "pause") {
-          exitWithFulfillmentPause(decision.reason);
-          return;
-        }
-      }
       if (requiresCharacterMutation && characterMutationFailedThisStep) {
         messages.push({
           role: "user",
@@ -4853,14 +5077,33 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 return store.proposals().find(item => item.sessionId === sessionId);
               } catch { return undefined; }
             })();
+          rememberReadSemanticDocuments();
+          if (latestProposal) rememberGeneratedSemanticDocument(latestProposal);
+          const narrativeBoundary = latestProposal ? isNarrativeDocumentDelivery(latestProposal.path) : false;
+          if (!narrativeBoundary) {
+            // Lore/outline/other auxiliary deliveries are progress evidence, not a
+            // chapter transition. Keep the live semantic transcript and continue.
+            documentProposalSubmitted = false;
+            submittedProposalRef = undefined;
+            messages.push({ role: "user", content: decision.prompt });
+            ensureThinkingTranscriptCanContinue();
+            continue;
+          }
           const handoff = toolContext.completedChapterHandoff;
           toolContext.completedChapterHandoff = undefined;
           // Measure *before* the cut so the graph can show step N → N+1 inheritance.
           const beforeTokens = approximateMessageTokens(messages);
           const beforeMessageCount = messages.length;
-          // Rebuild kept base: open-turn prefix + latest session materials shelf.
+          // Rebuild kept base from the open-turn prefix plus clean semantic state.
           // Drops previous chapter process and prior handoff only.
           messages.length = initialMessageCount;
+          const semanticBudget = Math.max(
+            8_000,
+            Math.floor((executionModel.pricing?.contextWindow ?? 128_000) * 0.35),
+          );
+          // Stable first-seen document messages precede the combined shelf digest:
+          // when chapter N+1 is appended, chapter 1..N remain a byte-identical prefix.
+          messages.push(...semanticDocumentContextMessages(semanticDocuments, semanticBudget));
           const shelfPrompt = formatJobMaterialsShelfPrompt(toolContext);
           if (shelfPrompt) messages.push({ role: "user", content: shelfPrompt });
           materialsBase = messages.length;
@@ -4872,6 +5115,18 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             role: "user",
             content: chapterContinuationPrompt({
               nextStep: decision.prompt,
+              proseLength: turnProseLength,
+              delegatedWriting: !fastWritingMode,
+              ...(agentLoop.snapshot.executionPlan
+                ? {
+                    executionPlan: {
+                      commitment: agentLoop.snapshot.executionPlan.commitment,
+                      remaining: agentLoop.snapshot.executionPlan.remaining,
+                    },
+                  }
+                : {}),
+              deliveredPaths: agentLoop.snapshot.deliverables
+                .flatMap(item => item.evidence?.path ? [item.evidence.path] : []),
               ...(latestProposal
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
                 : {}),
@@ -5075,17 +5330,15 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       return;
     }
     if (documentProposalSubmitted) {
-        let persistedVisibleReply = false;
+      let persistedVisibleReply = false;
       try {
+        let finalAssistantText: string | undefined;
         for (let i = turnStart; i < messages.length; i++) {
-          const msg = messages[i];
-          if (msg.role === "assistant") {
-            const text = messageContentText(msg.content).trim();
-            if (isVisibleAssistantText(text)) {
-              persistAssistantMessage(text);
-              persistedVisibleReply = true;
-            }
-          }
+          finalAssistantText = terminalAssistantText(messages[i]) ?? finalAssistantText;
+        }
+        if (finalAssistantText) {
+          persistAssistantMessage(finalAssistantText);
+          persistedVisibleReply = true;
         }
         if (toolContext.generatedAttachments?.length) {
           persistAssistantMessage("图片已生成。");
@@ -5107,7 +5360,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       // cross-job tool chain with one compact terminal block.
       let terminalHandoffPersisted = false;
       const terminalHandoff = toolContext.completedChapterHandoff;
-      if (submittedProposalRef) {
+      const terminalNarrativeDelivery = submittedProposalRef
+        ? isNarrativeDocumentDelivery(submittedProposalRef.path)
+        : false;
+      if (submittedProposalRef && terminalNarrativeDelivery) {
         try {
           persistChapterHandoff(store, {
             sessionId,
@@ -6386,6 +6642,21 @@ async function executeToolCached(
   } catch { digest = `${call.name} 返回了非 JSON 结果`; }
   const artifactId = store.saveContextArtifact(sessionId, { cacheKey, kind: call.name, path: sourcePath, sourceHash, content: result, digest });
   const attached = attachArtifactId(result, artifactId);
+  if (sourcePath && DOCUMENT_BODY_READ_TOOLS.has(call.name)) {
+    const snapshot = context.readSnapshots?.get(sourcePath);
+    if (snapshot) {
+      let parsedAttached: Record<string, unknown> | undefined;
+      try { parsedAttached = JSON.parse(attached) as Record<string, unknown>; } catch { /* no structured ranges */ }
+      for (const admittedRange of parsedAttached ? readResultRanges(parsedAttached) : []) {
+        const storedRange = snapshot.ranges.find(range => (
+          range.startLine === admittedRange.startLine
+          && range.endLine === admittedRange.endLine
+          && range.artifactId === undefined
+        ));
+        if (storedRange) storedRange.artifactId = artifactId;
+      }
+    }
+  }
   rememberMaterialsFromToolResult(call.name, attached, sourcePath, sourceHash, context, store);
   return attached;
 }

@@ -39,6 +39,7 @@ import {
   appendTerminalJobReference,
   documentDeliveryCompletionMessage,
   isVisibleAssistantText,
+  terminalAssistantText,
   proposalFailureShouldPersistRevisionCase,
   saveProposalRevisionCase,
   chapterDraftNeedsReview,
@@ -1139,6 +1140,19 @@ test("document delivery completion summary covers multi-path and placeholder fil
   );
   assert.equal(isVisibleAssistantText("[工具调用已隐藏]"), false);
   assert.equal(isVisibleAssistantText("已交付 chapters/a.md。"), true);
+  assert.equal(terminalAssistantText({
+    role: "assistant",
+    content: "现在委托 Writer 落盘第六章。",
+    tool_calls: [{
+      id: "call-write",
+      type: "function",
+      function: { name: "write_file", arguments: "{}" },
+    }],
+  }), undefined);
+  assert.equal(terminalAssistantText({
+    role: "assistant",
+    content: "六章正文已经全部交付。",
+  }), "六章正文已经全部交付。");
 });
 
 test("proposal pause reports when no independent review fallback exists", () => {

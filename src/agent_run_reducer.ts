@@ -91,6 +91,7 @@ export function reduceAgentRunEvent(
         ...next,
         sourceMessageId: event.sourceMessageId,
         status: "running",
+        intentReview: undefined,
         terminalReason: undefined,
         nextAction: undefined,
       };
@@ -112,6 +113,7 @@ export function reduceAgentRunEvent(
     case "step_started":
       return {
         ...next,
+        intentReview: undefined,
         step: Math.max(current.step, event.step),
         ...(event.deliverableId
           ? {
@@ -227,6 +229,10 @@ export function reduceAgentRunEvent(
           state: item.state === "revision_required" ? "pending" : item.state,
         })),
       };
+    case "intent_reviewed":
+      return { ...next, intentReview: event.review };
+    case "execution_plan_updated":
+      return { ...next, executionPlan: event.plan };
     case "run_suspended":
       return { ...next, status: "suspended", terminalReason: event.reason, nextAction: event.nextAction };
     case "run_completed":

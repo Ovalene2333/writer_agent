@@ -4,6 +4,7 @@ import type { AgentExecutionProgress, AgentTaskContract } from "./agentic_runtim
 import type { InterpretedAgentToolResult } from "./agent_tool_outcome.js";
 import type { AgentRunState, PermissionMode } from "./types.js";
 import type { ProposalRevisionCase } from "./proposal_retry.js";
+import type { AgentRunExecutionPlanV2, AgentRunIntentReviewV2 } from "./agent_run_types.js";
 
 /**
  * Thin host loop facade. Model transcript/cache code stays outside; all durable
@@ -52,6 +53,20 @@ export class AgentLoopRuntime {
 
   stalledDeliverableLabels(): string[] {
     return this.controller.stalledDeliverableLabels();
+  }
+
+  recordIntentReview(
+    review: Omit<AgentRunIntentReviewV2, "checkedAt">,
+    eventKey: string,
+  ): void {
+    this.controller.recordIntentReview(review, eventKey);
+  }
+
+  recordExecutionPlan(
+    plan: Omit<AgentRunExecutionPlanV2, "updatedAt">,
+    eventKey: string,
+  ): void {
+    this.controller.recordExecutionPlan(plan, eventKey);
   }
 
   activeDocumentDeliverable() {

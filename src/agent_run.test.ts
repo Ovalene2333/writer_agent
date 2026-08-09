@@ -110,6 +110,8 @@ test("the ledger opens when a document tool runs, never on a predicted count", (
     }), "test:second");
     assert.equal(controller.snapshot.deliverables.length, 2);
     assert.equal(controller.completedDocumentDeliverables, 2);
+    assert.deepEqual(controller.complete(documentTask, "两章均已落地"), ["尚未通过原始用户意图验收"]);
+    controller.recordIntentReview({ status: "satisfied", reason: "两章均已交付" }, "test:intent:complete");
     assert.deepEqual(controller.complete(documentTask, "两章均已落地"), []);
     assert.equal(controller.snapshot.status, "completed");
     assert.deepEqual(agentRunInvariantViolations(controller.snapshot), []);
@@ -407,6 +409,7 @@ test("resuming an older revision run detects a newer task's accepted document", 
       path,
       recordedAt: "2026-08-02T00:00:00.000Z",
     }, "document-1", "test:newer:proposal", "accepted");
+    newer.recordIntentReview({ status: "satisfied", reason: "重写已交付" }, "test:newer:intent");
     assert.deepEqual(newer.complete(task, "交付完成"), []);
 
     const resumed = AgentRunController.open({
@@ -592,6 +595,7 @@ test("resume reconciles an accepted proposal when the process missed its workflo
     });
     assert.equal(resumed.completedDocumentDeliverables, 1);
     assert.equal(resumed.snapshot.deliverables[0]?.evidence?.proposalId, proposal.id);
+    resumed.recordIntentReview({ status: "satisfied", reason: "恢复的提案已交付" }, "test:resume:intent");
     assert.deepEqual(resumed.complete(task, "交付完成"), []);
   } finally {
     store.close();
@@ -670,6 +674,7 @@ test("resume selects the matching suspended run even after a newer task", () => 
       reusableEvidence: false,
       resumeInterrupted: false,
     });
+    newer.recordIntentReview({ status: "satisfied", reason: "回答已回应用户问题" }, "test:answer:intent");
     assert.deepEqual(newer.complete(answerTask, "已答复"), []);
 
     const resumed = AgentRunController.open({

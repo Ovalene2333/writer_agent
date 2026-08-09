@@ -1,5 +1,4 @@
 import type { AgentRunSnapshotV2 } from "./agent_run_types.js";
-import { pendingAgentRunDeliverables } from "./agent_run_reducer.js";
 
 export function agentRunInvariantViolations(snapshot: AgentRunSnapshotV2): string[] {
   const violations: string[] = [];
@@ -29,14 +28,8 @@ export function agentRunInvariantViolations(snapshot: AgentRunSnapshotV2): strin
       }
     }
   }
-  if (snapshot.status === "completed" && pendingAgentRunDeliverables(snapshot).length) {
-    // Document-hint tasks may finish via a character card when evidence shows no file target.
-    const characterSatisfiesDocument = snapshot.contract.mutation === "document"
-      && snapshot.progress.characterArtifactProduced
-      && snapshot.deliverables.length <= 1;
-    if (!characterSatisfiesDocument) {
-      violations.push("运行已完成但仍有未完成交付项");
-    }
+  if (snapshot.status === "completed" && snapshot.intentReview?.status !== "satisfied") {
+    violations.push("运行已完成但缺少通过的原始意图验收");
   }
   if (snapshot.status === "suspended" && !snapshot.nextAction?.trim()) {
     violations.push("暂停运行缺少可执行的 nextAction");

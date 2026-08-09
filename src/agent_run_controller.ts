@@ -15,6 +15,8 @@ import { AgentRunStore } from "./agent_run_store.js";
 import type {
   AgentRunDeliverableV2,
   AgentRunContractRecord,
+  AgentRunIntentReviewV2,
+  AgentRunExecutionPlanV2,
   AgentRunSnapshotV2,
 } from "./agent_run_types.js";
 import type { AgentRunDocumentEvidence, AgentRunState, PermissionMode } from "./types.js";
@@ -330,8 +332,35 @@ export class AgentRunController {
     return pendingAgentRunDeliverables(this.snapshotValue).map(item => item.label);
   }
 
+  recordIntentReview(
+    review: Omit<AgentRunIntentReviewV2, "checkedAt">,
+    eventKey: string,
+  ): void {
+    const checkedAt = now();
+    this.append(eventKey, {
+      type: "intent_reviewed",
+      at: checkedAt,
+      review: { ...review, checkedAt },
+    });
+  }
+
+  recordExecutionPlan(
+    plan: Omit<AgentRunExecutionPlanV2, "updatedAt">,
+    eventKey: string,
+  ): void {
+    const updatedAt = now();
+    this.append(eventKey, {
+      type: "execution_plan_updated",
+      at: updatedAt,
+      plan: { ...plan, updatedAt },
+    });
+  }
+
   complete(task: AgentTaskContract, reason: string): string[] {
     const gaps = this.completionGaps(task);
+    if (this.snapshotValue.intentReview?.status !== "satisfied") {
+      gaps.push("尚未通过原始用户意图验收");
+    }
     if (gaps.length) return gaps;
     this.append("terminal:completed", { type: "run_completed", at: now(), reason });
     assertAgentRunInvariants(this.snapshotValue);
