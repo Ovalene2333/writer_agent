@@ -29,6 +29,13 @@ export function chapterVolumeNames(project: WriterProject): string[] {
   }))].sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true }));
 }
 
+/** Chapter paths whose ordinal sequence belongs to one destination container. */
+export function chapterPathsInVolume(project: WriterProject, volume?: string): string[] {
+  return project.listTextFiles()
+    .filter(path => documentKind(path) === "chapter")
+    .filter(path => chapterVolume(path) === volume);
+}
+
 export function volumePathAllowed(policy: VolumeAccessPolicy | undefined, path: string): boolean {
   const volume = chapterVolume(path);
   if (!volume) return true;

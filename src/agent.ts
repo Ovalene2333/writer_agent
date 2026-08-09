@@ -143,6 +143,7 @@ import {
   accessibleVolumeNames,
   agentVisibleDocumentPaths,
   chapterVolume,
+  chapterPathsInVolume,
   chapterVolumeNames,
   normalizeVolumeName,
   uniqueVolumeName,
@@ -728,7 +729,11 @@ export function dynamicContextPrompt(
         }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。write_file/edit_file 会由运行时自动绑定该章目标；场景链各场之和只对齐当前这一章。用户明确为不同章节分别指定数字时，以各章指定值为准。`
     : "";
   const chapterNamingLine = chapterNaming && chapterNamingNeedsAgentContext(task)
-    ? `\n${chapterNamingAgentPrompt(chapterNaming, project)}`
+    ? `\n${chapterNamingAgentPrompt(
+        chapterNaming,
+        project,
+        chapterPathsInVolume(project, volumeAccess?.activeVolume),
+      )}`
     : "";
   const volumeNames = chapterVolumeNames(project);
   const volumeInstruction = [
@@ -3174,14 +3179,6 @@ export async function runAgent(options: {
     && !(task.targetPath && project.documentExists(task.targetPath));
   const requestedActiveVolume = selectedVolume
     ?? (shouldCreateVolume ? uniqueVolumeName(project, task.newVolumeName) : undefined);
-  // 章节命名：仅写章/交付类任务锁定会话约定，同会话多章 path/H1 保持一致。
-  const sessionChapterNaming = resolveSessionChapterNaming(
-    project,
-    store,
-    sessionId,
-    runtimeSettings.chapterNaming,
-    { lock: chapterNamingNeedsAgentContext(task) },
-  );
   emit({
     type: "task_contract",
     contract: {
@@ -3272,6 +3269,19 @@ export async function runAgent(options: {
     ...(activeVolume ? { activeVolume } : {}),
     ...(autoCreatedVolume ? { autoCreated: true } : {}),
   };
+  // Convention inference may inspect only this run's visible chapters. Ordinal
+  // selection is narrower and happens later against the destination volume only.
+  const sessionChapterNaming = resolveSessionChapterNaming(
+    project,
+    store,
+    sessionId,
+    runtimeSettings.chapterNaming,
+    {
+      lock: chapterNamingNeedsAgentContext(task),
+      chapterPaths: agentVisibleDocumentPaths(project, accessibleVolumeNames(volumeAccess))
+        .filter(path => documentKind(path) === "chapter"),
+    },
+  );
   const persistRunTerminal = (
     terminalState: "interrupted" | "completed" | "failed" | "cancelled",
     terminalReason?: string,

@@ -439,11 +439,15 @@ export function inferChapterNamingFromPaths(paths: readonly string[]): Partial<C
 export function resolveChapterNaming(
   settings: ChapterNamingSettings,
   project: WriterProject,
-  options?: { sourceHint?: ResolvedChapterNaming["source"] },
+  options?: {
+    sourceHint?: ResolvedChapterNaming["source"];
+    /** Agent-visible chapter paths eligible for convention inference. */
+    chapterPaths?: readonly string[];
+  },
 ): ResolvedChapterNaming {
   const normalized = normalizeChapterNamingSettings(settings);
   if (normalized.preset === "auto") {
-    const inferred = inferChapterNamingFromPaths(listChapterPaths(project));
+    const inferred = inferChapterNamingFromPaths(options?.chapterPaths ?? listChapterPaths(project));
     if (Object.keys(inferred).length) {
       const merged = normalizeChapterNamingSettings({
         ...DEFAULT_CHAPTER_NAMING,
@@ -532,11 +536,11 @@ export function resolveSessionChapterNaming(
   store: WriterStore,
   sessionId: string,
   settings: ChapterNamingSettings,
-  options?: { lock?: boolean },
+  options?: { lock?: boolean; chapterPaths?: readonly string[] },
 ): ResolvedChapterNaming {
   const locked = loadSessionChapterNaming(store, sessionId);
   if (locked) return locked;
-  const resolved = resolveChapterNaming(settings, project);
+  const resolved = resolveChapterNaming(settings, project, { chapterPaths: options?.chapterPaths });
   if (options?.lock !== false) {
     try {
       saveSessionChapterNaming(store, sessionId, resolved);
@@ -553,9 +557,9 @@ export function resolveSessionChapterNaming(
 export function suggestNextChapter(
   resolved: ResolvedChapterNaming,
   project: WriterProject,
-  options?: { subtitle?: string; folder?: string },
+  options?: { subtitle?: string; folder?: string; chapterPaths?: readonly string[] },
 ): { index: number; path: string; title: string; heading: string } {
-  const paths = listChapterPaths(project);
+  const paths = options?.chapterPaths ?? listChapterPaths(project);
   const index = nextChapterIndex(paths);
   let path = formatChapterPath(resolved, index, options?.subtitle);
   if (options?.folder) {
@@ -570,8 +574,9 @@ export function suggestNextChapter(
 export function chapterNamingAgentPrompt(
   resolved: ResolvedChapterNaming,
   project: WriterProject,
+  chapterPaths?: readonly string[],
 ): string {
-  const next = suggestNextChapter(resolved, project);
+  const next = suggestNextChapter(resolved, project, { chapterPaths });
   const padExample = String(next.index).padStart(resolved.indexPadWidth, "0");
   return [
     "章节命名（本会话锁定，须全程一致）：",

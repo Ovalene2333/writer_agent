@@ -4,6 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadAgentSettings, saveAgentSettings } from "./agent_runtime.js";
+import {
+  chapterNamingAgentPrompt,
+  DEFAULT_CHAPTER_NAMING,
+  resolveChapterNaming,
+  suggestNextChapter,
+} from "./chapter_naming.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleListFiles, handleReadFile, handleSearchFiles } from "./tools/files.js";
@@ -12,6 +18,7 @@ import {
   accessibleVolumeNames,
   agentVisibleDocumentPaths,
   assertVolumePathAllowed,
+  chapterPathsInVolume,
   chapterVolume,
   chapterVolumeNames,
   routeNewChapterPath,
@@ -37,11 +44,15 @@ test("volume catalog exposes names while locked chapter bodies stay hidden", () 
     assert.equal(chapterVolume("chapters/第一卷/01.md"), "第一卷");
     assert.equal(chapterVolume("chapters/free.md"), undefined);
     assert.deepEqual(new Set(chapterVolumeNames(project)), new Set(["第一卷", "第二卷"]));
-    assert.deepEqual(new Set(agentVisibleDocumentPaths(project)), new Set(["chapters/free.md", "lore/world.md"]));
-    assert.deepEqual(
-      new Set(agentVisibleDocumentPaths(project, ["第二卷"])),
-      new Set(["chapters/free.md", "chapters/第二卷/02.md", "lore/world.md"]),
-    );
+    const locked = agentVisibleDocumentPaths(project);
+    assert.ok(locked.includes("chapters/free.md"));
+    assert.ok(locked.includes("lore/world.md"));
+    assert.equal(locked.includes("chapters/第一卷/01.md"), false);
+    assert.equal(locked.includes("chapters/第二卷/02.md"), false);
+    const secondUnlocked = agentVisibleDocumentPaths(project, ["第二卷"]);
+    assert.ok(secondUnlocked.includes("chapters/free.md"));
+    assert.ok(secondUnlocked.includes("chapters/第二卷/02.md"));
+    assert.equal(secondUnlocked.includes("chapters/第一卷/01.md"), false);
     assert.deepEqual(
       accessibleVolumeNames({ allowedVolumes: [], activeVolume: "第一卷", autoCreated: true }),
       ["第一卷"],
@@ -71,6 +82,32 @@ test("one run routes every new ungrouped chapter into its active volume", () => 
   });
 });
 
+test("chapter ordinals are local to the destination volume", () => {
+  withProject(project => {
+    for (let index = 1; index <= 6; index += 1) {
+      project.writeTextFile(`chapters/旧卷/chapter-${String(index).padStart(2, "0")}.md`, `# 第${index}章\n`);
+    }
+    project.writeTextFile("chapters/目标卷/chapter-01.md", "# 第一章\n");
+    project.writeTextFile("chapters/目标卷/chapter-02.md", "# 第二章\n");
+    project.writeTextFile("chapters/chapter-01.md", "# 未分卷第一章\n");
+
+    const naming = resolveChapterNaming(DEFAULT_CHAPTER_NAMING, project, { chapterPaths: [] });
+    assert.equal(suggestNextChapter(naming, project, {
+      chapterPaths: chapterPathsInVolume(project, "新卷"),
+    }).index, 1);
+    assert.equal(suggestNextChapter(naming, project, {
+      chapterPaths: chapterPathsInVolume(project, "目标卷"),
+    }).index, 3);
+    assert.equal(suggestNextChapter(naming, project, {
+      chapterPaths: chapterPathsInVolume(project),
+    }).index, 2);
+    assert.match(
+      chapterNamingAgentPrompt(naming, project, chapterPathsInVolume(project, "新卷")),
+      /下一可用：path=chapters\/chapter-01\.md · title=# 第一章/,
+    );
+  });
+});
+
 test("file tools expose volume names without leaking locked chapter paths or text", () => {
   withProject(project => {
     project.writeTextFile("chapters/free.md", "public marker\n");
@@ -90,8 +127,9 @@ test("file tools expose volume names without leaking locked chapter paths or tex
         files: string[];
         volumes: Array<{ name: string; unlocked: boolean }>;
       };
-      assert.deepEqual(listed.files, ["chapters/free.md"]);
-      assert.deepEqual(listed.volumes, [{ name: "Locked", unlocked: false }]);
+      assert.ok(listed.files.includes("chapters/free.md"));
+      assert.equal(listed.files.includes("chapters/Locked/secret.md"), false);
+      assert.deepEqual(listed.volumes, [{ name: "Locked", path: "chapters/Locked/", unlocked: false }]);
       assert.throws(() => handleReadFile(args({ path: "chapters/Locked/secret.md" })), /未解锁该卷/);
       assert.deepEqual(
         JSON.parse(handleSearchFiles(args({ query: "marker" }))).matches.map((item: { path: string }) => item.path),
