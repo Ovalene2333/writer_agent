@@ -23,6 +23,7 @@ import type {
   SceneStateExtractionResult,
 } from "../evidence_grounded_writer.js";
 import type { WritePack } from "../write_pack.js";
+import type { RepairPacketIssue } from "../repair_packet.js";
 import type { RegisterRisk } from "../register_risks.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
@@ -68,6 +69,12 @@ export type WorkingTextFile = {
   baseSourceHash: string;
   deliverableId?: string;
   revisionCaseId?: string;
+  /**
+   * Gate findings that rejected exactly this body. Carried so a bounded repair can
+   * be delegated back to the evidence-owning Writer instead of being hand-written
+   * by the parent Agent, which has no fact packet.
+   */
+  repairIssues?: RepairPacketIssue[];
 };
 
 export type ToolCall = {
@@ -143,6 +150,12 @@ export type ToolExecutionContext = {
   lastWritePackData?: WritePack;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
+  /**
+   * Fact packet that produced the current evidence-written body of each document.
+   * Retained after generation so a gate rejection can be repaired by the same
+   * Writer against the same facts, without forcing a full re-compile.
+   */
+  evidenceWriterPacks?: Map<string, WritePack>;
   /** Current project scene-chain guidance and per-document prose target. */
   scenePipelineSettings?: ScenePipelineSettings;
   /**

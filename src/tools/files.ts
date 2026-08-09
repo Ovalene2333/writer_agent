@@ -7,6 +7,8 @@ import {
   reportAndWrapEvidenceWriterError,
   requestEvidenceGroundedProse,
 } from "../evidence_grounded_writer.js";
+import type { EvidenceGroundedWriterInput } from "../evidence_grounded_writer.js";
+import type { RepairPacketIssue } from "../repair_packet.js";
 import { reportModelCallUsage } from "../dependency_diagnostics.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { normalizeChapterDocumentContent } from "../chapter_naming.js";
@@ -324,6 +326,21 @@ export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
     && args.context.evidenceGroundedWriter && isScenePipelineDocument(path)) {
     return handleEvidenceGroundedWriteFile(args, path);
   }
+  // A rejected working copy still belongs to the Writer that owns its fact packet.
+  // Repairing it here keeps the parent Agent out of the prose while reusing the
+  // exact gate findings, instead of forcing a full regeneration from scratch.
+  if (typeof args.input.content !== "string" && existing?.repairIssues?.length
+    && args.context.evidenceGroundedWriter && isScenePipelineDocument(path)) {
+    const repairIssues = writerReviewIssues(existing.repairIssues);
+    // Without locatable prose the repair would be an unbounded rewrite; fall back
+    // to the plain re-verification path instead.
+    if (repairIssues.length) {
+      return handleEvidenceGroundedWriteFile(args, path, {
+        existingText: existing.content,
+        repairIssues,
+      });
+    }
+  }
   if (typeof args.input.content !== "string" && !existing) {
     throw new Error("新建或完整替换文件时 content 必须是字符串；只有已有工作副本或已终审场景草稿才能省略 content 重新验证");
   }
@@ -333,10 +350,23 @@ export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
   return submitWorkingTextFile(args, staged, "write");
 }
 
-async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: string): Promise<string> {
-  const pack = args.context.lastWritePackData;
-  if (!pack || !args.context.writePackCompiled) {
-    throw new Error("EVIDENCE_WRITER_PACK_REQUIRED：先 compile_write_pack 提交场景目标、人物当下、已知事实、事件方向与不可补写项，再调用 write_file(path) 并省略 content");
+async function handleEvidenceGroundedWriteFile(
+  args: ToolHandlerArgs,
+  path: string,
+  repair?: {
+    existingText: string;
+    repairIssues: NonNullable<EvidenceGroundedWriterInput["reviewIssues"]>;
+  },
+): Promise<string> {
+  const normalizedPath = normalizeTextFilePath(path);
+  const compiledPack = args.context.writePackCompiled ? args.context.lastWritePackData : undefined;
+  // A repair reuses the packet that produced the rejected body unless the Agent
+  // deliberately compiled a new one; a first draft always requires a fresh compile.
+  const pack = compiledPack ?? (repair ? args.context.evidenceWriterPacks?.get(normalizedPath) : undefined);
+  if (!pack) {
+    throw new Error(repair
+      ? "EVIDENCE_WRITER_PACK_REQUIRED：本轮没有可复用的事实包。先 compile_write_pack 重新提交场景目标、人物当下、已知事实与不可补写项，再调用 write_file(path) 并省略 content 做定向修订"
+      : "EVIDENCE_WRITER_PACK_REQUIRED：先 compile_write_pack 提交场景目标、人物当下、已知事实、事件方向与不可补写项，再调用 write_file(path) 并省略 content");
   }
   const writer = args.context.evidenceGroundedWriter!;
   const evidence = buildNarrativeEvidencePacket({
@@ -347,7 +377,9 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
     path,
   });
   args.context.narrativeEvidencePackets?.set(path, evidence);
-  const existingText = args.project.textFileExists(path) ? args.project.readTextFile(path) : "";
+  // A repair rewrites the rejected working copy, not the last committed version.
+  const existingText = repair?.existingText
+    ?? (args.project.textFileExists(path) ? args.project.readTextFile(path) : "");
   const run = writer.run ?? requestEvidenceGroundedProse;
   const registerRisks = collectRegisterRisksForContext(args.store, args.context);
   if (registerRisks.length && !pack.registerRisks?.length) {
@@ -373,6 +405,7 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
         excludeProjectVoice: Boolean(existingText),
         projectSampleRole: "continuity",
       }),
+      ...(repair ? { reviewIssues: repair.repairIssues } : {}),
       targetCharacters: args.context.proseLength?.targetCharacters,
       lengthMode: args.context.proseLength?.mode,
       registerRisks,
@@ -393,6 +426,10 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
     callKind: "evidence_grounded_document_writer",
   });
   const content = ensureDocumentHeading(path, existingText, generated.content);
+  // The compiled pack is consumed, but stays available to repair whatever this
+  // generation produces; a later first draft still needs its own compile.
+  args.context.evidenceWriterPacks ??= new Map();
+  args.context.evidenceWriterPacks.set(normalizedPath, pack);
   args.context.writePackCompiled = false;
   args.context.lastWritePack = undefined;
   args.context.lastWritePackData = undefined;
@@ -401,11 +438,34 @@ async function handleEvidenceGroundedWriteFile(args: ToolHandlerArgs, path: stri
   const parsed = JSON.parse(result) as Record<string, unknown>;
   return JSON.stringify({
     ...parsed,
-    generationMode: "evidence_grounded_writer",
+    generationMode: repair ? "evidence_grounded_repair" : "evidence_grounded_writer",
+    ...(repair ? { repairedIssues: repair.repairIssues.length } : {}),
     evidenceHash: generated.evidenceHash,
     evidenceReads: generated.evidenceReads.length,
     ...(generated.emptyAutoRetryUsed ? { emptyAutoRetryUsed: true } : {}),
   });
+}
+
+/**
+ * Gate findings become writer-facing revision targets. Only findings that carry
+ * locatable prose survive: without an exact excerpt the Writer cannot bound the
+ * rewrite, and an unbounded "fix this" invites a full rewrite of accepted facts.
+ */
+function writerReviewIssues(
+  issues: readonly RepairPacketIssue[],
+): NonNullable<EvidenceGroundedWriterInput["reviewIssues"]> {
+  return issues.flatMap(issue => {
+    const evidence = [issue.oldText, issue.evidence]
+      .filter((value): value is string => Boolean(value?.trim()));
+    if (!evidence.length) return [];
+    return [{
+      id: issue.id,
+      kind: issue.kind,
+      evidence: [...new Set(evidence)],
+      problem: issue.problem ?? issue.kind,
+      action: issue.action ?? issue.suggestion ?? "在保留其余事实与事件的前提下改写这处证据文本",
+    }];
+  }).slice(0, 8);
 }
 
 function ensureDocumentHeading(path: string, existingText: string, generated: string): string {

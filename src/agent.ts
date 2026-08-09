@@ -2277,6 +2277,11 @@ function syncProposalReviewRevisionContext(
   if (revisionCase.status === "blocked") {
     const draftArtifact = store.contextArtifactById(sessionId, revisionCase.draftArtifactId);
     if (draftArtifact && draftArtifact.sourceHash === revisionCase.draftSourceHash) {
+      // The packet is only attached when it was built from this exact body; a stale
+      // packet would send the Writer after text that no longer exists.
+      const repairIssues = revisionCase.repairPacket?.sourceHash === revisionCase.draftSourceHash
+        ? revisionCase.repairPacket.issues
+        : undefined;
       context.workingTextFiles.set(revisionCase.path, {
         path: revisionCase.path,
         content: draftArtifact.content,
@@ -2285,6 +2290,7 @@ function syncProposalReviewRevisionContext(
         baseSourceHash: revisionCase.baseDocumentSourceHash,
         ...(revisionCase.deliverableId ? { deliverableId: revisionCase.deliverableId } : {}),
         revisionCaseId: revisionCase.revisionCaseId,
+        ...(repairIssues?.length ? { repairIssues } : {}),
       });
     }
   } else {
@@ -2696,7 +2702,19 @@ function repairPacketForConvergePrompt(
 function repairPacketInstructions(
   packet: RepairPacket | undefined,
   revisionCase?: ProposalRevisionCase,
+  delegatedProseRepair = false,
 ): string {
+  if (packet?.issues.some(issue => issue.oldText || issue.evidence) && delegatedProseRepair) {
+    // The fact packet lives with the Writer. Hand-editing prose here would repair
+    // the surface with a model that cannot see what the facts allow.
+    return [
+      `正文由证据型 Writer 持有事实包：直接用 write_file({path:"${packet.path}"}) 省略 content 重新提交，运行时会把这份修订包作为定向修订指令交回 Writer，只改证据点，其余事件与信息释放保持成立。`,
+      "不要自己用 edit_file 手写正文；只有同一条 blocker 连续两轮未闭合时，才对纯措辞问题做最小替换。",
+      packet.omittedIssueCount
+        ? `本包还有 ${packet.omittedIssueCount} 条因安全上限未展开；先完成当前批次并重新提交。`
+        : "",
+    ].filter(Boolean).join("\n");
+  }
   if (!packet) {
     return revisionCase
       ? "下一步用 read_file 对当前工作副本的 blocker evidence 定点定位，只做最小修订，再用 edit_file 提交；禁止重读已读材料或全文重写。"
@@ -2725,6 +2743,7 @@ export function proposalRevisionConvergePrompt(
   result: Record<string, unknown>,
   attempt: number,
   revisionCase?: ProposalRevisionCase,
+  delegatedProseRepair = false,
 ): string {
   const status = typeof result.status === "string" ? result.status : "rejected";
   const code = typeof result.code === "string" ? result.code : "";
@@ -2768,7 +2787,7 @@ export function proposalRevisionConvergePrompt(
         : "节奏信号只用于定位。通读命中段，保留承担命令、停顿和动作落点的短句，只合并语义上被机械切碎的内容；不要补配额长句或扩大改写。")
       : hardLimit
         ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
-        : repairPacketInstructions(repairPacket, revisionCase),
+        : repairPacketInstructions(repairPacket, revisionCase, delegatedProseRepair),
   ].filter(Boolean).join("\n");
 }
 
@@ -4393,7 +4412,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 }
                 documentProposalSubmitted = false;
                 pendingProposalRevisionPrompt = [
-                  proposalRevisionConvergePrompt(parsed, 1),
+                  proposalRevisionConvergePrompt(parsed, 1, undefined, Boolean(toolContext.evidenceGroundedWriter)),
                   proposalRevisionTargetConstraint(project, draft),
                 ].filter(Boolean).join("\n");
                 pendingProposalRevisionDraft = draft;
@@ -4521,6 +4540,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                       reviewResult,
                       decision.attempt,
                       draft?.revisionCase,
+                      Boolean(toolContext.evidenceGroundedWriter),
                     ),
                     proposalRevisionTargetConstraint(project, draft),
                   ].filter(Boolean).join("\n");

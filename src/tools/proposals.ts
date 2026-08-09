@@ -52,7 +52,7 @@ import {
   type DependencyAttemptDiagnostic,
 } from "../dependency_diagnostics.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
-import { dialogueFormatGateError } from "../dialogue_format.js";
+import { auditDialogueFormat, dialogueFormatGateError } from "../dialogue_format.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import {
@@ -382,6 +382,12 @@ async function gateProseStyleWithSparseAutoRepair(
     reason: string;
     suggestion?: string;
   }>;
+  /**
+   * Set when the gate rejected the body. Returned instead of thrown so the other
+   * deterministic gates can still run and the Agent gets one merged repair list
+   * rather than one round trip per gate.
+   */
+  failure?: { code: string; message: string; repairPacket?: RepairPacket };
 }> {
   let current = content;
   const stripped: string[] = [];
@@ -435,9 +441,16 @@ async function gateProseStyleWithSparseAutoRepair(
     if (!repairer || !repairable || attempt >= PROPOSAL_STYLE_AUTO_REPAIR_MAX_ATTEMPTS) {
       const packet = proseStyleRepairPacket(current, issues, { path, sourceHash });
       const suffix = errors.length ? `；自动局部修订未完成：${errors.slice(-2).join("；")}` : "";
-      throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", `${styleError}${suffix}`, {
-        repairPacket: packet,
-      });
+      return {
+        content: current,
+        sourceHash,
+        stripped,
+        failure: {
+          code: "PROSE_STYLE_REVISION_REQUIRED",
+          message: `${styleError}${suffix}`,
+          ...(packet ? { repairPacket: packet } : {}),
+        },
+      };
     }
     const runRepair = repairer.run ?? requestChapterStyleRepair;
     const models = [repairer.model, repairer.fallbackModel]
@@ -491,15 +504,35 @@ async function gateProseStyleWithSparseAutoRepair(
     }
     if (!applied) {
       const sourceHashAfterFailure = project.hash(current);
-      throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", `${styleError}；自动局部修订未完成：${errors.slice(-2).join("；")}`, {
-        repairPacket: proseStyleRepairPacket(current, issues, { path, sourceHash: sourceHashAfterFailure }),
-      });
+      const packet = proseStyleRepairPacket(current, issues, { path, sourceHash: sourceHashAfterFailure });
+      return {
+        content: current,
+        sourceHash: sourceHashAfterFailure,
+        stripped,
+        failure: {
+          code: "PROSE_STYLE_REVISION_REQUIRED",
+          message: `${styleError}；自动局部修订未完成：${errors.slice(-2).join("；")}`,
+          ...(packet ? { repairPacket: packet } : {}),
+        },
+      };
     }
   }
   const finalSourceHash = project.hash(current);
-  throw new ToolRevisionRequiredError("PROSE_STYLE_REVISION_REQUIRED", "句式自动修订达到运行时上限后仍未通过", {
-    repairPacket: proseStyleRepairPacket(current, newProseStyleIssues(beforeContent, current), { path, sourceHash: finalSourceHash }),
-  });
+  const finalPacket = proseStyleRepairPacket(
+    current,
+    newProseStyleIssues(beforeContent, current),
+    { path, sourceHash: finalSourceHash },
+  );
+  return {
+    content: current,
+    sourceHash: finalSourceHash,
+    stripped,
+    failure: {
+      code: "PROSE_STYLE_REVISION_REQUIRED",
+      message: "句式自动修订达到运行时上限后仍未通过",
+      ...(finalPacket ? { repairPacket: finalPacket } : {}),
+    },
+  };
 }
 
 function directReviewRepairPacket(
@@ -521,6 +554,72 @@ function directReviewRepairPacket(
       action: issue.action,
     })),
   });
+}
+
+type SurfaceGateFailure = { code: string; message: string; repairPacket?: RepairPacket };
+
+function dialogueFormatRepairPacket(
+  content: string,
+  path: string,
+  sourceHash: string,
+): RepairPacket | undefined {
+  const issues = auditDialogueFormat(content).filter(issue => issue.blocksProposal);
+  if (!issues.length) return undefined;
+  return boundedRepairPacket({
+    path,
+    sourceHash,
+    issueCount: issues.length,
+    issues: issues.map((issue, index) => ({
+      id: `dialogue_format:${issue.code}:${issue.line}:${issue.column}:${index}`,
+      kind: issue.code,
+      line: issue.line,
+      evidence: issue.evidence,
+      problem: issue.message,
+      action: issue.suggestion,
+    })),
+  });
+}
+
+/**
+ * Deterministic surface gates all classify to the same retry gate, so reporting
+ * them one at a time only bought extra round trips. Merge every finding into one
+ * packet and keep the first failing gate's code so retry accounting is unchanged.
+ */
+function mergedSurfaceGateError(
+  failures: readonly SurfaceGateFailure[],
+  path: string,
+  sourceHash: string,
+): ToolRevisionRequiredError {
+  const primary = failures[0]!;
+  const issues = failures.flatMap(failure => failure.repairPacket?.issues ?? []);
+  const packet = issues.length
+    ? boundedRepairPacket({
+        path,
+        sourceHash,
+        issueCount: Math.max(
+          issues.length,
+          failures.reduce((sum, failure) => sum + (failure.repairPacket?.issueCount ?? 0), 0),
+        ),
+        issues,
+        ...(failures.some(failure => failure.repairPacket?.omittedIssueCount)
+          ? {
+              omittedIssueCount: failures.reduce(
+                (sum, failure) => sum + (failure.repairPacket?.omittedIssueCount ?? 0),
+                0,
+              ),
+            }
+          : {}),
+      })
+    : undefined;
+  const message = failures.length > 1
+    ? `本次提交有 ${failures.length} 类确定性门禁未通过，已一并列出，请在同一稿里全部处理：\n${
+        failures.map(failure => `【${failure.code}】${failure.message}`).join("\n")}`
+    : primary.message;
+  return new ToolRevisionRequiredError(
+    primary.code,
+    message,
+    packet ? { repairPacket: packet } : undefined,
+  );
 }
 
 function chapterReviewRepairPacket(
@@ -787,6 +886,9 @@ export async function submitFullDocumentProposal(
       nextAllowedActions: ["read_file", "edit_file", "write_file"],
     });
   }
+  // Every deterministic gate runs before anything is reported: one submission
+  // should cost one repair round, not one round per gate.
+  const surfaceFailures: SurfaceGateFailure[] = [];
   if (!proseStyleApproved) {
     const styleGate = await gateProseStyleWithSparseAutoRepair(
       beforeContent,
@@ -803,11 +905,17 @@ export async function submitFullDocumentProposal(
     styleAutoRepair = styleGate.autoRepair;
     policyObservations = styleGate.policyObservations;
     recordLatestProposalDraft(proposedBody, draftSourceHash);
+    if (styleGate.failure) surfaceFailures.push(styleGate.failure);
   }
   if (isScenePipelineDocument(path)) {
     const dialogueFormatError = dialogueFormatGateError(proposedBody);
     if (dialogueFormatError) {
-      throw new ToolRevisionRequiredError("DIALOGUE_FORMAT_REVISION_REQUIRED", dialogueFormatError);
+      const packet = dialogueFormatRepairPacket(proposedBody, path, draftSourceHash);
+      surfaceFailures.push({
+        code: "DIALOGUE_FORMAT_REVISION_REQUIRED",
+        message: dialogueFormatError,
+        ...(packet ? { repairPacket: packet } : {}),
+      });
     }
   }
   let cardRegisterAssessment: CardRegisterAssessment | undefined;
@@ -816,13 +924,19 @@ export async function submitFullDocumentProposal(
     cardRegisterAssessment = assessCardRegisterHits(scanCardRegisterHits(proposedBody, risks));
     const registerError = cardRegisterGateError(cardRegisterAssessment);
     if (registerError) {
-      throw new ToolRevisionRequiredError("CARD_REGISTER_REVISION_REQUIRED", registerError, {
-        repairPacket: cardRegisterRepairPacket(proposedBody, cardRegisterAssessment, {
-          path,
-          sourceHash: draftSourceHash,
-        }),
+      const packet = cardRegisterRepairPacket(proposedBody, cardRegisterAssessment, {
+        path,
+        sourceHash: draftSourceHash,
+      });
+      surfaceFailures.push({
+        code: "CARD_REGISTER_REVISION_REQUIRED",
+        message: registerError,
+        ...(packet ? { repairPacket: packet } : {}),
       });
     }
+  }
+  if (surfaceFailures.length) {
+    throw mergedSurfaceGateError(surfaceFailures, path, draftSourceHash);
   }
   if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
     const blocked = await reviewDirectNarrativeProposal(
