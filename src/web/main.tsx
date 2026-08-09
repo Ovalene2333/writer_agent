@@ -63,7 +63,7 @@ import {
   type ConnectionPreference,
 } from "./connection";
 import type { ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
-import { DEFAULT_ROLEPLAY_SETTINGS } from "./model_config";
+import { DEFAULT_CHAPTER_NAMING, DEFAULT_ROLEPLAY_SETTINGS } from "./model_config";
 import { attachmentImageUrl, fileToPendingAttachment, isSupportedComposerImage } from "./composer_media";
 import { AssistantMessageBody } from "./assistant_display";
 import { DocumentDiffView, mergeProposalEvent, ProposalQualityCard, ReviewDock } from "./review_dock";
@@ -2499,13 +2499,42 @@ function App() {
     setCreateValue(kind === "file" ? "新文档" : "新文件夹");
   }
 
-  function handleNewChapter(parent = "chapters") {
-    const maxNumber = chapters.reduce((max, chapter) => {
-      const match = chapter.path.split("/").pop()?.match(/^chapter-(\d+)\.md$/iu);
-      return match ? Math.max(max, Number(match[1])) : max;
-    }, 0);
-    setCreating({ parent, kind: "file" });
-    setCreateValue(`chapter-${String(maxNumber + 1).padStart(3, "0")}`);
+  async function handleNewChapter(parent = "chapters") {
+    try {
+      const session = state?.sessionId ? `?session=${encodeURIComponent(state.sessionId)}&folder=${encodeURIComponent(parent)}` : `?folder=${encodeURIComponent(parent)}`;
+      const next = await api<{ path: string; title: string; content: string }>(`/api/chapters/next${session}`);
+      const fileName = next.path.split("/").pop()?.replace(/\.md$/iu, "") ?? next.path;
+      setCreating({
+        parent,
+        kind: "file",
+        // stash suggested heading for submitCreate via createValue stem + content template
+      });
+      setCreateValue(fileName);
+      // Prefer direct create when API already has path+heading.
+      await api("/api/document", {
+        method: "POST",
+        body: JSON.stringify({ path: next.path, content: next.content || `# ${next.title}\n\n` }),
+      });
+      setExpandedFolders((prev) => {
+        const expanded = new Set(prev);
+        expanded.add(parent);
+        return expanded;
+      });
+      await refresh(state?.sessionId);
+      await loadChapters();
+      setActivePath(next.path);
+      setCreating(null);
+      setNotice(`已新建 ${next.path}`);
+    } catch (e) {
+      // Fallback: local chapter-NNN heuristic when API unavailable.
+      const maxNumber = chapters.reduce((max, chapter) => {
+        const match = chapter.path.split("/").pop()?.match(/^chapter-(\d+)\.md$/iu);
+        return match ? Math.max(max, Number(match[1])) : max;
+      }, 0);
+      setCreating({ parent, kind: "file" });
+      setCreateValue(`chapter-${String(maxNumber + 1).padStart(2, "0")}`);
+      setError(String(e));
+    }
   }
 
   function handleNewVolume() {
@@ -6889,6 +6918,7 @@ function App() {
           initialCatalog={state.providerCatalog}
           scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 }}
           proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
+          chapterNaming={state.agentSettings?.chapterNaming ?? DEFAULT_CHAPTER_NAMING}
           proseGateTimeouts={state.agentSettings?.proseGateTimeouts ?? { primarySeconds: 60, finalSeconds: 180 }}
           roleplay={state.agentSettings?.roleplay ?? DEFAULT_ROLEPLAY_SETTINGS}
           writingMode={state.agentSettings?.writingMode ?? "fast"}
@@ -7057,6 +7087,21 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength,
+          chapterNaming: previous.agentSettings?.chapterNaming ?? DEFAULT_CHAPTER_NAMING,
+          },
+          } : previous)}
+          onChapterNamingChanged={chapterNaming => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          chapterNaming,
           },
           } : previous)}
           onProseGateTimeoutsChanged={proseGateTimeouts => setState(previous => previous ? {

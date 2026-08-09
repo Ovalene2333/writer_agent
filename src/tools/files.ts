@@ -9,6 +9,7 @@ import {
 } from "../evidence_grounded_writer.js";
 import { reportModelCallUsage } from "../dependency_diagnostics.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
+import { normalizeChapterDocumentContent } from "../chapter_naming.js";
 import { styleGroundingPrompt } from "../style_grounding.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import {
@@ -43,6 +44,10 @@ function stageWorkingTextFile(
   // the body enters the overlay or an approval record.
   args.project.resolveTextFileSafe(normalized);
   if (args.project.isDocumentHidden(normalized)) throw new Error("文件已对 Agent 屏蔽");
+  let body = content;
+  if (args.context.chapterNaming) {
+    body = normalizeChapterDocumentContent(normalized, content, args.context.chapterNaming).content;
+  }
   args.context.workingTextFiles ??= new Map();
   const previous = args.context.workingTextFiles.get(normalized);
   const baseExists = previous?.baseExists ?? args.project.textFileExists(normalized);
@@ -54,8 +59,8 @@ function stageWorkingTextFile(
     : previous?.deliverableId;
   const staged: WorkingTextFile = {
     path: normalized,
-    content,
-    sourceHash: args.project.hash(content),
+    content: body,
+    sourceHash: args.project.hash(body),
     baseExists,
     baseSourceHash,
     ...(deliverableId ? { deliverableId } : {}),

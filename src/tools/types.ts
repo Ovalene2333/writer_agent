@@ -3,6 +3,7 @@ import type { WriterProject } from "../project.js";
 import type { WriterStore } from "../store.js";
 import type { ChapterSceneDraft, SceneActualState, SceneCharacterScope } from "../scene_pipeline.js";
 import type { ProseLengthMode, ScenePipelineSettings } from "../agent_runtime.js";
+import type { ResolvedChapterNaming } from "../chapter_naming.js";
 import type { ProseReferenceMode } from "../agentic_runtime.js";
 import type { ProseVerdictCache } from "../prose_adjudicate.js";
 import type { ModelUsageReporter } from "../model_usage.js";
@@ -149,6 +150,8 @@ export type ToolExecutionContext = {
    * 旧调用方省略 mode 时按范围验收兼容。
    */
   proseLength?: { targetCharacters: number; enforceMinimum: boolean; mode?: ProseLengthMode };
+  /** Session-locked chapter path/title convention for multi-chapter jobs. */
+  chapterNaming?: ResolvedChapterNaming;
   /** In-run narrative draft; never writes a partial document to the project. */
   chapterSceneDraft?: ChapterSceneDraft;
   /**

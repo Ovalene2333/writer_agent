@@ -63,6 +63,30 @@ export type ProseLengthSettings = {
   mode: "bounded" | "guidance";
   enforceMinimum: boolean;
 };
+export type ChapterNamingPreset = "auto" | "cn-file-en" | "cn-file" | "cn-arabic" | "custom";
+export type ChapterIndexStyle = "chinese" | "arabic" | "padded-arabic";
+export type ChapterNamingSettings = {
+  preset: ChapterNamingPreset;
+  pathPattern: string;
+  indexPadWidth: number;
+  titlePattern: string;
+  titleWithSubtitle: string;
+  requireSubtitle: boolean;
+  subtitleMaxLen: number;
+  indexStyle: ChapterIndexStyle;
+  enforceHeading: boolean;
+};
+export const DEFAULT_CHAPTER_NAMING: ChapterNamingSettings = {
+  preset: "auto",
+  pathPattern: "chapters/chapter-{indexPad}.md",
+  indexPadWidth: 2,
+  titlePattern: "第{indexCn}章",
+  titleWithSubtitle: "第{indexCn}章 {subtitle}",
+  requireSubtitle: false,
+  subtitleMaxLen: 16,
+  indexStyle: "chinese",
+  enforceHeading: true,
+};
 export type WritingExecutionMode = "delegated" | "fast";
 export type AgentStepBudgetMode = "hard" | "experimental";
 export type RoleplayReasoningChoice = ReasoningEffort | "inherit";
@@ -215,6 +239,7 @@ type ModelConfigProps = {
   initialCatalog: ProviderCatalog;
   scenePipeline: ScenePipelineSettings;
   proseLength: ProseLengthSettings;
+  chapterNaming: ChapterNamingSettings;
   proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
   roleplay: RoleplaySettings;
   writingMode: WritingExecutionMode;
@@ -234,6 +259,7 @@ type ModelConfigProps = {
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onProseLengthChanged: (settings: ProseLengthSettings) => void;
+  onChapterNamingChanged: (settings: ChapterNamingSettings) => void;
   onProseGateTimeoutsChanged: (settings: { primarySeconds: number; finalSeconds: number }) => void;
   onRoleplayChanged: (settings: RoleplaySettings) => void;
   onCharacterEvolutionChanged: (enabled: boolean) => void;
@@ -245,6 +271,7 @@ export function ModelConfig({
   initialCatalog,
   scenePipeline,
   proseLength,
+  chapterNaming,
   proseGateTimeouts,
   roleplay,
   writingMode,
@@ -264,6 +291,7 @@ export function ModelConfig({
   onChanged,
   onScenePipelineChanged,
   onProseLengthChanged,
+  onChapterNamingChanged,
   onProseGateTimeoutsChanged,
   onRoleplayChanged,
   onCharacterEvolutionChanged,
@@ -273,6 +301,7 @@ export function ModelConfig({
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [lengthDraft, setLengthDraft] = useState(proseLength);
+  const [namingDraft, setNamingDraft] = useState(chapterNaming);
   const [proseGateTimeoutsDraft, setProseGateTimeoutsDraft] = useState(proseGateTimeouts);
   const [roleplayDraft, setRoleplayDraft] = useState(roleplay);
   const [characterEvolutionDraft, setCharacterEvolutionDraft] = useState(characterEvolutionEnabled);
@@ -291,6 +320,7 @@ export function ModelConfig({
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setLengthDraft(proseLength), [proseLength]);
+  useEffect(() => setNamingDraft(chapterNaming), [chapterNaming]);
   useEffect(() => setProseGateTimeoutsDraft(proseGateTimeouts), [proseGateTimeouts]);
   useEffect(() => setRoleplayDraft({
     ...DEFAULT_ROLEPLAY_SETTINGS,
@@ -347,13 +377,30 @@ export function ModelConfig({
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
     || lengthDraft.mode !== proseLength.mode
     || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
+    || namingDraft.preset !== chapterNaming.preset
+    || namingDraft.pathPattern !== chapterNaming.pathPattern
+    || namingDraft.indexPadWidth !== chapterNaming.indexPadWidth
+    || namingDraft.titlePattern !== chapterNaming.titlePattern
+    || namingDraft.titleWithSubtitle !== chapterNaming.titleWithSubtitle
+    || namingDraft.requireSubtitle !== chapterNaming.requireSubtitle
+    || namingDraft.subtitleMaxLen !== chapterNaming.subtitleMaxLen
+    || namingDraft.indexStyle !== chapterNaming.indexStyle
+    || namingDraft.enforceHeading !== chapterNaming.enforceHeading
     || proseGateTimeoutsDraft.primarySeconds !== proseGateTimeouts.primarySeconds
     || proseGateTimeoutsDraft.finalSeconds !== proseGateTimeouts.finalSeconds
     || reviewFollowsProseDraft !== reviewFollowsProseModel
     || stepBudgetModeDraft !== stepBudgetMode
     || maxAgentStepsDraft !== maxAgentSteps
     || Object.keys(sceneDraft).some(key => sceneDraft[key as keyof ScenePipelineSettings] !== scenePipeline[key as keyof ScenePipelineSettings]);
-  const sceneDraftValid = !lengthDraftInvalid && !stepsDraftInvalid && [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
+  const namingDraftInvalid = !Number.isInteger(namingDraft.indexPadWidth)
+    || namingDraft.indexPadWidth < 1
+    || namingDraft.indexPadWidth > 4
+    || !Number.isInteger(namingDraft.subtitleMaxLen)
+    || namingDraft.subtitleMaxLen < 4
+    || namingDraft.subtitleMaxLen > 40
+    || (namingDraft.preset === "custom" && !namingDraft.pathPattern.trim())
+    || (namingDraft.preset === "custom" && !namingDraft.titlePattern.trim());
+  const sceneDraftValid = !lengthDraftInvalid && !namingDraftInvalid && !stepsDraftInvalid && [sceneDraft.preferredMinScenes, sceneDraft.preferredMaxScenes, sceneDraft.maxScenes]
     .every(value => Number.isInteger(value) && value >= 1 && value <= 8)
     && sceneDraft.preferredMinScenes <= sceneDraft.preferredMaxScenes
     && sceneDraft.preferredMaxScenes <= sceneDraft.maxScenes
@@ -547,6 +594,7 @@ export function ModelConfig({
         body: JSON.stringify({
           scenePipeline: sceneDraft,
           proseLength: lengthDraft,
+          chapterNaming: namingDraft,
           proseGateTimeouts: proseGateTimeoutsDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
           reviewFollowsProseModel: reviewFollowsProseDraft,
@@ -556,6 +604,7 @@ export function ModelConfig({
       }) as {
         scenePipeline: ScenePipelineSettings;
         proseLength: ProseLengthSettings;
+        chapterNaming: ChapterNamingSettings;
         proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
         characterEvolutionEnabled: boolean;
         reviewFollowsProseModel: boolean;
@@ -564,6 +613,7 @@ export function ModelConfig({
       };
       setSceneDraft(result.scenePipeline);
       setLengthDraft(result.proseLength);
+      setNamingDraft(result.chapterNaming);
       setProseGateTimeoutsDraft(result.proseGateTimeouts);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
       setReviewFollowsProseDraft(result.reviewFollowsProseModel);
@@ -571,11 +621,12 @@ export function ModelConfig({
       setMaxAgentStepsDraft(result.maxAgentSteps);
       onScenePipelineChanged(result.scenePipeline);
       onProseLengthChanged(result.proseLength);
+      onChapterNamingChanged(result.chapterNaming);
       onProseGateTimeoutsChanged(result.proseGateTimeouts);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
       onReviewFollowsProseModelChanged(result.reviewFollowsProseModel);
       onStepBudgetChanged({ stepBudgetMode: result.stepBudgetMode, maxAgentSteps: result.maxAgentSteps });
-      setMessage("写作设置已保存，将从下一次 Agent 任务开始生效");
+      setMessage("写作设置已保存，将从下一次 Agent 任务开始生效（已打开的会话仍沿用会话内锁定的章节命名）");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -586,6 +637,7 @@ export function ModelConfig({
   function resetWritingSettings() {
     setSceneDraft(scenePipeline);
     setLengthDraft(proseLength);
+    setNamingDraft(chapterNaming);
     setProseGateTimeoutsDraft(proseGateTimeouts);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
     setReviewFollowsProseDraft(reviewFollowsProseModel);
@@ -856,6 +908,121 @@ export function ModelConfig({
         </section>
 
         <section className="writing-settings-section">
+          <div className="writing-settings-section-head"><div><h4>章节命名</h4><p>统一文件路径与文内 H1。同一会话首次写章时锁定约定，中途改设置只影响新会话。</p></div></div>
+          <div className="scene-settings-grid compact">
+            <label>
+              <span>预设</span>
+              <select
+                value={namingDraft.preset}
+                onChange={event => {
+                  const preset = event.target.value as ChapterNamingPreset;
+                  if (preset === "auto") {
+                    setNamingDraft(current => ({ ...current, preset }));
+                    return;
+                  }
+                  if (preset === "custom") {
+                    setNamingDraft(current => ({ ...current, preset }));
+                    return;
+                  }
+                  const table: Record<Exclude<ChapterNamingPreset, "auto" | "custom">, Omit<ChapterNamingSettings, "preset">> = {
+                    "cn-file-en": {
+                      pathPattern: "chapters/chapter-{indexPad}.md",
+                      indexPadWidth: 2,
+                      titlePattern: "第{indexCn}章",
+                      titleWithSubtitle: "第{indexCn}章 {subtitle}",
+                      requireSubtitle: false,
+                      subtitleMaxLen: 16,
+                      indexStyle: "chinese",
+                      enforceHeading: true,
+                    },
+                    "cn-file": {
+                      pathPattern: "chapters/第{indexPad}章.md",
+                      indexPadWidth: 2,
+                      titlePattern: "第{indexCn}章",
+                      titleWithSubtitle: "第{indexCn}章 {subtitle}",
+                      requireSubtitle: false,
+                      subtitleMaxLen: 16,
+                      indexStyle: "chinese",
+                      enforceHeading: true,
+                    },
+                    "cn-arabic": {
+                      pathPattern: "chapters/chapter-{indexPad}.md",
+                      indexPadWidth: 2,
+                      titlePattern: "第{index}章",
+                      titleWithSubtitle: "第{index}章 {subtitle}",
+                      requireSubtitle: false,
+                      subtitleMaxLen: 16,
+                      indexStyle: "arabic",
+                      enforceHeading: true,
+                    },
+                  };
+                  setNamingDraft({ preset, ...table[preset] });
+                }}
+              >
+                <option value="auto">自动（按已有章节推断）</option>
+                <option value="cn-file-en">chapter-02.md + 第二章</option>
+                <option value="cn-file">第02章.md + 第二章</option>
+                <option value="cn-arabic">chapter-02.md + 第2章</option>
+                <option value="custom">自定义模板</option>
+              </select>
+              <small>推荐 jn3 类项目用「chapter-02.md + 第二章」。</small>
+            </label>
+            <label className={namingDraftInvalid ? "field-invalid" : ""}>
+              <span>序号补零位数</span>
+              <input
+                type="number"
+                min={1}
+                max={4}
+                step={1}
+                value={namingDraft.indexPadWidth}
+                disabled={namingDraft.preset !== "auto" && namingDraft.preset !== "custom"}
+                onChange={event => setNamingDraft(current => ({ ...current, indexPadWidth: Number(event.target.value) }))}
+              />
+              <small>路径里 {"{indexPad}"} 的宽度，1—4。</small>
+            </label>
+          </div>
+          {(namingDraft.preset === "custom" || namingDraft.preset === "auto") && (
+            <div className="scene-settings-grid">
+              <label className={namingDraftInvalid ? "field-invalid" : ""}>
+                <span>路径模板</span>
+                <input
+                  value={namingDraft.pathPattern}
+                  onChange={event => setNamingDraft(current => ({ ...current, preset: current.preset === "auto" ? "custom" : current.preset, pathPattern: event.target.value }))}
+                  placeholder="chapters/chapter-{indexPad}.md"
+                />
+                <small>可用 {"{index}"} {"{indexPad}"} {"{indexCn}"} {"{subtitleSlug}"}</small>
+              </label>
+              <label>
+                <span>标题模板</span>
+                <input
+                  value={namingDraft.titlePattern}
+                  onChange={event => setNamingDraft(current => ({ ...current, preset: current.preset === "auto" ? "custom" : current.preset, titlePattern: event.target.value }))}
+                  placeholder="第{indexCn}章"
+                />
+                <small>无副标题时的 H1。</small>
+              </label>
+              <label>
+                <span>带副标题模板</span>
+                <input
+                  value={namingDraft.titleWithSubtitle}
+                  onChange={event => setNamingDraft(current => ({ ...current, preset: current.preset === "auto" ? "custom" : current.preset, titleWithSubtitle: event.target.value }))}
+                  placeholder="第{indexCn}章 {subtitle}"
+                />
+                <small>例：第四章 余波</small>
+              </label>
+            </div>
+          )}
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={namingDraft.requireSubtitle} onChange={event => setNamingDraft(current => ({ ...current, requireSubtitle: event.target.checked }))}/>
+            <span><strong>要求副标题</strong><small>新建/Agent 交付时标题优先使用「序号 + 副标题」形态（Agent 仍需自行提供副标题）。</small></span>
+          </label>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={namingDraft.enforceHeading} onChange={event => setNamingDraft(current => ({ ...current, enforceHeading: event.target.checked }))}/>
+            <span><strong>写入时校正文件名型 H1</strong><small>把 <code># chapter-02</code> 之类改成规范标题（如「第二章」）；已有文学标题不改。</small></span>
+          </label>
+        </section>
+
+        <section className="writing-settings-section">
           <div className="writing-settings-section-head"><div><h4>可选场景链</h4><p>默认关闭；开启后，模型只在分场确实有助于连续性或长篇修订时使用。</p></div></div>
           <label className="writing-setting-row">
             <input type="checkbox" checked={sceneDraft.enabled} onChange={event => setSceneDraft(current => ({ ...current, enabled: event.target.checked }))}/>
@@ -877,9 +1044,9 @@ export function ModelConfig({
 
         <div className={sceneDraftValid && !proseGateTimeoutsInvalid ? "scene-settings-summary" : "scene-settings-summary invalid"} role={sceneDraftValid && !proseGateTimeoutsInvalid ? "status" : "alert"}>{sceneDraftValid && !proseGateTimeoutsInvalid
           ? !sceneDraft.enabled
-            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式由 Agent 直接成稿" : "分工模式由 Agent 取证、证据型 Writer 成稿"}。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-            : `当前：${writingMode === "fast" ? "快速模式由 Agent 提交正文与状态" : "分工模式由证据型 Writer 生成正文、运行时提取状态"}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
-          : "请检查默认章节字数、Agent 步数、场景数量、notes 上限、候选稿数量与审核超时。"}</div>
+            ? `当前：场景链关闭；${writingMode === "fast" ? "快速模式由 Agent 直接成稿" : "分工模式由 Agent 取证、证据型 Writer 成稿"}。命名：${namingDraft.preset}。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+            : `当前：${writingMode === "fast" ? "快速模式由 Agent 提交正文与状态" : "分工模式由证据型 Writer 生成正文、运行时提取状态"}。场景链建议 ${sceneDraft.preferredMinScenes}—${sceneDraft.preferredMaxScenes} 场，最多 ${sceneDraft.maxScenes} 场。命名：${namingDraft.preset}。步数：${stepBudgetModeDraft === "hard" ? `硬上限 ${maxAgentStepsDraft}` : `实验 soft（硬顶 ${maxAgentStepsDraft}）`}。`
+          : "请检查默认章节字数、章节命名、Agent 步数、场景数量、notes 上限、候选稿数量与审核超时。"}</div>
         <div className="scene-settings-actions">
           <span>{writingSettingsDirty ? "有未保存的修改" : "所有修改均已保存"}</span>
           <button onClick={resetWritingSettings} disabled={busy || !writingSettingsDirty}>放弃修改</button>

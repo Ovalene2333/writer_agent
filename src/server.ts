@@ -39,6 +39,7 @@ import {
   MAX_ROLEPLAY_LENGTH_BLOCKS,
   ROLEPLAY_LENGTH_LEVEL_KEYS,
   type AgentStepBudgetMode,
+  type ChapterNamingSettings,
   type ProseLengthSettings,
   type ProseGateTimeoutSettings,
   type RoleplayLengthBlockBudgets,
@@ -46,6 +47,14 @@ import {
   type ScenePipelineSettings,
   type WritingExecutionMode,
 } from "./agent_runtime.js";
+import {
+  isChapterIndexStyle,
+  isChapterNamingPreset,
+  normalizeChapterNamingSettings,
+  resolveChapterNaming,
+  resolveSessionChapterNaming,
+  suggestNextChapter,
+} from "./chapter_naming.js";
 import {
   generateCharacter,
   maybeAutoTitleSession,
@@ -1170,6 +1179,36 @@ export async function startWriterServer(options: {
     }
   });
 
+  /** Next chapter path/title from project naming settings (optional session lock). */
+  app.get("/api/chapters/next", (context) => {
+    try {
+      const settings = loadAgentSettings(options.project);
+      const sessionId = context.req.query("session")?.trim() || "";
+      const subtitle = context.req.query("subtitle")?.trim() || undefined;
+      const folder = context.req.query("folder")?.trim() || undefined;
+      const resolved = sessionId && options.store.sessionExists(sessionId)
+        ? resolveSessionChapterNaming(
+          options.project,
+          options.store,
+          sessionId,
+          settings.chapterNaming,
+          { lock: false },
+        )
+        : resolveChapterNaming(settings.chapterNaming, options.project);
+      const next = suggestNextChapter(resolved, options.project, {
+        ...(subtitle ? { subtitle } : {}),
+        ...(folder ? { folder } : {}),
+      });
+      return context.json({
+        ...next,
+        naming: resolved,
+        content: `# ${next.heading}\n\n`,
+      });
+    } catch (error) {
+      return context.json({ error: errorMessage(error) }, 400);
+    }
+  });
+
   app.get("/api/document/version", (context) => {
     try {
       const path = context.req.query("path") ?? "";
@@ -1729,6 +1768,7 @@ export async function startWriterServer(options: {
       maxAgentSteps: settings.maxAgentSteps,
       scenePipeline: settings.scenePipeline,
       proseLength: settings.proseLength,
+      chapterNaming: settings.chapterNaming,
       proseGateTimeouts: settings.proseGateTimeouts,
       roleplay: settings.roleplay,
       instructionsPath: instructions?.path ?? null,
@@ -1752,6 +1792,7 @@ export async function startWriterServer(options: {
         maxAgentSteps?: number;
         scenePipeline?: Partial<ScenePipelineSettings>;
         proseLength?: Partial<ProseLengthSettings>;
+        chapterNaming?: Partial<ChapterNamingSettings>;
         proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
         roleplay?: Partial<Omit<RoleplaySettings, "lengthBlockBudgets">> & {
           lengthBlockBudgets?: Partial<RoleplayLengthBlockBudgets>;
@@ -1827,6 +1868,34 @@ export async function startWriterServer(options: {
         )) {
           return context.json({ error: "mode 仅支持 bounded、guidance" }, 400);
         }
+      }
+      if (body.chapterNaming !== undefined) {
+        if (!body.chapterNaming || typeof body.chapterNaming !== "object" || Array.isArray(body.chapterNaming)) {
+          return context.json({ error: "chapterNaming 须为对象" }, 400);
+        }
+        if (body.chapterNaming.preset !== undefined
+          && (typeof body.chapterNaming.preset !== "string" || !isChapterNamingPreset(body.chapterNaming.preset))) {
+          return context.json({ error: "chapterNaming.preset 仅支持 auto、cn-file-en、cn-file、cn-arabic、custom" }, 400);
+        }
+        if (body.chapterNaming.indexStyle !== undefined
+          && (typeof body.chapterNaming.indexStyle !== "string" || !isChapterIndexStyle(body.chapterNaming.indexStyle))) {
+          return context.json({ error: "chapterNaming.indexStyle 仅支持 chinese、arabic、padded-arabic" }, 400);
+        }
+        if (body.chapterNaming.requireSubtitle !== undefined && typeof body.chapterNaming.requireSubtitle !== "boolean") {
+          return context.json({ error: "requireSubtitle 必须是布尔值" }, 400);
+        }
+        if (body.chapterNaming.enforceHeading !== undefined && typeof body.chapterNaming.enforceHeading !== "boolean") {
+          return context.json({ error: "enforceHeading 必须是布尔值" }, 400);
+        }
+        if (body.chapterNaming.indexPadWidth !== undefined && (
+          !Number.isInteger(body.chapterNaming.indexPadWidth)
+          || Number(body.chapterNaming.indexPadWidth) < 1
+          || Number(body.chapterNaming.indexPadWidth) > 4
+        )) {
+          return context.json({ error: "indexPadWidth 须为 1—4 的整数" }, 400);
+        }
+        // Normalize to surface template issues early without rejecting empty custom mid-edit.
+        normalizeChapterNamingSettings(body.chapterNaming);
       }
       if (body.proseGateTimeouts !== undefined) {
         const values = [body.proseGateTimeouts.primarySeconds, body.proseGateTimeouts.finalSeconds]
@@ -1917,6 +1986,7 @@ export async function startWriterServer(options: {
         ...(body.maxAgentSteps !== undefined ? { maxAgentSteps: body.maxAgentSteps } : {}),
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
         ...(body.proseLength ? { proseLength: body.proseLength } : {}),
+        ...(body.chapterNaming ? { chapterNaming: body.chapterNaming } : {}),
         ...(body.proseGateTimeouts ? { proseGateTimeouts: body.proseGateTimeouts } : {}),
         ...(body.roleplay ? { roleplay: body.roleplay } : {}),
       });
@@ -1929,6 +1999,7 @@ export async function startWriterServer(options: {
         maxAgentSteps: settings.maxAgentSteps,
         scenePipeline: settings.scenePipeline,
         proseLength: settings.proseLength,
+        chapterNaming: settings.chapterNaming,
         proseGateTimeouts: settings.proseGateTimeouts,
         roleplay: settings.roleplay,
       });

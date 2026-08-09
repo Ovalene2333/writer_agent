@@ -115,6 +115,12 @@ import {
   type WritingExecutionMode,
 } from "./agent_runtime.js";
 import {
+  chapterNamingAgentPrompt,
+  chapterNamingNeedsAgentContext,
+  resolveSessionChapterNaming,
+  type ResolvedChapterNaming,
+} from "./chapter_naming.js";
+import {
   TOOL_NAMES,
   agentToolsForTask,
   executeTool,
@@ -534,6 +540,7 @@ export function dynamicContextPrompt(
   resumeInterrupted?: boolean,
   proseLength?: TurnProseLength,
   runDeliverables?: ReadonlyArray<{ id: string; label: string }>,
+  chapterNaming?: ResolvedChapterNaming,
 ): string {
   const explicitReferences = explicitReferencePaths(project, request);
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
@@ -623,6 +630,9 @@ export function dynamicContextPrompt(
               : "项目默认篇幅档"
         }）。这是每章目标，不是本轮所有章节合计；不得因本轮要写多章而均分。write_file/edit_file 会由运行时自动绑定该章目标；场景链各场之和只对齐当前这一章。用户明确为不同章节分别指定数字时，以各章指定值为准。`
     : "";
+  const chapterNamingLine = chapterNaming && chapterNamingNeedsAgentContext(task)
+    ? `\n${chapterNamingAgentPrompt(chapterNaming, project)}`
+    : "";
   const resumeLine = resumeInterrupted
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
     : "";
@@ -656,7 +666,7 @@ ${taskInstructions(
 简易卡范围：${simpleCharacterScopeInstruction}
 角色演进：${characterEvolutionInstruction}
 写入：${documentInstruction}
-修改范围：${editScopeInstruction[task.editScope]}${proseLengthLine}
+修改范围：${editScopeInstruction[task.editScope]}${proseLengthLine}${chapterNamingLine}
 写作模式：${writingMode === "fast" ? "快速模式；由当前 Agent 完成检索、编排与直接交付。" : "分工模式；主 Agent 负责检索与编排，证据型 Writer 只依据共享事实包实现正文。"}
 场景草稿链：${scenePipeline.enabled ? `已开启；只有分场能实际降低连续性或长篇修订风险时才使用。推荐 ${scenePipeline.preferredMinScenes}—${scenePipeline.preferredMaxScenes} 场、最多 ${scenePipeline.maxScenes} 场，不为达到推荐数拆场；${writingMode === "fast" ? "正文与实际状态均由主 Agent 提交" : "主 Agent 提交 notes，证据型 Writer 生成正文并由运行时提取实际状态"}。` : "已关闭；禁止调用 begin_chapter_draft、write_chapter_scene、revise_chapter_scene_guide 或 inspect_chapter_draft，直接使用普通文件交付路径。"}
 
@@ -3007,6 +3017,14 @@ export async function runAgent(options: {
     task.qualityProfile = "fast";
     task.capabilities = task.capabilities.filter(capability => capability !== "images");
   }
+  // 章节命名：仅写章/交付类任务锁定会话约定，同会话多章 path/H1 保持一致。
+  const sessionChapterNaming = resolveSessionChapterNaming(
+    project,
+    store,
+    sessionId,
+    runtimeSettings.chapterNaming,
+    { lock: chapterNamingNeedsAgentContext(task) },
+  );
   emit({
     type: "task_contract",
     contract: {
@@ -3245,6 +3263,7 @@ export async function runAgent(options: {
       mode: turnProseLength.mode,
       enforceMinimum: runtimeSettings.proseLength.enforceMinimum,
     },
+    chapterNaming: sessionChapterNaming,
     proseAdjudicator: {
       model: adjudicatorModel,
       ...(adjudicatorFallbackModel ? { fallbackModel: adjudicatorFallbackModel } : {}),
@@ -3400,6 +3419,7 @@ export async function runAgent(options: {
       options.resumeInterrupted === true,
       turnProseLength,
       agentLoop.deliverables.map(({ id, label }) => ({ id, label })),
+      sessionChapterNaming,
     )}
 
 ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}`,

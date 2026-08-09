@@ -1,7 +1,14 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  DEFAULT_CHAPTER_NAMING,
+  normalizeChapterNamingSettings,
+  type ChapterNamingSettings,
+} from "./chapter_naming.js";
 import { DEFAULT_WRITER_INSTRUCTIONS, type WriterProject } from "./project.js";
 import type { ReasoningEffort } from "./types.js";
+
+export type { ChapterNamingSettings, ChapterNamingPreset, ChapterIndexStyle } from "./chapter_naming.js";
 export {
   listProjectSkills,
   loadSkillById,
@@ -190,6 +197,8 @@ export interface AgentRuntimeSettings {
   scenePipeline: ScenePipelineSettings;
   /** 作者的篇幅偏好：默认目标字数与下限执行强度。 */
   proseLength: ProseLengthSettings;
+  /** 章节路径与 H1 命名约定；会话首次写章时锁定。 */
+  chapterNaming: ChapterNamingSettings;
   proseGateTimeouts: ProseGateTimeoutSettings;
   /** 角色扮演试演：推理档位、终审与输出预算。 */
   roleplay: RoleplaySettings;
@@ -258,6 +267,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     mode: "bounded",
     enforceMinimum: false,
   },
+  chapterNaming: { ...DEFAULT_CHAPTER_NAMING },
   proseGateTimeouts: {
     primarySeconds: DEFAULT_PRIMARY_PROSE_GATE_TIMEOUT_SECONDS,
     finalSeconds: DEFAULT_FINAL_PROSE_GATE_TIMEOUT_SECONDS,
@@ -454,11 +464,16 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       maxAgentSteps: normalizeMaxAgentSteps(raw.maxAgentSteps, DEFAULT_SETTINGS.maxAgentSteps),
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
       proseLength: normalizeProseLengthSettings(raw.proseLength),
+      chapterNaming: normalizeChapterNamingSettings(raw.chapterNaming),
       proseGateTimeouts: normalizeProseGateTimeoutSettings(raw.proseGateTimeouts),
       roleplay: normalizeRoleplaySettings(raw.roleplay),
     };
   } catch {
-    return { ...DEFAULT_SETTINGS, roleplay: { ...DEFAULT_SETTINGS.roleplay } };
+    return {
+      ...DEFAULT_SETTINGS,
+      chapterNaming: { ...DEFAULT_SETTINGS.chapterNaming },
+      roleplay: { ...DEFAULT_SETTINGS.roleplay },
+    };
   }
 }
 
@@ -473,6 +488,7 @@ export function saveAgentSettings(
     maxAgentSteps?: number;
     scenePipeline?: Partial<ScenePipelineSettings>;
     proseLength?: Partial<ProseLengthSettings>;
+    chapterNaming?: Partial<ChapterNamingSettings>;
     proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
     roleplay?: Partial<Omit<RoleplaySettings, "lengthBlockBudgets">> & {
       lengthBlockBudgets?: Partial<RoleplayLengthBlockBudgets>;
@@ -505,6 +521,9 @@ export function saveAgentSettings(
     proseLength: patch.proseLength
       ? normalizeProseLengthSettings({ ...current.proseLength, ...patch.proseLength })
       : current.proseLength,
+    chapterNaming: patch.chapterNaming
+      ? normalizeChapterNamingSettings({ ...current.chapterNaming, ...patch.chapterNaming })
+      : current.chapterNaming,
     proseGateTimeouts: patch.proseGateTimeouts
       ? normalizeProseGateTimeoutSettings({ ...current.proseGateTimeouts, ...patch.proseGateTimeouts })
       : current.proseGateTimeouts,
