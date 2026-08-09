@@ -1,6 +1,5 @@
 import type {
   AgentEvent,
-  AgentTodoItem,
   MessageAttachment,
   MessageAttachmentInput,
   MessageContent,
@@ -69,6 +68,14 @@ import {
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
 import { AgentLoopRuntime } from "./agent_loop.js";
+import {
+  parseRunFulfillmentVerdict,
+  runFulfillmentContinuationPrompt,
+  runFulfillmentMessages,
+  runFulfillmentPauseReason,
+  shouldReviewFulfillment,
+  type RunFulfillmentVerdict,
+} from "./run_completion.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
 import {
   createProposalRetryState,
@@ -100,13 +107,9 @@ import {
 } from "./context_graph.js";
 import {
   DEFAULT_SCENE_NOTES_CHARACTERS,
-  formatTodosForPrompt,
   loadAgentSettings,
   permissionModeLabel,
   isSuccessfulDocumentSubmission,
-  persistAdvancedTodosAfterProposal,
-  persistCompletedCharacterTaskTodos,
-  persistScenePipelineTodos,
   projectInstructionsPrompt,
   proposalIdFromToolResult,
   skillsCatalogPrompt,
@@ -192,14 +195,14 @@ export type { ProposalRevisionCase, ProposalRevisionIssue } from "./proposal_ret
  *    writingSystemPrompt, executionRulesPrompt, project instructions, skills
  *    catalog, stableStyleGroundingPrompt, fixed mode-extra placeholder.
  *    Prefer timeless project rules here. Avoid per-request paths, chapter text,
- *    timestamps, todos, “当前任务”, audit REVIEW text, or intensive-only gates.
+ *    timestamps, “当前任务”, audit REVIEW text, or intensive-only gates.
  *    Slot 4/5 must not flip between brainstorm / write / audit — put mode-specific
  *    and sample bodies in the dynamic tail. Frequent copy edits to stable text
  *    invalidate everyone's cache — batch them.
  *
  * 3) THIS TURN'S DYNAMIC BLOCK (the only miss-priced bytes — keep short)
  *    task/dynamicContext (+ audit REVIEW when needed), dynamic style evidence
- *    (范文/章节样本), bootstrap index, todos, work-memory catalog, user selection,
+ *    (范文/章节样本), bootstrap index, work-memory catalog, user selection,
  *    current user request. Prefer digests / ids / paths; full prose belongs in
  *    tool results or read_conversation paging, not auto-injection.
  *    From turn 2 the history preview and conversationStats (total / characters /
@@ -330,9 +333,6 @@ interface WritingTask extends AgentTaskContract {
   editScope: EditScope;
   documentProposalRequired: boolean;
   continuation: boolean;
-  todoPlan: string[];
-  /** Independent document outputs requested by the user; scenes/checks inside one document are not deliverables. */
-  documentDeliverables: string[];
   /** Existing narrative text policy selected by the planner. */
   proseReferenceMode: ProseReferenceMode;
   proseGateCandidate?: PlannedProseGateCandidate;
@@ -511,11 +511,10 @@ ${modeRule}
 5. 仅当缺少目标文档/关键事实且无法推断时 ask_user；可逆创作选择自行决定。询问后立即停止。
 6. 普通角色卡按任务分层读取：写作/构思先 get_character(view=summary)，capabilityIndex 的 availability 只用于选择能力与场景模式；正文要处理能力时必须在场景 competencyUses 声明 use/attempt/unlock/regain/lose，再用 get_character(view=sections, sections=["competencies"], competencyIds=[...]) 读取机制、限制与本场状态指令。明确编辑直接用 view=edit+sections 读取目标编辑分区，跨分区重做才用不带 sections 的 view=edit，禁止编辑任务先做无意义摘要读取。save_character 更新已有卡必须传最近读取所得 expectedUpdatedAt。已确认的能力状态演进用 apply_character_changes.set_competency_state；新建/大改→save_character；简易卡→save_simple_character。路人配角可只写正文不建卡。
 7. read_file 默认读取本轮最新工作副本；只复用本轮工作记忆、本轮工具结果与 reused 标记，禁止同路径反复读、禁止重复 list_outline_nodes。写作线索未验证；大纲 id 为 UUID。artifact_compacted 只用 digest。
-8. 内置章节场景四阶段由工具结果自动推进，禁止为勾选这些阶段单独调用 manage_todos；仅自定义清单需要更新。同时至多一项 in_progress。
-9. 技能描述与当前任务明确匹配，或修订问题给出 skillId 时，必须先 load_skill；只在正文不足时用 read_skill_resource 读取声明资源。勿编造技能。Skill 只增强判断，不自动构成固定工具流程。风格类作者偏好默认不阻断交付：先交付再按 skill 可选精修，勿为 warn/观察项反复改稿烧步数。
-10. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
-11. 作者明确把某类正文问题概括为今后持续检查/避免的要求时，用 manage_author_policies upsert 沉淀。新偏好默认 trial，含糊反馈只存 draft；没有明确放行条件不得 block。只改当前一句或一次性选择不要学习。旧 manage_prose_gates 仅兼容已有规则。
-12. 不泄露内部参数；对话简洁；文档适量 Markdown。最终对用户回复只写作者可读结论（做了什么、结果、是否待审）；禁止在最终气泡复述工具参数名（expectedUpdatedAt、sourceHash 等）、原始 ISO 时间戳、裸 (id=N)、内部 job/step 编号或工具调用过程流水账。工具细节只留在思考与工具轨迹。
+8. 技能描述与当前任务明确匹配，或修订问题给出 skillId 时，必须先 load_skill；只在正文不足时用 read_skill_resource 读取声明资源。勿编造技能。Skill 只增强判断，不自动构成固定工具流程。风格类作者偏好默认不阻断交付：先交付再按 skill 可选精修，勿为 warn/观察项反复改稿烧步数。
+9. resource/ 内所有可见 UTF-8 文本统一使用 list_files / search_files / read_file / write_file / edit_file / move_file / delete_file。写入先进入本轮工作副本；正文自动走质量门禁，其他变更走普通审批。禁止访问 resource/ 外、archive/、屏蔽路径、二进制文件或符号链接。
+10. 作者明确把某类正文问题概括为今后持续检查/避免的要求时，用 manage_author_policies upsert 沉淀。新偏好默认 trial，含糊反馈只存 draft；没有明确放行条件不得 block。只改当前一句或一次性选择不要学习。旧 manage_prose_gates 仅兼容已有规则。
+11. 不泄露内部参数；对话简洁；文档适量 Markdown。最终对用户回复只写作者可读结论（做了什么、结果、是否待审）；禁止在最终气泡复述工具参数名（expectedUpdatedAt、sourceHash 等）、原始 ISO 时间戳、裸 (id=N)、内部 job/step 编号或工具调用过程流水账。工具细节只留在思考与工具轨迹。
 13. generate_image 必须独占一步：同一步不得与其他工具并行调用；先完成检索/清单等准备，下一步再单独生图。用户要求修改、延续或参考既有图片时，必须从动态「可用图片参考」选 attachment ID 填入 referenceAttachmentIds；不可只靠文字复述原图。
 模式：${permissionModeLabel(mode)}`;
 }
@@ -539,7 +538,6 @@ export function dynamicContextPrompt(
   simpleCharacterScope?: number[],
   resumeInterrupted?: boolean,
   proseLength?: TurnProseLength,
-  runDeliverables?: ReadonlyArray<{ id: string; label: string }>,
   chapterNaming?: ResolvedChapterNaming,
 ): string {
   const explicitReferences = explicitReferencePaths(project, request);
@@ -561,7 +559,7 @@ export function dynamicContextPrompt(
     ? "开启。正文落盘后可按现有规则调用 apply_character_changes。"
     : "关闭。不得调用 apply_character_changes；显式新建或编辑角色卡仍可使用 save_character。";
   const documentInstruction = task.documentProposalRequired
-    ? `必须成功调用 write_file、edit_file、move_file 或 delete_file 完成请求后结束，禁止用最终回复代替文件交付。完整新建/替换用 write_file，局部修改和驳回修订用 edit_file；运行时自动绑定交付项、篇幅目标、审查与审批。工作副本已有目标原文且未变时直接继续。${runDeliverables && runDeliverables.length > 1 ? `本轮独立交付项：${JSON.stringify(runDeliverables)}。按目标路径依次交付，交付项 ID 由运行时绑定。` : ""}${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
+    ? `必须成功调用 write_file、edit_file、move_file 或 delete_file 完成请求后结束，禁止用最终回复代替文件交付。完整新建/替换用 write_file，局部修改和驳回修订用 edit_file；运行时自动绑定交付项、篇幅目标、审查与审批。工作副本已有目标原文且未变时直接继续。${continuationPath ? `承接续写默认目标：${continuationPath}。` : ""}`
     : "不强制文件写入；需要修改 resource/ 文本时按用户意图使用 write_file/edit_file。";
   const proseGateInstruction = task.proseGateCandidate
     ? permissionMode === "plan"
@@ -634,11 +632,11 @@ export function dynamicContextPrompt(
     ? `\n${chapterNamingAgentPrompt(chapterNaming, project)}`
     : "";
   const resumeLine = resumeInterrupted
-    ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用当前任务清单、checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
+    ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用 checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
     : "";
   return `当前任务：${task.label}
-任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, proseReferenceMode: task.proseReferenceMode, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile, deliverables: runDeliverables })}
-mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后用 manage_todos 修订剩余计划。
+任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, proseReferenceMode: task.proseReferenceMode, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile })}
+mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后自行重排剩余步骤。
 ${writingWorkflowPrompt(task.workflow ?? "free", task.qualityProfile ?? "fast")}
 ${resumeLine}
 本轮只执行最后一条 user 请求；历史仅用于指代与既有事实。仅下方「@ 明确引用」可称用户指定；契约编译器/会话推断不得冒充用户选择。
@@ -942,13 +940,6 @@ export function characterMutationCompletesTask(mode: WritingTaskMode, permission
   return permissionMode !== "plan" && (mode === "character" || mode === "simple_character");
 }
 
-/** Proposal continuation is authorized only by independent outputs declared in the task contract. */
-export function documentDeliveryRemaining(
-  documentDeliverables: readonly string[],
-  completedDocumentDeliverables: number,
-): boolean {
-  return completedDocumentDeliverables < documentDeliverables.length;
-}
 
 /** Exact catalog resolution for short follow-ups; no semantic keyword guessing. */
 export function resolveRecentCharacterIds(
@@ -1021,8 +1012,8 @@ async function compileWritingTaskContract(
     role: "system",
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
-JSON 总长度不超过 1600 字符；字符串保持简短，todoPlan 每项不超过 40 字。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；proseReferenceMode(project|continuity|independent)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；documentDeliverables(用户明确要求的独立文档产物短标签数组，最多5项，无则[])；todoPlan(仅复杂任务给2—5个初始步骤，否则[])；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
+JSON 总长度不超过 1400 字符；字符串保持简短。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；proseReferenceMode(project|continuity|independent)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
 契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
 正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
@@ -1037,14 +1028,13 @@ proseReferenceMode 判定：
 - project：其余项目写作。可按任务需要读取现有资料；仍不得为了模仿而遍历正文。
 纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；执行阶段统一使用 list_files/read_file/write_file/edit_file/move_file/delete_file。
 图片产物：用户明确要求生成封面、插图、概念图或视觉参考时 capabilities 必须含 images；单独生图用 outcome=answer、mutation=none，若还要求文档/角色写入则保留相应 outcome 与 mutation。只讨论画面或撰写生图提示词时不要加入 images。
-原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。多阶段才填 todoPlan。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
+原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
 连续对话中，若 recentHistory 已明确当前操作对象是角色卡，当前 user 用“修复/调整/删除/改成”等省略说法继续修改该对象，仍用 character、outcome=character、mutation=character；除非当前 user 明确改为正文、大纲或 resource/ 文档任务。不得仅因动作是“修改”就判为 rewrite；rewrite 的交付对象必须是文档正文。
 用户要求创作/设计一个具体人物，并主要描述其身份、外貌、性格、能力或关系时，即使没有说“角色卡”，也使用 character，outcome=character、mutation=character；只有明确要求“一段/片段/场景/章节/正文”来表现该人物时才使用 write_scene。
 正文与大纲必须严格区分：用户要求“写/创建/生成/续写第N章、某一章、一个场景或正文”时，一律优先 mode=write_scene，outcome=document、mutation=document、planning=adaptive；即使项目没有大纲，也不得改判为 outline。提到“第一章”不等于要求规划后续章节。
 用户引用具体正文句段并指出问题或要求修改（不合理/OOC/改掉这句/换个说法等）时，一律 mode=rewrite，outcome=document、mutation=document、evidence=target、documentContext=target；不得判为 audit（audit 只用于“审阅/检查/评价”而不动笔），也不得因目标是章节而改判 write_scene。
 editScope 仅描述既有文档修改范围：明确原句/网页选区/一小处→point；一个小节或若干相邻段→section；明确通篇/全文/整体统一调整且每部分都需处理→document。不要把“深度修改某一处”误判为document。
-只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。单章正文任务的 todoPlan 只能覆盖该章，禁止自行加入创建全书大纲、规划其他章节或一次写多章。
-documentDeliverables 只列最终会分别形成文档提案的独立产物：写一章时即使含多个场景、人物段落、检查步骤也只能列1项；明确一次写三章才列3项。讨论、角色卡或无文档写入时填[]。不得把 todoPlan 的内部步骤复制成多个交付项。
+只有用户明确要求“大纲、卷纲、全书规划、章节表、后续各章安排”时才用 mode=outline。用户只要求单章正文时不得顺带规划其他章节或改判为多章任务。
 作者复审候选按语义判断，不依赖“以后/始终/每次”等字面词。当前 user 若概括了一类可在后续正文重复出现的问题，并给出可复用的避免标准或典型例子，就输出 proseGateCandidate；即使同一请求还要求修改当前文档也要输出。只针对当前一句/当前段/本章的一次性取舍、单纯说“不好/重写”、没有可执行标准的含糊抱怨，不输出。
 proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短标题","userIntent":"作者意图","semanticCriterion":"可独立执行的语义核验标准，不能只靠关键词或固定句长","evidenceRequirement":"命中所需的最短连续原文","allowConditions":["合理例外"],"revisionIntent":"局部修订目标与必须保留项","enforcement":"observe|advise|block","status":"draft|trial","skillId":"可选修订技能","sourceFeedback":"当前反馈摘要"}。新风格偏好默认 trial+advise；标准边界仍含糊时 draft+observe；只有事实性确定错误或作者绝对禁令才可 block，且 block 必须有 allowConditions。
 路径：lore/=设定 outline/=大纲 chapters/=正文。targetPath/characterIds/exampleIds 必须来自目录，禁止编造。`,
@@ -1168,16 +1158,6 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
       normalizedDocumentContext = "search";
     }
   }
-  const requestedTodoPlan = Array.isArray(parsed.todoPlan)
-    ? parsed.todoPlan.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map(item => item.trim().slice(0, 120)).slice(0, 5)
-    : [];
-  const documentDeliverables = Array.isArray(parsed.documentDeliverables)
-    ? parsed.documentDeliverables
-      .filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
-      .map(item => item.trim().slice(0, 80))
-      .filter((item, index, all) => all.indexOf(item) === index)
-      .slice(0, 5)
-    : [];
   const proseGateCandidate = normalizePlannedProseGateCandidate(parsed.proseGateCandidate);
   const evidenceValues: AgentEvidenceRequirement[] = ["none", "project", "target", "continuation"];
   let evidence = evidenceValues.includes(parsed.evidence as AgentEvidenceRequirement)
@@ -1205,7 +1185,7 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
     general: ["research", "documents", "files", "characters"],
   };
   const capabilities = [...new Set([...baselineCapabilities[mode], ...requestedCapabilities])];
-  const planning = resolveAgentPlanningStrategy(mutation, parsed.planning, requestedTodoPlan.length);
+  const planning = resolveAgentPlanningStrategy(mutation, parsed.planning, documentProposalRequired ? 2 : 1);
   const searchQuery = typeof parsed.searchQuery === "string" && parsed.searchQuery.trim()
     ? parsed.searchQuery.slice(0, 200)
     : extractSearchQueryHint(request, documents, characters) || request.slice(0, 200);
@@ -1236,10 +1216,6 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
       editScope,
       documentProposalRequired,
       continuation,
-      todoPlan: requestedTodoPlan.length ? requestedTodoPlan : defaultTodoPlan(mode, documentProposalRequired),
-      documentDeliverables: documentProposalRequired
-        ? (documentDeliverables.length ? documentDeliverables : ["当前文档"])
-        : [],
       workflow: inferWritingWorkflowKind({
         mode,
         outcome,
@@ -1329,25 +1305,6 @@ function extractSearchQueryHint(
     .sort((a, b) => b.length - a.length)
     .slice(0, 4);
   return preferred.join(" ").slice(0, 80);
-}
-
-function defaultTodoPlan(mode: WritingTaskMode, documentProposalRequired: boolean): string[] {
-  if (mode === "write_scene") return [];
-  if (mode === "rewrite") return ["读取目标原文与约束", "完成定向改写并核对信息", "提交最小修改提案"];
-  if (mode === "outline" && documentProposalRequired) return ["核对现有结构与约束", "形成并检查大纲方案", "提交大纲提案"];
-  if (mode === "audit" && documentProposalRequired) return ["审计原文并定位证据", "完成最小修复", "提交修改提案"];
-  if (mode === "general" && documentProposalRequired) return ["定位相关纯文本文件", "准备并校验 change set", "提交统一审批"];
-  if (mode === "character") return ["核对已有普通角色卡与设定", "更新或保存普通角色卡"];
-  if (mode === "simple_character") return ["核对已有角色与设定", "整理并保存简易角色卡"];
-  return [];
-}
-
-export function initialTodos(todoPlan: string[]): AgentTodoItem[] {
-  return todoPlan.map((content, index) => ({
-    id: `t${index + 1}`,
-    content,
-    status: index === 0 ? "in_progress" : "pending",
-  }));
 }
 
 /**
@@ -1737,7 +1694,7 @@ export function buildStableSystemPrefix(
  *   2 task / dynamicContext
  *   3 dynamic style evidence OR placeholder
  *   4 bootstrap index OR placeholder
- *   5 todos OR placeholder
+ *   5 reserved (placeholder) — kept so the fixed slot count survives the todo removal
  *   6 work-memory catalog OR placeholder
  *   7 user selection OR placeholder
  *   8 user: current request
@@ -1751,7 +1708,8 @@ export function buildDynamicTurnMessages(parts: {
   taskContext: string;
   dynamicStyleContext?: string;
   bootstrapContext?: string;
-  todosPrompt?: string;
+  /** Slot 5 is reserved: the fixed slot count is part of the cache contract. */
+  reservedSlot?: string;
   artifactContext?: string;
   selectedContext?: string;
   prompt: string;
@@ -1762,7 +1720,7 @@ export function buildDynamicTurnMessages(parts: {
     { role: "system", content: parts.taskContext },
     { role: "system", content: parts.dynamicStyleContext || "本轮动态声线证据：无。" },
     { role: "system", content: parts.bootstrapContext || "写作线索：本轮无启发式索引。" },
-    { role: "system", content: parts.todosPrompt || "当前对话任务清单：（空）" },
+    { role: "system", content: parts.reservedSlot || "（保留槽位）" },
     { role: "system", content: parts.artifactContext || "本轮任务工作记忆：无。" },
     { role: "system", content: parts.selectedContext || "用户选区：无。" },
     { role: "user", content: parts.prompt },
@@ -1778,8 +1736,8 @@ export function buildDynamicTurnMessages(parts: {
  * state. Keep it compact — it is re-sent on every remaining step of the job.
  */
 export function chapterContinuationPrompt(parts: {
-  todosText: string;
-  remainingDeliverables?: readonly string[];
+  /** The terminal gate's instruction for what is still owed — the only source of「还要写什么」。 */
+  nextStep: string;
   proposal?: { path: string; summary: string; afterContent: string };
   handoff?: CompletedChapterHandoff;
   /** Paths/characters already on the session materials shelf — do not re-read. */
@@ -1820,11 +1778,8 @@ export function chapterContinuationPrompt(parts: {
     lines.push("材料架仍空：仅对写作必需的事实做最小读取；不要重读已交付章节全文。");
   }
   lines.push(
-    parts.remainingDeliverables?.length
-      ? `完成约束仍缺：${parts.remainingDeliverables.join("、")}。立即选择其中一项继续交付；任务清单仅供规划，不代表交付已经完成。`
-      : "完成约束已经满足；仅在确有必要时处理剩余计划。",
+    parts.nextStep,
     "根据下一份正文的篇幅、连续性风险和现有材料重新选择 write_file、局部 edit_file、write pack 或场景草稿链；不要沿用上一章的流程作为默认，也不要为「再确认设定」重复开局检索。",
-    parts.todosText,
   );
   return lines.join("\n");
 }
@@ -2786,7 +2741,7 @@ export function proposalRevisionConvergePrompt(
         ? "旧式节奏提示已重复出现：只在正文语义确实断裂处合并观察、动作与因果；不要为均长、长句比例或碎句比例改稿。若没有可证明的问题，保留正文并标明该兼容门禁无法继续执行。"
         : "节奏信号只用于定位。通读命中段，保留承担命令、停顿和动作落点的短句，只合并语义上被机械切碎的内容；不要补配额长句或扩大改写。")
       : hardLimit
-        ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，manage_todos 标明阻塞并继续下一可交付项，或 ask_user。"
+        ? "本窗口最后一轮：只按驳回项/blocker 做最小修订后重新提交一次；禁止重读已读设定、禁止扩大改写、禁止另起大纲。若仍无法满足，说明阻塞点并继续下一可交付项，或 ask_user。"
         : repairPacketInstructions(repairPacket, revisionCase, delegatedProseRepair),
   ].filter(Boolean).join("\n");
 }
@@ -2848,7 +2803,7 @@ export function chapterReviewRequiredPrompt(
 ): string {
   const lines = [
     `章节场景链已完成（${draft.completed.length}/${draft.scenes.length}）：${draft.path}。正文保存在内存草稿中，禁止重写、续写或重新建立 scene guide。`,
-    "运行时已自动推进章节阶段与任务清单，不要调用 manage_todos。",
+    "运行时已自动推进章节阶段。",
     "唯一下一步：立即调用 inspect_chapter_draft。summary 用一句话概括本章实际完成的变化；characterChanges 只提交正文已经兑现且确认需要写入角色卡的变化，没有则省略。不要输出计划说明，也不要调用其他工具。",
   ];
   if (retry?.rejectedTools.length) {
@@ -3070,8 +3025,8 @@ export async function runAgent(options: {
   const executionTools = agentToolsForTask(task.mode, permissionMode);
   const executionToolNames = new Set(executionTools.map(tool => tool.function.name));
   // Task state binds to the current dialogue, not the session shell.
-  // - continuation: reuse prior active doc / todos / tool memory
-  // - same mode without continuation: keep todos (multi-turn ask_user etc.), but never sticky-inherit a doc via COALESCE
+  // - continuation: reuse prior active doc / tool memory
+  // - same mode without continuation: keep tool memory, but never sticky-inherit a doc via COALESCE
   // - mode change without continuation: drop prior task residue entirely
   const taskIdentity = `${task.mode}/${task.outcome}/${task.mutation}`;
   const previousIdentity = previousTaskState.currentIntent.split(":")[0]?.trim() ?? "";
@@ -3083,20 +3038,14 @@ export async function runAgent(options: {
     // Exact arguments + sourceHash still guard every artifact cache lookup.
     store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true, preserveMaterialsShelf: true });
   }
-  // A fresh request in the same mode may keep its todo list, but must never
-  // inherit an unfinished server-side draft unless the planner marked it as a continuation.
+  // A fresh request must never inherit an unfinished server-side draft unless the
+  // planner marked it as a continuation.
   if (!task.continuation) store.clearAgentCheckpoint(sessionId);
   const activeDocument = task.targetPath ?? continuationPath;
   store.saveSessionContext(sessionId, {
     activeDocument,
     currentIntent: `${taskIdentity}: ${prompt.slice(0, 240)}`,
   });
-  let turnTodos = store.sessionTodos(sessionId);
-  if (!turnTodos.length && task.todoPlan.length) {
-    turnTodos = initialTodos(task.todoPlan);
-    store.saveSessionTodos(sessionId, turnTodos);
-  }
-  emit({ type: "todos", todos: turnTodos });
   // Capture before the current agent request is persisted, while the contiguous
   // roleplay block is still the newest conversation segment.
   const roleplayHandoffContext = recentRoleplayHandoffContext(store, sessionId);
@@ -3186,9 +3135,6 @@ export async function runAgent(options: {
     availableImageReferencesContext(store, sessionId),
   ].filter(Boolean).join("\n\n");
   const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
-  const todosPrompt = turnTodos.length
-    ? `当前对话任务清单（绑定本轮任务，非会话全局残留；可用 manage_todos 更新）：\n${formatTodosForPrompt(turnTodos)}`
-    : undefined;
   const preferredSample = task.mode === "rewrite" ? undefined : options.selectedDocumentBlocks
     ?.map((block) => block.text?.trim() ?? "")
     .filter(Boolean)
@@ -3437,14 +3383,12 @@ export async function runAgent(options: {
       simpleCharacterScope,
       options.resumeInterrupted === true,
       turnProseLength,
-      agentLoop.deliverables.map(({ id, label }) => ({ id, label })),
       sessionChapterNaming,
     )}
 
 ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}`,
     dynamicStyleContext: dynamicStyleContext || undefined,
     bootstrapContext: bootstrapContext || undefined,
-    todosPrompt,
     artifactContext: artifactContext || undefined,
     selectedContext: selectedContext || undefined,
     prompt,
@@ -3594,6 +3538,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   }
   let transcript = "";
   let documentProposalSubmitted = false;
+  /** The terminal gate's words for why the run ended, so a finished run is explainable. */
+  let terminalCompleteReason: string | undefined;
   // Executable proposal revision state belongs to AgentRun deliverables. Session
   // artifacts retain bodies/reviews, but never decide whether a fresh run may retry.
   /** Cached prefix immediately before the first full-body proposal in a retry chain. */
@@ -3609,6 +3555,89 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
   const requiresCharacterMutation = permissionMode !== "plan"
     && (task.mutation === "character" || task.mutation === "mixed");
   let executionProgress = agentLoop.executionProgress();
+  /** Tool calls issued this run; a zero-tool turn has nothing to audit. */
+  let toolCallsMade = 0;
+  let fulfillmentContinuations = 0;
+  let lastUnsatisfiedFulfillment: Extract<RunFulfillmentVerdict, { satisfied: false }> | undefined;
+  /**
+   * The single terminal gate.
+   *
+   * Every path that used to end a run separately now asks this one question, so a
+   * finished run always has a named reason and an unfinished one always has a
+   * concrete next step. Two layers, in order:
+   *
+   * 1. 不变量：任何时刻都答得出、失败点可定位的检查（证据下限、已声明的作者政策、
+   *    Agent 自己选定的写作路径的阶段完整性）。缺口直接翻译成继续执行的指令。
+   * 2. 兑现复审：用户要的东西到底交出来没有。这是对成品的语义判断，不是对计划的
+   *    计数，所以它只在这里问，而且由模型答。
+   *
+   * Returning `continue` never fabricates work: the loop's step budget still bounds
+   * it, and after `RUN_FULFILLMENT_MAX_CONTINUATIONS` refusals the run pauses for
+   * 续跑 instead of claiming a success it cannot show.
+   */
+  const terminalDecision = async (): Promise<
+    | { kind: "complete"; reason: string }
+    // `source` tells the caller whether the remaining work is a repair of what is
+    // already on the table (invariant) or a further deliverable (fulfillment). Only
+    // the latter may drop the finished chapter's transcript.
+    | { kind: "continue"; prompt: string; source: "invariant" | "fulfillment" }
+    | { kind: "pause"; reason: string }
+  > => {
+    const gaps = agentLoop.completionGaps();
+    if (gaps.length) {
+      return { kind: "continue", source: "invariant", prompt: completionRecoveryPrompt(gaps, executionProgress) };
+    }
+    if (!shouldReviewFulfillment({ permissionMode, toolCallsMade, continuations: fulfillmentContinuations })) {
+      return {
+        kind: lastUnsatisfiedFulfillment ? "pause" : "complete",
+        reason: lastUnsatisfiedFulfillment
+          ? runFulfillmentPauseReason(lastUnsatisfiedFulfillment)
+          : "契约不变量已满足",
+      };
+    }
+    let verdict: RunFulfillmentVerdict | undefined;
+    try {
+      const review = await streamCompletion(
+        plannerModel,
+        runFulfillmentMessages({
+          originalRequest: prompt,
+          finalText: stripDsmlText(transcript, "").trim(),
+          delivered: agentLoop.snapshot.deliverables
+            .filter(item => item.evidence)
+            .map(item => item.evidence?.path ?? item.label),
+          stalled: agentLoop.stalledDeliverableLabels(),
+          otherArtifacts: [
+            ...(executionProgress.characterArtifactProduced ? ["角色卡已保存"] : []),
+            ...(executionProgress.imageArtifactProduced ? ["图片已生成"] : []),
+            ...(executionProgress.proseGateRuleSaved ? ["作者复审规则已保存"] : []),
+          ],
+        }),
+        signal,
+        () => undefined,
+        () => undefined,
+        plannerCompletionOptions(plannerModel),
+      );
+      if (review.usage) {
+        emitUsageEvent(
+          emit, store, sessionId, plannerModel, review.usage, 0,
+          "fulfillment_review", options.jobId, undefined, review.durationMs,
+        );
+      }
+      verdict = parseRunFulfillmentVerdict(review.content);
+    } catch {
+      // A review that could not run must not strand a finished run. The invariants
+      // above already passed; falling through to completion is the honest default.
+      verdict = undefined;
+    }
+    if (!verdict || verdict.satisfied) {
+      lastUnsatisfiedFulfillment = undefined;
+      return { kind: "complete", reason: verdict?.reason ?? "交付复审未给出结论，按不变量通过" };
+    }
+    lastUnsatisfiedFulfillment = verdict;
+    const prompt_ = runFulfillmentContinuationPrompt(verdict, fulfillmentContinuations);
+    fulfillmentContinuations += 1;
+    return { kind: "continue", source: "fulfillment", prompt: prompt_ };
+  };
   const replannedFailures = new Set<string>();
   let thinkingContinuationDisabled = false;
   // Measured prefix-cache usage for this turn, summed over its agent_step calls.
@@ -3665,6 +3694,21 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     } catch { /* 缓存优化失败不影响本轮结果。 */ }
   };
 
+  /**
+   * Terminal exit for「复审连续判定未兑现且补齐机会用尽」。Ending as completed would
+   * claim a delivery the run cannot show; throwing would lose the context. It pauses
+   * with 续跑, exactly like a budget exhaustion.
+   */
+  const exitWithFulfillmentPause = (reason: string): void => {
+    persistAssistantMessage(appendTerminalJobReference(
+      [stripDsmlText(transcript, "").trim(), reason, "[生成已中断]"].filter(Boolean).join("\n\n"),
+      options.jobId,
+    ));
+    freezeCurrentTurn();
+    persistRunTerminal("interrupted", reason);
+    emit({ type: "waiting_for_input", sessionId, question: reason, options: ["续跑"] });
+  };
+
   try {
     // Step budget:
     // - hard (default): single configurable hard cap; no soft/stall converge.
@@ -3674,16 +3718,16 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     const stepBudgetMode = options.maxTurns !== undefined
       ? "hard" as const
       : runtimeSettings.stepBudgetMode;
-    // maxAgentSteps is the per-deliverable ceiling. A multi-document request gets
-    // one slice per independent output; tests may still force a single hard cap
-    // with options.maxTurns.
+    // maxAgentSteps is the per-deliverable ceiling. Slices are earned by landed
+    // documents and therefore recomputed each turn; tests may still force a single
+    // hard cap with options.maxTurns.
     const perDeliverableHardCap = Math.max(1, options.maxTurns ?? runtimeSettings.maxAgentSteps);
-    const hardCap = computeAgentHardTurnBudget({
+    const currentHardCap = (): number => computeAgentHardTurnBudget({
       baseHardCap: perDeliverableHardCap,
-      documentDeliverables: task.documentDeliverables.length,
-      documentProposalRequired: task.documentProposalRequired,
+      deliveredDocuments: agentLoop.completedDocumentDeliverables,
       maxTurnsOverride: options.maxTurns !== undefined,
     });
+    let hardCap = currentHardCap();
     // A completed draft must not fail merely because scene retries consumed the
     // ordinary budget. These turns exist only while the terminal review lock is
     // active; unfinished scene chains receive no extra capacity.
@@ -3707,20 +3751,19 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     // CACHE: append-only for the whole job — never rewrite prior message bodies
     // between steps (compact/rehydrate/strip would break step-to-step prefix hits).
     for (let turn = 0; ; turn += 1) {
-      const liveTodos = store.sessionTodos(sessionId);
+      hardCap = Math.max(hardCap, currentHardCap());
+      const stalledDeliveries = agentLoop.stalledDeliverableLabels().length;
       const softBudget = stepBudgetMode === "hard"
         ? hardCap
         : Math.min(hardCap, computeSoftTurnBudget({
-          todos: liveTodos,
-          todoPlanLength: task.todoPlan.length,
-          documentDeliverables: task.documentDeliverables.length,
-          completedDocumentDeliverables,
+          stalledDeliveries,
+          deliveredDocuments: agentLoop.completedDocumentDeliverables,
           documentProposalRequired: task.documentProposalRequired,
           mutation: task.mutation,
           scenePipelineEnabled: scenePipelineSettings.enabled && task.editScope === "document",
           chapterSceneDraft: toolContext.chapterSceneDraft,
         }));
-      const progressFp = agentStepProgressFingerprint(liveTodos, executionProgress, {
+      const progressFp = agentStepProgressFingerprint(executionProgress, {
         documentProposalSubmitted,
         characterMutationSubmitted,
         chapterReviewRequired,
@@ -3784,7 +3827,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
               step: turn + 1,
               softBudget,
               hardCap,
-              openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
+              stalledDeliveries,
             }),
           });
           stallStreak = 0;
@@ -3797,7 +3840,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
               step: turn + 1,
               softBudget,
               hardCap,
-              openTodos: liveTodos.filter(todo => todo.status === "pending" || todo.status === "in_progress").length,
+              stalledDeliveries,
             }),
           });
         }
@@ -3983,8 +4026,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           ensureThinkingTranscriptCanContinue();
           continue;
         }
-        const gaps = agentLoop.completionGaps(store.sessionTodos(sessionId));
-        if (gaps.length) {
+        const decision = await terminalDecision();
+        if (decision.kind === "continue") {
           messages.push({
             role: "assistant",
             content: stripDsmlText(result.content || "", "[本步未调用工具]"),
@@ -3994,10 +4037,19 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             // CACHE: user role — a mid-job system message flips DeepSeek's
             // whole-request rendering and forfeits the cached prefix (§4).
             role: "user",
-            content: completionRecoveryPrompt(gaps, executionProgress),
+            content: decision.prompt,
           });
           ensureThinkingTranscriptCanContinue();
           continue;
+        }
+        if (decision.kind === "pause") {
+          messages.push({
+            role: "assistant",
+            content: stripDsmlText(result.content || "", "[本步未调用工具]"),
+            ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
+          });
+          exitWithFulfillmentPause(decision.reason);
+          return;
         }
         const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
         persistAssistantMessage(answer);
@@ -4006,7 +4058,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         // tool result with no answer after it.
         messages.push({ role: "assistant", content: answer });
         freezeCurrentTurn();
-        persistRunTerminal("completed");
+        persistRunTerminal("completed", decision.reason);
         emit({ type: "done", sessionId });
         return;
       }
@@ -4272,7 +4324,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             error: `任务契约不允许执行 ${call.name}`,
             code: "CONTRACT_MUTATION_DENIED",
             contract: { outcome: task.outcome, mutation: task.mutation },
-            nextAllowedActions: ["manage_todos", "ask_user"],
+            nextAllowedActions: ["ask_user"],
           });
         } else {
           toolResult = await executeToolCached(effectiveCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
@@ -4306,15 +4358,12 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             }
           }
           if (!("error" in parsed) && call.name === "begin_chapter_draft" && parsed.status === "started") {
-            persistScenePipelineTodos(store, sessionId, "draft_started", emit);
             beginChapterSucceeded = true;
           }
           if (!("error" in parsed) && isChapterSceneWriteTool(call.name) && parsed.complete === true) {
-            persistScenePipelineTodos(store, sessionId, "draft_complete", emit);
             chapterReviewRequired = true;
           }
           if (!("error" in parsed) && call.name === "revise_chapter_scene_guide" && parsed.status === "guide_revised") {
-            persistScenePipelineTodos(store, sessionId, parsed.complete === true ? "draft_complete" : "draft_reopened", emit);
             chapterReviewRequired = parsed.complete === true;
           }
           if (!("error" in parsed) && isChapterSceneWriteTool(call.name)
@@ -4654,18 +4703,24 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         continue;
       }
       // Character saves may complete document-hint tasks when evidence led to a card-only fix.
-      if (characterMutationSubmitted && task.mutation !== "none") {
-        persistCompletedCharacterTaskTodos(store, sessionId, emit);
-        const gaps = agentLoop.completionGaps(store.sessionTodos(sessionId));
-        if (!gaps.length) {
+      // The same terminal gate decides: a saved card that still leaves the request
+      // unfulfilled (“建卡顺便补设定文件”) keeps running instead of ending here.
+      if (characterMutationSubmitted && task.mutation !== "none" && !waitingForUser) {
+        const decision = await terminalDecision();
+        if (decision.kind === "complete") {
           const answer = stripDsmlText(transcript, "").trim()
             || `${characterMutationName ? `“${characterMutationName}”` : "角色"}角色卡已保存。`;
           persistAssistantMessage(answer);
-          persistRunTerminal("completed");
+          persistRunTerminal("completed", decision.reason);
           emit({ type: "done", sessionId });
           return;
         }
-        messages.push({ role: "user", content: completionRecoveryPrompt(gaps, executionProgress) });
+        if (decision.kind === "continue") {
+          messages.push({ role: "user", content: decision.prompt });
+        } else if (decision.kind === "pause") {
+          exitWithFulfillmentPause(decision.reason);
+          return;
+        }
       }
       if (requiresCharacterMutation && characterMutationFailedThisStep) {
         messages.push({
@@ -4680,7 +4735,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         newlyRepeatedFailures.forEach(name => replannedFailures.add(name));
         messages.push({
           role: "user",
-          content: `执行路径出现重复失败（${newlyRepeatedFailures.join("、")}）。先根据结构化错误调用 manage_todos 修订剩余计划，再换用不同工具或更小范围；只有缺少不可推断的用户决策时才 ask_user。`,
+          content: `执行路径出现重复失败（${newlyRepeatedFailures.join("、")}）。先按结构化错误重排剩余步骤，再换用不同工具或更小范围；只有缺少不可推断的用户决策时才 ask_user。`,
         });
       }
       // §4b anchor: keep prep reads + the scene chain lock inside the cached base.
@@ -4770,16 +4825,23 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         // The controller already persisted concrete proposal evidence while
         // interpreting the tool result. Everything below derives from its snapshot.
         completedDocumentDeliverables = agentLoop.completedDocumentDeliverables;
-        const remainingDocumentDeliverables = agentLoop.pendingDocumentLabels();
-        const hasIndependentDocumentRemaining = remainingDocumentDeliverables.length > 0;
-        const advanced = persistAdvancedTodosAfterProposal(
-          store,
-          sessionId,
-          emit,
-          hasIndependentDocumentRemaining,
-          remainingDocumentDeliverables,
-        );
-        if (hasIndependentDocumentRemaining && !waitingForUser) {
+        // Whether another document is owed is no longer read off a planner-predicted
+        // label list — the terminal gate answers it from what actually landed. Only a
+        // fulfillment-level “还差东西” justifies dropping the finished chapter's
+        // transcript; an invariant gap is a repair of what is already on the table.
+        const decision = waitingForUser ? undefined : await terminalDecision();
+        if (decision?.kind === "pause") {
+          exitWithFulfillmentPause(decision.reason);
+          return;
+        }
+        if (decision?.kind === "continue" && decision.source === "invariant") {
+          documentProposalSubmitted = false;
+          submittedProposalRef = undefined;
+          messages.push({ role: "user", content: decision.prompt });
+          ensureThinkingTranscriptCanContinue();
+          continue;
+        }
+        if (decision?.kind === "continue") {
           // Per-chapter context reset: drop the finished chapter's tool transcript
           // and restart from the byte-stable initial prefix (still a cache hit), so
           // the next chapter stops paying the previous chapter's prose on every step.
@@ -4809,8 +4871,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             // whole-request rendering and forfeits the cached prefix (§4).
             role: "user",
             content: chapterContinuationPrompt({
-              todosText: formatTodosForPrompt(advanced.todos),
-              remainingDeliverables: remainingDocumentDeliverables,
+              nextStep: decision.prompt,
               ...(latestProposal
                 ? { proposal: { path: latestProposal.path, summary: latestProposal.summary, afterContent: latestProposal.afterContent } }
                 : {}),
@@ -4960,14 +5021,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           ensureThinkingTranscriptCanContinue();
           continue;
         }
-        const gaps = agentLoop.completionGaps(advanced.todos);
-        if (gaps.length && !waitingForUser) {
-          documentProposalSubmitted = false;
-          submittedProposalRef = undefined;
-          messages.push({ role: "user", content: completionRecoveryPrompt(gaps, executionProgress) });
-          ensureThinkingTranscriptCanContinue();
-          continue;
-        }
+        if (decision?.kind === "complete") terminalCompleteReason = decision.reason;
         break;
       }
       if (waitingForUser) break;
@@ -5021,7 +5075,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       return;
     }
     if (documentProposalSubmitted) {
-      let persistedVisibleReply = false;
+        let persistedVisibleReply = false;
       try {
         for (let i = turnStart; i < messages.length; i++) {
           const msg = messages[i];
@@ -5080,19 +5134,19 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         store.clearAgentTurnBlocks(sessionId);
       }
       freezeCurrentTurn();
-      persistRunTerminal("completed");
+      persistRunTerminal("completed", terminalCompleteReason);
       emit({ type: "done", sessionId });
       return;
     }
-    // Tools finished with a satisfied contract but no pure-text final step.
-    const endTodos = store.sessionTodos(sessionId);
-    const endGaps = agentLoop.completionGaps(endTodos);
-    if (!pauseForUserResume && !endGaps.length) {
+    // Tools finished with no pure-text final step. Same gate as everywhere else;
+    // a budget-exhausted run skips it because its next step is 续跑, not a verdict.
+    const endDecision = pauseForUserResume ? undefined : await terminalDecision();
+    if (endDecision?.kind === "complete") {
       const answer = stripDsmlText(transcript, "").trim() || "任务已处理。";
       persistAssistantMessage(answer);
       messages.push({ role: "assistant", content: answer });
       freezeCurrentTurn();
-      persistRunTerminal("completed");
+      persistRunTerminal("completed", endDecision.reason);
       emit({ type: "done", sessionId });
       return;
     }
@@ -5103,12 +5157,14 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       hardCap,
       usedSteps: Math.max(0, (currentUsageStep ?? 1) - 1),
     };
-    const openTodoLines = endTodos
-      .filter(todo => todo.status === "pending" || todo.status === "in_progress")
-      .map(todo => `- [${todo.status}] ${todo.content}`)
-      .slice(0, 8);
+    // What's still owed comes from the gate, not from a checklist: opened-but-unlanded
+    // deliveries are locatable facts, and the gate's own words cover the rest.
+    const stalledAtEnd = agentLoop.stalledDeliverableLabels();
+    const outstanding = endDecision?.kind === "continue"
+      ? endDecision.prompt
+      : endDecision?.kind === "pause" ? endDecision.reason : "";
     const reasonLabel = pause.reason === "stall"
-      ? "进度停滞（连续多步任务清单/交付状态未变化）"
+      ? "进度停滞（连续多步交付状态未变化）"
       : pause.reason === "soft_budget"
         ? "本轮 soft 步数预算已用尽"
         : "已达安全步数上限";
@@ -5116,9 +5172,9 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       stripDsmlText(transcript, "").trim(),
       `已暂停：${reasonLabel}。`,
       `已执行 ${pause.usedSteps} 步（soft ${pause.softBudget} / 安全上限 ${pause.hardCap}）。`,
-      openTodoLines.length ? `未完成清单：\n${openTodoLines.join("\n")}` : "当前无未完成清单项。",
-      endGaps.length ? `仍缺：${endGaps.join("；")}。` : "",
-      "中途上下文、任务清单与工作记忆已保留。请点击本条或上一条用户指令上的「续跑」继续，也可发送新指令。",
+      stalledAtEnd.length ? `已开始但未落地：${stalledAtEnd.join("、")}。` : "",
+      outstanding,
+      "中途上下文与工作记忆已保留。请点击本条或上一条用户指令上的「续跑」继续，也可发送新指令。",
       "[生成已中断]",
     ].filter(Boolean).join("\n\n");
     try {
@@ -5232,48 +5288,48 @@ export const AGENT_REVIEW_RESERVE_TURNS_PER_DELIVERABLE = 2;
 
 export type AgentBudgetPauseReason = "soft_budget" | "stall" | "hard_cap";
 
+/** Absolute rail on earned slots, so a mis-firing delivery loop still terminates. */
+export const AGENT_MAX_EARNED_DELIVERY_SLOTS = 8;
+
+/**
+ * Step budget is earned, not predicted.
+ *
+ * The cap used to be `baseHardCap × 计划交付数`, a number produced before the first
+ * tool call. It is recomputed every turn now: each document that actually landed
+ * buys the next one its own slice. 写五章的请求不需要有人先猜到「五」——第一章落地就
+ * 换来第二章的预算；只写一章的请求也不会白拿四份。
+ */
 export function computeAgentHardTurnBudget(input: {
   baseHardCap: number;
-  documentDeliverables: number;
-  documentProposalRequired: boolean;
+  deliveredDocuments: number;
   maxTurnsOverride: boolean;
 }): number {
   if (input.maxTurnsOverride) return input.baseHardCap;
-  const deliverableSlots = Math.max(
-    1,
-    input.documentDeliverables,
-    input.documentProposalRequired ? 1 : 0,
+  const slots = Math.min(
+    AGENT_MAX_EARNED_DELIVERY_SLOTS,
+    Math.max(1, input.deliveredDocuments + 1),
   );
-  return input.baseHardCap * deliverableSlots;
+  return input.baseHardCap * slots;
 }
 
 /**
- * Dynamic soft step budget from remaining work (todos, deliverables, scene chain).
+ * Dynamic soft step budget from observed work (open ledger entries, scene chain).
  * Not a hard wall: exhaustion enters a short converge window, then soft-pauses for 续跑.
  */
 export function computeSoftTurnBudget(input: {
-  todos: AgentTodoItem[];
-  todoPlanLength: number;
-  documentDeliverables: number;
-  completedDocumentDeliverables: number;
+  /** Ledger entries opened by a real document tool but not yet landed. */
+  stalledDeliveries: number;
+  deliveredDocuments: number;
   documentProposalRequired: boolean;
   mutation: AgentMutationRequirement;
   scenePipelineEnabled: boolean;
   chapterSceneDraft?: { scenes: readonly unknown[]; completed: readonly unknown[] } | null;
 }): number {
-  const openTodos = input.todos.filter(
-    todo => todo.status === "pending" || todo.status === "in_progress",
-  ).length;
-  const totalTodos = Math.max(input.todos.length, input.todoPlanLength, openTodos, 1);
-  const deliverableSlots = Math.max(
-    input.documentDeliverables,
-    input.documentProposalRequired ? 1 : 0,
-  );
-  const pendingDeliverables = Math.max(0, deliverableSlots - input.completedDocumentDeliverables);
-  let budget = 12;
-  budget += Math.max(openTodos, 1) * 6;
-  budget += Math.max(0, totalTodos - openTodos) * 2;
-  budget += pendingDeliverables * 8;
+  let budget = 18;
+  budget += input.stalledDeliveries * 8;
+  // Each landed document also earns soft room for the next one; see hard budget.
+  budget += Math.min(4, input.deliveredDocuments) * 8;
+  if (input.documentProposalRequired) budget += 8;
   if (input.mutation === "document" || input.mutation === "mixed") budget += 10;
   if (input.mutation === "character" || input.mutation === "mixed") budget += 4;
   if (input.scenePipelineEnabled) budget += 12;
@@ -5289,7 +5345,6 @@ export function computeSoftTurnBudget(input: {
 
 /** Structural progress only — not tool-name thrash or free-text heuristics. */
 export function agentStepProgressFingerprint(
-  todos: AgentTodoItem[],
   progress: ReturnType<typeof createAgentExecutionProgress>,
   flags: {
     documentProposalSubmitted: boolean;
@@ -5300,10 +5355,8 @@ export function agentStepProgressFingerprint(
     completedDocumentDeliverables: number;
   },
 ): string {
-  const todoSig = todos.map(todo => `${todo.id}:${todo.status}`).join(",");
   const stages = [...progress.workflowStages].sort().join("|");
   return [
-    todoSig,
     progress.documentArtifactProduced ? "d1" : "d0",
     progress.characterArtifactProduced ? "c1" : "c0",
     progress.proseGateRuleSaved ? "g1" : "g0",
@@ -5319,15 +5372,17 @@ export function agentStepProgressFingerprint(
 
 function agentBudgetConvergePrompt(
   reason: Exclude<AgentBudgetPauseReason, "hard_cap">,
-  meta: { step: number; softBudget: number; hardCap: number; openTodos: number },
+  meta: { step: number; softBudget: number; hardCap: number; stalledDeliveries: number },
 ): string {
   const head = reason === "stall"
-    ? `运行时检测到进度停滞（连续 ${AGENT_STALL_WINDOW} 步任务清单/交付状态未变化，当前第 ${meta.step} 步）。`
+    ? `运行时检测到进度停滞（连续 ${AGENT_STALL_WINDOW} 步交付状态未变化，当前第 ${meta.step} 步）。`
     : `本任务 soft 步数预算将尽（第 ${meta.step} 步，soft ${meta.softBudget} / 安全上限 ${meta.hardCap}）。`;
   return [
     head,
     `请在 ${AGENT_CONVERGE_TURNS} 步内收敛：完成当前可验证交付、提交提案、或 ask_user 澄清不可推断的决策；不要扩大范围或重复无效读取。`,
-    meta.openTodos > 0 ? `仍有 ${meta.openTodos} 项未完成清单。` : "无未完成清单项时请直接给出可交付结果。",
+    meta.stalledDeliveries > 0
+      ? `仍有 ${meta.stalledDeliveries} 项已开始但未落地的交付。`
+      : "没有未落地的交付时请直接给出可交付结果。",
     "若本窗口内仍无法完成，运行时会暂停并保留上下文，作者可点「续跑」继续。",
   ].join("");
 }

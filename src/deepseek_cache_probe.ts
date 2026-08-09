@@ -89,7 +89,6 @@ async function main(): Promise<void> {
         taskContext: "当前任务：验证真实消息前缀缓存。只执行用户要求的无副作用探针，不修改项目。",
         dynamicStyleContext: "本轮动态声线证据：无。",
         bootstrapContext: "写作线索：本轮无启发式索引。",
-        todosPrompt: "当前对话任务清单：（空）",
         artifactContext: "本轮任务工作记忆：无。",
         selectedContext: "用户选区：无。",
         prompt: seedPrompt,

@@ -963,11 +963,9 @@ test("chapter scene tool compiles notes inline and submits only after inspection
     assert.equal(begun.status, "started");
     assert.equal(begun.sceneCount, 1);
     assert.equal("scenes" in begun, false, "begin result must not echo the full scene chain");
-    // Planning-only steps mid-draft get steered back to write_chapter_scene.
-    const todosNudge = JSON.parse(await call("manage_todos", {
-      todos: [{ id: "t1", content: "自定义步骤", status: "in_progress" }],
-    })) as Record<string, unknown>;
-    assert.match(String(todosNudge.message), /write_chapter_scene/);
+    // The scene chain itself names the next step, so no planning tool sits between
+    // begin_chapter_draft and the first scene.
+    assert.match(String(begun.message), /write_chapter_scene/);
     const missingNotes = JSON.parse(await call("write_chapter_scene", {
       sceneId: "arrival", content: "门禁灯变红。".repeat(20), actualState: actualState("违规进入"),
     })) as Record<string, unknown>;

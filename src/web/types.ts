@@ -371,11 +371,6 @@ export type AgentJob = {
   terminalMessage?: string;
 };
 export type PermissionMode = "ask" | "auto" | "plan";
-export type AgentTodoItem = {
-  id: string;
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
-};
 export type AgentStreamEvent = {
   type: string;
   step?: number;
@@ -392,7 +387,6 @@ export type AgentStreamEvent = {
   usage?: Usage;
   call?: StepUsage;
   callKind?: string;
-  todos?: AgentTodoItem[];
   mode?: PermissionMode;
   /** provider_status */
   phase?: "queued" | "rate_limited" | "retrying" | "circuit_open" | "dispatched";
@@ -616,7 +610,6 @@ export type State = {
   providerCatalog: ProviderCatalog;
   activeJobs?: AgentJob[];
   styleTemplates?: StyleTemplateInfo[];
-  todos?: AgentTodoItem[];
   agentSettings?: {
     permissionMode: PermissionMode;
     writingMode: WritingExecutionMode;
@@ -642,13 +635,6 @@ export const PERMISSION_MODES: Array<{ id: PermissionMode; label: string; hint: 
   { id: "auto", label: "自动", hint: "提案自动写入磁盘" },
   { id: "plan", label: "规划", hint: "只读规划，不改文件" },
 ];
-
-export function todoStatusMark(status: AgentTodoItem["status"]): string {
-  if (status === "completed") return "✓";
-  if (status === "in_progress") return "›";
-  if (status === "cancelled") return "–";
-  return "○";
-}
 
 export type TreeNode = {
   name: string;

@@ -35,7 +35,6 @@ export const DEFAULT_WRITER_INSTRUCTIONS = `# 项目指令
 
 ## 协作约定
 
-- 多步任务用 manage_todos 维护清单
 - 局部修改优先 edit_file，完整新建或替换用 write_file
 - 设定进 lore/，大纲进 outline/，正文进 chapters/
 `;

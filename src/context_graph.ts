@@ -2,7 +2,7 @@
  * Manageable context graph for multi-chapter writing.
  *
  * Design (human terms):
- * - Notebook (result state): handoffs, delivered paths, todos — survives rewrites.
+ * - Notebook (result state): handoffs, delivered paths — survives rewrites.
  * - Scratch paper (process): tool transcripts live only inside an epoch.
  * - Trunk (project materials): outline skeleton + character index + lore paths —
  *   shared across chapters; byte-stable until materials change (prefix-cache friendly).
@@ -216,7 +216,7 @@ export type ProjectTrunkBuildResult = {
  *
  * CACHE: Sits after the 6 stable system slots and before turn replay. Same hash
  * ⇒ same bytes ⇒ provider prefix can hit through the trunk. Never put timestamps,
- * current chapter focus, todos, or full prose bodies here.
+ * current chapter focus or full prose bodies here.
  */
 export function buildProjectTrunk(input: ProjectTrunkBuildInput): ProjectTrunkBuildResult {
   const characters = input.characters

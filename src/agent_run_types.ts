@@ -86,6 +86,12 @@ export type AgentRunEventV2 =
       reusableEvidence: boolean;
     }
   | { type: "run_resumed"; at: string; sourceMessageId: number }
+  /**
+   * A document delivery opened on demand. The ledger is never pre-seeded from a
+   * planner guess: an entry exists because the agent actually started delivering
+   * a document, so `pending` means「开账未落地」rather than「预测数量差额」.
+   */
+  | { type: "deliverable_opened"; at: string; id: string; label: string }
   | { type: "step_started"; at: string; step: number; deliverableId?: string }
   | { type: "tool_observed"; at: string; observation: AgentRunToolObservation }
   | {
@@ -106,7 +112,8 @@ export type AgentRunEventV2 =
   | { type: "proposal_revision_set"; at: string; deliverableId: string; revision: ProposalRevisionCase }
   | { type: "proposal_revision_cleared"; at: string; deliverableId: string }
   | { type: "run_suspended"; at: string; reason: string; nextAction: string }
-  | { type: "run_completed"; at: string }
+  /** `reason` names which terminal gate fired, so a finished run is explainable. */
+  | { type: "run_completed"; at: string; reason?: string }
   | { type: "run_failed"; at: string; reason: string }
   | { type: "run_cancelled"; at: string; reason: string };
 

@@ -1,4 +1,4 @@
-import type { AgentRunDocumentEvidence, AgentRunState, AgentTodoItem, PermissionMode } from "./types.js";
+import type { AgentRunDocumentEvidence, AgentRunState, PermissionMode } from "./types.js";
 import { classifyAgentToolOutcome, isSuccessfulDocumentSubmission, proposalIdFromToolResult } from "./agent_runtime.js";
 import {
   inferWritingQualityProfile,
@@ -38,8 +38,6 @@ export interface AgentTaskContract {
   qualityProfile?: WritingQualityProfile;
   /** A semantic planner decision that must be persisted before the turn can finish. */
   proseGateRequired?: boolean;
-  /** Unordered user-visible document outputs. It constrains completion, never action order. */
-  documentDeliverables?: readonly string[];
   /** Narrative-reference policy selected by the task compiler. */
   proseReferenceMode?: ProseReferenceMode;
 }
@@ -84,6 +82,11 @@ const CHARACTER_MUTATION_TOOLS = new Set([
 ]);
 
 const IMAGE_MUTATION_TOOLS = new Set(["generate_image"]);
+
+/** The ledger opens an entry when one of these actually runs, never before. */
+export function isDocumentMutationTool(toolName: string): boolean {
+  return DOCUMENT_MUTATION_TOOLS.has(toolName);
+}
 
 export function createAgentExecutionProgress(reusableEvidence = false): AgentExecutionProgress {
   return {
@@ -160,108 +163,39 @@ function hasEvidence(contract: AgentTaskContract, progress: AgentExecutionProgre
 }
 
 /**
- * Precompiled mutation is a hint, not a frozen write path. When evidence shows the
- * change lives only on a character card (or only in a file), a successful alternate
- * artifact may satisfy a single-family obligation. Multi-document and mixed tasks
- * keep their explicit multi-artifact requirements.
+ * Completion checks are invariants, never predictions.
+ *
+ * What was removed here, and why: the compiler used to freeze「本轮会产出几份文档 /
+ * 会不会改角色卡 / 会不会出图」at t=0, before any evidence existed, and that guess
+ * decided when the run was allowed to end. Guessing low ended a five-chapter request
+ * after one chapter; guessing high forced an artifact onto a turn that only needed an
+ * answer. Whether the user's request was actually fulfilled is a semantic judgment
+ * about the finished work — it belongs to the terminal review in `run_completion.ts`,
+ * not to a counter seeded before the first tool call.
+ *
+ * What stays: things checkable at any moment with a locatable failure — an evidence
+ * floor before delivery, a persisted author policy the planner explicitly detected,
+ * and the internal stage integrity of a writing path the agent itself chose.
  */
-export function alternateMutationArtifactSatisfies(
-  contract: AgentTaskContract,
-  progress: AgentExecutionProgress,
-): boolean {
-  if (contract.mutation === "document") {
-    const required = Math.max(1, contract.documentDeliverables?.length ?? 0);
-    return required <= 1 && progress.characterArtifactProduced;
-  }
-  if (contract.mutation === "character") {
-    return progress.documentArtifactProduced || progress.documentArtifactKeys.size > 0;
-  }
-  return false;
-}
-
 export function agentCompletionGaps(
   contract: AgentTaskContract,
   progress: AgentExecutionProgress,
-  _todos: AgentTodoItem[],
 ): string[] {
   const gaps: string[] = [];
-  if (!hasEvidence(contract, progress)) {
+  // Evidence floor only bites once something was actually delivered: an unanswered
+  // question needs no reading, a document written from nothing does.
+  if (progress.documentArtifactKeys.size > 0 && !hasEvidence(contract, progress)) {
     gaps.push(contract.evidence === "project"
       ? "尚未通过项目检索或读取取得事实依据"
       : contract.evidence === "target"
         ? "尚未定位并读取目标资料"
         : "尚未取得可承接的正文末尾或工作记忆");
   }
-  const alternateSatisfied = alternateMutationArtifactSatisfies(contract, progress);
-  if (contract.mutation === "document" || contract.mutation === "mixed") {
-    const required = Math.max(1, contract.documentDeliverables?.length ?? 0);
-    const completed = progress.documentArtifactKeys.size;
-    if (completed < required && !(contract.mutation === "document" && alternateSatisfied)) {
-      gaps.push(required === 1
-        ? "尚未成功提交文件变更"
-        : `文件交付尚未完成：要求 ${required} 份，已有 ${completed} 份可验证提交`);
-    }
-  }
-  if ((contract.mutation === "character" || contract.mutation === "mixed")
-    && !progress.characterArtifactProduced
-    && !(contract.mutation === "character" && alternateSatisfied)) {
-    gaps.push("尚未成功保存或更新角色卡");
-  }
-  if (contract.capabilities.includes("images") && !progress.imageArtifactProduced) {
-    gaps.push("尚未成功生成用户要求的图片");
-  }
   if (contract.proseGateRequired && !progress.proseGateRuleSaved) {
     gaps.push("尚未把 planning 识别出的可复用作者反馈保存为复审规则");
   }
   gaps.push(...writingWorkflowCompletionGaps(contract, progress.workflowStages));
   return gaps;
-}
-
-export function createAgentRunState(
-  originalRequest: string,
-  documentDeliverables: readonly string[],
-  previous?: AgentRunState,
-): AgentRunState {
-  const resumable = previous?.version === 1
-    && previous.originalRequest === originalRequest
-    && previous.terminalState !== "completed";
-  return {
-    version: 1,
-    originalRequest,
-    documentObligations: resumable
-      ? previous.documentObligations.map(item => ({ ...item, ...(item.evidence ? { evidence: { ...item.evidence } } : {}) }))
-      : documentDeliverables.map((label, index) => ({ id: `document-${index + 1}`, label })),
-    terminalState: "running",
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-export function recordAgentRunDocumentEvidence(
-  state: AgentRunState,
-  evidence: AgentRunDocumentEvidence,
-): AgentRunState {
-  const evidenceKey = evidence.proposalId !== undefined
-    ? `proposal:${evidence.proposalId}`
-    : evidence.changeSetId !== undefined ? `change-set:${evidence.changeSetId}` : undefined;
-  if (evidenceKey && state.documentObligations.some(item => {
-    const current = item.evidence;
-    return current && (current.proposalId !== undefined
-      ? `proposal:${current.proposalId}`
-      : current.changeSetId !== undefined ? `change-set:${current.changeSetId}` : undefined) === evidenceKey;
-  })) return state;
-  const index = state.documentObligations.findIndex(item => !item.evidence);
-  if (index < 0) return state;
-  return {
-    ...state,
-    documentObligations: state.documentObligations.map((item, itemIndex) => (
-      itemIndex === index ? { ...item, evidence: { ...evidence } } : item
-    )),
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-export function agentRunPendingDocumentLabels(state: AgentRunState): string[] {
-  return state.documentObligations.filter(item => !item.evidence).map(item => item.label);
 }
 
 export function completionRecoveryPrompt(gaps: string[], progress: AgentExecutionProgress): string {
@@ -272,28 +206,28 @@ export function completionRecoveryPrompt(gaps: string[], progress: AgentExecutio
     "运行时完成检查未通过，请继续执行，不要用文字声称已经完成。",
     `缺口：${gaps.join("；") || "未知"}。`,
     repeatedFailures.length
-      ? `重复失败：${repeatedFailures.join("、")}。请调用 manage_todos 修订剩余计划并换用可行路径；若确实缺少不可推断的信息，再 ask_user。`
-      : "请依据已有工具结果选择下一项最小可验证动作；发现原计划不成立时可调用 manage_todos 更新计划。",
+      ? `重复失败：${repeatedFailures.join("、")}。换用可行路径，不要重复同一动作；若确实缺少不可推断的信息，再 ask_user。`
+      : "请依据已有工具结果选择下一项最小可验证动作。",
   ].join("\n");
 }
 
 /**
- * Tools remain visible in a stable catalog; this policy only guards side effects.
- * Precompiled mutation is a write-intent hint: any non-none mutation authorizes both
- * document and character writes so the agent can follow tool facts. plan still freezes
- * all writes; images still require an explicit capability.
+ * Write permission comes from the user, not from a guess about the user.
+ *
+ * `plan` is a mode the author selected, so it freezes every side effect. Everything
+ * else is the agent's call: the compiler's `mutation` / `capabilities` hints were
+ * produced in two seconds with no evidence, and using them as a hard gate meant a
+ * misread intent ("为啥就写了一章" classified as a pure question) permanently blocked
+ * the write that would have answered it. A wrong hint should cost one wasted step,
+ * never the run.
  */
 export function contractAllowsTool(
-  contract: AgentTaskContract,
+  _contract: AgentTaskContract,
   permissionMode: PermissionMode,
   toolName: string,
 ): boolean {
-  if (permissionMode === "plan" && (DOCUMENT_MUTATION_TOOLS.has(toolName) || CHARACTER_MUTATION_TOOLS.has(toolName) || IMAGE_MUTATION_TOOLS.has(toolName))) {
-    return false;
-  }
-  if (IMAGE_MUTATION_TOOLS.has(toolName)) return contract.capabilities.includes("images");
-  if (DOCUMENT_MUTATION_TOOLS.has(toolName) || CHARACTER_MUTATION_TOOLS.has(toolName)) {
-    return contract.mutation !== "none";
-  }
-  return true;
+  return !(permissionMode === "plan"
+    && (DOCUMENT_MUTATION_TOOLS.has(toolName)
+      || CHARACTER_MUTATION_TOOLS.has(toolName)
+      || IMAGE_MUTATION_TOOLS.has(toolName)));
 }

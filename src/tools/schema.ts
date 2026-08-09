@@ -1061,34 +1061,6 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
-      name: "manage_todos",
-      description: "维护本轮多步 todos；同时至多一项 in_progress",
-      parameters: {
-        type: "object",
-        properties: {
-          todos: {
-            type: "array",
-            maxItems: 30,
-            items: {
-              type: "object",
-              properties: {
-                id: { type: "string", description: "如 t1" },
-                content: { type: "string", description: "描述" },
-                status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
-              },
-              required: ["id", "content", "status"],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ["todos"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "load_skill",
       description: "加载项目 Skill 的指令、运行清单与资源目录；匹配任务或修订问题指定 skillId 时使用",
       parameters: {

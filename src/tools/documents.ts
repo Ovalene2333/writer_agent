@@ -452,7 +452,7 @@ export function handleReadDocumentSpan({ input, project, context }: ToolHandlerA
     content: body,
     nextAction: context.editScope === "point" ? "propose_document_patch" : undefined,
     message: context.editScope === "point"
-      ? "目标正文已经完整读取。下一步直接调用 propose_document_patch；不要继续 search、locate、read、整篇修订或维护 todos。"
+      ? "目标正文已经完整读取。下一步直接调用 propose_document_patch；不要继续 search、locate、read 或整篇修订。"
       : "写入时使用目标 anchorId+spanHash；行号只用于展示。",
   });
 }

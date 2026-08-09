@@ -1130,7 +1130,6 @@ export async function startWriterServer(options: {
       provider: options.providers.publicConfig(),
       providerCatalog: options.providers.catalog(),
       usage: options.store.usage(sessionId),
-      todos: options.store.sessionTodos(sessionId),
       agentSettings: loadAgentSettings(options.project),
       proseGateRules: loadProseGateRules(options.project),
       authorPolicies: loadAuthorPolicies(options.project),

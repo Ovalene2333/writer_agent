@@ -245,7 +245,6 @@ const TOOL_LABELS: Record<string, string> = {
   revise_chapter_scene_guide: "修场纲",
   revise_chapter_draft_style: "修文风",
   inspect_chapter_draft: "审章节",
-  manage_todos: "任务",
   generate_image: "生图",
 };
 

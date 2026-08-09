@@ -94,6 +94,21 @@ export function reduceAgentRunEvent(
         terminalReason: undefined,
         nextAction: undefined,
       };
+    case "deliverable_opened":
+      return current.deliverables.some(item => item.id === event.id)
+        ? next
+        : {
+            ...next,
+            deliverables: [
+              ...current.deliverables,
+              {
+                id: event.id,
+                label: event.label,
+                state: "pending",
+                execution: emptyDeliverableExecution(),
+              },
+            ],
+          };
     case "step_started":
       return {
         ...next,
@@ -215,7 +230,7 @@ export function reduceAgentRunEvent(
     case "run_suspended":
       return { ...next, status: "suspended", terminalReason: event.reason, nextAction: event.nextAction };
     case "run_completed":
-      return { ...next, status: "completed", terminalReason: undefined, nextAction: undefined };
+      return { ...next, status: "completed", terminalReason: event.reason, nextAction: undefined };
     case "run_failed":
       return { ...next, status: "failed", terminalReason: event.reason, nextAction: undefined };
     case "run_cancelled":

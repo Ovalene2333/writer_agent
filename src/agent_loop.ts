@@ -2,7 +2,7 @@ import type { WriterStore } from "./store.js";
 import { AgentRunController } from "./agent_run_controller.js";
 import type { AgentExecutionProgress, AgentTaskContract } from "./agentic_runtime.js";
 import type { InterpretedAgentToolResult } from "./agent_tool_outcome.js";
-import type { AgentRunState, AgentTodoItem, PermissionMode } from "./types.js";
+import type { AgentRunState, PermissionMode } from "./types.js";
 import type { ProposalRevisionCase } from "./proposal_retry.js";
 
 /**
@@ -50,8 +50,16 @@ export class AgentLoopRuntime {
     return this.controller.pendingDocumentLabels();
   }
 
+  stalledDeliverableLabels(): string[] {
+    return this.controller.stalledDeliverableLabels();
+  }
+
   activeDocumentDeliverable() {
     return this.controller.activeDocumentDeliverable();
+  }
+
+  ensureDocumentDeliverable(label?: string): string {
+    return this.controller.ensureDocumentDeliverable(label);
   }
 
   proposalDeliverableId(requestedId?: string): string | undefined {
@@ -96,8 +104,8 @@ export class AgentLoopRuntime {
     return this.controller.executionProgress();
   }
 
-  completionGaps(todos: AgentTodoItem[]): string[] {
-    return this.controller.completionGaps(this.task, todos);
+  completionGaps(): string[] {
+    return this.controller.completionGaps(this.task);
   }
 
   terminate(
@@ -105,7 +113,7 @@ export class AgentLoopRuntime {
     reason?: string,
   ): void {
     if (state === "completed") {
-      const gaps = this.controller.complete(this.task, this.store.sessionTodos(this.snapshot.sessionId));
+      const gaps = this.controller.complete(this.task, reason ?? "契约不变量已满足");
       if (gaps.length) throw new Error(`AgentRun 完成检查未通过：${gaps.join("；")}`);
       return;
     }

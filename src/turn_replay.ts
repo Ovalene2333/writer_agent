@@ -134,7 +134,6 @@ export function mergedTurnContext(parts: {
   taskContext: string;
   dynamicStyleContext?: string;
   bootstrapContext?: string;
-  todosPrompt?: string;
   artifactContext?: string;
   selectedContext?: string;
   prompt: string;
@@ -143,7 +142,7 @@ export function mergedTurnContext(parts: {
     parts.taskContext,
     parts.dynamicStyleContext || "本轮动态声线证据：无。",
     parts.bootstrapContext || "写作线索：本轮无启发式索引。",
-    parts.todosPrompt || "当前对话任务清单：（空）",
+    "（保留槽位）",
     parts.artifactContext || "本轮任务工作记忆：无。",
     parts.selectedContext || "用户选区：无。",
     `本轮用户请求：\n${parts.prompt}`,

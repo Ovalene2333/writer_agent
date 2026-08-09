@@ -589,11 +589,9 @@ export function chapterNamingNeedsAgentContext(task: {
   documentProposalRequired?: boolean;
   mode?: string;
   targetPath?: string;
-  documentDeliverables?: readonly string[];
 }): boolean {
   if (task.mode === "write_scene" || task.mode === "rewrite") return true;
   if (task.documentProposalRequired) return true;
   if (task.targetPath?.startsWith("chapters/")) return true;
-  if (task.documentDeliverables?.some(label => /章|chapter/i.test(label))) return true;
   return false;
 }

@@ -49,7 +49,6 @@ import {
   chapterReviewRequiredPrompt,
   compactCompletedToolCalls,
   compactRuntimeMessages,
-  documentDeliveryRemaining,
   executionModelForTask,
   executionModelForStep,
   buildMaterialsShelfDigest,
@@ -58,7 +57,6 @@ import {
   isTargetedDocumentSupplement,
   projectCacheUserId,
   registerMaterialsShelfEntry,
-  initialTodos,
   normalizeCharacterTaskMode,
   normalizeDocumentProposalRequired,
   normalizePlannedProseGateCandidate,
@@ -103,7 +101,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "ba62877c6760f61d");
+  assert.equal(agentToolSchemaHash(), "57c50a6a4e1964e2");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -311,7 +309,6 @@ test("validated checkpoints restore drafts and clear with task state", () => {
       draftVersion: 0, completedScenes: 0, totalScenes: 1, draft, updatedAt: new Date().toISOString(),
     });
     assert.equal(restoreChapterDraftCheckpoint(store, sessionId, project, draft.path)?.path, draft.path);
-    store.saveSessionTodos(sessionId, [{ id: "t1", content: "完成章节", status: "in_progress" }]);
     store.clearSessionTaskState(sessionId);
     assert.equal(store.agentCheckpoint(sessionId), undefined);
     store.close();
@@ -655,14 +652,6 @@ test("lore entity discussion upgrades to project fact search", () => {
   );
 });
 
-test("prebuilt todo plans start with one active step", () => {
-  assert.deepEqual(initialTodos(["核对资料", "完成写作", "提交提案"]), [
-    { id: "t1", content: "核对资料", status: "in_progress" },
-    { id: "t2", content: "完成写作", status: "pending" },
-    { id: "t3", content: "提交提案", status: "pending" },
-  ]);
-});
-
 test("chapter workflow lets the Agent choose a delivery path", () => {
   const instructions = taskInstructions("write_scene", "deliver", "ask", true);
   assert.match(instructions, /自主决定/);
@@ -699,8 +688,7 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
 test("chapter continuation handoff carries delivery, tail, and final scene state", () => {
   const tail = "走廊尽头的灯灭了。".repeat(200);
   const prompt = chapterContinuationPrompt({
-    todosText: "- [x] t1: 撰写第1章 (completed)\n- [>] t2: 撰写第2章 (in_progress)",
-    remainingDeliverables: ["第二章"],
+    nextStep: "第1章已落地，继续撰写第2章。",
     proposal: { path: "chapters/第1章.md", summary: "主角违规进入训练区", afterContent: tail },
     handoff: {
       path: "chapters/第1章.md",
@@ -727,8 +715,9 @@ test("chapter continuation handoff carries delivery, tail, and final scene state
   const tailOnly = afterTail.split("上一章末场")[0] ?? afterTail;
   assert.ok(tailOnly.length < 1_200, `tail block too long: ${tailOnly.length}`);
 
-  const minimal = chapterContinuationPrompt({ todosText: "（空）" });
-  assert.match(minimal, /完成约束已经满足/);
+  const minimal = chapterContinuationPrompt({ nextStep: "继续下一份正文。" });
+  // The only source of「还要写什么」is the terminal gate's instruction, carried verbatim.
+  assert.match(minimal, /继续下一份正文。/);
   assert.doesNotMatch(minimal, /已交付：/);
   assert.match(minimal, /材料架仍空/);
 });
@@ -826,7 +815,7 @@ test("proposal revision converge prompt carries the scoped blocker packet", () =
     message: "句式门禁",
   }, 2);
   assert.match(last, /最后一轮/);
-  assert.match(last, /manage_todos|ask_user/);
+  assert.match(last, /ask_user/);
 });
 
 test("proposal retry policy counts only same semantic blockers as no progress", () => {
@@ -1250,17 +1239,17 @@ test("scene continuation handoff carries seam tail, states and next card without
   const reviewLock = chapterReviewRequiredPrompt(draft);
   assert.match(reviewLock, /已完成（2\/2）/);
   assert.match(reviewLock, /唯一下一步：立即调用 inspect_chapter_draft/);
-  assert.match(reviewLock, /不要调用 manage_todos/);
+  assert.match(reviewLock, /运行时已自动推进章节阶段/);
   assert.match(reviewLock, /禁止重写、续写或重新建立 scene guide/);
   assert.equal(chapterReviewAllowsTool("inspect_chapter_draft"), true);
-  assert.equal(chapterReviewAllowsTool("manage_todos"), false);
+  assert.equal(chapterReviewAllowsTool("read_file"), false);
   assert.equal(chapterReviewAllowsTool("write_chapter_scene"), false);
   const reviewRetry = chapterReviewRequiredPrompt(draft, {
-    rejectedTools: ["write_chapter_scene", "manage_todos", "write_chapter_scene"],
+    rejectedTools: ["write_chapter_scene", "read_file", "write_chapter_scene"],
     attempt: 2,
   });
   assert.match(reviewRetry, /第 2 次/);
-  assert.match(reviewRetry, /write_chapter_scene、manage_todos/);
+  assert.match(reviewRetry, /write_chapter_scene、read_file/);
   assert.match(reviewRetry, /这些调用未执行，草稿没有变化/);
   assert.equal(chapterDraftNeedsReview(draft, "scene_written"), true);
   assert.equal(chapterDraftNeedsReview(draft, "review_blocked"), false);
@@ -1304,12 +1293,6 @@ test("automatic chapter review preserves character evolution and scopes rejected
   assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", JSON.stringify({ sceneId: "s3" })), false);
   assert.equal(chapterReviewRepairAllowsTool(structural!, "revise_chapter_scene_guide"), false);
   assert.equal(chapterReviewRepairAllowsTool(structural!, "write_chapter_scene", "{"), false);
-});
-
-test("document delivery continuation uses contract outputs instead of todo wording", () => {
-  assert.equal(documentDeliveryRemaining(["第二章"], 1), false);
-  assert.equal(documentDeliveryRemaining(["第二章", "第三章"], 1), true);
-  assert.equal(documentDeliveryRemaining([], 0), false);
 });
 
 type Msg = {
@@ -1475,7 +1458,7 @@ test("dynamic turn messages always expose the same slot count", () => {
     taskContext: "任务",
     dynamicStyleContext: "声线",
     bootstrapContext: "线索",
-    todosPrompt: "清单",
+    reservedSlot: "（保留槽位）",
     artifactContext: "记忆",
     selectedContext: "选区",
     prompt: "写一章",
@@ -1789,7 +1772,7 @@ test("turn one keeps today's 9-slot shape; later turns fold into a single user b
     taskContext: "当前任务：改稿",
     dynamicStyleContext: "声线",
     bootstrapContext: "线索",
-    todosPrompt: "清单",
+    reservedSlot: "（保留槽位）",
     artifactContext: "记忆",
     selectedContext: "选区",
     prompt: "把这段改短",
@@ -1805,7 +1788,7 @@ test("turn one keeps today's 9-slot shape; later turns fold into a single user b
   const frozen = freezeTurnBlock([...first, { role: "assistant", content: "已改" }], stable.length);
   const second = [...stable, ...frozen, mergedTurnContext(turnParts)];
   assert.equal(second.at(-1)?.role, "user");
-  for (const body of ["当前任务：改稿", "声线", "线索", "清单", "记忆", "选区", "把这段改短"]) {
+  for (const body of ["当前任务：改稿", "声线", "线索", "（保留槽位）", "记忆", "选区", "把这段改短"]) {
     assert.match(messageContentText(second.at(-1)?.content), new RegExp(body));
   }
 });

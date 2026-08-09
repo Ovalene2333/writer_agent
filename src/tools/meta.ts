@@ -1,5 +1,4 @@
-import { loadSkillById, normalizeTodos, readSkillResource, reconcileManagedTodos } from "../agent_runtime.js";
-import { chapterSceneDraftComplete, nextChapterScene } from "../scene_pipeline.js";
+import { loadSkillById, readSkillResource } from "../agent_runtime.js";
 import type { ToolHandlerArgs } from "./types.js";
 import { requireString } from "./helpers.js";
 import {
@@ -126,36 +125,6 @@ export function handleAskUser({ input }: ToolHandlerArgs): string {
     ? `${question}\n\n${options.map((opt, i) => `选项 ${i + 1}：${opt}`).join("\n")}`
     : question;
   return JSON.stringify({ status: "waiting", message: "问题已提交，等待用户回复", displayMessage: message, question, options: options ?? undefined });
-}
-
-export function handleManageTodos({ input, store, sessionId, emit, context }: ToolHandlerArgs): string {
-  const requested = normalizeTodos(input.todos);
-  const reconciled = reconcileManagedTodos(store.sessionTodos(sessionId), requested);
-  const todos = reconciled.todos;
-  store.saveSessionTodos(sessionId, todos);
-  emit({ type: "todos", todos });
-  const completed = todos.filter(item => item.status === "completed").length;
-  const active = todos.filter(item => item.status === "in_progress").map(item => item.id);
-  // Steer the model off planning-only steps while a scene draft is mid-flight.
-  const draft = context.chapterSceneDraft;
-  const nextScene = draft && !chapterSceneDraftComplete(draft) ? nextChapterScene(draft) : undefined;
-  const draftNudge = draft
-    ? nextScene
-      ? `章节场景草稿进行中（${draft.completed.length}/${draft.scenes.length}），内置阶段由工具结果自动推进；下一步直接调用 write_chapter_scene（sceneId=${nextScene.id}），要点直接写进 notes 参数，勿再为规划单独消耗步骤。`
-      : "章节场景已全部写完；下一步直接调用 inspect_chapter_draft，勿再为勾选清单单独消耗步骤。"
-    : "";
-  return JSON.stringify({
-    todos,
-    summary: { total: todos.length, completed, inProgress: active },
-    message: [
-      active.length ? `任务清单已更新；进行中：${active.join("、")}` : "任务清单已更新",
-      reconciled.scenePipelineProtected ? "内置章节阶段只能由实际场景工具结果推进；本次手动状态变更未应用。" : "",
-      reconciled.writingTodosProtected
-        ? "撰写/章节类条目须在文档提案真正创建后由运行时勾选完成；本次手动 completed 未生效（可改文案或 cancelled）。"
-        : "",
-      draftNudge,
-    ].filter(Boolean).join(" "),
-  });
 }
 
 export function handleLoadSkill({ input, project }: ToolHandlerArgs): string {

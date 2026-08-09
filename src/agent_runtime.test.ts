@@ -4,10 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  advanceScenePipelineTodos,
-  advanceTodosAfterProposal,
-  completeCharacterTaskTodos,
-  formatTodosForPrompt,
   isSuccessfulDocumentSubmission,
   listProjectSkills,
   loadSkillById,
@@ -15,12 +11,7 @@ import {
   loadProjectInstructions,
   readSkillResource,
   routeProjectSkills,
-  normalizeTodos,
-  persistAdvancedTodosAfterProposal,
-  persistCompletedCharacterTaskTodos,
-  protectDocumentWritingTodos,
   proposalIdFromToolResult,
-  reconcileManagedTodos,
   saveAgentSettings,
 } from "./agent_runtime.js";
 import { emptyCharacter } from "./characters.js";
@@ -28,64 +19,7 @@ import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
 import { handleApplyCharacterChanges, handleSaveCharacter } from "./tools/characters.js";
 import type { ToolHandlerArgs } from "./tools/types.js";
-import type { AgentTodoItem, ProseQualityReport } from "./types.js";
-
-test("normalizeTodos enforces single in_progress", () => {
-  const todos = normalizeTodos([
-    { id: "t1", content: "A", status: "in_progress" },
-    { id: "t2", content: "B", status: "in_progress" },
-    { id: "t3", content: "C", status: "pending" },
-  ]);
-  assert.equal(todos.filter(item => item.status === "in_progress").length, 1);
-  assert.equal(todos[0].status, "in_progress");
-  assert.equal(todos[1].status, "pending");
-  assert.match(formatTodosForPrompt(todos), /t1/);
-});
-
-test("scene pipeline milestones advance the built-in chapter todos without model bookkeeping", () => {
-  const initial: AgentTodoItem[] = [
-    { id: "t1", content: "核对本篇必要事实与衔接", status: "in_progress" },
-    { id: "t2", content: "建立初始场景引导", status: "pending" },
-    { id: "t3", content: "按成稿结果推进正文", status: "pending" },
-    { id: "t4", content: "全文审阅并提交提案", status: "pending" },
-  ];
-  const started = advanceScenePipelineTodos(initial, "draft_started");
-  assert.equal(started.changed, true);
-  assert.deepEqual(started.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
-  const complete = advanceScenePipelineTodos(started.todos, "draft_complete");
-  assert.deepEqual(complete.todos.map(item => item.status), ["completed", "completed", "completed", "in_progress"]);
-  const reopened = advanceScenePipelineTodos(complete.todos, "draft_reopened");
-  assert.deepEqual(reopened.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
-});
-
-test("scene pipeline milestones do not infer phases from custom todo wording", () => {
-  const custom: AgentTodoItem[] = [
-    { id: "x1", content: "看看资料", status: "in_progress" },
-    { id: "x2", content: "写正文", status: "pending" },
-  ];
-  const result = advanceScenePipelineTodos(custom, "draft_started");
-  assert.equal(result.changed, false);
-  assert.equal(result.todos, custom);
-});
-
-test("manage_todos cannot manually complete the built-in scene pipeline", () => {
-  const current: AgentTodoItem[] = [
-    { id: "t1", content: "核对本篇必要事实与衔接", status: "in_progress" },
-    { id: "t2", content: "建立初始场景引导", status: "pending" },
-    { id: "t3", content: "按成稿结果推进正文", status: "pending" },
-    { id: "t4", content: "全文审阅并提交提案", status: "pending" },
-  ];
-  const requested = current.map(item => ({ ...item, status: "completed" as const }));
-  const result = reconcileManagedTodos(current, requested);
-  assert.equal(result.scenePipelineProtected, true);
-  assert.equal(result.todos, current);
-
-  const custom = [{ id: "x1", content: "自定义步骤", status: "completed" as const }];
-  assert.deepEqual(reconcileManagedTodos([], custom), {
-    todos: custom,
-    scenePipelineProtected: false,
-  });
-});
+import type { ProseQualityReport } from "./types.js";
 
 test("final-review blocks are not successful document submissions", () => {
   assert.equal(isSuccessfulDocumentSubmission("propose_document", {
@@ -115,88 +49,7 @@ test("final-review blocks are not successful document submissions", () => {
   assert.equal(proposalIdFromToolResult({ proposal: { proposalId: 12 } }), 12);
 });
 
-test("manage_todos cannot manually complete multi-chapter writing items", () => {
-  const current: AgentTodoItem[] = [
-    { id: "t1", content: "搜索项目资料与第一章内容", status: "completed" },
-    { id: "t2", content: "撰写第02章：康复训练（学步）", status: "completed" },
-    { id: "t3", content: "补写第03章：父亲来访", status: "in_progress" },
-    { id: "t4", content: "撰写第04章：接受身份", status: "pending" },
-  ];
-  const requested = current.map(item => (
-    item.id === "t3" || item.id === "t4"
-      ? { ...item, status: "completed" as const }
-      : item
-  ));
-  const protectedTodos = protectDocumentWritingTodos(current, requested);
-  assert.equal(protectedTodos.find(item => item.id === "t3")?.status, "in_progress");
-  assert.equal(protectedTodos.find(item => item.id === "t4")?.status, "pending");
-
-  const reconciled = reconcileManagedTodos(current, requested);
-  assert.equal(reconciled.writingTodosProtected, true);
-  assert.equal(reconciled.todos.find(item => item.id === "t3")?.status, "in_progress");
-  // Non-writing checklist items can still be completed manually.
-  const soft = reconcileManagedTodos(
-    [{ id: "s1", content: "提交文档提案", status: "pending" }],
-    [{ id: "s1", content: "提交文档提案", status: "completed" }],
-  );
-  assert.equal(soft.todos[0]?.status, "completed");
-});
-
-test("scene pipeline milestones migrate the legacy chapter todo labels", () => {
-  const legacy: AgentTodoItem[] = [
-    { id: "t1", content: "核对大纲、人设与衔接", status: "completed" },
-    { id: "t2", content: "建立章节场景链", status: "in_progress" },
-    { id: "t3", content: "逐场编译、写作并传递状态", status: "pending" },
-    { id: "t4", content: "整章审阅并提交提案", status: "pending" },
-  ];
-  const result = advanceScenePipelineTodos(legacy, "draft_started");
-  assert.equal(result.changed, true);
-  assert.deepEqual(result.todos.map(item => item.status), ["completed", "completed", "in_progress", "pending"]);
-});
-
-test("completeCharacterTaskTodos completes a saved character task and keeps cancelled", () => {
-  const { todos, changed } = completeCharacterTaskTodos([
-    { id: "t1", content: "读取角色卡", status: "completed" },
-    { id: "t2", content: "更新角色卡", status: "in_progress" },
-    { id: "t3", content: "核对保存结果", status: "pending" },
-    { id: "t4", content: "无需处理", status: "cancelled" },
-  ]);
-  assert.equal(changed, true);
-  assert.equal(todos.find(item => item.id === "t1")?.status, "completed");
-  assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
-  assert.equal(todos.find(item => item.id === "t3")?.status, "completed");
-  assert.equal(todos.find(item => item.id === "t4")?.status, "cancelled");
-  assert.equal(completeCharacterTaskTodos(todos).changed, false);
-});
-
-test("advanceTodosAfterProposal keeps multi-chapter pending open and continues", () => {
-  const { todos, shouldContinue, changed } = advanceTodosAfterProposal([
-    { id: "t1", content: "阅读大纲和世界观设定", status: "completed" },
-    { id: "t2", content: "撰写第1章初稿", status: "in_progress" },
-    { id: "t3", content: "撰写第2章初稿", status: "pending" },
-    { id: "t4", content: "撰写第3章初稿", status: "pending" },
-  ]);
-  assert.equal(changed, true);
-  assert.equal(shouldContinue, true);
-  assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
-  assert.equal(todos.find(item => item.id === "t3")?.status, "in_progress");
-  assert.equal(todos.find(item => item.id === "t4")?.status, "pending");
-});
-
-test("advanceTodosAfterProposal projects a remaining obligation when planner combined todos", () => {
-  const { todos, shouldContinue } = advanceTodosAfterProposal([
-    { id: "t1", content: "创作并写入前两章", status: "in_progress" },
-  ], true, ["第二章"]);
-  assert.equal(shouldContinue, true);
-  assert.equal(todos[0]?.status, "completed");
-  assert.deepEqual(todos.at(-1), {
-    id: "runtime-document-2",
-    content: "继续交付：第二章",
-    status: "in_progress",
-  });
-});
-
-test("agent run completion constraints persist independently from todos and checkpoints", () => {
+test("agent run completion constraints persist independently from checkpoints", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-agent-run-state-"));
   try {
     const project = WriterProject.init(root, "run state");
@@ -225,74 +78,6 @@ test("agent run completion constraints persist independently from todos and chec
     assert.equal(store.agentRunState(sessionId)?.terminalState, "interrupted");
     store.clearAgentRunState(sessionId);
     assert.equal(store.agentRunState(sessionId), undefined);
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("advanceTodosAfterProposal closes single-scene soft checklist and stops", () => {
-  const { todos, shouldContinue } = advanceTodosAfterProposal([
-    { id: "t1", content: "核对大纲、人设与衔接", status: "completed" },
-    { id: "t2", content: "完成正文并自检", status: "in_progress" },
-    { id: "t3", content: "提交文档提案", status: "pending" },
-  ]);
-  assert.equal(shouldContinue, false);
-  assert.equal(todos.every(item => item.status === "completed"), true);
-});
-
-test("advanceTodosAfterProposal does not treat same-document scene todos as new deliverables", () => {
-  const { todos, shouldContinue } = advanceTodosAfterProposal([
-    { id: "t2", content: "规划第二章场景顺序", status: "in_progress" },
-    { id: "t3", content: "撰写千夏苏醒与适应", status: "pending" },
-    { id: "t4", content: "撰写与父亲的长谈", status: "pending" },
-    { id: "t5", content: "终审氛围与风格", status: "pending" },
-  ], false);
-  assert.equal(shouldContinue, false);
-  assert.equal(todos.every(item => item.status === "completed"), true);
-});
-
-test("persistCompletedCharacterTaskTodos closes todos after a character save", () => {
-  const root = mkdtempSync(join(tmpdir(), "writer-agent-"));
-  try {
-    const project = WriterProject.init(root, "测试");
-    const store = new WriterStore(project);
-    const sessionId = store.createSession("todos-finalize");
-    store.saveSessionTodos(sessionId, [
-      { id: "t1", content: "规划", status: "completed" },
-      { id: "t2", content: "撰写正文", status: "completed" },
-      { id: "t3", content: "提交文档提案", status: "pending" },
-    ]);
-    const emitted: AgentTodoItem[][] = [];
-    const todos = persistCompletedCharacterTaskTodos(store, sessionId, event => {
-      emitted.push(event.todos);
-    });
-    assert.equal(todos.every(item => item.status === "completed"), true);
-    assert.equal(store.sessionTodos(sessionId).at(-1)?.status, "completed");
-    assert.equal(emitted.at(-1)?.at(-1)?.status, "completed");
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("persistAdvancedTodosAfterProposal leaves later chapters open", () => {
-  const root = mkdtempSync(join(tmpdir(), "writer-agent-multi-"));
-  try {
-    const project = WriterProject.init(root, "多章");
-    const store = new WriterStore(project);
-    const sessionId = store.createSession("todos-multi");
-    store.saveSessionTodos(sessionId, [
-      { id: "t1", content: "阅读大纲和世界观设定", status: "completed" },
-      { id: "t2", content: "撰写第1章初稿", status: "in_progress" },
-      { id: "t3", content: "撰写第2章初稿", status: "pending" },
-      { id: "t4", content: "撰写第3章初稿", status: "pending" },
-    ]);
-    const { todos, shouldContinue } = persistAdvancedTodosAfterProposal(store, sessionId);
-    assert.equal(shouldContinue, true);
-    assert.equal(todos.find(item => item.id === "t2")?.status, "completed");
-    assert.equal(todos.find(item => item.id === "t3")?.status, "in_progress");
-    assert.equal(store.sessionTodos(sessionId).find(item => item.id === "t4")?.status, "pending");
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -568,7 +353,6 @@ test("session task state does not sticky-inherit activeDocument across turns", (
     const store = new WriterStore(project);
     const sessionId = store.createSession("task-bind");
     store.saveSessionContext(sessionId, { activeDocument: "outline/outline.md", currentIntent: "outline: 写大纲" });
-    store.saveSessionTodos(sessionId, [{ id: "t1", content: "发散路线", status: "in_progress" }]);
     store.saveContextArtifact(sessionId, {
       cacheKey: "k1", kind: "list_outline_nodes", path: "outline/outline.md",
       sourceHash: "h1", content: "{}", digest: "d1",
@@ -582,12 +366,9 @@ test("session task state does not sticky-inherit activeDocument across turns", (
     const after = store.sessionContext(sessionId);
     assert.equal(after.activeDocument, undefined);
     assert.equal(after.currentIntent, "general: 闲聊");
-    // todos are managed separately until clearSessionTaskState
-    assert.equal(store.sessionTodos(sessionId).length, 1);
 
     store.clearSessionTaskState(sessionId);
     assert.equal(store.sessionContext(sessionId).currentIntent, "");
-    assert.equal(store.sessionTodos(sessionId).length, 0);
     assert.equal(store.recentContextArtifacts(sessionId, 8).length, 0);
     assert.equal(store.agentCheckpoint(sessionId), undefined);
     store.close();
@@ -603,7 +384,6 @@ test("ordinary task switches preserve immutable context artifacts", () => {
     const store = new WriterStore(project);
     const sessionId = store.createSession("cache");
     store.saveSessionContext(sessionId, { activeDocument: "lore/world.md", currentIntent: "write_scene/document/document: 写正文" });
-    store.saveSessionTodos(sessionId, [{ id: "t1", content: "写正文", status: "in_progress" }]);
     store.saveContextArtifact(sessionId, {
       cacheKey: "read:v2:lore/world.md:h1",
       kind: "read_document",
@@ -616,7 +396,6 @@ test("ordinary task switches preserve immutable context artifacts", () => {
     store.clearSessionTaskState(sessionId, { preserveContextArtifacts: true });
 
     assert.equal(store.sessionContext(sessionId).currentIntent, "");
-    assert.equal(store.sessionTodos(sessionId).length, 0);
     assert.equal(store.recentContextArtifacts(sessionId, 8).length, 1);
     store.close();
   } finally {
@@ -634,14 +413,12 @@ test("rewind clears dialogue-bound task residue", () => {
     const userId = store.messages(sessionId, 10)[0].id;
     store.addMessage(sessionId, "assistant", "好的");
     store.saveSessionContext(sessionId, { activeDocument: "outline/outline.md", currentIntent: "outline: 写大纲" });
-    store.saveSessionTodos(sessionId, [{ id: "t1", content: "完成大纲", status: "pending" }]);
     store.saveContextArtifact(sessionId, {
       cacheKey: "k2", kind: "read_document", path: "outline/outline.md",
       sourceHash: "h2", content: "{}", digest: "d2",
     });
 
     store.rewindFromMessage(sessionId, userId);
-    assert.equal(store.sessionTodos(sessionId).length, 0);
     assert.equal(store.sessionContext(sessionId).activeDocument, undefined);
     assert.equal(store.recentContextArtifacts(sessionId, 8).length, 0);
     store.close();

@@ -78,8 +78,6 @@ program.command("run")
             } else if (event.type === "change_set") {
               const status = event.changeSet.status === "accepted" ? "已应用" : "待审批";
               process.stdout.write(`\n[${status} change set #${event.changeSet.id}：${event.changeSet.summary}（${event.changeSet.files.length} 个文件）]\n`);
-            } else if (event.type === "todos") {
-              process.stdout.write(`\n[任务 ${event.todos.filter(t => t.status === "completed").length}/${event.todos.length}]\n`);
             } else if (event.type === "error") process.stderr.write(`\n错误：${event.message}\n`);
           },
         });

@@ -614,8 +614,6 @@ export interface AgentTurnMessage {
   reasoning_content?: string;
 }
 
-export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
-
 export interface AgentCheckpoint {
   version: 1;
   stage: "task_started" | "draft_started" | "scene_written" | "guide_revised" | "style_repaired" | "review_blocked" | "review_passed" |
@@ -658,12 +656,6 @@ export interface AgentRunState {
   terminalState: "running" | "interrupted" | "completed" | "failed" | "cancelled";
   terminalReason?: string;
   updatedAt: string;
-}
-
-export interface AgentTodoItem {
-  id: string;
-  content: string;
-  status: AgentTodoStatus;
 }
 
 export type AgentEvaluationStatus = "running" | "passed" | "failed" | "error";
@@ -832,7 +824,6 @@ export type AgentEvent =
   | { type: "step_done"; step: number }
   | { type: "proposal"; proposal: Proposal }
   | { type: "change_set"; changeSet: ChangeSet }
-  | { type: "todos"; todos: AgentTodoItem[] }
   | { type: "mode"; mode: PermissionMode }
   | { type: "character"; character: Character }
   | { type: "done"; sessionId: string }

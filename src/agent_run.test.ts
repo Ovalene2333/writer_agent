@@ -12,7 +12,7 @@ import type { AgentTaskContract } from "./agentic_runtime.js";
 import { executeTool } from "./tools/execute.js";
 import { createProposalRetryState, type ProposalRevisionCase } from "./proposal_retry.js";
 
-const twoDocumentTask: AgentTaskContract = {
+const documentTask: AgentTaskContract = {
   mode: "write_scene",
   outcome: "document",
   evidence: "none",
@@ -21,7 +21,6 @@ const twoDocumentTask: AgentTaskContract = {
   capabilities: ["documents", "scenes", "review"],
   workflow: "free",
   qualityProfile: "fast",
-  documentDeliverables: ["第一章", "第二章"],
 };
 
 test("provider stream termination is resumable but explicit abort remains cancellation", () => {
@@ -74,39 +73,44 @@ function revisionCase(runId: string, deliverableId: string, path: string): Propo
   };
 }
 
-test("AgentRun v2 binds independent deliverables and completes only after both", () => {
-  const { root, store, sessionId } = fixture("two-documents");
+test("the ledger opens when a document tool runs, never on a predicted count", () => {
+  const { root, store, sessionId } = fixture("open-on-demand");
   try {
     const controller = AgentRunController.open({
       store,
       sessionId,
       sourceMessageId: 1,
       originalRequest: "写两章",
-      task: twoDocumentTask,
+      task: documentTask,
       permissionMode: "ask",
       reusableEvidence: false,
       resumeInterrupted: false,
     });
+    // Nothing is booked at t=0. A count guessed before the first tool call used to end
+    // a five-chapter request after one chapter, and to demand a file from a turn that
+    // only owed an answer.
+    assert.deepEqual(controller.pendingDocumentLabels(), []);
     controller.recordStep(1);
-    controller.recordStep(2);
-    assert.equal(controller.snapshot.deliverables[0]?.execution.usedSteps, 2);
-    controller.recordDocumentEvidence({
-      toolName: "write_file",
+    assert.equal(controller.snapshot.deliverables.length, 0);
+
+    controller.observeTool("write_file", JSON.stringify({
+      status: "pending",
       proposalId: 11,
       path: "chapters/01.md",
-      recordedAt: "2026-08-02T00:00:00.000Z",
-    }, "document-1", "test:first", "pending");
-    assert.deepEqual(controller.pendingDocumentLabels(), ["第二章"]);
-    controller.recordStep(3);
-    assert.equal(controller.snapshot.deliverables[1]?.execution.usedSteps, 1);
-    assert.equal(controller.complete(twoDocumentTask, []).length, 1);
-    controller.recordDocumentEvidence({
-      toolName: "write_file",
+    }), "test:first");
+    assert.equal(controller.snapshot.deliverables.length, 1);
+    assert.equal(controller.snapshot.deliverables[0]?.evidence?.proposalId, 11);
+    assert.deepEqual(controller.pendingDocumentLabels(), []);
+
+    // The next document opens its own entry rather than reusing a closed one.
+    controller.observeTool("write_file", JSON.stringify({
+      status: "pending",
       proposalId: 12,
       path: "chapters/02.md",
-      recordedAt: "2026-08-02T00:00:01.000Z",
-    }, "document-2", "test:second", "pending");
-    assert.deepEqual(controller.complete(twoDocumentTask, []), []);
+    }), "test:second");
+    assert.equal(controller.snapshot.deliverables.length, 2);
+    assert.equal(controller.completedDocumentDeliverables, 2);
+    assert.deepEqual(controller.complete(documentTask, "两章均已落地"), []);
     assert.equal(controller.snapshot.status, "completed");
     assert.deepEqual(agentRunInvariantViolations(controller.snapshot), []);
   } finally {
@@ -115,40 +119,62 @@ test("AgentRun v2 binds independent deliverables and completes only after both",
   }
 });
 
-test("AgentRun v2 creates a default deliverable for single document mutations", () => {
-  const { root, store, sessionId } = fixture("default-document-deliverable");
+test("a delivery that started but never landed stays visible without trapping the run", () => {
+  const { root, store, sessionId } = fixture("stalled-delivery");
   try {
     const controller = AgentRunController.open({
       store,
       sessionId,
       sourceMessageId: 4,
       originalRequest: "写一份设定",
-      task: { ...twoDocumentTask, documentDeliverables: [] },
+      task: documentTask,
       permissionMode: "ask",
       reusableEvidence: false,
       resumeInterrupted: false,
     });
-    assert.deepEqual(controller.pendingDocumentLabels(), ["文件交付"]);
+    controller.observeTool("write_file", JSON.stringify({
+      status: "revision_required",
+      code: "PROSE_STYLE_REVISION_REQUIRED",
+      failureKind: "semantic_revision",
+      error: "句式门禁未通过",
+    }), "test:blocked");
+    // Opened, unlanded: the run cannot pretend the document exists…
+    assert.equal(controller.snapshot.deliverables.length, 1);
+    assert.equal(controller.snapshot.deliverables[0]?.evidence, undefined);
+    assert.equal(controller.stalledDeliverableLabels().length, 1);
     controller.recordStep(1);
     assert.equal(controller.snapshot.deliverables[0]?.execution.startedAtStep, 1);
     assert.equal(controller.snapshot.deliverables[0]?.execution.usedSteps, 1);
+    // …and bookkeeping still refuses to be the thing that blocks it. Whether the
+    // request was fulfilled is the terminal review's judgment, not a counter's.
+    assert.deepEqual(controller.completionGaps(documentTask), []);
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("multi-document hard budget is derived per deliverable", () => {
+test("the hard step budget is earned by landed documents, not predicted", () => {
+  // Each document that actually landed buys the next one its own slice.
   assert.equal(computeAgentHardTurnBudget({
     baseHardCap: 32,
-    documentDeliverables: 3,
-    documentProposalRequired: true,
+    deliveredDocuments: 0,
+    maxTurnsOverride: false,
+  }), 32);
+  assert.equal(computeAgentHardTurnBudget({
+    baseHardCap: 32,
+    deliveredDocuments: 2,
     maxTurnsOverride: false,
   }), 96);
+  // Bounded, so a long chapter run cannot buy an unbounded budget.
+  assert.equal(computeAgentHardTurnBudget({
+    baseHardCap: 32,
+    deliveredDocuments: 40,
+    maxTurnsOverride: false,
+  }), 32 * 8);
   assert.equal(computeAgentHardTurnBudget({
     baseHardCap: 5,
-    documentDeliverables: 3,
-    documentProposalRequired: true,
+    deliveredDocuments: 3,
     maxTurnsOverride: true,
   }), 5);
 });
@@ -161,7 +187,7 @@ test("expected rhythm polish is a gate transition, not a generic tool failure", 
       sessionId,
       sourceMessageId: 2,
       originalRequest: "写一章",
-      task: { ...twoDocumentTask, documentDeliverables: ["第一章"] },
+      task: documentTask,
       permissionMode: "ask",
       reusableEvidence: false,
       resumeInterrupted: false,
@@ -229,7 +255,7 @@ test("proposal invocation errors do not consume semantic gate attempts", async (
       sessionId,
       sourceMessageId: 21,
       originalRequest: "写一章",
-      task: { ...twoDocumentTask, documentDeliverables: ["第一章"] },
+      task: documentTask,
       permissionMode: "ask",
       reusableEvidence: false,
       resumeInterrupted: false,
@@ -276,7 +302,7 @@ test("proposal invocation errors do not consume semantic gate attempts", async (
 test("proposal revision state belongs to one run and only explicit resume restores it", () => {
   const { root, store, sessionId } = fixture("revision-scope");
   try {
-    const task = { ...twoDocumentTask, documentDeliverables: ["第一章"] };
+    const task = documentTask;
     const first = AgentRunController.open({
       store,
       sessionId,
@@ -287,6 +313,7 @@ test("proposal revision state belongs to one run and only explicit resume restor
       reusableEvidence: false,
       resumeInterrupted: false,
     });
+    first.ensureDocumentDeliverable("chapters/第一章.md");
     const activeCase = revisionCase(first.runId, "document-1", "chapters/第一章.md");
     assert.throws(() => first.setProposalRevision("document-1", {
       ...activeCase,
@@ -330,7 +357,7 @@ test("proposal revision state belongs to one run and only explicit resume restor
 test("resuming an older revision run detects a newer task's accepted document", () => {
   const { root, project, store, sessionId } = fixture("revision-resume-base-drift");
   try {
-    const task = { ...twoDocumentTask, documentDeliverables: ["第一章"] };
+    const task = documentTask;
     const path = "chapters/第一章.md";
     const original = "# 第一章\n\n旧运行开始修订时的落盘正文。\n";
     project.writeRaw(path, original);
@@ -344,6 +371,7 @@ test("resuming an older revision run detects a newer task's accepted document", 
       reusableEvidence: false,
       resumeInterrupted: false,
     });
+    first.ensureDocumentDeliverable(path);
     const activeCase: ProposalRevisionCase = {
       ...revisionCase(first.runId, "document-1", path),
       baseDocumentExists: true,
@@ -372,13 +400,14 @@ test("resuming an older revision run detects a newer task's accepted document", 
       72,
     );
     store.acceptProposal(proposal.id);
+    newer.ensureDocumentDeliverable(path);
     newer.recordDocumentEvidence({
       toolName: "propose_document",
       proposalId: proposal.id,
       path,
       recordedAt: "2026-08-02T00:00:00.000Z",
     }, "document-1", "test:newer:proposal", "accepted");
-    assert.deepEqual(newer.complete(task, []), []);
+    assert.deepEqual(newer.complete(task, "交付完成"), []);
 
     const resumed = AgentRunController.open({
       store,
@@ -404,7 +433,7 @@ test("resuming an older revision run detects a newer task's accepted document", 
 test("explicit resume restores a zero-budget pending rhythm polish case", () => {
   const { root, store, sessionId } = fixture("rhythm-revision-resume");
   try {
-    const task = { ...twoDocumentTask, documentDeliverables: ["第一章"] };
+    const task = documentTask;
     const first = AgentRunController.open({
       store,
       sessionId,
@@ -415,6 +444,7 @@ test("explicit resume restores a zero-budget pending rhythm polish case", () => 
       reusableEvidence: false,
       resumeInterrupted: false,
     });
+    first.ensureDocumentDeliverable("chapters/第一章.md");
     const activeCase: ProposalRevisionCase = {
       ...revisionCase(first.runId, "document-1", "chapters/第一章.md"),
       attempt: 0,
@@ -457,28 +487,38 @@ test("evidence from another path cannot clear an active revision deliverable", (
       sessionId,
       sourceMessageId: 66,
       originalRequest: "写两章",
-      task: twoDocumentTask,
+      task: documentTask,
       permissionMode: "ask",
       reusableEvidence: false,
       resumeInterrupted: false,
     });
+    // A revision case binds to an entry the agent actually opened.
+    assert.equal(controller.ensureDocumentDeliverable("chapters/第一章.md"), "document-1");
     const activeCase = revisionCase(controller.runId, "document-1", "chapters/第一章.md");
     controller.setProposalRevision("document-1", activeCase, "test:revision-evidence:set");
-    assert.throws(() => controller.setProposalRevision(
-      "document-2",
-      revisionCase(controller.runId, "document-2", "chapters/第一章.md"),
-      "test:revision-evidence:duplicate-path",
-    ), /已绑定交付项 document-1/u);
+
+    // Evidence for a different document must not close the entry still under revision.
     controller.recordDocumentEvidence({
       toolName: "inspect_chapter_draft",
       proposalId: 201,
       path: "chapters/第二章.md",
       recordedAt: "2026-08-02T00:00:00.000Z",
     }, undefined, "test:revision-evidence:other", "pending");
-
     assert.equal(controller.proposalRevision("document-1")?.revisionCaseId, activeCase.revisionCaseId);
-    assert.equal(controller.snapshot.deliverables[0]?.evidence, undefined);
-    assert.equal(controller.snapshot.deliverables[1]?.evidence?.path, "chapters/第二章.md");
+    assert.equal(controller.snapshot.deliverables.length, 1);
+    assert.equal(controller.deliverables[0]?.evidence, undefined);
+
+    // Only the bound path closes it — and closing it releases the revision case, so
+    // the next document opens a clean entry instead of inheriting a stale blocker.
+    controller.recordDocumentEvidence({
+      toolName: "inspect_chapter_draft",
+      proposalId: 202,
+      path: "chapters/第一章.md",
+      recordedAt: "2026-08-02T00:00:01.000Z",
+    }, undefined, "test:revision-evidence:match", "pending");
+    assert.equal(controller.snapshot.deliverables[0]?.evidence?.path, "chapters/第一章.md");
+    assert.equal(controller.proposalRevision("document-1"), undefined);
+    assert.equal(controller.ensureDocumentDeliverable("chapters/第二章.md"), "document-2");
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
@@ -493,7 +533,7 @@ test("explicit prose rejection remains a semantic gate event", () => {
       sessionId,
       sourceMessageId: 22,
       originalRequest: "写一章",
-      task: { ...twoDocumentTask, documentDeliverables: ["第一章"] },
+      task: documentTask,
       permissionMode: "ask",
       reusableEvidence: false,
       resumeInterrupted: false,
@@ -516,7 +556,7 @@ test("explicit prose rejection remains a semantic gate event", () => {
 test("resume reconciles an accepted proposal when the process missed its workflow event", () => {
   const { root, store, sessionId } = fixture("reconcile");
   try {
-    const task = { ...twoDocumentTask, documentDeliverables: ["第一章"] };
+    const task = documentTask;
     const first = AgentRunController.open({
       store,
       sessionId,
@@ -552,7 +592,7 @@ test("resume reconciles an accepted proposal when the process missed its workflo
     });
     assert.equal(resumed.completedDocumentDeliverables, 1);
     assert.equal(resumed.snapshot.deliverables[0]?.evidence?.proposalId, proposal.id);
-    assert.deepEqual(resumed.complete(task, []), []);
+    assert.deepEqual(resumed.complete(task, "交付完成"), []);
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
@@ -598,7 +638,7 @@ test("proposal application resumes after the file write but before database comm
 test("resume selects the matching suspended run even after a newer task", () => {
   const { root, store, sessionId } = fixture("resume-matching");
   try {
-    const task = { ...twoDocumentTask, documentDeliverables: ["第一章"] };
+    const task = documentTask;
     const suspended = AgentRunController.open({
       store,
       sessionId,
@@ -619,7 +659,6 @@ test("resume selects the matching suspended run even after a newer task", () => 
       mutation: "none",
       planning: "direct",
       capabilities: [],
-      documentDeliverables: [],
     };
     const newer = AgentRunController.open({
       store,
@@ -631,7 +670,7 @@ test("resume selects the matching suspended run even after a newer task", () => 
       reusableEvidence: false,
       resumeInterrupted: false,
     });
-    assert.deepEqual(newer.complete(answerTask, []), []);
+    assert.deepEqual(newer.complete(answerTask, "已答复"), []);
 
     const resumed = AgentRunController.open({
       store,

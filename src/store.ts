@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFile
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTodoItem, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageAttachment, MessageAttachmentInput, MessageChannel, MessageContent, MessageContentPart, Proposal, ProposalCharacterChange, ProseQualityReport,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageAttachment, MessageAttachmentInput, MessageChannel, MessageContent, MessageContentPart, Proposal, ProposalCharacterChange, ProseQualityReport,
   RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
   MessageStepTrail, PersistedStreamStep,
@@ -963,7 +963,7 @@ export class WriterStore {
   /**
    * Persist this dialogue turn's task binding. activeDocument is always replaced
    * (null clears); never inherits a previous turn's document via COALESCE.
-   * todos_json is left untouched here — use saveSessionTodos / clearSessionTaskState.
+   * todos_json is legacy dead weight kept only so old rows still parse.
    */
   saveSessionContext(sessionId: string, value: { activeDocument?: string; currentIntent: string }): void {
     const now = new Date().toISOString();
@@ -1556,39 +1556,6 @@ export class WriterStore {
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
-  }
-
-  sessionTodos(sessionId: string): AgentTodoItem[] {
-    const row = this.database.prepare("SELECT todos_json FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
-    if (!row || typeof row.todos_json !== "string" || !row.todos_json.trim()) return [];
-    try {
-      const parsed = JSON.parse(row.todos_json) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.flatMap((item) => {
-        if (!item || typeof item !== "object") return [];
-        const todo = item as Record<string, unknown>;
-        if (typeof todo.id !== "string" || typeof todo.content !== "string") return [];
-        const status = todo.status === "in_progress" || todo.status === "completed" || todo.status === "cancelled"
-          ? todo.status
-          : "pending";
-        return [{ id: todo.id, content: todo.content, status }];
-      });
-    } catch {
-      return [];
-    }
-  }
-
-  saveSessionTodos(sessionId: string, todos: AgentTodoItem[]): void {
-    const now = new Date().toISOString();
-    const json = JSON.stringify(todos);
-    const existing = this.database.prepare("SELECT 1 AS ok FROM session_context WHERE session_id=?").get(sessionId) as Row | undefined;
-    if (existing) {
-      this.database.prepare("UPDATE session_context SET todos_json=?, updated_at=? WHERE session_id=?")
-        .run(json, now, sessionId);
-      return;
-    }
-    this.database.prepare(`INSERT INTO session_context(session_id,active_document,current_intent,todos_json,updated_at) VALUES(?,?,?,?,?)`)
-      .run(sessionId, null, "", json, now);
   }
 
   /**
@@ -3896,7 +3863,7 @@ export class WriterStore {
     this.deleteMessageStepTrailsFrom(sessionId, fromId);
     this.archiveContextGraphFrom(sessionId, fromId);
     if (!keepChanges) this.deleteWritingMemoryFromMessage(sessionId, fromId);
-    // Task/todos/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
+    // Task/tool memory are dialogue-turn state; rewind must not leave them attached to the session shell.
     this.clearSessionTaskState(sessionId);
     if (userRow.channel === "roleplay") this.restoreRoleplayMemoryBefore(sessionId, fromId);
     let summary: string;

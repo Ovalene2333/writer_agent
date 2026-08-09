@@ -1,7 +1,7 @@
 import type { WriterStore } from "./store.js";
 import {
   agentCompletionGaps,
-  alternateMutationArtifactSatisfies,
+  isDocumentMutationTool,
   type AgentExecutionProgress,
   type AgentTaskContract,
 } from "./agentic_runtime.js";
@@ -17,7 +17,7 @@ import type {
   AgentRunContractRecord,
   AgentRunSnapshotV2,
 } from "./agent_run_types.js";
-import type { AgentRunDocumentEvidence, AgentRunState, AgentTodoItem, PermissionMode } from "./types.js";
+import type { AgentRunDocumentEvidence, AgentRunState, PermissionMode } from "./types.js";
 import type { WritingWorkflowStage } from "./writing_workflow.js";
 import type { ProposalRevisionCase } from "./proposal_retry.js";
 
@@ -76,20 +76,15 @@ export class AgentRunController {
         sourceMessageId: input.sourceMessageId,
       });
     } else {
-      const documentDeliverableLabels = input.task.documentDeliverables?.length
-        ? input.task.documentDeliverables
-        : input.task.mutation === "document" || input.task.mutation === "mixed"
-          ? ["文件交付"]
-          : [];
+      // Empty on purpose. Entries are opened by `ensureDocumentDeliverable` when a
+      // document tool actually runs, so the ledger records deliveries that happened
+      // instead of a count predicted before the first tool call.
       snapshot = runStore.start({
         sessionId: input.sessionId,
         sourceMessageId: input.sourceMessageId,
         originalRequest: input.originalRequest,
         contract: contractRecord(input.task, input.permissionMode),
-        deliverables: documentDeliverableLabels.map((label, index) => ({
-          id: `document-${index + 1}`,
-          label,
-        })),
+        deliverables: [],
         reusableEvidence: input.reusableEvidence,
       });
     }
@@ -97,7 +92,13 @@ export class AgentRunController {
     if (!previous && input.resumeInterrupted && input.legacyState?.originalRequest === input.originalRequest) {
       for (const item of input.legacyState.documentObligations) {
         if (!item.evidence) continue;
-        controller.recordDocumentEvidence(item.evidence, item.id, `legacy:${item.id}`);
+        // The legacy ledger was pre-booked; the current one is not, so the entry has
+        // to be opened here or the recovered evidence would land nowhere.
+        controller.recordDocumentEvidence(
+          item.evidence,
+          controller.ensureDocumentDeliverable(item.evidence.path),
+          `legacy:${item.id}`,
+        );
       }
     }
     if (input.resumeInterrupted) controller.reconcilePersistedProposals();
@@ -130,6 +131,25 @@ export class AgentRunController {
     return pending.find(item => Boolean(item.proposalRevision))
       ?? pending.find(item => item.state === "revision_required")
       ?? pending[0];
+  }
+
+  /**
+   * Return the open delivery, opening one if the agent has started delivering and the
+   * ledger is still empty. At most one entry is open at a time: the agent finishes a
+   * document before starting the next, and evidence closes an entry. `label` is the
+   * document path once it is known, so a stalled delivery is nameable in diagnostics.
+   */
+  ensureDocumentDeliverable(label?: string): string {
+    const open = this.snapshotValue.deliverables.find(item => !item.evidence);
+    if (open) return open.id;
+    const id = `document-${this.snapshotValue.deliverables.length + 1}`;
+    this.append(`deliverable:open:${id}`, {
+      type: "deliverable_opened",
+      at: now(),
+      id,
+      label: label ?? "文件交付",
+    });
+    return id;
   }
 
   proposalDeliverableId(requestedId?: string): string | undefined {
@@ -209,6 +229,11 @@ export class AgentRunController {
     deliverableId?: string,
   ): InterpretedAgentToolResult {
     const interpreted = interpretAgentToolResult(toolName, rawResult);
+    // Opening before evidence is recorded is what lets a *failed* delivery stay
+    // visible: the entry exists, has no evidence, and the run cannot quietly finish.
+    if (isDocumentMutationTool(toolName)) {
+      this.ensureDocumentDeliverable(interpreted.document?.path);
+    }
     this.append(`${eventKey}:outcome`, {
       type: "tool_observed",
       at: now(),
@@ -291,26 +316,24 @@ export class AgentRunController {
     };
   }
 
-  completionGaps(task: AgentTaskContract, todos: AgentTodoItem[]): string[] {
-    const progress = this.executionProgress();
-    const gaps = agentCompletionGaps(task, progress, todos);
-    const pending = pendingAgentRunDeliverables(this.snapshotValue);
-    // When a document-hint task is actually completed via character mutation (or the
-    // reverse), do not re-open pending document deliverables that the compiler pre-seeded.
-    if (
-      pending.length
-      && !alternateMutationArtifactSatisfies(task, progress)
-      && !gaps.some(gap => gap.includes("文件交付") || gap.includes("文档交付") || gap.includes("文档提案"))
-    ) {
-      gaps.push(`文档交付尚未达到所需状态：${pending.map(item => item.label).join("、")}`);
-    }
-    return gaps;
+  /**
+   * Only invariants. A ledger entry that was opened and never landed is reported to
+   * the terminal review as context rather than blocking here: bookkeeping should make
+   * a stalled delivery visible, not trap the run in a loop it cannot exit.
+   */
+  completionGaps(task: AgentTaskContract): string[] {
+    return agentCompletionGaps(task, this.executionProgress());
   }
 
-  complete(task: AgentTaskContract, todos: AgentTodoItem[]): string[] {
-    const gaps = this.completionGaps(task, todos);
+  /** Deliveries the agent started but never landed. */
+  stalledDeliverableLabels(): string[] {
+    return pendingAgentRunDeliverables(this.snapshotValue).map(item => item.label);
+  }
+
+  complete(task: AgentTaskContract, reason: string): string[] {
+    const gaps = this.completionGaps(task);
     if (gaps.length) return gaps;
-    this.append("terminal:completed", { type: "run_completed", at: now() });
+    this.append("terminal:completed", { type: "run_completed", at: now(), reason });
     assertAgentRunInvariants(this.snapshotValue);
     return [];
   }
@@ -348,12 +371,13 @@ export class AgentRunController {
             try { return this.store.acceptProposal(candidate.id); } catch { return candidate; }
           })()
         : candidate;
+      // A proposal that landed while the process was down never got to open its entry.
       this.recordDocumentEvidence({
         toolName: "reconcile_proposal",
         proposalId: proposal.id,
         path: proposal.path,
         recordedAt: now(),
-      }, undefined, `reconcile:proposal:${proposal.id}`, proposal.status);
+      }, this.ensureDocumentDeliverable(proposal.path), `reconcile:proposal:${proposal.id}`, proposal.status);
     }
     for (const candidate of this.store.changeSetsForSession(this.snapshotValue.sessionId)
       .filter(item => item.sourceMessageId !== undefined && sourceMessageIds.has(item.sourceMessageId))
@@ -367,7 +391,7 @@ export class AgentRunController {
         toolName: "reconcile_change_set",
         changeSetId: changeSet.id,
         recordedAt: now(),
-      }, undefined, `reconcile:change-set:${changeSet.id}`, changeSet.status);
+      }, this.ensureDocumentDeliverable(), `reconcile:change-set:${changeSet.id}`, changeSet.status);
     }
   }
 

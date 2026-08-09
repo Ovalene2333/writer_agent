@@ -86,13 +86,11 @@ import {
   callKindLabel,
   emptyRoleplayScene,
   roleplaySetupPhases,
-  todoStatusMark,
   type ActiveRoleplayState,
   type AuthorPolicy,
   type AuthorPolicyStatus,
   type AgentJob,
   type AgentStreamEvent,
-  type AgentTodoItem,
   type ChangeSet,
   type ChapterSummary,
   type Character,
@@ -401,7 +399,6 @@ function App() {
   const [roleplaySetupBusy, setRoleplaySetupBusy] = useState(false);
   const [roleplaySetupPhase, setRoleplaySetupPhase] = useState<RoleplaySetupPhase | null>(null);
   const [roleplaySetupElapsed, setRoleplaySetupElapsed] = useState(0);
-  const [todosCollapsed, setTodosCollapsed] = useState(false);
   /** Collapsed final Assistant bubbles (steps already have their own expand state). */
   const [collapsedAssistantIds, setCollapsedAssistantIds] = useState<Set<number>>(() => new Set());
   const [resizing, setResizing] = useState<"sidebar" | "agent" | null>(null);
@@ -422,7 +419,6 @@ function App() {
   const documentRequestSeqRef = useRef(0);
   const chaptersRequestSeqRef = useRef(0);
   const sessionIdRef = useRef<string | undefined>(undefined);
-  const todosCompletionRef = useRef({ sessionId: "", complete: false });
   const activePathRef = useRef(activePath);
   const editingDocumentRef = useRef(editingDocument);
   activePathRef.current = activePath;
@@ -912,21 +908,6 @@ function App() {
     if (!state?.sessionId) return;
     setRoleplaySetup(null);
   }, [state?.sessionId]);
-
-  useEffect(() => {
-    const sessionId = state?.sessionId ?? "";
-    const todos = state?.todos ?? [];
-    const complete = todos.length > 0 && todos.every(item => item.status === "completed");
-    const previous = todosCompletionRef.current;
-    if (sessionId !== previous.sessionId) {
-      setTodosCollapsed(complete);
-    } else if (complete && !previous.complete) {
-      setTodosCollapsed(true);
-    } else if (!complete && previous.complete) {
-      setTodosCollapsed(false);
-    }
-    todosCompletionRef.current = { sessionId, complete };
-  }, [state?.sessionId, state?.todos]);
 
   // Intentionally do NOT rehydrate completed trails into streamSteps when idle.
   // History is rendered from state.stepTrails per message. Rehydrating the latest
@@ -1551,9 +1532,6 @@ function App() {
       setNotice(event.changeSet.status === "accepted"
         ? `Auto：批量改动 #${event.changeSet.id} 已写入`
         : `批量改动 #${event.changeSet.id} 待审批`);
-    }
-    if (event.type === "todos" && event.todos) {
-      setState((prev) => (prev ? { ...prev, todos: event.todos } : prev));
     }
     if (event.type === "mode" && event.mode) {
       setState((prev) =>
@@ -4671,32 +4649,6 @@ function App() {
                 </div>
               </div>
             </div>
-          </div>
-        )}
-        {(state.todos?.length ?? 0) > 0 && (
-          <div className="agent-todos" aria-label="Agent 任务清单">
-            <button
-              type="button"
-              className="agent-todos-head"
-              aria-expanded={!todosCollapsed}
-              onClick={() => setTodosCollapsed(value => !value)}
-            >
-              <strong>任务</strong>
-              <span>
-                {state.todos!.filter((item) => item.status === "completed").length}/{state.todos!.length}
-              </span>
-            </button>
-            {!todosCollapsed && <ul className="agent-todos-list">
-              {state.todos!.map((todo) => (
-                <li key={todo.id} className={`todo-${todo.status}`}>
-                  <span className="todo-mark" aria-hidden="true">{todoStatusMark(todo.status)}</span>
-                  <span className="todo-body">
-                    <code>{todo.id}</code>
-                    {todo.content}
-                  </span>
-                </li>
-              ))}
-            </ul>}
           </div>
         )}
         <div className="conversation-region">

@@ -80,7 +80,6 @@ test("merged turn context is one user message without per-turn counters", () => 
   const merged = mergedTurnContext({
     taskContext: "当前任务：改稿",
     dynamicStyleContext: "声线证据",
-    todosPrompt: "清单",
     prompt: "把这段改短",
   });
   // Role is load-bearing: a system message here forfeits the whole cached prefix.
