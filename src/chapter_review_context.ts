@@ -4,6 +4,7 @@ import type { WriterStore } from "./store.js";
 import type { ToolExecutionContext } from "./tools/types.js";
 import { characterConstraintHash, characterConstraintView } from "./character_constraints.js";
 import { buildNarrativeEvidencePacket } from "./narrative_evidence.js";
+import { factContractForReview } from "./fact_contract.js";
 import { OutlineStore } from "./outline.js";
 
 const REVIEW_CONTEXT_CHARACTER_LIMIT = 8;
@@ -72,9 +73,12 @@ export function buildFactualChapterReviewContext(options: {
       characterScopes: scene.characterScopes ?? [],
     }))
     : [];
+  const contract = context.factContracts?.get(path);
+  const factContract = contract ? factContractForReview(contract) : undefined;
   const evidencePacket = JSON.stringify({
     instructions: "narrativeEvidence 是 Writer 与终审共享的事实底座。coverageGaps 表示写前证据覆盖不足，不能把它冒充为正文自身的事实错误；只有正文违背已提供证据时才判 fact/knowledge blocker。objective 只是客观成立；character_knowledge 仅 knownBy 可直接知道；rumor 只能作为传闻或信念。conflict/pending 不得自行选边。characters 是仅供终审核验越权的完整硬约束，不扩大 Writer 许可；sceneCapabilityScopes 是逐场能力/对白声线许可，按 competencyUses.mode 判定使用、尝试、觉醒、恢复或失去，没有列出即不许可。dialogueCharacters 仅包含写作时实际读取过 voice 的说话角色。",
     narrativeEvidence,
+    ...(factContract ? { factContract } : {}),
     characters,
     dialogueCharacters,
     sceneCapabilityScopes,

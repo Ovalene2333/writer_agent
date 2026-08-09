@@ -23,6 +23,7 @@ import type {
   SceneStateExtractionResult,
 } from "../evidence_grounded_writer.js";
 import type { WritePack } from "../write_pack.js";
+import type { FactContract } from "../fact_contract.js";
 import type { RepairPacketIssue } from "../repair_packet.js";
 import type { RegisterRisk } from "../register_risks.js";
 
@@ -156,6 +157,12 @@ export type ToolExecutionContext = {
    * Writer against the same facts, without forcing a full re-compile.
    */
   evidenceWriterPacks?: Map<string, WritePack>;
+  /**
+   * Checkable commitments derived from each document's fact packet. Final review
+   * judges the prose against these, which is what closes the fact layer: what the
+   * Writer was promised to deliver is what a later stage verifies.
+   */
+  factContracts?: Map<string, FactContract>;
   /** Current project scene-chain guidance and per-document prose target. */
   scenePipelineSettings?: ScenePipelineSettings;
   /**

@@ -52,13 +52,11 @@ import {
   type DependencyAttemptDiagnostic,
 } from "../dependency_diagnostics.js";
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
-import { auditDialogueFormat, dialogueFormatGateError } from "../dialogue_format.js";
+import { runSurfaceGates, type SurfaceGateFinding } from "../surface_gates.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import {
   assessCardRegisterHits,
-  cardRegisterGateError,
-  cardRegisterRepairPacket,
   cardRegisterReportForTool,
   collectRegisterRisksForContext,
   proseSignalsFromCardRegister,
@@ -556,29 +554,7 @@ function directReviewRepairPacket(
   });
 }
 
-type SurfaceGateFailure = { code: string; message: string; repairPacket?: RepairPacket };
-
-function dialogueFormatRepairPacket(
-  content: string,
-  path: string,
-  sourceHash: string,
-): RepairPacket | undefined {
-  const issues = auditDialogueFormat(content).filter(issue => issue.blocksProposal);
-  if (!issues.length) return undefined;
-  return boundedRepairPacket({
-    path,
-    sourceHash,
-    issueCount: issues.length,
-    issues: issues.map((issue, index) => ({
-      id: `dialogue_format:${issue.code}:${issue.line}:${issue.column}:${index}`,
-      kind: issue.code,
-      line: issue.line,
-      evidence: issue.evidence,
-      problem: issue.message,
-      action: issue.suggestion,
-    })),
-  });
-}
+type SurfaceGateFailure = SurfaceGateFinding;
 
 /**
  * Deterministic surface gates all classify to the same retry gate, so reporting
@@ -907,34 +883,17 @@ export async function submitFullDocumentProposal(
     recordLatestProposalDraft(proposedBody, draftSourceHash);
     if (styleGate.failure) surfaceFailures.push(styleGate.failure);
   }
-  if (isScenePipelineDocument(path)) {
-    const dialogueFormatError = dialogueFormatGateError(proposedBody);
-    if (dialogueFormatError) {
-      const packet = dialogueFormatRepairPacket(proposedBody, path, draftSourceHash);
-      surfaceFailures.push({
-        code: "DIALOGUE_FORMAT_REVISION_REQUIRED",
-        message: dialogueFormatError,
-        ...(packet ? { repairPacket: packet } : {}),
-      });
-    }
-  }
-  let cardRegisterAssessment: CardRegisterAssessment | undefined;
-  if (isScenePipelineDocument(path)) {
-    const risks = collectRegisterRisksForContext(store, context);
-    cardRegisterAssessment = assessCardRegisterHits(scanCardRegisterHits(proposedBody, risks));
-    const registerError = cardRegisterGateError(cardRegisterAssessment);
-    if (registerError) {
-      const packet = cardRegisterRepairPacket(proposedBody, cardRegisterAssessment, {
-        path,
-        sourceHash: draftSourceHash,
-      });
-      surfaceFailures.push({
-        code: "CARD_REGISTER_REVISION_REQUIRED",
-        message: registerError,
-        ...(packet ? { repairPacket: packet } : {}),
-      });
-    }
-  }
+  const narrative = isScenePipelineDocument(path);
+  const cardRegisterAssessment = narrative
+    ? assessCardRegisterHits(scanCardRegisterHits(proposedBody, collectRegisterRisksForContext(store, context)))
+    : undefined;
+  const surfaceGateResult = runSurfaceGates({
+    path,
+    content: proposedBody,
+    sourceHash: draftSourceHash,
+    ...(cardRegisterAssessment ? { cardRegister: cardRegisterAssessment } : {}),
+  }, { narrative });
+  surfaceFailures.push(...surfaceGateResult.blocking);
   if (surfaceFailures.length) {
     throw mergedSurfaceGateError(surfaceFailures, path, draftSourceHash);
   }
@@ -985,6 +944,10 @@ export async function submitFullDocumentProposal(
       ? { cardRegister: cardRegisterReportForTool(cardRegisterAssessment) }
       : {}),
     ...(policyObservations?.length ? { policyObservations } : {}),
+    // Demoted surface rules: reported once, never a round trip.
+    ...(surfaceGateResult.notes.length
+      ? { surfaceNotes: surfaceGateResult.notes.map(note => `${note.code}：${note.message}`) }
+      : {}),
     ...(existed ? { versionBaseHash: project.hash(beforeContent) } : {}),
     ...(preparedCharacterChanges.skipped ? { characterEvolutionSkipped: true } : {}),
     ...(styleAutoRepair ? { styleAutoRepaired: styleAutoRepair } : {}),

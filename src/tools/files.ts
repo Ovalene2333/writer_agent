@@ -8,6 +8,7 @@ import {
   requestEvidenceGroundedProse,
 } from "../evidence_grounded_writer.js";
 import type { EvidenceGroundedWriterInput } from "../evidence_grounded_writer.js";
+import { buildFactContract } from "../fact_contract.js";
 import type { RepairPacketIssue } from "../repair_packet.js";
 import { reportModelCallUsage } from "../dependency_diagnostics.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
@@ -430,6 +431,14 @@ async function handleEvidenceGroundedWriteFile(
   // generation produces; a later first draft still needs its own compile.
   args.context.evidenceWriterPacks ??= new Map();
   args.context.evidenceWriterPacks.set(normalizedPath, pack);
+  // The promises this body was written against become final review's baseline.
+  // Without this the pack is a prompt nobody ever checks: the Writer is told
+  // what must land and what may not be invented, and no later stage knows.
+  const contract = buildFactContract(path, pack);
+  if (contract) {
+    args.context.factContracts ??= new Map();
+    args.context.factContracts.set(path, contract);
+  }
   args.context.writePackCompiled = false;
   args.context.lastWritePack = undefined;
   args.context.lastWritePackData = undefined;

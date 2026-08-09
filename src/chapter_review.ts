@@ -19,7 +19,7 @@ export const CHAPTER_REVIEW_MAX_OUTPUT_TOKENS = 16_000;
 
 const CHAPTER_REVIEW_ISSUE_KINDS = [
   "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
-  "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship", "capability_scope",
+  "fact_conflict", "knowledge_leak", "unsupported_fact", "commitment_unmet", "identity_relationship", "capability_scope",
   "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose",
   "field_verbalization", "voice_macro_reuse", "template_reuse",
   "voice_homogenization", "dialogue_format", "dialogue_telegraphic",
@@ -115,7 +115,7 @@ export type ChapterReviewScene = {
 export type ChapterReviewIssue = {
   severity: "blocker" | "warning";
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
-    | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "identity_relationship" | "capability_scope"
+    | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "commitment_unmet" | "identity_relationship" | "capability_scope"
     | "telemetry_pileup" | "register_leak" | "compressed_prose" | "expository_mechanics" | "semantic_echo" | "generic_prose"
     | "field_verbalization" | "voice_macro_reuse" | "template_reuse"
     | "voice_homogenization" | "dialogue_format" | "dialogue_telegraphic"
@@ -231,7 +231,7 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 
 单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。
 
-交付方式：完成审读后必须调用工具 submit_chapter_review 提交结论；不要用 assistant 纯文本、Markdown 代码块或 content 内嵌 JSON 代替。工具参数：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。`;
+交付方式：完成审读后必须调用工具 submit_chapter_review 提交结论；不要用 assistant 纯文本、Markdown 代码块或 content 内嵌 JSON 代替。工具参数：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|commitment_unmet|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。若上下文提供 factContract，事实类判定以它为基准：must_land 未落地判 commitment_unmet，known_fact 被违背判 fact_conflict，do_not_invent 被补写判 unsupported_fact，越过 viewpoint 或 knowledge_gate 判 knowledge_leak；每条都要能引用正文原文，引不出就不要报。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -319,7 +319,7 @@ export function parseChapterReview(
 
   const kinds = new Set<ChapterReviewIssue["kind"]>([
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
-    "fact_conflict", "knowledge_leak", "unsupported_fact", "identity_relationship", "capability_scope",
+    "fact_conflict", "knowledge_leak", "unsupported_fact", "commitment_unmet", "identity_relationship", "capability_scope",
     "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose",
     "field_verbalization", "voice_macro_reuse", "template_reuse",
     "voice_homogenization", "dialogue_format", "dialogue_telegraphic",
