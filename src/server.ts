@@ -47,6 +47,7 @@ import {
   type ScenePipelineSettings,
   type WritingExecutionMode,
 } from "./agent_runtime.js";
+import type { AutoVolumeSettings } from "./volume_policy.js";
 import {
   isChapterIndexStyle,
   isChapterNamingPreset,
@@ -1768,6 +1769,7 @@ export async function startWriterServer(options: {
       scenePipeline: settings.scenePipeline,
       proseLength: settings.proseLength,
       chapterNaming: settings.chapterNaming,
+      autoVolume: settings.autoVolume,
       proseGateTimeouts: settings.proseGateTimeouts,
       roleplay: settings.roleplay,
       instructionsPath: instructions?.path ?? null,
@@ -1792,6 +1794,7 @@ export async function startWriterServer(options: {
         scenePipeline?: Partial<ScenePipelineSettings>;
         proseLength?: Partial<ProseLengthSettings>;
         chapterNaming?: Partial<ChapterNamingSettings>;
+        autoVolume?: Partial<AutoVolumeSettings>;
         proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
         roleplay?: Partial<Omit<RoleplaySettings, "lengthBlockBudgets">> & {
           lengthBlockBudgets?: Partial<RoleplayLengthBlockBudgets>;
@@ -1867,6 +1870,9 @@ export async function startWriterServer(options: {
         )) {
           return context.json({ error: "mode 仅支持 bounded、guidance" }, 400);
         }
+      }
+      if (body.autoVolume?.enabled !== undefined && typeof body.autoVolume.enabled !== "boolean") {
+        return context.json({ error: "autoVolume.enabled 必须是布尔值" }, 400);
       }
       if (body.chapterNaming !== undefined) {
         if (!body.chapterNaming || typeof body.chapterNaming !== "object" || Array.isArray(body.chapterNaming)) {
@@ -1986,6 +1992,7 @@ export async function startWriterServer(options: {
         ...(body.scenePipeline ? { scenePipeline: body.scenePipeline as ScenePipelineSettings } : {}),
         ...(body.proseLength ? { proseLength: body.proseLength } : {}),
         ...(body.chapterNaming ? { chapterNaming: body.chapterNaming } : {}),
+        ...(body.autoVolume ? { autoVolume: body.autoVolume } : {}),
         ...(body.proseGateTimeouts ? { proseGateTimeouts: body.proseGateTimeouts } : {}),
         ...(body.roleplay ? { roleplay: body.roleplay } : {}),
       });
@@ -1999,6 +2006,7 @@ export async function startWriterServer(options: {
         scenePipeline: settings.scenePipeline,
         proseLength: settings.proseLength,
         chapterNaming: settings.chapterNaming,
+        autoVolume: settings.autoVolume,
         proseGateTimeouts: settings.proseGateTimeouts,
         roleplay: settings.roleplay,
       });

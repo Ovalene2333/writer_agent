@@ -1,5 +1,5 @@
 import { documentBlocks } from "../document_blocks.js";
-import { isScenePipelineDocument } from "../project.js";
+import { documentKind, isScenePipelineDocument } from "../project.js";
 import { buildNarrativeEvidencePacket } from "../narrative_evidence.js";
 import { collectRegisterRisksForContext } from "../register_risks.js";
 import {
@@ -13,6 +13,13 @@ import type { RepairPacketIssue } from "../repair_packet.js";
 import { reportModelCallUsage } from "../dependency_diagnostics.js";
 import { chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { normalizeChapterDocumentContent } from "../chapter_naming.js";
+import {
+  accessibleVolumeNames,
+  agentVisibleDocumentPaths,
+  assertVolumePathAllowed,
+  chapterVolumeNames,
+  routeNewChapterPath,
+} from "../volume_policy.js";
 import { styleGroundingPrompt } from "../style_grounding.js";
 import type { ChangeSetFileOperation } from "../types.js";
 import {
@@ -41,7 +48,8 @@ function stageWorkingTextFile(
   content: string,
 ): WorkingTextFile {
   if (content.includes("\0")) throw new Error("纯文本内容不能包含 NUL 字节");
-  const normalized = normalizeTextFilePath(path);
+  const requestedPath = normalizeTextFilePath(path);
+  const normalized = routeNewChapterPath(args.project, requestedPath, args.context.volumeAccess);
   if (!normalized) throw new Error("path 不能为空");
   // Resolve eagerly so traversal, internal paths and symlink targets fail before
   // the body enters the overlay or an approval record.
@@ -185,7 +193,13 @@ export function handleListFiles(args: ToolHandlerArgs): string {
     .filter(path => !prefix || path === prefix || path.startsWith(`${prefix}/`))
     .filter(path => !cursor || path.localeCompare(cursor, undefined, { numeric: true }) > 0);
   const files = all.slice(0, limit);
-  return JSON.stringify({ files, count: files.length, hasMore: all.length > files.length, nextCursor: all.length > files.length ? files.at(-1) : undefined });
+  return JSON.stringify({
+    files,
+    volumes: chapterVolumeNames(project).map(name => ({ name, path: `chapters/${name}/`, unlocked: context.volumeAccess?.allowedVolumes.includes(name) || context.volumeAccess?.activeVolume === name })),
+    count: files.length,
+    hasMore: all.length > files.length,
+    nextCursor: all.length > files.length ? files.at(-1) : undefined,
+  });
 }
 
 export function handleInspectFile(args: ToolHandlerArgs): string {
@@ -302,7 +316,11 @@ export function handleSearchFiles(args: ToolHandlerArgs): string {
 
 export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
   assertWritableMode(args.context.permissionMode, "write_file");
-  const path = requireString(args.input.path, "path");
+  const path = routeNewChapterPath(
+    args.project,
+    requireString(args.input.path, "path"),
+    args.context.volumeAccess,
+  );
   const existing = args.context.workingTextFiles?.get(normalizeTextFilePath(path));
   const chapterDraft = args.context.chapterSceneDraft;
   const inspectedChapterDraft = !existing
@@ -405,6 +423,11 @@ async function handleEvidenceGroundedWriteFile(
         targetPath: path,
         excludeProjectVoice: Boolean(existingText),
         projectSampleRole: "continuity",
+        allowedProjectChapterPaths: agentVisibleDocumentPaths(
+          args.project,
+          accessibleVolumeNames(args.context.volumeAccess),
+          [path],
+        ).filter(candidate => documentKind(candidate) === "chapter"),
       }),
       ...(repair ? { reviewIssues: repair.repairIssues } : {}),
       targetCharacters: args.context.proseLength?.targetCharacters,
@@ -531,6 +554,7 @@ export async function handleMoveFile(args: ToolHandlerArgs): Promise<string> {
   const targetPath = normalizeTextFilePath(requireString(args.input.targetPath, "targetPath"));
   const snapshot = readableTextFile(args, path);
   assertExpectedSourceHash(args.input, snapshot.sourceHash);
+  assertVolumePathAllowed(args.context.volumeAccess, targetPath);
   args.project.resolveTextFileSafe(targetPath);
   if (args.project.isDocumentHidden(targetPath)) throw new Error("目标文件已对 Agent 屏蔽");
   const raw = await handleProposeChangeSet({
@@ -576,6 +600,10 @@ export async function handleProposeChangeSet({ input, project, store, sessionId,
       return { search: requireString(value.search, `files[${index}].edits[${editIndex}].search`),
         replace: typeof value.replace === "string" ? value.replace : (() => { throw new Error(`files[${index}].edits[${editIndex}].replace 无效`); })() };
     }) : undefined;
+    assertVolumePathAllowed(context.volumeAccess, path);
+    if (typeof item.targetPath === "string") {
+      assertVolumePathAllowed(context.volumeAccess, item.targetPath);
+    }
     return {
       operation, path,
       ...(typeof item.targetPath === "string" ? { targetPath: item.targetPath } : {}),

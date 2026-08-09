@@ -62,7 +62,7 @@ import {
   type ConnectionProbeResults,
   type ConnectionPreference,
 } from "./connection";
-import type { ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
+import type { AutoVolumeSettings, ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, SettingsSection, WritingExecutionMode } from "./model_config";
 import { DEFAULT_CHAPTER_NAMING, DEFAULT_ROLEPLAY_SETTINGS } from "./model_config";
 import { attachmentImageUrl, fileToPendingAttachment, isSupportedComposerImage } from "./composer_media";
 import { AssistantMessageBody } from "./assistant_display";
@@ -247,6 +247,7 @@ const ModelConfig = React.lazy(async () => {
 
 /** 后端未回篇幅设置时的兜底档，与 agent_runtime 的 DEFAULT_SETTINGS.proseLength 保持一致。 */
 const DEFAULT_PROSE_LENGTH: ProseLengthSettings = { chapterTargetCharacters: 3000, mode: "bounded", enforceMinimum: false };
+const DEFAULT_AUTO_VOLUME: AutoVolumeSettings = { enabled: true };
 const DEFAULT_ROLEPLAY: RoleplaySettings = DEFAULT_ROLEPLAY_SETTINGS;
 
 function App() {
@@ -6870,6 +6871,7 @@ function App() {
           initialCatalog={state.providerCatalog}
           scenePipeline={state.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 }}
           proseLength={state.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH}
+          autoVolume={state.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME}
           chapterNaming={state.agentSettings?.chapterNaming ?? DEFAULT_CHAPTER_NAMING}
           proseGateTimeouts={state.agentSettings?.proseGateTimeouts ?? { primarySeconds: 60, finalSeconds: 180 }}
           roleplay={state.agentSettings?.roleplay ?? DEFAULT_ROLEPLAY_SETTINGS}
@@ -7026,6 +7028,7 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline,
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           },
           } : previous)}
           onProseLengthChanged={proseLength => setState(previous => previous ? {
@@ -7040,6 +7043,22 @@ function App() {
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength,
           chapterNaming: previous.agentSettings?.chapterNaming ?? DEFAULT_CHAPTER_NAMING,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
+          },
+          } : previous)}
+          onAutoVolumeChanged={autoVolume => setState(previous => previous ? {
+          ...previous,
+          agentSettings: {
+          permissionMode: previous.agentSettings?.permissionMode ?? "ask",
+          writingMode: previous.agentSettings?.writingMode ?? "fast",
+          characterEvolutionEnabled: previous.agentSettings?.characterEvolutionEnabled ?? true,
+          reviewFollowsProseModel: previous.agentSettings?.reviewFollowsProseModel ?? true,
+          stepBudgetMode: previous.agentSettings?.stepBudgetMode ?? "hard",
+          maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
+          scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
+          proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          chapterNaming: previous.agentSettings?.chapterNaming ?? DEFAULT_CHAPTER_NAMING,
+          autoVolume,
           },
           } : previous)}
           onChapterNamingChanged={chapterNaming => setState(previous => previous ? {
@@ -7054,6 +7073,7 @@ function App() {
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
           chapterNaming,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           },
           } : previous)}
           onProseGateTimeoutsChanged={proseGateTimeouts => setState(previous => previous ? {
@@ -7067,6 +7087,7 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           proseGateTimeouts,
           roleplay: previous.agentSettings?.roleplay ?? DEFAULT_ROLEPLAY,
           },
@@ -7082,6 +7103,7 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           proseGateTimeouts: previous.agentSettings?.proseGateTimeouts ?? { primarySeconds: 60, finalSeconds: 180 },
           roleplay,
           },
@@ -7097,6 +7119,7 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           },
           } : previous)}
           onReviewFollowsProseModelChanged={reviewFollowsProseModel => setState(previous => previous ? {
@@ -7110,6 +7133,7 @@ function App() {
           maxAgentSteps: previous.agentSettings?.maxAgentSteps ?? 32,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           },
           } : previous)}
           onStepBudgetChanged={({ stepBudgetMode, maxAgentSteps }) => setState(previous => previous ? {
@@ -7123,6 +7147,7 @@ function App() {
           maxAgentSteps,
           scenePipeline: previous.agentSettings?.scenePipeline ?? { enabled: false, preferredMinScenes: 3, preferredMaxScenes: 5, maxScenes: 5, notesMaxCharacters: 3000, candidateCount: 1 },
           proseLength: previous.agentSettings?.proseLength ?? DEFAULT_PROSE_LENGTH,
+          autoVolume: previous.agentSettings?.autoVolume ?? DEFAULT_AUTO_VOLUME,
           },
           } : previous)}
           />

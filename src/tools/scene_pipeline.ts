@@ -107,6 +107,7 @@ import {
   scanCardRegisterHits,
 } from "../register_risks.js";
 import type { ToolHandlerArgs } from "./types.js";
+import { accessibleVolumeNames, agentVisibleDocumentPaths, routeNewChapterPath } from "../volume_policy.js";
 
 function saveDraftCheckpoint(
   args: Pick<ToolHandlerArgs, "store" | "sessionId">,
@@ -139,7 +140,7 @@ export function handleBeginChapterDraft({ input, project, store, sessionId, char
     throw new Error("场景链当前已关闭；请直接使用 write_file 或 edit_file 完成文档");
   }
   if (context.chapterSceneDraft) throw new Error("已有章节场景草稿正在进行；请完成提案后再开始下一章");
-  const path = requireString(input.path, "path");
+  const path = routeNewChapterPath(project, requireString(input.path, "path"), context.volumeAccess);
   if (!isScenePipelineDocument(path)) throw new Error("逐场景正文草稿只能写入 chapters/ 或 side/");
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const requestedMode = requireString(input.mode, "mode") as ChapterDraftMode;
@@ -260,7 +261,11 @@ function activateNextSceneCharacterScopes(context: ToolExecutionContext, draft: 
  */
 function priorProseText(project: WriterProject, draft: ChapterSceneDraft, context: ToolExecutionContext): string {
   if (context.priorProseContext?.forPath === draft.path) return context.priorProseContext.text;
-  const ordered = orderedChapterPaths(project);
+  const visibleChapters = new Set(
+    agentVisibleDocumentPaths(project, accessibleVolumeNames(context.volumeAccess), [draft.path])
+      .filter(path => documentKind(path) === "chapter"),
+  );
+  const ordered = orderedChapterPaths(project).filter(path => visibleChapters.has(path));
   // Narrative order: the draft's predecessor if registered, else the current last
   // chapter (a new chapter will be appended right after it).
   const registeredIndex = ordered.indexOf(draft.path);
@@ -762,6 +767,11 @@ function chapterStyleEvidence(
     intensive: true,
     targetPath: draft.path,
     projectSampleRole: "continuity",
+    allowedProjectChapterPaths: agentVisibleDocumentPaths(
+      args.project,
+      accessibleVolumeNames(args.context.volumeAccess),
+      [draft.path],
+    ).filter(path => documentKind(path) === "chapter"),
   });
   args.context.sceneStyleEvidence = { forPath: draft.path, text };
   return text;

@@ -25,6 +25,8 @@ export type StyleGroundingOptions = {
   excludeProjectVoice?: boolean;
   /** Scene chains use recent project prose for continuity, not as a positive style exemplar. */
   projectSampleRole?: "voice_anchor" | "continuity";
+  /** Run-authorized project chapter paths; omitted for non-Agent callers. */
+  allowedProjectChapterPaths?: readonly string[];
   /** RNG for exemplar window sampling (tests inject a seeded fn). Defaults to Math.random. */
   random?: () => number;
 };
@@ -150,6 +152,7 @@ export function dynamicStyleGroundingPrompt(
     options.targetPath,
     options.preferredSample,
     options.excludeProjectVoice,
+    options.allowedProjectChapterPaths,
   );
   const catalogExamples = pickStyleExamples(store, template?.name, options.exampleIds, random);
   const selectedExamples = pickExplicitStyleExamples(store, options.exampleIds);
@@ -296,6 +299,7 @@ function pickProjectVoiceSample(
   targetPath?: string,
   preferredSample?: string,
   excludeProjectVoice = false,
+  allowedProjectChapterPaths?: readonly string[],
 ): { text: string; source: string } | undefined {
   const preferred = extractProseSample(preferredSample ?? "", 1_200);
   if (preferred) return { text: preferred, source: "本轮上下文/选区" };
@@ -305,7 +309,8 @@ function pickProjectVoiceSample(
   if (targetPath && project.documentExists(targetPath) && !project.isDocumentHidden(targetPath)) {
     candidates.push(targetPath);
   }
-  const chapters = orderedChapterPaths(project);
+  const allowed = allowedProjectChapterPaths ? new Set(allowedProjectChapterPaths) : undefined;
+  const chapters = orderedChapterPaths(project).filter(path => !allowed || allowed.has(path));
   if (targetPath) {
     const index = chapters.indexOf(targetPath);
     if (index > 0) candidates.push(chapters[index - 1]);

@@ -68,6 +68,8 @@ export interface AgentRunSnapshotV2 {
   originalRequest: string;
   sourceMessageId: number;
   contract: AgentRunContractRecord;
+  /** Run-scoped chapter destination; retained unchanged across interrupted resumes. */
+  volume?: { name: string; autoCreated: boolean };
   deliverables: AgentRunDeliverableV2[];
   progress: AgentRunProgressV2;
   /** Latest review against the immutable originalRequest. Cleared when execution resumes. */
@@ -102,6 +104,7 @@ export type AgentRunEventV2 =
       sourceMessageId: number;
       originalRequest: string;
       contract: AgentRunContractRecord;
+      volume?: { name: string; autoCreated: boolean };
       deliverables: Array<{ id: string; label: string }>;
       reusableEvidence: boolean;
     }

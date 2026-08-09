@@ -23,6 +23,7 @@ export class AgentLoopRuntime {
     sourceMessageId: number;
     originalRequest: string;
     task: AgentTaskContract;
+    volume?: { name: string; autoCreated: boolean };
     permissionMode: PermissionMode;
     reusableEvidence: boolean;
     resumeInterrupted: boolean;

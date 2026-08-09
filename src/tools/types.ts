@@ -26,6 +26,7 @@ import type { WritePack } from "../write_pack.js";
 import type { FactContract } from "../fact_contract.js";
 import type { RepairPacketIssue } from "../repair_packet.js";
 import type { RegisterRisk } from "../register_risks.js";
+import type { VolumeAccessPolicy } from "../volume_policy.js";
 
 /** Compact cross-chapter handoff captured when a chapter draft is proposed. */
 export type CompletedChapterHandoff = {
@@ -86,6 +87,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Volume names are visible globally; chapter bodies require this run-scoped grant. */
+  volumeAccess?: VolumeAccessPolicy;
   /** Runtime boundary for using existing narrative text as prose reference. */
   proseReferencePolicy?: {
     mode: ProseReferenceMode;

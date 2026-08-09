@@ -139,6 +139,15 @@ import {
   type ToolExecutionContext,
   type ToolDefinition,
 } from "./tools/index.js";
+import {
+  accessibleVolumeNames,
+  agentVisibleDocumentPaths,
+  chapterVolume,
+  chapterVolumeNames,
+  normalizeVolumeName,
+  uniqueVolumeName,
+  type VolumeAccessPolicy,
+} from "./volume_policy.js";
 
 type ApiMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -422,6 +431,10 @@ interface WritingTask extends AgentTaskContract {
   proseReferenceMode: ProseReferenceMode;
   proseGateCandidate?: PlannedProseGateCandidate;
   targetPath?: string;
+  /** Existing volume semantically selected from the names-only catalog. */
+  targetVolume?: string;
+  /** Planner-proposed name for a fresh auto-created volume. */
+  newVolumeName?: string;
 }
 
 /** Parse the planner's single JSON object without accepting surrounding prose. */
@@ -624,6 +637,7 @@ export function dynamicContextPrompt(
   resumeInterrupted?: boolean,
   proseLength?: TurnProseLength,
   chapterNaming?: ResolvedChapterNaming,
+  volumeAccess?: VolumeAccessPolicy,
 ): string {
   const explicitReferences = explicitReferencePaths(project, request);
   const inferredTargets = task.targetPath && !explicitReferences.includes(task.targetPath) ? [task.targetPath] : [];
@@ -716,11 +730,21 @@ export function dynamicContextPrompt(
   const chapterNamingLine = chapterNaming && chapterNamingNeedsAgentContext(task)
     ? `\n${chapterNamingAgentPrompt(chapterNaming, project)}`
     : "";
+  const volumeNames = chapterVolumeNames(project);
+  const volumeInstruction = [
+    `卷目录：${volumeNames.length ? volumeNames.join("、") : "无"}。默认只可见卷名，不能列出、搜索或读取未解锁卷内章节。`,
+    volumeAccess?.activeVolume
+      ? `${volumeAccess.autoCreated ? "本轮已自动创建目标卷" : "本轮目标卷"}：「${volumeAccess.activeVolume}」。新建章节直接使用 chapters/ 下的常规文件名，运行时会固定路由到该卷；不要自行改卷。`
+      : "本轮没有目标卷；新建章节保持未分卷路径。",
+    volumeAccess?.allowedVolumes.length
+      ? `本轮允许读取的既有卷：${volumeAccess.allowedVolumes.join("、")}。仍只按任务需要读取最小范围。`
+      : "本轮未解锁任何既有卷。",
+  ].join("\n");
   const resumeLine = resumeInterrupted
     ? "续跑：本轮用于接续上一次中断的 Agent 任务。优先复用 checkpoint、工作记忆、已写草稿和已读证据；从未完成的最小下一步继续，避免重复已成功的工具动作。"
     : "";
   return `当前任务：${task.label}
-任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, proseReferenceMode: task.proseReferenceMode, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile })}
+任务契约：${JSON.stringify({ outcome: task.outcome, evidence: task.evidence, mutation: task.mutation, planning: task.planning, proseReferenceMode: task.proseReferenceMode, capabilities: task.capabilities, workflow: task.workflow, qualityProfile: task.qualityProfile, targetVolume: task.targetVolume })}
 mode 只决定表达与领域工作流，不限制可见工具。根据工具事实自主选择下一步；planning=adaptive 时在发现新情况、路径失败或范围变化后自行重排剩余步骤。
 ${writingWorkflowPrompt(task.workflow ?? "free", task.qualityProfile ?? "fast")}
 ${resumeLine}
@@ -745,6 +769,7 @@ ${taskInstructions(
 
 上下文：${contextInstruction[task.documentContext]}
 正文引用边界：${proseReferenceInstruction[task.proseReferenceMode]}
+卷访问边界：${volumeInstruction}
 角色范围：${characterScopeInstruction}
 简易卡范围：${simpleCharacterScopeInstruction}
 角色演进：${characterEvolutionInstruction}
@@ -1053,6 +1078,8 @@ async function compileWritingTaskContract(
   model: ModelConfig, project: WriterProject, store: WriterStore, request: string, history: ApiMessage[], signal?: AbortSignal,
   characterScope?: number[],
   selectionCharacters = 0,
+  selectedDocumentPaths: string[] = [],
+  autoVolumeEnabled = true,
   onUsage?: (
     usage: {
       promptTokens: number;
@@ -1068,7 +1095,13 @@ async function compileWritingTaskContract(
   ) => void,
   prefixCache?: Omit<PrefixCacheRequestContext, "callKind" | "stableMessageCount" | "initialMessageCount">,
 ): Promise<{ task: WritingTask }> {
-  const allDocuments = project.listTextFiles().filter(path => !project.isDocumentHidden(path));
+  const explicitPaths = [
+    ...selectedDocumentPaths,
+    ...explicitReferencePaths(project, request),
+  ].filter((path, index, all) => all.indexOf(path) === index);
+  const explicitVolumes = explicitPaths.flatMap(path => chapterVolume(path) ?? []).filter((name, index, all) => all.indexOf(name) === index);
+  const volumes = chapterVolumeNames(project);
+  const allDocuments = agentVisibleDocumentPaths(project, explicitVolumes, explicitPaths);
   // Cap catalog size — planner only needs path identity, not the whole monorepo dump.
   const documents = prioritizeDocumentCatalog(allDocuments, request, 80);
   const allowedCharacters = characterScope === undefined ? undefined : new Set(characterScope);
@@ -1098,7 +1131,7 @@ async function compileWritingTaskContract(
     // CACHE: stable planner rules only — no documents/characters/history here.
     content: `写作任务契约编译器。不得调用工具；只输出一个 JSON，无 Markdown。
 JSON 总长度不超过 1400 字符；字符串保持简短。
-字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；proseReferenceMode(project|continuity|independent)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
+字段：mode(brainstorm|outline|write_scene|rewrite|audit|character|simple_character|general，仅为表达风格标签)；outcome(answer|document|character|review|multiple)；evidence(none|project|target|continuation)；mutation(none|document|character|mixed)；planning(direct|adaptive)；proseReferenceMode(project|continuity|independent)；capabilities(research|documents|files|outline|scenes|characters|review|images 的数组)；creativeDepth(explore|shape|deliver)；editScope(point|section|document)；documentContext(none|search|target|continuation)；targetPath(从目录原样选或省略)；targetVolume(只能从 volumeNames 原样选或省略)；newVolumeName(自动入卷且创建新正文时给出与请求相关的短卷名)；searchQuery(search 时短查询，优先专名)；characterIds(最多4，否则[])；exampleIds(最多2，否则[])；continuation；proseGateCandidate(符合下述条件时输出作者政策草案，否则省略)。
 契约语义：outcome 描述最终交付；evidence 描述结束前必须取得的环境事实；mutation 描述必须成功产生的写入；planning=adaptive 表示执行 Agent 应根据工具结果维护和修订计划。capabilities 可多选，禁止因 mode 单选而漏掉必要能力。
 正文/大纲/文件的创建或修改必须 outcome=document、mutation=document；角色卡创建或修改必须 outcome=character、mutation=character；同一请求明确要求两类产物则 outcome=multiple、mutation=mixed；纯讨论/问答 mutation=none；只审阅不修改则 outcome=review、mutation=none，明确要求边审边修才用 document。
 creativeDepth=对话交付深度：explore 开放；shape 少量方向；deliver 用户明确要求完整成品。是否必须写入只由 mutation 决定。
@@ -1111,6 +1144,7 @@ proseReferenceMode 判定：
 - independent：用户明确要求独立故事、全新口吻、不要基于或模仿现有章节。只允许读取 lore、outline 和角色卡核对事实；禁止读取 chapter/side 正文作为范文或结构来源。
 - continuity：用户要求承接现有情节或续写，只允许读取目标正文及紧邻前文的最小末尾范围，用于状态衔接，不把它当正向范文。
 - project：其余项目写作。可按任务需要读取现有资料；仍不得为了模仿而遍历正文。
+卷访问：volumeNames 只表示已有卷名称，默认看不到卷内章节。当前请求明确提到某卷、选择了卷内文档，或请求主题与卷名语义直接相关时，targetVolume 从 volumeNames 原样选择；不得臆造已有卷。autoVolumeEnabled=true 且是新建正文、不是续写/改写/指定已有卷时，给出 newVolumeName；名称概括本次故事主题，不含斜杠、章号或文件扩展名。
 纯文本文件管理：用户要求创建、修改、移动、删除 resource/ 内文件时，mode=general、outcome=document、mutation=document、planning=adaptive、capabilities 含 files；执行阶段统一使用 list_files/read_file/write_file/edit_file/move_file/delete_file。
 图片产物：用户明确要求生成封面、插图、概念图或视觉参考时 capabilities 必须含 images；单独生图用 outcome=answer、mutation=none，若还要求文档/角色写入则保留相应 outcome 与 mutation。只讨论画面或撰写生图提示词时不要加入 images。
 原则：按语义与产物判断。用户说“角色卡”时默认普通角色卡→character+search；只有明确说“简易角色卡/简易角色/简易卡”才用 simple_character+search。更新已有角色时 characterIds 必须包含目录中的目标 ID，禁止因资料为空而另建同名卡。当前 user 唯一任务；历史只解指代。指定单篇→target；承接正文→continuation。不要因为“只是讨论”就 none——讨论项目设定仍须 search。
@@ -1129,6 +1163,9 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
       request,
       documents,
       documentCatalogTruncated: allDocuments.length > documents.length,
+      volumeNames: volumes,
+      explicitlySelectedDocuments: explicitPaths,
+      autoVolumeEnabled,
       characters,
       examples,
       selectionCharacters,
@@ -1194,6 +1231,7 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
   const validCharacterIds = new Set(characters.map(item => item.id));
   const validExampleIds = new Set(examples.map(item => item.id));
   const validDocumentPaths = new Set(documents);
+  const validVolumes = new Set(volumes);
   const continuation = parsed.continuation === true;
   const proseReferenceMode: ProseReferenceMode = plannedProseReferenceMode
     ?? (continuation ? "continuity" : "project");
@@ -1322,6 +1360,10 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
       proseGateRequired: Boolean(proseGateCandidate),
       ...(proseGateCandidate ? { proseGateCandidate } : {}),
       ...(typeof parsed.targetPath === "string" && validDocumentPaths.has(parsed.targetPath) ? { targetPath: parsed.targetPath } : {}),
+      ...(typeof parsed.targetVolume === "string" && validVolumes.has(parsed.targetVolume) ? { targetVolume: parsed.targetVolume } : {}),
+      ...(typeof parsed.newVolumeName === "string" && normalizeVolumeName(parsed.newVolumeName)
+        ? { newVolumeName: normalizeVolumeName(parsed.newVolumeName) }
+        : {}),
     },
   };
 }
@@ -3088,6 +3130,8 @@ export async function runAgent(options: {
   const planned = await compileWritingTaskContract(
     plannerModel, project, store, prompt, history, signal, characterScope,
     options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
+    options.selectedDocumentBlocks?.map(block => block.path) ?? [],
+    runtimeSettings.autoVolume.enabled,
     (usage, retry, durationMs) => emitUsageEvent(
       emit, store, sessionId, plannerModel, usage, 0,
       retry ? "planner_retry" : "planner", options.jobId,
@@ -3111,6 +3155,25 @@ export async function runAgent(options: {
     task.qualityProfile = "fast";
     task.capabilities = task.capabilities.filter(capability => capability !== "images");
   }
+  const explicitlyUnlockedVolumes = [
+    ...explicitReferencePaths(project, prompt),
+    ...(options.selectedDocumentBlocks?.map(block => block.path) ?? []),
+    ...(task.targetPath ? [task.targetPath] : []),
+  ].flatMap(path => {
+    const volume = chapterVolume(path);
+    return volume ? [volume] : [];
+  });
+  const selectedVolume = task.targetVolume
+    ?? explicitlyUnlockedVolumes[0];
+  const shouldCreateVolume = runtimeSettings.autoVolume.enabled
+    && permissionMode !== "plan"
+    && task.mode === "write_scene"
+    && task.documentProposalRequired
+    && !task.continuation
+    && !selectedVolume
+    && !(task.targetPath && project.documentExists(task.targetPath));
+  const requestedActiveVolume = selectedVolume
+    ?? (shouldCreateVolume ? uniqueVolumeName(project, task.newVolumeName) : undefined);
   // 章节命名：仅写章/交付类任务锁定会话约定，同会话多章 path/H1 保持一致。
   const sessionChapterNaming = resolveSessionChapterNaming(
     project,
@@ -3188,6 +3251,9 @@ export async function runAgent(options: {
     sourceMessageId,
     originalRequest: prompt,
     task,
+    ...(requestedActiveVolume
+      ? { volume: { name: requestedActiveVolume, autoCreated: shouldCreateVolume } }
+      : {}),
     permissionMode,
     reusableEvidence: Boolean(
       options.selectedDocumentBlocks?.some(block => Boolean(block.text?.trim()) && block.text!.trim().length <= 800)
@@ -3196,6 +3262,16 @@ export async function runAgent(options: {
     resumeInterrupted: options.resumeInterrupted === true,
     legacyState: previousRunState,
   });
+  const activeVolume = agentLoop.snapshot.volume?.name ?? requestedActiveVolume;
+  const autoCreatedVolume = agentLoop.snapshot.volume?.autoCreated ?? shouldCreateVolume;
+  const volumeAccess: VolumeAccessPolicy = {
+    allowedVolumes: [...new Set([
+      ...explicitlyUnlockedVolumes,
+      ...(selectedVolume ? [selectedVolume] : []),
+    ])],
+    ...(activeVolume ? { activeVolume } : {}),
+    ...(autoCreatedVolume ? { autoCreated: true } : {}),
+  };
   const persistRunTerminal = (
     terminalState: "interrupted" | "completed" | "failed" | "cancelled",
     terminalReason?: string,
@@ -3254,7 +3330,7 @@ export async function runAgent(options: {
     roleplayHandoffContext,
     availableImageReferencesContext(store, sessionId),
   ].filter(Boolean).join("\n\n");
-  const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings);
+  const bootstrapContext = writingBootstrapContext(project, store, prompt, task, scenePipelineSettings, volumeAccess);
   const preferredSample = task.mode === "rewrite" ? undefined : options.selectedDocumentBlocks
     ?.map((block) => block.text?.trim() ?? "")
     .filter(Boolean)
@@ -3270,7 +3346,11 @@ export async function runAgent(options: {
   };
   // Direct drafting remains available even when the optional scene chain is
   // configured for isolated writing, so the parent Agent always needs voice evidence.
-  const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, styleOptions);
+  const dynamicStyleContext = dynamicStyleGroundingPrompt(project, store, {
+    ...styleOptions,
+    allowedProjectChapterPaths: agentVisibleDocumentPaths(project, accessibleVolumeNames(volumeAccess))
+      .filter(path => documentKind(path) === "chapter"),
+  });
   // Prefer cheap roles for prose snippet second pass (flash-class models).
   const adjudicatorModel = options.models?.inline
     ?? options.models?.summarizer
@@ -3309,7 +3389,8 @@ export async function runAgent(options: {
   };
   const toolContext: ToolExecutionContext = {
     permissionMode,
-    proseReferencePolicy: buildProseReferencePolicy(project, task, continuationPath),
+    volumeAccess,
+    proseReferencePolicy: buildProseReferencePolicy(project, task, continuationPath, volumeAccess),
     runId: agentLoop.snapshot.id,
     proposalReviewRevisions: new Map(),
     activeProposalRevisionPaths: new Set(),
@@ -3504,6 +3585,7 @@ export async function runAgent(options: {
       options.resumeInterrupted === true,
       turnProseLength,
       sessionChapterNaming,
+      volumeAccess,
     )}
 
 ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}`,
@@ -5936,6 +6018,7 @@ function buildProseReferencePolicy(
   project: WriterProject,
   task: WritingTask,
   continuationPath?: string,
+  volumeAccess?: VolumeAccessPolicy,
 ): NonNullable<ToolExecutionContext["proseReferencePolicy"]> {
   const targetPath = task.targetPath ?? continuationPath;
   if (task.proseReferenceMode === "project") {
@@ -5944,8 +6027,7 @@ function buildProseReferencePolicy(
   if (task.proseReferenceMode === "independent") {
     return { mode: "independent", ...(targetPath ? { targetPath } : {}), allowedNarrativePaths: [] };
   }
-  const narrativePaths = project.listDocuments()
-    .filter(path => !project.isDocumentHidden(path))
+  const narrativePaths = agentVisibleDocumentPaths(project, accessibleVolumeNames(volumeAccess), targetPath ? [targetPath] : [])
     .filter(path => documentKind(path) === "chapter" || documentKind(path) === "side")
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const allowed = new Set<string>();
@@ -5987,6 +6069,7 @@ function writingBootstrapContext(
   prompt: string,
   task: WritingTask,
   scenePipeline: ScenePipelineSettings,
+  volumeAccess?: VolumeAccessPolicy,
 ): string {
   if (task.mode !== "write_scene" && task.mode !== "rewrite" && !task.continuation) return "";
   const chapterNum = parseChapterNumber(prompt) ?? parseChapterNumber(task.targetPath ?? "");
@@ -6023,8 +6106,8 @@ function writingBootstrapContext(
 
   const chapterDocs = task.proseReferenceMode === "independent"
     ? []
-    : project.listDocuments()
-      .filter(path => !project.isDocumentHidden(path) && documentKind(path) === "chapter")
+    : agentVisibleDocumentPaths(project, accessibleVolumeNames(volumeAccess), task.targetPath ? [task.targetPath] : [])
+      .filter(path => documentKind(path) === "chapter")
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
   // Only paths that actually exist — never invent chapters/第N章.md.

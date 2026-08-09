@@ -61,6 +61,7 @@ export class AgentRunController {
     sourceMessageId: number;
     originalRequest: string;
     task: AgentTaskContract;
+    volume?: { name: string; autoCreated: boolean };
     permissionMode: PermissionMode;
     reusableEvidence: boolean;
     resumeInterrupted: boolean;
@@ -86,6 +87,7 @@ export class AgentRunController {
         sourceMessageId: input.sourceMessageId,
         originalRequest: input.originalRequest,
         contract: contractRecord(input.task, input.permissionMode),
+        ...(input.volume ? { volume: input.volume } : {}),
         deliverables: [],
         reusableEvidence: input.reusableEvidence,
       });

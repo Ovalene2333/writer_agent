@@ -33,6 +33,41 @@ test("provider stream termination is resumable but explicit abort remains cancel
   assert.equal(isRecoverableProviderTermination(new Error("模型请求失败（400）：invalid request")), false);
 });
 
+test("an interrupted writing run keeps its automatic volume on resume", () => {
+  const { root, store, sessionId } = fixture("volume-resume");
+  try {
+    const first = AgentRunController.open({
+      store,
+      sessionId,
+      sourceMessageId: 1,
+      originalRequest: "写六章荒原故事",
+      task: documentTask,
+      volume: { name: "荒原来客", autoCreated: true },
+      permissionMode: "auto",
+      reusableEvidence: false,
+      resumeInterrupted: false,
+    });
+    first.suspend("等待续跑", "resume");
+
+    const resumed = AgentRunController.open({
+      store,
+      sessionId,
+      sourceMessageId: 2,
+      originalRequest: "写六章荒原故事",
+      task: documentTask,
+      volume: { name: "错误的新卷", autoCreated: true },
+      permissionMode: "auto",
+      reusableEvidence: true,
+      resumeInterrupted: true,
+    });
+    assert.equal(resumed.runId, first.runId);
+    assert.deepEqual(resumed.snapshot.volume, { name: "荒原来客", autoCreated: true });
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function fixture(name: string): { root: string; project: WriterProject; store: WriterStore; sessionId: string } {
   const root = mkdtempSync(join(tmpdir(), `writer-agent-run-v2-${name}-`));
   const project = WriterProject.init(root, name);

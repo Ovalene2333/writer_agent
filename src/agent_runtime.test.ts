@@ -135,6 +135,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         indexStyle: "chinese",
         enforceHeading: true,
       },
+      autoVolume: { enabled: true },
       proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
       roleplay: {
         performanceReasoningEffort: "inherit",
@@ -156,6 +157,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
       permissionMode: "plan",
       writingMode: "fast",
       characterEvolutionEnabled: false,
+      autoVolume: { enabled: false },
       stepBudgetMode: "experimental",
       maxAgentSteps: 48,
       scenePipeline: {
@@ -188,6 +190,7 @@ test("agent settings round-trip permission, writing mode, and scene pipeline", (
         indexStyle: "chinese",
         enforceHeading: true,
       },
+      autoVolume: { enabled: false },
       proseGateTimeouts: { primarySeconds: 60, finalSeconds: 180 },
       roleplay: {
         performanceReasoningEffort: "inherit",

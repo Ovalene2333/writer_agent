@@ -1,5 +1,6 @@
 import { documentKind, normalizeResourcePath, type WriterProject } from "../project.js";
 import type { ToolExecutionContext } from "./types.js";
+import { chapterVolume, volumePathAllowed } from "../volume_policy.js";
 
 export type DocumentWriteMode = "create" | "replace" | "append";
 
@@ -23,6 +24,7 @@ export function proseReferenceReadAllowed(
   path: string,
 ): boolean {
   const normalized = normalizeTextFilePath(path);
+  if (!volumePathAllowed(context.volumeAccess, normalized)) return false;
   if (!isNarrativeReferencePath(normalized)) return true;
   if (context.workingTextFiles?.has(normalized)) return true;
   const policy = context.proseReferencePolicy;
@@ -39,6 +41,10 @@ export function assertProseReferenceReadAllowed(
 ): void {
   if (proseReferenceReadAllowed(context, path)) return;
   const mode = context.proseReferencePolicy?.mode ?? "project";
+  const volume = chapterVolume(path);
+  if (volume && !volumePathAllowed(context.volumeAccess, path)) {
+    throw new Error(`卷「${volume}」默认只暴露名称；本轮意图未解锁该卷，不能读取其中章节`);
+  }
   throw new Error(mode === "independent"
     ? "独立创作模式禁止读取既有 chapter/side 正文；可读取 lore、outline、角色卡和本轮生成的工作副本"
     : "连续性模式只允许读取目标正文或紧邻前文；请改读 lore/outline，或使用本轮允许的连续性路径");

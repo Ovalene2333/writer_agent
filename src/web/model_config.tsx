@@ -63,6 +63,7 @@ export type ProseLengthSettings = {
   mode: "bounded" | "guidance";
   enforceMinimum: boolean;
 };
+export type AutoVolumeSettings = { enabled: boolean };
 export type ChapterNamingPreset = "auto" | "cn-file-en" | "cn-file" | "cn-arabic" | "custom";
 export type ChapterIndexStyle = "chinese" | "arabic" | "padded-arabic";
 export type ChapterNamingSettings = {
@@ -239,6 +240,7 @@ type ModelConfigProps = {
   initialCatalog: ProviderCatalog;
   scenePipeline: ScenePipelineSettings;
   proseLength: ProseLengthSettings;
+  autoVolume: AutoVolumeSettings;
   chapterNaming: ChapterNamingSettings;
   proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
   roleplay: RoleplaySettings;
@@ -259,6 +261,7 @@ type ModelConfigProps = {
   onChanged: () => void | Promise<void>;
   onScenePipelineChanged: (settings: ScenePipelineSettings) => void;
   onProseLengthChanged: (settings: ProseLengthSettings) => void;
+  onAutoVolumeChanged: (settings: AutoVolumeSettings) => void;
   onChapterNamingChanged: (settings: ChapterNamingSettings) => void;
   onProseGateTimeoutsChanged: (settings: { primarySeconds: number; finalSeconds: number }) => void;
   onRoleplayChanged: (settings: RoleplaySettings) => void;
@@ -271,6 +274,7 @@ export function ModelConfig({
   initialCatalog,
   scenePipeline,
   proseLength,
+  autoVolume,
   chapterNaming,
   proseGateTimeouts,
   roleplay,
@@ -291,6 +295,7 @@ export function ModelConfig({
   onChanged,
   onScenePipelineChanged,
   onProseLengthChanged,
+  onAutoVolumeChanged,
   onChapterNamingChanged,
   onProseGateTimeoutsChanged,
   onRoleplayChanged,
@@ -301,6 +306,7 @@ export function ModelConfig({
   const [catalog, setCatalog] = useState(initialCatalog);
   const [sceneDraft, setSceneDraft] = useState(scenePipeline);
   const [lengthDraft, setLengthDraft] = useState(proseLength);
+  const [autoVolumeDraft, setAutoVolumeDraft] = useState(autoVolume);
   const [namingDraft, setNamingDraft] = useState(chapterNaming);
   const [proseGateTimeoutsDraft, setProseGateTimeoutsDraft] = useState(proseGateTimeouts);
   const [roleplayDraft, setRoleplayDraft] = useState(roleplay);
@@ -320,6 +326,7 @@ export function ModelConfig({
   useEffect(() => setCatalog(initialCatalog), [initialCatalog]);
   useEffect(() => setSceneDraft(scenePipeline), [scenePipeline]);
   useEffect(() => setLengthDraft(proseLength), [proseLength]);
+  useEffect(() => setAutoVolumeDraft(autoVolume), [autoVolume]);
   useEffect(() => setNamingDraft(chapterNaming), [chapterNaming]);
   useEffect(() => setProseGateTimeoutsDraft(proseGateTimeouts), [proseGateTimeouts]);
   useEffect(() => setRoleplayDraft({
@@ -374,6 +381,7 @@ export function ModelConfig({
         || draft.maxBlocks !== saved.maxBlocks;
     });
   const writingSettingsDirty = characterEvolutionDraft !== characterEvolutionEnabled
+    || autoVolumeDraft.enabled !== autoVolume.enabled
     || lengthDraft.chapterTargetCharacters !== proseLength.chapterTargetCharacters
     || lengthDraft.mode !== proseLength.mode
     || lengthDraft.enforceMinimum !== proseLength.enforceMinimum
@@ -594,6 +602,7 @@ export function ModelConfig({
         body: JSON.stringify({
           scenePipeline: sceneDraft,
           proseLength: lengthDraft,
+          autoVolume: autoVolumeDraft,
           chapterNaming: namingDraft,
           proseGateTimeouts: proseGateTimeoutsDraft,
           characterEvolutionEnabled: characterEvolutionDraft,
@@ -604,6 +613,7 @@ export function ModelConfig({
       }) as {
         scenePipeline: ScenePipelineSettings;
         proseLength: ProseLengthSettings;
+        autoVolume: AutoVolumeSettings;
         chapterNaming: ChapterNamingSettings;
         proseGateTimeouts: { primarySeconds: number; finalSeconds: number };
         characterEvolutionEnabled: boolean;
@@ -613,6 +623,7 @@ export function ModelConfig({
       };
       setSceneDraft(result.scenePipeline);
       setLengthDraft(result.proseLength);
+      setAutoVolumeDraft(result.autoVolume);
       setNamingDraft(result.chapterNaming);
       setProseGateTimeoutsDraft(result.proseGateTimeouts);
       setCharacterEvolutionDraft(result.characterEvolutionEnabled);
@@ -621,6 +632,7 @@ export function ModelConfig({
       setMaxAgentStepsDraft(result.maxAgentSteps);
       onScenePipelineChanged(result.scenePipeline);
       onProseLengthChanged(result.proseLength);
+      onAutoVolumeChanged(result.autoVolume);
       onChapterNamingChanged(result.chapterNaming);
       onProseGateTimeoutsChanged(result.proseGateTimeouts);
       onCharacterEvolutionChanged(result.characterEvolutionEnabled);
@@ -637,6 +649,7 @@ export function ModelConfig({
   function resetWritingSettings() {
     setSceneDraft(scenePipeline);
     setLengthDraft(proseLength);
+    setAutoVolumeDraft(autoVolume);
     setNamingDraft(chapterNaming);
     setProseGateTimeoutsDraft(proseGateTimeouts);
     setCharacterEvolutionDraft(characterEvolutionEnabled);
@@ -849,6 +862,10 @@ export function ModelConfig({
           {section === "writing" && <div className="scene-settings">
         <section className="writing-settings-section">
           <div className="writing-settings-section-head"><div><h4>通用行为</h4><p>无论采用哪种正文模式都生效。</p></div></div>
+          <label className="writing-setting-row">
+            <input type="checkbox" checked={autoVolumeDraft.enabled} onChange={event => setAutoVolumeDraft({ enabled: event.target.checked })}/>
+            <span><strong>新正文自动入卷</strong><small>默认开启：一次新的正文任务创建一个卷，本次任务的后续章节都写入同一卷。关闭后新章节保持未分卷；既有卷内章节仍默认隐藏，只在本轮意图明确关联该卷时读取。</small></span>
+          </label>
           <label className="writing-setting-row">
             <input type="checkbox" checked={characterEvolutionDraft} onChange={event => setCharacterEvolutionDraft(event.target.checked)}/>
             <span><strong>角色演进</strong><small>允许叙事任务自动追加角色经历和故事状态。关闭后仍可显式新建或编辑角色卡。</small></span>

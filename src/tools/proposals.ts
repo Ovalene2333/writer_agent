@@ -71,6 +71,12 @@ import {
   rejectCompressedPlaceholder,
   requireString,
 } from "./helpers.js";
+import {
+  accessibleVolumeNames,
+  agentVisibleDocumentPaths,
+  assertVolumePathAllowed,
+  routeNewChapterPath,
+} from "../volume_policy.js";
 
 /** Auto-fix referential meta leaks; block if residual high-confidence leaks remain. */
 function gateProseMetaLeaks(content: string, path: string): { content: string; stripped: string[] } {
@@ -750,7 +756,7 @@ export async function proseStyleGateIssues(
 
 export async function handleProposeDocument({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document");
-  const path = requireString(input.path, "path");
+  const path = routeNewChapterPath(project, requireString(input.path, "path"), context.volumeAccess);
   const content = requireString(input.content, "content");
   // 调用方没给数字时用本轮篇幅目标兜底，而不是把交付卡在「必须先报个数」上。
   const rawTargetCharacters = input.targetCharacters
@@ -800,6 +806,7 @@ export async function submitFullDocumentProposal(
   lengthNotice?: string,
 ): Promise<string> {
   const { project, store, sessionId, emit, context, characterScope } = args;
+  assertVolumePathAllowed(context.volumeAccess, path);
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   assertCreativeOutlineDesigned(context, path, context.fileMutationTool ?? "propose_document");
   rejectCompressedPlaceholder(proposedContent, "content");
@@ -1159,14 +1166,20 @@ function finalReviewUnavailablePayload(
 }
 
 function directReviewComparisonMaterials(
-  args: Pick<ToolHandlerArgs, "project">,
+  args: Pick<ToolHandlerArgs, "project" | "context">,
   path: string,
 ): Array<{ path: string; content: string; role: "template_check" }> {
   const kind = documentKind(path);
   if (kind !== "chapter" && kind !== "side") return [];
   const slash = path.lastIndexOf("/");
   const directory = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const visible = new Set(agentVisibleDocumentPaths(
+    args.project,
+    accessibleVolumeNames(args.context.volumeAccess),
+    [path],
+  ));
   const siblings = args.project.listDocuments()
+    .filter(candidate => visible.has(candidate))
     .filter(candidate => candidate !== path && !args.project.isDocumentHidden(candidate))
     .filter(candidate => candidate.startsWith(directory) && !candidate.slice(directory.length).includes("/"))
     .filter(candidate => documentKind(candidate) === kind)
@@ -1190,6 +1203,7 @@ function directReviewComparisonMaterials(
 export async function handleProposeDocumentPatch({ input, project, store, sessionId, emit, context, characterScope }: ToolHandlerArgs): Promise<string> {
   assertWritableMode(context.permissionMode, "propose_document_patch");
   const path = requireString(input.path, "path");
+  assertVolumePathAllowed(context.volumeAccess, path);
   if (context.activeProposalRevisionPaths?.has(path)) {
     return JSON.stringify({
       status: "recoverable_state_error",
@@ -1333,6 +1347,7 @@ export async function handleReviseDocumentIsolated(args: ToolHandlerArgs): Promi
   if (context.editScope !== "document") throw new Error("仅通篇修改可使用 revise_document_isolated；局部/分节修改请使用锚点 patch");
   if (!context.documentRevisioner) throw new Error("隔离文档修订器未配置");
   const path = requireString(input.path, "path");
+  assertVolumePathAllowed(context.volumeAccess, path);
   if (project.isDocumentHidden(path)) throw new Error("文档已对 Agent 屏蔽");
   const beforeContent = project.read(path);
   const sourceHash = project.hash(beforeContent);

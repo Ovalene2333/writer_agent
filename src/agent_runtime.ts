@@ -7,6 +7,7 @@ import {
 } from "./chapter_naming.js";
 import { DEFAULT_WRITER_INSTRUCTIONS, type WriterProject } from "./project.js";
 import type { ReasoningEffort } from "./types.js";
+import type { AutoVolumeSettings } from "./volume_policy.js";
 
 export type { ChapterNamingSettings, ChapterNamingPreset, ChapterIndexStyle } from "./chapter_naming.js";
 export {
@@ -199,6 +200,8 @@ export interface AgentRuntimeSettings {
   proseLength: ProseLengthSettings;
   /** 章节路径与 H1 命名约定；会话首次写章时锁定。 */
   chapterNaming: ChapterNamingSettings;
+  /** 新正文任务自动创建并固定写入一个新卷；卷级读取隔离不受此开关影响。 */
+  autoVolume: AutoVolumeSettings;
   proseGateTimeouts: ProseGateTimeoutSettings;
   /** 角色扮演试演：推理档位、终审与输出预算。 */
   roleplay: RoleplaySettings;
@@ -225,6 +228,7 @@ const DEFAULT_SETTINGS: AgentRuntimeSettings = {
     enforceMinimum: false,
   },
   chapterNaming: { ...DEFAULT_CHAPTER_NAMING },
+  autoVolume: { enabled: true },
   proseGateTimeouts: {
     primarySeconds: DEFAULT_PRIMARY_PROSE_GATE_TIMEOUT_SECONDS,
     finalSeconds: DEFAULT_FINAL_PROSE_GATE_TIMEOUT_SECONDS,
@@ -422,6 +426,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
       scenePipeline: normalizeScenePipelineSettings(raw.scenePipeline),
       proseLength: normalizeProseLengthSettings(raw.proseLength),
       chapterNaming: normalizeChapterNamingSettings(raw.chapterNaming),
+      autoVolume: { enabled: raw.autoVolume?.enabled !== false },
       proseGateTimeouts: normalizeProseGateTimeoutSettings(raw.proseGateTimeouts),
       roleplay: normalizeRoleplaySettings(raw.roleplay),
     };
@@ -429,6 +434,7 @@ export function loadAgentSettings(project: WriterProject): AgentRuntimeSettings 
     return {
       ...DEFAULT_SETTINGS,
       chapterNaming: { ...DEFAULT_SETTINGS.chapterNaming },
+      autoVolume: { ...DEFAULT_SETTINGS.autoVolume },
       roleplay: { ...DEFAULT_SETTINGS.roleplay },
     };
   }
@@ -446,6 +452,7 @@ export function saveAgentSettings(
     scenePipeline?: Partial<ScenePipelineSettings>;
     proseLength?: Partial<ProseLengthSettings>;
     chapterNaming?: Partial<ChapterNamingSettings>;
+    autoVolume?: Partial<AutoVolumeSettings>;
     proseGateTimeouts?: Partial<ProseGateTimeoutSettings>;
     roleplay?: Partial<Omit<RoleplaySettings, "lengthBlockBudgets">> & {
       lengthBlockBudgets?: Partial<RoleplayLengthBlockBudgets>;
@@ -481,6 +488,9 @@ export function saveAgentSettings(
     chapterNaming: patch.chapterNaming
       ? normalizeChapterNamingSettings({ ...current.chapterNaming, ...patch.chapterNaming })
       : current.chapterNaming,
+    autoVolume: patch.autoVolume
+      ? { enabled: patch.autoVolume.enabled !== false }
+      : current.autoVolume,
     proseGateTimeouts: patch.proseGateTimeouts
       ? normalizeProseGateTimeoutSettings({ ...current.proseGateTimeouts, ...patch.proseGateTimeouts })
       : current.proseGateTimeouts,

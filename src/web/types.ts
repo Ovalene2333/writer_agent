@@ -1,6 +1,6 @@
 /** Shared web types & pure constants extracted from main.tsx. */
 
-import type { AgentStepBudgetMode, ChapterNamingSettings, ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, WritingExecutionMode } from "./model_config";
+import type { AgentStepBudgetMode, AutoVolumeSettings, ChapterNamingSettings, ProseLengthSettings, ProviderCatalog, RoleplaySettings, ScenePipelineSettings, WritingExecutionMode } from "./model_config";
 
 /** Rule-layer writing-quality picture. Absent on非正文提案与旧提案 —— 渲染时必须容忍。 */
 export type ProseQualityReport = {
@@ -619,6 +619,7 @@ export type State = {
     maxAgentSteps?: number;
     scenePipeline: ScenePipelineSettings;
     proseLength?: ProseLengthSettings;
+    autoVolume?: AutoVolumeSettings;
     chapterNaming?: ChapterNamingSettings;
     proseGateTimeouts?: { primarySeconds: number; finalSeconds: number };
     roleplay?: RoleplaySettings;

@@ -30,6 +30,7 @@ export class AgentRunStore {
     sourceMessageId: number;
     originalRequest: string;
     contract: Extract<AgentRunEventV2, { type: "run_started" }>["contract"];
+    volume?: { name: string; autoCreated: boolean };
     deliverables: Array<{ id: string; label: string }>;
     reusableEvidence: boolean;
   }): AgentRunSnapshotV2 {
@@ -41,6 +42,7 @@ export class AgentRunStore {
       sourceMessageId: input.sourceMessageId,
       originalRequest: input.originalRequest,
       contract: input.contract,
+      ...(input.volume ? { volume: input.volume } : {}),
       deliverables: input.deliverables,
       reusableEvidence: input.reusableEvidence,
     };

@@ -39,6 +39,7 @@ function initialSnapshot(
     originalRequest: event.originalRequest,
     sourceMessageId: event.sourceMessageId,
     contract: event.contract,
+    ...(event.volume ? { volume: event.volume } : {}),
     deliverables: event.deliverables.map(item => ({
       ...item,
       state: "pending",
