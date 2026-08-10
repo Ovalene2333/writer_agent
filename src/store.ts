@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFile
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentVersionDetail, DocumentVersionMeta, Message, MessageAttachment, MessageAttachmentInput, MessageChannel, MessageContent, MessageContentPart, Proposal, ProposalCharacterChange, ProseQualityReport,
+  ActiveRoleplayState, AgentEvaluationCaseResult, AgentEvaluationRun, AgentEvaluationStatus, AgentTurnBlock, AgentTurnMessage, ChangeSet, ChangeSetFileChange, ChangeSetFileOperation, ChapterSummary, Character, DocumentQualityReportSnapshot, DocumentVersionDetail, DocumentVersionMeta, Message, MessageAttachment, MessageAttachmentInput, MessageChannel, MessageContent, MessageContentPart, Proposal, ProposalCharacterChange, ProseQualityReport,
   RoleplayContentRating, RoleplayInputMode, RoleplayInterlocutor, RoleplayMemoryFact, RoleplayMemoryFactKind, RoleplayMemoryFactStatus, RoleplayParticipant, RoleplayScene,
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
   MessageStepTrail, PersistedStreamStep,
@@ -215,6 +215,7 @@ function parseProposalQualityReport(value: unknown): ProseQualityReport | undefi
     const report = parsed as Partial<ProseQualityReport>;
     if (typeof report.grade !== "string" || !report.vividness || !report.aiTells) return undefined;
     return {
+      ...(typeof report.version === "number" ? { version: report.version } : {}),
       characters: Number(report.characters) || 0,
       vividness: report.vividness,
       aiTells: report.aiTells,
@@ -362,6 +363,26 @@ export class WriterStore {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS revisions_path_after_hash ON revisions(path, after_hash, id DESC);
+      CREATE TABLE IF NOT EXISTS document_quality_reports (
+        path TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(path, source_hash)
+      );
+      CREATE INDEX IF NOT EXISTS document_quality_reports_updated ON document_quality_reports(updated_at DESC);
+      CREATE TABLE IF NOT EXISTS narrative_semantic_reviews (
+        path TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        review_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(path, source_hash, context_hash)
+      );
+      CREATE INDEX IF NOT EXISTS narrative_semantic_reviews_updated ON narrative_semantic_reviews(updated_at DESC);
       CREATE TABLE IF NOT EXISTS change_sets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -737,6 +758,13 @@ export class WriterStore {
     if (!proposalColumns.some(column => column.name === "delivery_ready")) {
       this.database.exec("ALTER TABLE proposals ADD COLUMN delivery_ready INTEGER NOT NULL DEFAULT 1");
     }
+    this.database.exec(`
+      INSERT OR IGNORE INTO document_quality_reports(path,source_hash,report_json,origin,created_at,updated_at)
+      SELECT path,after_hash,quality_report_json,'revision',created_at,created_at
+      FROM revisions
+      WHERE quality_report_json<>''
+      ORDER BY id DESC
+    `);
     const writingExampleColumns = this.database.prepare("PRAGMA table_info(writing_examples)").all() as Row[];
     if (!writingExampleColumns.some(column => column.name === "gate_hash")) {
       this.database.exec("ALTER TABLE writing_examples ADD COLUMN gate_hash TEXT NOT NULL DEFAULT ''");
@@ -3562,6 +3590,9 @@ export class WriterStore {
       INSERT INTO proposals(session_id,source_message_id,delivery_ready,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)
     `).run(sessionId, sourceMessageId ?? null, deliveryReady ? 1 : 0, path, summary, before, content, baseHash, JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
+    if (qualityReport) {
+      this.saveDocumentQualityReport(path, this.project.hash(content), qualityReport, "proposal", now);
+    }
     return this.proposal(Number(result.lastInsertRowid));
   }
 
@@ -3702,6 +3733,9 @@ export class WriterStore {
     } catch (error) {
       try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
       throw error;
+    }
+    if (proposal.qualityReport) {
+      this.saveDocumentQualityReport(proposal.path, expectedAfterHash, proposal.qualityReport, "revision", now);
     }
     this.refreshWritingMemoryForDocument(proposal.path, proposal.afterContent);
     this.reindex();
@@ -4293,6 +4327,8 @@ export class WriterStore {
   /** Terminal report for the exact body currently open in the reader. */
   documentQualityReport(path: string, afterHash: string): ProseQualityReport | undefined {
     if (!path || !afterHash) return undefined;
+    const cached = this.documentQualityReportSnapshot(path, afterHash);
+    if (cached) return cached.report;
     const row = this.database.prepare(`
       SELECT quality_report_json
       FROM revisions
@@ -4301,6 +4337,72 @@ export class WriterStore {
       LIMIT 1
     `).get(path, afterHash) as Row | undefined;
     return row ? parseProposalQualityReport(row.quality_report_json) : undefined;
+  }
+
+  documentQualityReportSnapshot(path: string, sourceHash: string): DocumentQualityReportSnapshot | undefined {
+    if (!path || !sourceHash) return undefined;
+    const row = this.database.prepare(`
+      SELECT path,source_hash,report_json,origin,created_at,updated_at
+      FROM document_quality_reports
+      WHERE path=? AND source_hash=?
+    `).get(path, sourceHash) as Row | undefined;
+    if (!row) return undefined;
+    const report = parseProposalQualityReport(row.report_json);
+    if (!report) return undefined;
+    return {
+      path: String(row.path),
+      sourceHash: String(row.source_hash),
+      report,
+      origin: String(row.origin) as DocumentQualityReportSnapshot["origin"],
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  saveDocumentQualityReport(
+    path: string,
+    sourceHash: string,
+    report: ProseQualityReport,
+    origin: DocumentQualityReportSnapshot["origin"],
+    at = new Date().toISOString(),
+  ): DocumentQualityReportSnapshot {
+    if (!path || !sourceHash) throw new Error("质量报告缺少文档路径或正文哈希");
+    this.database.prepare(`
+      INSERT INTO document_quality_reports(path,source_hash,report_json,origin,created_at,updated_at)
+      VALUES(?,?,?,?,?,?)
+      ON CONFLICT(path,source_hash) DO UPDATE SET
+        report_json=excluded.report_json,
+        origin=excluded.origin,
+        updated_at=excluded.updated_at
+    `).run(path, sourceHash, JSON.stringify(report), origin, at, at);
+    return this.documentQualityReportSnapshot(path, sourceHash)!;
+  }
+
+  narrativeSemanticReview(path: string, sourceHash: string, contextHash: string): unknown | undefined {
+    if (!path || !sourceHash || !contextHash) return undefined;
+    const row = this.database.prepare(`
+      SELECT review_json FROM narrative_semantic_reviews
+      WHERE path=? AND source_hash=? AND context_hash=?
+    `).get(path, sourceHash, contextHash) as Row | undefined;
+    if (!row) return undefined;
+    try { return JSON.parse(String(row.review_json)); } catch { return undefined; }
+  }
+
+  saveNarrativeSemanticReview(
+    path: string,
+    sourceHash: string,
+    contextHash: string,
+    review: unknown,
+    at = new Date().toISOString(),
+  ): void {
+    if (!path || !sourceHash || !contextHash) throw new Error("语义终审缓存缺少正文或上下文哈希");
+    this.database.prepare(`
+      INSERT INTO narrative_semantic_reviews(path,source_hash,context_hash,review_json,created_at,updated_at)
+      VALUES(?,?,?,?,?,?)
+      ON CONFLICT(path,source_hash,context_hash) DO UPDATE SET
+        review_json=excluded.review_json,
+        updated_at=excluded.updated_at
+    `).run(path, sourceHash, contextHash, JSON.stringify(review), at, at);
   }
 
   restoreDocumentVersion(path: string, revisionId: number, baseHash: string): DocumentVersionMeta {

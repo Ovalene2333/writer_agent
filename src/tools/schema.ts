@@ -310,6 +310,21 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "get_document_quality_report",
+      description: "读取当前正文哈希对应的持久化质量报告；缺失或版本过旧时生成一次并缓存。报告是修改证据，不自动强制改写",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "chapters/ 或 side/ 正文路径" },
+          sourceHash: { type: "string", description: "可选；已读取正文的精确快照哈希" },
+        },
+        required: ["path"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "list_outline_nodes",
       description: "大纲节点目录（id/层级/摘要/状态/正文关联）",
       parameters: {

@@ -64,6 +64,16 @@ test("报告可以直接渲染成文本，供工具结果与 Agent 使用", () =
   }
 });
 
+test("确定性质量警告持久化完整命中，展示示例仍保持有界", () => {
+  const text = Array.from({ length: 9 }, (_, index) =>
+    `第${index}段不是停顿，是她重新确认了门后的脚步声。`).join("\n\n");
+  const report = buildProseQualityReport(text);
+  const contrast = report.warnings.find(warning => warning.code === "contrast_density");
+  assert.ok(contrast);
+  assert.ok((contrast?.occurrences?.length ?? 0) > contrast!.examples.length);
+  assert.equal(contrast?.occurrences?.length, 9);
+});
+
 test("低于统计下限的短文只给分数，不编造问题", () => {
   const report = buildProseQualityReport("他走了。门在身后合上。");
   assert.deepEqual(report.warnings, []);

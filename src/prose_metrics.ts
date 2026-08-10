@@ -7,8 +7,9 @@
  * flat sentence rhythm, numeric-readout spam and monotone paragraph openings.
  *
  * Usage:
- * - analyzeChapterProseMetrics → inspect_chapter_draft (errors block, warnings ship
- *   as an actionable checklist).
+ * - analyzeChapterProseMetrics → every narrative submission through the shared
+ *   validation layer. Only exact duplication/recycling errors block directly;
+ *   density signals are evidence for semantic chapter review.
  * - findAdjacentDuplicateSentences → write_chapter_scene hard gate (AA-repeat bug).
  * - Metrics remain diagnostic inputs for final review; they are deliberately not
  *   fed back into prose-generation requests or used to select prose candidates.
@@ -35,6 +36,8 @@ export type ChapterMetricIssue = {
   severity: ChapterMetricSeverity;
   message: string;
   examples: string[];
+  /** Complete deterministic matches; examples remain bounded for display. */
+  occurrences?: string[];
 };
 
 export type ChapterRhythmStats = {
@@ -95,6 +98,7 @@ export function analyzeChapterProseMetrics(
       severity: "error",
       message: `发现 ${duplicates.length} 处相邻逐字复读句（生成缺陷，零容忍）；用 revise_chapter_draft_style 把「S。S。」替换为单句。`,
       examples: duplicates.slice(0, 5),
+      occurrences: duplicates,
     });
   }
 
@@ -105,6 +109,7 @@ export function analyzeChapterProseMetrics(
       severity: "warning",
       message: `回声对白（相邻两段完全相同的台词）出现 ${echoes.length} 组，同一装置一章最多 1 次，其余改为不同回应或沉默。`,
       examples: echoes.slice(0, 4),
+      occurrences: echoes,
     });
   }
 
@@ -116,22 +121,23 @@ export function analyzeChapterProseMetrics(
       severity,
       message: `${recycled.length} 个完整句子与既有正文逐字重合（上限 ${RECYCLE_ERROR_LIMIT}）；除刻意母题召回外须变形重写，不要回收旧章语料。`,
       examples: recycled.slice(0, 8),
+      occurrences: recycled,
     });
   }
 
   const dashCount = countMatches(body, DASH_UNIT);
   const dashPer10k = per10k(dashCount);
   if (dashPer10k > DASH_PER_10K_LIMIT) {
+    const dashOccurrences = splitSentences(body).filter(sentence => {
+      DASH_UNIT.lastIndex = 0;
+      return DASH_UNIT.test(sentence);
+    });
     issues.push({
       code: "dash_density",
-      severity: "error",
-      message: `破折号 ${dashPer10k}/万字（硬上限 ${DASH_PER_10K_LIMIT}）；保留确有必要的对白拖音、中断或偶发揭示，其余补注改写为完整句、逗号或冒号，或直接删除。`,
-      examples: splitSentences(body)
-        .filter(sentence => {
-          DASH_UNIT.lastIndex = 0;
-          return DASH_UNIT.test(sentence);
-        })
-        .slice(0, 8),
+      severity: "warning",
+      message: `破折号 ${dashPer10k}/万字（观察线 ${DASH_PER_10K_LIMIT}）；结合整章语义检查是否反复用破折号承担解释、补注或揭示，必要的对白拖音、中断和偶发重音可以保留。`,
+      examples: dashOccurrences.slice(0, 8),
+      occurrences: dashOccurrences,
     });
   }
 
@@ -140,31 +146,36 @@ export function analyzeChapterProseMetrics(
   if (contrastPer10k > CONTRAST_PER_10K_LIMIT) {
     issues.push({
       code: "contrast_density",
-      severity: "error",
-      message: `否定—改判句式家族 ${contrastMatches.length} 次（${contrastPer10k}/万字，硬上限 ${CONTRAST_PER_10K_LIMIT}/万字，对白与“没有A只有B”等衍生式一并计数）；只保留不可替代的少数实例，其余改为直接事实、动作或人物各自的说话方式。`,
+      severity: "warning",
+      message: `否定—改判句式家族 ${contrastMatches.length} 次（${contrastPer10k}/万字，观察线 ${CONTRAST_PER_10K_LIMIT}/万字，对白与“没有A只有B”等衍生式一并计数）；结合整章语义判断是否已形成重复改判口吻，只保留确有排除、纠错或人物声线功能的实例。`,
       examples: contrastMatches.slice(0, 5),
+      occurrences: contrastMatches,
     });
   }
 
   const samenessMatches = body.match(SAMENESS_FRAME) ?? [];
   const samenessPer10k = per10k(samenessMatches.length);
   if (samenessPer10k > SAMENESS_PER_10K_LIMIT) {
+    const samenessOccurrences = dedupe(samenessMatches);
     issues.push({
       code: "sameness_frame",
       severity: "warning",
       message: `「和X一样」认证句 ${samenessMatches.length} 次（${samenessPer10k}/万字，上限 ${SAMENESS_PER_10K_LIMIT}/万字）；不必为每个动作援引先例。`,
-      examples: dedupe(samenessMatches).slice(0, 5),
+      examples: samenessOccurrences.slice(0, 5),
+      occurrences: samenessOccurrences,
     });
   }
 
   const numericCount = countMatches(body, NUMERIC_READOUT);
   const numericPer10k = per10k(numericCount);
   if (numericPer10k > NUMERIC_PER_10K_LIMIT) {
+    const numericOccurrences = body.match(NUMERIC_READOUT) ?? [];
     issues.push({
       code: "numeric_readout",
       severity: "warning",
       message: `数值读数 ${numericPer10k}/万字（上限 ${NUMERIC_PER_10K_LIMIT}）；情绪与反应镜头改用比喻、动作或留白承载，同一数据源（心率/角度类）一章最多 3 次。`,
       examples: [],
+      occurrences: numericOccurrences,
     });
   }
 
@@ -221,7 +232,7 @@ export function analyzeChapterProseMetrics(
   };
 }
 
-/** Blocking message for deterministic metric errors only. Rhythm is advisory. */
+/** Blocking message for exact deterministic errors only. Style density is advisory. */
 export function chapterMetricsBlockError(metrics: ChapterProseMetrics): string | undefined {
   const errors = metrics.issues.filter(issue => issue.severity === "error");
   if (!errors.length) return undefined;

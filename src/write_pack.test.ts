@@ -35,6 +35,7 @@ import {
 import type { ToolExecutionContext } from "./tools/types.js";
 import { ChapterReviewRequestError } from "./chapter_review.js";
 import { proposalRevisionIssueId, proposalRevisionScopeKey } from "./proposal_retry.js";
+import { narrativeValidationReceipt } from "./narrative_validation.js";
 import { documentSpans } from "./document_spans.js";
 import type { AgentEvent } from "./types.js";
 
@@ -433,7 +434,8 @@ test("direct chapter proposal preserves reviewer knowledge blockers before creat
     };
     const content = "# 第一章\n\n来客径直说密钥藏在钟摆里。";
     const blocked = JSON.parse(await submitFullDocumentProposal(
-      args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+      args, "chapters/第一章.md", content, "来客试探北塔", undefined,
+      narrativeValidationReceipt(project.hash(content), { styleReviewed: true, semanticReviewed: false }),
     )) as Record<string, unknown>;
     assert.equal(blocked.code, "DIRECT_CHAPTER_REVIEW_BLOCKED");
     assert.equal(store.proposals().length, 0);
@@ -462,7 +464,8 @@ test("direct chapter proposal preserves reviewer knowledge blockers before creat
       unresolvedIssues: [issue],
     });
     const unchanged = JSON.parse(await submitFullDocumentProposal(
-      args, "chapters/第一章.md", content, "来客试探北塔", undefined, true,
+      args, "chapters/第一章.md", content, "来客试探北塔", undefined,
+      narrativeValidationReceipt(project.hash(content), { styleReviewed: true, semanticReviewed: false }),
     )) as Record<string, unknown>;
     assert.equal(unchanged.code, "DIRECT_CHAPTER_REVIEW_BLOCKED");
     assert.equal(reviewCalls, 1, "identical rejected body must reuse the prior blockers");
@@ -470,7 +473,8 @@ test("direct chapter proposal preserves reviewer knowledge blockers before creat
     shouldBlock = false;
     const revisedContent = "# 第一章\n\n来客只问钟摆是否需要检修。";
     const passed = JSON.parse(await submitFullDocumentProposal(
-      args, "chapters/第一章.md", revisedContent, "来客试探北塔", undefined, true,
+      args, "chapters/第一章.md", revisedContent, "来客试探北塔", undefined,
+      narrativeValidationReceipt(project.hash(revisedContent), { styleReviewed: true, semanticReviewed: false }),
     )) as Record<string, unknown>;
     assert.equal(passed.status, "pending");
     assert.equal(store.proposals().length, 1);
@@ -517,7 +521,7 @@ test("direct chapter proposal rejects a document modified while final review is 
       "# 第一章\n\n来客在雨里推开门，向昏暗的走廊深处走去。",
       "来客进入走廊",
       undefined,
-      true,
+      narrativeValidationReceipt(project.hash("# 第一章\n\n来客在雨里推开门，向昏暗的走廊深处走去。"), { styleReviewed: true, semanticReviewed: false }),
     )) as Record<string, unknown>;
 
     assert.deepEqual(result, {

@@ -10,6 +10,7 @@ import {
 } from "../tool_failure.js";
 import {
   handleAuditProseStyle,
+  handleGetDocumentQualityReport,
   handleInspectDocument,
   handleListDocuments,
   handleLocateDocumentSpan,
@@ -75,6 +76,7 @@ type Handler = (args: ToolHandlerArgs) => string | Promise<string>;
 const HANDLERS: Record<string, Handler> = {
   list_documents: handleListDocuments,
   audit_prose_style: handleAuditProseStyle,
+  get_document_quality_report: handleGetDocumentQualityReport,
   inspect_document: handleInspectDocument,
   locate_document_span: handleLocateDocumentSpan,
   read_document: handleReadDocument,

@@ -20,7 +20,7 @@ export const CHAPTER_REVIEW_MAX_OUTPUT_TOKENS = 16_000;
 const CHAPTER_REVIEW_ISSUE_KINDS = [
   "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
   "fact_conflict", "knowledge_leak", "unsupported_fact", "commitment_unmet", "identity_relationship", "capability_scope",
-  "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose",
+  "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose", "construction_repetition",
   "field_verbalization", "voice_macro_reuse", "template_reuse",
   "voice_homogenization", "dialogue_format", "dialogue_telegraphic",
   "theme_stated", "resolution_too_smooth", "dialogue_frictionless",
@@ -116,7 +116,7 @@ export type ChapterReviewIssue = {
   severity: "blocker" | "warning";
   kind: "seam" | "duplicate_function" | "turn_repetition" | "state_continuity" | "motif_reuse" | "chapter_arc"
     | "fact_conflict" | "knowledge_leak" | "unsupported_fact" | "commitment_unmet" | "identity_relationship" | "capability_scope"
-    | "telemetry_pileup" | "register_leak" | "compressed_prose" | "expository_mechanics" | "semantic_echo" | "generic_prose"
+    | "telemetry_pileup" | "register_leak" | "compressed_prose" | "expository_mechanics" | "semantic_echo" | "generic_prose" | "construction_repetition"
     | "field_verbalization" | "voice_macro_reuse" | "template_reuse"
     | "voice_homogenization" | "dialogue_format" | "dialogue_telegraphic"
     | "theme_stated" | "resolution_too_smooth" | "dialogue_frictionless"
@@ -218,6 +218,7 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 - 场景接续是否存在因果断裂、状态矛盾或换地点重复同一功能；章首到章尾是否形成与 chapterGoal 相符的变化。静场、铺垫章、过渡章和收束章可以只改变认知、关系或选择，不必强造对抗、悬念和损失；
 - telemetry_pileup：读数或术语连续出现，却不影响人物判断与行动；register_leak：资料中的规范术语跨越专业报告、普通对白、贴身叙述或人物内心后仍被当作唯一默认指称，使人物不像在自己的处境中说话或感受。单个必要术语、角色确有专业身份、正式状态汇报和首次精确定义都应放行；不得因词频本身报告，必须引用至少两处能证明语域不分的原文，并说明各处为什么应采用不同的信息精度或体验表达；compressed_prose：叙述或对白连续把主谓、动作对象、感受来源、比较维度或句间承接压成“名词短语＋谓词”，或用抽象归属硬扣物件制造短梗，导致句子虽可猜懂却长期像提纲字段。报此项必须引用至少两处相邻或同段原文并指出被压掉的具体关系；单个短句、军令、紧张重音、自然问答和符合人物压力的口语省略应放行；expository_mechanics：已经成立的动作又被教程式解释挤占；semantic_echo：相邻句段重复同一信息；generic_prose：关键场面长期只有泛化判断，缺少可辨认的现场依据；
 - field_verbalization：角色把权限、状态、时刻、读数、分类或角色卡摘要直接念成对白，或叙述者把资料字段改写成判断句，没有经过人物当前关注、交际目的和感受来源转换。正式汇报、紧急命令、对表核验和对方确实询问该字段时放行；必须引用至少两处当前正文的连续证据，说明字段为何没有成为人物行动。
+- construction_repetition：结合 proseSignals 中的章级候选，检查“不是A，是B”“没有A，只有B”、说明性破折号等高辨识度骨架是否跨段反复承担同一种改判或补充解释。统计值只负责定位；必须引用至少三处当前正文，逐处判断其场景功能。必要事实排除、人物即时纠错、对白中确有目的的反驳和偶发重音应保留。只有重复骨架贯穿关键场面、让不同人物与叙述者持续使用同一种改判口吻，并且多数实例可改为直接事实或动作而不损失信息时，才可判 blocker；否则 warning 或不报。
 - voice_macro_reuse：角色卡中的例句、短句节拍、反问、吐槽、术语或动作锚点被近邻改写后反复充当角色签名，出现时缺少当前触发条件和现场功能。相同动作若每次由不同压力触发并改变现场，不应判错；必须引用至少两处当前正文，说明复用的是句法/动作宏而非稳定的交际策略。
 - template_reuse：若提供 comparisonMaterials，只检查当前正文是否复用了旧章的事件槽位顺序、角色分工、道具功能、对白功能和收束方式；共享世界观事实、自然母题、地点或同一人物本身不构成复刻。evidence 仍必须逐字引用当前 fullChapter 至少两处连续证据，problem 可点明对照路径与结构，但不得把 comparisonMaterials 原句冒充当前正文证据。comparisonMaterials 仅供审查，绝不是写作范文。
 - voice_homogenization：主要人物的措辞、信息取舍和说话目的长期无法区分。若 evidence packet 有 dialogueCharacters，先对照其 voice、目标、关系与当前状态；判断两人是否因想达成不同事情而选择不同信息、回避角度和谈话策略（追问、换题、还价、拒绝、解释、威胁等）。报此项必须引用至少两名人物各自的逐字台词，并在 problem 说明可互换的原因；口语标记比例、短句或统计接近都不能单独成立。不要以口头禅、固定句长或强行回避作为角色声线模板；
@@ -227,11 +228,11 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 - dialogue_frictionless：仅当本章需要谈判、冲突、试探或隐瞒时，检查对白是否回避了应有的利益差异。直接回答、解释、配合、沉默和日常交流本身都有效，不因缺少“交锋动作”判错；
 - drive_flat / stakes_absent：结合 chapterGoal 判断本章是否承诺了未定结果或显著代价。若目标本来是休整、交代、确认或收束，不得要求每场都有主动阻力、不可逆代价或新钩子。
 
-分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。register_leak、field_verbalization、voice_macro_reuse 若有至少两处可定位正文证据且发生在普通对白或贴身叙述（非正式汇报），应判 blocker 并要求局部改写措辞、保留事实；不得因“只是文风”而一律 warning。主题直陈、声线趋同、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。proseSignals.cardRegister 只定位候选人设词泄漏，不能单独成为证据；判 blocker 仍须引用 fullChapter 原文。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
+分级原则：事实冲突、知识泄漏、关键因果无来源、状态断裂，以及足以使本章目标无法成立的结构问题可以判 blocker。register_leak、field_verbalization、voice_macro_reuse 若有至少两处可定位正文证据且发生在普通对白或贴身叙述（非正式汇报），应判 blocker 并要求局部改写措辞、保留事实；不得因“只是文风”而一律 warning。construction_repetition 必须满足其跨段、多证据和可替换条件，不能因超过观察线自动阻断。主题直陈、声线趋同、平顺对白、节奏与驱动力问题默认 warning；只有它们贯穿关键场面、明显妨碍理解或违背项目明确风格约定时才可判 blocker。proseSignals.cardRegister 只定位候选人设词泄漏，不能单独成为证据；判 blocker 仍须引用 fullChapter 原文。任何统计字段只用于定位候选段落，不能单独成为证据，也不能用阈值替代语义判断。
 
 单个准确数字、必要技术语言、短句、抽象句和直接对白均可保留。句式符号由独立门禁处理，本终审不做全文润色。evidence 必须逐字引用能证明问题的最短连续原文；没有充分证据就不报。若能给出包含 evidence、在全文中唯一且可整体替换的完整句/段，可选填 oldText；不确定唯一性时省略它。
 
-交付方式：完成审读后必须调用工具 submit_chapter_review 提交结论；不要用 assistant 纯文本、Markdown 代码块或 content 内嵌 JSON 代替。工具参数：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|commitment_unmet|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。若上下文提供 factContract，事实类判定以它为基准：must_land 未落地判 commitment_unmet，known_fact 被违背判 fact_conflict，do_not_invent 被补写判 unsupported_fact，越过 viewpoint 或 knowledge_gate 判 knowledge_leak；每条都要能引用正文原文，引不出就不要报。`;
+交付方式：完成审读后必须调用工具 submit_chapter_review 提交结论；不要用 assistant 纯文本、Markdown 代码块或 content 内嵌 JSON 代替。工具参数：verdict(pass|revise)；chapterChange；reviewNotes；issues(最多8项，每项 severity=blocker|warning、kind=seam|duplicate_function|turn_repetition|state_continuity|motif_reuse|chapter_arc|fact_conflict|knowledge_leak|unsupported_fact|commitment_unmet|identity_relationship|capability_scope|telemetry_pileup|register_leak|compressed_prose|expository_mechanics|semantic_echo|generic_prose|construction_repetition|field_verbalization|voice_macro_reuse|template_reuse|voice_homogenization|dialogue_format|dialogue_telegraphic|theme_stated|resolution_too_smooth|dialogue_frictionless|drive_flat|stakes_absent、sceneId、evidence最多3条、oldText可选、problem、action)。revise 必须至少有一项带 sceneId 和逐字证据的 blocker。事实类 blocker 的 problem 必须指出冲突的事实基准，或明确缺少哪条获知路径；不得只写“可能不合理”。若上下文提供 factContract，事实类判定以它为基准：must_land 未落地判 commitment_unmet，known_fact 被违背判 fact_conflict，do_not_invent 被补写判 unsupported_fact，越过 viewpoint 或 knowledge_gate 判 knowledge_leak；每条都要能引用正文原文，引不出就不要报。`;
 
 export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ role: "system" | "user"; content: string }> {
   return [
@@ -320,7 +321,7 @@ export function parseChapterReview(
   const kinds = new Set<ChapterReviewIssue["kind"]>([
     "seam", "duplicate_function", "turn_repetition", "state_continuity", "motif_reuse", "chapter_arc",
     "fact_conflict", "knowledge_leak", "unsupported_fact", "commitment_unmet", "identity_relationship", "capability_scope",
-    "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose",
+    "telemetry_pileup", "register_leak", "compressed_prose", "expository_mechanics", "semantic_echo", "generic_prose", "construction_repetition",
     "field_verbalization", "voice_macro_reuse", "template_reuse",
     "voice_homogenization", "dialogue_format", "dialogue_telegraphic",
     "theme_stated", "resolution_too_smooth", "dialogue_frictionless",

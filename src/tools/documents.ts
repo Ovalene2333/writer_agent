@@ -5,7 +5,12 @@ import { adjudicateLearnedProseGates, adjudicateProseStyleForAudit, applyCachedP
 import { analyzeAiTells, formatAiTellSummary, type AiTellProfile } from "../ai_tells.js";
 import { analyzeProseStyle } from "../prose_quality.js";
 import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
-import { documentKind } from "../project.js";
+import { documentKind, isScenePipelineDocument } from "../project.js";
+import {
+  buildProseQualityReport,
+  formatQualityReportLines,
+  PROSE_QUALITY_REPORT_VERSION,
+} from "../final_quality.js";
 import { proseGateRulesForTarget } from "../prose_gate_rules.js";
 import { buildProseDiagnosis } from "../prose_review.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -124,6 +129,40 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
       stats: aiTells.stats,
       issues: aiTells.issues,
     },
+  });
+}
+
+export function handleGetDocumentQualityReport({ input, project, store, context }: ToolHandlerArgs): string {
+  const path = normalizeTextFilePath(requireString(input.path, "path"));
+  const snapshot = readableTextFile({ project, context }, path);
+  assertExpectedSourceHash(input, snapshot.sourceHash);
+  if (!isScenePipelineDocument(path)) {
+    throw new Error("质量报告仅适用于 chapters/ 与 side/ 正文");
+  }
+  const cached = store.documentQualityReportSnapshot(path, snapshot.sourceHash);
+  const reusable = cached?.report.version === PROSE_QUALITY_REPORT_VERSION
+    && (!context.proseLength?.targetCharacters
+      || cached.report.length?.target === context.proseLength.targetCharacters);
+  const persisted = reusable
+    ? cached
+    : store.saveDocumentQualityReport(
+      path,
+      snapshot.sourceHash,
+      buildProseQualityReport(snapshot.content, context.proseLength?.targetCharacters
+        ? { lengthTarget: context.proseLength.targetCharacters }
+        : undefined),
+      "agent_tool",
+    );
+  return JSON.stringify({
+    path,
+    sourceHash: snapshot.sourceHash,
+    workingCopy: snapshot.workingCopy,
+    cached: reusable,
+    origin: persisted.origin,
+    createdAt: persisted.createdAt,
+    updatedAt: persisted.updatedAt,
+    report: persisted.report,
+    summary: formatQualityReportLines(persisted.report),
   });
 }
 

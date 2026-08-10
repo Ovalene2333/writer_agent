@@ -1530,7 +1530,7 @@ ${scenePipelineEnabled ? `- 若选择场景链，guide 只是可改导航。每�
 - 只交付用户本轮明确要求的正文范围；用户指定多章时逐章提交并沿用已读材料，未要求的章节不得自行扩展。遇到真实事实缺口才 ask_user；可逆的创作选择由你判断。`;
   if (mode === "rewrite") return `工作流（内部执行）：
 - 定位用户引用的原句：先 search_files，或用 read_file(path+quote) 读取原句及必要上下文。
-- 用户要求修复句式、文风、解释腔或生成感时，修改前先 audit_prose_style；按 diagnosis.actionableIssues 的 evidence 定位，优先 verdict=block，并复核 aiTells.issues 的示例与建议；资料文档只处理资料画像中的问题。revisionIntent 只规定修改目标、不当作替换句。一般修改不为展示流程调用审计。
+- 用户依据质量报告反馈，或要求修复句式、文风、解释腔、生成感时，先用 get_document_quality_report 读取目标哈希已有报告；报告缺失时工具只生成并持久化一次。需要语义裁决或报告未覆盖的定位证据时再调用 audit_prose_style，不要人工通读后猜测完整问题清单。报告是证据而非硬门禁，可保留有明确场景功能的实例。revisionIntent 只规定修改目标、不当作替换句。一般修改不为展示流程调用审计。
 - 对齐风格锚定与原文声线；只改作者要求的维度，其余事实/动机/信息序不变。
 - 若改动依赖大纲/设定核对：先读最小片段，将约束整理后 compile_write_pack，再据 writePack 改写。
 - 风格变化落到叙述距离、句长、对白比、感官与信息释放，勿同义替换或无故含蓄化。

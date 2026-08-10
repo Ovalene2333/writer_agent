@@ -45,9 +45,9 @@ export function writingWorkflowPrompt(kind: WritingWorkflowKind, quality: Writin
     return `阶段图：free。${qualityText[quality]}Agent 可按工具结果自主选路；完成条件仍由任务契约和文件提交结果判定。`;
   }
   if (kind === "scene_graph") {
-    return `阶段图：scene_graph。参考阶段 gather_context → shape_scene_chain → draft_unit → inspect_unit → submit_artifact。${qualityText[quality]}场景链只在能降低连续性风险时使用；可根据工具结果跳过或回退。`;
+    return `能力提示：scene_graph。场景链是可选的连续性工具，不是正文交付前置流程；${qualityText[quality]}验证与提交由正文出口统一处理，Agent 可根据工具结果跳过、回退或组合能力。`;
   }
-  return `阶段图：chapter_delivery。参考阶段 gather_context → shape_scene_chain → draft_unit → inspect_chapter → repair_targeted → submit_artifact。${qualityText[quality]}若已进入章节场景链，必须让运行时终审完成后再提交；未写场景引导可随实际结果修订。`;
+  return `能力提示：chapter_delivery。章节场景链是可选的连续性工具，不是唯一正文交付流程；${qualityText[quality]}一旦实际建立场景草稿，提交前必须验证当前整章版本，但验证入口与普通正文、写作包保持一致。未写场景引导可随实际结果修订。`;
 }
 
 export function writingWorkflowStagesForTool(
@@ -73,7 +73,7 @@ export function writingWorkflowStagesForTool(
   ].includes(toolName)) {
     stages.push("draft_unit");
   }
-  if (toolName === "audit_prose_style") stages.push("inspect_unit");
+  if (toolName === "audit_prose_style" || toolName === "get_document_quality_report") stages.push("inspect_unit");
   if (toolName === "inspect_chapter_draft") {
     stages.push("inspect_unit", "inspect_chapter");
   }
@@ -96,10 +96,8 @@ export function writingWorkflowCompletionGaps(
 ): string[] {
   if (task.mutation !== "document" && task.mutation !== "mixed") return [];
   if (!task.documentProposalRequired) return [];
-  const kind = task.workflow ?? inferWritingWorkflowKind(task);
-  if (kind === "free") return [];
   const gaps: string[] = [];
-  if (kind === "chapter_delivery" && stages.has("shape_scene_chain") && !stages.has("inspect_chapter")) {
+  if (stages.has("shape_scene_chain") && !stages.has("inspect_chapter")) {
     gaps.push("章节场景链已启动但尚未完成整章终审");
   }
   return gaps;

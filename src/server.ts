@@ -82,7 +82,8 @@ import {
 } from "./roleplay.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
 import { buildRecordedUsageEvent, type ModelUsageReporter } from "./model_usage.js";
-import { documentKind, WriterProject } from "./project.js";
+import { documentKind, isScenePipelineDocument, WriterProject } from "./project.js";
+import { buildProseQualityReport, PROSE_QUALITY_REPORT_VERSION } from "./final_quality.js";
 import { ProviderManager } from "./provider_catalog.js";
 import {
   providerConcurrencySnapshot,
@@ -1154,7 +1155,17 @@ export async function startWriterServer(options: {
       const path = context.req.query("path") ?? "";
       const content = options.project.read(path);
       const hash = options.project.hash(content);
-      const qualityReport = options.store.documentQualityReport(path, hash);
+      const cachedQualityReport = options.store.documentQualityReportSnapshot(path, hash);
+      const qualityReport = cachedQualityReport?.report.version === PROSE_QUALITY_REPORT_VERSION
+        ? cachedQualityReport.report
+        : isScenePipelineDocument(path)
+          ? options.store.saveDocumentQualityReport(
+            path,
+            hash,
+            buildProseQualityReport(content),
+            "web",
+          ).report
+          : undefined;
       return context.json({ path, content, hash, ...(qualityReport ? { qualityReport } : {}) });
     } catch (error) {
       return context.json({ error: errorMessage(error) }, 400);

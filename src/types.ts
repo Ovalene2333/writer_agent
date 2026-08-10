@@ -418,6 +418,8 @@ export interface Proposal {
  * layers; advisory only — it never blocks a proposal.
  */
 export interface ProseQualityReport {
+  /** Schema version for persisted derived reports; absent means legacy compact report. */
+  version?: number;
   characters: number;
   /** 0–100, higher is better (现场感). */
   vividness: { score: number; summary: string };
@@ -434,7 +436,19 @@ export interface ProseQualityReport {
     code: string;
     message: string;
     examples: string[];
+    /** Complete deterministic matches when the underlying analyzer can enumerate them. */
+    occurrences?: string[];
   }>;
+}
+
+/** Persisted derived report for one exact document body. */
+export interface DocumentQualityReportSnapshot {
+  path: string;
+  sourceHash: string;
+  report: ProseQualityReport;
+  origin: "proposal" | "revision" | "agent_tool" | "web" | "validation";
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ProposalCharacterChange {

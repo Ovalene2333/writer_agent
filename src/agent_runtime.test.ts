@@ -632,6 +632,10 @@ test("accepted final review report stays with the matching document version", ()
       store.documentQualityReport("chapters/第一章.md", project.hash(project.read("chapters/第一章.md"))),
       report,
     );
+    assert.equal(
+      store.documentQualityReportSnapshot("chapters/第一章.md", project.hash(project.read("chapters/第一章.md")))?.origin,
+      "revision",
+    );
 
     const edited = `${body}\n\n风穿过巷口。`;
     store.updateDocument("chapters/第一章.md", edited, project.hash(body));

@@ -44,3 +44,50 @@ test("AI 风格审计覆盖 lore 下的任意 UTF-8 文本，并使用资料画�
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("正文质量报告按精确哈希生成一次并跨 Store 持久化复用", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-quality-tool-"));
+  try {
+    const project = WriterProject.init(root, "质量报告工具");
+    const path = "chapters/第一章.md";
+    const content = Array.from({ length: 9 }, (_, index) =>
+      `第${index}段不是犹豫，是她听见门后有人换了站姿。`).join("\n\n");
+    project.writeRaw(path, content);
+    const sourceHash = project.hash(content);
+    let store = new WriterStore(project);
+    const sessionId = store.createSession("quality-tool");
+
+    const firstRaw = await executeTool(
+      { id: "quality-1", name: "get_document_quality_report", arguments: JSON.stringify({ path, sourceHash }) },
+      project,
+      store,
+      sessionId,
+      () => {},
+    );
+    const first = JSON.parse(firstRaw) as Record<string, unknown>;
+    const firstReport = first.report as { version?: number; warnings: Array<{ code: string; examples: string[]; occurrences?: string[] }> };
+    const contrast = firstReport.warnings.find(warning => warning.code === "contrast_density");
+    assert.equal(first.cached, false);
+    assert.equal(firstReport.version, 3);
+    assert.equal(contrast?.occurrences?.length, 9);
+    assert.ok((contrast?.occurrences?.length ?? 0) > (contrast?.examples.length ?? 0));
+    const createdAt = first.createdAt;
+    store.close();
+
+    store = new WriterStore(project);
+    const secondRaw = await executeTool(
+      { id: "quality-2", name: "get_document_quality_report", arguments: JSON.stringify({ path, sourceHash }) },
+      project,
+      store,
+      sessionId,
+      () => {},
+    );
+    const second = JSON.parse(secondRaw) as Record<string, unknown>;
+    assert.equal(second.cached, true);
+    assert.equal(second.createdAt, createdAt);
+    assert.deepEqual(second.report, first.report);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

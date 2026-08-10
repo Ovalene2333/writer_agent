@@ -37,3 +37,11 @@ test("scene guides and character reads expose source-linked capability selection
   const readProperties = getCharacter?.function.parameters.properties as Record<string, unknown>;
   assert.ok(Object.hasOwn(readProperties, "competencyIds"));
 });
+
+test("quality report tool exposes exact-snapshot lookup without mutation controls", () => {
+  const quality = TOOLS.find(tool => tool.function.name === "get_document_quality_report");
+  assert.ok(quality);
+  assert.deepEqual(quality.function.parameters.required, ["path"]);
+  const properties = quality.function.parameters.properties as Record<string, unknown>;
+  assert.ok(Object.hasOwn(properties, "sourceHash"));
+});

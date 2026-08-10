@@ -37,10 +37,14 @@ import { previewProseStyleGateError } from "../prose_adjudicate.js";
 import { dialogueFormatGateError } from "../dialogue_format.js";
 import {
   analyzeChapterProseMetrics,
-  chapterMetricsBlockError,
   findAdjacentDuplicateSentences,
   removeAdjacentDuplicateSentences,
 } from "../prose_metrics.js";
+import {
+  buildNarrativeValidationSnapshot,
+  narrativeValidationReceipt,
+  proseSignalsFromNarrativeValidation,
+} from "../narrative_validation.js";
 import { analyzeProseVividness, formatVividnessSummary } from "../prose_vividness.js";
 import { analyzeDialogueTexture, formatDialogueSummary } from "../dialogue_texture.js";
 import { characterName } from "../characters.js";
@@ -1323,14 +1327,25 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
         : "把 error 中列出的全部命中句在一次 revise_chapter_draft_style 调用中修完（最多 20 条替换），只替换命中句、不重写场景；修订结果自带复检（styleRecheck），复检 passed 后再重新 inspect，不要为查看结果单独 inspect。",
     });
   }
-  // Rhythm / reuse metrics on the newly written scenes only (base content excluded):
-  // AA repeats and heavy verbatim recycling block; the rest ships as a checklist.
+  // Every narrative source uses the same content-addressed validation snapshot.
+  // Scene-specific state remains here; delivery metrics no longer depend on the
+  // Agent having chosen this pipeline.
   const scenesText = draft.completed.map(scene => scene.content).join("\n\n");
-  const metrics = analyzeChapterProseMetrics(scenesText, {
-    priorText: priorProseText(project, draft, context) || undefined,
+  const validation = buildNarrativeValidationSnapshot({
+    store: args.store,
+    path: draft.path,
+    content,
+    sourceHash: project.hash(content),
+    ...(context.proseLength?.targetCharacters
+      ? { targetCharacters: context.proseLength.targetCharacters }
+      : {}),
+    ...(priorProseText(project, draft, context)
+      ? { priorText: priorProseText(project, draft, context) }
+      : {}),
+    origin: "validation",
   });
-  const metricsError = chapterMetricsBlockError(metrics);
-  if (metricsError) {
+  const metrics = validation.adaptive.metrics;
+  if (validation.metricBlockError) {
     saveDraftCheckpoint(args, "review_blocked", draft, {
       unresolved: metrics.issues.filter(issue => issue.severity === "error").flatMap(issue => issue.examples).slice(0, 20),
       reviewRepair: { mode: "style" },
@@ -1338,7 +1353,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
     return JSON.stringify({
       status: "style_revision_required",
       code: "CHAPTER_METRICS_BLOCKED",
-      error: metricsError,
+      error: validation.metricBlockError,
+      ...(validation.metricRepairPacket ? { repairPacket: validation.metricRepairPacket } : {}),
       metricIssues: metrics.issues.filter(issue => issue.severity === "error"),
       path: draft.path,
       complete: true,
@@ -1380,7 +1396,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
   }
   // Additive layer: never blocks, only tells the reviewer and the agent where the
   // chapter is correct but has no picture in it.
-  const vividness = analyzeProseVividness(scenesText);
+  const vividness = validation.adaptive.vividness;
   const vividnessWarnings = vividness.issues.map(issue => ({
     code: issue.code,
     message: issue.message,
@@ -1389,7 +1405,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
   // Same contract as vividness: measured, reported, never blocking. The only way
   // an AI-tell turns into a revise loop is the reviewer model judging it a blocker
   // (voice_homogenization / theme_stated / resolution_too_smooth).
-  const aiTells = analyzeAiTells(scenesText);
+  const aiTells = validation.adaptive.aiTells;
   const aiTellWarnings = aiTells.issues.map(issue => ({
     code: issue.code,
     message: issue.message,
@@ -1457,11 +1473,8 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             revisionBaselineContent: priorReviewCycle!.baselineContent,
           } : {}),
           proseSignals: {
-            stats: metrics.stats,
-            warnings: styleWarnings,
-            vividness: vividness.stats,
+            ...proseSignalsFromNarrativeValidation(validation),
             vividnessWarnings,
-            aiTells: aiTells.stats,
             aiTellWarnings,
             drive,
             dialogue: dialogue.stats,
@@ -1676,8 +1689,10 @@ async function submitChapterDraftProposal(
     assembleChapterSceneDraft(draft),
     values.summary,
     values.characterChanges,
-    true,
-    true,
+    narrativeValidationReceipt(project.hash(assembleChapterSceneDraft(draft)), {
+      styleReviewed: true,
+      semanticReviewed: true,
+    }),
   );
   let returnedResult = result;
   try {

@@ -75,7 +75,7 @@ test("analyzeChapterProseMetrics blocks adjacent duplicates and heavy recycling"
   assert.match(blocked, /复读|重合/);
 });
 
-test("analyzeChapterProseMetrics blocks dash overload and construction-family density", () => {
+test("analyzeChapterProseMetrics reports dash overload and construction-family density for semantic review", () => {
   const text = [
     "她看着屏幕——数据在跳——然后停住——像被掐断。",
     "不是伏击。是撤退。",
@@ -89,10 +89,10 @@ test("analyzeChapterProseMetrics blocks dash overload and construction-family de
   assert.ok(metrics.stats.contrastCount >= 2, `dialogue contrast frame must count too, got ${metrics.stats.contrastCount}`);
   const dash = metrics.issues.find(issue => issue.code === "dash_density");
   const contrast = metrics.issues.find(issue => issue.code === "contrast_density");
-  assert.equal(dash?.severity, "error");
+  assert.equal(dash?.severity, "warning");
   assert.ok(dash?.examples.some(example => example.includes("——")));
-  assert.equal(contrast?.severity, "error");
-  assert.match(chapterMetricsBlockError(metrics) ?? "", /破折号|句式家族/u);
+  assert.equal(contrast?.severity, "warning");
+  assert.equal(chapterMetricsBlockError(metrics), undefined);
 });
 
 test("analyzeChapterProseMetrics reports flat staccato rhythm without numeric hard blocking", () => {

@@ -218,9 +218,10 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     }
   }
   // Registered constructions have two independent axes. Flash decides whether an
-  // occurrence is semantically justified; the deterministic family budget is a
-  // review signal for unresolved/warned repetitions. An explicitly allowed
-  // occurrence is preserved and does not consume a hard budget slot.
+  // occurrence is semantically justified; the deterministic family budget still
+  // measures every occurrence unless the adjudicator explicitly marks it as
+  // metadata/non-usage. An allowed sentence may remain, but it must not make a
+  // chapter-wide repetition pattern disappear from the evidence.
   const characters = Math.max(1, text.replace(/\s/g, "").length);
   const familyRules = new Map(PROSE_CONSTRUCTION_RULES.map(rule => [rule.familyId, rule]));
   for (const [familyId, budgetRule] of familyRules) {
@@ -228,17 +229,19 @@ export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]):
     const counted = issues.filter(issue =>
       issue.constructionRuleId !== undefined
       && familyRuleIds.has(issue.constructionRuleId as typeof budgetRule.id)
-      && issue.semanticVerdict !== "allow"
       && issue.countsTowardFamilyBudget !== false,
     );
     const allowed = budgetRule.allowedOccurrences(characters);
     if (counted.length <= allowed) continue;
-    const keep = new Set(counted
+    const unresolved = counted.filter(issue => issue.semanticVerdict !== "allow");
+    const allowedCount = counted.length - unresolved.length;
+    const unresolvedBudget = Math.max(0, allowed - allowedCount);
+    const keep = new Set(unresolved
       .slice()
       .sort((left, right) => constructionKeepPriority(right) - constructionKeepPriority(left) || left.start - right.start)
-      .slice(0, allowed)
+      .slice(0, unresolvedBudget)
       .map(issue => issue.id));
-    for (const issue of counted) {
+    for (const issue of unresolved) {
       if (keep.has(issue.id)) continue;
       // Only unresolved/warned occurrences reach this branch; explicit allows
       // were excluded above, while explicit blocks remain actionable.

@@ -27,7 +27,14 @@ import {
 import { assessProseLength, proseLengthOutcome, type ProseLengthAssessment } from "../prose_length.js";
 import { MAX_CHAPTER_TARGET_CHARACTERS, MIN_CHAPTER_TARGET_CHARACTERS } from "../agent_runtime.js";
 import { documentKind, isScenePipelineDocument } from "../project.js";
-import { buildProseQualityReport, formatQualityReportLines } from "../final_quality.js";
+import { formatQualityReportLines } from "../final_quality.js";
+import {
+  buildNarrativeValidationSnapshot,
+  proseSignalsFromNarrativeValidation,
+  validationReceiptMatches,
+  type NarrativeValidationReceipt,
+  type NarrativeValidationSnapshot,
+} from "../narrative_validation.js";
 import {
   buildChapterReviewRevisionContext,
   ChapterReviewRequestError,
@@ -788,8 +795,7 @@ export async function handleProposeDocument({ input, project, store, sessionId, 
     content,
     requireString(input.summary, "summary"),
     input.characterChanges,
-    false,
-    false,
+    undefined,
     lengthNotice,
   );
 }
@@ -800,8 +806,7 @@ export async function submitFullDocumentProposal(
   proposedContent: string,
   summary: string,
   characterChanges: unknown,
-  proseStyleApproved = false,
-  semanticReviewApproved = false,
+  validationReceipt?: NarrativeValidationReceipt,
   /** 偏短但不阻断时给作者/Agent 看的一句话；随提案结果一起回给 Agent。 */
   lengthNotice?: string,
 ): Promise<string> {
@@ -858,7 +863,8 @@ export async function submitFullDocumentProposal(
     return baseChangedResult();
   }
   const expectedBaseHash = expectedDocumentBase?.sourceHash ?? liveBaseHash;
-  if (semanticReviewApproved && context.activeProposalRevisionPaths?.has(path)) {
+  let receiptMatches = validationReceiptMatches(validationReceipt, draftSourceHash);
+  if (receiptMatches && validationReceipt?.semanticReviewed && context.activeProposalRevisionPaths?.has(path)) {
     return JSON.stringify({
       status: "recoverable_state_error",
       code: "ACTIVE_REVISION_REQUIRES_FULL_DRAFT",
@@ -872,7 +878,7 @@ export async function submitFullDocumentProposal(
   // Every deterministic gate runs before anything is reported: one submission
   // should cost one repair round, not one round per gate.
   const surfaceFailures: SurfaceGateFailure[] = [];
-  if (!proseStyleApproved) {
+  if (!(receiptMatches && validationReceipt?.styleReviewed)) {
     const styleGate = await gateProseStyleWithSparseAutoRepair(
       beforeContent,
       proposedBody,
@@ -888,6 +894,7 @@ export async function submitFullDocumentProposal(
     styleAutoRepair = styleGate.autoRepair;
     policyObservations = styleGate.policyObservations;
     recordLatestProposalDraft(proposedBody, draftSourceHash);
+    receiptMatches = validationReceiptMatches(validationReceipt, draftSourceHash);
     if (styleGate.failure) surfaceFailures.push(styleGate.failure);
   }
   const narrative = isScenePipelineDocument(path);
@@ -904,13 +911,32 @@ export async function submitFullDocumentProposal(
   if (surfaceFailures.length) {
     throw mergedSurfaceGateError(surfaceFailures, path, draftSourceHash);
   }
-  if (!semanticReviewApproved && isScenePipelineDocument(path) && context.chapterReviewer) {
+  const targetCharacters = context.proseLength?.targetCharacters;
+  const narrativeValidation = narrative
+    ? buildNarrativeValidationSnapshot({
+      store,
+      path,
+      content: proposedBody,
+      sourceHash: draftSourceHash,
+      ...(targetCharacters ? { targetCharacters } : {}),
+      origin: "validation",
+    })
+    : undefined;
+  if (narrativeValidation?.metricBlockError) {
+    throw new ToolRevisionRequiredError(
+      "CHAPTER_METRICS_REVISION_REQUIRED",
+      narrativeValidation.metricBlockError,
+      { repairPacket: narrativeValidation.metricRepairPacket },
+    );
+  }
+  if (!(receiptMatches && validationReceipt?.semanticReviewed) && narrative && context.chapterReviewer) {
     const blocked = await reviewDirectNarrativeProposal(
       args,
       path,
       proposedBody,
       summary,
       cardRegisterAssessment,
+      narrativeValidation,
     );
     if (blocked) return blocked;
   }
@@ -918,11 +944,7 @@ export async function submitFullDocumentProposal(
   // Single funnel for every narrative proposal (场景管线与直接文档两条路都走这里), so the
   // author sees the same quality picture in the review dock no matter how it was written.
   // Advisory: the report never blocks — everything that blocks已在上面 gate 掉了。
-  const qualityReport = isScenePipelineDocument(path)
-    ? buildProseQualityReport(proposedBody, context.proseLength
-      ? { lengthTarget: context.proseLength.targetCharacters }
-      : undefined)
-    : undefined;
+  const qualityReport = narrativeValidation?.report;
   let proposal: Proposal;
   try {
     proposal = store.createProposal(
@@ -968,6 +990,7 @@ async function reviewDirectNarrativeProposal(
   content: string,
   summary: string,
   cardRegisterAssessment?: CardRegisterAssessment,
+  validation?: NarrativeValidationSnapshot,
 ): Promise<string | undefined> {
   const reviewer = args.context.chapterReviewer!;
   const runReview = reviewer.run ?? reviewChapterDraft;
@@ -1024,6 +1047,22 @@ async function reviewDirectNarrativeProposal(
     baseContext: reviewer.context,
   });
   const comparisonMaterials = directReviewComparisonMaterials(args, path);
+  const semanticContextHash = args.project.hash(JSON.stringify({
+    validator: "direct_chapter_review:v2",
+    summary,
+    reviewContext,
+    comparisonMaterials,
+    revisionReview,
+    proseSignals: (validation || cardRegisterAssessment) ? {
+      ...(validation ? proseSignalsFromNarrativeValidation(validation) : {}),
+      ...(cardRegisterAssessment ? proseSignalsFromCardRegister(cardRegisterAssessment) : {}),
+    } : undefined,
+  }));
+  const cachedSemanticReview = args.store.narrativeSemanticReview(path, contentSourceHash, semanticContextHash);
+  if (cachedSemanticReview && typeof cachedSemanticReview === "object" && !Array.isArray(cachedSemanticReview)
+    && (cachedSemanticReview as Record<string, unknown>).verdict === "pass") {
+    return undefined;
+  }
   const requestCharacters = content.length + reviewContext.length + summary.length
     + comparisonMaterials.reduce((sum, item) => sum + item.path.length + item.content.length, 0)
     + (revisionReview ? JSON.stringify(revisionReview).length : 0) + 1_200;
@@ -1065,9 +1104,12 @@ async function reviewDirectNarrativeProposal(
           revisionReview,
           revisionBaselineContent: revisionContext!.previousContent,
         } : {}),
-        ...(cardRegisterAssessment
-          ? { proseSignals: proseSignalsFromCardRegister(cardRegisterAssessment) }
-          : {}),
+        ...((validation || cardRegisterAssessment) ? {
+          proseSignals: {
+            ...(validation ? proseSignalsFromNarrativeValidation(validation) : {}),
+            ...(cardRegisterAssessment ? proseSignalsFromCardRegister(cardRegisterAssessment) : {}),
+          },
+        } : {}),
         scenes: [{
           sceneId: "document",
           title: path,
@@ -1096,7 +1138,10 @@ async function reviewDirectNarrativeProposal(
             content,
           )
         : reviewed.review;
-      if (constrainedReview.verdict === "pass") return undefined;
+      if (constrainedReview.verdict === "pass") {
+        args.store.saveNarrativeSemanticReview(path, contentSourceHash, semanticContextHash, constrainedReview);
+        return undefined;
+      }
       const repairPacket = chapterReviewRepairPacket(path, contentSourceHash, constrainedReview);
       return JSON.stringify({
         status: "final_review_revision_required",

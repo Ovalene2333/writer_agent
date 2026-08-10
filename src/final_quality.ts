@@ -13,10 +13,12 @@
  */
 
 import { formatAiTellSummary } from "./ai_tells.js";
-import { adaptiveQualityWarnings, analyzeAdaptiveStyle } from "./adaptive_style.js";
+import { adaptiveQualityWarnings, analyzeAdaptiveStyle, type AdaptiveStyleAnalysis } from "./adaptive_style.js";
 import { formatVividnessSummary } from "./prose_vividness.js";
 import { assessProseLength } from "./prose_length.js";
 import type { ProseQualityReport } from "./types.js";
+
+export const PROSE_QUALITY_REPORT_VERSION = 3;
 
 /** 生动度低于此分记一次扣分（现场感不足）。 */
 export const VIVIDNESS_GOOD_SCORE = 55;
@@ -31,6 +33,14 @@ export function buildProseQualityReport(
     text,
     options?.priorText ? { priorText: options.priorText } : undefined,
   );
+  return buildProseQualityReportFromAnalysis(text, adaptive, options);
+}
+
+export function buildProseQualityReportFromAnalysis(
+  text: string,
+  adaptive: AdaptiveStyleAnalysis,
+  options?: { lengthTarget?: number },
+): ProseQualityReport {
   const { vividness, aiTells } = adaptive;
   const warnings: ProseQualityReport["warnings"] = adaptiveQualityWarnings(adaptive);
 
@@ -40,6 +50,7 @@ export function buildProseQualityReport(
       || warning.code === "narrative_rhythm_uniform",
   );
   return {
+    version: PROSE_QUALITY_REPORT_VERSION,
     characters: vividness.stats.characters,
     vividness: { score: vividness.stats.score, summary: formatVividnessSummary(vividness.stats) },
     aiTells: { score: aiTells.stats.score, summary: formatAiTellSummary(aiTells.stats) },

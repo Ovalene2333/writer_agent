@@ -46,6 +46,7 @@ export type AdaptiveQualityWarning = {
   code: string;
   message: string;
   examples: string[];
+  occurrences?: string[];
 };
 
 export function analyzeAdaptiveStyle(
@@ -139,6 +140,7 @@ export function adaptiveQualityWarnings(analysis: AdaptiveStyleAnalysis): Adapti
         code: issue.code,
         message: issue.message,
         examples: issue.examples.slice(0, 5),
+        ...(issue.occurrences ? { occurrences: issue.occurrences } : {}),
       })),
     ...analysis.vividness.issues
       .filter(issue => !related.has(issue.code))
