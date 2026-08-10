@@ -57,16 +57,16 @@ export interface AgentExecutionProgress {
 const PROJECT_EVIDENCE_TOOLS = new Set([
   "read_file", "search_files", "get_outline_node",
   "get_character", "get_simple_character", "read_conversation",
-  "read_context_artifact",
+  "read_context_artifact", "search_session_artifacts",
 ]);
 
 const TARGET_EVIDENCE_TOOLS = new Set([
   "read_file", "search_files", "get_outline_node", "get_character", "get_simple_character",
-  "read_context_artifact",
+  "read_context_artifact", "search_session_artifacts",
 ]);
 
 const CONTINUATION_EVIDENCE_TOOLS = new Set([
-  "read_file", "read_context_artifact", "inspect_chapter_draft",
+  "read_file", "read_context_artifact", "search_session_artifacts", "inspect_chapter_draft",
 ]);
 
 const DOCUMENT_MUTATION_TOOLS = new Set([

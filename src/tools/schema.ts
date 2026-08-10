@@ -979,8 +979,26 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "search_session_artifacts",
+      description: "检索本会话已读资料、写作包、草稿、修订包、裁决、报告与提案的持久化目录；只返回摘要和 artifactId",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: { type: "string", description: "精确 artifact 类型；省略=全部" },
+          path: { type: "string", description: "精确文档路径；省略=全部" },
+          status: { type: "string", enum: ["active", "blocked", "resolved", "submitted", "applied", "superseded", "rejected", "stale"] },
+          query: { type: "string", description: "可选摘要检索词，不搜索正文内容" },
+          limit: { type: "number", description: "1–50，默认20" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_context_artifact",
-      description: "分页读取被 token 预算裁剪的完整工具结果；仅凭 artifactId 读取必要页",
+      description: "按 artifactId 分页读取本会话资料库中的完整内容；仅读取完成当前任务所需页",
       parameters: {
         type: "object",
         properties: {

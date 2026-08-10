@@ -1635,3 +1635,65 @@ test("semantic locator reranks bounded anchors and whole-document revision stays
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a rejected working copy returns its repair packet to the evidence Writer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-evidence-repair-"));
+  const project = WriterProject.init(root, "evidence-repair");
+  const store = new WriterStore(project);
+  try {
+    const sessionId = store.createSession("evidence-repair");
+    const path = "chapters/repair.md";
+    const rejected = "# 第一章\n\n不是风，是门后的脚步。";
+    const pack = compileWritePack("## 场景目标\n抵达城门\n## 已知事实\n城门关闭");
+    let writerCalls = 0;
+    const context: ToolExecutionContext = {
+      permissionMode: "ask",
+      workingTextFiles: new Map([[path, {
+        path,
+        content: rejected,
+        sourceHash: project.hash(rejected),
+        baseExists: false,
+        baseSourceHash: "__missing__",
+        repairIssues: [{
+          id: "style:contrast",
+          kind: "style",
+          oldText: "不是风，是门后的脚步。",
+          problem: "否定对照过密",
+          action: "直接写实际听见的声音",
+        }],
+      }]]),
+      evidenceWriterPacks: new Map([[path, pack]]),
+      proseLength: { targetCharacters: 500, enforceMinimum: false, mode: "guidance" },
+      evidenceGroundedWriter: {
+        model: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" },
+        stateModel: { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "state-test" },
+        run: async (_model, input) => {
+          writerCalls += 1;
+          assert.equal(input.existingText, rejected);
+          assert.equal(input.reviewIssues?.[0]?.evidence[0], "不是风，是门后的脚步。");
+          return {
+            content: "# 第一章\n\n门后传来一串脚步声。她停在紧闭的城门前。",
+            requestCharacters: 100,
+            evidenceHash: "evidence:test",
+            evidenceReads: [],
+          };
+        },
+      },
+    };
+    const result = JSON.parse(await executeTool(
+      { id: "repair", name: "write_file", arguments: JSON.stringify({ path }) },
+      project,
+      store,
+      sessionId,
+      () => {},
+      undefined,
+      context,
+    )) as Record<string, unknown>;
+    assert.equal(writerCalls, 1);
+    assert.equal(result.status, "pending", JSON.stringify(result));
+    assert.equal(store.proposals().filter(item => item.sessionId === sessionId).length, 1);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

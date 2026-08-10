@@ -102,7 +102,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "538854d55463b0a5");
+  assert.equal(agentToolSchemaHash(), "aed719fbeee6ebff");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -434,6 +434,7 @@ test("planner uses deterministic sampling, JSON mode and DeepSeek Thinking", () 
   assert.deepEqual(plannerCompletionOptions({ provider: "openai-compatible", baseUrl: "https://api.openai.com/v1" }), {
     temperature: 0,
     topP: 1,
+    thinking: { type: "enabled" },
   });
 });
 
@@ -670,8 +671,8 @@ test("chapter workflow lets the Agent choose a delivery path", () => {
   assert.match(instructions, /未列入的能力不得在正文使用或点名/);
   assert.match(instructions, /大纲不是前置条件/);
   assert.match(instructions, /设定中的规范术语是事实来源/);
-  assert.match(instructions, /上下文能猜出意思不等于表达自然/);
-  assert.match(instructions, /抽象归属或判断硬扣到物件/u);
+  assert.match(instructions, /表达与句式规则是边界/);
+  assert.match(instructions, /孤立且符合人物或文体的表达保留/u);
   assert.match(instructions, /## 表达边界/);
   assert.match(instructions, /不为普通名词制造同义词配额/);
   assert.match(instructions, /问题密集/);
@@ -1395,8 +1396,8 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
       undefined, undefined, undefined, false,
       { targetCharacters: 4_200, source: "settings", mode: "guidance" },
     );
-    assert.match(guidanceTarget, /弱引导参考/u);
-    assert.match(guidanceTarget, /不因偏离目标而缩句、扩句或发起重写/u);
+    assert.match(guidanceTarget, /弱引导只表示运行时不为差额强制返工/u);
+    assert.match(guidanceTarget, /章节已经自然完整时不要事后用总结、复述或无效支线机械凑字/u);
 
     // 这个数字每轮都可能变，只能待在 miss-priced 的动态块里。
     const stable = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "write_scene");
@@ -1855,4 +1856,85 @@ test("cache waterfall reports replayed turns separately from the live dynamic ta
   assert.equal(components.filter(item => item.kind === "user").length, 1);
   assert.equal(components.find(item => item.kind === "user")?.label, "当前用户请求");
   assert.equal(components.find(item => item.kind === "dynamic_system"), undefined);
+});
+
+test("session artifact repository keeps a pre-proposal revision independent of delivery state", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-session-artifacts-"));
+  const project = WriterProject.init(root, "session-artifacts");
+  let store = new WriterStore(project);
+  try {
+    const sessionId = store.createSession("session-artifacts");
+    const path = "chapters/draft.md";
+    const packContent = JSON.stringify({ sceneGoal: "抵达城门", knownFacts: ["城门关闭"] });
+    const packHash = project.hash(packContent);
+    const pack = store.saveSessionArtifact(sessionId, {
+      artifactKey: `write_pack:${path}:${packHash}`,
+      kind: "write_pack",
+      path,
+      sourceHash: packHash,
+      content: packContent,
+      digest: "城门场景写作包",
+    });
+    const body = "# 第一章\n\n她抵达关闭的城门。";
+    const bodyHash = project.hash(body);
+    const draft = store.saveSessionArtifact(sessionId, {
+      artifactKey: `draft:${bodyHash}`,
+      kind: "proposal_revision_draft",
+      path,
+      sourceHash: bodyHash,
+      content: body,
+      digest: "门禁前草稿",
+    });
+    const retryState = createProposalRetryState({ runId: "run-pre-proposal", path });
+    const revision = saveProposalRevisionCase(
+      { artifactId: draft.id, path, sourceHash: bodyHash },
+      "style",
+      { ...retryState, gateAttempts: { ...retryState.gateAttempts, style: 1 }, absoluteSubmissions: 1 },
+      1,
+      [],
+      undefined,
+      captureProposalRevisionDocumentBase(project, path),
+      store,
+      sessionId,
+      undefined,
+      {
+        writePackArtifactId: pack.id,
+        repairPacket: {
+          path,
+          sourceHash: bodyHash,
+          issueCount: 1,
+          issues: [{ id: "style:1", kind: "style", oldText: "她抵达关闭的城门。", action: "按人物感受改写" }],
+        },
+      },
+    );
+    assert.equal(revision.revisionCase.deliverableId, undefined);
+    assert.equal(revision.revisionCase.writePackArtifactId, pack.id);
+    assert.deepEqual(
+      new Set(store.sessionArtifactRelations(sessionId, revision.revisionCase.reviewArtifactId)
+        .filter(item => item.direction === "outgoing")
+        .map(item => item.relation)),
+      new Set(["repairs", "supported_by"]),
+    );
+    assert.equal(store.findSessionArtifacts(sessionId, {
+      kinds: ["proposal_revision_case"], statuses: ["blocked"], path,
+    }).length, 1);
+
+    const proposal = store.createProposal(sessionId, path, body, "提交待审正文");
+    const proposalArtifact = store.sessionArtifact(sessionId, `proposal:${proposal.id}`);
+    assert.equal(proposal.status, "pending");
+    assert.equal(proposalArtifact?.status, "submitted", "proposal mode must not become applied evidence");
+
+    store.close();
+    store = new WriterStore(project);
+    const restored = store.findSessionArtifacts(sessionId, {
+      kinds: ["proposal_revision_case"], statuses: ["blocked"], path,
+    });
+    assert.equal(restored.length, 1);
+    const restoredCase = JSON.parse(restored[0]!.content) as ProposalRevisionCase;
+    assert.equal(restoredCase.draftSourceHash, bodyHash);
+    assert.equal(restoredCase.writePackArtifactId, pack.id);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

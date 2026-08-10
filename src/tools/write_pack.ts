@@ -7,7 +7,7 @@ import { requireString } from "./helpers.js";
  * Compile planner notes / outline digests into a diegetic write pack.
  * Optional adapter for turning dense planning notes into diegetic writing material.
  */
-export function handleCompileWritePack({ input, context, store }: ToolHandlerArgs): string {
+export function handleCompileWritePack({ input, context, store, sessionId, project }: ToolHandlerArgs): string {
   const notes = requireString(input.notes, "notes");
   if (notes.length > 4_000) throw new Error("notes 过长（上限 4000 字）；只写场景目标、关键事实与事件顺序的要点清单，不要写成长文");
   const targetPath = typeof input.targetPath === "string" ? input.targetPath.trim() : undefined;
@@ -30,9 +30,22 @@ export function handleCompileWritePack({ input, context, store }: ToolHandlerArg
   context.writePackCompiled = true;
   context.lastWritePack = writePack;
   context.lastWritePackData = pack;
+  const packHash = project.hash(JSON.stringify(pack));
+  const artifact = store.saveSessionArtifact(sessionId, {
+    artifactKey: `write_pack:${targetPath ?? "unbound"}:${packHash}`,
+    kind: "write_pack",
+    ...(targetPath ? { path: targetPath } : {}),
+    sourceHash: packHash,
+    content: JSON.stringify(pack),
+    digest: `${targetPath ?? "待绑定正文"} 写作包：${pack.sceneGoal.slice(0, 160)}`,
+    status: "active",
+    metadata: { targetPath, instruction, factAtomCount: pack.factAtoms?.length ?? 0 },
+  });
+  context.lastWritePackArtifactId = artifact.id;
   context.writePackSceneId = undefined;
   return JSON.stringify({
     status: "compiled",
+    artifactId: artifact.id,
     writePack,
     factAtomCount: pack.factAtoms?.length ?? 0,
     realizationBoundaryCount: pack.realizationBoundaries?.length ?? 0,

@@ -379,6 +379,9 @@ async function handleEvidenceGroundedWriteFile(
 ): Promise<string> {
   const normalizedPath = normalizeTextFilePath(path);
   const compiledPack = args.context.writePackCompiled ? args.context.lastWritePackData : undefined;
+  const compiledPackArtifactId = args.context.writePackCompiled
+    ? args.context.lastWritePackArtifactId
+    : undefined;
   // A repair reuses the packet that produced the rejected body unless the Agent
   // deliberately compiled a new one; a first draft always requires a fresh compile.
   const pack = compiledPack ?? (repair ? args.context.evidenceWriterPacks?.get(normalizedPath) : undefined);
@@ -454,6 +457,12 @@ async function handleEvidenceGroundedWriteFile(
   // generation produces; a later first draft still needs its own compile.
   args.context.evidenceWriterPacks ??= new Map();
   args.context.evidenceWriterPacks.set(normalizedPath, pack);
+  const packArtifactId = compiledPackArtifactId
+    ?? args.context.evidenceWriterPackArtifactIds?.get(normalizedPath);
+  if (packArtifactId) {
+    args.context.evidenceWriterPackArtifactIds ??= new Map();
+    args.context.evidenceWriterPackArtifactIds.set(normalizedPath, packArtifactId);
+  }
   // The promises this body was written against become final review's baseline.
   // Without this the pack is a prompt nobody ever checks: the Writer is told
   // what must land and what may not be invented, and no later stage knows.
@@ -465,6 +474,7 @@ async function handleEvidenceGroundedWriteFile(
   args.context.writePackCompiled = false;
   args.context.lastWritePack = undefined;
   args.context.lastWritePackData = undefined;
+  args.context.lastWritePackArtifactId = undefined;
   const staged = stageWorkingTextFile(args, path, content);
   const result = await submitWorkingTextFile(args, staged, "write");
   const parsed = JSON.parse(result) as Record<string, unknown>;

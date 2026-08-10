@@ -11,6 +11,7 @@ import {
   formatQualityReportLines,
   PROSE_QUALITY_REPORT_VERSION,
 } from "../final_quality.js";
+import { documentQualityArtifactKey } from "../session_artifacts.js";
 import { proseGateRulesForTarget } from "../prose_gate_rules.js";
 import { buildProseDiagnosis } from "../prose_review.js";
 import type { ToolHandlerArgs } from "./types.js";
@@ -132,7 +133,7 @@ export async function handleAuditProseStyle({ input, project, context }: ToolHan
   });
 }
 
-export function handleGetDocumentQualityReport({ input, project, store, context }: ToolHandlerArgs): string {
+export function handleGetDocumentQualityReport({ input, project, store, context, sessionId }: ToolHandlerArgs): string {
   const path = normalizeTextFilePath(requireString(input.path, "path"));
   const snapshot = readableTextFile({ project, context }, path);
   assertExpectedSourceHash(input, snapshot.sourceHash);
@@ -152,7 +153,21 @@ export function handleGetDocumentQualityReport({ input, project, store, context 
         ? { lengthTarget: context.proseLength.targetCharacters }
         : undefined),
       "agent_tool",
+      undefined,
+      sessionId,
     );
+  if (reusable && cached) {
+    store.saveSessionArtifact(sessionId, {
+      artifactKey: documentQualityArtifactKey(path, snapshot.sourceHash, cached.report),
+      kind: "document_quality_report",
+      path,
+      sourceHash: snapshot.sourceHash,
+      content: JSON.stringify(cached.report),
+      digest: `${path} 质量报告（${cached.report.grade}）`,
+      status: "active",
+      metadata: { origin: cached.origin, reportVersion: cached.report.version },
+    });
+  }
   return JSON.stringify({
     path,
     sourceHash: snapshot.sourceHash,

@@ -6,7 +6,11 @@ import {
   normalizeCharacterChangeOp,
   validateCharacters,
 } from "../characters.js";
-import { adjudicateLearnedProseGates, adjudicateProseStyleForProposal } from "../prose_adjudicate.js";
+import {
+  adjudicateLearnedProseGates,
+  adjudicateProseStyleForProposal,
+  shouldAdjudicateForProposal,
+} from "../prose_adjudicate.js";
 import {
   isHardBlockSubtype,
   newProseStyleIssues,
@@ -679,6 +683,9 @@ export async function proseStyleGateIssues(
     // Verdicts persist across gate rounds so repeat inspects stay deterministic
     // and only genuinely new sentences spend another Flash call.
     context.proseVerdictCache ??= new Map();
+    const semanticAdjudicationRequired = shouldAdjudicateForProposal(afterContent, issues);
+    let semanticAdjudicationSettled = !semanticAdjudicationRequired;
+    const semanticAdjudicationFailures: string[] = [];
     for (const adjudicatorModel of adjudicatorModels) {
       const flash = await adjudicateProseStyleForProposal(
         afterContent,
@@ -692,7 +699,21 @@ export async function proseStyleGateIssues(
         },
       );
       issues = flash.issues;
-      if (!flash.skipped?.startsWith("model_error:")) break;
+      if (flash.skipped?.startsWith("model_error:")
+        || flash.skipped === "empty_verdicts"
+        || flash.skipped === "no_model") {
+        semanticAdjudicationFailures.push(flash.skipped);
+        continue;
+      }
+      semanticAdjudicationSettled = true;
+      break;
+    }
+    if (semanticAdjudicationRequired && !semanticAdjudicationSettled
+      && proposalStyleHardErrors(issues).length) {
+      throw new ToolDependencyError(
+        "PROSE_ADJUDICATION_UNAVAILABLE",
+        `句式候选需要语义裁决，但审核依赖未形成有效结论：${semanticAdjudicationFailures.join(" | ") || "无可用裁决"}`,
+      );
     }
     let learnedIssues: Awaited<ReturnType<typeof adjudicateLearnedProseGates>> | undefined;
     let learnedFailure: unknown;
@@ -879,6 +900,34 @@ export async function submitFullDocumentProposal(
   // should cost one repair round, not one round per gate.
   const surfaceFailures: SurfaceGateFailure[] = [];
   if (!(receiptMatches && validationReceipt?.styleReviewed)) {
+    const styleContextHash = project.hash(JSON.stringify({
+      validator: "prose_style_gate:v2",
+      rules: context.proseGateRules ?? [],
+      targetKind: documentKind(path),
+    }));
+    const styleReceiptKey = `prose_gate_receipt:${path}:${draftSourceHash}:${styleContextHash}`;
+    const priorStyleReceipt = store.sessionArtifact(sessionId, styleReceiptKey)
+      ?? store.findSessionArtifacts(sessionId, {
+        kinds: ["prose_gate_receipt"],
+        path,
+        statuses: ["active", "blocked"],
+        limit: 20,
+      }).find(item => item.metadata.contextHash === styleContextHash);
+    // Verdict keys are sentence-based, so never let another document's cache
+    // silently adjudicate this body. Exact-body receipts repopulate this scope.
+    context.proseVerdictCache = new Map();
+    if (priorStyleReceipt) {
+      try {
+        const parsed = JSON.parse(priorStyleReceipt.content) as { verdicts?: Array<[string, unknown]> };
+        if (Array.isArray(parsed.verdicts)) {
+          for (const [key, verdict] of parsed.verdicts) {
+            if (typeof key === "string" && verdict && typeof verdict === "object") {
+              context.proseVerdictCache.set(key, verdict as never);
+            }
+          }
+        }
+      } catch { /* Invalid legacy receipt is ignored and regenerated. */ }
+    }
     const styleGate = await gateProseStyleWithSparseAutoRepair(
       beforeContent,
       proposedBody,
@@ -893,6 +942,29 @@ export async function submitFullDocumentProposal(
     strippedMeta.push(...styleGate.stripped);
     styleAutoRepair = styleGate.autoRepair;
     policyObservations = styleGate.policyObservations;
+    const persistedStyleReceiptKey = `prose_gate_receipt:${path}:${draftSourceHash}:${styleContextHash}`;
+    const persistedStyleReceipt = store.saveSessionArtifact(sessionId, {
+      artifactKey: persistedStyleReceiptKey,
+      kind: "prose_gate_receipt",
+      path,
+      sourceHash: draftSourceHash,
+      content: JSON.stringify({
+        validator: "prose_style_gate:v2",
+        contextHash: styleContextHash,
+        status: styleGate.failure ? "blocked" : "pass",
+        verdicts: [...(context.proseVerdictCache ?? new Map()).entries()],
+        repairPacket: styleGate.failure?.repairPacket,
+      }),
+      digest: `${path} 句式门禁：${styleGate.failure ? "需修订" : "通过"}`,
+      status: styleGate.failure ? "blocked" : "active",
+      metadata: { contextHash: styleContextHash, validator: "prose_style_gate:v2" },
+      ...(priorStyleReceipt && priorStyleReceipt.artifactKey !== persistedStyleReceiptKey
+        ? { relations: [{ artifactId: priorStyleReceipt.id, relation: "supersedes" }] }
+        : {}),
+    });
+    if (priorStyleReceipt && priorStyleReceipt.id !== persistedStyleReceipt.id) {
+      store.updateSessionArtifactStatus(sessionId, priorStyleReceipt.id, "superseded");
+    }
     recordLatestProposalDraft(proposedBody, draftSourceHash);
     receiptMatches = validationReceiptMatches(validationReceipt, draftSourceHash);
     if (styleGate.failure) surfaceFailures.push(styleGate.failure);
@@ -1061,6 +1133,16 @@ async function reviewDirectNarrativeProposal(
   const cachedSemanticReview = args.store.narrativeSemanticReview(path, contentSourceHash, semanticContextHash);
   if (cachedSemanticReview && typeof cachedSemanticReview === "object" && !Array.isArray(cachedSemanticReview)
     && (cachedSemanticReview as Record<string, unknown>).verdict === "pass") {
+    args.store.saveSessionArtifact(args.sessionId, {
+      artifactKey: `semantic_review:${path}:${contentSourceHash}:${semanticContextHash}`,
+      kind: "narrative_semantic_review",
+      path,
+      sourceHash: contentSourceHash,
+      content: JSON.stringify(cachedSemanticReview),
+      digest: `${path} 语义终审：通过`,
+      status: "active",
+      metadata: { contextHash: semanticContextHash, cached: true },
+    });
     return undefined;
   }
   const requestCharacters = content.length + reviewContext.length + summary.length
@@ -1139,7 +1221,14 @@ async function reviewDirectNarrativeProposal(
           )
         : reviewed.review;
       if (constrainedReview.verdict === "pass") {
-        args.store.saveNarrativeSemanticReview(path, contentSourceHash, semanticContextHash, constrainedReview);
+        args.store.saveNarrativeSemanticReview(
+          path,
+          contentSourceHash,
+          semanticContextHash,
+          constrainedReview,
+          undefined,
+          args.sessionId,
+        );
         return undefined;
       }
       const repairPacket = chapterReviewRepairPacket(path, contentSourceHash, constrainedReview);

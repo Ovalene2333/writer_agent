@@ -58,7 +58,7 @@ export function writingWorkflowStagesForTool(
   const stages: WritingWorkflowStage[] = [];
   if ([
     "read_file", "search_files", "get_outline_node", "get_character",
-    "get_simple_character", "read_conversation", "read_context_artifact",
+    "get_simple_character", "read_conversation", "read_context_artifact", "search_session_artifacts",
     "list_outline_nodes", "validate_outline", "compare_outline_with_draft",
   ].includes(toolName)) {
     stages.push("gather_context");

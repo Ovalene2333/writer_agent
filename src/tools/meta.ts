@@ -157,10 +157,41 @@ export function handleReadSkillResource({ input, project }: ToolHandlerArgs): st
   });
 }
 
+export function handleSearchSessionArtifacts({ input, store, sessionId }: ToolHandlerArgs): string {
+  const kind = typeof input.kind === "string" && input.kind.trim() ? input.kind.trim() : undefined;
+  const path = typeof input.path === "string" && input.path.trim() ? input.path.trim() : undefined;
+  const status = typeof input.status === "string" && input.status.trim() ? input.status.trim() : undefined;
+  const query = typeof input.query === "string" ? input.query.trim().toLocaleLowerCase() : "";
+  const limit = Math.max(1, Math.min(50, Math.floor(Number(input.limit ?? 20)) || 20));
+  const allowedStatuses = new Set([
+    "active", "blocked", "resolved", "submitted", "applied", "superseded", "rejected", "stale",
+  ]);
+  if (status && !allowedStatuses.has(status)) throw new Error("未知 artifact 状态");
+  const artifacts = store.findSessionArtifacts(sessionId, {
+    ...(kind ? { kinds: [kind] } : {}),
+    ...(path ? { path } : {}),
+    ...(status ? { statuses: [status as never] } : {}),
+    limit: query ? 100 : limit,
+  }).filter(item => !query || [item.kind, item.path, item.digest, JSON.stringify(item.metadata)]
+    .filter(Boolean).join(" ").toLocaleLowerCase().includes(query))
+    .slice(0, limit)
+    .map(item => ({
+      artifactId: item.id,
+      kind: item.kind,
+      status: item.status,
+      path: item.path,
+      sourceHash: item.sourceHash,
+      digest: item.digest,
+      metadata: item.metadata,
+      updatedAt: item.updatedAt,
+    }));
+  return JSON.stringify({ status: "artifact_catalog", artifacts, count: artifacts.length });
+}
+
 export function handleReadContextArtifact({ input, store, sessionId }: ToolHandlerArgs): string {
   const artifactId = Number(input.artifactId);
   if (!Number.isInteger(artifactId) || artifactId <= 0) throw new Error("artifactId 必须是正整数");
-  const artifact = store.contextArtifactById(sessionId, artifactId);
+  const artifact = store.sessionArtifactById(sessionId, artifactId);
   if (!artifact) throw new Error("工作记忆不存在或不属于当前会话");
   const offset = Math.max(0, Math.floor(Number(input.offset ?? 0)) || 0);
   const limit = Math.max(500, Math.min(6_000, Math.floor(Number(input.limit ?? 4_000)) || 4_000));
@@ -169,8 +200,11 @@ export function handleReadContextArtifact({ input, store, sessionId }: ToolHandl
     status: "artifact_page",
     artifactId,
     kind: artifact.kind,
+    artifactStatus: artifact.status,
     path: artifact.path,
     sourceHash: artifact.sourceHash,
+    metadata: artifact.metadata,
+    relations: store.sessionArtifactRelations(sessionId, artifact.id),
     offset,
     nextOffset: offset + content.length,
     totalCharacters: artifact.content.length,

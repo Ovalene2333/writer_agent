@@ -54,6 +54,8 @@ export type ProposalRevisionCase = {
   /** Latest submitted body, including drafts stopped by deterministic gates. */
   draftArtifactId: number;
   draftSourceHash: string;
+  /** Fact packet that produced the draft; retained so its Writer can repair it. */
+  writePackArtifactId?: number;
   /** Latest body that actually received a semantic verdict. */
   semanticDraftArtifactId?: number;
   semanticDraftSourceHash?: string;

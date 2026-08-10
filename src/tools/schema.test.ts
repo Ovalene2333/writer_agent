@@ -45,3 +45,11 @@ test("quality report tool exposes exact-snapshot lookup without mutation control
   const properties = quality.function.parameters.properties as Record<string, unknown>;
   assert.ok(Object.hasOwn(properties, "sourceHash"));
 });
+
+test("session artifact catalog is discoverable without exposing artifact bodies", () => {
+  const search = TOOLS.find(tool => tool.function.name === "search_session_artifacts");
+  assert.ok(search);
+  const properties = search.function.parameters.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(properties), ["kind", "path", "status", "query", "limit"]);
+  assert.equal(search.function.parameters.required, undefined);
+});

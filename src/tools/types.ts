@@ -25,6 +25,7 @@ import type {
 import type { WritePack } from "../write_pack.js";
 import type { FactContract } from "../fact_contract.js";
 import type { RepairPacketIssue } from "../repair_packet.js";
+import type { ProposalRevisionCase } from "../proposal_retry.js";
 import type { RegisterRisk } from "../register_risks.js";
 import type { VolumeAccessPolicy } from "../volume_policy.js";
 
@@ -152,6 +153,8 @@ export type ToolExecutionContext = {
   lastWritePack?: string;
   /** Structured counterpart of lastWritePack; delegated Writer must not reparse display text. */
   lastWritePackData?: WritePack;
+  /** Session artifact backing lastWritePackData. */
+  lastWritePackArtifactId?: number;
   /** Scene id bound to the latest write pack while assembling a chapter. */
   writePackSceneId?: string;
   /**
@@ -160,6 +163,8 @@ export type ToolExecutionContext = {
    * Writer against the same facts, without forcing a full re-compile.
    */
   evidenceWriterPacks?: Map<string, WritePack>;
+  /** Session artifact IDs for the fact packets that produced each working body. */
+  evidenceWriterPackArtifactIds?: Map<string, number>;
   /**
    * Checkable commitments derived from each document's fact packet. Final review
    * judges the prose against these, which is what closes the fact layer: what the
@@ -267,6 +272,8 @@ export type ToolExecutionContext = {
   registerRisks?: RegisterRisk[];
   /** Semantic repair baselines, keyed by run + deliverable + path. */
   proposalReviewRevisions?: Map<string, ProposalReviewRevisionContext>;
+  /** Active draft transactions keyed by normalized path, independent of proposal/delivery state. */
+  proposalRevisionCasesByPath?: Map<string, ProposalRevisionCase>;
   /** Paths whose latest blocked full draft is not the persisted project version. */
   activeProposalRevisionPaths?: Set<string>;
   /** Current run's file overlay; read_file resolves this before persisted files. */

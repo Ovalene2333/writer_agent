@@ -8,6 +8,13 @@ import type {
   RoleplaySessionMemory, RoleplayWorkingState, SavedRoleplayInterlocutor, StyleTemplate, TokenPricing, UsageSummary, WritingExample,
   MessageStepTrail, PersistedStreamStep,
 } from "./types.js";
+import type {
+  SaveSessionArtifactInput,
+  SessionArtifact,
+  SessionArtifactRelation,
+  SessionArtifactStatus,
+} from "./session_artifacts.js";
+import { documentQualityArtifactKey } from "./session_artifacts.js";
 import {
   extensionForImageMime,
   isSupportedImageMime,
@@ -519,9 +526,22 @@ export class WriterStore {
         source_hash TEXT NOT NULL,
         content TEXT NOT NULL,
         digest TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
         last_used_at TEXT NOT NULL,
         UNIQUE(session_id, cache_key)
+      );
+      CREATE INDEX IF NOT EXISTS context_artifacts_session_kind_path
+        ON context_artifacts(session_id,kind,path,last_used_at DESC);
+      CREATE TABLE IF NOT EXISTS context_artifact_edges (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        from_artifact_id INTEGER NOT NULL REFERENCES context_artifacts(id) ON DELETE CASCADE,
+        to_artifact_id INTEGER NOT NULL REFERENCES context_artifacts(id) ON DELETE CASCADE,
+        relation TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(session_id,from_artifact_id,to_artifact_id,relation)
       );
       CREATE TABLE IF NOT EXISTS writing_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -836,37 +856,176 @@ export class WriterStore {
     if (!replayCommitColumns.some(column => column.name === "project_update_included")) {
       this.database.exec("ALTER TABLE agent_replay_commits ADD COLUMN project_update_included INTEGER NOT NULL DEFAULT 0");
     }
+    const contextArtifactColumns = this.database.prepare("PRAGMA table_info(context_artifacts)").all() as Row[];
+    if (!contextArtifactColumns.some(column => column.name === "status")) {
+      this.database.exec("ALTER TABLE context_artifacts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+    }
+    if (!contextArtifactColumns.some(column => column.name === "metadata_json")) {
+      this.database.exec("ALTER TABLE context_artifacts ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'");
+    }
+    if (!contextArtifactColumns.some(column => column.name === "updated_at")) {
+      this.database.exec("ALTER TABLE context_artifacts ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''");
+      this.database.exec("UPDATE context_artifacts SET updated_at=created_at WHERE updated_at=''");
+    }
+  }
+
+  private sessionArtifactFromRow(row: Row): SessionArtifact {
+    let metadata: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(String(row.metadata_json ?? "{}")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        metadata = parsed as Record<string, unknown>;
+      }
+    } catch { /* Legacy/corrupt metadata remains an empty object. */ }
+    return {
+      id: Number(row.id),
+      sessionId: String(row.session_id),
+      artifactKey: String(row.cache_key),
+      kind: String(row.kind),
+      ...(typeof row.path === "string" ? { path: row.path } : {}),
+      sourceHash: String(row.source_hash),
+      content: String(row.content),
+      digest: String(row.digest),
+      status: String(row.status ?? "active") as SessionArtifactStatus,
+      metadata,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at || row.created_at),
+      lastUsedAt: String(row.last_used_at),
+    };
+  }
+
+  sessionArtifact(sessionId: string, artifactKey: string): SessionArtifact | undefined {
+    const row = this.database.prepare("SELECT * FROM context_artifacts WHERE session_id=? AND cache_key=?")
+      .get(sessionId, artifactKey) as Row | undefined;
+    if (!row) return undefined;
+    const usedAt = new Date().toISOString();
+    this.database.prepare("UPDATE context_artifacts SET last_used_at=? WHERE id=?").run(usedAt, Number(row.id));
+    return this.sessionArtifactFromRow({ ...row, last_used_at: usedAt });
+  }
+
+  sessionArtifactById(sessionId: string, id: number): SessionArtifact | undefined {
+    const row = this.database.prepare("SELECT * FROM context_artifacts WHERE session_id=? AND id=?")
+      .get(sessionId, id) as Row | undefined;
+    return row ? this.sessionArtifactFromRow(row) : undefined;
+  }
+
+  saveSessionArtifact(sessionId: string, value: SaveSessionArtifactInput): SessionArtifact {
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO context_artifacts(
+        session_id,cache_key,kind,path,source_hash,content,digest,status,metadata_json,created_at,updated_at,last_used_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(session_id,cache_key) DO UPDATE SET
+        kind=excluded.kind,path=excluded.path,source_hash=excluded.source_hash,
+        content=excluded.content,digest=excluded.digest,status=excluded.status,
+        metadata_json=excluded.metadata_json,updated_at=excluded.updated_at,last_used_at=excluded.last_used_at`)
+      .run(
+        sessionId,
+        value.artifactKey,
+        value.kind,
+        value.path ?? null,
+        value.sourceHash,
+        value.content,
+        value.digest,
+        value.status ?? "active",
+        JSON.stringify(value.metadata ?? {}),
+        now,
+        now,
+        now,
+      );
+    const artifact = this.sessionArtifact(sessionId, value.artifactKey)!;
+    for (const relation of value.relations ?? []) {
+      this.linkSessionArtifacts(sessionId, artifact.id, relation.artifactId, relation.relation);
+    }
+    return artifact;
+  }
+
+  linkSessionArtifacts(
+    sessionId: string,
+    fromArtifactId: number,
+    toArtifactId: number,
+    relation: SessionArtifactRelation,
+  ): void {
+    if (!this.sessionArtifactById(sessionId, fromArtifactId)
+      || !this.sessionArtifactById(sessionId, toArtifactId)) {
+      throw new Error("资料关系引用了不存在或不属于当前会话的 artifact");
+    }
+    this.database.prepare(`INSERT OR IGNORE INTO context_artifact_edges(
+      session_id,from_artifact_id,to_artifact_id,relation,created_at
+    ) VALUES(?,?,?,?,?)`).run(sessionId, fromArtifactId, toArtifactId, relation, new Date().toISOString());
+  }
+
+  sessionArtifactRelations(sessionId: string, artifactId: number): Array<{
+    direction: "outgoing" | "incoming";
+    relation: SessionArtifactRelation;
+    artifactId: number;
+  }> {
+    return (this.database.prepare(`SELECT from_artifact_id,to_artifact_id,relation
+      FROM context_artifact_edges
+      WHERE session_id=? AND (from_artifact_id=? OR to_artifact_id=?)
+      ORDER BY created_at,from_artifact_id,to_artifact_id`).all(sessionId, artifactId, artifactId) as Row[]).map(row => {
+      const outgoing = Number(row.from_artifact_id) === artifactId;
+      return {
+        direction: outgoing ? "outgoing" : "incoming",
+        relation: String(row.relation) as SessionArtifactRelation,
+        artifactId: Number(outgoing ? row.to_artifact_id : row.from_artifact_id),
+      };
+    });
+  }
+
+  updateSessionArtifactStatus(sessionId: string, id: number, status: SessionArtifactStatus): void {
+    this.database.prepare("UPDATE context_artifacts SET status=?,updated_at=? WHERE session_id=? AND id=?")
+      .run(status, new Date().toISOString(), sessionId, id);
+  }
+
+  findSessionArtifacts(sessionId: string, options: {
+    kinds?: string[];
+    path?: string;
+    sourceHash?: string;
+    statuses?: SessionArtifactStatus[];
+    limit?: number;
+  } = {}): SessionArtifact[] {
+    const where = ["session_id=?"];
+    const values: Array<string | number> = [sessionId];
+    if (options.kinds?.length) {
+      where.push(`kind IN (${options.kinds.map(() => "?").join(",")})`);
+      values.push(...options.kinds);
+    }
+    if (options.path) { where.push("path=?"); values.push(options.path); }
+    if (options.sourceHash) { where.push("source_hash=?"); values.push(options.sourceHash); }
+    if (options.statuses?.length) {
+      where.push(`status IN (${options.statuses.map(() => "?").join(",")})`);
+      values.push(...options.statuses);
+    }
+    const limit = Math.max(1, Math.min(200, options.limit ?? 20));
+    values.push(limit);
+    return (this.database.prepare(`SELECT * FROM context_artifacts
+      WHERE ${where.join(" AND ")} ORDER BY updated_at DESC,id DESC LIMIT ?`).all(...values) as Row[])
+      .map(row => this.sessionArtifactFromRow(row));
   }
 
   contextArtifact(sessionId: string, cacheKey: string): { id: number; kind: string; path?: string; sourceHash: string; content: string; digest: string } | undefined {
-    const row = this.database.prepare("SELECT id,kind,path,source_hash,content,digest FROM context_artifacts WHERE session_id=? AND cache_key=?")
-      .get(sessionId, cacheKey) as Row | undefined;
-    if (!row) return undefined;
-    this.database.prepare("UPDATE context_artifacts SET last_used_at=? WHERE id=?").run(new Date().toISOString(), Number(row.id));
-    return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), content: String(row.content), digest: String(row.digest),
-      ...(typeof row.path === "string" ? { path: row.path } : {}) };
+    return this.sessionArtifact(sessionId, cacheKey);
   }
 
   contextArtifactById(sessionId: string, id: number): { id: number; kind: string; path?: string; sourceHash: string; content: string; digest: string } | undefined {
-    const row = this.database.prepare("SELECT id,kind,path,source_hash,content,digest FROM context_artifacts WHERE session_id=? AND id=?")
-      .get(sessionId, id) as Row | undefined;
-    if (!row) return undefined;
-    return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), content: String(row.content), digest: String(row.digest),
-      ...(typeof row.path === "string" ? { path: row.path } : {}) };
+    return this.sessionArtifactById(sessionId, id);
   }
 
   saveContextArtifact(sessionId: string, value: { cacheKey: string; kind: string; path?: string; sourceHash: string; content: string; digest: string }): number {
-    const now = new Date().toISOString();
-    this.database.prepare(`INSERT INTO context_artifacts(session_id,cache_key,kind,path,source_hash,content,digest,created_at,last_used_at)
-      VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,cache_key) DO UPDATE SET kind=excluded.kind,path=excluded.path,source_hash=excluded.source_hash,
-      content=excluded.content,digest=excluded.digest,last_used_at=excluded.last_used_at`)
-      .run(sessionId, value.cacheKey, value.kind, value.path ?? null, value.sourceHash, value.content, value.digest, now, now);
-    const row = this.database.prepare("SELECT id FROM context_artifacts WHERE session_id=? AND cache_key=?").get(sessionId, value.cacheKey) as Row;
-    return Number(row.id);
+    return this.saveSessionArtifact(sessionId, {
+      artifactKey: value.cacheKey,
+      kind: value.kind,
+      path: value.path,
+      sourceHash: value.sourceHash,
+      content: value.content,
+      digest: value.digest,
+    }).id;
   }
 
   recentContextArtifacts(sessionId: string, limit = 6): Array<{ id: number; kind: string; path?: string; sourceHash: string; digest: string }> {
-    return this.database.prepare("SELECT id,kind,path,source_hash,digest FROM context_artifacts WHERE session_id=? ORDER BY last_used_at DESC LIMIT ?")
+    return this.database.prepare(`SELECT id,kind,path,source_hash,digest FROM context_artifacts
+      WHERE session_id=? AND status IN ('active','blocked','submitted','applied')
+      ORDER BY last_used_at DESC LIMIT ?`)
       .all(sessionId, limit).map(raw => {
         const row = raw as Row;
         return { id: Number(row.id), kind: String(row.kind), sourceHash: String(row.source_hash), digest: String(row.digest),
@@ -3590,10 +3749,28 @@ export class WriterStore {
       INSERT INTO proposals(session_id,source_message_id,delivery_ready,path,summary,before_content,after_content,base_hash,character_changes_json,quality_report_json,status,created_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)
     `).run(sessionId, sourceMessageId ?? null, deliveryReady ? 1 : 0, path, summary, before, content, baseHash, JSON.stringify(characterChanges), qualityReport ? JSON.stringify(qualityReport) : "", now);
+    const proposalId = Number(result.lastInsertRowid);
+    const afterHash = this.project.hash(content);
     if (qualityReport) {
-      this.saveDocumentQualityReport(path, this.project.hash(content), qualityReport, "proposal", now);
+      this.saveDocumentQualityReport(path, afterHash, qualityReport, "proposal", now, sessionId);
     }
-    return this.proposal(Number(result.lastInsertRowid));
+    const qualityArtifact = qualityReport
+      ? this.findSessionArtifacts(sessionId, {
+        kinds: ["document_quality_report"], path, sourceHash: afterHash, limit: 1,
+      })[0]
+      : undefined;
+    this.saveSessionArtifact(sessionId, {
+      artifactKey: `proposal:${proposalId}`,
+      kind: "proposal",
+      path,
+      sourceHash: afterHash,
+      content: JSON.stringify({ proposalId, path, summary, status: "pending", baseHash }),
+      digest: `${path} 待审提案：${summary}`,
+      status: "submitted",
+      metadata: { proposalId, baseHash, deliveryReady },
+      ...(qualityArtifact ? { relations: [{ artifactId: qualityArtifact.id, relation: "validated_by" }] } : {}),
+    });
+    return this.proposal(proposalId);
   }
 
   private evolveCharactersForProposal(
@@ -3673,6 +3850,8 @@ export class WriterStore {
         : exists && this.project.hash(current) === proposal.baseHash;
       if (!unchanged) {
         this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
+        const artifact = this.sessionArtifact(proposal.sessionId, `proposal:${proposal.id}`);
+        if (artifact) this.updateSessionArtifactStatus(proposal.sessionId, artifact.id, "stale");
         throw new Error("文档已被修改，提案已过期，未覆盖当前内容");
       }
       const evolved = this.evolveCharactersForProposal(proposal.characterChanges);
@@ -3693,6 +3872,8 @@ export class WriterStore {
     const beforeHash = proposal.baseHash === "__missing__" ? "__missing__" : this.project.hash(beforeContent);
     if (currentHash !== expectedAfterHash && currentHash !== beforeHash) {
       this.database.prepare("UPDATE proposals SET status='stale' WHERE id=?").run(id);
+      const artifact = this.sessionArtifact(proposal.sessionId, `proposal:${proposal.id}`);
+      if (artifact) this.updateSessionArtifactStatus(proposal.sessionId, artifact.id, "stale");
       throw new Error("文档已在提案应用过程中发生冲突，未覆盖当前内容");
     }
     if (currentHash !== expectedAfterHash) this.project.writeRaw(proposal.path, proposal.afterContent);
@@ -3735,8 +3916,17 @@ export class WriterStore {
       throw error;
     }
     if (proposal.qualityReport) {
-      this.saveDocumentQualityReport(proposal.path, expectedAfterHash, proposal.qualityReport, "revision", now);
+      this.saveDocumentQualityReport(
+        proposal.path,
+        expectedAfterHash,
+        proposal.qualityReport,
+        "revision",
+        now,
+        proposal.sessionId,
+      );
     }
+    const proposalArtifact = this.sessionArtifact(proposal.sessionId, `proposal:${proposal.id}`);
+    if (proposalArtifact) this.updateSessionArtifactStatus(proposal.sessionId, proposalArtifact.id, "applied");
     this.refreshWritingMemoryForDocument(proposal.path, proposal.afterContent);
     this.reindex();
     return this.proposal(id);
@@ -3747,6 +3937,8 @@ export class WriterStore {
     if (proposal.status === "rejected") return proposal;
     if (proposal.status !== "pending") throw new Error("该提案已处理");
     this.database.prepare("UPDATE proposals SET status='rejected' WHERE id=?").run(id);
+    const artifact = this.sessionArtifact(proposal.sessionId, `proposal:${proposal.id}`);
+    if (artifact) this.updateSessionArtifactStatus(proposal.sessionId, artifact.id, "rejected");
     return this.proposal(id);
   }
 
@@ -4365,6 +4557,7 @@ export class WriterStore {
     report: ProseQualityReport,
     origin: DocumentQualityReportSnapshot["origin"],
     at = new Date().toISOString(),
+    sessionId?: string,
   ): DocumentQualityReportSnapshot {
     if (!path || !sourceHash) throw new Error("质量报告缺少文档路径或正文哈希");
     this.database.prepare(`
@@ -4375,7 +4568,20 @@ export class WriterStore {
         origin=excluded.origin,
         updated_at=excluded.updated_at
     `).run(path, sourceHash, JSON.stringify(report), origin, at, at);
-    return this.documentQualityReportSnapshot(path, sourceHash)!;
+    const snapshot = this.documentQualityReportSnapshot(path, sourceHash)!;
+    if (sessionId) {
+      this.saveSessionArtifact(sessionId, {
+        artifactKey: documentQualityArtifactKey(path, sourceHash, snapshot.report),
+        kind: "document_quality_report",
+        path,
+        sourceHash,
+        content: JSON.stringify(snapshot.report),
+        digest: `${path} 质量报告（${snapshot.report.grade}）`,
+        status: "active",
+        metadata: { origin: snapshot.origin, reportVersion: snapshot.report.version },
+      });
+    }
+    return snapshot;
   }
 
   narrativeSemanticReview(path: string, sourceHash: string, contextHash: string): unknown | undefined {
@@ -4394,6 +4600,7 @@ export class WriterStore {
     contextHash: string,
     review: unknown,
     at = new Date().toISOString(),
+    sessionId?: string,
   ): void {
     if (!path || !sourceHash || !contextHash) throw new Error("语义终审缓存缺少正文或上下文哈希");
     this.database.prepare(`
@@ -4403,6 +4610,18 @@ export class WriterStore {
         review_json=excluded.review_json,
         updated_at=excluded.updated_at
     `).run(path, sourceHash, contextHash, JSON.stringify(review), at, at);
+    if (sessionId) {
+      this.saveSessionArtifact(sessionId, {
+        artifactKey: `semantic_review:${path}:${sourceHash}:${contextHash}`,
+        kind: "narrative_semantic_review",
+        path,
+        sourceHash,
+        content: JSON.stringify(review),
+        digest: `${path} 语义终审`,
+        status: "active",
+        metadata: { contextHash },
+      });
+    }
   }
 
   restoreDocumentVersion(path: string, revisionId: number, baseHash: string): DocumentVersionMeta {

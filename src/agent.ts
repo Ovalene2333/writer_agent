@@ -2050,8 +2050,8 @@ function saveProposalRevisionDraft(
     const path = useCaptured ? captured!.path : inputPath;
     const deliverableId = useCaptured ? captured!.deliverableId : inputDeliverableId;
     const sourceHash = useCaptured ? captured!.sourceHash : project.hash(content);
-    const artifactId = store.saveContextArtifact(sessionId, {
-      cacheKey: proposalRevisionDraftCacheKey({
+    const artifactId = store.saveSessionArtifact(sessionId, {
+      artifactKey: proposalRevisionDraftCacheKey({
         runId: context?.runId,
         deliverableId,
         path,
@@ -2062,7 +2062,13 @@ function saveProposalRevisionDraft(
       sourceHash,
       content,
       digest: `${path ?? "当前文档"} 待修订稿 ${content.length} 字符`,
-    });
+      status: "active",
+      metadata: {
+        runId: context?.runId,
+        deliverableId,
+        writePackArtifactId: path ? context?.evidenceWriterPackArtifactIds?.get(path) : undefined,
+      },
+    }).id;
     return { artifactId, path, ...(deliverableId ? { deliverableId } : {}), sourceHash };
   } catch {
     return undefined;
@@ -2260,7 +2266,12 @@ export function saveProposalRevisionCase(
   store: WriterStore,
   sessionId: string,
   previous?: ProposalRevisionCase,
-  options?: { rhythmPolishPending?: boolean; semanticVerdict?: boolean; repairPacket?: RepairPacket },
+  options?: {
+    rhythmPolishPending?: boolean;
+    semanticVerdict?: boolean;
+    repairPacket?: RepairPacket;
+    writePackArtifactId?: number;
+  },
 ): ProposalRevisionDraftRef & { revisionCase: ProposalRevisionCase } {
   if (retryState.deliverableId !== draft.deliverableId || retryState.path !== draft.path) {
     throw new Error("提案修订稿与重试状态作用域不匹配");
@@ -2310,6 +2321,9 @@ export function saveProposalRevisionCase(
     ...effectiveDocumentBase,
     draftArtifactId: draft.artifactId,
     draftSourceHash: draft.sourceHash,
+    ...(options?.writePackArtifactId
+      ? { writePackArtifactId: options.writePackArtifactId }
+      : previous?.writePackArtifactId ? { writePackArtifactId: previous.writePackArtifactId } : {}),
     ...(semanticVerdict
       ? { semanticDraftArtifactId: draft.artifactId, semanticDraftSourceHash: draft.sourceHash }
       : previous?.semanticDraftArtifactId && previous.semanticDraftSourceHash
@@ -2331,23 +2345,37 @@ export function saveProposalRevisionCase(
     retention: "executable" as const,
   };
   const sourceHash = createHash("sha256").update(JSON.stringify(base)).digest("hex");
-  const reviewArtifactId = store.saveContextArtifact(sessionId, {
-    cacheKey: `proposal_revision_case:${retryState.runId}:${retryState.deliverableId ?? "document"}:${revisionCaseId}:${retryState.absoluteSubmissions}:${sourceHash}`,
+  if (previous?.reviewArtifactId) {
+    store.updateSessionArtifactStatus(sessionId, previous.reviewArtifactId, "superseded");
+  }
+  const reviewArtifactId = store.saveSessionArtifact(sessionId, {
+    artifactKey: `proposal_revision_case:${retryState.runId}:${retryState.deliverableId ?? "document"}:${revisionCaseId}:${retryState.absoluteSubmissions}:${sourceHash}`,
     kind: "proposal_revision_case",
     path: draft.path,
     sourceHash,
     content: JSON.stringify(base),
     digest: `${draft.path ?? "当前文档"} ${gate} 第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
-  });
+    status: "blocked",
+    metadata: { runId: retryState.runId, revisionCaseId, gate, attempt },
+    relations: [
+      { artifactId: draft.artifactId, relation: "repairs" },
+      ...(base.writePackArtifactId
+        ? [{ artifactId: base.writePackArtifactId, relation: "supported_by" as const }]
+        : []),
+    ],
+  }).id;
   const revisionCase: ProposalRevisionCase = { ...base, reviewArtifactId };
   const revisionCaseSourceHash = createHash("sha256").update(JSON.stringify(revisionCase)).digest("hex");
-  store.saveContextArtifact(sessionId, {
-    cacheKey: `proposal_revision_case:${retryState.runId}:${retryState.deliverableId ?? "document"}:${revisionCaseId}:${retryState.absoluteSubmissions}:${sourceHash}`,
+  store.saveSessionArtifact(sessionId, {
+    artifactKey: `proposal_revision_case:${retryState.runId}:${retryState.deliverableId ?? "document"}:${revisionCaseId}:${retryState.absoluteSubmissions}:${sourceHash}`,
     kind: "proposal_revision_case",
     path: draft.path,
     sourceHash: revisionCaseSourceHash,
     content: JSON.stringify(revisionCase),
     digest: `${draft.path ?? "当前文档"} ${gate} 第${attempt}轮：${unresolvedIssues.length}项未解决 blocker`,
+    status: "blocked",
+    metadata: { runId: retryState.runId, revisionCaseId, gate, attempt },
+    relations: [{ artifactId: draft.artifactId, relation: "repairs" }],
   });
   return { ...draft, revisionCase };
 }
@@ -2369,14 +2397,18 @@ function closeProposalRevisionCase(
   delete closed.rhythmPolishPending;
   delete closed.repairPacket;
   const sourceHash = createHash("sha256").update(JSON.stringify(closed)).digest("hex");
-  store.saveContextArtifact(sessionId, {
-    cacheKey: `proposal_revision_case:${current.runId}:${current.deliverableId ?? "document"}:${current.revisionCaseId}:resolved:${sourceHash}`,
+  store.saveSessionArtifact(sessionId, {
+    artifactKey: `proposal_revision_case:${current.runId}:${current.deliverableId ?? "document"}:${current.revisionCaseId}:resolved:${sourceHash}`,
     kind: "proposal_revision_case",
     path: current.path,
     sourceHash,
     content: JSON.stringify(closed),
     digest: `${current.path ?? "当前文档"} 修订案例已解决`,
+    status: "resolved",
+    metadata: { runId: current.runId, revisionCaseId: current.revisionCaseId },
+    relations: [{ artifactId: current.draftArtifactId, relation: "repairs" }],
   });
+  store.updateSessionArtifactStatus(sessionId, current.reviewArtifactId, "resolved");
 }
 
 function syncProposalReviewRevisionContext(
@@ -2387,9 +2419,11 @@ function syncProposalReviewRevisionContext(
 ): void {
   if (!revisionCase?.path) return;
   context.proposalReviewRevisions ??= new Map();
+  context.proposalRevisionCasesByPath ??= new Map();
   context.activeProposalRevisionPaths ??= new Set();
   context.workingTextFiles ??= new Map();
   if (revisionCase.status === "blocked") {
+    context.proposalRevisionCasesByPath.set(revisionCase.path, revisionCase);
     const draftArtifact = store.contextArtifactById(sessionId, revisionCase.draftArtifactId);
     if (draftArtifact && draftArtifact.sourceHash === revisionCase.draftSourceHash) {
       // The packet is only attached when it was built from this exact body; a stale
@@ -2407,8 +2441,21 @@ function syncProposalReviewRevisionContext(
         revisionCaseId: revisionCase.revisionCaseId,
         ...(repairIssues?.length ? { repairIssues } : {}),
       });
+      if (revisionCase.writePackArtifactId) {
+        const packArtifact = store.sessionArtifactById(sessionId, revisionCase.writePackArtifactId);
+        if (packArtifact?.kind === "write_pack") {
+          try {
+            const pack = JSON.parse(packArtifact.content) as import("./write_pack.js").WritePack;
+            context.evidenceWriterPacks ??= new Map();
+            context.evidenceWriterPackArtifactIds ??= new Map();
+            context.evidenceWriterPacks.set(revisionCase.path, pack);
+            context.evidenceWriterPackArtifactIds.set(revisionCase.path, packArtifact.id);
+          } catch { /* Corrupt legacy pack cannot be used for prose repair. */ }
+        }
+      }
     }
   } else {
+    context.proposalRevisionCasesByPath.delete(revisionCase.path);
     context.workingTextFiles.delete(revisionCase.path);
   }
   if (revisionCase.status === "blocked" && revisionCase.rhythmPolishPending) {
@@ -2445,6 +2492,7 @@ function clearProposalReviewRevisionContext(
   if (!revisionCase) return;
   context.proposalReviewRevisions?.delete(proposalRevisionScopeKey(revisionCase.retryState));
   if (revisionCase.path) {
+    context.proposalRevisionCasesByPath?.delete(revisionCase.path);
     context.activeProposalRevisionPaths?.delete(revisionCase.path);
     context.rhythmGracePaths?.delete(revisionCase.path);
     context.workingTextFiles?.delete(revisionCase.path);
@@ -3329,13 +3377,36 @@ export async function runAgent(options: {
   const archiveContext = `会话归档元数据（注入历史仅为预览；完整史用 inspect/read_conversation）：${JSON.stringify(store.conversationStats(sessionId))}`;
   const selectedContext = selectedBlocksContext(project, options.selectedDocumentBlocks);
   const historyText = historicalConversationContext(history);
+  const ledgerRevisionCases = agentLoop.snapshot.deliverables
+    .flatMap(item => item.proposalRevision ? [item.proposalRevision] : []);
+  const revisionFocusPath = task.targetPath ?? continuationPath;
+  const reusableSessionRevisionCases = activeSessionProposalRevisionCases(store, sessionId, project)
+    .filter(item => ledgerRevisionCases.some(ledger => ledger.revisionCaseId === item.revisionCaseId)
+      || (revisionFocusPath ? item.path === revisionFocusPath : task.continuation))
+    .map(item => item.runId === agentLoop.snapshot.id ? item : {
+      ...item,
+      runId: agentLoop.snapshot.id,
+      deliverableId: undefined,
+      retryState: {
+        ...item.retryState,
+        runId: agentLoop.snapshot.id,
+        deliverableId: undefined,
+      },
+    });
+  const revisionCasesByPath = new Map<string, ProposalRevisionCase>();
+  for (const revisionCase of [...ledgerRevisionCases, ...reusableSessionRevisionCases]) {
+    if (revisionCase.path && !revisionCasesByPath.has(revisionCase.path)) {
+      revisionCasesByPath.set(revisionCase.path, revisionCase);
+    }
+  }
+  const activeRevisionCases = [...revisionCasesByPath.values()];
   const artifactContext = [
     recentArtifactsContext(
       store,
       sessionId,
       project,
       task,
-      agentLoop.snapshot.deliverables.flatMap(item => item.proposalRevision ? [item.proposalRevision] : []),
+      activeRevisionCases,
     ),
     roleplayHandoffContext,
     availableImageReferencesContext(store, sessionId),
@@ -3508,8 +3579,8 @@ export async function runAgent(options: {
         }
       : {}),
   };
-  for (const deliverable of agentLoop.snapshot.deliverables) {
-    syncProposalReviewRevisionContext(toolContext, deliverable.proposalRevision, store, sessionId);
+  for (const revisionCase of activeRevisionCases) {
+    syncProposalReviewRevisionContext(toolContext, revisionCase, store, sessionId);
   }
   const persistAssistantMessage = (content: string): number => {
     const attachments = toolContext.generatedAttachments?.splice(0);
@@ -4561,11 +4632,15 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             proposalScopeError = `交付项 ${requestedDeliverableId} 不属于当前 AgentRun`;
           } else if (canonicalDeliverableId) {
             deliverableId = canonicalDeliverableId;
-            proposalRevisionBeforeCall = agentLoop.proposalRevision(canonicalDeliverableId);
             try {
               const input = JSON.parse(effectiveCall.arguments || "{}") as Record<string, unknown>;
               const path = typeof input.path === "string" ? input.path : undefined;
-              const activeRevision = proposalRevisionBeforeCall;
+              const pathScopedRevision = path
+                ? toolContext.proposalRevisionCasesByPath?.get(path)
+                : undefined;
+              const activeRevision = agentLoop.proposalRevision(canonicalDeliverableId)
+                ?? pathScopedRevision;
+              proposalRevisionBeforeCall = activeRevision;
               const pathOwner = path
                 ? agentLoop.snapshot.deliverables.find(item => item.id !== canonicalDeliverableId
                   && item.proposalRevision?.status === "blocked"
@@ -4590,15 +4665,22 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                 } else {
                   toolContext.proposalExpectedDocumentBase = {
                     path,
-                    deliverableId: canonicalDeliverableId,
+                    ...(activeRevision.deliverableId
+                      ? { deliverableId: activeRevision.deliverableId }
+                      : {}),
                     exists: activeRevision.baseDocumentExists,
                     sourceHash: activeRevision.baseDocumentSourceHash,
                     revisionCaseId: activeRevision.revisionCaseId,
                   };
-                  effectiveCall = {
-                    ...effectiveCall,
-                    arguments: JSON.stringify({ ...input, deliverableId: canonicalDeliverableId }),
-                  };
+                  // A pre-proposal revision remains path-scoped. Binding the tool
+                  // input to a later-opened deliverable would change transaction
+                  // identity halfway through the repair chain.
+                  if (activeRevision.deliverableId) {
+                    effectiveCall = {
+                      ...effectiveCall,
+                      arguments: JSON.stringify({ ...input, deliverableId: activeRevision.deliverableId }),
+                    };
+                  }
                 }
               } else {
                 if (!activeRevision && path) {
@@ -4618,6 +4700,40 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             } catch {
               // Invalid JSON is handled by executeTool and never consumes a gate.
             }
+          } else {
+            // Validation happens before a proposal exists. Keep its draft/base
+            // transaction path-scoped instead of manufacturing delivery evidence.
+            try {
+              const input = JSON.parse(effectiveCall.arguments || "{}") as Record<string, unknown>;
+              const path = typeof input.path === "string" ? input.path : undefined;
+              const activeRevision = path
+                ? toolContext.proposalRevisionCasesByPath?.get(path)
+                : undefined;
+              proposalRevisionBeforeCall = activeRevision;
+              if (activeRevision && path) {
+                const baseChangeReason = proposalRevisionBaseChangeReason(project, activeRevision);
+                if (baseChangeReason) {
+                  proposalScopeCode = "PROPOSAL_REVISION_BASE_CHANGED";
+                  proposalScopeRetryable = false;
+                  proposalScopeNextAllowedActions = ["ask_user"];
+                  proposalScopeError = `${baseChangeReason}；旧修订稿不能自动覆盖当前文档。请由用户确认后重新基于当前文档开始修订`;
+                } else {
+                  toolContext.proposalExpectedDocumentBase = {
+                    path,
+                    exists: activeRevision.baseDocumentExists,
+                    sourceHash: activeRevision.baseDocumentSourceHash,
+                    revisionCaseId: activeRevision.revisionCaseId,
+                  };
+                }
+              } else if (path) {
+                proposalDocumentBaseBeforeCall = captureProposalRevisionDocumentBase(project, path);
+                toolContext.proposalExpectedDocumentBase = {
+                  path,
+                  exists: proposalDocumentBaseBeforeCall.baseDocumentExists,
+                  sourceHash: proposalDocumentBaseBeforeCall.baseDocumentSourceHash,
+                };
+              }
+            } catch { /* Invalid JSON is handled by executeTool. */ }
           }
         }
         let toolResult: string;
@@ -4781,7 +4897,12 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                     store,
                     sessionId,
                     proposalRevisionBeforeCall,
-                    { rhythmPolishPending: true },
+                    {
+                      rhythmPolishPending: true,
+                      ...(savedDraft.path
+                        ? { writePackArtifactId: toolContext.evidenceWriterPackArtifactIds?.get(savedDraft.path) }
+                        : {}),
+                    },
                   );
                   draft = caseDraft;
                   agentLoop.setProposalRevision(
@@ -4815,6 +4936,17 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                   }
                 }
                 const proposalId = proposalIdFromToolResult(parsed);
+                if (proposalId !== undefined && proposalRevisionBeforeCall) {
+                  const proposalArtifact = store.sessionArtifact(sessionId, `proposal:${proposalId}`);
+                  if (proposalArtifact) {
+                    store.linkSessionArtifacts(
+                      sessionId,
+                      proposalArtifact.id,
+                      proposalRevisionBeforeCall.draftArtifactId,
+                      "derived_from",
+                    );
+                  }
+                }
                 proposalRetryBase = undefined;
               }
               const proposalId = proposalIdFromToolResult(parsed);
@@ -4889,15 +5021,20 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
                     proposalRevisionBeforeCall,
                     { rhythmPolishPending: Boolean(
                       scopePath && toolContext.rhythmGracePaths?.has(scopePath),
-                    ), semanticVerdict: gate === "semantic_review", ...(repairPacket ? { repairPacket } : {}) },
+                    ), semanticVerdict: gate === "semantic_review", ...(repairPacket ? { repairPacket } : {}),
+                    ...(scopePath
+                      ? { writePackArtifactId: toolContext.evidenceWriterPackArtifactIds?.get(scopePath) }
+                      : {}) },
                   )
                 : undefined;
-              if (caseDraft?.revisionCase && deliverableId) {
-                agentLoop.setProposalRevision(
-                  deliverableId,
-                  caseDraft.revisionCase,
-                  `proposal-revision:${sourceMessageId}:${step}:${call.id}:${caseDraft.revisionCase.retryState.absoluteSubmissions}`,
-                );
+              if (caseDraft?.revisionCase) {
+                if (deliverableId && caseDraft.revisionCase.deliverableId === deliverableId) {
+                  agentLoop.setProposalRevision(
+                    deliverableId,
+                    caseDraft.revisionCase,
+                    `proposal-revision:${sourceMessageId}:${step}:${call.id}:${caseDraft.revisionCase.retryState.absoluteSubmissions}`,
+                  );
+                }
                 syncProposalReviewRevisionContext(toolContext, caseDraft.revisionCase, store, sessionId);
               }
               const draft = proposalFailureDraft({
@@ -5358,6 +5495,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           toolContext.writePackCompiled = false;
           toolContext.lastWritePack = undefined;
           toolContext.lastWritePackData = undefined;
+          toolContext.lastWritePackArtifactId = undefined;
           toolContext.writePackSceneId = undefined;
           toolContext.chapterSceneDraft = undefined;
           toolContext.activeSceneCharacterScopes = undefined;
@@ -5861,6 +5999,7 @@ function recentArtifactsContext(
     item.draftArtifactId,
     item.reviewArtifactId,
     ...(item.semanticDraftArtifactId ? [item.semanticDraftArtifactId] : []),
+    ...(item.writePackArtifactId ? [item.writePackArtifactId] : []),
   ]));
   const recentArtifacts = store.recentContextArtifacts(sessionId, 12);
   const referencedArtifacts = [...activeRevisionArtifactIds].flatMap(id => {
@@ -5880,6 +6019,10 @@ function recentArtifactsContext(
       // an on-disk document yet. Source-backed reads still validate against disk.
       if (artifact.kind === "proposal_revision_draft" || artifact.kind === "proposal_revision_case") {
         return activeRevisionArtifactIds.has(artifact.id);
+      }
+      if (artifact.kind === "write_pack" || artifact.kind === "proposal"
+        || artifact.kind === "prose_gate_receipt" || artifact.kind === "narrative_semantic_review") {
+        return true;
       }
       if (!artifact.path) return true;
       if (project.isDocumentHidden(artifact.path)) return false;
@@ -5944,7 +6087,10 @@ function recentArtifactsContext(
     .filter(item => item.kind === "read_document" || item.kind === "read_document_span" || item.kind === "locate_document_span" || item.kind === "inspect_document"
       || item.kind === "read_file" || item.kind === "inspect_file"
       || item.kind === "get_outline_node" || item.kind === "list_outline_nodes"
-      || item.kind === "proposal_revision_draft" || item.kind === "proposal_revision_case")
+      || item.kind === "proposal_revision_draft" || item.kind === "proposal_revision_case"
+      || item.kind === "write_pack" || item.kind === "document_quality_report"
+      || item.kind === "prose_gate_receipt" || item.kind === "narrative_semantic_review"
+      || item.kind === "proposal")
     .map(({ id, kind, path, sourceHash, digest }) => ({
       id, kind, path, sourceHash,
       digest: digest.replace(/\s+/g, " ").slice(0, 240),
@@ -5965,6 +6111,36 @@ function recentArtifactsContext(
     artifacts: catalog,
     restoredReads: restored,
   })}`;
+}
+
+/** Latest executable draft transactions owned by this session, including ones
+ * opened before a proposal/deliverable existed or surviving an interrupted job. */
+function activeSessionProposalRevisionCases(
+  store: WriterStore,
+  sessionId: string,
+  project: WriterProject,
+): ProposalRevisionCase[] {
+  const byPath = new Map<string, ProposalRevisionCase>();
+  for (const artifact of store.findSessionArtifacts(sessionId, {
+    kinds: ["proposal_revision_case"],
+    statuses: ["blocked"],
+    limit: 100,
+  })) {
+    try {
+      const revisionCase = JSON.parse(artifact.content) as ProposalRevisionCase;
+      if (revisionCase.schemaVersion !== 3 || revisionCase.status !== "blocked"
+        || !revisionCase.path || revisionCase.reviewArtifactId !== artifact.id
+        || byPath.has(revisionCase.path)) continue;
+      if (proposalRevisionBaseChangeReason(project, revisionCase)) {
+        store.updateSessionArtifactStatus(sessionId, artifact.id, "stale");
+        continue;
+      }
+      byPath.set(revisionCase.path, revisionCase);
+    } catch {
+      store.updateSessionArtifactStatus(sessionId, artifact.id, "stale");
+    }
+  }
+  return [...byPath.values()];
 }
 
 /** Restore only a validated, unfinished write-scene checkpoint. */

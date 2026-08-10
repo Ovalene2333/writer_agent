@@ -68,6 +68,7 @@ import {
   handleManageAuthorPolicies,
   handleManageProseGates,
   handleReadContextArtifact,
+  handleSearchSessionArtifacts,
   handleReadSkillResource,
 } from "./meta.js";
 
@@ -121,6 +122,7 @@ const HANDLERS: Record<string, Handler> = {
   load_skill: handleLoadSkill,
   read_skill_resource: handleReadSkillResource,
   read_context_artifact: handleReadContextArtifact,
+  search_session_artifacts: handleSearchSessionArtifacts,
   manage_prose_gates: handleManageProseGates,
   generate_image: handleGenerateImage,
 };
