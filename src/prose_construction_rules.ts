@@ -32,6 +32,8 @@ export type ProseConstructionRule = {
   patterns: readonly RegExp[];
   generationGuidance: string;
   adjudicationGuidance: string;
+  /** Narration forms that remain revision-required even when locally defensible. */
+  revisionRequiredSubtypes: readonly ProseConstructionClassification["subtype"][];
   reviewAtCount: number;
   allowedOccurrences: (nonWhitespaceCharacters: number) => number;
   classify: (context: ProseConstructionCandidateContext) => ProseConstructionClassification;
@@ -46,8 +48,8 @@ export type ProseConstructionMatch = {
 
 const ABSTRACT_REFRAMING_WORDS = /(?:情绪|愤怒|恐惧|悲伤|不安|紧张|沉默|妥协|失败|成功|反抗|勇气|希望|绝望|灵魂|命运|意义|感觉|姿态|态度|选择|真相)/u;
 const DIRECT_FACT_SUGGESTIONS = [
-  "直接陈述真正成立的事实",
-  "若确需纠正误解，让人物通过对白、观察过程或后续反应完成",
+  "保留原句的节奏、意象和信息落点，改用动作、感受、视线变化或结果自然显出真正成立的事实",
+  "允许重组命中句及紧邻一句来维持文气；不要压成生硬的说明句，也不要扩大改写范围",
 ];
 
 export const PROSE_CONSTRUCTION_RULES = [
@@ -65,8 +67,9 @@ export const PROSE_CONSTRUCTION_RULES = [
       /不在于[^\n。！？!?]{1,48}而在于[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
       /(?:不能|算不上|谈不上|称不上)[^\n。！？!?]{1,40}(?:只是|不过是|更像)[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
     ],
-    generationGuidance: "叙述不要反复用先否定再改判（包括「不是……是/而是……」与拆句变体）、“没有A只有B”等同功能变体，或在成立事实后补一句否定标签来制造力度；优先让动作、感受或事实自行成立。必要的客观排除和人物即时纠错可以保留，但仍占句式家族额度。",
-    adjudicationGuidance: "判断候选是否在重新命名同一事实，或先写成立事实再追加否定补注；人物即时纠错、必要客观排除及确有语境作用者 allow，轻微模板化者 warn，重复解释者 block。语义 allow 与句式家族计数彼此独立。",
+    generationGuidance: "叙述不要用先否定后改判（包括「不是……是/而是……」与拆句变体）、“没有A只有B”等同功能变体，或在成立事实后补一句否定标签制造力度；语义递进和语义诠释也应让动作、感受、视线变化或结果自然显出。人物对白中的即时纠错可以保留，但仍占句式家族额度。修订时保留原有节奏、意象和信息落点，可重组命中句及紧邻一句，避免压成生硬说明句。",
+    adjudicationGuidance: "判断候选是否以否定—改判骨架完成语义递进、重新命名、感受诠释或在成立事实后追加否定补注。叙述中的 split_redefinition 与 abstract_reframing 必须 block：局部事实成立、比喻自然或确有语境作用都不能作为 allow 理由，因为应改由动作、感受、视线变化或结果承载。真实人物对白中的即时纠错可结合声线 allow；纯引用、代码或元数据标记为不计数。其他必要事实排除从严判断。语义 verdict 与句式家族计数彼此独立。",
+    revisionRequiredSubtypes: ["split_redefinition", "abstract_reframing"],
     reviewAtCount: 2,
     allowedOccurrences: characters => Math.max(1, Math.floor((characters * 4) / 10_000)),
     classify: context => {
@@ -114,6 +117,11 @@ export type ProseConstructionRuleId = typeof PROSE_CONSTRUCTION_RULES[number]["i
 
 export function proseConstructionRule(id: string | undefined): ProseConstructionRule | undefined {
   return PROSE_CONSTRUCTION_RULES.find(rule => rule.id === id);
+}
+
+export function proseConstructionRequiresRevision(ruleId: string | undefined, subtype: string): boolean {
+  const rule = proseConstructionRule(ruleId);
+  return Boolean(rule?.revisionRequiredSubtypes.includes(subtype as ProseConstructionClassification["subtype"]));
 }
 
 export function findProseConstructionMatches(text: string): ProseConstructionMatch[] {

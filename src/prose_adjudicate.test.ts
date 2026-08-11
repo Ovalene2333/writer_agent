@@ -209,7 +209,7 @@ test("shouldAdjudicateForProposal when dense hard mannerisms exist", () => {
   assert.equal(shouldAdjudicateForProposal(dense, denseIssues), true);
 });
 
-test("split not-A-is-B narration is semantically adjudicated instead of hard-coded", () => {
+test("split not-A-is-B narration cannot be exempted by a permissive semantic verdict", () => {
   const text = "她不是被叫醒。是自己醒的。";
   const issues = analyzeProseStyle(text);
   const split = issues.find(item => item.subtype === "split_redefinition");
@@ -224,12 +224,34 @@ test("split not-A-is-B narration is semantically adjudicated instead of hard-cod
   const freshSplit = fresh.find(item => item.subtype === "split_redefinition");
   assert.ok(freshSplit);
   const allowed = applyProseVerdicts(text, fresh, [{ id: freshSplit.id, verdict: "allow", reason: "必要事实排除" }]);
-  assert.equal(proseStyleIssuesError(allowed), undefined);
+  assert.ok(proseStyleIssuesError(allowed));
+  assert.equal(allowed.find(item => item.id === freshSplit.id)?.semanticVerdict, "block");
+  assert.match(allowed.find(item => item.id === freshSplit.id)?.suggestions[0] ?? "", /节奏、意象和信息落点/u);
 
   const cache: ProseVerdictCache = new Map([
     [proseVerdictCacheKey(freshSplit), { verdict: "allow", reason: "旧缓存误放行" }],
   ]);
-  assert.equal(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)), undefined);
+  assert.ok(proseStyleIssuesError(applyCachedProseVerdicts(text, analyzeProseStyle(text), cache)), "旧 allow 缓存不能绕过新规则");
+});
+
+test("semantic progression and interpretation contrasts are blocked with non-mechanical repair guidance", () => {
+  const text = [
+    "发射单元偏了。不是对着人。是对着谷口前三十米的碎石坡。",
+    "那感觉像把手从冰水里抽出来——不是疼，是脑子里突然少了很多东西。",
+  ].join("\n");
+  const issues = analyzeProseStyle(text);
+  const registered = issues.filter(item => item.constructionRuleId === "negation_redefinition");
+  assert.deepEqual(registered.map(item => item.subtype), ["split_redefinition", "abstract_reframing"]);
+  assert.ok(registered.every(item => item.severity === "error"));
+
+  const reviewed = applyProseVerdicts(text, issues, registered.map(item => ({
+    id: item.id,
+    verdict: "allow" as const,
+    reason: "局部事实成立且比喻自然",
+  })));
+  const reviewedRegistered = reviewed.filter(item => item.constructionRuleId === "negation_redefinition");
+  assert.ok(reviewedRegistered.every(item => item.semanticVerdict === "block"));
+  assert.ok(reviewedRegistered.every(item => item.suggestions.some(suggestion => /不要压成说明句/u.test(suggestion))));
 });
 
 test("semantic allow and deterministic construction-family budget stay independent", () => {

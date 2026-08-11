@@ -66,14 +66,14 @@ test("registered construction family budget blocks dense repetition before scene
   ].join("");
   const issues = analyzeProseStyle(dense).filter(issue => issue.constructionRuleId === "negation_redefinition");
   assert.equal(issues.length, 4);
-  assert.equal(issues.filter(issue => issue.severity === "error").length, 3);
+  assert.equal(issues.filter(issue => issue.severity === "error").length, 4);
   assert.ok(sceneMannerismGateError(dense));
   assert.ok(proseStyleIssuesError(issues));
 });
 
-test("scene gate leaves a single split negation-redefinition for semantic review", () => {
+test("scene gate blocks a single split negation-redefinition with soft repair guidance", () => {
   const blocked = sceneMannerismGateError("母亲的手收紧。不是抱。是扣。随后地板断了。");
-  assert.equal(blocked, undefined);
+  assert.match(blocked ?? "", /节奏、意象和信息落点/u);
 });
 
 test("a couple of factual negation frames share the short-scene family budget", () => {
@@ -169,8 +169,8 @@ test("distinguishes dialogue correction from narrator abstract reframing", () =>
 
   const narrationText = "这不是愤怒，而是一种更深的恐惧。";
   const narration = analyzeProseStyle(narrationText);
-  assert.ok(narration.some(issue => issue.subtype === "abstract_reframing" && issue.severity === "warning"));
-  assert.equal(contrastStyleError(narrationText), undefined);
+  assert.ok(narration.some(issue => issue.subtype === "abstract_reframing" && issue.severity === "error"));
+  assert.ok(contrastStyleError(narrationText));
 });
 
 test("repeated abstract contrast frames exceed a shared deterministic budget", () => {
@@ -182,25 +182,26 @@ test("repeated abstract contrast frames exceed a shared deterministic budget", (
   ].join("\n");
   const contrastIssues = analyzeProseStyle(text).filter(issue => issue.subtype === "abstract_reframing");
   assert.equal(contrastIssues.length, 4);
-  assert.equal(contrastIssues.filter(issue => issue.severity === "error").length, 3);
+  assert.equal(contrastIssues.filter(issue => issue.severity === "error").length, 4);
   assert.ok(contrastIssues.every(issue => issue.constructionRuleId === "negation_redefinition"));
   assert.ok(contrastStyleError(text));
 });
 
-test("a single abstract contrast remains advisory", () => {
+test("a single abstract contrast requires revision", () => {
   const text = "这不是愤怒，而是一种更深的恐惧。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "abstract_reframing");
-  assert.equal(issue?.severity, "warning");
-  assert.equal(contrastStyleError(text), undefined);
+  assert.equal(issue?.severity, "error");
+  assert.ok(contrastStyleError(text));
 });
 
-test("reports a split not-A-is-B narration for semantic review", () => {
+test("blocks a split not-A-is-B narration with a soft revision target", () => {
   const text = "她不是被叫醒。是自己醒的。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
   assert.ok(issue);
-  assert.equal(issue.severity, "warning");
+  assert.equal(issue.severity, "error");
   assert.equal(issue.sentence, text);
-  assert.equal(proseStyleIssuesError([issue]), undefined);
+  assert.ok(proseStyleIssuesError([issue]));
+  assert.match(issue.suggestions[0] ?? "", /节奏、意象和信息落点/u);
 });
 
 test("detects postposed denial after an already established fact", () => {
@@ -208,9 +209,9 @@ test("detects postposed denial after an already established fact", () => {
   const issue = analyzeProseStyle(text).find(item => item.constructionRuleId === "negation_redefinition");
   assert.ok(issue);
   assert.equal(issue.subtype, "abstract_reframing");
-  assert.equal(issue.severity, "warning");
+  assert.equal(issue.severity, "error");
   assert.match(issue.evidence, /不是紧张/u);
-  assert.equal(proseStyleIssuesError([issue]), undefined);
+  assert.ok(proseStyleIssuesError([issue]));
 });
 
 test("derivative negation-redefinition forms share the registered family", () => {
@@ -235,11 +236,11 @@ test("unrelated local patches do not inherit a pre-existing family-budget failur
     issue.constructionRuleId === "negation_redefinition" && issue.severity === "error"));
 });
 
-test("allows a single factual split contrast pending semantic review", () => {
+test("blocks a single factual split contrast because the narration skeleton needs revision", () => {
   const text = "他不是坏人。他是个逃兵。";
   const issue = analyzeProseStyle(text).find(item => item.subtype === "split_redefinition");
-  assert.equal(issue?.severity, "warning");
-  assert.equal(contrastStyleError(text), undefined);
+  assert.equal(issue?.severity, "error");
+  assert.ok(contrastStyleError(text));
 });
 
 test("reports only newly introduced issues for patches", () => {
@@ -301,7 +302,7 @@ test("style repair packet keeps every unique late blocker executable", () => {
   }
 });
 
-test("typical chapter snippet with mixed dashes does not block", () => {
+test("typical chapter snippet still blocks a semantic reinterpretation despite otherwise valid dashes", () => {
   const chapter = `
 夜色压在巷口。王二推开门——门轴吱了一声。
 「你——你怎么来了？」女孩往后退半步。
@@ -309,8 +310,8 @@ test("typical chapter snippet with mixed dashes does not block", () => {
 这不是愤怒，而是一种更深的恐惧。他仍没有解释，只把钥匙推过去。
 她没有接——因为手指还在发抖。
 `;
-  assert.equal(contrastStyleError(chapter), undefined);
-  assert.equal(proseStyleIssuesError(newProseStyleIssues("", chapter)), undefined);
+  assert.match(contrastStyleError(chapter) ?? "", /一种更深的恐惧/u);
+  assert.match(proseStyleIssuesError(newProseStyleIssues("", chapter)) ?? "", /一种更深的恐惧/u);
 });
 
 test("classifies adjacent explanatory labels as semantic echo candidates", () => {

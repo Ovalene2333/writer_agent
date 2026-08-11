@@ -2,6 +2,7 @@ import {
   findProseConstructionMatches,
   PROSE_CONSTRUCTION_RULES,
   proseConstructionRule,
+  proseConstructionRequiresRevision,
   proseConstructionGenerationPrompt,
 } from "./prose_construction_rules.js";
 import { boundedRepairPacket, type RepairPacket, type RepairPacketIssue } from "./repair_packet.js";
@@ -179,11 +180,12 @@ export function scanProseStyleIssues(text: string): ProseStyleIssue[] {
 export function escalateHardMannerisms(text: string, issues: ProseStyleIssue[]): ProseStyleIssue[] {
   for (const issue of issues) {
     if (issue.constructionRuleId) {
-      // Flash's semantic verdict is authoritative for whether a candidate is
-      // actually a violation. Density may discover a crowded family, but it
-      // must not turn an explicitly allowed sentence into a hard error (or
-      // downgrade an explicit block to a warning).
-      issue.severity = issue.semanticVerdict === "allow"
+      // A registered narration policy may require revision even when a reviewer
+      // finds the local meaning defensible. Local validity is not an escape hatch
+      // for a prohibited explanatory skeleton.
+      issue.severity = proseConstructionRequiresRevision(issue.constructionRuleId, issue.subtype)
+        ? "error"
+        : issue.semanticVerdict === "allow"
         ? "info"
         : issue.semanticVerdict === "block"
           ? "error"
@@ -462,7 +464,7 @@ function rewriteTipForSubtype(subtype: ProseStyleSubtype): string {
     case "abstract_reframing":
     case "split_redefinition":
     case "narrator_redefinition":
-      return "去掉「不是A而是B」模板，直接写成立事实或落到行动/对白";
+      return "保留节奏、意象和信息落点，重组命中句及紧邻一句，让动作、感受、视线变化或结果自然显出成立事实";
     case "semantic_echo":
       return "若前文证据已经充分，删除重复解释；否则只保留新增事实";
     case "emotion_label":

@@ -17,6 +17,7 @@ import { ToolDependencyError } from "./tool_failure.js";
 import {
   PROSE_CONSTRUCTION_RULES,
   proseConstructionAdjudicationPrompt,
+  proseConstructionRequiresRevision,
 } from "./prose_construction_rules.js";
 
 export type ProseVerdict = "allow" | "warn" | "block";
@@ -228,11 +229,14 @@ export function applyProseVerdicts(
   for (const issue of issues) {
     const hit = byId.get(issue.id);
     if (!hit) continue;
+    const verdict = proseConstructionRequiresRevision(issue.constructionRuleId, issue.subtype)
+      ? "block" as const
+      : hit.verdict;
     if (issue.constructionRuleId) {
-      issue.semanticVerdict = hit.verdict;
+      issue.semanticVerdict = verdict;
       if (hit.countsTowardFamilyBudget !== undefined) issue.countsTowardFamilyBudget = hit.countsTowardFamilyBudget;
     }
-    if (hit.verdict === "allow") {
+    if (verdict === "allow") {
       issue.severity = "info";
       issue.confidence = Math.min(issue.confidence, 0.55);
       if (hit.reason?.trim()) {
@@ -240,16 +244,22 @@ export function applyProseVerdicts(
       } else {
         issue.reason = `${issue.reason}（Flash：允许）`;
       }
-    } else if (hit.verdict === "warn") {
+    } else if (verdict === "warn") {
       if (issue.severity === "error") issue.severity = "warning";
       issue.confidence = Math.min(0.88, Math.max(issue.confidence, 0.75));
       if (hit.reason?.trim()) {
         issue.suggestions = [hit.reason.trim().slice(0, 120), ...issue.suggestions].slice(0, 4);
       }
-    } else if (hit.verdict === "block") {
+    } else if (verdict === "block") {
       if (issue.severity === "info") issue.severity = "warning";
       issue.confidence = Math.max(issue.confidence, 0.95);
-      if (hit.reason?.trim()) {
+      if (proseConstructionRequiresRevision(issue.constructionRuleId, issue.subtype)) {
+        issue.suggestions = [
+          "保留节奏、意象和信息落点，允许重组命中句及紧邻一句；改由动作、感受、视线变化或结果承载，不要压成说明句",
+          ...issue.suggestions,
+        ].slice(0, 4);
+        issue.reason = `${issue.reason}（注册规则：叙述中的语义递进/诠释型否定改判必须修订）`;
+      } else if (hit.reason?.trim()) {
         issue.suggestions = [hit.reason.trim().slice(0, 120), ...issue.suggestions].slice(0, 4);
         issue.reason = `${issue.reason}（Flash：建议改 — ${hit.reason.trim().slice(0, 80)}）`;
       }
@@ -693,11 +703,11 @@ async function requestProseAdjudication(
   outerSignal?: AbortSignal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<{ verdicts: ProseAdjudicationVerdict[]; discoveries: ProseAdjudicationDiscovery[]; usage?: ModelTokenUsage }> {
-  const system = `你是中文小说解释腔二审器。既要复核规则候选，也要在高风险段落中主动发现规则漏掉的解释回声，不要改写全文。正则只负责提供 candidates，不代表语义违规；必须结合相邻上下文裁决。
+  const system = `你是中文小说解释腔二审器。既要复核规则候选，也要在高风险段落中主动发现规则漏掉的解释回声，不要改写全文。正则只负责提供 candidates；注册规则声明为必须修订的叙述子类除外，其余候选必须结合相邻上下文裁决。
 注册句式规则：
 ${proseConstructionAdjudicationPrompt()}
 对 candidates 中每条给出 verdict：
-- allow：应放行（对白拖音/中断、停顿—揭示、短同位、列举、表格/元数据、口语纠正、客观事实排除等）
+- allow：应放行（对白拖音/中断、停顿—揭示、短同位、列举、表格/元数据、真实口语纠正等）；不要用“局部事实成立”“比喻自然”放行注册规则明确要求修订的叙述子类
 - warn：略模板化但不必拦截
 - block：明确的重复解释，建议局部改写
 若 candidate 属于注册句式，再独立给 countsTowardFamilyBudget。语义 allow 不等于免计数：人物对白、必要纠错和客观排除仍写 true；只有正文在引用/讨论该句式本身、代码或元数据而非实际使用时才写 false。非注册候选可省略。
