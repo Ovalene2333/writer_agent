@@ -1,6 +1,6 @@
 # 自动校验与廉价模型日志分析工作流
 
-状态：已完成（2026-08-11）
+状态：二期已完成（2026-08-11）
 
 恢复基线：`45b0583 refactor(agent): introduce event-driven runtime kernel`
 
@@ -54,11 +54,21 @@
 - [x] 使用本地项目执行 collect-only 烟测，不发送真实日志。
 - [x] 完成源码后运行 `npm run build`。
 
+### E. 面向上层 Agent 的纯文本快照
+
+- [x] 每次 collect/audit 都生成有界 `snapshot.txt`，包含范围、结论、finding、证据索引与下钻路径。
+- [x] 新增 `--text` 模式：stdout 仅输出快照正文，便于 Codex/Claude 直接作为低 token 上下文读取。
+- [x] 支持 `-q/--question` 传递用户原始排障问题，使补证与结论围绕明确目标而非泛化体检。
+- [x] OpenCode 后端允许省略 `--model`，复用用户已经配置的默认廉价模型。
+- [x] 在 `AGENTS.md` 和 `CLAUDE.md` 登记“日志排障先快照、必要时再下钻”的默认协议。
+- [x] 使用 WSL 原生 OpenCode 完成一次真实低成本端到端烟测，并复核快照体积。
+- [x] 更新测试、文档并再次运行 `npm run build`。
+
 ## 决策记录
 
 - OpenCode 官方 CLI 支持 `run` 非交互模式、`--format json`、`--model provider/model`、
-  `--agent`、`--file`、`--attach` 和 `--dir`。本机 Windows shim 在当前 WSL 沙箱因 vsock
-  失败，故不能把自动化绑定到当前 PATH；适配器必须允许显式指定原生可执行文件或 headless server。
+  `--agent`、`--file`、`--attach` 和 `--dir`。适配器允许复用默认模型、显式指定原生可执行文件或
+  headless server；2026-08-11 用户已在 WSL 安装并配置 OpenCode 1.18.16。
 - 不让 OpenCode 自由扫描项目私有目录。宿主先生成最小证据包，OpenCode 只读取该文件并返回报告。
 - direct 后端是稳定基线，OpenCode 是可选 Agent 外壳；两者共用同一证据和报告协议。
 
@@ -71,3 +81,9 @@
 - 2026-08-11：协议/脱敏/预算/证据引用/OpenCode 参数测试 4/4 通过；`p/jn3` 以 96 KiB 预算完成
   collect-only 烟测，未调用模型，生成证据约 86 KiB，未发现密钥形态。
 - 2026-08-11：`npm run build` 完整通过；Vite 仅报告既有第三方 `use client` 与动态/静态重复导入警告。
+- 2026-08-11：二期增加 `snapshot.txt`/`--text`、OpenCode 默认模型、用户问题 `-q`、Codex/Claude
+  仓库级先快照协议。修复 OpenCode 1.18.16 的 `--file` 数组吞掉 positional prompt、reasoning 事件误解析、
+  `--fail-on none` 误返回 2 等真实烟测问题。
+- 2026-08-11：WSL 原生 OpenCode 端到端验证通过；以“为什么这个 Job 当时没有输出？”为唯一问题，
+  单轮生成 completed 快照并引用 Job/消息/Run/提案证据。快照硬上限收紧为 12,000 字符。
+- 2026-08-11：二期完整构建通过，专项测试 6/6；Vite 仅保留既有第三方与 chunk 提示。

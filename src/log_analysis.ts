@@ -57,6 +57,19 @@ export type LogAnalysisFinding = {
   recommendation?: string;
 };
 
+export type LogAuditFailureThreshold = LogAnalysisFinding["severity"] | "none";
+
+export function logAuditFindingsTriggerFailure(
+  findings: Pick<LogAnalysisFinding, "severity">[],
+  threshold: LogAuditFailureThreshold,
+): boolean {
+  if (threshold === "none") return false;
+  const rank: Record<LogAnalysisFinding["severity"], number> = {
+    critical: 0, high: 1, medium: 2, low: 3, info: 4,
+  };
+  return findings.some(item => rank[item.severity] <= rank[threshold]);
+}
+
 export type LogAnalysisReport = {
   version: typeof LOG_ANALYSIS_VERSION;
   status: "completed" | "inconclusive";
@@ -88,6 +101,7 @@ export type LogAuditOptions = {
   collectOnly?: boolean;
   jobId?: string;
   runId?: string;
+  question?: string;
 };
 
 export type LogAuditResult = {
@@ -95,13 +109,14 @@ export type LogAuditResult = {
   runDir: string;
   manifestPath: string;
   evidencePath: string;
+  snapshotPath: string;
   reportPath?: string;
   report?: LogAnalysisReport;
   evidence: LogEvidence[];
 };
 
 type AuditScope = Required<Pick<LogAuditOptions, "sinceHours" | "limit" | "maxEvidenceBytes" | "maxRounds">>
-  & Pick<LogAuditOptions, "jobId" | "runId">;
+  & Pick<LogAuditOptions, "jobId" | "runId" | "question">;
 
 type Row = Record<string, unknown>;
 
@@ -327,6 +342,7 @@ export function collectLogEvidence(project: WriterProject, options: LogAuditOpti
     maxRounds: Math.max(1, Math.min(6, Math.floor(options.maxRounds ?? 3))),
     ...(options.jobId ? { jobId: options.jobId } : {}),
     ...(options.runId ? { runId: options.runId } : {}),
+    ...(options.question?.trim() ? { question: options.question.trim().slice(0, 1_000) } : {}),
   };
   const evidence: LogEvidence[] = [];
   const budget = { remaining: scope.maxEvidenceBytes };
@@ -347,6 +363,7 @@ export function collectLogEvidence(project: WriterProject, options: LogAuditOpti
         cutoff,
         jobId: scope.jobId,
         runId: scope.runId,
+        analysisQuestion: scope.question,
         tables: presentTables,
         prefixCacheLog: existsSync(prefixCacheLogPath(project.root)),
         privacy: "正文、完整对话、供应商凭据未采集；步骤仅保留状态、工具名和字符数",
@@ -357,7 +374,7 @@ export function collectLogEvidence(project: WriterProject, options: LogAuditOpti
       const params = scope.jobId ? [scope.jobId] : [cutoff];
       addEvidence(evidence, budget, {
         kind: "jobs", title: "近期后台 Job", source: "writer.db:background_jobs",
-        data: rows(database, `SELECT id,session_id,status,source_message_id,length(terminal_message) AS terminal_chars,created_at,updated_at FROM background_jobs ${where} ORDER BY updated_at DESC LIMIT ?`, ...params, scope.limit),
+        data: rows(database, `SELECT id,session_id,status,kind,source_message_id,length(terminal_message) AS terminal_chars,CASE WHEN status NOT IN ('running','completed','cancelled') THEN substr(terminal_message,1,2000) END AS failure_message,created_at,updated_at FROM background_jobs ${where} ORDER BY updated_at DESC LIMIT ?`, ...params, scope.limit),
       });
     }
     if (database && tableExists(database, "agent_runs")) {
@@ -400,12 +417,21 @@ function collectRunTrace(database: DatabaseSync, runId: string, limit: number, e
 
 function collectJobTrace(database: DatabaseSync, jobId: string, limit: number, evidence: LogEvidence[], budget: { remaining: number }): void {
   const data: Record<string, unknown> = { jobId };
+  if (tableExists(database, "background_jobs")) {
+    data.job = rows(database, "SELECT id,session_id,status,kind,source_message_id,length(terminal_message) AS terminal_chars,substr(terminal_message,1,1000) AS terminal_preview,created_at,updated_at FROM background_jobs WHERE id=?", jobId)[0];
+  }
   if (tableExists(database, "message_step_trails")) {
     data.steps = rows(database, "SELECT session_id,source_message_id,steps_json,updated_at FROM message_step_trails WHERE job_id=? ORDER BY updated_at DESC LIMIT ?", jobId, limit)
       .map(row => ({ ...row, steps_json: compactStepTrail(row.steps_json) }));
   }
   if (tableExists(database, "model_usage")) {
     data.usage = rows(database, "SELECT call_kind,step,provider_name,model,prompt_tokens,completion_tokens,cache_hit_tokens,cache_miss_tokens,cost,created_at FROM model_usage WHERE job_id=? ORDER BY id LIMIT ?", jobId, limit);
+  }
+  if (tableExists(database, "messages") && tableExists(database, "background_jobs")) {
+    data.messages = rows(database, `SELECT id,role,length(content) AS content_chars,CASE WHEN role='assistant' THEN substr(content,1,500) ELSE '' END AS assistant_preview,created_at FROM messages WHERE session_id=(SELECT session_id FROM background_jobs WHERE id=?) AND id>=COALESCE((SELECT source_message_id FROM background_jobs WHERE id=?),0) ORDER BY id LIMIT ?`, jobId, jobId, limit);
+  }
+  if (tableExists(database, "proposals") && tableExists(database, "background_jobs")) {
+    data.proposals = rows(database, `SELECT id,path,status,delivery_ready,source_message_id,created_at FROM proposals WHERE session_id=(SELECT session_id FROM background_jobs WHERE id=?) AND source_message_id>=COALESCE((SELECT source_message_id FROM background_jobs WHERE id=?),0) ORDER BY id LIMIT ?`, jobId, jobId, limit);
   }
   addEvidence(evidence, budget, {
     kind: "job_trace", title: `Job ${jobId} 步骤与用量`, source: "writer.db:message_step_trails+model_usage", data,
@@ -504,14 +530,24 @@ function validateFindings(values: unknown[] | undefined, evidence: LogEvidence[]
   return findings;
 }
 
-function analysisPrompt(round: number, evidence: LogEvidence[], diagnostics: string[]): string {
+function analysisPrompt(
+  round: number,
+  evidence: LogEvidence[],
+  diagnostics: string[],
+  finalRound: boolean,
+  question?: string,
+): string {
   return `你是 Writer Agent 运行质量审计员。分析附带的版本化证据包，寻找可复现的运行错误、状态矛盾、\n` +
     `工具空转、缓存退化、成本异常与交付不完整。不要猜测未提供的正文或用户意图。\n` +
+    (question
+      ? `本次唯一首要问题：${oneLine(question, 1_000)} 先直接回答它；findings 最多 5 项且每项必须帮助解释该问题，无关发现仅在 critical 时附带。\n`
+      : "本次未指定具体问题，执行有界的通用运行审计。\n") +
     `每个结论必须引用 evidence ID。你可以请求补取指定 run/job 的结构化轨迹。当前第 ${round} 轮。\n` +
     `只返回一个 JSON 对象，不要 Markdown。二选一：\n` +
     `{"status":"need_evidence","requests":[{"kind":"run_trace|job_trace|prefix_cache|model_usage","id":"必要时填写","reason":"..."}]}\n` +
     `或 {"status":"complete","summary":"...","findings":[{"id":"...","severity":"critical|high|medium|low|info","category":"...","title":"...","diagnosis":"...","evidenceIds":["ev-001"],"confidence":0.0,"recommendation":"..."}]}。\n` +
     `证据索引：${evidence.map(item => `${item.id}:${item.kind}:${item.title}`).join("；")}。\n` +
+    (finalRound ? "这是最后一轮：必须返回 status=complete；证据不足的判断降低 confidence，不得再请求补证。\n" : "") +
     (diagnostics.length ? `此前协议诊断：${diagnostics.slice(-5).join("；")}。` : "");
 }
 
@@ -520,6 +556,77 @@ function writeJsonAtomic(path: string, value: unknown): void {
   const temp = `${path}.tmp-${process.pid}`;
   writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   renameSync(temp, path);
+}
+
+function writeTextAtomic(path: string, value: string): void {
+  mkdirSync(resolve(path, ".."), { recursive: true });
+  const temp = `${path}.tmp-${process.pid}`;
+  writeFileSync(temp, value.endsWith("\n") ? value : `${value}\n`, "utf8");
+  renameSync(temp, path);
+}
+
+function oneLine(value: string | undefined, maxChars: number): string {
+  return (value ?? "").replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+export function renderLogSnapshot(input: {
+  runId: string;
+  projectRoot: string;
+  scope: AuditScope;
+  evidence: LogEvidence[];
+  evidencePath: string;
+  reportPath?: string;
+  report?: LogAnalysisReport;
+  error?: string;
+}): string {
+  const lines: string[] = [
+    "WRITER_LOG_SNAPSHOT_V1",
+    `run: ${input.runId}`,
+    `project: ${input.projectRoot}`,
+    `scope: last=${input.scope.sinceHours}h limit=${input.scope.limit}`
+      + `${input.scope.jobId ? ` job=${input.scope.jobId}` : ""}`
+      + `${input.scope.runId ? ` agent_run=${input.scope.runId}` : ""}`,
+    `status: ${input.error ? "error" : input.report?.status ?? "collected_only"}`,
+  ];
+  if (input.scope.question) lines.push(`question: ${oneLine(input.scope.question, 1_000)}`);
+  if (input.error) lines.push(`error: ${oneLine(input.error, 1_000)}`);
+  if (input.report) {
+    lines.push(
+      `analyzer: ${input.report.analyzer.backend}/${input.report.analyzer.model} rounds=${input.report.analyzer.rounds}`,
+      `summary: ${oneLine(input.report.summary, 2_000) || "(empty)"}`,
+      `findings: ${input.report.findings.length}`,
+    );
+    const findingLimit = input.scope.question ? 5 : 10;
+    for (const [index, finding] of input.report.findings.slice(0, findingLimit).entries()) {
+      lines.push(
+        "",
+        `${index + 1}. [${finding.severity.toUpperCase()}] ${oneLine(finding.title, 240)} confidence=${finding.confidence.toFixed(2)}`,
+        `   diagnosis: ${oneLine(finding.diagnosis, 1_200)}`,
+        `   evidence: ${finding.evidenceIds.join(", ")}`,
+      );
+      if (finding.recommendation) lines.push(`   action: ${oneLine(finding.recommendation, 1_000)}`);
+    }
+    if (input.report.findings.length > findingLimit) lines.push(`findings_omitted: ${input.report.findings.length - findingLimit}`);
+    if (input.report.diagnostics.length) {
+      lines.push("", "protocol_diagnostics:");
+      for (const item of input.report.diagnostics.slice(0, 8)) lines.push(`- ${oneLine(item, 400)}`);
+    }
+  } else if (!input.error) {
+    lines.push("summary: Evidence collected but not analyzed.", `findings: 0`);
+  }
+  lines.push("", `evidence_index: ${input.evidence.length}`);
+  for (const item of input.evidence.slice(0, 30)) {
+    lines.push(`- ${item.id} ${item.kind} bytes=${item.bytes}${item.truncated ? " truncated" : ""} ${oneLine(item.title, 180)}`);
+  }
+  if (input.evidence.length > 30) lines.push(`evidence_omitted: ${input.evidence.length - 30}`);
+  lines.push("", `evidence_json: ${input.evidencePath}`);
+  if (input.reportPath) lines.push(`report_json: ${input.reportPath}`);
+  lines.push("next: Read JSON or query writer.db only when this snapshot is insufficient or a cited evidence item needs verification.");
+  const snapshot = `${lines.join("\n")}\n`;
+  const maxChars = 12_000;
+  return snapshot.length <= maxChars
+    ? snapshot
+    : `${snapshot.slice(0, maxChars - 80)}\n[SNAPSHOT_TRUNCATED; inspect evidence_json for details]\n`;
 }
 
 function evidenceContainsIdentifier(evidence: LogEvidence[], identifier: string): boolean {
@@ -591,22 +698,29 @@ export async function runLogAudit(input: {
     maxRounds: Math.max(1, Math.min(6, Math.floor(options.maxRounds ?? 3))),
     ...(options.jobId ? { jobId: options.jobId } : {}),
     ...(options.runId ? { runId: options.runId } : {}),
+    ...(options.question?.trim() ? { question: options.question.trim().slice(0, 1_000) } : {}),
   };
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`;
   const runDir = resolve(input.project.privateDir, "analysis", "log-audit", runId);
   const manifestPath = resolve(runDir, "manifest.json");
   const evidencePath = resolve(runDir, "evidence.json");
   const reportPath = resolve(runDir, "report.json");
+  const snapshotPath = resolve(runDir, "snapshot.txt");
   mkdirSync(runDir, { recursive: true });
   const evidence = collectLogEvidence(input.project, scope);
   writeJsonAtomic(evidencePath, { version: LOG_ANALYSIS_VERSION, evidence });
   const manifest: Record<string, unknown> = {
     version: LOG_ANALYSIS_VERSION, runId, status: options.collectOnly ? "collected" : "analyzing",
     project: input.project.root, scope, backend: input.analyzer?.backend, model: input.analyzer?.model,
-    createdAt: new Date().toISOString(), evidencePath,
+    createdAt: new Date().toISOString(), evidencePath, snapshotPath,
   };
   writeJsonAtomic(manifestPath, manifest);
-  if (options.collectOnly) return { runId, runDir, manifestPath, evidencePath, evidence };
+  if (options.collectOnly) {
+    writeTextAtomic(snapshotPath, renderLogSnapshot({
+      runId, projectRoot: input.project.root, scope, evidence, evidencePath,
+    }));
+    return { runId, runDir, manifestPath, evidencePath, snapshotPath, evidence };
+  }
   if (!input.analyzer) throw new Error("执行日志分析需要 analyzer；仅取证请使用 collectOnly");
 
   const diagnostics: string[] = [];
@@ -617,7 +731,9 @@ export async function runLogAudit(input: {
     for (let round = 1; round <= scope.maxRounds; round += 1) {
       rounds = round;
       writeJsonAtomic(evidencePath, { version: LOG_ANALYSIS_VERSION, evidence });
-      const raw = await input.analyzer.analyze({ prompt: analysisPrompt(round, evidence, diagnostics), evidencePath, round });
+      const raw = await input.analyzer.analyze({
+        prompt: analysisPrompt(round, evidence, diagnostics, round === scope.maxRounds, scope.question), evidencePath, round,
+      });
       let turn: LogAnalysisTurn;
       try { turn = parseLogAnalysisTurn(raw); }
       catch (error) {
@@ -645,12 +761,19 @@ export async function runLogAudit(input: {
     };
     writeJsonAtomic(evidencePath, { version: LOG_ANALYSIS_VERSION, evidence });
     writeJsonAtomic(reportPath, report);
+    writeTextAtomic(snapshotPath, renderLogSnapshot({
+      runId, projectRoot: input.project.root, scope, evidence, evidencePath, reportPath, report,
+    }));
     writeJsonAtomic(manifestPath, { ...manifest, status: report.status, completedAt: new Date().toISOString(), reportPath, rounds });
-    return { runId, runDir, manifestPath, evidencePath, reportPath, report, evidence };
+    return { runId, runDir, manifestPath, evidencePath, snapshotPath, reportPath, report, evidence };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeTextAtomic(snapshotPath, renderLogSnapshot({
+      runId, projectRoot: input.project.root, scope, evidence, evidencePath, error: message,
+    }));
     writeJsonAtomic(manifestPath, {
       ...manifest, status: "error", failedAt: new Date().toISOString(),
-      error: error instanceof Error ? error.message : String(error), rounds,
+      error: message, rounds,
     });
     throw error;
   }
@@ -679,40 +802,43 @@ export function createDirectLogAnalyzer(model: ModelConfig): LogAnalyzer {
 
 export type OpenCodeAnalyzerOptions = {
   bin?: string;
-  model: string;
+  model?: string;
   attach?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
 };
 
 export function openCodeRunArgs(input: {
-  model: string;
+  model?: string;
   evidencePath: string;
   workingDirectory: string;
   prompt: string;
   attach?: string;
 }): string[] {
   return [
-    "run", "--format", "json", "--agent", "plan", "--model", input.model,
-    "--dir", input.workingDirectory, "--file", input.evidencePath,
+    "run", "--format", "json", "--agent", "plan",
+    ...(input.model?.trim() ? ["--model", input.model.trim()] : []),
+    "--dir", input.workingDirectory, `--file=${input.evidencePath}`,
     ...(input.attach ? ["--attach", input.attach] : []),
-    input.prompt,
+    "--", input.prompt,
   ];
 }
 
-function textFromOpenCodeOutput(output: string): string {
+export function textFromOpenCodeOutput(output: string): string {
   const parts: string[] = [];
+  let sawJsonEvent = false;
   for (const line of output.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line) as Record<string, unknown>;
+      sawJsonEvent = true;
       const part = event.part && typeof event.part === "object" ? event.part as Record<string, unknown> : undefined;
-      if (typeof part?.text === "string") parts.push(part.text);
-      else if (typeof event.text === "string") parts.push(event.text);
-      else if (typeof event.content === "string") parts.push(event.content);
+      if (part?.type === "text" && part.synthetic !== true && typeof part.text === "string") parts.push(part.text);
+      else if (event.type === "text" && typeof event.text === "string") parts.push(event.text);
+      else if (event.type === "text" && typeof event.content === "string") parts.push(event.content);
     } catch { /* raw diagnostic lines are not model output */ }
   }
-  return parts.length ? parts.join("") : output;
+  return parts.length ? parts.join("") : sawJsonEvent ? "" : output;
 }
 
 export function createOpenCodeLogAnalyzer(options: OpenCodeAnalyzerOptions): LogAnalyzer {
@@ -720,7 +846,7 @@ export function createOpenCodeLogAnalyzer(options: OpenCodeAnalyzerOptions): Log
   const maxOutputBytes = Math.max(8_000, Math.min(10_000_000, options.maxOutputBytes ?? 2_000_000));
   return {
     backend: "opencode",
-    model: options.model,
+    model: options.model?.trim() || "opencode-default",
     analyze({ prompt, evidencePath }) {
       return new Promise<string>((accept, reject) => {
         const args = openCodeRunArgs({

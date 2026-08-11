@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import process, { loadEnvFile } from "node:process";
@@ -8,7 +8,7 @@ import { runAgent } from "./agent.js";
 import { DEFAULT_AGENT_EVALUATION_CASES, prepareAgentEvaluationFixtures, runPersistedAgentEvaluation } from "./agent_eval.js";
 import { isPermissionMode, loadAgentSettings, saveAgentSettings } from "./agent_runtime.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
-import { createDirectLogAnalyzer, createOpenCodeLogAnalyzer, runLogAudit } from "./log_analysis.js";
+import { createDirectLogAnalyzer, createOpenCodeLogAnalyzer, logAuditFindingsTriggerFailure, runLogAudit, type LogAuditFailureThreshold } from "./log_analysis.js";
 import { prefixCacheLogPath, summarizePrefixCacheLog } from "./prefix_cache.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -147,7 +147,7 @@ program.command("log-audit")
   .option("-p, --project <directory>", "待分析的写作项目", ".")
   .option("--provider-project <directory>", "direct 后端的供应商配置项目；默认同待分析项目")
   .option("--backend <backend>", "分析后端：direct | opencode", "direct")
-  .option("--model <provider/model>", "OpenCode 模型，例如 deepseek/deepseek-chat")
+  .option("--model <provider/model>", "OpenCode 模型；省略时使用其已配置的默认模型")
   .option("--opencode-bin <path>", "OpenCode 可执行文件", "opencode")
   .option("--attach <url>", "连接已运行的 opencode serve")
   .option("--since-hours <hours>", "采集最近小时数", "24")
@@ -157,8 +157,10 @@ program.command("log-audit")
   .option("--timeout <seconds>", "单轮 OpenCode 超时秒数", "300")
   .option("--job <id>", "聚焦指定 Job 并收集步骤轨迹")
   .option("--run-id <id>", "聚焦指定 Agent Run 并收集事件轨迹")
+  .option("-q, --question <question>", "原样传给廉价分析器的本次排障问题")
   .option("--collect-only", "只生成脱敏证据包，不调用模型")
   .option("--fail-on <severity>", "发现达到该级别时退出码为 2：critical | high | medium | low | info | none", "none")
+  .option("--text", "stdout 仅输出低 token 纯文本快照")
   .option("--json", "输出 JSON")
   .action(async (options: {
     project: string;
@@ -174,8 +176,10 @@ program.command("log-audit")
     timeout: string;
     job?: string;
     runId?: string;
+    question?: string;
     collectOnly?: boolean;
     failOn: string;
+    text?: boolean;
     json?: boolean;
   }) => {
     const project = new WriterProject(resolve(options.project));
@@ -183,11 +187,9 @@ program.command("log-audit")
     if (options.backend !== "direct" && options.backend !== "opencode") {
       throw new Error("backend 仅支持 direct 或 opencode");
     }
-    if (options.backend === "opencode" && !options.collectOnly && !options.model?.trim()) {
-      throw new Error("OpenCode 后端需要 --model provider/model");
-    }
-    const severityRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4, none: 99 };
-    if (!(options.failOn in severityRank)) throw new Error("fail-on 级别无效");
+    if (options.text && options.json) throw new Error("--text 与 --json 不能同时使用");
+    const failureThresholds = new Set<LogAuditFailureThreshold>(["critical", "high", "medium", "low", "info", "none"]);
+    if (!failureThresholds.has(options.failOn as LogAuditFailureThreshold)) throw new Error("fail-on 级别无效");
     const positive = (value: string, name: string) => {
       const number = Number(value);
       if (!Number.isFinite(number) || number <= 0) throw new Error(`${name} 必须是正数`);
@@ -197,7 +199,7 @@ program.command("log-audit")
     if (!options.collectOnly && options.backend === "opencode") {
       analyzer = createOpenCodeLogAnalyzer({
         bin: options.opencodeBin,
-        model: options.model!,
+        ...(options.model ? { model: options.model } : {}),
         ...(options.attach ? { attach: options.attach } : {}),
         timeoutMs: positive(options.timeout, "timeout") * 1_000,
       });
@@ -217,12 +219,15 @@ program.command("log-audit")
         collectOnly: Boolean(options.collectOnly),
         ...(options.job ? { jobId: options.job } : {}),
         ...(options.runId ? { runId: options.runId } : {}),
+        ...(options.question ? { question: options.question } : {}),
       },
     });
-    if (options.json) {
+    if (options.text) {
+      process.stdout.write(readFileSync(result.snapshotPath, "utf8"));
+    } else if (options.json) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } else {
-      process.stdout.write(`log-audit run=${result.runId}\n证据：${result.evidencePath}\n`);
+      process.stdout.write(`log-audit run=${result.runId}\n快照：${result.snapshotPath}\n证据：${result.evidencePath}\n`);
       if (result.reportPath && result.report) {
         process.stdout.write(`报告：${result.reportPath}\n状态：${result.report.status}，发现 ${result.report.findings.length} 项\n`);
         for (const finding of result.report.findings) {
@@ -230,7 +235,9 @@ program.command("log-audit")
         }
       }
     }
-    if (result.report && result.report.findings.some(item => severityRank[item.severity] <= severityRank[options.failOn])) {
+    if (result.report && logAuditFindingsTriggerFailure(
+      result.report.findings, options.failOn as LogAuditFailureThreshold,
+    )) {
       process.exitCode = 2;
     }
   });

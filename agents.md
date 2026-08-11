@@ -37,7 +37,11 @@
 
 - 整体修改完成之后才进行 `npm run build`，不要做非必要的测试；改完源码后须编译再交付/验收
 - 项目采用 ESM（`"type": "module"`）。TypeScript 源码中的本地运行时导入继续使用 `.js` 后缀，并遵循现有模块风格。
-- 排查会话/Job/提案时只读查询项目库：见 `docs/db-query.md`（`p/<name>/.writer/writer.db`）
+- 排查会话/Job/提案/模型用量/缓存日志时，先运行
+  `npm run --silent snapshot:logs -- -p ./p/<name> -q "<用户原始排障问题>" [--job <id>] [--run-id <id>]`。
+  用户问“为什么 fail / 为什么没输出 / 某次运行发生了什么”时必须把该问题原样放进 `-q`，优先只读取 stdout 或生成的
+  `snapshot.txt`。仅当快照结论不充分或需要核对其 evidence ID 时，才按 `docs/db-query.md` 下钻只读项目库；
+  不要一开始就把原始日志、完整 steps 或大段数据库结果放入主 Agent 上下文。
 
 ## 修改原则
 
