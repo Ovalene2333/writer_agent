@@ -1,6 +1,6 @@
 # 自动校验与廉价模型日志分析工作流
 
-状态：二期已完成（2026-08-11）
+状态：三期已完成（2026-08-11）
 
 恢复基线：`45b0583 refactor(agent): introduce event-driven runtime kernel`
 
@@ -64,6 +64,15 @@
 - [x] 使用 WSL 原生 OpenCode 完成一次真实低成本端到端烟测，并复核快照体积。
 - [x] 更新测试、文档并再次运行 `npm run build`。
 
+### F. 零模型事实快照与分级降级
+
+- [x] 从已有 evidence 确定性投影 Job、Run、消息输出、提案、步骤错误、用量与缓存关键事实。
+- [x] `snapshot:logs` 默认只 collect + render facts，不再启动任何模型或外部 Agent。
+- [x] 保留 direct 廉价模型作为二级语义分析，OpenCode 降为需要自主文件探索时的三级后备。
+- [x] 更新 Codex/Claude 项目约定：先依据事实快照回答，证据不足才升级，不默认运行 OpenCode。
+- [x] 整理 `docs/log-analysis.md`，清楚区分事实、模型推断、证据与原始数据四层。
+- [x] 增补确定性投影测试、真实 Job 快照烟测并运行完整构建。
+
 ## 决策记录
 
 - OpenCode 官方 CLI 支持 `run` 非交互模式、`--format json`、`--model provider/model`、
@@ -87,3 +96,8 @@
 - 2026-08-11：WSL 原生 OpenCode 端到端验证通过；以“为什么这个 Job 当时没有输出？”为唯一问题，
   单轮生成 completed 快照并引用 Job/消息/Run/提案证据。快照硬上限收紧为 12,000 字符。
 - 2026-08-11：二期完整构建通过，专项测试 6/6；Vite 仅保留既有第三方与 chunk 提示。
+- 2026-08-11：三期将默认 `snapshot:logs` 改为零模型事实投影，新增 direct/OpenCode 显式分级命令；
+  facts 覆盖 Job/Run/输出/提案/步骤/事件/用量/缓存，并按 Job 关联过滤，避免混入其他活跃任务。
+- 2026-08-11：整理 `log-analysis`、`db-query`、Agent framework、README、Codex 与 Claude 指令，统一为
+  facts → direct 廉价模型 → OpenCode → evidence/原始 DB 的按需降级顺序。
+- 2026-08-11：真实旧 Job 的零模型快照烟测通过，仅输出 7 条聚焦 facts；专项测试 7/7、完整构建通过。

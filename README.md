@@ -387,7 +387,8 @@ npm test                    # 编译并跑测试
 | `src/templates.ts` | 风格模板 |
 | `src/web/` | Web 前端（Vite + React） |
 
-排障与数据分析：[docs/db-query.md](docs/db-query.md)（如何只读查询项目的 `.writer/writer.db`：表结构、成本/缓存命中分析等常用配方）。
+排障先读：[docs/log-analysis.md](docs/log-analysis.md)（零模型低 token 事实快照与 direct/OpenCode 分级降级）。
+需要核对具体证据时再用：[docs/db-query.md](docs/db-query.md)（只读查询 `.writer/writer.db` 的表结构与常用配方）。
 
 ## 安全提示
 

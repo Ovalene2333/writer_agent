@@ -378,8 +378,12 @@ export function collectLogEvidence(project: WriterProject, options: LogAuditOpti
       });
     }
     if (database && tableExists(database, "agent_runs")) {
-      const where = scope.runId ? "WHERE id=?" : "WHERE updated_at>=?";
-      const params = scope.runId ? [scope.runId] : [cutoff];
+      const where = scope.runId
+        ? "WHERE id=?"
+        : scope.jobId && tableExists(database, "background_jobs")
+          ? "WHERE session_id=(SELECT session_id FROM background_jobs WHERE id=?) AND source_message_id=(SELECT source_message_id FROM background_jobs WHERE id=?)"
+          : "WHERE updated_at>=?";
+      const params = scope.runId ? [scope.runId] : scope.jobId ? [scope.jobId, scope.jobId] : [cutoff];
       const data = rows(database, `SELECT id,session_id,status,source_message_id,snapshot_json,created_at,updated_at FROM agent_runs ${where} ORDER BY updated_at DESC LIMIT ?`, ...params, scope.limit)
         .map(row => ({ ...row, snapshot_json: projectAgentRunSnapshot(row.snapshot_json) }));
       addEvidence(evidence, budget, {
@@ -387,12 +391,14 @@ export function collectLogEvidence(project: WriterProject, options: LogAuditOpti
       });
     }
     if (database && tableExists(database, "model_usage")) {
+      const usageWhere = scope.jobId ? "WHERE job_id=?" : "WHERE created_at>=?";
+      const usageParam = scope.jobId ?? cutoff;
       addEvidence(evidence, budget, {
         kind: "model_usage", title: "模型用量与缓存聚合", source: "writer.db:model_usage",
-        data: rows(database, `SELECT call_kind,provider_name,model,count(*) AS calls,sum(prompt_tokens) AS prompt_tokens,sum(completion_tokens) AS completion_tokens,sum(cache_hit_tokens) AS cache_hit_tokens,sum(cache_miss_tokens) AS cache_miss_tokens,sum(cost) AS cost,min(created_at) AS first_at,max(created_at) AS last_at FROM model_usage WHERE created_at>=? GROUP BY call_kind,provider_name,model ORDER BY last_at DESC LIMIT ?`, cutoff, scope.limit),
+        data: rows(database, `SELECT call_kind,provider_name,model,count(*) AS calls,sum(prompt_tokens) AS prompt_tokens,sum(completion_tokens) AS completion_tokens,sum(cache_hit_tokens) AS cache_hit_tokens,sum(cache_miss_tokens) AS cache_miss_tokens,sum(cost) AS cost,min(created_at) AS first_at,max(created_at) AS last_at FROM model_usage ${usageWhere} GROUP BY call_kind,provider_name,model ORDER BY last_at DESC LIMIT ?`, usageParam, scope.limit),
       });
     }
-    if (existsSync(prefixCacheLogPath(project.root)) && budget.remaining > 2_000) {
+    if (!scope.jobId && !scope.runId && existsSync(prefixCacheLogPath(project.root)) && budget.remaining > 2_000) {
       addEvidence(evidence, budget, {
         kind: "prefix_cache", title: "Prefix cache 汇总", source: prefixCacheLogPath(project.root),
         data: summarizePrefixCacheLog(prefixCacheLogPath(project.root), { maxBytes: 8_000_000, topDivergences: 8 }),
@@ -569,6 +575,139 @@ function oneLine(value: string | undefined, maxChars: number): string {
   return (value ?? "").replace(/\s+/g, " ").trim().slice(0, maxChars);
 }
 
+function asRecord(value: unknown): Row | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Row : undefined;
+}
+
+function recordArray(value: unknown): Row[] {
+  return Array.isArray(value) ? value.map(asRecord).filter((item): item is Row => Boolean(item)) : [];
+}
+
+function compactFactValue(value: unknown, maxChars = 500): string {
+  if (value === undefined || value === null || value === "") return "-";
+  if (typeof value === "string") return oneLine(value, maxChars) || "-";
+  return oneLine(JSON.stringify(value), maxChars) || "-";
+}
+
+function finiteNumber(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function countValues(values: unknown[]): string {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const key = String(value ?? "unknown");
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([key, count]) => `${key}:${count}`).join(",") || "-";
+}
+
+/** Deterministic, model-free projection for the parent Agent's first diagnostic pass. */
+export function renderLogFacts(evidence: LogEvidence[]): string[] {
+  const lines: string[] = [];
+  for (const item of evidence) {
+    if (item.kind === "jobs") {
+      const jobs = recordArray(item.data);
+      if (!jobs.length) lines.push(`[${item.id}] JOBS count=0`);
+      for (const job of jobs.slice(0, 12)) {
+        lines.push(`[${item.id}] JOB id=${compactFactValue(job.id, 120)} status=${compactFactValue(job.status, 40)}`
+          + ` kind=${compactFactValue(job.kind, 40)} source_message=${compactFactValue(job.source_message_id, 40)}`
+          + ` terminal_chars=${finiteNumber(job.terminal_chars)} created=${compactFactValue(job.created_at, 40)}`
+          + ` updated=${compactFactValue(job.updated_at, 40)}`);
+        if (job.failure_message) lines.push(`[${item.id}] JOB_FAILURE id=${compactFactValue(job.id, 120)} message=${compactFactValue(job.failure_message, 800)}`);
+      }
+      continue;
+    }
+    if (item.kind === "agent_runs") {
+      const runs = recordArray(item.data);
+      if (!runs.length) lines.push(`[${item.id}] RUNS count=0`);
+      for (const run of runs.slice(0, 12)) {
+        const snapshot = asRecord(run.snapshot_json) ?? {};
+        const deliverables = recordArray(snapshot.deliverables);
+        const progress = asRecord(snapshot.progress) ?? {};
+        const intentReview = asRecord(snapshot.intentReview);
+        const effect = asRecord(snapshot.pendingEffect);
+        lines.push(`[${item.id}] RUN id=${compactFactValue(run.id, 120)} status=${compactFactValue(run.status, 40)}`
+          + ` phase=${compactFactValue(snapshot.phase, 40)} step=${compactFactValue(snapshot.step, 20)}`
+          + ` pending_effect=${compactFactValue(effect?.kind, 40)} deliverables=${deliverables.length}`
+          + ` states=${countValues(deliverables.map(entry => entry.state))}`
+          + ` intent_review=${compactFactValue(intentReview?.status, 40)} updated=${compactFactValue(run.updated_at, 40)}`);
+        const failedTools = asRecord(progress.failedTools);
+        if (failedTools && Object.keys(failedTools).length) {
+          lines.push(`[${item.id}] RUN_FAILED_TOOLS id=${compactFactValue(run.id, 120)} ${Object.entries(failedTools).map(([name, count]) => `${name}=${finiteNumber(count)}`).join(" ")}`);
+        }
+        for (const deliverable of deliverables.slice(0, 8)) {
+          const artifact = asRecord(deliverable.evidence);
+          lines.push(`[${item.id}] DELIVERABLE run=${compactFactValue(run.id, 120)} id=${compactFactValue(deliverable.id, 80)}`
+            + ` state=${compactFactValue(deliverable.state, 40)} tool=${compactFactValue(artifact?.toolName, 60)}`
+            + ` path=${compactFactValue(artifact?.path, 240)} proposal=${compactFactValue(artifact?.proposalId, 40)}`);
+        }
+      }
+      continue;
+    }
+    if (item.kind === "job_trace") {
+      const trace = asRecord(item.data) ?? {};
+      const job = asRecord(trace.job);
+      if (job) {
+        lines.push(`[${item.id}] JOB_DETAIL id=${compactFactValue(job.id, 120)} status=${compactFactValue(job.status, 40)}`
+          + ` terminal_chars=${finiteNumber(job.terminal_chars)} terminal_preview=${compactFactValue(job.terminal_preview, 600)}`);
+      }
+      const messages = recordArray(trace.messages);
+      const assistant = messages.filter(message => message.role === "assistant");
+      const lastAssistant = assistant.at(-1);
+      lines.push(`[${item.id}] OUTPUT messages_after_source=${messages.length} assistant_messages=${assistant.length}`
+        + ` last_assistant_id=${compactFactValue(lastAssistant?.id, 40)}`
+        + ` chars=${finiteNumber(lastAssistant?.content_chars)} preview=${compactFactValue(lastAssistant?.assistant_preview, 800)}`);
+      const proposals = recordArray(trace.proposals);
+      lines.push(`[${item.id}] PROPOSALS total=${proposals.length} statuses=${countValues(proposals.map(proposal => proposal.status))}`
+        + (proposals.length ? ` paths=${proposals.slice(0, 8).map(proposal => compactFactValue(proposal.path, 180)).join(" | ")}` : ""));
+      const trailRows = recordArray(trace.steps);
+      const steps = trailRows.flatMap(row => recordArray(row.steps_json));
+      const toolNames = steps.flatMap(step => Array.isArray(step.tools) ? step.tools : []);
+      const errors = steps.map(step => step.error).filter(Boolean);
+      lines.push(`[${item.id}] STEPS total=${steps.length} statuses=${countValues(steps.map(step => step.status))}`
+        + ` tools=${countValues(toolNames)} errors=${errors.length}`);
+      for (const error of errors.slice(0, 5)) lines.push(`[${item.id}] STEP_ERROR ${compactFactValue(error, 800)}`);
+      continue;
+    }
+    if (item.kind === "run_trace") {
+      const events = recordArray(item.data);
+      lines.push(`[${item.id}] RUN_EVENTS total=${events.length} types=${countValues(events.map(event => event.type))}`);
+      for (const event of events.slice(-8)) {
+        lines.push(`[${item.id}] EVENT seq=${compactFactValue(event.sequence, 20)} type=${compactFactValue(event.type, 80)}`
+          + ` at=${compactFactValue(event.created_at, 40)} payload=${compactFactValue(event.payload_json, 700)}`);
+      }
+      continue;
+    }
+    if (item.kind === "model_usage") {
+      const usages = recordArray(item.data);
+      if (!usages.length) lines.push(`[${item.id}] MODEL calls=0`);
+      for (const usage of usages.slice(0, 16)) {
+        const prompt = finiteNumber(usage.prompt_tokens);
+        const hit = finiteNumber(usage.cache_hit_tokens);
+        lines.push(`[${item.id}] MODEL kind=${compactFactValue(usage.call_kind, 80)}`
+          + ` provider=${compactFactValue(usage.provider_name, 80)} model=${compactFactValue(usage.model, 120)}`
+          + ` calls=${compactFactValue(usage.calls, 20)} prompt=${prompt} output=${finiteNumber(usage.completion_tokens)}`
+          + ` cache_hit_rate=${prompt > 0 ? (hit / prompt).toFixed(3) : "-"} cost=${finiteNumber(usage.cost)}`);
+      }
+      continue;
+    }
+    if (item.kind === "prefix_cache") {
+      const summary = asRecord(item.data) ?? {};
+      for (const cache of recordArray(summary.callKinds).slice(0, 12)) {
+        const divergences = recordArray(cache.topDivergences).slice(0, 3)
+          .map(entry => `${compactFactValue(entry.label, 80)}:${finiteNumber(entry.requests)}/${finiteNumber(entry.missedTokens)}`)
+          .join(",") || "-";
+        lines.push(`[${item.id}] CACHE scope=project_log_tail kind=${compactFactValue(cache.callKind, 80)} requests=${finiteNumber(cache.requests)}`
+          + ` measured=${finiteNumber(cache.measuredRequests)} actual_hit_rate=${compactFactValue(cache.actualHitRate, 20)}`
+          + ` top_divergence=${divergences}`);
+      }
+    }
+  }
+  return lines;
+}
+
 export function renderLogSnapshot(input: {
   runId: string;
   projectRoot: string;
@@ -590,6 +729,9 @@ export function renderLogSnapshot(input: {
   ];
   if (input.scope.question) lines.push(`question: ${oneLine(input.scope.question, 1_000)}`);
   if (input.error) lines.push(`error: ${oneLine(input.error, 1_000)}`);
+  const facts = renderLogFacts(input.evidence);
+  lines.push("", `facts: ${facts.length}`);
+  lines.push(...facts);
   if (input.report) {
     lines.push(
       `analyzer: ${input.report.analyzer.backend}/${input.report.analyzer.model} rounds=${input.report.analyzer.rounds}`,
@@ -612,21 +754,22 @@ export function renderLogSnapshot(input: {
       for (const item of input.report.diagnostics.slice(0, 8)) lines.push(`- ${oneLine(item, 400)}`);
     }
   } else if (!input.error) {
-    lines.push("summary: Evidence collected but not analyzed.", `findings: 0`);
+    lines.push("", "analysis: not_run", "summary: Deterministic facts only; no model or external Agent was called.");
   }
   lines.push("", `evidence_index: ${input.evidence.length}`);
   for (const item of input.evidence.slice(0, 30)) {
     lines.push(`- ${item.id} ${item.kind} bytes=${item.bytes}${item.truncated ? " truncated" : ""} ${oneLine(item.title, 180)}`);
   }
   if (input.evidence.length > 30) lines.push(`evidence_omitted: ${input.evidence.length - 30}`);
-  lines.push("", `evidence_json: ${input.evidencePath}`);
-  if (input.reportPath) lines.push(`report_json: ${input.reportPath}`);
-  lines.push("next: Read JSON or query writer.db only when this snapshot is insufficient or a cited evidence item needs verification.");
-  const snapshot = `${lines.join("\n")}\n`;
+  const footer = ["", `evidence_json: ${input.evidencePath}`];
+  if (input.reportPath) footer.push(`report_json: ${input.reportPath}`);
+  footer.push("next: Let the parent Agent answer from facts first. Run direct model analysis or inspect evidence/DB only if facts are insufficient.");
+  const footerText = `${footer.join("\n")}\n`;
+  const snapshot = `${lines.join("\n")}${footerText}`;
   const maxChars = 12_000;
   return snapshot.length <= maxChars
     ? snapshot
-    : `${snapshot.slice(0, maxChars - 80)}\n[SNAPSHOT_TRUNCATED; inspect evidence_json for details]\n`;
+    : `${snapshot.slice(0, Math.max(0, maxChars - footerText.length - 90))}\n[SNAPSHOT_TRUNCATED; inspect evidence_json for details]${footerText}`;
 }
 
 function evidenceContainsIdentifier(evidence: LogEvidence[], identifier: string): boolean {

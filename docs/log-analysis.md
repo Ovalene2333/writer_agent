@@ -1,35 +1,40 @@
-# Agent 日志自动校验
+# Agent 日志快照与分级分析
 
-`writer log-audit` 从 Writer 项目只读取证，用低价模型分析 Agent 运行异常，并把可复核报告保存在：
+本工作流的首要目标是减少 Codex/Claude 排障时占用的 token 和主上下文。默认路径完全不调用模型：
+宿主只读采集 Writer 运行数据，投影成不超过 12,000 字符的纯文本事实快照，当前 Agent 直接据此回答。
+
+## 四层数据边界
+
+```text
+原始 writer.db / prefix-cache.jsonl
+        ↓ 只读快照、脱敏、限量
+evidence.json（结构化证据）
+        ↓ 确定性字段投影，不做语义判断
+snapshot.txt / stdout（低 token facts）
+        ↓ facts 不足时才升级
+direct 廉价模型 → OpenCode 自主探索
+```
+
+每次运行保存在：
 
 ```text
 <project>/.writer/analysis/log-audit/<run-id>/
 ├── manifest.json
 ├── evidence.json
-├── report.json
-└── snapshot.txt
+├── snapshot.txt
+└── report.json       # 仅运行模型分析时存在
 ```
 
-证据包默认不包含正文、完整对话或供应商凭据。步骤轨迹只保留状态、工具名、错误和文本字符数；
-prefix-cache 原始 JSONL 会先在本地聚合。模型提出的结论必须引用包内 `ev-*` ID，否则不会进入最终报告。
-`snapshot.txt` 是给 Codex/Claude 的首选入口：纯文本、有界、不超过 12,000 字符；只有它不够时
-才读取 JSON 或原始数据库。
+四层含义不得混淆：
 
-## Codex / Claude 默认入口
+- `facts`：程序从数据库字段确定性投影的事实，可以直接引用。
+- `summary/findings`：模型推断，必须附带 `ev-*` 证据引用，仍需当前 Agent 判断。
+- `evidence.json`：有界结构化证据；只在快照不够或需要核对引用时读取。
+- 原始 DB/log：最后手段，按 `docs/db-query.md` 只读下钻。
 
-OpenCode 已配置默认廉价模型时，不需要再传模型名：
+## 一级：零模型事实快照（默认）
 
-```bash
-npm run --silent snapshot:logs -- -p ./p/jn3
-```
-
-该命令的 stdout 只有快照正文，适合直接作为上层 Agent 的工具结果。聚焦目标可以显著缩短快照：
-
-```bash
-npm run --silent snapshot:logs -- -p ./p/jn3 --job <job-id> --run-id <run-id>
-```
-
-如果用户有明确问题，必须原样传入 `-q/--question`；它会成为分析器的首要目标并写入快照：
+用户提出明确问题时，原样传给 `-q`，并尽量提供 Job 或 Run ID：
 
 ```bash
 npm run --silent snapshot:logs -- \
@@ -38,8 +43,6 @@ npm run --silent snapshot:logs -- \
   -q "为什么这次 Job fail 了？"
 ```
 
-另一个典型例子：
-
 ```bash
 npm run --silent snapshot:logs -- \
   -p ./p/jn3 \
@@ -47,72 +50,85 @@ npm run --silent snapshot:logs -- \
   -q "文件已经写入，为什么聊天里没有最终输出？"
 ```
 
-仓库的 `AGENTS.md` 和 `CLAUDE.md` 已规定日志排障优先调用该入口：先读快照，必要时读其引用的
-`evidence.json`，最后才查询原始 DB/日志。
+该命令等价于 `writer log-audit --collect-only --text`，不会启动 OpenCode、DeepSeek 或任何子代理。
+stdout 只包含纯文本快照，主要 facts 包括：
 
-## 先检查取证内容
+- `JOB/JOB_DETAIL/JOB_FAILURE`：状态、类型、source message、terminal 长度和错误文本。
+- `RUN/RUN_FAILED_TOOLS/DELIVERABLE`：phase、pending effect、步骤、交付状态与失败工具。
+- `OUTPUT/PROPOSALS`：请求后的 assistant 消息、最后输出预览和提案状态。
+- `STEPS/STEP_ERROR/RUN_EVENTS`：步骤工具分布、错误及最近语义事件。
+- `MODEL/CACHE`：调用量、token、费用、命中率和主要前缀分叉。
 
-```bash
-npm run build
-npm run audit:logs -- -p ./p/jn3 --collect-only
-```
+指定 `--job` 时，Job、Run 和 model usage 都按该 Job 的 session/source/job_id 关联过滤；指定 Job/Run 时
+默认不加入无法精确归因的项目级 prefix-cache 汇总。无聚焦 ID 的通用快照才输出 `CACHE scope=project_log_tail`，
+提醒调用方它是项目日志尾部而非单次运行事实。
 
-也可聚焦一次运行：
+Codex/Claude 应先依据这些 facts 回答。比如 `terminal_chars=0` 但 `assistant_messages=1`，只能证明 Job
+终端字段为空而聊天消息已持久化；是否属于 bug，仍由当前 Agent结合问题和代码判断。
 
-```bash
-npm run audit:logs -- -p ./p/jn3 --job <job-id> --run-id <run-id> --collect-only
-```
+## 二级：direct 廉价模型
 
-## 直接使用 Writer 的廉价模型
-
-`direct` 是默认后端，使用 `provider-project` 的 `summarizer` 模型分工。先在供应商设置中把
-summarizer 指向 DeepSeek 等低价模型，然后运行：
-
-```bash
-npm run audit:logs -- -p ./p/jn3 --backend direct
-```
-
-分析其他项目但复用一份供应商配置：
+事实不足、需要语义归因时，调用 Writer 供应商目录分配给 `summarizer` 的模型。推荐将该角色指向
+DeepSeek 等廉价模型：
 
 ```bash
-npm run audit:logs -- -p ./p/jn3 --backend direct --provider-project ./p/jn2
+npm run --silent snapshot:logs:direct -- \
+  -p ./p/jn3 \
+  --provider-project ./p/jn2 \
+  --job <job-id> \
+  -q "为什么这次 Job fail 了？"
 ```
 
-## OpenCode + DeepSeek
+direct 后端直接复用 `completeProviderCompletion`，没有 OpenCode 冷启动、文件工具、plan Agent 或 JSON
+事件流。模型可以按白名单请求补充 `run_trace`、`job_trace`、`model_usage` 和 prefix-cache 聚合；宿主限制
+轮次、字节数和 evidence ID。
 
-OpenCode 需先自行完成 provider 认证。省略 `--model` 时使用 OpenCode 当前默认模型；显式覆盖时模型 ID
-使用 `provider/model` 格式：
+## 三级：OpenCode（需要自主探索时）
+
+只有分析确实需要外部 Agent 自主读取证据文件，才运行：
 
 ```bash
-npm run audit:logs -- -p ./p/jn3 \
-  --backend opencode \
-  --model deepseek/deepseek-chat
+npm run --silent snapshot:logs:opencode -- \
+  -p ./p/jn3 \
+  --job <job-id> \
+  -q "为什么这次 Job fail 了？"
 ```
 
-工作流实际调用非交互命令：
+省略 `--model` 时使用 OpenCode 已配置的默认模型；也可显式指定：
 
-```text
-opencode run --format json --agent plan --model <provider/model> \
-  --dir <audit-run-dir> --file=<evidence.json> <audit-prompt>
+```bash
+npm run --silent snapshot:logs:opencode -- \
+  -p ./p/jn3 \
+  --model deepseek/deepseek-chat \
+  -q "分析这次运行为什么反复重试"
 ```
 
-OpenCode 的工作目录被限制在单次审计目录，`plan` Agent 只负责读取证据并输出 JSON。也可用
-`--opencode-bin` 指定另一安装，或启动 `opencode serve` 后传 `--attach http://127.0.0.1:4096`。
+实际以 `opencode run --format json --agent plan --dir <audit-dir> --file=<evidence.json>` 运行；工作目录
+限制在单次审计目录。可用 `--attach` 连接常驻 `opencode serve`，减少冷启动。OpenCode 仍是外部工具，
+不是 Codex 原生子代理。
 
-## 自动任务建议
+## 参数与自动化
 
-定时器或 CI 应先运行 `--collect-only` 检查证据边界，再启用模型分析。常用预算参数：
-
-- `--since-hours 24`：时间窗口。
+- `-q, --question`：用户原始排障问题；明确问题时必须传递。
+- `--job` / `--run-id`：聚焦目标，同时补充步骤/消息/事件事实。
+- `--since-hours 24`：无明确 ID 时的时间窗口。
 - `--limit 80`：每类数据库证据最大行数。
-- `--max-evidence-kb 160`：所有证据的总预算。
-- `--max-rounds 3`：模型主动补证轮次上限。
-- `--timeout 300`：OpenCode 单轮超时秒数。
-- `-q "问题"`：本次排障的唯一首要问题；上层 Agent 应直接传递用户原话。
-- `--fail-on high`：出现 high 或 critical finding 时返回退出码 2，供 CI/定时任务报警；默认不门禁。
+- `--max-evidence-kb 160`：所有 evidence 的总预算。
+- `--max-rounds 3`：仅模型分析使用的补证轮次。
+- `--timeout 300`：OpenCode 单轮墙钟上限；不影响零模型快照。
+- `--fail-on high`：模型报告达到阈值时返回退出码 2；默认不门禁。
+- `--json`：输出完整结构，不与 `--text` 同用。
 
-分析器可请求 `run_trace`、`job_trace`、`model_usage` 或更完整的 `prefix_cache` 聚合；宿主会拒绝
-未知能力、重复请求和超预算请求。分析失败也会在 manifest 中记录阶段与错误。
+自动任务应默认执行一级快照。只有调用方确认 facts 不足，才显式选择二级或三级；禁止失败后无上限
+自动重试模型。
 
-OpenCode 无头运行、`--format json`、`--model`、`--agent`、`--file`、`--attach` 与 `--dir` 参数见
+## 隐私与可靠性
+
+- 不采集正文、完整对话或供应商凭据；focused Job 只保留有界 assistant 预览。
+- Agent Run 原始请求、执行承诺和长 reasoning 不进入 evidence。
+- 活跃 WAL 数据库先复制 `writer.db + -wal + -shm` 到临时目录，再只读查询并清理。
+- prefix-cache 原始 JSONL 只做本地聚合，不直接进入模型上下文。
+- 快照即使截断，也保留 `evidence_json` 路径，便于精确下钻。
+
+仓库的 `agents.md` 与 `CLAUDE.md` 已登记同一分级协议。OpenCode 参数参考
 [OpenCode CLI 官方文档](https://opencode.ai/docs/zh-cn/cli/)。

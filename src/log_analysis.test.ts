@@ -110,3 +110,36 @@ test("log audit persists bounded evidence and rejects unsupported citations", as
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("collect-only snapshot projects focused job output facts without an analyzer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-log-facts-"));
+  try {
+    const project = WriterProject.init(root, "Log facts fixture");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("facts");
+    const sourceMessageId = store.addMessage(sessionId, "user", "为什么没有输出？");
+    const assistantMessageId = store.addMessage(sessionId, "assistant", "已交付章节文档。");
+    store.upsertBackgroundJob({
+      id: "job-facts",
+      sessionId,
+      status: "completed",
+      sourceMessageId,
+      terminalMessage: "",
+    });
+    store.close();
+
+    const result = await runLogAudit({
+      project,
+      options: { collectOnly: true, jobId: "job-facts", question: "为什么没有输出？" },
+    });
+    assert.equal(result.report, undefined);
+    const snapshot = readFileSync(result.snapshotPath, "utf8");
+    assert.match(snapshot, /analysis: not_run/);
+    assert.match(snapshot, /JOB id=job-facts status=completed/);
+    assert.match(snapshot, new RegExp(`OUTPUT messages_after_source=2 assistant_messages=1 last_assistant_id=${assistantMessageId}`));
+    assert.match(snapshot, /preview=已交付章节文档。/);
+    assert.match(snapshot, /no model or external Agent was called/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

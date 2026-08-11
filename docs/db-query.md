@@ -1,16 +1,31 @@
 # 智能体：项目索引与 `writer.db` 查询
 
-给排障 / 审计 Agent 用的**最短操作手册**。库结构细节以 `src/store.ts` 为准。
+给需要核对具体 evidence 或继续下钻的排障 / 审计 Agent 使用。默认入口是 `docs/log-analysis.md`
+的零模型事实快照；库结构细节以 `src/store.ts` 为准。
 
 ---
 
-## 0. 改代码后
+## 0. 先生成事实快照
+
+不要从宽泛 SQL 和完整 steps 开始。先把用户原始问题、Job/Run ID 交给本地确定性投影：
+
+```bash
+npm run --silent snapshot:logs -- \
+  -p ./p/jn3 \
+  --job <job-id> \
+  -q "为什么这次 Job 没有输出？"
+```
+
+先根据 stdout 的 `JOB/RUN/OUTPUT/PROPOSALS/STEPS` facts 回答。仅当 facts 缺字段或需要核对某个
+`ev-*` 时，读取快照末尾的 `evidence_json`；仍不够才执行下文 SQL。该入口不调用模型。
+
+### 0.1 改代码后
 
 ```bash
 npm run build          # 或至少 npm run typecheck
 ```
 
-整体改完再 build；不要只改 `src/` 就宣称可用。`dist/` 不提交。
+整体改完再 build；不要只改 `src/` 就宣称可用。`dist/` 不提交。仅排查日志、不修改源码时无需 build。
 
 ---
 
