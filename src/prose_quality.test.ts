@@ -242,20 +242,48 @@ test("derivative negation-redefinition forms share the registered family", () =>
     "远端没有手指，没有脚趾，只有一阵沿着神经爬升的麻意。",
     "这算不上撤退，只是把阵地让给下一班人。",
   ].join("\n");
-  const issues = analyzeProseStyle(text).filter(issue => issue.constructionRuleId === "negation_redefinition");
+  const issues = analyzeProseStyle(text).filter(issue => issue.constructionRuleId !== undefined);
   assert.equal(issues.length, 3);
   assert.equal(issues.filter(issue => issue.severity === "error").length, 2);
+  assert.deepEqual(issues.map(issue => issue.constructionRuleId), ["absence_replacement", "absence_replacement", "negation_redefinition"]);
   assert.ok(issues.every(issue => issue.countsTowardFamilyBudget === true));
 });
 
-test("unrelated local patches do not inherit a pre-existing family-budget failure", () => {
+test("captures no-A-just-B emotional interpretation for semantic review", () => {
+  const text = "她走路不快，脚步却稳，没有那种“终于等到”的欣喜或紧张，只是在看过来时微微眯了一下眼——像确认一样东西确实和记忆里吻合。";
+  const issue = analyzeProseStyle(text).find(item => item.constructionRuleId === "absence_replacement");
+  assert.ok(issue);
+  assert.equal(issue.subtype, "abstract_reframing");
+  assert.equal(issue.severity, "error");
+  assert.match(issue.evidence, /没有那种“终于等到”的欣喜或紧张，只是在看过来时/u);
+  assert.ok(proseStyleIssuesError([issue]));
+});
+
+test("captures an implicit not-A-but-B replacement across paragraphs", () => {
+  const text = [
+    "楼门推开，走出来的不是接待员。",
+    "",
+    "一个女人，五十多岁，灰白短发别在耳后，白大褂口袋里插着两支笔。",
+  ].join("\n");
+  const issue = analyzeProseStyle(text).find(item => item.constructionRuleId === "negation_redefinition");
+  assert.ok(issue);
+  assert.equal(issue.subtype, "split_redefinition");
+  assert.equal(issue.severity, "error");
+  assert.match(issue.evidence, /走出来的不是接待员[。]\s+一个女人/u);
+  assert.ok(proseStyleIssuesError([issue]));
+});
+
+test("separate construction families do not inherit each other's budget failure", () => {
   const before = "不是掉线。是往上跳。\n不是慢慢降，是断崖。\n不是下降，是横住。";
   const after = `${before}\n窗外的雨停了。`;
   assert.equal(newProseStyleIssues(before, after).some(issue => issue.severity === "error"), false);
 
-  const increased = `${after}\n没有回声，只有泵机稳定的低鸣。`;
-  assert.ok(newProseStyleIssues(after, increased).some(issue =>
-    issue.constructionRuleId === "negation_redefinition" && issue.severity === "error"));
+  const firstAbsence = `${after}\n没有回声，只有泵机稳定的低鸣。`;
+  assert.equal(newProseStyleIssues(after, firstAbsence).some(issue => issue.severity === "error"), false);
+
+  const secondAbsence = `${firstAbsence}\n屏幕上没有人脸，只有一列读数。`;
+  assert.ok(newProseStyleIssues(firstAbsence, secondAbsence).some(issue =>
+    issue.constructionRuleId === "absence_replacement" && issue.severity === "error"));
 });
 
 test("blocks a single factual split contrast because the narration skeleton needs revision", () => {

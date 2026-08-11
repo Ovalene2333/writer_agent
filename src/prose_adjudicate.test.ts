@@ -254,6 +254,20 @@ test("semantic progression and interpretation contrasts are blocked with non-mec
   assert.ok(reviewedRegistered.every(item => item.suggestions.some(suggestion => /不要压成说明句/u.test(suggestion))));
 });
 
+test("implicit cross-paragraph replacement cannot be semantically allowed", () => {
+  const text = "楼门推开，走出来的不是接待员。\n\n一个女人，五十多岁，灰白短发别在耳后。";
+  const issues = analyzeProseStyle(text);
+  const implicit = issues.find(item => item.constructionRuleId === "negation_redefinition");
+  assert.ok(implicit);
+  const reviewed = applyProseVerdicts(text, issues, [{
+    id: implicit.id,
+    verdict: "allow",
+    reason: "后段提供了新人物信息",
+  }]);
+  assert.equal(reviewed.find(item => item.id === implicit.id)?.semanticVerdict, "block");
+  assert.ok(proseStyleIssuesError(reviewed));
+});
+
 test("semantic allow and deterministic construction-family budget stay independent", () => {
   const text = "一个热源，速度很快，不是步兵的速度。门锁内侧有新划痕，不是风吹出来的。";
   const issues = analyzeProseStyle(text);
