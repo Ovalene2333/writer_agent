@@ -29,17 +29,22 @@ import {
   formatRoleplayRerunControls,
   formatRoleplayRerunDirections,
   formatRoleplaySummarySlot,
+  formatRoleplaySemanticRetry,
+  formatRoleplayTurnStrategy,
   isRoleplayContinuationContent,
   isRoleplayExitCommand,
   isRoleplayOocInput,
   parseRoleplayPerception,
   parseRoleplayAutoReply,
   parseRoleplayQualityReview,
+  parseRoleplayPerformanceFinalization,
+  parseRoleplayTurnStrategy,
   parseGeneratedRoleplayScene,
   parseStoredRoleplayPerception,
   normalizeRoleplayRerunControls,
   roleplayLengthPreset,
   roleplayTurnPresentationBudget,
+  selectRoleplayFactsForStrategy,
   ROLEPLAY_RECENT_MESSAGES,
   ROLEPLAY_EPISTEMIC_MEMORY_VERSION,
   roleplayContextKey,
@@ -119,7 +124,7 @@ describe("roleplay prompts", () => {
     assert.match(prompt, /具体数值只能引用上下文中已有的数值/);
     assert.match(prompt, /长档应在同一核心反应内依次完成/);
     assert.match(prompt, /开场同样服从本轮块数安排/);
-    assert.match(prompt, /先否定再改判/);
+    assert.match(prompt, /先否定(?:再|后)改判/);
     assert.match(prompt, /不是……是\/而是……/);
     assert.doesNotMatch(prompt, /字符|回复长度/);
     assert.match(prompt, /不要为了追求短而截断表达/);
@@ -595,6 +600,63 @@ describe("roleplay prompts", () => {
     assert.match(messages.at(-1)?.content ?? "", /雨夜重逢/);
     assert.match(messages.at(-1)?.content ?? "", /答应天亮前离开/);
     assert.match(messages.at(-1)?.content ?? "", /旧港午夜封锁/);
+  });
+
+  test("turn strategy selects relevant memories and stays in the dynamic tail", () => {
+    const facts = [
+      { id: 1, sessionId: "s", contextKey: "k", kind: "promise" as const, content: "答应天亮前离开", sourceMessageId: 9, knownBy: ["public" as const], importance: 90, status: "active" as const, pinned: true, createdAt: "", updatedAt: "" },
+      { id: 2, sessionId: "s", contextKey: "k", kind: "event" as const, content: "旧伤已经处理", sourceMessageId: 4, knownBy: ["performer" as const], importance: 50, status: "active" as const, pinned: false, createdAt: "", updatedAt: "" },
+    ];
+    const plan = parseRoleplayTurnStrategy(JSON.stringify({
+      candidates: [
+        { intent: "结束僵持", tactic: "兑现承诺并起身", expectedSelfDelta: "从等待变为准备离开", usesFactIds: [1, 99] },
+        { intent: "保留余地", tactic: "停止解释", expectedSelfDelta: "明确收回追问", usesFactIds: [] },
+      ],
+      selectedIndex: 0,
+      reason: "承诺已经到期",
+    }), facts);
+    assert.ok(plan);
+    assert.deepEqual(plan.selected.usesFactIds, [1]);
+    assert.equal(plan.alternatives.length, 1);
+    assert.deepEqual(selectRoleplayFactsForStrategy(facts, plan).map(fact => fact.id), [1]);
+    assert.match(formatRoleplayTurnStrategy(plan), /兑现承诺并起身/);
+
+    const base = {
+      stablePrefix: "stable",
+      summary: "",
+      state: { scene: "门边", proximity: "", mood: "", openThreads: [], promises: [], revealed: [], relationshipDelta: "", beat: "僵持", timeInScene: "" },
+      recentAssistantReplies: ["<dialogue>「我不会再解释。」</dialogue>"],
+      history: [] as Array<{ role: "user" | "assistant"; content: string }>,
+      userText: "<current_perception>对话者沉默。</current_perception>",
+    };
+    const withoutPlan = buildRoleplayChatMessages(base);
+    const withPlan = buildRoleplayChatMessages({ ...base, strategy: plan, facts: selectRoleplayFactsForStrategy(facts, plan) });
+    assert.deepEqual(withoutPlan.slice(0, 4), withPlan.slice(0, 4));
+    assert.match(withPlan.at(-1)?.content ?? "", /本轮角色策略/);
+    assert.match(withPlan.at(-1)?.content ?? "", /答应天亮前离开/);
+  });
+
+  test("semantic finalizer requests actor retry instead of editing an old point into new wording", () => {
+    const budget = { minBlocks: 1, maxBlocks: 2, preferredMinCharsPerBlock: 40, preferredMaxCharsPerBlock: 100 };
+    const rejected = parseRoleplayPerformanceFinalization(JSON.stringify({
+      verdict: "retry",
+      issues: ["semantic_self_echo", "state_delta_missing"],
+      blocks: [],
+    }), budget);
+    assert.equal(rejected.verdict, "retry");
+    assert.deepEqual(rejected.issues, ["semantic_self_echo", "state_delta_missing"]);
+    const retry = formatRoleplaySemanticRetry(rejected.issues, {
+      intent: "结束对话", tactic: "起身离开", expectedSelfDelta: "从僵持变为离场尝试", usesFactIds: [],
+    });
+    assert.match(retry, /不要换词重申/);
+    assert.match(retry, /起身离开/);
+
+    const passed = parseRoleplayPerformanceFinalization(JSON.stringify({
+      verdict: "pass", issues: [], propositions: ["她决定结束等待"], blocks: [{ kind: "action", text: "她起身，把椅子推回桌下。" }],
+    }), budget);
+    assert.equal(passed.verdict, "pass");
+    assert.equal(passed.blocks.length, 1);
+    assert.deepEqual(passed.propositions, ["她决定结束等待"]);
   });
 
   test("empty summary and memory use stable placeholders", () => {

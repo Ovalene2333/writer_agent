@@ -95,6 +95,101 @@ export function formatRoleplayRerunDirections(value: readonly RoleplayRerunDirec
     : "";
 }
 
+export interface RoleplayTurnStrategyCandidate {
+  intent: string;
+  tactic: string;
+  expectedSelfDelta: string;
+  usesFactIds: number[];
+}
+
+export interface RoleplayTurnStrategyPlan {
+  selected: RoleplayTurnStrategyCandidate;
+  alternatives: RoleplayTurnStrategyCandidate[];
+  relevantFactIds: number[];
+  reason: string;
+}
+
+function boundedStrategyText(value: unknown, max = 160): string {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+/** Parse the small pre-performance strategy plan without turning dialogue acts into a fixed state machine. */
+export function parseRoleplayTurnStrategy(
+  text: string,
+  availableFacts: readonly Pick<RoleplayMemoryFact, "id">[] = [],
+): RoleplayTurnStrategyPlan | undefined {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) return undefined;
+  try {
+    const raw = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
+    const allowedFactIds = new Set(availableFacts.map(fact => fact.id));
+    const candidates = Array.isArray(raw.candidates) ? raw.candidates.flatMap(item => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const value = item as Record<string, unknown>;
+      const intent = boundedStrategyText(value.intent);
+      const tactic = boundedStrategyText(value.tactic, 100);
+      const expectedSelfDelta = boundedStrategyText(value.expectedSelfDelta);
+      if (!intent || !tactic || !expectedSelfDelta) return [];
+      const usesFactIds = Array.isArray(value.usesFactIds)
+        ? [...new Set(value.usesFactIds.filter((id): id is number => Number.isInteger(id) && allowedFactIds.has(id)))].slice(0, 6)
+        : [];
+      return [{ intent, tactic, expectedSelfDelta, usesFactIds } satisfies RoleplayTurnStrategyCandidate];
+    }).slice(0, 3) : [];
+    if (!candidates.length) return undefined;
+    const selectedIndex = Number.isInteger(raw.selectedIndex)
+      ? Math.max(0, Math.min(candidates.length - 1, Number(raw.selectedIndex)))
+      : 0;
+    const selected = candidates[selectedIndex];
+    const alternatives = candidates.filter((_candidate, index) => index !== selectedIndex);
+    return {
+      selected,
+      alternatives,
+      relevantFactIds: [...new Set(candidates.flatMap(candidate => candidate.usesFactIds))].slice(0, 6),
+      reason: boundedStrategyText(raw.reason, 200),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function selectRoleplayFactsForStrategy(
+  facts: readonly RoleplayMemoryFact[],
+  plan: RoleplayTurnStrategyPlan | undefined,
+  fallbackLimit = 6,
+): RoleplayMemoryFact[] {
+  if (!plan) return facts.slice(0, fallbackLimit);
+  const selectedIds = new Set(plan.relevantFactIds);
+  return facts.filter(fact => selectedIds.has(fact.id)).slice(0, 6);
+}
+
+export function formatRoleplayTurnStrategy(plan: RoleplayTurnStrategyPlan | undefined): string {
+  if (!plan) return "";
+  return [
+    "本轮角色策略（只规定角色自己的意图与可观察变化，不授权改写他人或世界结果）：",
+    `- 意图：${plan.selected.intent}`,
+    `- 策略：${plan.selected.tactic}`,
+    `- 本轮应产生的自身变化：${plan.selected.expectedSelfDelta}`,
+    "围绕这一策略自然演出；若近期已经明确说过同一立场，不换词重申，直接从新压力造成的处境或下一步行动接续。",
+  ].join("\n");
+}
+
+export function formatRoleplaySemanticRetry(
+  issues: readonly RoleplayFinalizationRetryIssue[],
+  alternative?: RoleplayTurnStrategyCandidate,
+): string {
+  const lines = [
+    "［演出语义重试：上一版尚未交付，这不是新的剧情回合。保持同一时刻、事实边界和人物目标，重新演出。］",
+    issues.includes("semantic_self_echo") ? "不要换词重申近期已经明确说过的立场、承诺、拒绝或情绪结论。" : "",
+    issues.includes("tactic_reuse_without_new_pressure") ? "当前没有足以支持旧策略重演的新压力，改用不同的角色策略。" : "",
+    issues.includes("state_delta_missing") ? "本轮必须形成角色自身可观察的变化，不能只解释或再次强调。" : "",
+    alternative ? `改用备选策略：意图=${alternative.intent}；策略=${alternative.tactic}；自身变化=${alternative.expectedSelfDelta}` : "从当前处境选择一个与近期不同、但仍符合角色权限的策略。",
+    "不得新增身世、能力、关键物件、精确机制，不得替对话者或世界决定反应与结果。只输出 <action> / <dialogue> / <ooc> 块。",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
 export interface RoleplayRerunControls {
   /** Ongoing length preference (-2..2); not rerun-only. */
   length: number;
@@ -1104,6 +1199,81 @@ export interface RoleplayPresentationBudget {
   preferredMaxCharsPerBlock: number;
 }
 
+async function planRoleplayTurnStrategy(options: {
+  model: ModelConfig;
+  performerName: string;
+  perception: string;
+  summary: string;
+  state: RoleplayWorkingState;
+  scene?: RoleplayScene;
+  facts: RoleplayMemoryFact[];
+  recentAssistantReplies: string[];
+  recentStrategies?: Array<{ tactic: string; expectedSelfDelta: string }>;
+  recentPropositions?: string[];
+  rerunControls?: RoleplayRerunControls;
+  signal?: AbortSignal;
+  usageReporter?: ModelUsageReporter;
+  maxTokens?: number;
+}): Promise<RoleplayTurnStrategyPlan | undefined> {
+  const completed = await completeJsonText(options.model, [
+    { role: "system", content: `你是即时角色对戏的下一拍策略规划器，不写台词或正文。为扮演角色选择其权限内的一个自然反应策略。
+先判断当前输入给角色造成了什么新压力、机会或信息缺口，再生成 2—3 个语义不同的候选。候选可以是回应、回避、试探、让步、拒绝、兑现、隐瞒、改变距离、使用已建立物件或沉默；这只是开放示例，不是固定动作表。
+每个候选必须改变角色自己的策略、姿态、承诺状态、注意焦点或可观察行动之一。不得创造新身世、能力、关键物件、精确机制、他人内心/动作/反应或未经确认的世界结果。
+对照 recentAssistantReplies、recentStrategies 与 recentPropositions：已经明确表达过的立场、承诺、拒绝或情绪结论不得换词重申，除非 currentPerception 出现了直接质疑、局势变化或承诺到期。目标不变时应优先换策略，而不是重复目标。
+主动性不是每轮配额；没有新压力或安全推进机会时，可以选择保留、停顿或结束本轮。只选择真正相关的 memoryFacts，未选择的事实不进入主演出。
+rollingSummary、currentState、recentAssistantReplies 与 memoryFacts 可能重复记录同一件事；把它们视为同一证据，不得因多路出现就提高重复表达的必要性。选择事实时综合当前相关性、重要性和消息新近程度，置顶只表示可检索，不表示本轮必须使用。
+只输出严格 JSON：{"candidates":[{"intent":"角色本轮想完成什么","tactic":"本轮采用的策略","expectedSelfDelta":"本轮结束时角色自身发生的可观察变化","usesFactIds":[整数]}],"selectedIndex":整数,"reason":"选择原因"}。` },
+    { role: "user", content: JSON.stringify({
+      performer: options.performerName,
+      currentPerception: options.perception,
+      rollingSummary: options.summary,
+      currentState: options.state,
+      sceneGoal: options.scene ? {
+        performerGoal: options.scene.performerGoal,
+        stakes: options.scene.stakes,
+        endConditions: options.scene.endConditions,
+      } : null,
+      initiative: normalizeRoleplayRerunControls(options.rerunControls).initiative,
+      recentAssistantReplies: options.recentAssistantReplies.slice(-3),
+      recentStrategies: (options.recentStrategies ?? []).slice(0, 6),
+      recentPropositions: (options.recentPropositions ?? []).slice(0, 12),
+      memoryFacts: options.facts.map(fact => ({
+        id: fact.id,
+        kind: fact.kind,
+        content: fact.content,
+        importance: fact.importance,
+        pinned: fact.pinned,
+        sourceMessageId: fact.sourceMessageId,
+      })),
+    }) },
+  ], options.signal, {
+    strictJson: true,
+    errorLabel: "角色下一拍策略规划",
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+  });
+  if (completed.usage) {
+    options.usageReporter?.(options.model, completed.usage, {
+      callKind: "roleplay_strategy_plan",
+      ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
+    });
+  }
+  return parseRoleplayTurnStrategy(completed.content, options.facts);
+}
+
+export const ROLEPLAY_FINALIZATION_RETRY_ISSUES = [
+  "semantic_self_echo",
+  "tactic_reuse_without_new_pressure",
+  "state_delta_missing",
+] as const;
+export type RoleplayFinalizationRetryIssue = typeof ROLEPLAY_FINALIZATION_RETRY_ISSUES[number];
+
+export type RoleplayPerformanceFinalization = {
+  verdict: "pass" | "retry";
+  issues: RoleplayFinalizationRetryIssue[];
+  blocks: RoleplayPresentationBlock[];
+  propositions: string[];
+};
+
 export function roleplayPresentationWithinBudget(
   blocks: RoleplayPresentationBlock[],
   budget: RoleplayPresentationBudget,
@@ -1169,29 +1339,36 @@ async function finalizeRoleplayPerformance(options: {
   model: ModelConfig;
   source: string;
   perception: string;
+  recentAssistantReplies: string[];
+  strategy?: RoleplayTurnStrategyCandidate;
   rerunDirections: RoleplayRerunDirection[];
   rerunControls?: RoleplayRerunControls;
   budget: RoleplayPresentationBudget;
   signal?: AbortSignal;
   usageReporter?: ModelUsageReporter;
   maxTokens?: number;
-}): Promise<RoleplayPresentationBlock[]> {
+}): Promise<RoleplayPerformanceFinalization> {
   const completed = await completeJsonText(options.model, [
-    { role: "system", content: `你是即时角色对戏的终审剪辑器，不续写剧情。依据 currentPerception、定向要求和候选演出，返回可以直接展示的最终演出块。
+    { role: "system", content: `你是即时角色对戏的终审剪辑器，不续写剧情。依据 currentPerception、近期角色输出、选中策略、定向要求和候选演出，返回可以直接展示的最终演出块。
 语义规则：删除对玩家输入的引用、改写、逐项回应和理解汇报；删除技术、心理、风险分析，以及角色对自身动机、情绪、反应原因的解释、归纳、总结和说教。含义与潜台词必须留在角色的措辞、停顿和动作里。删除 currentPerception 与既有表达中没有依据的具体数值、制度、机制、经历或结论；不得使用角色不可能知道的信息；不得替玩家角色决定动作、内心、情绪或结果；必须遵守 requestedDirections 与 requestedControls，包括内容分级。
+反复规则：比较 recentAssistantReplies 与 candidatePerformance 的语义，而不只比较原词。若候选只是换词重申角色最近已经明确表达的立场、承诺、拒绝、情绪结论，且 currentPerception 没有直接质疑、局势变化或承诺到期，返回 retry + semantic_self_echo。若角色目标不变但仍照搬近期交涉策略，且没有新压力使该策略合理，返回 retry + tactic_reuse_without_new_pressure。若候选没有实现 plannedStrategy.expectedSelfDelta，且删除重复部分后已无有意义的新反应，返回 retry + state_delta_missing。自然承接、必要确认、对新压力的合理重提不得仅因词面相似退回。
 句式规则：删除 action 与叙述中的「不是……是/而是……」及「不是……。是……。」先否定再改判骨架，改为直接陈述成立的动作、感受或事实；dialogue 中仅保留必要的即时纠正，删除教学腔连发的「不是A，是B」。
 提问规则：保留候选中为完成眼前行动、确认必要事实，或维持合乎人物关系的互动而自然提出的问题；不必把自然说明或必要追问硬改成短促陈述。删除只为续聊、确认理解、索取态度、让玩家选择、镜像原话、逐项追问或以问代答的问题。requestedDirections 包含 no_question 时删除全部问题。
 演出规则：保留角色口吻和一个完整核心反应，可保留相互连贯的动作、停顿与台词；删除场景复述、物件清单、冗余过程和重复信息。不得新增事实、数值、动作或台词。action=角色自身动作/神态/主观感受，dialogue=说出口的台词，ooc=出戏说明。
-只输出严格 JSON：{"blocks":[{"kind":"action|dialogue|ooc","text":"..."}]}。` },
+无法仅靠删除冗余修好时不得自行新增动作或台词，返回 retry 且 blocks=[]，交回演员换策略。pass 时从最终 blocks 提取本轮已经明确表达、值得后续避免无功能复述的最小命题（立场、承诺、拒绝、请求、已揭示信息或情绪结论）；纯动作过程和措辞风格不提取。只输出严格 JSON：{"verdict":"pass|retry","issues":["semantic_self_echo|tactic_reuse_without_new_pressure|state_delta_missing"],"propositions":["最小语义命题"],"blocks":[{"kind":"action|dialogue|ooc","text":"..."}]}。` },
     { role: "user", content: JSON.stringify({
       limits: options.budget,
       requirement: "blocks 应落在 minBlocks–maxBlocks 范围内，每块尽量接近 preferredMinCharsPerBlock–preferredMaxCharsPerBlock，但自然完整优先，不得机械补字或硬裁切。优先保留候选中各有作用且相互连贯的块；不得把长档压成少数块，也不得新增候选中没有的事实、动作或台词。",
       currentPerception: options.perception,
+      recentAssistantReplies: options.recentAssistantReplies.slice(-3),
+      plannedStrategy: options.strategy ?? null,
       requestedDirections: normalizeRoleplayRerunDirections(options.rerunDirections),
       requestedControls: normalizeRoleplayRerunControls(options.rerunControls),
       candidatePerformance: options.source,
     }) },
   ], options.signal, {
+    strictJson: true,
+    errorLabel: "角色演出终审",
     ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
   });
   if (completed.usage) {
@@ -1200,12 +1377,24 @@ async function finalizeRoleplayPerformance(options: {
       ...(completed.durationMs !== undefined ? { durationMs: completed.durationMs } : {}),
     });
   }
-  const cleaned = completed.content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  return parseRoleplayPerformanceFinalization(completed.content, options.budget);
+}
+
+export function parseRoleplayPerformanceFinalization(
+  text: string,
+  budget: RoleplayPresentationBudget,
+): RoleplayPerformanceFinalization {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
   if (start < 0 || end <= start) throw new Error("角色演出终审没有返回有效 JSON");
   try {
-    const value = JSON.parse(cleaned.slice(start, end + 1)) as { blocks?: unknown };
+    const value = JSON.parse(cleaned.slice(start, end + 1)) as { verdict?: unknown; issues?: unknown; propositions?: unknown; blocks?: unknown };
+    const allowedIssues = new Set<string>(ROLEPLAY_FINALIZATION_RETRY_ISSUES);
+    const issues = Array.isArray(value.issues)
+      ? [...new Set(value.issues.filter((issue): issue is RoleplayFinalizationRetryIssue => typeof issue === "string" && allowedIssues.has(issue)))]
+      : [];
+    if (value.verdict === "retry" && issues.length) return { verdict: "retry", issues, blocks: [], propositions: [] };
     if (!Array.isArray(value.blocks)) throw new Error("角色演出终审缺少 blocks");
     const blocks = value.blocks.flatMap(item => {
       if (!item || typeof item !== "object" || Array.isArray(item)) return [];
@@ -1215,8 +1404,11 @@ async function finalizeRoleplayPerformance(options: {
         ? [{ kind, text: raw.text } satisfies RoleplayPresentationBlock]
         : [];
     });
-    if (roleplayPresentationWithinBudget(blocks, options.budget)) return blocks;
-    if (blocks.length > options.budget.maxBlocks) return clampRoleplayPresentationBlocks(blocks, options.budget);
+    const propositions = Array.isArray(value.propositions)
+      ? [...new Set(value.propositions.flatMap(item => boundedStrategyText(item, 160) || []).slice(0, 8))]
+      : [];
+    if (roleplayPresentationWithinBudget(blocks, budget)) return { verdict: "pass", issues: [], blocks, propositions };
+    if (blocks.length > budget.maxBlocks) return { verdict: "pass", issues: [], blocks: clampRoleplayPresentationBlocks(blocks, budget), propositions };
     throw new Error("角色演出终审返回的 blocks 不满足展示预算");
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("角色演出终审")) throw error;
@@ -1350,6 +1542,7 @@ export function buildRoleplayChatMessages(parts: {
   scene?: RoleplayScene;
   facts?: RoleplayMemoryFact[];
   lore?: RoleplayLoreEvidence[];
+  strategy?: RoleplayTurnStrategyPlan;
   recentAssistantReplies: string[];
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userText: string;
@@ -1360,6 +1553,7 @@ export function buildRoleplayChatMessages(parts: {
   spectatorContinuation?: boolean;
 }): ChatMessage[] {
   const dynamicTurnHints = [
+    formatRoleplayTurnStrategy(parts.strategy),
     formatRoleplayAntiFormulaSlot(parts.recentAssistantReplies, {
       spectatorContinuation: parts.spectatorContinuation === true,
     }),
@@ -1606,6 +1800,67 @@ export async function runRoleplayChat(options: {
   const facts = options.store.roleplayMemoryFacts(options.sessionId, performerKey)
     .filter(fact => fact.status === "active" && (fact.knownBy.includes("public") || fact.knownBy.includes("performer")))
     .slice(0, 16);
+  const liveRoleplayMessageIds = new Set(channelAll.map(message => message.id));
+  const strategyHistory = options.store.findSessionArtifacts(options.sessionId, {
+    kinds: ["roleplay-strategy"],
+    statuses: ["active"],
+    limit: 20,
+  }).filter(artifact => artifact.artifactKey.startsWith(`roleplay-strategy:${performerKey}:`))
+    .flatMap(artifact => {
+      try {
+        const parsed = JSON.parse(artifact.content) as {
+          status?: unknown;
+          sourceMessageId?: unknown;
+          plan?: { selected?: Partial<RoleplayTurnStrategyCandidate> };
+          retryStrategy?: Partial<RoleplayTurnStrategyCandidate> | null;
+          deliveredStrategy?: Partial<RoleplayTurnStrategyCandidate> | null;
+          finalization?: { propositions?: unknown };
+        };
+        if (parsed.status !== "delivered"
+          || !Number.isInteger(parsed.sourceMessageId)
+          || !liveRoleplayMessageIds.has(Number(parsed.sourceMessageId))) return [];
+        const strategy = parsed.deliveredStrategy ?? parsed.retryStrategy ?? parsed.plan?.selected;
+        const tactic = boundedStrategyText(strategy?.tactic, 100);
+        const expectedSelfDelta = boundedStrategyText(strategy?.expectedSelfDelta);
+        const propositions = Array.isArray(parsed.finalization?.propositions)
+          ? parsed.finalization.propositions.map(item => boundedStrategyText(item, 160)).filter(Boolean).slice(0, 8)
+          : [];
+        return tactic && expectedSelfDelta ? [{ tactic, expectedSelfDelta, propositions }] : [];
+      } catch {
+        return [];
+      }
+    }).slice(0, 6);
+  const recentStrategies = strategyHistory.map(({ tactic, expectedSelfDelta }) => ({ tactic, expectedSelfDelta }));
+  const recentPropositions = [...new Set(strategyHistory.flatMap(entry => entry.propositions))].slice(0, 12);
+  const strategyPlan = await planRoleplayTurnStrategy({
+    model: qualityModel,
+    performerName: performerDisplayName,
+    perception: modelUserText,
+    summary: memory.summary,
+    state: memory.state,
+    scene: options.scene,
+    facts,
+    recentAssistantReplies,
+    recentStrategies,
+    recentPropositions,
+    rerunControls: options.rerunControls,
+    signal: options.signal,
+    usageReporter: reportInternalUsage,
+    maxTokens: Math.min(roleplaySettings.jsonMaxOutputTokens, 2_000),
+  }).catch(() => undefined);
+  const relevantFacts = selectRoleplayFactsForStrategy(facts, strategyPlan);
+  const strategyArtifactKey = currentUserMessageId !== undefined
+    ? `roleplay-strategy:${performerKey}:${currentUserMessageId}`
+    : undefined;
+  if (strategyPlan && strategyArtifactKey) {
+    options.store.saveContextArtifact(options.sessionId, {
+      cacheKey: strategyArtifactKey,
+      kind: "roleplay-strategy",
+      sourceHash: options.project.hash(modelUserText),
+      content: JSON.stringify({ sourceMessageId: currentUserMessageId, plan: strategyPlan, relevantFactIds: relevantFacts.map(fact => fact.id), status: "planned" }),
+      digest: `${strategyPlan.selected.tactic} → ${strategyPlan.selected.expectedSelfDelta}`.slice(0, 300),
+    });
+  }
   // Do not retrieve global lore from an in-character player message. A hidden thought,
   // secret name, or attempted action in that message must not become performer knowledge
   // merely because semantic retrieval found a matching project document. Scene/card facts
@@ -1618,8 +1873,9 @@ export async function runRoleplayChat(options: {
     state: memory.state,
     sameBeatTurns: memory.sameBeatTurns,
     scene: options.scene,
-    facts,
+    facts: relevantFacts,
     lore,
+    strategy: strategyPlan,
     recentAssistantReplies,
     history,
     userText: modelUserText,
@@ -1645,7 +1901,7 @@ export async function runRoleplayChat(options: {
       options.rerunControls?.length,
       roleplaySettings.lengthBlockBudgets,
     );
-    const result = await streamRoleplayText(
+    let result = await streamRoleplayText(
       performanceModel,
       messages,
       options.signal,
@@ -1655,13 +1911,16 @@ export async function runRoleplayChat(options: {
     if (result.finishReason === "length") {
       throw new Error("角色演出输出达到长度上限；当前进度未落库，请重试本回合");
     }
-    const rawReply = result.content.trim();
+    let rawReply = result.content.trim();
     let finalizationError = "";
-    const finalized = rawReply && roleplaySettings.qualityFinalizeEnabled
+    let deliveredStrategy = strategyPlan?.selected;
+    let finalized = rawReply && roleplaySettings.qualityFinalizeEnabled
       ? await finalizeRoleplayPerformance({
           model: qualityModel,
           source: rawReply,
           perception: modelUserText,
+          recentAssistantReplies,
+          strategy: strategyPlan?.selected,
           rerunDirections: options.rerunDirections ?? [],
           rerunControls: options.rerunControls,
           budget,
@@ -1670,12 +1929,72 @@ export async function runRoleplayChat(options: {
           maxTokens: roleplaySettings.jsonMaxOutputTokens,
         }).catch((error) => {
           finalizationError = error instanceof Error ? error.message : String(error);
-          return [];
+          return undefined;
         })
-      : [];
+      : undefined;
+    if (finalized?.verdict === "retry") {
+      const rejectedIssues = [...finalized.issues];
+      if (result.usage) {
+        emitUsage(emit, options.store, options.sessionId, performanceModel, result.usage, 1, "roleplay_reply_rejected", options.jobId);
+      }
+      const alternative = strategyPlan?.alternatives[0];
+      deliveredStrategy = alternative ?? deliveredStrategy;
+      if (strategyPlan && strategyArtifactKey) {
+        options.store.saveContextArtifact(options.sessionId, {
+          cacheKey: strategyArtifactKey,
+          kind: "roleplay-strategy",
+          sourceHash: options.project.hash(modelUserText),
+          content: JSON.stringify({
+            plan: strategyPlan,
+            sourceMessageId: currentUserMessageId,
+            relevantFactIds: relevantFacts.map(fact => fact.id),
+            status: "retrying",
+            rejectedIssues,
+            retryStrategy: alternative ?? null,
+          }),
+          digest: `语义重试：${rejectedIssues.join("、")}`.slice(0, 300),
+        });
+      }
+      result = await streamRoleplayText(
+        performanceModel,
+        [
+          ...messages,
+          { role: "assistant", content: rawReply },
+          { role: "user", content: formatRoleplaySemanticRetry(finalized.issues, alternative) },
+        ],
+        options.signal,
+        () => undefined,
+        { maxTokens: roleplaySettings.replyMaxOutputTokens },
+      );
+      if (result.finishReason === "length") {
+        throw new Error("角色语义重试输出达到长度上限；当前进度未落库，请重试本回合");
+      }
+      rawReply = result.content.trim();
+      finalized = rawReply
+        ? await finalizeRoleplayPerformance({
+            model: qualityModel,
+            source: rawReply,
+            perception: modelUserText,
+            recentAssistantReplies,
+            strategy: alternative ?? strategyPlan?.selected,
+            rerunDirections: options.rerunDirections ?? [],
+            rerunControls: options.rerunControls,
+            budget,
+            signal: options.signal,
+            usageReporter: reportInternalUsage,
+            maxTokens: roleplaySettings.jsonMaxOutputTokens,
+          }).catch((error) => {
+            finalizationError = error instanceof Error ? error.message : String(error);
+            return undefined;
+          })
+        : undefined;
+      if (finalized?.verdict === "retry") {
+        throw new Error(`角色演出连续语义原地打转（${finalized.issues.join("、")}）；当前进度未落库，请重试本回合`);
+      }
+    }
     const rendered = renderRoleplayWirePresentation(rawReply);
     const fallbackBlocks = rendered.valid ? clampRoleplayPresentationBlocks(rendered.blocks, budget) : [];
-    let reply = (finalized.length ? finalized : fallbackBlocks)
+    let reply = (finalized?.verdict === "pass" && finalized.blocks.length ? finalized.blocks : fallbackBlocks)
       .map(renderRoleplayPresentationBlock).filter(Boolean).join("\n\n");
     if (!reply) {
       const primaryState = rawReply
@@ -1689,6 +2008,24 @@ export async function runRoleplayChat(options: {
             : "终审没有返回满足展示预算的有效 blocks"
         : "主回复为空，未执行终审";
       throw new Error(`角色演出没有可展示内容：${primaryState}；${qualityState}`);
+    }
+    if (strategyPlan && strategyArtifactKey) {
+      options.store.saveContextArtifact(options.sessionId, {
+        cacheKey: strategyArtifactKey,
+        kind: "roleplay-strategy",
+        sourceHash: options.project.hash(modelUserText),
+        content: JSON.stringify({
+          plan: strategyPlan,
+          sourceMessageId: currentUserMessageId,
+          relevantFactIds: relevantFacts.map(fact => fact.id),
+          status: "delivered",
+          deliveredStrategy: deliveredStrategy ?? null,
+          finalization: finalized
+            ? { verdict: finalized.verdict, issues: finalized.issues, propositions: finalized.propositions }
+            : { verdict: "fallback", issues: [], propositions: [] },
+        }),
+        digest: `${strategyPlan.selected.tactic} → 已交付`.slice(0, 300),
+      });
     }
     // Lightweight post-turn bookkeeping (no extra model call).
     // Spectator continuations are still the same action chain when state.beat is stale;
