@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AgentRunController } from "./agent_run_controller.js";
+import { AgentRunStore } from "./agent_run_store.js";
 import { computeAgentHardTurnBudget, isRecoverableProviderTermination, proposalRevisionBaseChangeReason } from "./agent.js";
 import { agentRunInvariantViolations } from "./agent_run_invariants.js";
 import { WriterProject } from "./project.js";
@@ -11,6 +12,11 @@ import { WriterStore } from "./store.js";
 import type { AgentTaskContract } from "./agentic_runtime.js";
 import { executeTool } from "./tools/execute.js";
 import { createProposalRetryState, type ProposalRevisionCase } from "./proposal_retry.js";
+import { decideAgentRuntimeCommand, gateDecisionForToolObservation } from "./agent_runtime_kernel.js";
+import { projectAgentContextBoundary, projectAgentOpenTurn } from "./agent_context_projector.js";
+import { executeObservedToolEffect } from "./agent_effect_runner.js";
+import { executeFulfillmentReviewEffect } from "./agent_fulfillment_effect.js";
+import { guardAgentToolCall } from "./agent_tool_guard.js";
 
 const documentTask: AgentTaskContract = {
   mode: "write_scene",
@@ -22,6 +28,119 @@ const documentTask: AgentTaskContract = {
   workflow: "free",
   qualityProfile: "fast",
 };
+
+test("the pure runtime kernel orders invariants before semantic fulfillment", () => {
+  assert.deepEqual(decideAgentRuntimeCommand({
+    invariantGaps: ["尚未终审"],
+    invariantRecoveryPrompt: "先终审",
+  }), { kind: "continue_execution", source: "invariant", prompt: "先终审" });
+  assert.deepEqual(decideAgentRuntimeCommand({
+    invariantGaps: [],
+    invariantRecoveryPrompt: "",
+  }), { kind: "request_fulfillment_review" });
+  assert.deepEqual(decideAgentRuntimeCommand({
+    invariantGaps: [],
+    invariantRecoveryPrompt: "",
+    fulfillment: { kind: "verdict", verdict: { satisfied: true, reason: "已交付" } },
+  }), { kind: "complete_run", reason: "已交付" });
+});
+
+test("tool observations use one gate decision protocol", () => {
+  assert.equal(gateDecisionForToolObservation({
+    toolName: "write_file",
+    outcome: "revision_required",
+    successful: false,
+    gate: "style",
+    message: "定向修复",
+  }).kind, "repair");
+  assert.equal(gateDecisionForToolObservation({
+    toolName: "write_file",
+    outcome: "interruption",
+    successful: false,
+  }).kind, "retry_dependency");
+});
+
+test("context boundaries are pure projections", () => {
+  const open = projectAgentOpenTurn({
+    stablePrefix: ["s1", "s2"],
+    trunk: "trunk",
+    replay: ["old"],
+    currentTurn: ["new"],
+  });
+  assert.deepEqual(open.messages, ["s1", "s2", "trunk", "old", "new"]);
+  assert.equal(open.replayedMessageCount, 4);
+  const projection = projectAgentContextBoundary(["stable", "draft", "review"], {
+    kind: "chapter_review",
+    keepCount: 1,
+    append: ["handoff"],
+  });
+  assert.deepEqual(projection.messages, ["stable", "handoff"]);
+  assert.equal(projection.droppedMessageCount, 2);
+});
+
+test("tool effects observe complete facts before model-facing bounds", async () => {
+  const order: string[] = [];
+  const effect = await executeObservedToolEffect({
+    execute: () => {
+      order.push("execute");
+      return JSON.stringify({ status: "ok", content: "full" });
+    },
+    observe: result => {
+      order.push(`observe:${JSON.parse(result).content}`);
+    },
+    bound: result => {
+      order.push("bound");
+      return JSON.stringify({ status: JSON.parse(result).status });
+    },
+  });
+  assert.deepEqual(order, ["execute", "observe:full", "bound"]);
+  assert.deepEqual(effect.parsedModelResult, { status: "ok" });
+});
+
+test("fulfillment effect separates invalid output from semantic verdicts", async () => {
+  const snapshot = {
+    originalRequest: "回答问题",
+    finalText: "已经回答",
+    delivered: [],
+    stalled: [],
+    otherArtifacts: [],
+    permissionMode: "ask" as const,
+  };
+  const reviewed = await executeFulfillmentReviewEffect({
+    snapshot,
+    complete: async () => JSON.stringify({ satisfied: true, reason: "已回答" }),
+  });
+  assert.equal(reviewed.status, "reviewed");
+  const invalid = await executeFulfillmentReviewEffect({
+    snapshot,
+    complete: async () => "not-json",
+  });
+  assert.deepEqual(invalid, { status: "unavailable", reason: "意图验收未返回可解析结论" });
+});
+
+test("tool guard centralizes permission and chapter repair locks", () => {
+  const common = {
+    argumentsText: "{}",
+    chapterReviewRequired: false,
+    chapterRepairAllows: () => false,
+    chapterReviewAllows: () => false,
+    visible: true,
+    permissionAllows: true,
+    contract: { outcome: "document", mutation: "document" },
+  };
+  const repair = guardAgentToolCall({
+    ...common,
+    toolName: "write_chapter_scene",
+    chapterRepair: { mode: "style" },
+  });
+  assert.match(repair.blockedResult ?? "", /CHAPTER_STYLE_REPAIR_ONLY/);
+  const planDenied = guardAgentToolCall({
+    ...common,
+    toolName: "write_file",
+    permissionAllows: false,
+  });
+  assert.match(planDenied.blockedResult ?? "", /CONTRACT_MUTATION_DENIED/);
+});
 
 test("provider stream termination is resumable but explicit abort remains cancellation", () => {
   assert.equal(isRecoverableProviderTermination(new Error("terminated")), true);
@@ -62,6 +181,55 @@ test("an interrupted writing run keeps its automatic volume on resume", () => {
     });
     assert.equal(resumed.runId, first.runId);
     assert.deepEqual(resumed.snapshot.volume, { name: "荒原来客", autoCreated: true });
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime phase and context boundaries survive event replay", () => {
+  const { root, store, sessionId } = fixture("runtime-phase");
+  try {
+    const controller = AgentRunController.open({
+      store,
+      sessionId,
+      sourceMessageId: 1,
+      originalRequest: "写一章",
+      task: documentTask,
+      permissionMode: "ask",
+      reusableEvidence: false,
+      resumeInterrupted: false,
+    });
+    controller.recordPhase("awaiting_model", "test:phase:model", {
+      kind: "model",
+      effectId: "step:1",
+      step: 1,
+    });
+    controller.recordContextBoundary({
+      kind: "scene",
+      step: 1,
+      beforeMessageCount: 20,
+      afterMessageCount: 12,
+      droppedMessageCount: 8,
+    }, "test:boundary:scene");
+    const reopened = new AgentRunStore(store).snapshot(controller.runId);
+    assert.equal(reopened?.phase, "awaiting_model");
+    assert.equal(reopened?.pendingEffect?.effectId, "step:1");
+    assert.equal(reopened?.lastContextBoundary?.kind, "scene");
+    assert.equal(reopened?.contextBoundaryCount, 1);
+    const resumed = AgentRunController.open({
+      store,
+      sessionId,
+      sourceMessageId: 2,
+      originalRequest: "写一章",
+      task: documentTask,
+      permissionMode: "ask",
+      reusableEvidence: false,
+      resumeInterrupted: true,
+    });
+    assert.equal(resumed.runId, controller.runId);
+    assert.equal(resumed.snapshot.phase, "ready");
+    assert.equal(resumed.snapshot.pendingEffect, undefined);
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
@@ -179,6 +347,8 @@ test("a delivery that started but never landed stays visible without trapping th
     assert.equal(controller.snapshot.deliverables.length, 1);
     assert.equal(controller.snapshot.deliverables[0]?.evidence, undefined);
     assert.equal(controller.stalledDeliverableLabels().length, 1);
+    assert.equal(controller.snapshot.activeGate?.decision, "repair");
+    assert.equal(controller.snapshot.phase, "repairing");
     controller.recordStep(1);
     assert.equal(controller.snapshot.deliverables[0]?.execution.startedAtStep, 1);
     assert.equal(controller.snapshot.deliverables[0]?.execution.usedSteps, 1);
@@ -249,6 +419,32 @@ test("expected rhythm polish is a gate transition, not a generic tool failure", 
     assert.equal(controller.snapshot.progress.failedTools.propose_document, 1);
     assert.equal(controller.snapshot.progress.gateAttempts.rhythm, 2);
     assert.equal(controller.snapshot.deliverables[0]?.execution.gateAttempts.rhythm, 2);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("chapter review repair locks enter the unified gate protocol", () => {
+  const { root, store, sessionId } = fixture("chapter-review-gate");
+  try {
+    const controller = AgentRunController.open({
+      store,
+      sessionId,
+      sourceMessageId: 7,
+      originalRequest: "写一章",
+      task: documentTask,
+      permissionMode: "ask",
+      reusableEvidence: false,
+      resumeInterrupted: false,
+    });
+    controller.observeTool("inspect_chapter_draft", JSON.stringify({
+      status: "style_revision_required",
+      error: "需要局部句式修复",
+    }), "test:chapter-review");
+    assert.equal(controller.snapshot.activeGate?.gate, "style");
+    assert.equal(controller.snapshot.activeGate?.decision, "repair");
+    assert.equal(controller.snapshot.phase, "repairing");
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });

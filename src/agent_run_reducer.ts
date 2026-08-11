@@ -56,6 +56,7 @@ function initialSnapshot(
       gateAttempts: {},
     },
     status: "running",
+    phase: "preparing",
     step: 0,
     createdAt: event.at,
     updatedAt: event.at,
@@ -92,10 +93,47 @@ export function reduceAgentRunEvent(
         ...next,
         sourceMessageId: event.sourceMessageId,
         status: "running",
+        phase: "ready",
+        pendingEffect: undefined,
+        activeGate: undefined,
         intentReview: undefined,
         terminalReason: undefined,
         nextAction: undefined,
       };
+    case "phase_changed":
+      return {
+        ...next,
+        phase: event.phase,
+        pendingEffect: event.pendingEffect,
+      };
+    case "context_boundary_projected":
+      return {
+        ...next,
+        lastContextBoundary: event.boundary,
+        contextBoundaryCount: (current.contextBoundaryCount ?? 0) + 1,
+      };
+    case "runtime_diagnostic":
+      return {
+        ...next,
+        diagnostics: [
+          ...(current.diagnostics ?? []),
+          { code: event.code, message: event.message, at: event.at },
+        ].slice(-24),
+      };
+    case "runtime_gate_decided":
+      return {
+        ...next,
+        activeGate: {
+          decision: event.decision,
+          toolName: event.toolName,
+          ...(event.gate ? { gate: event.gate } : {}),
+          reason: event.reason,
+          ...(event.deliverableId ? { deliverableId: event.deliverableId } : {}),
+          at: event.at,
+        },
+      };
+    case "runtime_gate_cleared":
+      return { ...next, activeGate: undefined };
     case "deliverable_opened":
       return current.deliverables.some(item => item.id === event.id)
         ? next
@@ -235,13 +273,42 @@ export function reduceAgentRunEvent(
     case "execution_plan_updated":
       return { ...next, executionPlan: event.plan };
     case "run_suspended":
-      return { ...next, status: "suspended", terminalReason: event.reason, nextAction: event.nextAction };
+      return {
+        ...next,
+        status: "suspended",
+        phase: "suspended",
+        pendingEffect: undefined,
+        terminalReason: event.reason,
+        nextAction: event.nextAction,
+      };
     case "run_completed":
-      return { ...next, status: "completed", terminalReason: event.reason, nextAction: undefined };
+      return {
+        ...next,
+        status: "completed",
+        phase: "completed",
+        pendingEffect: undefined,
+        activeGate: undefined,
+        terminalReason: event.reason,
+        nextAction: undefined,
+      };
     case "run_failed":
-      return { ...next, status: "failed", terminalReason: event.reason, nextAction: undefined };
+      return {
+        ...next,
+        status: "failed",
+        phase: "failed",
+        pendingEffect: undefined,
+        terminalReason: event.reason,
+        nextAction: undefined,
+      };
     case "run_cancelled":
-      return { ...next, status: "cancelled", terminalReason: event.reason, nextAction: "resume" };
+      return {
+        ...next,
+        status: "cancelled",
+        phase: "cancelled",
+        pendingEffect: undefined,
+        terminalReason: event.reason,
+        nextAction: "resume",
+      };
   }
 }
 

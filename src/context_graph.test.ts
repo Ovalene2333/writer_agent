@@ -12,6 +12,7 @@ import test from "node:test";
 import {
   buildContextGraphView,
   buildProjectTrunk,
+  buildProjectTrunkDelta,
   chapterHandoffKey,
   formatActiveHandoffsForPrompt,
   PROJECT_TRUNK_EMPTY,
@@ -188,4 +189,13 @@ test("buildProjectTrunk is hash-stable for the same materials and empty when bar
   assert.match(a.content, /"id":1/);
   assert.equal(a.characterCount, 2);
   assert.equal(a.outlineNodeCount, 2);
+
+  const changed = buildProjectTrunk({
+    ...input,
+    characters: [...input.characters, { id: 3, name: "丙", narrativeRole: "访客" }],
+  });
+  const delta = buildProjectTrunkDelta(a, changed);
+  assert.deepEqual(delta?.changedSections, ["characters"]);
+  assert.match(delta?.content ?? "", /"characters"/);
+  assert.doesNotMatch(delta?.content ?? "", /"outlineNodes":\[/);
 });

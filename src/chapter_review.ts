@@ -248,7 +248,6 @@ export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ r
       content: JSON.stringify({
         chapterGoal: input.chapterGoal,
         scenes: input.scenes,
-        fullChapter: input.content,
         ...(input.comparisonMaterials?.length ? { comparisonMaterials: input.comparisonMaterials.slice(0, 3) } : {}),
         ...(input.proseSignals ? { proseSignals: input.proseSignals } : {}),
         ...(input.revisionReview ? {
@@ -267,6 +266,10 @@ export function buildChapterReviewMessages(input: ChapterReviewInput): Array<{ r
             ],
           },
         } : {}),
+        // CACHE: full prose is always the final field. Scene/review metadata may
+        // grow, but a revision that preserves the opening of the chapter can reuse
+        // the request prefix up to the first actually changed prose byte.
+        fullChapter: input.content,
       }),
     },
   ];

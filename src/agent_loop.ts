@@ -4,7 +4,14 @@ import type { AgentExecutionProgress, AgentTaskContract } from "./agentic_runtim
 import type { InterpretedAgentToolResult } from "./agent_tool_outcome.js";
 import type { AgentRunState, PermissionMode } from "./types.js";
 import type { ProposalRevisionCase } from "./proposal_retry.js";
-import type { AgentRunExecutionPlanV2, AgentRunIntentReviewV2 } from "./agent_run_types.js";
+import type {
+  AgentRunExecutionPlanV2,
+  AgentRunIntentReviewV2,
+  AgentRunPendingEffect,
+  AgentRunPhase,
+  AgentRunContextBoundary,
+  AgentRunGateState,
+} from "./agent_run_types.js";
 
 /**
  * Thin host loop facade. Model transcript/cache code stays outside; all durable
@@ -96,6 +103,36 @@ export class AgentLoopRuntime {
 
   recordStep(step: number, deliverableId?: string): void {
     this.controller.recordStep(step, deliverableId);
+  }
+
+  recordPhase(
+    phase: AgentRunPhase,
+    eventKey: string,
+    pendingEffect?: AgentRunPendingEffect,
+  ): void {
+    this.controller.recordPhase(phase, eventKey, pendingEffect);
+  }
+
+  recordContextBoundary(boundary: AgentRunContextBoundary, eventKey: string): void {
+    this.controller.recordContextBoundary(boundary, eventKey);
+  }
+
+  recordDiagnostic(code: string, message: string, eventKey: string): void {
+    this.controller.recordDiagnostic(code, message, eventKey);
+  }
+
+  recordRuntimeGate(input: {
+    decision: AgentRunGateState["decision"];
+    source: string;
+    reason: string;
+    gate?: string;
+    deliverableId?: string;
+  }, eventKey: string): void {
+    this.controller.recordRuntimeGate(input, eventKey);
+  }
+
+  clearRuntimeGate(source: string, eventKey: string): void {
+    this.controller.clearRuntimeGate(source, eventKey);
   }
 
   useDeliverableReviewReserve(

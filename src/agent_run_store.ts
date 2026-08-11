@@ -79,10 +79,19 @@ export class AgentRunStore {
   }
 
   resumableForSession(sessionId: string, originalRequest: string): AgentRunSnapshotV2 | undefined {
-    const row = this.store.database.prepare(`SELECT snapshot_json FROM agent_runs
-      WHERE session_id=? AND original_request=? AND status IN ('suspended','cancelled','failed')
-      ORDER BY updated_at DESC LIMIT 1`).get(sessionId, originalRequest) as Row | undefined;
-    return parseSnapshot(row?.snapshot_json);
+    const rows = this.store.database.prepare(`SELECT snapshot_json FROM agent_runs
+      WHERE session_id=? AND original_request=? AND status IN ('running','suspended','cancelled','failed')
+      ORDER BY CASE status WHEN 'suspended' THEN 0 WHEN 'cancelled' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,
+      updated_at DESC`).all(sessionId, originalRequest) as Row[];
+    for (const row of rows) {
+      const snapshot = parseSnapshot(row.snapshot_json);
+      if (!snapshot) continue;
+      // Explicit terminal pauses outrank a newer unrelated fresh run. A running
+      // run is recoverable only at a journaled external-effect boundary; plain
+      // `ready/preparing` may still belong to a live worker and must not be stolen.
+      if (snapshot.status !== "running" || snapshot.pendingEffect) return snapshot;
+    }
+    return undefined;
   }
 
   append(runId: string, eventKey: string, event: AgentRunEventV2): AgentRunSnapshotV2 {

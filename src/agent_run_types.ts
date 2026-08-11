@@ -3,6 +3,52 @@ import type { ProposalRevisionCase } from "./proposal_retry.js";
 
 export type AgentRunStatus = "running" | "suspended" | "completed" | "failed" | "cancelled";
 
+/**
+ * Durable orchestration phase. `status` is the externally visible lifecycle;
+ * `phase` identifies the resumable effect boundary inside a running job.
+ */
+export type AgentRunPhase =
+  | "preparing"
+  | "ready"
+  | "awaiting_model"
+  | "executing_tools"
+  | "reviewing"
+  | "repairing"
+  | "awaiting_user"
+  | "suspended"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type AgentRunPendingEffect = {
+  kind: "model" | "tools" | "fulfillment_review";
+  effectId: string;
+  step?: number;
+};
+
+export type AgentRunContextBoundary = {
+  kind: "proposal_revision" | "chapter_review" | "scene" | "chapter" | "completed_job";
+  step?: number;
+  beforeMessageCount: number;
+  afterMessageCount: number;
+  droppedMessageCount: number;
+};
+
+export type AgentRunDiagnostic = {
+  code: string;
+  message: string;
+  at: string;
+};
+
+export type AgentRunGateState = {
+  decision: "repair" | "retry_dependency" | "ask_user" | "pause";
+  toolName: string;
+  gate?: string;
+  reason: string;
+  deliverableId?: string;
+  at: string;
+};
+
 export type AgentRunDeliverableState = "pending" | "revision_required" | "submitted" | "applied";
 
 export interface AgentRunDeliverableExecutionV2 {
@@ -77,6 +123,13 @@ export interface AgentRunSnapshotV2 {
   /** Durable global plan inferred from explicit Agent commitments and delivery evidence. */
   executionPlan?: AgentRunExecutionPlanV2;
   status: AgentRunStatus;
+  /** Defaults to `ready` when reading snapshots created before the runtime reform. */
+  phase?: AgentRunPhase;
+  pendingEffect?: AgentRunPendingEffect;
+  lastContextBoundary?: AgentRunContextBoundary;
+  contextBoundaryCount?: number;
+  diagnostics?: AgentRunDiagnostic[];
+  activeGate?: AgentRunGateState;
   step: number;
   terminalReason?: string;
   nextAction?: string;
@@ -109,6 +162,24 @@ export type AgentRunEventV2 =
       reusableEvidence: boolean;
     }
   | { type: "run_resumed"; at: string; sourceMessageId: number }
+  | {
+      type: "phase_changed";
+      at: string;
+      phase: AgentRunPhase;
+      pendingEffect?: AgentRunPendingEffect;
+    }
+  | { type: "context_boundary_projected"; at: string; boundary: AgentRunContextBoundary }
+  | { type: "runtime_diagnostic"; at: string; code: string; message: string }
+  | {
+      type: "runtime_gate_decided";
+      at: string;
+      decision: AgentRunGateState["decision"];
+      toolName: string;
+      gate?: string;
+      reason: string;
+      deliverableId?: string;
+    }
+  | { type: "runtime_gate_cleared"; at: string; toolName: string }
   /**
    * A document delivery opened on demand. The ledger is never pre-seeded from a
    * planner guess: an entry exists because the agent actually started delivering

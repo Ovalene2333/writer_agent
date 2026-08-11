@@ -56,6 +56,8 @@ import {
   buildMaterialsShelfDigest,
   formatJobMaterialsShelfPrompt,
   hydrateSessionMaterialsShelf,
+  latestMaterialsShelfPrompt,
+  materialsShelfUpdatePrompt,
   isTargetedDocumentSupplement,
   projectCacheUserId,
   registerMaterialsShelfEntry,
@@ -131,7 +133,9 @@ test("isolated chapter review carries the full draft once and returns bounded st
   assert.match(messageContentText(messages[0].content), /resolution_too_smooth/u);
   assert.match(messageContentText(messages[0].content), /capability_scope/u);
   assert.match(messageContentText(messages[2].content), /门禁灯由绿变红/u);
-  assert.deepEqual(JSON.parse(messages[2].content).proseSignals, proseSignals);
+  const chapterReviewPayload = JSON.parse(messages[2].content) as Record<string, unknown>;
+  assert.deepEqual(chapterReviewPayload.proseSignals, proseSignals);
+  assert.equal(Object.keys(chapterReviewPayload).at(-1), "fullChapter");
 
   const review = parseChapterReview(JSON.stringify({
     verdict: "revise",
@@ -1877,6 +1881,20 @@ test("cache waterfall reports replayed turns separately from the live dynamic ta
   assert.equal(components.filter(item => item.kind === "user").length, 1);
   assert.equal(components.find(item => item.kind === "user")?.label, "当前用户请求");
   assert.equal(components.find(item => item.kind === "dynamic_system"), undefined);
+});
+
+test("materials shelf replay keeps frozen bytes and appends only authority changes", () => {
+  const frozen = "【会话材料架 · 跨任务保留】旧快照";
+  assert.equal(latestMaterialsShelfPrompt([
+    { role: "assistant", content: "ok" },
+    { role: "user", content: frozen },
+  ]), frozen);
+  assert.equal(materialsShelfUpdatePrompt(frozen, frozen), "");
+  assert.equal(materialsShelfUpdatePrompt(frozen, "【会话材料架 · 跨任务保留】新快照"),
+    "【会话材料架 · 跨任务保留】新快照");
+  const clear = materialsShelfUpdatePrompt(frozen, "");
+  assert.match(clear, /当前材料架为空/);
+  assert.equal(materialsShelfUpdatePrompt(clear, ""), "");
 });
 
 test("session artifact repository keeps a pre-proposal revision independent of delivery state", () => {

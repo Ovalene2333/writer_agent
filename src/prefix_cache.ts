@@ -12,8 +12,12 @@ import { dirname, resolve } from "node:path";
 
 const PREFIX_CACHE_LOG_VERSION = 2;
 const DEFAULT_REPLAY_BYTES = 16 * 1024 * 1024;
-/** Conservative implicit-cache lease; older entries remain structural evidence only. */
-const DEFAULT_CACHE_LEASE_MS = 55 * 60 * 1000;
+/**
+ * Conservative implicit-cache lease. Production observations showed provider
+ * eviction/routing misses after 13–17 minutes, so older prefixes remain useful
+ * structural evidence but are no longer predicted as warm.
+ */
+const DEFAULT_CACHE_LEASE_MS = 12 * 60 * 1000;
 
 export type PrefixCacheMessage = {
   role: "system" | "user" | "assistant" | "tool";

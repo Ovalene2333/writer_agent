@@ -211,6 +211,73 @@ export type ProjectTrunkBuildResult = {
   empty: boolean;
 };
 
+export type ProjectTrunkDelta = {
+  content: string;
+  changedSections: Array<"meta" | "outline" | "characters" | "lorePaths" | "all">;
+};
+
+function projectTrunkBody(content: string): Record<string, unknown> | undefined {
+  const serialized = content.split("\n").at(-1)?.trim();
+  if (!serialized?.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(serialized) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Build an authoritative section delta instead of re-sending the whole trunk. */
+export function buildProjectTrunkDelta(
+  baseline: Pick<ProjectTrunkBuildResult, "hash" | "content">,
+  current: Pick<ProjectTrunkBuildResult, "hash" | "content">,
+): ProjectTrunkDelta | undefined {
+  if (baseline.hash === current.hash) return undefined;
+  const before = projectTrunkBody(baseline.content);
+  const after = projectTrunkBody(current.content);
+  if (!before || !after) {
+    return {
+      content: [
+        "项目索引更新（权威，覆盖前缀中的历史项目索引）：",
+        `baseline=${baseline.hash} current=${current.hash}`,
+        current.content,
+      ].join("\n"),
+      changedSections: ["all"],
+    };
+  }
+  const changes: Record<string, unknown> = {};
+  const removed: string[] = [];
+  const changedSections: ProjectTrunkDelta["changedSections"] = [];
+  const record = (section: ProjectTrunkDelta["changedSections"][number], keys: string[]) => {
+    const changed = keys.some(key => JSON.stringify(before[key]) !== JSON.stringify(after[key]));
+    if (!changed) return;
+    changedSections.push(section);
+    for (const key of keys) {
+      if (key in after) changes[key] = after[key];
+      else if (key in before) removed.push(key);
+    }
+  };
+  record("meta", ["title"]);
+  record("outline", ["outlineSource", "outlineNodes"]);
+  record("characters", ["characters"]);
+  record("lorePaths", ["lorePaths"]);
+  return {
+    content: [
+      "项目索引增量更新（权威；未列出的 section 继续沿用前缀基线）：",
+      JSON.stringify({
+        baseline: baseline.hash,
+        current: current.hash,
+        changedSections,
+        changes,
+        ...(removed.length ? { removed } : {}),
+      }),
+    ].join("\n"),
+    changedSections,
+  };
+}
+
 /**
  * Build the shared project trunk: stable across turns until materials change.
  *

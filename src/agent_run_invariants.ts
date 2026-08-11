@@ -37,6 +37,22 @@ export function agentRunInvariantViolations(snapshot: AgentRunSnapshotV2): strin
   if (snapshot.status === "completed" && snapshot.deliverables.some(item => item.proposalRevision)) {
     violations.push("运行已完成但仍有活动提案修订状态");
   }
+  const terminalPhase = snapshot.phase === "suspended"
+    || snapshot.phase === "completed"
+    || snapshot.phase === "failed"
+    || snapshot.phase === "cancelled";
+  if (snapshot.status === "running" && terminalPhase) {
+    violations.push(`运行状态为 running，但 phase 已终止：${snapshot.phase}`);
+  }
+  if (snapshot.status !== "running" && snapshot.phase && snapshot.phase !== snapshot.status) {
+    violations.push(`终止状态 ${snapshot.status} 与 phase ${snapshot.phase} 不一致`);
+  }
+  if (snapshot.pendingEffect && snapshot.status !== "running") {
+    violations.push("终止运行仍保存 pendingEffect");
+  }
+  if (snapshot.pendingEffect && !["awaiting_model", "executing_tools", "reviewing"].includes(snapshot.phase ?? "")) {
+    violations.push(`pendingEffect 与 phase ${snapshot.phase ?? "unknown"} 不匹配`);
+  }
   return violations;
 }
 

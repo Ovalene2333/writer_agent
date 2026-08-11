@@ -38,6 +38,8 @@ function gateName(result: Record<string, unknown> | undefined): string | undefin
   const code = typeof result.code === "string" ? result.code : "";
   if (result.rhythmRevisionRequired === true || code === "RHYTHM_POLISH_REQUIRED") return "rhythm";
   if (result.status === "final_review_revision_required") return "semantic_review";
+  if (result.status === "style_revision_required") return "style";
+  if (result.status === "structural_revision_required") return "semantic_review";
   if (code.includes("STYLE") && (code.includes("BLOCKED") || code.includes("REVISION_REQUIRED"))) return "style";
   if (code.includes("RHYTHM") && (code.includes("BLOCKED") || code.includes("REVISION_REQUIRED"))) return "rhythm";
   if (code.includes("LENGTH") && (code.includes("BLOCKED") || code.includes("REVISION_REQUIRED"))) return "length";

@@ -1,5 +1,7 @@
 # 缓存前缀优化清单（基于 p/jn3 实测）
 
+状态：已完成（2026-08-11）
+
 > 依据：`src/agent.ts` 顶部 `PROMPT / PREFIX-CACHE CONTRACT`、`src/prefix_cache.ts`、
 > `src/turn_replay.ts`，以及 p/jn3 `.writer/logs/prefix-cache.jsonl` 与 `model_usage` 实测。
 > 本文只列「有数据支撑」的问题与修法；不改动契约的 6+8+1 槽位布局。
@@ -75,3 +77,14 @@
 - 修完后对照 `model_usage`：轮间首步命中率应从 21–71% 提升到 85%+。
 - 跑 `npm run build` 与 `src/agent_cache.test.ts`、`src/turn_replay.test.ts`（槽位形状与哈希被测试锁定）。
 - 不引入新槽位、不改变槽位顺序；材料架/trunk 更新仍走动态尾部。
+
+## 6. 完成记录（2026-08-11）
+
+- 冻结回合保留实际发送给供应商的材料架字节；开场和章节切换只在权威材料架变化时追加更新，
+  材料架清空也使用显式权威 tombstone，不再 strip 后每轮全量重发。
+- 项目 trunk 继续钉住旧基线，变化时按 `meta / outline / characters / lorePaths` section 发送
+  权威 delta；无法解析旧格式时才回退完整 trunk。
+- 默认 cache lease 从 55 分钟降为 12 分钟，13—17 分钟后的 provider eviction 不再被误报为高置信 warm。
+- `direct_chapter_review` 的 `fullChapter` 固定为动态 payload 最后字段；项目上下文和审查规则仍位于其前。
+- prose adjudication 与 learned gate 已保持固定规则在前、候选 passages 在后的结构，本次未重复改写。
+- 稳定 6 槽、首轮动态 8+1、后续单 user、工具 schema 均未改变；相关缓存/AgentRun/上下文测试通过。

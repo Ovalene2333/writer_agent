@@ -69,15 +69,20 @@ import {
   type AgentTaskOutcome,
 } from "./agentic_runtime.js";
 import { AgentLoopRuntime } from "./agent_loop.js";
+import { AgentEffectJournal, executeObservedToolEffect } from "./agent_effect_runner.js";
+import { decideAgentRuntimeCommand } from "./agent_runtime_kernel.js";
 import {
-  parseRunFulfillmentVerdict,
+  projectAgentContextBoundary,
+  projectAgentOpenTurn,
+  type AgentContextBoundaryKind,
+} from "./agent_context_projector.js";
+import {
   advanceRunFulfillmentStagnation,
   runFulfillmentEvidenceFingerprint,
   runFulfillmentContinuationPrompt,
-  runFulfillmentMessages,
-  runFulfillmentPauseReason,
-  type RunFulfillmentVerdict,
 } from "./run_completion.js";
+import { executeFulfillmentReviewEffect } from "./agent_fulfillment_effect.js";
+import { guardAgentToolCall } from "./agent_tool_guard.js";
 import { writingWorkflowPrompt } from "./writing_workflow.js";
 import {
   createProposalRetryState,
@@ -98,6 +103,7 @@ import {
 import { boundedRepairPacket, normalizeRepairPacket, type RepairPacket } from "./repair_packet.js";
 import { approximateMessageTokens, freezeTurnBlock, loadReplayMessages, mergedTurnContext } from "./turn_replay.js";
 import {
+  buildProjectTrunkDelta,
   buildProjectTrunk,
   chapterHandoffKey,
   chapterHandoffLabel,
@@ -811,6 +817,31 @@ const TASK_LABELS: Record<WritingTaskMode, string> = {
   simple_character: "创建或更新简易角色卡", general: "通用写作协作",
 };
 
+/** Safe capability-open fallback when the advisory contract compiler is unavailable. */
+function fallbackWritingTask(request: string): WritingTask {
+  return {
+    mode: "general",
+    label: TASK_LABELS.general,
+    outcome: "answer",
+    evidence: "none",
+    mutation: "none",
+    planning: "adaptive",
+    capabilities: ["research", "documents", "files", "outline", "scenes", "characters", "review", "images"],
+    searchQuery: request.trim().slice(0, 200),
+    characterIds: [],
+    exampleIds: [],
+    documentContext: "search",
+    proseReferenceMode: "project",
+    creativeDepth: "shape",
+    editScope: "section",
+    documentProposalRequired: false,
+    continuation: false,
+    workflow: "free",
+    qualityProfile: "fast",
+    proseGateRequired: false,
+  };
+}
+
 /**
  * Conservatively close a JSON object only when the stream ended between values.
  * Never invents or closes an unterminated string, so truncated prose cannot be
@@ -1123,7 +1154,7 @@ async function compileWritingTaskContract(
     durationMs?: number,
   ) => void,
   prefixCache?: Omit<PrefixCacheRequestContext, "callKind" | "stableMessageCount" | "initialMessageCount">,
-): Promise<{ task: WritingTask }> {
+): Promise<{ task: WritingTask; diagnostic?: { code: string; message: string } }> {
   const explicitPaths = [
     ...selectedDocumentPaths,
     ...explicitReferencePaths(project, request),
@@ -1202,6 +1233,7 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
     }),
   }];
   const plannerRequestOptions = plannerCompletionOptions(model);
+  let plannerDiagnostic: { code: string; message: string } | undefined;
   let result = await streamCompletion(model, planningMessages, signal, () => undefined, () => undefined, {
     ...plannerRequestOptions,
     ...(prefixCache ? {
@@ -1242,7 +1274,26 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
     if (retry.usage) onUsage?.(retry.usage, true, retry.durationMs);
     parsed = parsePlannerJson(retry.content);
     if (!parsed) {
-      throw new Error(`任务契约编译器连续两次没有返回有效 JSON（首次 finish=${result.finishReason ?? "unknown"}、${result.content.length} 字符；重试 finish=${retry.finishReason ?? "unknown"}、${retry.content.length} 字符）`);
+      // The compiler is advisory. A malformed lightweight planning call must not
+      // make the capable execution Agent unavailable. Fall back to a permissive,
+      // adaptive contract; runtime permissions and terminal fulfillment review
+      // still enforce the real safety and completion boundaries.
+      parsed = {
+        mode: "general",
+        outcome: "answer",
+        evidence: "none",
+        mutation: "none",
+        planning: "adaptive",
+        capabilities: ["research", "documents", "files", "outline", "scenes", "characters", "review", "images"],
+        creativeDepth: "shape",
+        editScope: "section",
+        documentContext: "search",
+        proseReferenceMode: "project",
+      };
+      plannerDiagnostic = {
+        code: "TASK_CONTRACT_FALLBACK",
+        message: `任务契约编译器连续两次未返回有效 JSON；已使用开放式自适应契约。首次 finish=${result.finishReason ?? "unknown"}，重试 finish=${retry.finishReason ?? "unknown"}。`,
+      };
     }
     result = retry;
   }
@@ -1351,6 +1402,7 @@ proseGateCandidate 格式：{"id":"稳定英文数字连字符ID","title":"短�
       [request, ...(continuation ? [...recent].reverse().map(item => messageContentText(item.content)) : [])],
     );
   return {
+    ...(plannerDiagnostic ? { diagnostic: plannerDiagnostic } : {}),
     task: {
       mode,
       label: TASK_LABELS[mode],
@@ -3204,23 +3256,36 @@ export async function runAgent(options: {
   // Contract compilation declares outcome/evidence/mutation obligations, but
   // never freezes the execution path. Prefer Flash and keep the call tool-free.
   const plannerModel = options.models?.summarizer ?? options.models?.inline ?? model;
-  const planned = await compileWritingTaskContract(
-    plannerModel, project, store, prompt, history, signal, characterScope,
-    options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
-    options.selectedDocumentBlocks?.map(block => block.path) ?? [],
-    runtimeSettings.autoVolume.enabled,
-    (usage, retry, durationMs) => emitUsageEvent(
-      emit, store, sessionId, plannerModel, usage, 0,
-      retry ? "planner_retry" : "planner", options.jobId,
-      undefined, durationMs,
-    ),
-    {
-      projectRoot: project.root,
-      sessionId,
-      ...(options.jobId ? { jobId: options.jobId } : {}),
-      step: 0,
-    },
-  );
+  let planned: Awaited<ReturnType<typeof compileWritingTaskContract>>;
+  try {
+    planned = await compileWritingTaskContract(
+      plannerModel, project, store, prompt, history, signal, characterScope,
+      options.selectedDocumentBlocks?.reduce((sum, block) => sum + (block.text?.length ?? 0), 0) ?? 0,
+      options.selectedDocumentBlocks?.map(block => block.path) ?? [],
+      runtimeSettings.autoVolume.enabled,
+      (usage, retry, durationMs) => emitUsageEvent(
+        emit, store, sessionId, plannerModel, usage, 0,
+        retry ? "planner_retry" : "planner", options.jobId,
+        undefined, durationMs,
+      ),
+      {
+        projectRoot: project.root,
+        sessionId,
+        ...(options.jobId ? { jobId: options.jobId } : {}),
+        step: 0,
+      },
+    );
+  } catch (error) {
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    planned = {
+      task: fallbackWritingTask(prompt),
+      diagnostic: {
+        code: "TASK_CONTRACT_DEPENDENCY_FALLBACK",
+        message: `任务契约编译依赖不可用；执行 Agent 已使用开放式自适应契约继续。${reason}`,
+      },
+    };
+  }
   const task = planned.task;
   if (options.resumeInterrupted) task.continuation = true;
   // Permission policy is orthogonal to semantic mode and always wins.
@@ -3331,6 +3396,14 @@ export async function runAgent(options: {
     resumeInterrupted: options.resumeInterrupted === true,
     legacyState: previousRunState,
   });
+  const runtimeEffects = new AgentEffectJournal(agentLoop, sourceMessageId);
+  if (planned.diagnostic) {
+    agentLoop.recordDiagnostic(
+      planned.diagnostic.code,
+      planned.diagnostic.message,
+      `diagnostic:${sourceMessageId}:${planned.diagnostic.code}`,
+    );
+  }
   const activeVolume = agentLoop.snapshot.volume?.name ?? requestedActiveVolume;
   const autoCreatedVolume = agentLoop.snapshot.volume?.autoCreated ?? shouldCreateVolume;
   const volumeAccess: VolumeAccessPolicy = {
@@ -3629,9 +3702,6 @@ export async function runAgent(options: {
     sessionId,
     budgetTokens: replayBudgetTokens,
     compact: compactRuntimeMessages,
-    // The shelf is session state assembled once below. Older builds froze a copy
-    // into every turn, so normalize legacy blocks before the first request too.
-    normalize: stripFrozenMaterialsShelfMessages,
   });
   const currentProjectTrunk = buildSessionProjectTrunk(project, store);
   // Keep the epoch's trunk byte-stable in front of replay. Project edits made by
@@ -3646,12 +3716,8 @@ export async function runAgent(options: {
   const replayHead = activeReplayBlocks.at(-1);
   const activeReplayHasCurrentUpdate = activeReplayBlocks.some(block =>
     block.projectUpdateIncluded && block.projectSnapshotHash === currentProjectTrunk.hash);
-  const projectTrunkUpdate = currentProjectTrunk.hash !== projectTrunk.hash && !activeReplayHasCurrentUpdate
-    ? [
-        "项目索引更新（权威，覆盖前缀中的历史项目索引）：",
-        `baseline=${projectTrunk.hash} current=${currentProjectTrunk.hash}`,
-        currentProjectTrunk.content,
-      ].join("\n")
+  const projectTrunkUpdate = !activeReplayHasCurrentUpdate
+    ? buildProjectTrunkDelta(projectTrunk, currentProjectTrunk)?.content ?? ""
     : "";
   const replayHeadCommitId = replayHead?.commitId;
   const trunkMessage: ApiMessage = { role: "system", content: projectTrunk.content };
@@ -3701,10 +3767,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     selectedContext: selectedContext || undefined,
     prompt,
   };
-  const messages: ApiMessage[] = [
-    ...stableSystemPrefix,
-    trunkMessage,
-    ...replay.messages,
+  const currentTurnMessages: ApiMessage[] = [
     // First turn of a session keeps today's exact 8-system + 1-user shape (nothing
     // but stable+trunk precedes it, so system slots are still legal). From turn 2
     // the same bodies in the same order must fold into one `user` message — see
@@ -3713,6 +3776,13 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       ? [mergedTurnContext(turnContextParts)]
       : buildDynamicTurnMessages({ historyText, archiveContext, ...turnContextParts })),
   ];
+  const openTurnProjection = projectAgentOpenTurn<ApiMessage>({
+    stablePrefix: stableSystemPrefix,
+    trunk: trunkMessage,
+    replay: replay.messages,
+    currentTurn: currentTurnMessages,
+  });
+  let messages = openTurnProjection.messages;
   // Attach images only on this turn's final user message (stable prefix stays text).
   if (turnAttachments.length) {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -3725,16 +3795,36 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       break;
     }
   }
+  let contextBoundarySequence = agentLoop.snapshot.contextBoundaryCount ?? 0;
+  const applyContextBoundary = (
+    kind: AgentContextBoundaryKind,
+    keepCount: number,
+  ) => {
+    const projection = projectAgentContextBoundary(messages, { kind, keepCount });
+    messages = projection.messages;
+    contextBoundarySequence += 1;
+    runtimeEffects.contextBoundary({
+      kind: projection.kind,
+      ...(currentUsageStep !== undefined ? { step: currentUsageStep } : {}),
+      beforeMessageCount: projection.beforeMessageCount,
+      afterMessageCount: projection.afterMessageCount,
+      droppedMessageCount: projection.droppedMessageCount,
+    }, contextBoundarySequence);
+    return projection;
+  };
   // Everything before this turn's own context block: frozen bytes the provider has
   // already seen (plus the session trunk, which is rebuilt identically by hash).
-  const trunkEnd = stableSystemPrefix.length + 1;
-  const replayedMessageCount = trunkEnd + replay.messages.length;
-  // Open-turn prefix before session materials shelf (chapter cuts rebuild shelf after this).
-  const initialMessageCount = messages.length;
-  // Session shelf from prior jobs: inject now so step 1 is not a cold start.
+  const trunkEnd = openTurnProjection.trunkEnd;
+  const replayedMessageCount = openTurnProjection.replayedMessageCount;
+  // Open-turn prefix before a possible materials update. Frozen turns retain the
+  // exact shelf bytes the provider saw; append only when the authoritative shelf
+  // changed, so replay remains a byte-identical cache prefix.
+  const initialMessageCount = openTurnProjection.initialMessageCount;
   const openShelfPrompt = formatJobMaterialsShelfPrompt(toolContext);
-  if (openShelfPrompt) {
-    messages.push({ role: "user", content: openShelfPrompt });
+  const replayShelfPrompt = latestMaterialsShelfPrompt(replay.messages);
+  const openShelfUpdate = materialsShelfUpdatePrompt(replayShelfPrompt, openShelfPrompt);
+  if (openShelfUpdate) {
+    messages.push({ role: "user", content: openShelfUpdate });
   }
   // Chapter boundaries truncate here: open-turn prefix + materials shelf (if any).
   let materialsBase = messages.length;
@@ -3757,8 +3847,8 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           id: "shelf",
           layer: "L0",
           label: openShelfCount ? `已读材料 ${openShelfCount} 项` : "已读材料 · 空",
-          estimatedTokens: openShelfPrompt
-            ? Math.ceil(Buffer.byteLength(openShelfPrompt, "utf8") / 4)
+          estimatedTokens: openShelfUpdate
+            ? Math.ceil(Buffer.byteLength(openShelfUpdate, "utf8") / 4)
             : 0,
         },
         {
@@ -3989,12 +4079,31 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     | { kind: "pause"; reason: string }
   > => {
     const gaps = agentLoop.completionGaps();
-    if (gaps.length) {
-      return { kind: "continue", source: "invariant", prompt: completionRecoveryPrompt(gaps, executionProgress) };
+    const initialCommand = decideAgentRuntimeCommand({
+      invariantGaps: gaps,
+      invariantRecoveryPrompt: completionRecoveryPrompt(gaps, executionProgress),
+    });
+    if (initialCommand.kind === "continue_execution") {
+      agentLoop.recordRuntimeGate({
+        decision: "repair",
+        source: "runtime_invariant",
+        gate: "completion_invariant",
+        reason: gaps.join("；"),
+      }, `gate:${sourceMessageId}:invariant:${intentReviewAttempts}`);
+      runtimeEffects.ready(`invariant:${intentReviewAttempts}`);
+      return {
+        kind: "continue",
+        source: initialCommand.source,
+        prompt: initialCommand.prompt,
+      };
     }
+    agentLoop.clearRuntimeGate(
+      "runtime_invariant",
+      `gate:${sourceMessageId}:invariant-cleared:${intentReviewAttempts}`,
+    );
     intentReviewAttempts += 1;
     const reviewEventKey = `intent-review:${sourceMessageId}:${intentReviewAttempts}`;
-    let verdict: RunFulfillmentVerdict | undefined;
+    runtimeEffects.beginFulfillmentReview(reviewEventKey);
     const fulfillmentSnapshot = {
       originalRequest: agentLoop.snapshot.originalRequest,
       finalText: stripDsmlText(transcript, "").trim(),
@@ -4015,37 +4124,51 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           }
         : {}),
     };
-    try {
-      const review = await streamCompletion(
-        plannerModel,
-        runFulfillmentMessages(fulfillmentSnapshot),
-        signal,
-        () => undefined,
-        () => undefined,
-        plannerCompletionOptions(plannerModel),
-      );
-      if (review.usage) {
-        emitUsageEvent(
-          emit, store, sessionId, plannerModel, review.usage, 0,
-          "fulfillment_review", options.jobId, undefined, review.durationMs,
+    const reviewEffect = await executeFulfillmentReviewEffect({
+      snapshot: fulfillmentSnapshot,
+      complete: async messages_ => {
+        const review = await streamCompletion(
+          plannerModel,
+          messages_,
+          signal,
+          () => undefined,
+          () => undefined,
+          plannerCompletionOptions(plannerModel),
         );
-      }
-      verdict = parseRunFulfillmentVerdict(review.content);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+        if (review.usage) {
+          emitUsageEvent(
+            emit, store, sessionId, plannerModel, review.usage, 0,
+            "fulfillment_review", options.jobId, undefined, review.durationMs,
+          );
+        }
+        return review.content;
+      },
+    });
+    if (reviewEffect.status === "unavailable") {
       agentLoop.recordIntentReview({
         status: "unavailable",
-        reason: reason.slice(0, 400) || "意图验收调用失败",
+        reason: reviewEffect.reason,
       }, reviewEventKey);
-      return { kind: "pause", reason: "原始意图验收暂时不可用，已保留上下文，可点「续跑」重试。" };
+      const command = decideAgentRuntimeCommand({
+        invariantGaps: [],
+        invariantRecoveryPrompt: "",
+        fulfillment: {
+          kind: "unavailable",
+          reason: "原始意图验收暂时不可用，已保留上下文，可点「续跑」重试。",
+        },
+      });
+      agentLoop.recordRuntimeGate({
+        decision: "retry_dependency",
+        source: "fulfillment_review",
+        reason: command.kind === "suspend_run" ? command.reason : reviewEffect.reason,
+      }, `${reviewEventKey}:gate:dependency`);
+      runtimeEffects.finishFulfillmentReview(reviewEventKey, "awaiting_user", "unavailable");
+      return {
+        kind: "pause",
+        reason: command.kind === "suspend_run" ? command.reason : reviewEffect.reason,
+      };
     }
-    if (!verdict) {
-      agentLoop.recordIntentReview({
-        status: "unavailable",
-        reason: "意图验收未返回可解析结论",
-      }, reviewEventKey);
-      return { kind: "pause", reason: "原始意图验收未返回有效结论，已保留上下文，可点「续跑」重试。" };
-    }
+    const verdict = reviewEffect.verdict;
     const existingPlan = agentLoop.snapshot.executionPlan;
     const commitment = existingPlan?.commitment || verdict.planCommitment;
     if (commitment) {
@@ -4059,7 +4182,16 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     }
     if (verdict.satisfied) {
       agentLoop.recordIntentReview({ status: "satisfied", reason: verdict.reason }, reviewEventKey);
-      return { kind: "complete", reason: verdict.reason };
+      const command = decideAgentRuntimeCommand({
+        invariantGaps: [],
+        invariantRecoveryPrompt: "",
+        fulfillment: { kind: "verdict", verdict },
+      });
+      agentLoop.clearRuntimeGate("fulfillment_review", `${reviewEventKey}:gate:cleared`);
+      runtimeEffects.finishFulfillmentReview(reviewEventKey, "ready", "reviewed");
+      return command.kind === "complete_run"
+        ? { kind: "complete", reason: command.reason }
+        : { kind: "pause", reason: "原始意图验收状态不一致，已保留上下文。" };
     }
     agentLoop.recordIntentReview({
       status: "unsatisfied",
@@ -4073,11 +4205,37 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     }, evidenceFingerprint);
     lastUnsatisfiedEvidenceFingerprint = stagnation.fingerprint;
     stagnantFulfillmentReviews = stagnation.stagnantReviews;
-    if (stagnation.shouldPause) {
-      return { kind: "pause", reason: runFulfillmentPauseReason(verdict) };
-    }
     const prompt_ = runFulfillmentContinuationPrompt(verdict, stagnantFulfillmentReviews);
-    return { kind: "continue", source: "fulfillment", prompt: prompt_ };
+    const command = decideAgentRuntimeCommand({
+      invariantGaps: [],
+      invariantRecoveryPrompt: "",
+      fulfillment: {
+        kind: "verdict",
+        verdict,
+        continuationPrompt: prompt_,
+        stagnated: stagnation.shouldPause,
+      },
+    });
+    if (command.kind === "suspend_run") {
+      agentLoop.recordRuntimeGate({
+        decision: "pause",
+        source: "fulfillment_review",
+        gate: "fulfillment",
+        reason: command.reason,
+      }, `${reviewEventKey}:gate:stagnated`);
+      runtimeEffects.finishFulfillmentReview(reviewEventKey, "awaiting_user", "stagnated");
+      return { kind: "pause", reason: command.reason };
+    }
+    agentLoop.recordRuntimeGate({
+      decision: "repair",
+      source: "fulfillment_review",
+      gate: "fulfillment",
+      reason: verdict.missing,
+    }, `${reviewEventKey}:gate:continue`);
+    runtimeEffects.finishFulfillmentReview(reviewEventKey, "ready", "continue");
+    return command.kind === "continue_execution"
+      ? { kind: "continue", source: command.source, prompt: command.prompt }
+      : { kind: "pause", reason: "原始意图验收状态不一致，已保留上下文。" };
   };
   const replannedFailures = new Set<string>();
   let thinkingContinuationDisabled = false;
@@ -4096,9 +4254,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       persistSessionMaterialsShelf(store, sessionId, toolContext);
       // Session materials are assembled once at the next open turn; freezing them
       // into every turn duplicates the same digest table across the replay chain.
-      const block = stripFrozenMaterialsShelfMessages(
-        freezeTurnBlock(messages, replayedMessageCount),
-      );
+      const block = freezeTurnBlock(messages, replayedMessageCount);
       if (!block.length) return;
       store.appendAgentTurnBlock(sessionId, {
         turnIndex: store.nextAgentTurnIndex(sessionId),
@@ -4150,6 +4306,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
     emit({ type: "waiting_for_input", sessionId, question: reason, options: ["续跑"] });
   };
 
+  runtimeEffects.ready();
   try {
     // Step budget:
     // - hard (default): single configurable hard cap; no soft/stall converge.
@@ -4292,6 +4449,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
       nextUiStep += 1;
       currentUsageStep = step;
       agentLoop.recordStep(step, activeDeliverable?.id);
+      runtimeEffects.beginModel(step);
       emit({ type: "step_start", step });
       const stepModel = executionModelForStep(
         task.mode,
@@ -4452,6 +4610,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           turnCache.steps += 1;
         }
       }
+      runtimeEffects.finishModel(step, result.toolCalls.length > 0);
       if (!result.toolCalls.length) {
         emit({ type: "step_done", step });
         if (chapterReviewRequired && toolContext.chapterSceneDraft) {
@@ -4769,67 +4928,55 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
             } catch { /* Invalid JSON is handled by executeTool. */ }
           }
         }
-        let toolResult: string;
-        if (proposalScopeError) {
-          toolResult = JSON.stringify({
-            status: "recoverable_state_error",
-            code: proposalScopeCode,
-            failureKind: "invalid_request",
-            retryable: proposalScopeRetryable,
-            error: proposalScopeError,
-            ...(proposalScopeNextAllowedActions
-              ? { nextAllowedActions: proposalScopeNextAllowedActions }
-              : {}),
-          });
-        } else if (chapterReviewRequired && !chapterReviewAllowsTool(call.name)) {
-          chapterReviewRejectedTools.push(call.name);
-          toolResult = JSON.stringify({
-            error: "章节场景链已经完成，当前阶段只允许 inspect_chapter_draft；任务清单已由运行时推进。",
-            code: "CHAPTER_REVIEW_REQUIRED",
-            nextAllowedActions: ["inspect_chapter_draft"],
-          });
-        } else if (chapterReviewRepair && !chapterReviewRepairAllowsTool(chapterReviewRepair, call.name, effectiveCall.arguments)) {
-          toolResult = JSON.stringify({
-            error: chapterReviewRepair.mode === "style"
-              ? "终审只要求精确句式修订，禁止重写场景或重建 scene guide。"
-              : "终审只允许重写 blocker 明确定位的 targetScenes。",
-            code: chapterReviewRepair.mode === "style"
-              ? "CHAPTER_STYLE_REPAIR_ONLY"
-              : "CHAPTER_STRUCTURAL_TARGET_ONLY",
-            nextAllowedActions: chapterReviewRepair.mode === "style"
-              ? ["revise_chapter_draft_style"]
-              : ["write_chapter_scene"],
-            ...(chapterReviewRepair.mode === "structural"
-              ? { targetSceneIds: chapterReviewRepair.targetSceneIds }
-              : {}),
-          });
-        } else if (!executionToolNames.has(call.name)) {
-          toolResult = JSON.stringify({ error: `工具 ${call.name} 不在当前权限模式的稳定能力集中` });
-        } else if (!contractAllowsTool(task, permissionMode, call.name)) {
-          toolResult = JSON.stringify({
-            error: `任务契约不允许执行 ${call.name}`,
-            code: "CONTRACT_MUTATION_DENIED",
-            contract: { outcome: task.outcome, mutation: task.mutation },
-            nextAllowedActions: ["ask_user"],
-          });
-        } else {
-          toolResult = await executeToolCached(effectiveCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext);
-        }
-        // Workflow state consumes the complete result before model-facing bounding.
-        const workflowControlResult = toolResult;
-        agentLoop.observeTool(call.name, workflowControlResult, `tool:${sourceMessageId}:${step}:${call.id}`, deliverableId);
+        const toolGuard = guardAgentToolCall({
+          toolName: call.name,
+          argumentsText: effectiveCall.arguments,
+          ...(proposalScopeError
+            ? {
+                proposalScopeError: {
+                  ...(proposalScopeCode ? { code: proposalScopeCode } : {}),
+                  error: proposalScopeError,
+                  retryable: proposalScopeRetryable,
+                  ...(proposalScopeNextAllowedActions
+                    ? { nextAllowedActions: proposalScopeNextAllowedActions }
+                    : {}),
+                },
+              }
+            : {}),
+          chapterReviewRequired,
+          ...(chapterReviewRepair ? { chapterRepair: chapterReviewRepair } : {}),
+          chapterRepairAllows: chapterReviewRepairAllowsTool,
+          chapterReviewAllows: chapterReviewAllowsTool,
+          visible: executionToolNames.has(call.name),
+          permissionAllows: contractAllowsTool(task, permissionMode, call.name),
+          contract: { outcome: task.outcome, mutation: task.mutation },
+        });
+        if (toolGuard.chapterReviewRejected) chapterReviewRejectedTools.push(call.name);
+        const toolEffect = await executeObservedToolEffect({
+          execute: async () => {
+            if (toolGuard.blockedResult) return toolGuard.blockedResult;
+            return executeToolCached(
+              effectiveCall, project, store, sessionId, emit,
+              toolCallCounts, characterScope, toolContext,
+            );
+          },
+          observe: controlResult => agentLoop.observeTool(
+            call.name,
+            controlResult,
+            `tool:${sourceMessageId}:${step}:${call.id}`,
+            deliverableId,
+          ),
+          bound: controlResult => boundToolResultForModel(
+            effectiveCall, controlResult, project, store, sessionId,
+          ),
+        });
+        const workflowControlResult = toolEffect.controlResult;
         executionProgress = agentLoop.executionProgress();
         // Proposal control flow must read the complete structured review before a
         // large tool result is archived/previewed; otherwise nested issues vanish.
         const proposalControlResult = PROPOSAL_SUBMISSION_TOOLS.has(call.name) ? workflowControlResult : undefined;
-        toolResult = boundToolResultForModel(effectiveCall, toolResult, project, store, sessionId);
-        let structuredToolResult: Record<string, unknown> | undefined;
-        try {
-          const parsed = JSON.parse(toolResult) as unknown;
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            structuredToolResult = parsed as Record<string, unknown>;
-          }
-        } catch { /* 非 JSON 工具结果仍会作为失败/不可验证观察记录。 */ }
+        let toolResult = toolEffect.modelResult;
+        const structuredToolResult = toolEffect.parsedModelResult;
         try {
           const parsed = JSON.parse(toolResult) as Record<string, unknown>;
           if (call.name === "change_character_knowledge" || call.name === "revise_character_expression"
@@ -5129,7 +5276,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         // complete draft arguments and gate tool rows, then point at the newest
         // draft artifact. This is truncation, not an in-place prefix rewrite.
         if (pendingProposalRevisionDraft && proposalRetryBase !== undefined) {
-          messages.length = proposalRetryBase;
+          applyContextBoundary("proposal_revision", proposalRetryBase);
         }
         messages.push({
           role: "user",
@@ -5152,26 +5299,23 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           arguments: JSON.stringify({ summary: automaticChapterReviewSummary(toolContext.chapterSceneDraft) }),
         };
         emit({ type: "tool", name: automaticReviewCall.name });
-        let automaticReviewResult = await executeToolCached(
-          automaticReviewCall, project, store, sessionId, emit, toolCallCounts, characterScope, toolContext,
-        );
-        const automaticReviewControlResult = automaticReviewResult;
-        agentLoop.observeTool(
-          automaticReviewCall.name,
-          automaticReviewControlResult,
-          `tool:${sourceMessageId}:${step}:${automaticReviewCall.id}`,
-        );
+        const automaticReviewEffect = await executeObservedToolEffect({
+          execute: () => executeToolCached(
+            automaticReviewCall, project, store, sessionId, emit,
+            toolCallCounts, characterScope, toolContext,
+          ),
+          observe: controlResult => agentLoop.observeTool(
+            automaticReviewCall.name,
+            controlResult,
+            `tool:${sourceMessageId}:${step}:${automaticReviewCall.id}`,
+          ),
+          bound: controlResult => boundToolResultForModel(
+            automaticReviewCall, controlResult, project, store, sessionId,
+          ),
+        });
         executionProgress = agentLoop.executionProgress();
-        automaticReviewResult = boundToolResultForModel(
-          automaticReviewCall, automaticReviewResult, project, store, sessionId,
-        );
-        let parsedAutomaticReview: Record<string, unknown> | undefined;
-        try {
-          const parsed = JSON.parse(automaticReviewResult) as unknown;
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            parsedAutomaticReview = parsed as Record<string, unknown>;
-          }
-        } catch { /* malformed automatic review keeps the ordinary terminal lock */ }
+        const automaticReviewResult = automaticReviewEffect.modelResult;
+        const parsedAutomaticReview = automaticReviewEffect.parsedModelResult;
         if (parsedAutomaticReview && chapterReviewCompleted(parsedAutomaticReview)) {
           if (isSuccessfulDocumentSubmission("inspect_chapter_draft", parsedAutomaticReview)) {
             documentProposalSubmitted = true;
@@ -5198,9 +5342,17 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           if (!documentProposalSubmitted) automaticReviewHandoff = automaticReviewResult;
         }
       }
+      runtimeEffects.finishTools(
+        step,
+        waitingForUser
+          ? "awaiting_user"
+          : pendingProposalRevisionPrompt || chapterReviewRepair
+            ? "repairing"
+            : "ready",
+      );
       emit({ type: "step_done", step });
       if (automaticReviewHandoff) {
-        messages.length = contextBase;
+        applyContextBoundary("chapter_review", contextBase);
         messages.push({
           role: "user",
           content: `运行时自动终审已完成。严格按结构化结果执行修复或兼容性提交，不要复述报告，也不要扩大修改范围。\n${automaticReviewHandoff}`,
@@ -5232,7 +5384,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         // Deterministic scene→review transition. Drop the final scene's full tool
         // arguments and any rejected planning-only calls, then expose one compact
         // terminal action. This also handles restored 5/5 checkpoints.
-        messages.length = contextBase;
+        applyContextBoundary("chapter_review", contextBase);
         if (chapterReviewRejectedTools.length) chapterReviewRejectedAttempts += 1;
         messages.push({
           role: "user",
@@ -5257,7 +5409,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         if (!beginChapterSucceeded) {
           const beforeTokens = approximateMessageTokens(messages);
           const beforeMessageCount = messages.length;
-          messages.length = contextBase;
+          applyContextBoundary("scene", contextBase);
           messages.push({
             // CACHE: user role — a mid-job system message flips DeepSeek's
             // whole-request rendering and forfeits the cached prefix (§4).
@@ -5359,7 +5511,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           const beforeMessageCount = messages.length;
           // Rebuild kept base from the open-turn prefix plus clean semantic state.
           // Drops previous chapter process and prior handoff only.
-          messages.length = initialMessageCount;
+          applyContextBoundary("chapter", initialMessageCount);
           const semanticBudget = Math.max(
             8_000,
             Math.floor((executionModel.pricing?.contextWindow ?? 128_000) * 0.35),
@@ -5367,7 +5519,10 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
           // Stable first-seen document messages precede the combined shelf digest:
           // when chapter N+1 is appended, chapter 1..N remain a byte-identical prefix.
           messages.push(...semanticDocumentContextMessages(semanticDocuments, semanticBudget));
-          const shelfPrompt = formatJobMaterialsShelfPrompt(toolContext);
+          const shelfPrompt = materialsShelfUpdatePrompt(
+            latestMaterialsShelfPrompt(messages),
+            formatJobMaterialsShelfPrompt(toolContext),
+          );
           if (shelfPrompt) messages.push({ role: "user", content: shelfPrompt });
           materialsBase = messages.length;
           persistSessionMaterialsShelf(store, sessionId, toolContext);
@@ -5642,7 +5797,7 @@ ${managedHandoffContext}${projectTrunkUpdate ? `\n\n${projectTrunkUpdate}` : ""}
         } catch { /* keep the raw replay chain if the durable handoff failed */ }
       }
       if (terminalHandoffPersisted && submittedProposalRef) {
-        messages.length = initialMessageCount;
+        applyContextBoundary("completed_job", initialMessageCount);
         messages.push({
           role: "user",
           content: completedJobHandoffPrompt(submittedProposalRef, terminalHandoff),
@@ -6405,11 +6560,26 @@ const MATERIALS_SHELF_DIGEST_CHARS_SETTING = 1_200;
 /** Cap shelf entries so the cross-chapter kept block stays cheap. */
 const MATERIALS_SHELF_MAX_ENTRIES = 24;
 const MATERIALS_SHELF_PROMPT_PREFIX = "【会话材料架 · 跨任务保留】";
+const MATERIALS_SHELF_EMPTY_UPDATE =
+  `${MATERIALS_SHELF_PROMPT_PREFIX}权威更新：当前材料架为空；此前冻结回合中的材料摘要已失效。`;
 
-function stripFrozenMaterialsShelfMessages(messages: ApiMessage[]): ApiMessage[] {
-  return messages.filter(message =>
-    message.role !== "user"
-    || !messageContentText(message.content).startsWith(MATERIALS_SHELF_PROMPT_PREFIX));
+export function latestMaterialsShelfPrompt(messages: readonly ApiMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    const content = messageContentText(message.content);
+    if (content.startsWith(MATERIALS_SHELF_PROMPT_PREFIX)) return content;
+  }
+  return undefined;
+}
+
+export function materialsShelfUpdatePrompt(
+  previousPrompt: string | undefined,
+  authoritativePrompt: string,
+): string {
+  const previousAuthority = previousPrompt === MATERIALS_SHELF_EMPTY_UPDATE ? "" : previousPrompt ?? "";
+  if (authoritativePrompt === previousAuthority) return "";
+  return authoritativePrompt || MATERIALS_SHELF_EMPTY_UPDATE;
 }
 
 function materialsShelfKeyForPath(path: string): string {

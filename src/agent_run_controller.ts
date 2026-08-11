@@ -18,7 +18,12 @@ import type {
   AgentRunIntentReviewV2,
   AgentRunExecutionPlanV2,
   AgentRunSnapshotV2,
+  AgentRunPhase,
+  AgentRunPendingEffect,
+  AgentRunContextBoundary,
+  AgentRunGateState,
 } from "./agent_run_types.js";
+import { gateDecisionForToolObservation } from "./agent_runtime_kernel.js";
 import type { AgentRunDocumentEvidence, AgentRunState, PermissionMode } from "./types.js";
 import type { WritingWorkflowStage } from "./writing_workflow.js";
 import type { ProposalRevisionCase } from "./proposal_retry.js";
@@ -211,6 +216,61 @@ export class AgentRunController {
     });
   }
 
+  recordPhase(
+    phase: AgentRunPhase,
+    eventKey: string,
+    pendingEffect?: AgentRunPendingEffect,
+  ): void {
+    if (this.snapshotValue.phase === phase
+      && JSON.stringify(this.snapshotValue.pendingEffect) === JSON.stringify(pendingEffect)) return;
+    this.append(eventKey, {
+      type: "phase_changed",
+      at: now(),
+      phase,
+      ...(pendingEffect ? { pendingEffect } : {}),
+    });
+  }
+
+  recordContextBoundary(boundary: AgentRunContextBoundary, eventKey: string): void {
+    this.append(eventKey, {
+      type: "context_boundary_projected",
+      at: now(),
+      boundary,
+    });
+  }
+
+  recordDiagnostic(code: string, message: string, eventKey: string): void {
+    this.append(eventKey, {
+      type: "runtime_diagnostic",
+      at: now(),
+      code: code.slice(0, 80),
+      message: message.slice(0, 800),
+    });
+  }
+
+  recordRuntimeGate(input: {
+    decision: AgentRunGateState["decision"];
+    source: string;
+    reason: string;
+    gate?: string;
+    deliverableId?: string;
+  }, eventKey: string): void {
+    this.append(eventKey, {
+      type: "runtime_gate_decided",
+      at: now(),
+      decision: input.decision,
+      toolName: input.source,
+      ...(input.gate ? { gate: input.gate } : {}),
+      reason: input.reason,
+      ...(input.deliverableId ? { deliverableId: input.deliverableId } : {}),
+    });
+  }
+
+  clearRuntimeGate(source: string, eventKey: string): void {
+    if (!this.snapshotValue.activeGate || this.snapshotValue.activeGate.toolName !== source) return;
+    this.append(eventKey, { type: "runtime_gate_cleared", at: now(), toolName: source });
+  }
+
   useDeliverableReviewReserve(
     deliverableId: string,
     step: number,
@@ -243,6 +303,29 @@ export class AgentRunController {
       at: now(),
       observation: interpreted.observation,
     });
+    const gateDecision = gateDecisionForToolObservation(interpreted.observation, interpreted.waiting);
+    if (gateDecision.kind !== "pass") {
+      const reason = gateDecision.kind === "repair"
+        ? gateDecision.instruction
+        : gateDecision.kind === "ask_user"
+          ? gateDecision.question
+          : gateDecision.reason;
+      this.recordRuntimeGate({
+        decision: gateDecision.kind,
+        source: toolName,
+        ...(gateDecision.kind === "repair" ? { gate: gateDecision.gate } : {}),
+        reason,
+        ...(deliverableId ? { deliverableId } : {}),
+      }, `${eventKey}:runtime-gate:${gateDecision.kind}`);
+    } else if (this.snapshotValue.activeGate
+      && (this.snapshotValue.activeGate.toolName === toolName || Boolean(interpreted.document))) {
+      this.clearRuntimeGate(this.snapshotValue.activeGate.toolName, `${eventKey}:runtime-gate:cleared`);
+    }
+    if (gateDecision.kind === "repair") {
+      this.recordPhase("repairing", `${eventKey}:phase:repairing`);
+    } else if (gateDecision.kind !== "pass") {
+      this.recordPhase("awaiting_user", `${eventKey}:phase:awaiting-user`);
+    }
     if (interpreted.observation.outcome === "revision_required" && interpreted.observation.gate) {
       this.append(`${eventKey}:gate:${interpreted.observation.gate}`, {
         type: "gate_blocked",
