@@ -56,12 +56,12 @@ export interface AgentExecutionProgress {
 
 const PROJECT_EVIDENCE_TOOLS = new Set([
   "read_file", "search_files", "get_outline_node",
-  "get_character", "get_simple_character", "read_conversation",
+  "search_characters", "get_character_context", "get_character", "get_simple_character", "read_conversation",
   "read_context_artifact", "search_session_artifacts",
 ]);
 
 const TARGET_EVIDENCE_TOOLS = new Set([
-  "read_file", "search_files", "get_outline_node", "get_character", "get_simple_character",
+  "read_file", "search_files", "get_outline_node", "get_character_context", "get_character", "get_simple_character",
   "read_context_artifact", "search_session_artifacts",
 ]);
 
@@ -78,6 +78,8 @@ const DOCUMENT_MUTATION_TOOLS = new Set([
 ]);
 
 const CHARACTER_MUTATION_TOOLS = new Set([
+  "change_character_knowledge", "revise_character_expression",
+  "open_character_draft", "update_character_draft", "submit_character_draft",
   "save_character", "apply_character_changes", "save_simple_character",
 ]);
 
@@ -139,7 +141,7 @@ export function recordAgentToolResult(
     if (key) progress.documentArtifactKeys.add(key);
     progress.documentArtifactProduced = true;
   }
-  if (["save_character", "save_simple_character"].includes(toolName)
+  if (["change_character_knowledge", "revise_character_expression", "submit_character_draft", "save_character", "save_simple_character"].includes(toolName)
     || (toolName === "apply_character_changes" && Array.isArray(result.applied) && result.applied.length > 0)) {
     progress.characterArtifactProduced = true;
   }

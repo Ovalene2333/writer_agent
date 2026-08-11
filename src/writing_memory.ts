@@ -12,10 +12,14 @@ export const WRITING_MEMORY_KINDS = [
   "open_thread",
   "dialogue_voice",
   "portrayal",
+  "character_candidate",
 ] as const;
 
 export type WritingMemoryKind = typeof WRITING_MEMORY_KINDS[number];
 export type WritingMemoryStatus = "active" | "stale";
+
+export const WRITING_MEMORY_AUTHORITY =
+  "writingMemory 只是当前会话从已接受正文提取的近期辅助状态，不是项目事实、角色卡或扩写许可；与正文、角色卡或大纲冲突时忽略，措辞或事实不确定时回读 source 原文。";
 
 export type WritingMemoryEntry = {
   id: number;
@@ -38,21 +42,25 @@ export type WritingMemoryEntry = {
 export type WritingMemoryCandidate = Pick<
   WritingMemoryEntry,
   "kind" | "content" | "characterIds" | "importance" | "sourceEvidence"
->;
+> & {
+  characterName?: string;
+  aliases?: string[];
+};
 
 const WRITING_MEMORY_EXTRACTOR_SYSTEM = `你维护单次写作会话的临时写作记忆。只从“本次已经接受的正文变化”提取后续续写近期可能需要的中间态，只输出 JSON 数组，不要 markdown。
 
-这些条目不是项目设定或永久事实，不得扩写、推断或总结全文。只记录正文已经明确呈现且短期续写有用的内容：
+${WRITING_MEMORY_AUTHORITY}只记录正文已经明确呈现且短期续写有用的内容；不得扩写、推断或总结全文：
 - character_state：人物此刻的身体、情绪、意图或处境；
 - relationship：本次实际表现出的关系变化；
 - knowledge：正文明确建立的角色知情状态；
 - open_thread：正文明确留下、尚未闭合的行动或问题；
 - dialogue_voice：角色在本段对白中实际采用的表达策略或语域；
 - portrayal：本段实际呈现的动作、沉默、回避或互动方式。
+- character_candidate：本次已接受正文明确引入、但输入角色目录中不存在的具名人物；content 只写正文已确认的身份/作用，另填 characterName 与 aliases。无名路人、组织、称号不确定者不要记录。
 
 不要提取世界观百科、长期设定、修辞评价、主题分析、写作建议或普通动作流水账。不要把人物猜测当成客观结论。dialogue_voice/portrayal 只能描述这段证据里的实际表现，不能写成永久性格规则。
 
-每项字段：kind；content（独立、简短、无文档术语）；characterIds（只能使用输入角色目录中的 ID，不确定则空数组）；importance（0-100）；sourceEvidence（当前正文中的一段连续原文，必须逐字存在，不得拼接或改写）。最多 18 项。`;
+每项字段：kind；content（独立、简短、无文档术语）；characterIds（只能使用输入角色目录中的 ID，不确定则空数组）；importance（0-100）；sourceEvidence（当前正文中的一段连续原文，必须逐字存在，不得拼接或改写）。character_candidate 还必须给 characterName（正文原名）与 aliases（正文明确别名，可空）。最多 18 项。`;
 
 function jsonArray(text: string): unknown[] {
   const trimmed = text.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
@@ -71,8 +79,10 @@ export function parseWritingMemoryCandidates(
   text: string,
   currentContent: string,
   allowedCharacterIds: readonly number[],
+  knownCharacterNames: readonly string[] = [],
 ): WritingMemoryCandidate[] {
   const allowed = new Set(allowedCharacterIds);
+  const knownNames = new Set(knownCharacterNames.map(name => name.normalize("NFKC").trim()).filter(Boolean));
   const candidates: WritingMemoryCandidate[] = [];
   for (const raw of jsonArray(text).slice(0, 18)) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
@@ -86,12 +96,25 @@ export function parseWritingMemoryCandidates(
     const characterIds = Array.isArray(item.characterIds)
       ? [...new Set(item.characterIds.map(Number).filter(id => Number.isInteger(id) && id > 0 && allowed.has(id)))].slice(0, 8)
       : [];
+    const characterName = typeof item.characterName === "string"
+      ? item.characterName.normalize("NFKC").trim().slice(0, 120)
+      : "";
+    if (kind === "character_candidate"
+      && (!characterName || knownNames.has(characterName) || !sourceEvidence.includes(characterName))) continue;
+    const aliases = Array.isArray(item.aliases)
+      ? [...new Set(item.aliases
+        .filter((value): value is string => typeof value === "string")
+        .map(value => value.normalize("NFKC").trim().slice(0, 120))
+        .filter(value => value && value !== characterName))].slice(0, 8)
+      : [];
     candidates.push({
       kind,
       content,
       characterIds,
       importance: Math.max(0, Math.min(100, Math.round(Number(item.importance ?? 50)) || 0)),
       sourceEvidence,
+      ...(characterName ? { characterName } : {}),
+      ...(aliases.length ? { aliases } : {}),
     });
   }
   return candidates;
@@ -169,5 +192,6 @@ export async function extractWritingMemory(options: {
     parseProviderCompletionPayload(payload).content,
     options.afterContent,
     options.characters.map(item => item.id),
+    options.characters.flatMap(item => [item.name, ...item.aliases]),
   );
 }

@@ -9,7 +9,7 @@ import type { AgentRunToolObservation } from "./agent_run_types.js";
 
 const PROJECT_EVIDENCE_TOOLS = new Set([
   "read_file", "search_files", "get_outline_node",
-  "get_character", "get_simple_character", "read_conversation", "read_context_artifact", "search_session_artifacts",
+  "search_characters", "get_character_context", "get_character", "get_simple_character", "read_conversation", "read_context_artifact", "search_session_artifacts",
 ]);
 
 export interface InterpretedAgentToolResult {
@@ -68,7 +68,7 @@ export function interpretAgentToolResult(
     successful,
     ...(resultMessage(parsed) ? { message: resultMessage(parsed) } : {}),
     ...(PROJECT_EVIDENCE_TOOLS.has(toolName) && successful ? { reusableEvidence: true } : {}),
-    ...(["save_character", "save_simple_character"].includes(toolName)
+    ...(["change_character_knowledge", "revise_character_expression", "submit_character_draft", "save_character", "save_simple_character"].includes(toolName)
       || (toolName === "apply_character_changes" && Array.isArray(parsed?.applied) && parsed.applied.length)
       ? { characterArtifactProduced: successful }
       : {}),

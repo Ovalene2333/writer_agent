@@ -8,15 +8,17 @@ import {
 import { samplingRequestOptions } from "./model_compat.js";
 import {
   narrativeEvidenceForPrompt,
+  formatNarrativeEvidenceGapAction,
   readNarrativeEvidenceSource,
   type NarrativeEvidencePacket,
 } from "./narrative_evidence.js";
 import type { ProseLengthMode } from "./agent_runtime.js";
+import { proseTargetBounds } from "./prose_length.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
 import type { ModelConfig, ModelTokenUsage, RequestComponentUsage } from "./types.js";
 import type { WriterProject } from "./project.js";
 import type { ToolExecutionContext } from "./tools/types.js";
-import { DIALOGUE_HARD_BANS } from "./dialogue_texture.js";
+import { DIALOGUE_HARD_BANS, dialogueNaturalnessGuidance } from "./dialogue_texture.js";
 import { formatWritePackForWriter, type WritePack } from "./write_pack.js";
 import { formatRegisterRisksForWriter, type RegisterRisk } from "./register_risks.js";
 import {
@@ -283,6 +285,7 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
   const sections = [
     `写作材料：\n${formatWritePackForWriter(input.writePack)}`,
     `共享事实证据（hash=${input.evidence.hash}）：\n${JSON.stringify(narrativeEvidenceForPrompt(input.evidence))}`,
+    dialogueNaturalnessGuidance(),
   ];
   if (input.writePack.realizationBoundaries?.length) {
     sections.push(
@@ -314,15 +317,15 @@ export function buildEvidenceGroundedWriterMessages(input: EvidenceGroundedWrite
     })}`);
     sections.push("场景卡是当前导航，不是正文模板。先保证入场事实与本场变化成立；goal、characterIntent、obstacle、turn、outcome、readerQuestion、cost 和 oppositionMove 可在同一动作链中合并实现，不要逐字段分段、逐项解释或为可选字段补戏。");
   }
-  // Beats are the length knob when the pack carries them; the character count
-  // stays as a bound so a beat budget cannot silently double the scene.
+  // Beats shape the scene; the turn's prose-length mode remains authoritative.
   if (input.writePack.beats?.length) {
-    sections.push(`篇幅按节拍走：本场 ${input.writePack.beats.length} 拍，每拍完整落地（意图、尝试、阻碍或错位回应各自可见）后再进入下一拍。字数是上限参考，不是目标；不要为凑字数补铺垫，也不要为压字数把一拍写成一句交代。`);
+    sections.push(`篇幅按节拍走：本场 ${input.writePack.beats.length} 拍，每拍完整落地（意图、尝试、阻碍或错位回应各自可见）后再进入下一拍。节拍不取代下方篇幅控制；不要为凑字数补铺垫，也不要为压字数把一拍写成一句交代。`);
   }
   if (input.targetCharacters) {
+    const bounds = proseTargetBounds(input.targetCharacters);
     sections.push(input.lengthMode === "guidance"
       ? `篇幅参考约 ${input.targetCharacters} 字（弱引导）。保持场景自然完整，不因偏离参考而缩句、扩句或重写；不用总结、复述和无关支线凑字。`
-      : `目标约 ${input.targetCharacters} 字。篇幅服从场景变化，不用总结、复述和无关支线凑字。`);
+      : `篇幅目标约 ${input.targetCharacters} 字，可接受范围 ${bounds.minimum}—${bounds.maximum} 字；超出上限会被运行时拒收。篇幅服从场景变化，但应在这一范围内组织节拍；不用总结、复述和无关支线凑字。`);
   }
   if (input.reviewIssues?.length) {
     sections.push(
@@ -346,7 +349,9 @@ export async function requestEvidenceGroundedProse(
   options?: { complete?: EvidenceWriterCompleteFn },
 ): Promise<EvidenceGroundedWriterResult> {
   if (input.evidence.coverageGaps.length) {
-    throw new Error(`EVIDENCE_COVERAGE_REQUIRED：${input.evidence.coverageGaps.map(gap => gap.action).join("；")}`);
+    throw new Error(
+      `EVIDENCE_COVERAGE_REQUIRED：${input.evidence.coverageGaps.map(formatNarrativeEvidenceGapAction).join("；")}`,
+    );
   }
   const complete = options?.complete ?? completeProviderCompletion;
   const messages = buildEvidenceGroundedWriterMessages(input);

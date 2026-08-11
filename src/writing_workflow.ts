@@ -57,7 +57,7 @@ export function writingWorkflowStagesForTool(
   if (!result || "error" in result || result.status === "error" || result.status === "failed") return [];
   const stages: WritingWorkflowStage[] = [];
   if ([
-    "read_file", "search_files", "get_outline_node", "get_character",
+    "read_file", "search_files", "get_outline_node", "search_characters", "get_character_context", "get_character",
     "get_simple_character", "read_conversation", "read_context_artifact", "search_session_artifacts",
     "list_outline_nodes", "validate_outline", "compare_outline_with_draft",
   ].includes(toolName)) {

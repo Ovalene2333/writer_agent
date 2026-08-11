@@ -1,0 +1,102 @@
+flowchart TD
+    A(["用户消息: Web SSE / writer run"]) --> B[装载会话上下文<br/>历史/任务状态/上一 AgentRun]
+    B --> C[编译任务契约<br/>compileWritingTaskContract<br/>无工具 Flash 单次调用]
+
+    subgraph C1[契约编译 · 无工具 Flash 调用]
+        C --> C2[读目录快照<br/>文档/角色/范文/卷名]
+        C2 --> C3[输出 WritingTask<br/>mode/outcome/evidence/mutation<br/>planning/capabilities/workflow<br/>qualityProfile/proseReferenceMode]
+        C3 -->|JSON 不可解析| C4[重试一次]
+        C4 -->|仍失败| C5(["抛错终止"])
+        C4 --> C3
+    end
+
+    C3 --> D{权限模式 plan?}
+    D -->|plan| D1[强制 mutation=none / workflow=free<br/>写入工具保留在 schema 但运行时拒绝]
+    D -->|ask / auto| D2[保留契约<br/>解析目标卷 / autoVolume 建新卷]
+    D1 --> E
+    D2 --> E
+
+    subgraph E1[消息装配 · 前缀缓存契约]
+        E[装配请求消息] --> E2[6 个稳定 system 槽位<br/>写作系统提示/执行规则/项目指令/技能目录/风格锚定]
+        E2 --> E3[项目索引 trunk · 1 个 system]
+        E3 --> E4[重放已冻结回合]
+        E4 --> E5[本轮动态尾部<br/>首轮 = 8 system + 1 user<br/>第 2 轮起合并为 1 个 user]
+        E5 --> E6[会话材料库 materials shelf<br/>已读设定摘要]
+    end
+
+    E6 --> F{Agent 主循环<br/>turn = 1..N}
+
+    subgraph Loop[每步执行 · 追加式]
+        F1{步数预算检查<br/>hard cap 按落地文档数赚取<br/>experimental: soft/stall 收敛}
+        F1 -->|预算耗尽| F2[收敛提示 → 超限则暂停续跑]
+        F1 -->|有预算| F3[streamCompletion<br/>reasoning + 工具调用]
+        F3 --> F4{是否调用工具}
+    end
+
+    F4 -->|无工具调用| G{需要章节终审?}
+    G -->|是| G1[注入终审提示 → 继续]
+    G -->|否| H[执行 terminalDecision 终审双闸]
+
+    subgraph Gate[终审双闸]
+        H --> H1[第 1 闸 · 不变量检查<br/>agentCompletionGaps<br/>证据下限 / 作者政策 / 场景链阶段完整性]
+        H1 -->|有缺口| H2[注入继续执行提示 → 继续]
+        H1 -->|通过| H3[第 2 闸 · 兑现复审<br/>runFulfillmentMessages<br/>模型判定原始请求是否交付]
+        H3 -->|satisfied| H4(["complete 完成"])
+        H3 -->|未兑现| H5{连续停滞超限?}
+        H5 -->|未超限| H6[注入 nextStep → 继续]
+        H5 -->|超限| H7(["pause 暂停保留上下文"])
+    end
+
+    F4 -->|有工具调用| I[逐工具处理]
+
+    subgraph ToolExec[工具执行 · 三道运行时关卡]
+        I --> I1{字符突变工具?}
+        I1 -->|是| I2[参数修复<br/>repairToolArgumentsWithModel]
+        I1 -->|否| I3[参数放行]
+        I2 --> I3
+        I3 --> I4{提案作用域校验<br/>revision chain / path 归属}
+        I4 -->|不合法| I5[返回 recoverable_state_error]
+        I4 -->|合法| I6{章节终审锁 / 修复锁?}
+        I6 -->|受限| I7[返回 CHAPTER_REVIEW_REQUIRED<br/>或 STYLE_REPAIR_ONLY]
+        I6 -->|放行| I8[executeToolCached<br/>正文写入自动走句式门禁 + 提案]
+        I8 --> I9[observeTool → AgentRun 事件<br/>打开交付账本 deliverable]
+        I9 --> I10{提案类工具?}
+    end
+
+    I10 -->|是| I11{提案结果判定}
+    I11 -->|提交成功| I12[记录交付证据<br/>关闭 revision case]
+    I11 -->|需要句式抛光| I13[rhythm polish<br/>强制一次句式修订]
+    I11 -->|复审失败| I14[proposalFailure 状态机<br/>→ 收敛提示 / pause / ask_user]
+    I12 --> J
+    I13 --> J
+    I14 --> J
+
+    I10 -->|否| J{场景链里程碑}
+    J -->|begin_chapter_draft 成功| J1[推进 contextBase]
+    J -->|写完一场| J2[场景边界截断<br/>注入 sceneContinuationPrompt → 继续]
+    J -->|整章写完| J3[进入章节终审锁<br/>自动 inspect_chapter_draft]
+    J -->|普通工具| J4[重复失败注入重排提示]
+    J3 --> K{终审通过?}
+    K -->|是| L[提交整章提案]
+    K -->|否| M[按结构化结果精确修复<br/>style / structural 修复锁]
+
+    L --> N{还有后续交付?<br/>兑现复审 continue 且是叙事正文}
+    N -->|是| N1[章节边界截断<br/>回到 initial prefix<br/>语义快照 + 衔接 handoff → 下一章]
+    N -->|否| N2([到达完成判定])
+    M --> F
+    J2 --> F
+    H6 --> F
+    G1 --> F
+    J4 --> F
+
+    N2 --> O[保存 assistant 消息]
+    O --> P[freezeTurnBlock 冻结回合<br/>下轮按字节重放]
+    P --> Q[persistRunTerminal completed<br/>AgentRun 事件落库]
+    Q --> R(["emit done"])
+
+    subgraph Exit[异常与暂停出口]
+        H7 --> S1[保存可见回复 + 续跑标记]
+        F2 --> S1
+        S1 --> S2[freeze 回合 + persist interrupted]
+        S2 --> S3(["emit waiting_for_input"])
+    end

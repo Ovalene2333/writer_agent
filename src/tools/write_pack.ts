@@ -50,6 +50,6 @@ export function handleCompileWritePack({ input, context, store, sessionId, proje
     factAtomCount: pack.factAtoms?.length ?? 0,
     realizationBoundaryCount: pack.realizationBoundaries?.length ?? 0,
     registerRiskCount: registerRisks.length,
-    message: "已编译本场场景材料。writePack 不替代角色卡；能力、知识、关系与对白声线仍须依据本轮 get_character 的原始分区。慎用措辞清单只约束措辞，不改变事实。",
+    message: "已编译本场场景材料。writePack 不替代角色知识；能力、状态、关系与对白声线仍须依据本轮 get_character_context(writing) 的用途投影。表达政策只约束呈现，不改变事实。",
   });
 }

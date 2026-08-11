@@ -28,12 +28,19 @@ import {
 } from "./outline.js";
 import {
   handleApplyCharacterChanges,
+  handleChangeCharacterKnowledge,
+  handleGetCharacterContext,
   handleGetCharacter,
   handleGetSimpleCharacter,
   handleListCharacters,
   handleListSimpleCharacters,
+  handleOpenCharacterDraft,
+  handleReviseCharacterExpression,
   handleSaveCharacter,
   handleSaveSimpleCharacter,
+  handleSubmitCharacterDraft,
+  handleSearchCharacters,
+  handleUpdateCharacterDraft,
 } from "./characters.js";
 import { handleInspectConversation, handleReadConversation } from "./conversation.js";
 import {
@@ -108,10 +115,17 @@ const HANDLERS: Record<string, Handler> = {
   propose_document_patch: handleProposeDocumentPatch,
   revise_document_isolated: handleReviseDocumentIsolated,
   propose_change_set: handleProposeChangeSet,
+  search_characters: handleSearchCharacters,
+  get_character_context: handleGetCharacterContext,
+  change_character_knowledge: handleChangeCharacterKnowledge,
+  revise_character_expression: handleReviseCharacterExpression,
   list_characters: handleListCharacters,
   get_character: handleGetCharacter,
   list_simple_characters: handleListSimpleCharacters,
   get_simple_character: handleGetSimpleCharacter,
+  open_character_draft: handleOpenCharacterDraft,
+  update_character_draft: handleUpdateCharacterDraft,
+  submit_character_draft: handleSubmitCharacterDraft,
   save_character: handleSaveCharacter,
   apply_character_changes: handleApplyCharacterChanges,
   save_simple_character: handleSaveSimpleCharacter,

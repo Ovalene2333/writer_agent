@@ -74,7 +74,7 @@ test("one run routes every new ungrouped chapter into its active volume", () => 
     assert.equal(activeVolume, "远行-2");
     assert.equal(routeNewChapterPath(project, "chapters/01.md", policy), "chapters/远行-2/01.md");
     assert.equal(routeNewChapterPath(project, "chapters/02.md", policy), "chapters/远行-2/02.md");
-    assert.equal(routeNewChapterPath(project, "chapters/existing.md", policy), "chapters/existing.md");
+    assert.equal(routeNewChapterPath(project, "chapters/existing.md", policy), "chapters/远行-2/existing.md");
     assert.throws(
       () => routeNewChapterPath(project, "chapters/远行/03.md", policy),
       /未解锁该卷/,
@@ -139,6 +139,57 @@ test("file tools expose volume names without leaking locked chapter paths or tex
         JSON.parse(handleReadFile(args({ path: "chapters/Locked/secret.md" }, ["Locked"]))).content.trim(),
         "private marker",
       );
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("search_files supports bounded grep-style literal and regex matching", () => {
+  withProject(project => {
+    project.writeTextFile("lore/a.md", "Alpha 第12章\nbeta 第3章 alpha\n");
+    project.writeTextFile("outline/b.md", "第九幕\nALPHA\n");
+    const store = new WriterStore(project);
+    try {
+      const sessionId = store.createSession("regex search");
+      const args = (input: Record<string, unknown>): ToolHandlerArgs => ({
+        input, project, store, sessionId, emit: () => undefined,
+        context: { permissionMode: "ask" },
+      });
+      const literal = JSON.parse(handleSearchFiles(args({ query: "alpha", limit: 2 }))) as {
+        mode: string; caseSensitive: boolean; matchCount: number; truncated: boolean;
+        matches: Array<{ path: string; line: number; column: number; matchedText: string; matchesInLine: number }>;
+      };
+      assert.equal(literal.mode, "literal");
+      assert.equal(literal.caseSensitive, false);
+      assert.equal(literal.matchCount, 2);
+      assert.equal(literal.truncated, true);
+      assert.deepEqual(literal.matches.map(item => [item.path, item.line, item.column]), [
+        ["lore/a.md", 1, 1],
+        ["lore/a.md", 2, 10],
+      ]);
+
+      const regex = JSON.parse(handleSearchFiles(args({
+        query: "第(?:\\d+章|[一二三四五六七八九十]+幕)",
+        mode: "regex",
+        caseSensitive: true,
+        contextLines: 0,
+        limit: 10,
+      }))) as { matches: Array<{ path: string; line: number; matchedText: string; contextStartLine: number; contextEndLine: number }> };
+      assert.deepEqual(regex.matches.map(item => [item.path, item.line, item.matchedText]), [
+        ["lore/a.md", 1, "第12章"],
+        ["lore/a.md", 2, "第3章"],
+        ["outline/b.md", 1, "第九幕"],
+      ]);
+      assert.ok(regex.matches.every(item => item.contextStartLine === item.contextEndLine));
+      assert.throws(
+        () => handleSearchFiles(args({ query: "([", mode: "regex" })),
+        /正则表达式无效/u,
+      );
+      const zeroWidth = JSON.parse(handleSearchFiles(args({
+        query: "^|$", mode: "regex", pathPrefix: "lore/a.md", limit: 10,
+      }))) as { matchCount: number };
+      assert.equal(zeroWidth.matchCount, 3, "zero-width global matches advance and return one result per line");
     } finally {
       store.close();
     }

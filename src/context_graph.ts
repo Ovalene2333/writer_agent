@@ -298,7 +298,7 @@ export function buildProjectTrunk(input: ProjectTrunkBuildInput): ProjectTrunkBu
 
   const content = [
     "【项目树干 · 跨章共享】以下材料跨任务字节稳定（大纲/角色/设定变更后换新版本）。",
-    "这是索引与骨架，不是已读正文；需要细节时用 get_outline_node / get_character / read_file 按 id 或路径读取。",
+    "这是索引与骨架，不是已读正文；需要细节时用 get_outline_node / get_character_context / read_file 按 id/ref 或路径读取。",
     "禁止因树干存在而重复 list_outline_nodes 或通读整本大纲。",
     serialized,
   ].join("\n");

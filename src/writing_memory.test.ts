@@ -28,6 +28,69 @@ test("writing memory parser requires verbatim evidence and known character ids",
   assert.deepEqual(parsed[0]?.characterIds, [3]);
 });
 
+test("writing memory parser identifies only evidence-backed unknown named characters", () => {
+  const content = "韩肃按住耳机：『山雀继续向西。』西琳已经接入火控。";
+  const parsed = parseWritingMemoryCandidates(JSON.stringify([
+    {
+      kind: "character_candidate",
+      characterName: "韩肃",
+      aliases: ["獾"],
+      content: "山雀小队的现场指挥者",
+      characterIds: [],
+      importance: 80,
+      sourceEvidence: "韩肃按住耳机：『山雀继续向西。』",
+    },
+    {
+      kind: "character_candidate",
+      characterName: "西琳",
+      content: "已登记角色不得重复建候选",
+      characterIds: [],
+      sourceEvidence: "西琳已经接入火控。",
+    },
+  ]), content, [4], ["西琳"]);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0]?.characterName, "韩肃");
+  assert.deepEqual(parsed[0]?.aliases, ["獾"]);
+});
+
+test("accepted prose promotes a planned session character candidate to confirmed", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-confirmed-character-candidate-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "候选确认");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("正文写作");
+    const sourceMessageId = store.addMessage(sessionId, "user", "写第一章", "agent");
+    store.saveSessionCharacterCandidate(sessionId, {
+      name: "韩肃", aliases: ["獾"], status: "planned", summary: "暂定小队长",
+      source: { sourceMessageId },
+    });
+    const path = "chapters/001.md";
+    const content = "# 第一章\n\n韩肃按住耳机：『山雀继续向西。』\n";
+    project.writeTextFile(path, "# 第一章\n\n");
+    const proposal = store.createProposal(sessionId, path, content, "引入韩肃", [], undefined, sourceMessageId);
+    store.acceptProposal(proposal.id);
+    store.saveExtractedWritingMemory(sessionId, sourceMessageId, path, content, proposal.id, [{
+      kind: "character_candidate",
+      characterName: "韩肃",
+      aliases: ["獾"],
+      content: "山雀小队的现场指挥者",
+      characterIds: [],
+      importance: 80,
+      sourceEvidence: "韩肃按住耳机：『山雀继续向西。』",
+    }]);
+    const artifact = store.findSessionArtifacts(sessionId, { kinds: ["character_candidate"] })[0];
+    const candidate = JSON.parse(artifact.content) as { status: string; sources: unknown[] };
+    assert.equal(candidate.status, "confirmed");
+    assert.equal(candidate.sources.length, 2);
+    assert.ok(store.sessionArtifactRelations(sessionId, artifact.id)
+      .some(relation => relation.relation === "supported_by"));
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("writing memory is session-scoped, follows source text, and rewinds with its message", () => {
   const root = mkdtempSync(join(tmpdir(), "writer-session-memory-"));
   let store: WriterStore | undefined;

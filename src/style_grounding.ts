@@ -174,7 +174,7 @@ export function dynamicStyleGroundingPrompt(
   const projectSection = projectSample
     ? continuityOnly
       ? `［最近正文连续性材料（来源：${projectSample.source}）——只承接人物称谓、叙述距离、现场状态和语域；它未经风格验收，不模仿其中重复段首、固定句长或短对白节拍］\n${projectSample.text}`
-      : `［紧接本次写作之前的正文（来源：${projectSample.source}）——新正文从这里的声线自然续下去，句法与节奏保持同一支笔的手感］\n${projectSample.text}`
+      : `［紧接本次写作之前的正文（来源：${projectSample.source}）——新正文从这里的叙述距离、语域与节奏自然续下去，但不复用固定句式、段首或事件结构］\n${projectSample.text}`
     : "";
   if (continuityOnly) {
     if (projectSection) sections.push(projectSection);

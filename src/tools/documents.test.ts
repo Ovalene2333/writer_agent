@@ -91,3 +91,56 @@ test("正文质量报告按精确哈希生成一次并跨 Store 持久化复用"
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("会话产物与文件检索共享卷访问边界", async () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-artifact-volume-access-"));
+  try {
+    const project = WriterProject.init(root, "产物卷权限");
+    const store = new WriterStore(project);
+    const sessionId = store.createSession("artifact-volume-access");
+    const lockedPath = "chapters/锁定卷/01.md";
+    project.writeTextFile(lockedPath, "# 第一章\n\n只存在于锁定卷的暗号。");
+    const locked = store.saveSessionArtifact(sessionId, {
+      artifactKey: "locked-draft",
+      kind: "proposal_revision_draft",
+      path: lockedPath,
+      sourceHash: "locked-hash",
+      content: "锁定卷完整正文",
+      digest: "锁定卷摘要",
+    });
+    store.saveSessionArtifact(sessionId, {
+      artifactKey: "open-lore",
+      kind: "read_file",
+      path: "lore/world.md",
+      sourceHash: "open-hash",
+      content: "可读设定",
+      digest: "可读摘要",
+    });
+    const context = { permissionMode: "ask" as const, volumeAccess: { allowedVolumes: [] } };
+
+    const catalog = JSON.parse(await executeTool(
+      { id: "artifact-search", name: "search_session_artifacts", arguments: "{}" },
+      project, store, sessionId, () => {}, undefined, context,
+    )) as { count: number; accessFiltered?: number; message?: string };
+    assert.equal(catalog.count, 1);
+    assert.equal(catalog.accessFiltered, 1);
+    assert.match(catalog.message ?? "", /未解锁/u);
+
+    const read = JSON.parse(await executeTool(
+      { id: "artifact-read", name: "read_context_artifact", arguments: JSON.stringify({ artifactId: locked.id }) },
+      project, store, sessionId, () => {}, undefined, context,
+    )) as { error?: string };
+    assert.match(read.error ?? "", /未解锁该卷/u);
+
+    const search = JSON.parse(await executeTool(
+      { id: "file-search", name: "search_files", arguments: JSON.stringify({ query: "暗号" }) },
+      project, store, sessionId, () => {}, undefined, context,
+    )) as { matches: unknown[]; accessFiltered?: number; message?: string };
+    assert.deepEqual(search.matches, []);
+    assert.equal(search.accessFiltered, 1);
+    assert.match(search.message ?? "", /未参与检索/u);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

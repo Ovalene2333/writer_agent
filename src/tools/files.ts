@@ -11,7 +11,7 @@ import type { EvidenceGroundedWriterInput } from "../evidence_grounded_writer.js
 import { buildFactContract } from "../fact_contract.js";
 import type { RepairPacketIssue } from "../repair_packet.js";
 import { reportModelCallUsage } from "../dependency_diagnostics.js";
-import { chapterSceneDraftComplete } from "../scene_pipeline.js";
+import { assembleChapterSceneDraft, chapterSceneDraftComplete } from "../scene_pipeline.js";
 import { normalizeChapterDocumentContent } from "../chapter_naming.js";
 import {
   accessibleVolumeNames,
@@ -37,6 +37,7 @@ import {
 } from "./proposals.js";
 import { handleProposeChapterDraft } from "./scene_pipeline.js";
 import type { ToolHandlerArgs, WorkingTextFile } from "./types.js";
+import { fallbackDocumentMutationSummary } from "../delivery_evidence.js";
 
 const READ_BLOCK_TARGET_CHARACTERS = 3_000;
 const MAX_READ_CHARACTERS = 4_000;
@@ -96,8 +97,12 @@ function fileMutationSummary(
   input: Record<string, unknown>,
   path: string,
   verb: "write" | "edit" | "move" | "delete",
+  content?: string,
 ): string {
   if (typeof input.summary === "string" && input.summary.trim()) return input.summary.trim();
+  if ((verb === "write" || verb === "edit") && content !== undefined) {
+    return fallbackDocumentMutationSummary(verb, path, content);
+  }
   const label = verb === "write" ? "写入" : verb === "edit" ? "编辑" : verb === "move" ? "移动" : "删除";
   return `${label} ${path}`;
 }
@@ -107,7 +112,7 @@ async function submitWorkingTextFile(
   staged: WorkingTextFile,
   verb: "write" | "edit",
 ): Promise<string> {
-  const summary = fileMutationSummary(args.input, staged.path, verb);
+  const summary = fileMutationSummary(args.input, staged.path, verb, staged.content);
   const internalInput = {
     path: staged.path,
     content: staged.content,
@@ -290,28 +295,114 @@ export function handleReadFile(args: ToolHandlerArgs): string {
 export function handleSearchFiles(args: ToolHandlerArgs): string {
   const { input, project, context } = args;
   const query = requireString(input.query, "query");
+  if (query.length > 500) throw new Error("搜索表达式最多 500 个字符");
+  const mode = input.mode === undefined ? "literal" : input.mode;
+  if (mode !== "literal" && mode !== "regex") throw new Error("mode 必须是 literal 或 regex");
+  const caseSensitive = input.caseSensitive === true;
+  const contextLines = input.contextLines === undefined
+    ? 1
+    : Math.max(0, Math.min(3, Number(input.contextLines)));
+  if (!Number.isInteger(contextLines)) throw new Error("contextLines 必须是 0—3 的整数");
   const prefix = typeof input.pathPrefix === "string"
     ? input.pathPrefix.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "")
     : "";
-  const limit = Math.max(1, Math.min(20, optionalPositiveInteger(input.limit, "limit") ?? 8));
-  const needle = query.toLocaleLowerCase();
-  const matches: Array<{ path: string; line: number; excerpt: string }> = [];
+  const limit = Math.max(1, Math.min(50, optionalPositiveInteger(input.limit, "limit") ?? 12));
+  const needle = caseSensitive ? query : query.toLocaleLowerCase();
+  let expression: RegExp | undefined;
+  if (mode === "regex") {
+    try {
+      expression = new RegExp(query, `gu${caseSensitive ? "" : "i"}`);
+    } catch (error) {
+      throw new Error(`正则表达式无效：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const matches: Array<{
+    path: string;
+    line: number;
+    column: number;
+    matchedText: string;
+    matchesInLine: number;
+    contextStartLine: number;
+    contextEndLine: number;
+    excerpt: string;
+    workingCopy: boolean;
+  }> = [];
+  let accessFiltered = 0;
+  let searchedFiles = 0;
+  let truncated = false;
   const paths = [...new Set([
     ...project.listTextFiles(),
     ...(context.workingTextFiles?.keys() ?? []),
   ])].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  for (const path of paths) {
-    if (matches.length >= limit) break;
-    if (project.isDocumentHidden(path) || !proseReferenceReadAllowed(context, path)
-      || (prefix && path !== prefix && !path.startsWith(`${prefix}/`))) continue;
+  pathLoop: for (const path of paths) {
+    if (project.isDocumentHidden(path) || (prefix && path !== prefix && !path.startsWith(`${prefix}/`))) continue;
+    if (!proseReferenceReadAllowed(context, path)) {
+      accessFiltered += 1;
+      continue;
+    }
+    searchedFiles += 1;
+    const workingCopy = context.workingTextFiles?.has(path) ?? false;
     const content = context.workingTextFiles?.get(path)?.content ?? project.readTextFile(path);
-    const offset = content.toLocaleLowerCase().indexOf(needle);
-    if (offset < 0) continue;
-    const line = content.slice(0, offset).split(/\r?\n/).length;
     const lines = content.split(/\r?\n/);
-    matches.push({ path, line, excerpt: lines.slice(Math.max(0, line - 2), Math.min(lines.length, line + 1)).join("\n").slice(0, 1_500) });
+    for (const [lineIndex, lineText] of lines.entries()) {
+      let column = -1;
+      let matchedText = "";
+      let matchesInLine = 0;
+      if (expression) {
+        expression.lastIndex = 0;
+        let found: RegExpExecArray | null;
+        while ((found = expression.exec(lineText)) !== null) {
+          if (column < 0) {
+            column = found.index;
+            matchedText = found[0];
+          }
+          matchesInLine += 1;
+          if (found[0].length === 0) expression.lastIndex = found.index + 1;
+        }
+      } else {
+        const haystack = caseSensitive ? lineText : lineText.toLocaleLowerCase();
+        column = haystack.indexOf(needle);
+        if (column >= 0) {
+          matchedText = lineText.slice(column, column + query.length);
+          for (let offset = column; offset >= 0;) {
+            matchesInLine += 1;
+            offset = haystack.indexOf(needle, offset + Math.max(1, needle.length));
+          }
+        }
+      }
+      if (column < 0) continue;
+      if (matches.length >= limit) {
+        truncated = true;
+        break pathLoop;
+      }
+      const contextStart = Math.max(0, lineIndex - contextLines);
+      const contextEnd = Math.min(lines.length, lineIndex + contextLines + 1);
+      matches.push({
+        path,
+        line: lineIndex + 1,
+        column: column + 1,
+        matchedText: matchedText.slice(0, 300),
+        matchesInLine,
+        contextStartLine: contextStart + 1,
+        contextEndLine: contextEnd,
+        excerpt: lines.slice(contextStart, contextEnd).join("\n").slice(0, 1_500),
+        workingCopy,
+      });
+    }
   }
-  return JSON.stringify({ query, matches });
+  return JSON.stringify({
+    query,
+    mode,
+    caseSensitive,
+    searchedFiles,
+    matchCount: matches.length,
+    truncated,
+    matches,
+    ...(accessFiltered ? {
+      accessFiltered,
+      message: "部分正文因本轮正文或卷访问边界未参与检索；空结果不代表被锁定范围内不存在匹配。",
+    } : {}),
+  });
 }
 
 export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
@@ -330,13 +421,18 @@ export async function handleWriteFile(args: ToolHandlerArgs): Promise<string> {
     && chapterSceneDraftComplete(chapterDraft)
     && chapterDraft.inspectedVersion === chapterDraft.version;
   if (inspectedChapterDraft) {
-    const summary = fileMutationSummary(args.input, normalizeTextFilePath(path), "write");
+    const summary = fileMutationSummary(
+      args.input,
+      normalizeTextFilePath(path),
+      "write",
+      assembleChapterSceneDraft(chapterDraft),
+    );
     return handleProposeChapterDraft({
       ...args,
       input: {
         ...args.input,
         summary,
-        chapterChange: "主 Agent 已按终审清单确认章节目标变化成立",
+        chapterChange: summary,
         reviewNotes: "主 Agent 已通读 inspect_chapter_draft 返回的当前工作副本并确认可以提交",
       },
     });

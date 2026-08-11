@@ -209,10 +209,10 @@ function validateSceneCharacterScopes(
   for (const scene of scenes) {
     for (const scope of scene.characterScopes ?? []) {
       if (readable && !readable.has(scope.characterId)) {
-        throw new Error(`场景 ${scene.id} 引用了本次不可读的角色卡：${scope.characterId}`);
+        throw new Error(`场景 ${scene.id} 引用了本次不可读的角色知识实体：${scope.characterId}`);
       }
       const character = cards.get(scope.characterId);
-      if (!character) throw new Error(`场景 ${scene.id} 引用了不存在的角色卡：${scope.characterId}`);
+      if (!character) throw new Error(`场景 ${scene.id} 引用了不存在的角色知识实体：${scope.characterId}`);
       const competencies = new Map(character.competencies.map(item => [item.id, item]));
       const states = resolveCompetencyStates(character, nodes, targetNodeId);
       const competencyUses = scope.competencyUses
@@ -1693,6 +1693,8 @@ async function submitChapterDraftProposal(
       styleReviewed: true,
       semanticReviewed: true,
     }),
+    undefined,
+    values.chapterChange,
   );
   let returnedResult = result;
   try {

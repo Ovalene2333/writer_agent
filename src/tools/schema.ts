@@ -186,13 +186,16 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "search_files",
-      description: "在 resource/ 的所有可见 UTF-8 文本中检索原文，返回路径、行号和上下文",
+      description: "grep 风格检索 resource/ 可见 UTF-8 文本；默认字面量，也可显式使用 JavaScript regex，返回逐行位置和上下文",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "要查找的原文" },
+          query: { type: "string", description: "字面量或正则表达式本体；regex 不要包 /.../flags" },
+          mode: { type: "string", enum: ["literal", "regex"], description: "默认 literal；只有需要模式匹配时才用 regex" },
+          caseSensitive: { type: "boolean", description: "是否区分大小写，默认 false" },
           pathPrefix: { type: "string", description: "可选目录前缀" },
-          limit: { type: "number", description: "结果数 1-20，默认 8" },
+          contextLines: { type: "number", description: "命中行前后上下文 0-3 行，默认 1" },
+          limit: { type: "number", description: "匹配行数 1-50，默认 12" },
         },
         required: ["query"], additionalProperties: false,
       },
@@ -304,6 +307,115 @@ const TOOL_DEFINITIONS = deepFreeze([
         type: "object",
         properties: { path: { type: "string", description: "resource/ 内相对路径" } },
         required: ["path"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_characters",
+      description: "搜索项目角色知识与本 Session 人物候选；返回紧凑目录和 ref，不返回整卡",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "名称、别名或知识摘要查询；空=列出目录" },
+          mode: { type: "string", enum: ["literal", "regex"], description: "默认 literal；regex 为 JavaScript 模式正文，不写 /.../" },
+          caseSensitive: { type: "boolean", description: "默认 false" },
+          limit: { type: "number", description: "1–50，默认20" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_character_context",
+      description: "按 ref 和用途读取角色知识投影；只取完成当前任务所需记录，可分页",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "search_characters 返回的 project:<id> 或 session:<artifactId>" },
+          id: { type: "number", description: "兼容项目角色 ID；与 ref 二选一" },
+          purpose: { type: "string", enum: ["catalog", "author", "writing", "roleplay", "review", "history"] },
+          recordTypes: {
+            type: "array",
+            maxItems: 12,
+            items: { type: "string", enum: ["appearance_fact", "background_fact", "biography_fact", "feature", "capability", "relationship", "voice_principle", "psychological_model", "goal", "story_state", "event", "note"] },
+          },
+          outlineNodeId: { type: "string", description: "writing 投影解析剧情态时可填" },
+          competencyIds: { type: "array", maxItems: 12, items: { type: "string" }, description: "writing 读取 capability 详情时填写已选择的能力记录 ID" },
+          cursor: { type: "number", description: "author/review/history 分页偏移，默认0" },
+          limit: { type: "number", description: "每页1–20条，默认10" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "change_character_knowledge",
+      description: "直接提交一个角色知识事务；ask 待审批、auto 原子应用，正文中新人物自动留在 Session 候选库",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "修改/晋升时填写；新建可省略" },
+          id: { type: "number", description: "兼容项目角色 ID；与 ref 二选一" },
+          name: { type: "string", description: "新建时必填" },
+          expectedRevision: { type: "number", description: "修改已有实体必填，来自最近一次投影" },
+          summary: { type: "string", description: "本事务目的与依据" },
+          changes: {
+            type: "array", minItems: 1, maxItems: 20,
+            description: "操作：set_identity；set_lifecycle；upsert_record{record}；supersede_record{recordId}；retract_record{recordId}",
+            items: {
+              type: "object",
+              properties: {
+                op: { type: "string", enum: ["set_identity", "set_lifecycle", "upsert_record", "supersede_record", "retract_record"] },
+                name: { type: "string" }, aliases: { type: "array", items: { type: "string" } }, tags: { type: "array", items: { type: "string" } },
+                narrativeRole: { type: "string" }, summary: { type: "string" }, lifecycle: { type: "string", enum: ["candidate", "active", "archived"] },
+                recordId: { type: "string" }, reason: { type: "string" },
+                record: {
+                  type: "object",
+                  description: "有类型原子记录；id 省略=新增。psychological_model payload={choiceLogic,dominantValue,centralTension,pressureStrategy,relationshipPattern}；goal={horizon,status,priority,objective,stakes,obstacles}",
+                  properties: {
+                    id: { type: "string" },
+                    type: { type: "string", enum: ["appearance_fact", "background_fact", "biography_fact", "feature", "capability", "relationship", "voice_principle", "psychological_model", "goal", "story_state", "event", "note"] },
+                    status: { type: "string", enum: ["provisional", "confirmed", "superseded", "retracted"] },
+                    summary: { type: "string" }, payload: { type: "object", additionalProperties: true },
+                    evidence: { type: "array", maxItems: 20, items: { type: "object", additionalProperties: true } },
+                    validFrom: { type: "string" }, validUntil: { type: "string" },
+                  },
+                  required: ["type", "payload"], additionalProperties: false,
+                },
+              },
+              required: ["op"], additionalProperties: false,
+            },
+          },
+        },
+        required: ["summary", "changes"], additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "revise_character_expression",
+      description: "修改角色表达政策而不改人物事实；用于避免某种卡面措辞、声线迁移或呈现方式",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string" }, id: { type: "number" }, expectedRevision: { type: "number" },
+          policyId: { type: "string", description: "更新已有政策时填写；省略=新增" },
+          instruction: { type: "string", description: "语义呈现原则，说明想保留和改变的效果" },
+          appliesTo: { type: "array", items: { type: "string", enum: ["author", "writing", "roleplay", "review"] }, maxItems: 4 },
+          avoid: { type: "array", items: { type: "string" }, maxItems: 30, description: "明确不应直接出现的原词/短语；仅作表达校验，不代替语义原则" },
+          allow: { type: "array", items: { type: "string" }, maxItems: 30, description: "允许出现的语境或例外" },
+          preferredGuidance: { type: "string", description: "更自然的呈现方向，不提供固定替换句" },
+          status: { type: "string", enum: ["active", "paused"] },
+          summary: { type: "string", description: "审批摘要" },
+        },
+        required: ["expectedRevision", "instruction"], additionalProperties: false,
       },
     },
   },
@@ -615,6 +727,7 @@ const TOOL_DEFINITIONS = deepFreeze([
           summary: { type: "string", description: "终审通过后用于提案的修改摘要" },
           characterChanges: {
             type: "array", maxItems: 8,
+            description: "可选：正文已兑现且提案获批后才生效的角色知识事务；changes 使用 set_identity/set_lifecycle/upsert_record/supersede_record/retract_record",
             items: {
               type: "object",
               properties: {
@@ -648,7 +761,7 @@ const TOOL_DEFINITIONS = deepFreeze([
               type: "object",
               properties: {
                 characterId: { type: "number" }, reason: { type: "string" },
-                changes: { type: "array", description: "op 同 apply_character_changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+                changes: { type: "array", description: "角色知识操作，同 change_character_knowledge.changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
             },
@@ -680,7 +793,7 @@ const TOOL_DEFINITIONS = deepFreeze([
               properties: {
                 characterId: { type: "number", description: "角色 ID" },
                 reason: { type: "string", description: "正文依据" },
-                changes: { type: "array", description: "op 同 apply_character_changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+                changes: { type: "array", description: "角色知识操作，同 change_character_knowledge.changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
             },
@@ -727,7 +840,7 @@ const TOOL_DEFINITIONS = deepFreeze([
               type: "object",
               properties: {
                 characterId: { type: "number" }, reason: { type: "string" },
-                changes: { type: "array", description: "op 同 apply_character_changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
+                changes: { type: "array", description: "角色知识操作，同 change_character_knowledge.changes", minItems: 1, maxItems: 12, items: { type: "object", additionalProperties: true } },
               },
               required: ["characterId", "reason", "changes"], additionalProperties: false,
             },
@@ -856,8 +969,113 @@ const TOOL_DEFINITIONS = deepFreeze([
   {
     type: "function",
     function: {
+      name: "open_character_draft",
+      description: "打开或恢复 Session 角色工作副本；已有角色传 id，新建传 name，不直接修改项目角色库",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "number", description: "编辑已有角色时填写" },
+          name: { type: "string", description: "新建角色时填写；同名已有卡会自动转为编辑" },
+          summary: { type: "string", description: "本次角色编辑目的" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_character_draft",
+      description: "增量编辑角色工作副本；心理和目标使用紧凑字段，服务端管理内部条目 ID 并保留旧资料归档",
+      parameters: {
+        type: "object",
+        properties: {
+          draftId: { type: "string", description: "open_character_draft 返回的工作副本 ID" },
+          revision: { type: "number", description: "工作副本当前版本，防止覆盖并发编辑" },
+          patch: {
+            type: "object",
+            properties: {
+              identity: {
+                type: "object",
+                properties: {
+                  name: { type: "string" }, aliases: { type: "array", items: { type: "string" } },
+                  tags: { type: "array", items: { type: "string" } }, narrativeRole: { type: "string" }, summary: { type: "string" },
+                }, additionalProperties: false,
+              },
+              profile: {
+                type: "object",
+                properties: {
+                  appearance: { type: "string" }, appearanceSummary: { type: "string" }, background: { type: "string" },
+                  backgroundSummary: { type: "string" }, biography: { type: "string" },
+                }, additionalProperties: false,
+              },
+              psychology: {
+                type: "object",
+                description: "稳定心理内核；只传需要改变的字段，不要枚举近义标签",
+                properties: {
+                  core: { type: "string", description: "长期行为与选择逻辑" },
+                  dominantValue: { type: "string", description: "首要价值取向" },
+                  centralTension: { type: "string", description: "最关键的内在矛盾" },
+                  pressureResponse: { type: "string", description: "受压时的典型选择" },
+                }, additionalProperties: false,
+              },
+              goals: {
+                type: "object",
+                description: "活跃目标槽位；省略=保留，null=清空。临时意图不要放入角色目标",
+                properties: {
+                  primary: { anyOf: [{ type: "object", properties: { summary: { type: "string" }, stakes: { type: "string" }, obstacles: { type: "array", items: { type: "string" } } }, required: ["summary"], additionalProperties: false }, { type: "null" }] },
+                  secondary: { anyOf: [{ type: "object", properties: { summary: { type: "string" }, stakes: { type: "string" }, obstacles: { type: "array", items: { type: "string" } } }, required: ["summary"], additionalProperties: false }, { type: "null" }] },
+                  longTerm: { anyOf: [{ type: "object", properties: { summary: { type: "string" }, stakes: { type: "string" }, obstacles: { type: "array", items: { type: "string" } } }, required: ["summary"], additionalProperties: false }, { type: "null" }] },
+                }, additionalProperties: false,
+              },
+              voice: {
+                type: "object",
+                properties: {
+                  summary: { type: "string" }, register: { type: "string" }, diction: { type: "array", items: { type: "string" } },
+                  verbalHabits: { type: "array", items: { type: "string" } }, avoidedExpressions: { type: "array", items: { type: "string" } },
+                  interactionPrinciples: { type: "array", items: { type: "string" } },
+                }, additionalProperties: false,
+              },
+              notes: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+          changes: {
+            type: "array",
+            maxItems: 12,
+            description: "可选高级领域操作，用于能力、关系、经历与故事状态；op 同旧角色演进操作，未知操作会返回可修复错误",
+            items: { type: "object", additionalProperties: true },
+          },
+          reason: { type: "string", description: "高级领域操作的依据" },
+          summary: { type: "string", description: "更新工作副本摘要" },
+        },
+        required: ["draftId", "revision"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "submit_character_draft",
+      description: "提交角色工作副本；ask 生成待审批角色变更，auto 原子应用，失败时保留工作副本",
+      parameters: {
+        type: "object",
+        properties: {
+          draftId: { type: "string" },
+          revision: { type: "number" },
+          summary: { type: "string", description: "作者可读的变更摘要" },
+        },
+        required: ["draftId", "revision"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "save_character",
-      description: "创建/嵌套更新 v3 角色卡；数组按 id upsert。情节小改优先 apply_character_changes。新建须 identity.name",
+      description: "按用户明确要求创建/嵌套更新 v3 角色卡；正文任务中新人物只留会话候选。情节小改优先 apply_character_changes",
       parameters: {
         type: "object",
         properties: {
@@ -935,7 +1153,7 @@ const TOOL_DEFINITIONS = deepFreeze([
     type: "function",
     function: {
       name: "save_simple_character",
-      description: "创建/更新简易角色卡（name/identity/relationship/knowledge/scene/goal）",
+      description: "按用户明确要求创建/更新轻量扮演用简易角色卡；正文配角只留会话候选",
       parameters: {
         type: "object",
         properties: {
@@ -1040,7 +1258,7 @@ const TOOL_DEFINITIONS = deepFreeze([
             additionalProperties: false,
           },
           enforcement: { type: "string", enum: ["observe", "advise", "block"], description: "审美偏好默认 advise；事实性确定错误才考虑 block" },
-          status: { type: "string", enum: ["draft", "trial", "active", "paused", "deprecated"], description: "模糊或新政策默认 draft/trial" },
+          status: { type: "string", enum: ["draft", "trial", "active", "paused", "deprecated"], description: "upsert 必填：边界含糊或待确认=draft；明确可复用新偏好=trial" },
           skillId: { type: "string", description: "命中后应加载的修订 Skill，可省略" },
           sourceFeedback: { type: "string", description: "作者原始反馈的短摘要" },
           disposition: { type: "string", enum: ["accepted", "dismissed", "edited", "false_positive"], description: "feedback 操作必填" },
@@ -1161,6 +1379,13 @@ const LEGACY_MODEL_FILE_TOOLS = new Set([
   "revise_document_isolated",
   "propose_change_set",
   "propose_chapter_draft",
+  "list_characters",
+  "get_character",
+  "open_character_draft",
+  "update_character_draft",
+  "submit_character_draft",
+  "save_character",
+  "apply_character_changes",
 ]);
 
 export const TOOLS = deepFreeze(
@@ -1172,6 +1397,8 @@ export const TOOL_NAMES = new Set<string>(TOOLS.map(tool => tool.function.name))
 const WRITE_TOOLS = new Set([
   "write_file", "edit_file", "move_file", "delete_file",
   "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "revise_chapter_draft_style", "inspect_chapter_draft", "propose_chapter_draft",
+  "change_character_knowledge", "revise_character_expression",
+  "open_character_draft", "update_character_draft", "submit_character_draft",
   "save_character", "apply_character_changes", "save_simple_character",
   "manage_prose_gates",
   "manage_author_policies",

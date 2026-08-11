@@ -1,4 +1,11 @@
-import type { AgentEvent, ModelConfig, PermissionMode, Proposal, ProposalCharacterChange } from "../types.js";
+import type {
+  AgentEvent,
+  ModelConfig,
+  PermissionMode,
+  Proposal,
+  ProposalCharacterChange,
+  ProposalCharacterEvolutionChange,
+} from "../types.js";
 import {
   applyCharacterChanges,
   characterChangeOpsHint,
@@ -65,6 +72,11 @@ import {
 import { buildFactualChapterReviewContext } from "../chapter_review_context.js";
 import { runSurfaceGates, type SurfaceGateFinding } from "../surface_gates.js";
 import { ProposalDocumentBaseChangedError, type WriterStore } from "../store.js";
+import {
+  applyCharacterKnowledgeChanges,
+  characterFromKnowledgeBundle,
+  type CharacterKnowledgeChange,
+} from "../character_knowledge.js";
 import { proseGateRulesForTarget, type ProseGateTargetKind } from "../prose_gate_rules.js";
 import {
   assessCardRegisterHits,
@@ -101,7 +113,7 @@ function gateProseMetaLeaks(content: string, path: string): { content: string; s
   return { content: cleaned.text, stripped: cleaned.stripped };
 }
 
-export function deferredCharacterChanges(value: unknown, characterScope?: number[]): ProposalCharacterChange[] {
+export function deferredCharacterChanges(value: unknown, characterScope?: number[]): ProposalCharacterEvolutionChange[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error("characterChanges 必须是数组");
   const seen = new Set<number>();
@@ -125,13 +137,25 @@ export function deferredCharacterChanges(value: unknown, characterScope?: number
       if (!rawOp) throw new Error(`characterChanges[${index}].changes[${changeIndex}].op 不能为空`);
       // Reject unknown ops at propose time — deferring them means they silently
       // fail (skip) when the user later accepts the proposal.
-      if (!isCharacterChangeOp(rawOp)) {
+      if (!isCharacterChangeOp(rawOp) && !isCharacterKnowledgeChangeOp(rawOp)) {
         throw new Error(`characterChanges[${index}].changes[${changeIndex}].op 无效：${rawOp}。${characterChangeOpsHint()}`);
       }
-      return { ...(change as Record<string, unknown>), op: normalizeCharacterChangeOp(rawOp) };
+      return { ...(change as Record<string, unknown>), op: isCharacterKnowledgeChangeOp(rawOp) ? rawOp : normalizeCharacterChangeOp(rawOp) };
     });
+    const knowledgeCount = changes.filter(change => isCharacterKnowledgeChangeOp(change.op)).length;
+    if (knowledgeCount > 0 && knowledgeCount !== changes.length) {
+      throw new Error(`characterChanges[${index}] 不能混用角色知识操作与旧角色演进操作`);
+    }
     return { characterId, reason, changes };
   });
+}
+
+const CHARACTER_KNOWLEDGE_CHANGE_OPS = new Set([
+  "set_identity", "set_lifecycle", "upsert_record", "supersede_record", "retract_record",
+]);
+
+function isCharacterKnowledgeChangeOp(value: string): boolean {
+  return CHARACTER_KNOWLEDGE_CHANGE_OPS.has(value);
 }
 
 export function prepareDeferredCharacterChanges(
@@ -155,10 +179,11 @@ export function tolerantDeferredCharacterChanges(
   if (!Array.isArray(value)) return { changes: [], warnings: ["characterChanges 不是数组，已忽略角色演进"] };
 
   let workingCharacters = store.characters();
-  const accepted = new Map<number, ProposalCharacterChange>();
+  const workingBundles = new Map(store.characterKnowledgeBundles().map(bundle => [bundle.entity.id, bundle]));
+  const accepted = new Map<number, ProposalCharacterEvolutionChange>();
   const warnings: string[] = [];
   for (const [rowIndex, raw] of value.slice(0, 8).entries()) {
-    let parsed: ProposalCharacterChange;
+    let parsed: ProposalCharacterEvolutionChange;
     try {
       parsed = deferredCharacterChanges([raw], characterScope)[0];
     } catch (error) {
@@ -170,8 +195,27 @@ export function tolerantDeferredCharacterChanges(
       warnings.push(`characterChanges[${rowIndex}]：角色 ${parsed.characterId} 不存在`);
       continue;
     }
-    const validOps: ProposalCharacterChange["changes"] = [];
+    const validOps: ProposalCharacterEvolutionChange["changes"] = [];
     for (const [changeIndex, change] of parsed.changes.entries()) {
+      if (isCharacterKnowledgeChangeOp(change.op)) {
+        try {
+          const bundle = workingBundles.get(parsed.characterId);
+          if (!bundle) throw new Error("角色知识实体不存在");
+          const result = applyCharacterKnowledgeChanges(
+            bundle,
+            [change as CharacterKnowledgeChange],
+            new Set(workingCharacters.map(character => character.id)),
+          );
+          const updated = characterFromKnowledgeBundle(result.bundle);
+          workingBundles.set(parsed.characterId, result.bundle);
+          workingCharacters = workingCharacters.map(character => character.id === updated.id ? updated : character);
+          current = updated;
+          validOps.push(change);
+        } catch (error) {
+          warnings.push(`characterChanges[${rowIndex}].changes[${changeIndex}]：${error instanceof Error ? error.message : String(error)}`);
+        }
+        continue;
+      }
       const normalized = normalizeProposalCharacterChange(change);
       const result = applyCharacterChanges(current, {
         reason: parsed.reason,
@@ -212,8 +256,8 @@ export function tolerantDeferredCharacterChanges(
 }
 
 function normalizeProposalCharacterChange(
-  change: ProposalCharacterChange["changes"][number],
-): ProposalCharacterChange["changes"][number] {
+  change: ProposalCharacterEvolutionChange["changes"][number],
+): ProposalCharacterEvolutionChange["changes"][number] {
   if (normalizeCharacterChangeOp(String(change.op ?? "")) !== "upsert_story_state") return change;
   const source = change.entry && typeof change.entry === "object" && !Array.isArray(change.entry)
     ? change.entry as Record<string, unknown>
@@ -686,13 +730,21 @@ export async function proseStyleGateIssues(
     const semanticAdjudicationRequired = shouldAdjudicateForProposal(afterContent, issues);
     let semanticAdjudicationSettled = !semanticAdjudicationRequired;
     const semanticAdjudicationFailures: string[] = [];
-    for (const adjudicatorModel of adjudicatorModels) {
+    for (const [modelIndex, adjudicatorModel] of adjudicatorModels.entries()) {
       const flash = await adjudicateProseStyleForProposal(
         afterContent,
         issues,
         adjudicatorModel,
         {
           signal: context.proseAdjudicator.signal,
+          // Formal proposal adjudication shares the same centrally managed
+          // primary/final budget as learned gates. Never fall back to the
+          // low-level 12s convenience default on a delivery-critical path.
+          timeoutMs: proseGateReviewTimeoutMs(
+            modelIndex,
+            adjudicatorModels.length,
+            context.proseAdjudicator.reviewTimeoutsMs,
+          ),
           verdictCache: context.proseVerdictCache,
           usageReporter: context.modelUsageReporter,
           callKind: "prose_gate",
@@ -830,6 +882,8 @@ export async function submitFullDocumentProposal(
   validationReceipt?: NarrativeValidationReceipt,
   /** 偏短但不阻断时给作者/Agent 看的一句话；随提案结果一起回给 Agent。 */
   lengthNotice?: string,
+  /** Existing semantic review result from the scene pipeline; avoids reviewing twice. */
+  preReviewedChapterChange?: string,
 ): Promise<string> {
   const { project, store, sessionId, emit, context, characterScope } = args;
   assertVolumePathAllowed(context.volumeAccess, path);
@@ -1001,8 +1055,9 @@ export async function submitFullDocumentProposal(
       { repairPacket: narrativeValidation.metricRepairPacket },
     );
   }
+  let reviewedChapterChange = preReviewedChapterChange?.trim() || "";
   if (!(receiptMatches && validationReceipt?.semanticReviewed) && narrative && context.chapterReviewer) {
-    const blocked = await reviewDirectNarrativeProposal(
+    const review = await reviewDirectNarrativeProposal(
       args,
       path,
       proposedBody,
@@ -1010,8 +1065,12 @@ export async function submitFullDocumentProposal(
       cardRegisterAssessment,
       narrativeValidation,
     );
-    if (blocked) return blocked;
+    if (review.kind === "blocked") return review.response;
+    if (review.chapterChange) reviewedChapterChange = review.chapterChange;
   }
+  const deliverySummary = reviewedChapterChange && reviewedChapterChange !== summary.trim()
+    ? `${summary.trim()}；终审变化：${reviewedChapterChange}`.slice(0, 600)
+    : summary;
   const preparedCharacterChanges = prepareDeferredCharacterChanges(characterChanges, context, characterScope);
   // Single funnel for every narrative proposal (场景管线与直接文档两条路都走这里), so the
   // author sees the same quality picture in the review dock no matter how it was written.
@@ -1023,7 +1082,7 @@ export async function submitFullDocumentProposal(
       sessionId,
       path,
       proposedBody,
-      summary,
+      deliverySummary,
       preparedCharacterChanges.changes,
       qualityReport,
       context.sourceMessageId,
@@ -1063,7 +1122,10 @@ async function reviewDirectNarrativeProposal(
   summary: string,
   cardRegisterAssessment?: CardRegisterAssessment,
   validation?: NarrativeValidationSnapshot,
-): Promise<string | undefined> {
+): Promise<
+  | { kind: "pass"; chapterChange?: string }
+  | { kind: "blocked"; response: string }
+> {
   const reviewer = args.context.chapterReviewer!;
   const runReview = reviewer.run ?? reviewChapterDraft;
   const deliverableId = typeof args.input.deliverableId === "string" && args.input.deliverableId.trim()
@@ -1083,7 +1145,7 @@ async function reviewDirectNarrativeProposal(
       contentSourceHash,
       revisionContext.unresolvedIssues,
     );
-    return JSON.stringify({
+    return { kind: "blocked", response: JSON.stringify({
       status: "final_review_revision_required",
       code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
       path,
@@ -1096,7 +1158,7 @@ async function reviewDirectNarrativeProposal(
       },
       ...(repairPacket ? { repairPacket } : {}),
       message: "正文与上一轮语义驳回稿相同，未重复调用终审。请按既有 blocker 做最小修订后再提交。",
-    });
+    }) };
   }
   const revisionReview = revisionContext
     ? buildChapterReviewRevisionContext({
@@ -1143,7 +1205,10 @@ async function reviewDirectNarrativeProposal(
       status: "active",
       metadata: { contextHash: semanticContextHash, cached: true },
     });
-    return undefined;
+    const chapterChange = typeof (cachedSemanticReview as Record<string, unknown>).chapterChange === "string"
+      ? String((cachedSemanticReview as Record<string, unknown>).chapterChange).trim()
+      : "";
+    return { kind: "pass", ...(chapterChange ? { chapterChange } : {}) };
   }
   const requestCharacters = content.length + reviewContext.length + summary.length
     + comparisonMaterials.reduce((sum, item) => sum + item.path.length + item.content.length, 0)
@@ -1172,7 +1237,7 @@ async function reviewDirectNarrativeProposal(
         failureClass: "config",
       })],
     });
-    return JSON.stringify(finalReviewUnavailablePayload(path, bundle));
+    return { kind: "blocked", response: JSON.stringify(finalReviewUnavailablePayload(path, bundle)) };
   }
   const attempts: DependencyAttemptDiagnostic[] = [];
   for (const [modelIndex, model] of models.entries()) {
@@ -1229,10 +1294,10 @@ async function reviewDirectNarrativeProposal(
           undefined,
           args.sessionId,
         );
-        return undefined;
+        return { kind: "pass", chapterChange: constrainedReview.chapterChange.trim() };
       }
       const repairPacket = chapterReviewRepairPacket(path, contentSourceHash, constrainedReview);
-      return JSON.stringify({
+      return { kind: "blocked", response: JSON.stringify({
         status: "final_review_revision_required",
         code: "DIRECT_CHAPTER_REVIEW_BLOCKED",
         path,
@@ -1241,7 +1306,7 @@ async function reviewDirectNarrativeProposal(
         chapterReview: constrainedReview,
         ...(repairPacket ? { repairPacket } : {}),
         message: "终审发现有正文证据的事实、认知边界或结构问题，未创建提案。按 blocker 的 action 做最小修订后重新提交；不要删除无关事实或全文改写。",
-      });
+      }) };
     } catch (error) {
       const usage = error instanceof ChapterReviewRequestError ? error.usage : undefined;
       const durationMs = error instanceof ChapterReviewRequestError ? error.durationMs : undefined;
@@ -1277,7 +1342,7 @@ async function reviewDirectNarrativeProposal(
     attempts,
     uniqueModelCount: models.length,
   });
-  return JSON.stringify(finalReviewUnavailablePayload(path, bundle));
+  return { kind: "blocked", response: JSON.stringify(finalReviewUnavailablePayload(path, bundle)) };
 }
 
 function finalReviewUnavailablePayload(

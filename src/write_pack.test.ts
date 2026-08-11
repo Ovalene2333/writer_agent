@@ -43,6 +43,10 @@ test("fail-closed prose gate gives the final reviewer a full-chapter timeout", (
   assert.equal(proseGateReviewTimeoutMs(0, 2), PRIMARY_PROSE_GATE_TIMEOUT_MS);
   assert.equal(proseGateReviewTimeoutMs(1, 2), FINAL_PROSE_GATE_TIMEOUT_MS);
   assert.equal(proseGateReviewTimeoutMs(0, 1), FINAL_PROSE_GATE_TIMEOUT_MS);
+  const configured = { primary: 90_000, final: 420_000 };
+  assert.equal(proseGateReviewTimeoutMs(0, 2, configured), configured.primary);
+  assert.equal(proseGateReviewTimeoutMs(1, 2, configured), configured.final);
+  assert.equal(proseGateReviewTimeoutMs(0, 1, configured), configured.final);
   assert.ok(FINAL_PROSE_GATE_TIMEOUT_MS > PRIMARY_PROSE_GATE_TIMEOUT_MS);
 });
 
@@ -478,6 +482,7 @@ test("direct chapter proposal preserves reviewer knowledge blockers before creat
     )) as Record<string, unknown>;
     assert.equal(passed.status, "pending");
     assert.equal(store.proposals().length, 1);
+    assert.equal(store.proposals()[0]?.summary, "来客从试探转为撤退");
     assert.equal(reviewCalls, 2);
     assert.equal(sawRevisionReview, true);
   } finally {

@@ -159,8 +159,11 @@ export function ChangeSetCard({ value, onAction, onOpenPath }: {
         <details className="change-set-file">
           <summary><strong>角色卡</strong> {value.characterChanges.length} 项</summary>
           {value.characterChanges.map((change) => (
-            <p key={change.characterId}>
-              #{change.characterId}: {change.reason}（{change.changes.map(item => item.op).join("、")}）
+            <p key={`${change.operation ?? "evolve"}:${change.characterId}`}>
+              {change.after?.identity?.name ?? `#${change.characterId}`}: {change.reason}
+              {change.operation === "create" ? "（新建）"
+                : change.operation === "replace" ? "（工作副本更新）"
+                  : `（${change.changes.map(item => item.op).join("、")}）`}
             </p>
           ))}
         </details>

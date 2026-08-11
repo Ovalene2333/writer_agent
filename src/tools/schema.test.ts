@@ -24,7 +24,7 @@ test("scene write schema supports delegated prose while fast mode validates its 
   assert.equal(TOOLS.some(tool => tool.function.name === "write_document_isolated"), false);
 });
 
-test("scene guides and character reads expose source-linked capability selection", () => {
+test("scene guides and character knowledge projections expose source-linked capability selection", () => {
   const begin = TOOLS.find(tool => tool.function.name === "begin_chapter_draft");
   const beginProperties = begin?.function.parameters.properties as Record<string, unknown>;
   const scenes = beginProperties.scenes as { items: { properties: Record<string, unknown> } };
@@ -33,7 +33,7 @@ test("scene guides and character reads expose source-linked capability selection
   assert.ok(Object.hasOwn(scopes.items.properties, "competencyUses"));
   assert.ok(Object.hasOwn(scopes.items.properties, "dialogue"));
 
-  const getCharacter = TOOLS.find(tool => tool.function.name === "get_character");
+  const getCharacter = TOOLS.find(tool => tool.function.name === "get_character_context");
   const readProperties = getCharacter?.function.parameters.properties as Record<string, unknown>;
   assert.ok(Object.hasOwn(readProperties, "competencyIds"));
 });

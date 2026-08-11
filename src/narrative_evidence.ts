@@ -6,7 +6,7 @@ import {
   competenciesWritingPayload,
 } from "./characters.js";
 import { resolveCompetencyStates, type SceneCompetencyUse } from "./competency_state.js";
-import type { WritingMemoryEntry } from "./writing_memory.js";
+import { WRITING_MEMORY_AUTHORITY, type WritingMemoryEntry } from "./writing_memory.js";
 import { orderedChapterPaths, type WriterProject } from "./project.js";
 import type { ChapterSceneCard, SceneActualState } from "./scene_pipeline.js";
 import type { Character } from "./types.js";
@@ -84,6 +84,16 @@ export type CharacterEvidenceRead = {
   competencyIds: Set<string>;
 };
 
+/** Preserve the structured owner of a gap when translating it into an Agent action. */
+export function formatNarrativeEvidenceGapAction(gap: NarrativeEvidenceGap): string {
+  const owner = gap.characterName?.trim()
+    ? `角色「${gap.characterName.trim()}」(id=${gap.characterId})`
+    : gap.characterId !== undefined
+      ? `角色 id=${gap.characterId}`
+      : "叙事证据";
+  return `${owner}：${gap.action}`;
+}
+
 export function recordCharacterEvidenceRead(
   context: ToolExecutionContext,
   characterId: number,
@@ -155,7 +165,7 @@ export function buildNarrativeEvidencePacket(options: {
     version: 1 as const,
     path,
     ...(scene ? { sceneId: scene.id } : {}),
-    instructions: "writingMemory 只是当前会话从已接受正文提取的近期辅助状态，不是项目事实、角色卡或扩写许可；冲突时以正文、角色卡和大纲为准，不确定时读取 source 原文。角色能力只可按 allowedCompetencyUses 的 mode 与入场状态处理：use 才可直接使用，attempt 可失败，unlock/regain 必须在本场建立状态转变，lose 必须写出失去事件；dialogueAllowed 只授权该角色说出口的对白声线。",
+    instructions: `${WRITING_MEMORY_AUTHORITY}角色能力只可按 allowedCompetencyUses 的 mode 与入场状态处理：use 才可直接使用，attempt 可失败，unlock/regain 必须在本场建立状态转变，lose 必须写出失去事件；dialogueAllowed 只授权该角色说出口的对白声线。`,
     writingMemory,
     characters,
     ...(scene ? {
@@ -311,7 +321,7 @@ function characterCoverageGaps(
       characterId: evidence.id,
       characterName: evidence.name,
       missing: missingCompetencies,
-      action: `先 get_character(view=sections, sections=[\"competencies\"], competencyIds=${JSON.stringify(missingCompetencies)}) 读取能力原文。`,
+      action: `先 get_character_context(purpose=writing, recordTypes=[\"capability\"], competencyIds=${JSON.stringify(missingCompetencies)}) 读取能力机制与入场状态。`,
     });
   }
   if (evidence.dialogueAllowed) {
@@ -323,7 +333,9 @@ function characterCoverageGaps(
         characterId: evidence.id,
         characterName: evidence.name,
         missing,
-        action: `先 get_character(view=sections, sections=${JSON.stringify(missing)}) 读取对白所需原始分区。`,
+        action: `先 get_character_context(purpose=writing, recordTypes=${JSON.stringify(missing.map(section => ({
+          voice: "voice_principle", motivations: "goal", relationships: "relationship", storyState: "story_state",
+        } as Record<string, string>)[section] ?? section))}) 读取对白所需用途投影。`,
       });
     }
   }

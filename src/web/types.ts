@@ -194,7 +194,13 @@ export type ChangeSet = {
     beforeContent: string;
     afterContent: string;
   }>;
-  characterChanges: Array<{ characterId: number; reason: string; changes: Array<{ op: string }> }>;
+  characterChanges: Array<{
+    characterId: number;
+    reason: string;
+    changes: Array<{ op: string }>;
+    operation?: "evolve" | "create" | "replace";
+    after?: { identity?: { name?: string } };
+  }>;
 };
 export type RoleplayInputMode = "dialogue" | "director";
 export type RoleplayScene = {

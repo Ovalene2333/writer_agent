@@ -26,6 +26,39 @@ import type { ToolExecutionContext, ToolHandlerArgs } from "./tools/types.js";
 
 const MODEL = { baseUrl: "http://127.0.0.1:1", apiKey: "test", model: "writer-test" };
 
+test("writer coverage errors identify the exact character that must be read", async () => {
+  const pack = {
+    sourceDraft: "", sceneGoal: "对话", beatOrder: [], knownFacts: [], mustLand: [],
+    characterState: [], narrationNotes: [], doNotInvent: [], narrativeBrief: "", structured: true,
+    strippedMeta: [],
+  };
+  await assert.rejects(
+    () => requestEvidenceGroundedProse(MODEL, {
+      path: "chapters/test.md",
+      outputKind: "document",
+      writePack: pack,
+      evidence: {
+        version: 1,
+        path: "chapters/test.md",
+        instructions: "",
+        writingMemory: [],
+        characters: [],
+        sources: [],
+        coverageGaps: [{
+          code: "character_sections_missing",
+          characterId: 5,
+          characterName: "温晚",
+          missing: ["motivations"],
+          action: "先 get_character(view=sections, sections=[\"motivations\"]) 读取对白所需原始分区。",
+        }],
+        hash: "gap-hash",
+      },
+      styleEvidence: "稳定文风",
+    }, {} as never),
+    /角色「温晚」\(id=5\).*get_character\(view=sections/u,
+  );
+});
+
 test("length-limited writer continuations keep prose and remove a repeated seam", () => {
   const first = "风压把沙粒推过靶沟。林千夏压低枪口，等最后一辆车越过标杆。";
   const next = "林千夏压低枪口，等最后一辆车越过标杆。车尾刚沉进热浪，她便抬手示意全组前移。";
@@ -165,6 +198,8 @@ test("delegated write_file realizes a compiled pack through the evidence-grounde
     assert.equal(result.generationMode, "evidence_grounded_writer");
     assert.equal(context.narrativeEvidencePackets?.has("chapters/new.md"), true);
     assert.equal(context.workingTextFiles?.get("chapters/new.md")?.content.startsWith("# new\n"), true);
+    assert.match(store.proposals()[0]?.summary ?? "", /废站台/u);
+    assert.match(store.proposals()[0]?.summary ?? "", /检修通道/u);
   } finally {
     store?.close();
     rmSync(root, { recursive: true, force: true });

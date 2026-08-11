@@ -107,7 +107,6 @@ export function routeNewChapterPath(
     assertVolumePathAllowed(policy, normalized);
     return normalized;
   }
-  if (project.textFileExists(normalized)) return normalized;
   if (!policy?.activeVolume) return normalized;
   const fileName = normalized.slice("chapters/".length);
   return `chapters/${policy.activeVolume}/${fileName}`;

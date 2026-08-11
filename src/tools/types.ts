@@ -88,6 +88,8 @@ export type ToolCall = {
 
 export type ToolExecutionContext = {
   permissionMode: PermissionMode;
+  /** Project-authority level explicitly requested by this task. Narrative NPCs stay session-scoped. */
+  characterPersistenceIntent?: "candidate" | "simple" | "full";
   /** Volume names are visible globally; chapter bodies require this run-scoped grant. */
   volumeAccess?: VolumeAccessPolicy;
   /** Runtime boundary for using existing narrative text as prose reference. */
@@ -184,7 +186,7 @@ export type ToolExecutionContext = {
   chapterSceneDraft?: ChapterSceneDraft;
   /**
    * Card material authorized for the next scene only. The guide stores IDs;
-   * get_character resolves them against the current source card on demand.
+   * get_character_context resolves them against the current knowledge projection on demand.
    */
   activeSceneCharacterScopes?: { sceneId: string; characterScopes: SceneCharacterScope[] };
   /**
@@ -267,7 +269,7 @@ export type ToolExecutionContext = {
   };
   /**
    * Character-card phrasing that must not be quoted into lived prose.
-   * Accumulated when get_character serves voice/competencies/psychology/features.
+   * Accumulated when get_character_context serves voice/capability/psychology/feature records.
    */
   registerRisks?: RegisterRisk[];
   /** Semantic repair baselines, keyed by run + deliverable + path. */

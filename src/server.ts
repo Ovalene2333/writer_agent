@@ -62,7 +62,6 @@ import {
   suggestActions,
   summarizeCharacterCompetency,
   summarizeCharacterField,
-  updateCharacterFromConversation,
   type CharacterSummaryKind,
   type WritingMode,
 } from "./generation.js";
@@ -1145,7 +1144,7 @@ export async function startWriterServer(options: {
         validationErrors: skill.validationErrors,
       })),
       activeJobs: agentJobs.activeJobs(undefined, activeProject.id),
-      characterDirectory: "characters/",
+      characterDirectory: "characters/entities/",
       styleTemplates: styleTemplatesForClient(options.project, options.store, styleExampleReviews),
     });
   });
@@ -2235,12 +2234,16 @@ export async function startWriterServer(options: {
     if (!body.prompt?.trim() && !chatAttachments.length && !(body.mode === "roleplay" && (body.opening || body.performerAutoReply))) {
       return context.json({ error: "写作指令不能为空" }, 400);
     }
-    if (chatAttachments.length && (body.mode === "character" || body.mode === "roleplay")) {
-      return context.json({ error: "目前仅写作 Agent 支持附图" }, 400);
+    if (chatAttachments.length && body.mode === "roleplay") {
+      return context.json({ error: "目前角色扮演链路不支持附图" }, 400);
     }
-    const characterScope = Array.isArray(body.characterScope)
-      ? [...new Set(body.characterScope.map(Number).filter(Number.isInteger))]
-      : undefined;
+    const characterScope = (() => {
+      const selected = Array.isArray(body.characterScope)
+        ? body.characterScope.map(Number).filter(Number.isInteger)
+        : [];
+      if (body.mode === "character" && Number.isInteger(body.characterId)) selected.push(Number(body.characterId));
+      return selected.length ? [...new Set(selected)] : undefined;
+    })();
     const simpleCharacterScope = Array.isArray(body.simpleCharacterScope)
       ? [...new Set(body.simpleCharacterScope.map(Number).filter(Number.isInteger))]
       : undefined;
@@ -2285,16 +2288,7 @@ export async function startWriterServer(options: {
           }
           emit(event);
         };
-        if (body.mode === "character") {
-          await updateCharacterFromConversation({
-            model: providers.modelConfig("agent"), summaryModel: providers.summaryModelConfig(), store,
-            sessionId: body.sessionId, instruction: body.prompt,
-            characterId: Number.isInteger(body.characterId) ? body.characterId : undefined,
-            jobId: job.id,
-            allowedDocumentPaths: characterContextDocumentPaths(project, body.contextDocumentPaths),
-            signal, onEvent,
-          });
-        } else if (body.mode === "roleplay") {
+        if (body.mode === "roleplay") {
           if (!body.performer && !Number.isInteger(body.characterId)) throw new Error("角色扮演需要指定扮演者");
           await runRoleplayChat({
             project,
@@ -2332,7 +2326,14 @@ export async function startWriterServer(options: {
             prompt: body.prompt,
             ...(chatAttachments.length ? { attachments: chatAttachments } : {}),
             variantGroupId,
-            selectedDocumentBlocks: body.documentSelections,
+            selectedDocumentBlocks: [
+              ...(body.documentSelections ?? []),
+              ...((body.contextDocumentPaths ?? [])
+                .filter(path => typeof path === "string" && project.documentExists(path) && !project.isDocumentHidden(path))
+                .filter(path => !(body.documentSelections ?? []).some(selection => selection.path === path))
+                .slice(0, 5)
+                .map(path => ({ path }))),
+            ],
             resumeInterrupted: body.resumeInterrupted === true,
             characterScope,
             simpleCharacterScope,
@@ -2874,11 +2875,6 @@ function findLanAddress(): string {
     return score(right) - score(left);
   });
   return candidates[0].address;
-}
-
-function characterContextDocumentPaths(project: WriterProject, paths?: string[]): string[] {
-  if (!Array.isArray(paths)) return [];
-  return [...new Set(paths)].filter(path => typeof path === "string" && project.documentExists(path) && !project.isDocumentHidden(path)).slice(0, 5);
 }
 
 function errorMessage(error: unknown): string {

@@ -17,6 +17,7 @@ import { modelFetch, modelRequestOptions } from "./model_fetch.js";
 import { buildProviderCompletionBody, completeProviderCompletion, contentFromProviderResponseBody, modelCompletionEndpoint, parseProviderCompletionPayload, serializeProviderChatBody, streamProviderCompletion } from "./model_api.js";
 import { buildRecordedUsageEvent, parseModelTokenUsage, type ModelUsageReporter } from "./model_usage.js";
 import { characterPromptViews, emptyCharacter, normalizeV3Character } from "./characters.js";
+import { characterWritingConstraintView } from "./character_constraints.js";
 import { OutlineStore } from "./outline.js";
 import { compileWritePack, formatWritePackForWriter, writePackDraftContractPrompt } from "./write_pack.js";
 import { dialogueNaturalnessGuidance } from "./dialogue_texture.js";
@@ -334,66 +335,6 @@ export async function summarizeCharacterCompetency(input: {
   });
 }
 
-export async function updateCharacterFromConversation(input: {
-  model: ModelConfig;
-  summaryModel?: ModelConfig;
-  store: WriterStore;
-  sessionId: string;
-  instruction: string;
-  characterId?: number;
-  allowedDocumentPaths?: string[];
-  signal?: AbortSignal;
-  onEvent?: (event: AgentEvent) => void | Promise<void>;
-  jobId?: string;
-}): Promise<void> {
-  const emit = async (event: AgentEvent) => { await input.onEvent?.(event); };
-  const usageReporter: ModelUsageReporter = (callModel, callUsage, meta) => {
-    void emit(buildRecordedUsageEvent(input.store, input.sessionId, callModel, callUsage, {
-      ...meta,
-      step: meta.step ?? 1,
-      ...(meta.jobId || !input.jobId ? {} : { jobId: input.jobId }),
-    }));
-  };
-  if (!input.store.sessionExists(input.sessionId)) throw new Error("写作会话不存在");
-  const existing = input.characterId === undefined
-    ? undefined
-    : input.store.characters().find(item => item.id === input.characterId);
-  if (input.characterId !== undefined && !existing) throw new Error("目标角色卡不存在");
-  const userMessageId = input.store.addMessage(input.sessionId, "user", input.instruction.trim());
-  await emit({ type: "source_message", messageId: userMessageId, channel: "agent" });
-  await emit({ type: "step_start", step: 1 });
-  try {
-    const draft = await generateCharacter({
-      model: input.model, description: input.instruction, existing,
-      project: input.store.project, allowedDocumentPaths: input.allowedDocumentPaths,
-      onTool: async () => { await emit({ type: "tool", name: "read_document" }); }, signal: input.signal,
-      usageReporter,
-    });
-    const character = input.store.saveCharacterWithRevision(input.sessionId, userMessageId, {
-      ...draft, id: existing?.id,
-      relationships: existing?.relationships ?? draft.relationships,
-    });
-    const fallback = existing ? `已更新角色卡：${character.identity.name}` : `已创建角色卡：${character.identity.name}`;
-    const message = await safeChangeSummary(input.summaryModel ?? input.model, {
-      kind: "character", action: existing ? "更新角色卡" : "创建角色卡", target: character.identity.name,
-      instruction: input.instruction,
-      before: existing ? JSON.stringify(characterContext(existing), null, 2) : "（新建）",
-      after: JSON.stringify(characterContext(character), null, 2),
-    }, fallback, input.signal, usageReporter);
-    input.store.addMessage(input.sessionId, "assistant", message);
-    await emit({ type: "text", text: message, channel: "output" });
-    await emit({ type: "character", character });
-    await emit({ type: "step_done", step: 1 });
-    await emit({ type: "done", sessionId: input.sessionId });
-  } catch (error) {
-    if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
-      await emit({ type: "cancelled", sessionId: input.sessionId }); return;
-    }
-    await emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
-    throw error;
-  }
-}
-
 type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
 type ToolLoopMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -416,12 +357,15 @@ async function buildWritingDraft(
     .filter(path => generateNarrativeReferenceAllowed(options, path))
     .slice(0, 100);
   const documentSet = new Set(documents);
-  const characterDirectory = options.store.characters().filter(item => allowedCharacterIds.has(item.id)).map(item => ({ id: item.id, name: item.identity.name, aliases: item.identity.aliases, narrativeRole: item.identity.narrativeRole, identity: item.identity.summary }));
+  const characterDirectory = options.store.characterKnowledgeBundles().filter(item => allowedCharacterIds.has(item.entity.id)).map(item => ({
+    ref: `project:${item.entity.id}`, id: item.entity.id, name: item.entity.name, aliases: item.entity.aliases,
+    narrativeRole: item.entity.narrativeRole, summary: item.entity.summary, revision: item.entity.revision,
+  }));
   // CACHE: free-form ids/paths (no project enum) keep this small tools JSON stable across growth.
   // Prefer the same discipline as agent TOOLS: do not inject live path lists into tool schemas.
   const tools = [
-    { type: "function", function: { name: "list_characters", description: "列出本次获准读取的角色卡目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
-    { type: "function", function: { name: "read_character", description: "读取一张与本次写作相关的完整角色卡（id 须在获准列表中）。", parameters: { type: "object", properties: { id: { type: "number" } }, required: ["id"], additionalProperties: false } } },
+    { type: "function", function: { name: "list_character_refs", description: "列出本次获准读取的角色知识目录。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
+    { type: "function", function: { name: "get_character_context", description: "读取一名相关角色的紧凑 writing 投影（id 须在获准列表中）。", parameters: { type: "object", properties: { id: { type: "number" } }, required: ["id"], additionalProperties: false } } },
     { type: "function", function: { name: "list_documents", description: "列出可读取文档路径。约定：lore/=设定，outline/=大纲，chapters/=正文。先看目录，只选本次需要的文档。", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "read_document", description: "读取一份与本次情节或事实核对直接相关的文档（path 须在项目可见文档中）。", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } } },
   ];
@@ -440,7 +384,7 @@ async function buildWritingDraft(
   });
   const messages: ToolLoopMessage[] = [
     { role: "system", content: `你是小说写作的草案编辑，使用成本较低的模型完成正文前准备。你不写正式正文，也不修改文件。
-项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文（分区名仅用于你选文档，不得写入草案正文）。先根据任务判断需要哪些事实，再通过工具读取相关角色卡；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料；archive 旧稿对 Agent 不可见，side 不作现行事实。
+项目分区：lore/=设定事实，outline/=情节计划，chapters/=主线正文（分区名仅用于你选文档，不得写入草案正文）。先根据任务判断需要哪些事实，再通过工具读取相关角色的 writing 用途投影；仅在确有必要时选择性读取 lore、outline 或前文 chapters，不得为了“全面”遍历资料；archive 旧稿对 Agent 不可见，side 不作现行事实。
 草案语气保持直接：标出冲突、欲望、身体或暴力要点时用准确词，不要改成含蓄代称；不做道德评判。
 ${proseMannerismConstraintPrompt({ compact: true })}
 ${proseRealizationContract()}
@@ -489,13 +433,13 @@ ${writePackDraftContractPrompt()}
       let result: unknown;
       try {
         const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-        if (call.function.name === "list_characters") result = characterDirectory;
-        else if (call.function.name === "read_character") {
+        if (call.function.name === "list_character_refs") result = characterDirectory;
+        else if (call.function.name === "get_character_context") {
           const id = Number(args.id);
           if (!allowedCharacterIds.has(id)) throw new Error("角色不在本次获准范围内");
           const character = options.store.characters().find(item => item.id === id);
           if (!character) throw new Error("角色不存在");
-          result = characterContext(character, options.project, options.path, options.selection);
+          result = characterContext(character, options.project, options.path, options.selection, options.store);
         } else if (call.function.name === "list_documents") result = documents.map(path => ({ path, characters: options.project.read(path).length }));
         else if (call.function.name === "read_document") {
           const path = typeof args.path === "string" ? args.path : "";
@@ -563,7 +507,7 @@ ${proseRealizationContract()}
     ...(styleBlock ? [{ role: "system" as const, content: styleBlock }] : []),
     { role: "user", content: [
       `作品语言：${options.project.config().language}`,
-      characters.length ? `相关角色卡：\n${JSON.stringify(characters.map(item => characterContext(item, options.project, options.path, options.selection)), null, 2)}` : "相关角色卡：无",
+      characters.length ? `相关角色知识（writing 用途投影）：\n${JSON.stringify(characters.map(item => characterContext(item, options.project, options.path, options.selection, options.store)), null, 2)}` : "相关角色知识：无",
       packText,
       context ? `文档上下文（纯正文，用于衔接声线与事实）：\n${context}` : "",
       `正文缩句契约：\n${proseCompressionGuidance()}`,
@@ -619,12 +563,18 @@ function selectedCharacters(store: WriterStore, ids?: number[]): Character[] {
   return store.characters().filter(item => allowed.has(item.id)).slice(0, 12);
 }
 
-function characterContext(item: Character, project?: WriterProject, path?: string, selection?: string) {
+function characterContext(item: Character, project?: WriterProject, path?: string, selection?: string, store?: WriterStore) {
   if (!project) return characterPromptViews(item);
   const nodes = new OutlineStore(project).sync().nodes;
   const linked = path ? nodes.filter(node => node.documentPath === path) : [];
   const selected = selection ? linked.find(node => node.documentHeading && selection.includes(node.documentHeading)) : undefined;
   const target = selected?.id ?? (linked.length === 1 ? linked[0].id : undefined);
+  if (store) {
+    return {
+      knowledge: store.characterKnowledgeContext(item.id, "writing", { limit: 12 }),
+      constraints: characterWritingConstraintView(item, nodes, target),
+    };
+  }
   return characterPromptViews(item, nodes, target);
 }
 

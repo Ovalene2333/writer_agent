@@ -7,16 +7,25 @@ import { characterEditorSaveInput } from "./character_editor_payload.js";
 import {
   applyCharacterChanges,
   applyCharacterInput,
+  applyCharacterWorkspacePatch,
   competenciesWritingPayload,
   emptyCharacter,
   characterSummaryCard,
+  characterWorkspaceView,
   normalizeV3Character,
   resolveCharacterAt,
   upsertById,
 } from "./characters.js";
 import { WriterProject } from "./project.js";
 import { WriterStore } from "./store.js";
-import { handleGetCharacter, handleListCharacters, handleSaveCharacter } from "./tools/characters.js";
+import {
+  handleGetCharacter,
+  handleListCharacters,
+  handleOpenCharacterDraft,
+  handleSaveCharacter,
+  handleSubmitCharacterDraft,
+  handleUpdateCharacterDraft,
+} from "./tools/characters.js";
 import type { Character, OutlineNode } from "./types.js";
 import { characterConstraintHash, characterConstraintView, characterWritingConstraintView } from "./character_constraints.js";
 
@@ -375,6 +384,148 @@ test("web character editor save replaces deleted experiences and story states", 
   }));
   assert.deepEqual(saved.experiences, []);
   assert.deepEqual(saved.storyStates, []);
+});
+
+test("narrative character creation is persisted as a session candidate without mutating project cards", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-candidate-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "人物候选");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("正文写作");
+    const before = store.characters().length;
+    const result = JSON.parse(handleSaveCharacter({
+      input: {
+        identity: { name: "韩肃", aliases: ["獾"], narrativeRole: "山雀小队队长" },
+        psychology: { malformedPlanningShape: true },
+      },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      characterScope: [],
+      context: { permissionMode: "ask", characterPersistenceIntent: "candidate" },
+    })) as { status: string; artifactId: number };
+    assert.equal(result.status, "candidate_saved");
+    assert.equal(store.characters().length, before);
+    const artifact = store.sessionArtifactById(sessionId, result.artifactId);
+    assert.equal(artifact?.kind, "character_candidate");
+    assert.match(artifact?.digest ?? "", /韩肃.*planned/u);
+    const autoResult = JSON.parse(handleSaveCharacter({
+      input: { identity: { name: "韩肃", aliases: ["獾"] } },
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      characterScope: [],
+      context: { permissionMode: "auto", characterPersistenceIntent: "candidate" },
+    })) as { storedAs: string };
+    assert.equal(autoResult.storedAs, "session_character_candidate");
+    assert.equal(store.characters().length, before, "proposal/auto both keep narrative candidates outside project cards");
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("character workspace compacts psychology and goals and submits creation through change set", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-character-workspace-"));
+  let store: WriterStore | undefined;
+  try {
+    const project = WriterProject.init(root, "角色工作副本");
+    store = new WriterStore(project);
+    const sessionId = store.createSession("创建角色");
+    const args = {
+      project,
+      store,
+      sessionId,
+      emit: () => undefined,
+      characterScope: [] as number[],
+      context: { permissionMode: "ask" as const, characterPersistenceIntent: "full" as const },
+    };
+    const opened = JSON.parse(handleOpenCharacterDraft({
+      ...args, input: { name: "闻灯", summary: "建立核心角色" },
+    })) as { draftId: string; revision: number };
+    const updated = JSON.parse(handleUpdateCharacterDraft({
+      ...args,
+      input: {
+        draftId: opened.draftId,
+        revision: opened.revision,
+        patch: {
+          identity: { narrativeRole: "调查者", summary: "在旧城区追查失踪案" },
+          psychology: {
+            core: "先确认事实，再决定是否信任他人",
+            dominantValue: "可验证的诚实",
+            centralTension: "需要同伴，却害怕判断受人操纵",
+            pressureResponse: "压力越大越会缩小问题并亲自核对",
+          },
+          goals: {
+            primary: { summary: "找到失踪者", stakes: "失踪者可能仍活着", obstacles: ["线索被人为清理"] },
+            longTerm: { summary: "查明旧城区档案被篡改的原因" },
+          },
+        },
+      },
+    })) as { revision: number; character: ReturnType<typeof characterWorkspaceView> };
+    assert.equal(updated.character.psychology.centralTension, "需要同伴，却害怕判断受人操纵");
+    assert.equal(updated.character.goals.primary?.summary, "找到失踪者");
+    assert.equal(store.characters().length, 0, "editing stays in the Session workspace");
+
+    const submitted = JSON.parse(handleSubmitCharacterDraft({
+      ...args,
+      input: { draftId: opened.draftId, revision: updated.revision, summary: "创建闻灯角色卡" },
+    })) as { status: string; changeSetId: number };
+    assert.equal(submitted.status, "pending");
+    assert.equal(store.characters().length, 0, "ask mode does not write JSONL before approval");
+    store.acceptChangeSet(submitted.changeSetId);
+    const saved = store.characters()[0];
+    assert.equal(saved.identity.name, "闻灯");
+    assert.equal(saved.psychology.values.length, 1);
+    assert.equal(saved.psychology.conflicts.length, 1);
+    assert.equal(saved.motivations.length, 2);
+    assert.equal(store.sessionCharacterDraft(sessionId, opened.draftId).status, "applied");
+    store.undoChangeSet(submitted.changeSetId);
+    assert.equal(store.characters().length, 0, "new character creation is reversible");
+    store.redoChangeSet(submitted.changeSetId);
+    assert.equal(store.characters()[0].identity.name, "闻灯");
+  } finally {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("character workspace archives expanded legacy psychology and goals only when those sections change", () => {
+  const base = normalizeV3Character({
+    ...emptyCharacter("旧卡"), id: 1, updatedAt: "2026-01-01T00:00:00.000Z",
+    psychology: {
+      summary: "旧核心",
+      traits: [
+        { id: "trait-a", label: "谨慎", description: "先观察" },
+        { id: "trait-b", label: "固执", description: "不轻易改口" },
+      ],
+      values: [{ id: "value-a", label: "承诺", description: "答应的事必须完成" }],
+      fears: [{ id: "fear-a", label: "失控", description: "害怕失去判断" }],
+      conflicts: [{ id: "conflict-a", label: "依赖", description: "需要又拒绝帮助" }],
+    },
+    motivations: [
+      { id: "goal-a", category: "current", status: "active", priority: 90, summary: "目标甲", stakes: "", obstacles: [] },
+      { id: "goal-b", category: "current", status: "active", priority: 80, summary: "目标乙", stakes: "", obstacles: [] },
+      { id: "goal-c", category: "current", status: "active", priority: 70, summary: "目标丙", stakes: "", obstacles: [] },
+      { id: "goal-d", category: "longTerm", status: "active", priority: 60, summary: "长期目标", stakes: "", obstacles: [] },
+    ],
+  });
+  const unchanged = applyCharacterInput(base, { notes: "只改备注" });
+  assert.equal(unchanged.psychology.traits.length, 2);
+  assert.equal(unchanged.motivations.length, 4);
+
+  const compacted = applyCharacterWorkspacePatch(base, {
+    psychology: { core: "新的稳定内核" },
+    goals: { primary: { summary: "唯一当前主目标" }, secondary: null },
+  });
+  assert.equal(compacted.psychology.traits.length, 1);
+  assert.equal(compacted.motivations.length, 2, "omitted long-term goal is preserved while secondary is cleared");
+  const archive = compacted.extensions?.characterWorkspaceArchive as Record<string, unknown>;
+  assert.ok(archive.psychology);
+  assert.ok(archive.goals);
 });
 
 test("web character editor save payload preserves ability costs", () => {

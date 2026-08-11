@@ -1,6 +1,6 @@
 import { loadSkillById, readSkillResource } from "../agent_runtime.js";
 import type { ToolHandlerArgs } from "./types.js";
-import { requireString } from "./helpers.js";
+import { assertProseReferenceReadAllowed, proseReferenceReadAllowed, requireString } from "./helpers.js";
 import {
   loadProseGateRules,
   removeProseGateRule,
@@ -27,6 +27,10 @@ export function handleManageAuthorPolicies({ input, project, context }: ToolHand
   }
   if (context.permissionMode === "plan") throw new Error("plan 模式不能修改作者政策");
   if (operation === "upsert") {
+    const requestedStatus = requireString(input.status, "status") as AuthorPolicyStatus;
+    if (!["draft", "trial", "active", "paused", "deprecated"].includes(requestedStatus)) {
+      throw new Error("status 必须是 draft/trial/active/paused/deprecated");
+    }
     const policy = upsertAuthorPolicy(project, {
       id: requireString(input.id, "id"),
       title: requireString(input.title, "title"),
@@ -48,7 +52,7 @@ export function handleManageAuthorPolicies({ input, project, context }: ToolHand
         };
       })(),
       enforcement: (input.enforcement === "block" || input.enforcement === "advise" ? input.enforcement : "observe") as AuthorPolicyEnforcement,
-      status: (input.status === "trial" || input.status === "active" || input.status === "paused" ? input.status : "draft") as AuthorPolicyStatus,
+      status: requestedStatus,
       ...(typeof input.skillId === "string" ? { skillId: input.skillId } : {}),
       sourceFeedback: typeof input.sourceFeedback === "string" ? input.sourceFeedback : "",
     });
@@ -157,7 +161,7 @@ export function handleReadSkillResource({ input, project }: ToolHandlerArgs): st
   });
 }
 
-export function handleSearchSessionArtifacts({ input, store, sessionId }: ToolHandlerArgs): string {
+export function handleSearchSessionArtifacts({ input, store, sessionId, context }: ToolHandlerArgs): string {
   const kind = typeof input.kind === "string" && input.kind.trim() ? input.kind.trim() : undefined;
   const path = typeof input.path === "string" && input.path.trim() ? input.path.trim() : undefined;
   const status = typeof input.status === "string" && input.status.trim() ? input.status.trim() : undefined;
@@ -167,11 +171,18 @@ export function handleSearchSessionArtifacts({ input, store, sessionId }: ToolHa
     "active", "blocked", "resolved", "submitted", "applied", "superseded", "rejected", "stale",
   ]);
   if (status && !allowedStatuses.has(status)) throw new Error("未知 artifact 状态");
+  let accessFiltered = 0;
   const artifacts = store.findSessionArtifacts(sessionId, {
     ...(kind ? { kinds: [kind] } : {}),
     ...(path ? { path } : {}),
     ...(status ? { statuses: [status as never] } : {}),
     limit: query ? 100 : limit,
+  }).filter(item => {
+    if (item.path && !proseReferenceReadAllowed(context, item.path)) {
+      accessFiltered += 1;
+      return false;
+    }
+    return true;
   }).filter(item => !query || [item.kind, item.path, item.digest, JSON.stringify(item.metadata)]
     .filter(Boolean).join(" ").toLocaleLowerCase().includes(query))
     .slice(0, limit)
@@ -185,14 +196,23 @@ export function handleSearchSessionArtifacts({ input, store, sessionId }: ToolHa
       metadata: item.metadata,
       updatedAt: item.updatedAt,
     }));
-  return JSON.stringify({ status: "artifact_catalog", artifacts, count: artifacts.length });
+  return JSON.stringify({
+    status: "artifact_catalog",
+    artifacts,
+    count: artifacts.length,
+    ...(accessFiltered ? {
+      accessFiltered,
+      message: "另有会话产物因本轮未解锁的正文或卷访问边界不可见；如确需使用，请由用户解锁对应范围。",
+    } : {}),
+  });
 }
 
-export function handleReadContextArtifact({ input, store, sessionId }: ToolHandlerArgs): string {
+export function handleReadContextArtifact({ input, store, sessionId, context }: ToolHandlerArgs): string {
   const artifactId = Number(input.artifactId);
   if (!Number.isInteger(artifactId) || artifactId <= 0) throw new Error("artifactId 必须是正整数");
   const artifact = store.sessionArtifactById(sessionId, artifactId);
   if (!artifact) throw new Error("工作记忆不存在或不属于当前会话");
+  if (artifact.path) assertProseReferenceReadAllowed(context, artifact.path);
   const offset = Math.max(0, Math.floor(Number(input.offset ?? 0)) || 0);
   const limit = Math.max(500, Math.min(6_000, Math.floor(Number(input.limit ?? 4_000)) || 4_000));
   const content = artifact.content.slice(offset, offset + limit);

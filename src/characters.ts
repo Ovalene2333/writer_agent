@@ -78,6 +78,43 @@ export type ApplyCharacterChangesInput = {
   changes: CharacterChangeOp[];
 };
 
+export type CharacterWorkspaceGoal = {
+  summary: string;
+  stakes: string;
+  obstacles: string[];
+};
+
+/**
+ * Compact authoring view used by the Agent-facing character workspace. The
+ * project may still contain richer v3 history, but the Agent edits one stable
+ * psychological model and at most three simultaneously active goal slots.
+ */
+export type CharacterWorkspaceView = {
+  id: number;
+  name: string;
+  updatedAt: string;
+  identity: Character["identity"];
+  profile: Character["profile"];
+  psychology: {
+    core: string;
+    dominantValue: string;
+    centralTension: string;
+    pressureResponse: string;
+  };
+  goals: {
+    primary?: CharacterWorkspaceGoal;
+    secondary?: CharacterWorkspaceGoal;
+    longTerm?: CharacterWorkspaceGoal;
+  };
+  voice: Character["voice"];
+  features: Character["features"];
+  competencies: Character["competencies"];
+  relationships: Character["relationships"];
+  storyStateCount: number;
+  experienceCount: number;
+  notes: string;
+};
+
 export type AppliedCharacterChange = { op: string; detail: string };
 export type SkippedCharacterChange = { op: string; reason: string };
 
@@ -701,6 +738,195 @@ export function applyCharacterInput(base: Character, input: CharacterInput): Cha
     notes: input.notes !== undefined ? txt(input.notes) : base.notes,
     extensions: input.extensions !== undefined ? input.extensions : base.extensions,
   });
+}
+
+function workspaceTextEntry(values: CharacterTextEntry[], preferredId: string): string {
+  const preferred = values.find(item => item.id === preferredId) ?? values[0];
+  return preferred ? preferred.description || preferred.label : "";
+}
+
+function workspaceGoalValue(goal: CharacterGoal | undefined): CharacterWorkspaceGoal | undefined {
+  return goal ? { summary: goal.summary, stakes: goal.stakes, obstacles: [...goal.obstacles] } : undefined;
+}
+
+export function characterWorkspaceView(character: Character): CharacterWorkspaceView {
+  const activeCurrent = character.motivations
+    .filter(goal => goal.category === "current" && goal.status === "active")
+    .sort((a, b) => b.priority - a.priority);
+  const activeLongTerm = character.motivations
+    .filter(goal => goal.category === "longTerm" && goal.status === "active")
+    .sort((a, b) => b.priority - a.priority);
+  return {
+    id: character.id,
+    name: character.identity.name,
+    updatedAt: character.updatedAt,
+    identity: { ...character.identity, aliases: [...character.identity.aliases], tags: [...character.identity.tags] },
+    profile: { ...character.profile },
+    psychology: {
+      core: character.psychology.summary,
+      dominantValue: workspaceTextEntry(character.psychology.values, "workspace-dominant-value"),
+      centralTension: workspaceTextEntry(character.psychology.conflicts, "workspace-central-tension"),
+      pressureResponse: workspaceTextEntry(character.psychology.traits, "workspace-pressure-response"),
+    },
+    goals: {
+      ...(workspaceGoalValue(activeCurrent[0]) ? { primary: workspaceGoalValue(activeCurrent[0]) } : {}),
+      ...(workspaceGoalValue(activeCurrent[1]) ? { secondary: workspaceGoalValue(activeCurrent[1]) } : {}),
+      ...(workspaceGoalValue(activeLongTerm[0]) ? { longTerm: workspaceGoalValue(activeLongTerm[0]) } : {}),
+    },
+    voice: {
+      ...character.voice,
+      diction: [...character.voice.diction],
+      verbalHabits: [...character.voice.verbalHabits],
+      avoidedExpressions: [...character.voice.avoidedExpressions],
+      examples: [...character.voice.examples],
+      interactionPrinciples: [...character.voice.interactionPrinciples],
+      modes: character.voice.modes.map(mode => ({ ...mode })),
+    },
+    features: character.features.map(item => ({ ...item })),
+    competencies: character.competencies.map(item => ({
+      ...item,
+      resources: [...item.resources], limitations: [...item.limitations], costs: [...item.costs],
+    })),
+    relationships: character.relationships.map(item => ({ ...item })),
+    storyStateCount: character.storyStates.length,
+    experienceCount: character.experiences.length,
+    notes: character.notes,
+  };
+}
+
+function workspaceGoal(raw: unknown, id: string, category: CharacterGoal["category"], priority: number): CharacterGoal | undefined {
+  if (raw === null) return undefined;
+  const value = obj(raw);
+  const summary = txt(value.summary);
+  if (!summary) return undefined;
+  return goal({
+    id,
+    category,
+    status: "active",
+    priority,
+    summary,
+    stakes: value.stakes,
+    obstacles: value.obstacles,
+  });
+}
+
+function compactArchive(base: Character, section: "psychology" | "goals"): Record<string, unknown> {
+  const extensions = obj(base.extensions);
+  const previous = obj(extensions.characterWorkspaceArchive);
+  if (previous[section] !== undefined) return extensions;
+  const archived = section === "psychology"
+    ? {
+        traits: base.psychology.traits,
+        values: base.psychology.values,
+        fears: base.psychology.fears,
+        conflicts: base.psychology.conflicts,
+      }
+    : base.motivations;
+  return {
+    ...extensions,
+    characterWorkspaceArchive: {
+      ...previous,
+      [section]: archived,
+    },
+  };
+}
+
+/** Apply a compact workspace patch without making the Agent manage v3 entry IDs. */
+export function applyCharacterWorkspacePatch(base: Character, patchValue: unknown): Character {
+  const patch = obj(patchValue);
+  let next = normalizeV3Character(base);
+  if (patch.identity !== undefined) {
+    const value = obj(patch.identity);
+    next = applyCharacterInput(next, {
+      identity: {
+        ...next.identity,
+        ...(value.name !== undefined ? { name: txt(value.name) } : {}),
+        ...(value.aliases !== undefined ? { aliases: strs(value.aliases) } : {}),
+        ...(value.tags !== undefined ? { tags: strs(value.tags) } : {}),
+        ...(value.narrativeRole !== undefined ? { narrativeRole: txt(value.narrativeRole) } : {}),
+        ...(value.summary !== undefined ? { summary: txt(value.summary) } : {}),
+      },
+    });
+  }
+  if (patch.profile !== undefined) {
+    const value = obj(patch.profile);
+    next = applyCharacterInput(next, { profile: {
+      ...next.profile,
+      ...(value.appearance !== undefined ? { appearance: txt(value.appearance) } : {}),
+      ...(value.appearanceSummary !== undefined ? { appearanceSummary: txt(value.appearanceSummary) } : {}),
+      ...(value.background !== undefined ? { background: txt(value.background) } : {}),
+      ...(value.backgroundSummary !== undefined ? { backgroundSummary: txt(value.backgroundSummary) } : {}),
+      ...(value.biography !== undefined ? { biography: txt(value.biography) } : {}),
+    } });
+  }
+  if (patch.psychology !== undefined) {
+    const value = obj(patch.psychology);
+    const current = characterWorkspaceView(next).psychology;
+    const selected = (key: keyof typeof current): string => Object.prototype.hasOwnProperty.call(value, key)
+      ? txt(value[key])
+      : current[key];
+    const entryOrEmpty = (id: string, label: string, raw: unknown): CharacterTextEntry[] => {
+      const description = txt(raw);
+      return description ? [{ id, label, description }] : [];
+    };
+    next = normalizeV3Character({
+      ...next,
+      psychology: {
+        summary: selected("core"),
+        values: entryOrEmpty("workspace-dominant-value", "首要价值取向", selected("dominantValue")),
+        conflicts: entryOrEmpty("workspace-central-tension", "核心内在矛盾", selected("centralTension")),
+        traits: entryOrEmpty("workspace-pressure-response", "受压时的典型选择", selected("pressureResponse")),
+        fears: [],
+      },
+      extensions: compactArchive(next, "psychology"),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  if (patch.goals !== undefined) {
+    const value = obj(patch.goals);
+    const current = characterWorkspaceView(next).goals;
+    const selected = (key: keyof typeof current): unknown => Object.prototype.hasOwnProperty.call(value, key)
+      ? value[key]
+      : current[key];
+    const motivations = [
+      workspaceGoal(selected("primary"), "workspace-goal-primary", "current", 100),
+      workspaceGoal(selected("secondary"), "workspace-goal-secondary", "current", 60),
+      workspaceGoal(selected("longTerm"), "workspace-goal-long-term", "longTerm", 80),
+    ].filter((item): item is CharacterGoal => Boolean(item));
+    const concludedGoalExperiences = next.motivations
+      .filter(item => item.status === "achieved" || item.status === "abandoned" || item.status === "blocked")
+      .map(item => ({
+        id: `goal-history-${item.id}`.slice(0, 128),
+        label: `目标：${item.summary}`,
+        description: [
+          item.status === "achieved" ? "已达成" : item.status === "abandoned" ? "已放弃" : "受阻结束",
+          item.stakes,
+        ].filter(Boolean).join("；"),
+        ...(item.validFrom ? { validFrom: item.validFrom } : {}),
+        ...(item.validUntil ? { validUntil: item.validUntil } : {}),
+      }));
+    next = normalizeV3Character({
+      ...next,
+      motivations,
+      experiences: upsertById(next.experiences, concludedGoalExperiences),
+      extensions: compactArchive(next, "goals"),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  if (patch.voice !== undefined) {
+    const value = obj(patch.voice);
+    next = applyCharacterInput(next, { voice: {
+      ...next.voice,
+      ...(value.summary !== undefined ? { summary: txt(value.summary) } : {}),
+      ...(value.register !== undefined ? { register: txt(value.register) } : {}),
+      ...(value.diction !== undefined ? { diction: strs(value.diction) } : {}),
+      ...(value.verbalHabits !== undefined ? { verbalHabits: strs(value.verbalHabits) } : {}),
+      ...(value.avoidedExpressions !== undefined ? { avoidedExpressions: strs(value.avoidedExpressions) } : {}),
+      ...(value.interactionPrinciples !== undefined ? { interactionPrinciples: strs(value.interactionPrinciples) } : {}),
+    } });
+  }
+  if (patch.notes !== undefined) next = applyCharacterInput(next, { notes: txt(patch.notes) });
+  return next;
 }
 
 let generatedEntrySequence = 0;

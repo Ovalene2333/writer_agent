@@ -65,7 +65,7 @@ export const PROSE_CONSTRUCTION_RULES = [
       /不在于[^\n。！？!?]{1,48}而在于[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
       /(?:不能|算不上|谈不上|称不上)[^\n。！？!?]{1,40}(?:只是|不过是|更像)[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
     ],
-    generationGuidance: "叙述不要反复用先否定后改判、“没有A只有B”等同功能变体，或在成立事实后补一句否定标签来制造力度；优先让动作、感受或事实自行成立。必要的客观排除和人物即时纠错可以保留，但仍占句式家族额度。",
+    generationGuidance: "叙述不要反复用先否定再改判（包括「不是……是/而是……」与拆句变体）、“没有A只有B”等同功能变体，或在成立事实后补一句否定标签来制造力度；优先让动作、感受或事实自行成立。必要的客观排除和人物即时纠错可以保留，但仍占句式家族额度。",
     adjudicationGuidance: "判断候选是否在重新命名同一事实，或先写成立事实再追加否定补注；人物即时纠错、必要客观排除及确有语境作用者 allow，轻微模板化者 warn，重复解释者 block。语义 allow 与句式家族计数彼此独立。",
     reviewAtCount: 2,
     allowedOccurrences: characters => Math.max(1, Math.floor((characters * 4) / 10_000)),
@@ -134,6 +134,10 @@ export function findProseConstructionMatches(text: string): ProseConstructionMat
 
 export function proseConstructionGenerationPrompt(): string {
   return PROSE_CONSTRUCTION_RULES.map(rule => `- ${rule.generationGuidance}`).join("\n");
+}
+
+export function negationRedefinitionGenerationGuidance(): string {
+  return proseConstructionRule("negation_redefinition")!.generationGuidance;
 }
 
 export function proseConstructionAdjudicationPrompt(): string {

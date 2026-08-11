@@ -451,11 +451,25 @@ export interface DocumentQualityReportSnapshot {
   updatedAt: string;
 }
 
-export interface ProposalCharacterChange {
+export interface ProposalCharacterEvolutionChange {
   characterId: number;
   reason: string;
   changes: Array<{ op: string; [key: string]: unknown }>;
+  operation?: "evolve";
 }
+
+export interface ProposalCharacterSnapshotChange {
+  characterId: number;
+  reason: string;
+  changes: [];
+  operation: "create" | "replace";
+  /** Internal compatibility projection carrying an exact v4 knowledge bundle. */
+  after: Character;
+  /** Required for replace; create is guarded by the allocated ID remaining absent. */
+  expectedUpdatedAt?: string;
+}
+
+export type ProposalCharacterChange = ProposalCharacterEvolutionChange | ProposalCharacterSnapshotChange;
 
 export type ChangeSetFileOperation = "write" | "patch" | "move" | "delete";
 

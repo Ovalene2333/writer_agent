@@ -11,10 +11,13 @@ import type {
 import type {
   SaveSessionArtifactInput,
   SessionArtifact,
+  SessionCharacterCandidate,
+  SessionCharacterDraft,
+  SessionCharacterCandidateSource,
   SessionArtifactRelation,
   SessionArtifactStatus,
 } from "./session_artifacts.js";
-import { documentQualityArtifactKey } from "./session_artifacts.js";
+import { characterCandidateArtifactKey, characterDraftArtifactKey, documentQualityArtifactKey } from "./session_artifacts.js";
 import {
   extensionForImageMime,
   isSupportedImageMime,
@@ -27,6 +30,7 @@ import { documentSpans } from "./document_spans.js";
 import {
   applyCharacterChanges as applyCharacterChangesCore,
   applyCharacterInput,
+  applyCharacterWorkspacePatch,
   characterName,
   emptyCharacter,
   migrateV2Character,
@@ -53,9 +57,24 @@ import type {
 import {
   buildContextGraphView, newContextEdgeId, newContextNodeId, type ContextGraphView,
 } from "./context_graph.js";
+import {
+  applyCharacterKnowledgeChanges,
+  characterFromKnowledgeBundle,
+  characterKnowledgeProjection,
+  characterKnowledgeSearchText,
+  knowledgeBundleFromCharacter,
+  normalizeCharacterKnowledgeEntity,
+  normalizeCharacterKnowledgeRecord,
+  normalizeCharacterPresentationPolicy,
+  type CharacterContextPurpose,
+  type CharacterKnowledgeBundle,
+  type CharacterKnowledgeChange,
+  type CharacterKnowledgeRecordType,
+  type CharacterPresentationPolicy,
+} from "./character_knowledge.js";
 
 type Row = Record<string, unknown>;
-type ProposalCharacterRevision = { characterId: number; before: Character; after: Character };
+type ProposalCharacterRevision = { characterId: number; before?: Character; after?: Character };
 
 export class ProposalDocumentBaseChangedError extends Error {
   readonly code = "PROPOSAL_DOCUMENT_BASE_CHANGED";
@@ -98,12 +117,15 @@ function parseProposalCharacterChanges(value: unknown): ProposalCharacterChange[
   try {
     const parsed = JSON.parse(value) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item): item is ProposalCharacterChange => Boolean(
-      item && typeof item === "object" && !Array.isArray(item)
-      && Number.isInteger((item as { characterId?: unknown }).characterId)
-      && typeof (item as { reason?: unknown }).reason === "string"
-      && Array.isArray((item as { changes?: unknown }).changes),
-    ));
+    return parsed.filter((item): item is ProposalCharacterChange => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const change = item as Record<string, unknown>;
+      if (!Number.isInteger(change.characterId) || typeof change.reason !== "string" || !Array.isArray(change.changes)) return false;
+      if (change.operation === "create" || change.operation === "replace") {
+        return Boolean(change.after && typeof change.after === "object" && !Array.isArray(change.after));
+      }
+      return change.operation === undefined || change.operation === "evolve";
+    });
   } catch {
     return [];
   }
@@ -282,7 +304,8 @@ export class WriterStore {
       // busy_timeout: multi-process readers/writers wait instead of failing immediately.
       this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
       this.migrate();
-      this.migrateCharacterCardsToJsonl();
+      this.project.initializeCharacterKnowledgeStore();
+      this.retireLegacyCharacterDrafts();
       this.migrateSimpleCharacterCardsToJsonl();
       this.reindex();
       // Close trails / jobs left "running" by a crashed process (in-memory runners are gone).
@@ -737,6 +760,16 @@ export class WriterStore {
         UNIQUE(run_id, case_id)
       );
       CREATE INDEX IF NOT EXISTS agent_evaluation_cases_run ON agent_evaluation_cases(run_id, id);
+      CREATE TABLE IF NOT EXISTS character_projection_cache (
+        cache_key TEXT PRIMARY KEY,
+        character_id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        purpose TEXT NOT NULL,
+        content_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS character_projection_cache_character
+        ON character_projection_cache(character_id, revision, purpose);
       CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(path UNINDEXED, content);
     `);
     const revisionColumns = this.database.prepare("PRAGMA table_info(revisions)").all() as Row[];
@@ -939,6 +972,280 @@ export class WriterStore {
     return artifact;
   }
 
+  saveSessionCharacterCandidate(
+    sessionId: string,
+    value: {
+      name: string;
+      aliases?: string[];
+      status: SessionCharacterCandidate["status"];
+      summary?: string;
+      knowledgeEntity?: Record<string, unknown>;
+      knowledgePolicies?: Array<Record<string, unknown>>;
+      proposedCard?: Record<string, unknown>;
+      promotedCharacterId?: number;
+      source?: SessionCharacterCandidateSource;
+    },
+  ): SessionArtifact {
+    const name = value.name.normalize("NFKC").trim();
+    if (!name) throw new Error("人物候选缺少名称");
+    const artifactKey = characterCandidateArtifactKey(name);
+    const previousArtifact = this.sessionArtifact(sessionId, artifactKey);
+    let previous: SessionCharacterCandidate | undefined;
+    try {
+      const parsed = previousArtifact ? JSON.parse(previousArtifact.content) as unknown : undefined;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) previous = parsed as SessionCharacterCandidate;
+    } catch { /* malformed legacy candidate is replaced by the structured record */ }
+    const rank: Record<SessionCharacterCandidate["status"], number> = {
+      planned: 0, drafted: 1, confirmed: 2, promoted: 3,
+    };
+    const status = previous && rank[previous.status] > rank[value.status] ? previous.status : value.status;
+    const aliases = [...new Set([
+      ...(previous?.aliases ?? []),
+      ...(value.aliases ?? []),
+    ].map(alias => alias.normalize("NFKC").trim()).filter(alias => alias && alias !== name))];
+    const sources = [...(previous?.sources ?? [])];
+    if (value.source) {
+      const fingerprint = JSON.stringify(value.source);
+      if (!sources.some(source => JSON.stringify(source) === fingerprint)) sources.push(value.source);
+    }
+    const candidate: SessionCharacterCandidate = {
+      name,
+      aliases,
+      status,
+      summary: value.summary?.trim() || previous?.summary || "正文任务中产生的暂定人物",
+      ...(value.knowledgeEntity || previous?.knowledgeEntity
+        ? { knowledgeEntity: value.knowledgeEntity ?? previous?.knowledgeEntity }
+        : {}),
+      ...(value.knowledgePolicies || previous?.knowledgePolicies
+        ? { knowledgePolicies: value.knowledgePolicies ?? previous?.knowledgePolicies }
+        : {}),
+      ...(value.proposedCard || previous?.proposedCard
+        ? { proposedCard: value.proposedCard ?? previous?.proposedCard }
+        : {}),
+      sources,
+      ...(value.promotedCharacterId || previous?.promotedCharacterId
+        ? { promotedCharacterId: value.promotedCharacterId ?? previous?.promotedCharacterId }
+        : {}),
+    };
+    const content = JSON.stringify(candidate);
+    return this.saveSessionArtifact(sessionId, {
+      artifactKey,
+      kind: "character_candidate",
+      ...(value.source?.path ? { path: value.source.path } : previousArtifact?.path ? { path: previousArtifact.path } : {}),
+      sourceHash: this.project.hash(content),
+      content,
+      digest: `人物候选「${name}」(${status})：${candidate.summary.slice(0, 180)}`,
+      status: status === "promoted" ? "resolved" : "active",
+      metadata: {
+        candidateStatus: status,
+        sourceMessageId: value.source?.sourceMessageId,
+        sourceProposalId: value.source?.sourceProposalId,
+        promotedCharacterId: candidate.promotedCharacterId,
+      },
+      ...(value.source?.artifactId
+        ? { relations: [{ artifactId: value.source.artifactId, relation: "supported_by" }] }
+        : {}),
+    });
+  }
+
+  sessionCharacterDraft(sessionId: string, draftId: string): SessionCharacterDraft {
+    const artifact = this.sessionArtifact(sessionId, characterDraftArtifactKey(draftId));
+    if (!artifact || artifact.kind !== "character_draft") throw new Error("角色工作副本不存在");
+    try {
+      const parsed = JSON.parse(artifact.content) as SessionCharacterDraft;
+      if (!parsed || parsed.draftId !== draftId || !Number.isInteger(parsed.revision) || !parsed.character) {
+        throw new Error("invalid draft");
+      }
+      return parsed;
+    } catch {
+      throw new Error("角色工作副本已损坏，无法继续编辑");
+    }
+  }
+
+  private persistSessionCharacterDraft(sessionId: string, draft: SessionCharacterDraft): SessionArtifact {
+    const character = this.normalizeCharacter(draft.character);
+    const normalized: SessionCharacterDraft = { ...draft, character };
+    const content = JSON.stringify(normalized);
+    return this.saveSessionArtifact(sessionId, {
+      artifactKey: characterDraftArtifactKey(draft.draftId),
+      kind: "character_draft",
+      sourceHash: this.project.hash(JSON.stringify({
+        baseCharacterId: draft.baseCharacterId,
+        baseUpdatedAt: draft.baseUpdatedAt,
+        revision: draft.revision,
+      })),
+      content,
+      digest: `角色工作副本「${character.identity.name}」r${draft.revision}：${draft.summary.slice(0, 160)}`,
+      status: draft.status === "editing" ? "active"
+        : draft.status === "submitted" ? "submitted"
+          : draft.status === "applied" ? "applied"
+            : draft.status === "stale" ? "stale" : "rejected",
+      metadata: {
+        draftId: draft.draftId,
+        draftRevision: draft.revision,
+        draftStatus: draft.status,
+        baseCharacterId: draft.baseCharacterId,
+        baseUpdatedAt: draft.baseUpdatedAt,
+        characterName: character.identity.name,
+        changeSetId: draft.changeSetId,
+      },
+      ...(draft.sourceCandidateArtifactId
+        ? { relations: [{ artifactId: draft.sourceCandidateArtifactId, relation: "derived_from" }] }
+        : {}),
+    });
+  }
+
+  openSessionCharacterDraft(
+    sessionId: string,
+    input: { id?: number; name?: string; summary?: string },
+  ): SessionCharacterDraft {
+    const name = input.name?.normalize("NFKC").trim() ?? "";
+    const existing = input.id
+      ? this.characters().find(item => item.id === input.id)
+      : name ? this.findCharacter(name) : undefined;
+    if (input.id && !existing) throw new Error("要编辑的角色不存在");
+
+    const rows = this.database.prepare(`SELECT * FROM context_artifacts
+      WHERE session_id=? AND kind='character_draft' AND status='active' ORDER BY updated_at DESC`).all(sessionId) as Row[];
+    for (const row of rows) {
+      try {
+        const draft = JSON.parse(String(row.content)) as SessionCharacterDraft;
+        const draftCharacter = this.normalizeCharacter(draft.character);
+        if (existing && draft.baseCharacterId === existing.id && draft.baseUpdatedAt !== existing.updatedAt) {
+          this.persistSessionCharacterDraft(sessionId, { ...draft, status: "stale" });
+          continue;
+        }
+        if ((existing && draft.baseCharacterId === existing.id)
+          || (!existing && name && !draft.baseCharacterId && draftCharacter.identity.name === name)) {
+          return draft;
+        }
+      } catch { /* ignore malformed older workspaces */ }
+    }
+
+    if (!existing && !name) throw new Error("新建角色工作副本必须提供 name");
+    const reservedDraftIds = (this.database.prepare(`SELECT content FROM context_artifacts
+      WHERE kind='character_draft' AND status IN ('active','submitted')`).all() as Row[]).flatMap(row => {
+      try {
+        const parsed = JSON.parse(String(row.content)) as SessionCharacterDraft;
+        return Number.isInteger(parsed.character?.id) ? [parsed.character.id] : [];
+      } catch { return []; }
+    });
+    const id = existing?.id ?? Math.max(0, ...this.characters().map(item => item.id), ...reservedDraftIds) + 1;
+    let character: Character = existing
+      ? this.normalizeCharacter(existing)
+      : { ...emptyCharacter(name), id, updatedAt: new Date().toISOString() };
+    let sourceCandidateArtifactId: number | undefined;
+    if (!existing) {
+      const candidateArtifact = this.sessionArtifact(sessionId, characterCandidateArtifactKey(name));
+      if (candidateArtifact) {
+        try {
+          const candidate = JSON.parse(candidateArtifact.content) as SessionCharacterCandidate;
+          if (candidate.proposedCard) character = applyCharacterInput(character, candidate.proposedCard as CharacterInput);
+          sourceCandidateArtifactId = candidateArtifact.id;
+        } catch { /* candidate remains evidence even when its provisional card is incomplete */ }
+      }
+    }
+    const draft: SessionCharacterDraft = {
+      draftId: randomUUID(),
+      revision: 1,
+      status: "editing",
+      ...(existing ? { baseCharacterId: existing.id, baseUpdatedAt: existing.updatedAt } : {}),
+      character,
+      summary: input.summary?.trim() || (existing ? `编辑角色「${existing.identity.name}」` : `创建角色「${name}」`),
+      ...(sourceCandidateArtifactId ? { sourceCandidateArtifactId } : {}),
+    };
+    this.persistSessionCharacterDraft(sessionId, draft);
+    return draft;
+  }
+
+  updateSessionCharacterDraft(
+    sessionId: string,
+    draftId: string,
+    expectedRevision: number,
+    input: { patch?: unknown; changes?: ApplyCharacterChangesInput; summary?: string },
+  ): SessionCharacterDraft {
+    const draft = this.sessionCharacterDraft(sessionId, draftId);
+    if (draft.status !== "editing") throw new Error("角色工作副本已经提交；请重新打开后再修改");
+    if (draft.revision !== expectedRevision) throw new Error(`角色工作副本已更新；当前 revision=${draft.revision}，请使用最新版本继续`);
+    let character = this.normalizeCharacter(draft.character);
+    if (input.patch !== undefined) character = applyCharacterWorkspacePatch(character, input.patch);
+    if (input.changes) {
+      const changed = applyCharacterChangesCore(character, input.changes);
+      if (changed.skipped.length) {
+        throw new Error(`角色工作副本包含无效修改：${changed.skipped.map(item => `${item.op}: ${item.reason}`).join("；")}`);
+      }
+      character = changed.character;
+    }
+    const projectCharacters = this.characters();
+    const nextCharacters = draft.baseCharacterId
+      ? [...projectCharacters.filter(item => item.id !== draft.baseCharacterId), character]
+      : [...projectCharacters, character];
+    validateCharacters(nextCharacters, this.outlineNodeIds());
+    const updated: SessionCharacterDraft = {
+      ...draft,
+      revision: draft.revision + 1,
+      character,
+      summary: input.summary?.trim() || draft.summary,
+    };
+    this.persistSessionCharacterDraft(sessionId, updated);
+    return updated;
+  }
+
+  markSessionCharacterDraft(
+    sessionId: string,
+    draftId: string,
+    status: SessionCharacterDraft["status"],
+    changeSetId?: number,
+  ): SessionCharacterDraft {
+    const draft = this.sessionCharacterDraft(sessionId, draftId);
+    const updated = { ...draft, status, ...(changeSetId ? { changeSetId } : {}) };
+    this.persistSessionCharacterDraft(sessionId, updated);
+    return updated;
+  }
+
+  private finalizeCharacterDraftsForChangeSet(sessionId: string, changeSetId: number): void {
+    const rows = this.database.prepare(`SELECT content FROM context_artifacts
+      WHERE session_id=? AND kind='character_draft' AND status='submitted'`).all(sessionId) as Row[];
+    for (const row of rows) {
+      try {
+        const draft = JSON.parse(String(row.content)) as SessionCharacterDraft;
+        if (draft.changeSetId !== changeSetId) continue;
+        const applied = this.markSessionCharacterDraft(sessionId, draft.draftId, "applied", changeSetId);
+        if (applied.sourceCandidateArtifactId) {
+          const character = this.normalizeCharacter(applied.character);
+          this.saveSessionCharacterCandidate(sessionId, {
+            name: character.identity.name,
+            aliases: character.identity.aliases,
+            status: "promoted",
+            summary: character.identity.summary || character.identity.narrativeRole,
+            promotedCharacterId: character.id,
+          });
+        }
+      } catch { /* a malformed draft must not roll back an already committed change set */ }
+    }
+  }
+
+  private transitionCharacterDraftsForChangeSet(
+    sessionId: string,
+    changeSetId: number,
+    status: "editing" | "stale",
+  ): void {
+    const rows = this.database.prepare(`SELECT content FROM context_artifacts
+      WHERE session_id=? AND kind='character_draft'`).all(sessionId) as Row[];
+    for (const row of rows) {
+      try {
+        const draft = JSON.parse(String(row.content)) as SessionCharacterDraft;
+        if (draft.changeSetId !== changeSetId) continue;
+        const { changeSetId: _discarded, ...rest } = draft;
+        this.persistSessionCharacterDraft(sessionId, {
+          ...rest,
+          status,
+          revision: status === "editing" ? draft.revision + 1 : draft.revision,
+        });
+      } catch { /* malformed legacy workspace stays isolated */ }
+    }
+  }
+
   linkSessionArtifacts(
     sessionId: string,
     fromArtifactId: number,
@@ -1103,6 +1410,7 @@ export class WriterStore {
     ) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,?,?)
     ON CONFLICT(session_id,source_message_id,kind,content,source_path,source_evidence) DO UPDATE SET
       source_hash=excluded.source_hash,source_anchor_id=excluded.source_anchor_id,status='active',updated_at=excluded.updated_at`);
+    const proposalArtifact = proposalId > 0 ? this.sessionArtifact(sessionId, `proposal:${proposalId}`) : undefined;
     for (const candidate of candidates.slice(0, 18)) {
       if (!candidate.sourceEvidence || !content.includes(candidate.sourceEvidence)) continue;
       insert.run(
@@ -1111,6 +1419,22 @@ export class WriterStore {
         path, hash, candidate.sourceEvidence,
         writingMemoryEvidenceAnchor(content, hash, candidate.sourceEvidence), now, now,
       );
+      if (candidate.kind === "character_candidate" && candidate.characterName) {
+        this.saveSessionCharacterCandidate(sessionId, {
+          name: candidate.characterName,
+          aliases: candidate.aliases,
+          status: "confirmed",
+          summary: candidate.content,
+          source: {
+            sourceMessageId,
+            ...(proposalId > 0 ? { sourceProposalId: proposalId } : {}),
+            ...(proposalArtifact ? { artifactId: proposalArtifact.id } : {}),
+            path,
+            sourceHash: hash,
+            evidence: candidate.sourceEvidence,
+          },
+        });
+      }
     }
     return this.writingMemory(sessionId, { statuses: ["active"], sourcePath: path, limit: 200 })
       .filter(item => item.sourceMessageId === sourceMessageId);
@@ -1860,14 +2184,95 @@ export class WriterStore {
     this.database.prepare("DELETE FROM writing_drafts WHERE session_id=?").run(sessionId);
   }
 
-  characters(): Character[] {
-    const characters = this.project.readCharacterCardsJsonl().split(/\r?\n/).flatMap((line, index) => {
-      if (!line.trim()) return [];
+  characterKnowledgeBundles(): CharacterKnowledgeBundle[] {
+    let policies: CharacterPresentationPolicy[];
+    try {
+      const raw = JSON.parse(this.project.readCharacterPresentationPolicies()) as unknown;
+      if (!Array.isArray(raw)) throw new Error("根节点必须是数组");
+      policies = raw.map(normalizeCharacterPresentationPolicy);
+    } catch (error) {
+      throw new Error(`characters/policies.json: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const bundles = this.project.listCharacterKnowledgeEntityIds().map(id => {
       try {
-        const parsed = JSON.parse(line) as unknown;
-        return [this.normalizeCharacter(parsed)];
-      } catch (error) { throw new Error(`characters/characters.jsonl:${index + 1}: ${error instanceof Error ? error.message : String(error)}`); }
+        const entity = normalizeCharacterKnowledgeEntity(JSON.parse(this.project.readCharacterKnowledgeEntity(id)) as unknown);
+        if (entity.id !== id) throw new Error(`文件 ID ${id} 与实体 ID ${entity.id} 不一致`);
+        const events = this.project.readCharacterKnowledgeEvents(id).split(/\r?\n/).flatMap((line, index) => {
+          if (!line.trim()) return [];
+          try { return [normalizeCharacterKnowledgeRecord(JSON.parse(line) as unknown, "event")]; }
+          catch (error) { throw new Error(`events/char_${id}.jsonl:${index + 1}: ${error instanceof Error ? error.message : String(error)}`); }
+        });
+        if (events.some(record => record.type !== "event")) throw new Error(`events/char_${id}.jsonl 只能保存 event 记录`);
+        return { entity, events, policies: policies.filter(policy => policy.characterId === id) };
+      } catch (error) {
+        throw new Error(`characters/entities/char_${id}.json: ${error instanceof Error ? error.message : String(error)}`);
+      }
     });
+    const ids = new Set(bundles.map(bundle => bundle.entity.id));
+    for (const bundle of bundles) {
+      for (const record of bundle.entity.records.filter(record => record.type === "relationship" && record.status !== "retracted")) {
+        const target = Number(record.payload.characterId);
+        if (!Number.isInteger(target) || target <= 0 || target === bundle.entity.id || !ids.has(target)) {
+          throw new Error(`角色 ${bundle.entity.id} 的关系记录 ${record.id} 指向无效角色 ${target}`);
+        }
+      }
+    }
+    return bundles.sort((left, right) => left.entity.name.localeCompare(right.entity.name, "zh-CN"));
+  }
+
+  characterKnowledgeBundle(id: number): CharacterKnowledgeBundle | undefined {
+    return this.characterKnowledgeBundles().find(bundle => bundle.entity.id === id);
+  }
+
+  nextCharacterKnowledgeId(): number {
+    return Math.max(0, ...this.project.listCharacterKnowledgeEntityIds()) + 1;
+  }
+
+  characterKnowledgeContext(
+    id: number,
+    purpose: CharacterContextPurpose,
+    options: { recordTypes?: CharacterKnowledgeRecordType[]; cursor?: number; limit?: number } = {},
+  ): Record<string, unknown> {
+    const bundle = this.characterKnowledgeBundle(id);
+    if (!bundle) throw new Error("角色不存在");
+    const cacheKey = this.project.hash(JSON.stringify({
+      id,
+      revision: bundle.entity.revision,
+      policies: bundle.policies.map(policy => [policy.id, policy.revision, policy.status]),
+      purpose,
+      options,
+    }));
+    const cached = this.database.prepare("SELECT content_json FROM character_projection_cache WHERE cache_key=?").get(cacheKey) as Row | undefined;
+    if (typeof cached?.content_json === "string") {
+      try { return JSON.parse(cached.content_json) as Record<string, unknown>; }
+      catch { this.database.prepare("DELETE FROM character_projection_cache WHERE cache_key=?").run(cacheKey); }
+    }
+    const projection = characterKnowledgeProjection(bundle, purpose, options);
+    this.database.prepare(`INSERT OR REPLACE INTO character_projection_cache(
+      cache_key,character_id,revision,purpose,content_json,created_at
+    ) VALUES(?,?,?,?,?,?)`).run(cacheKey, id, bundle.entity.revision, purpose, JSON.stringify(projection), new Date().toISOString());
+    return projection;
+  }
+
+  searchCharacterKnowledge(query: string, options: { mode?: "literal" | "regex"; caseSensitive?: boolean; limit?: number } = {}): Array<Record<string, unknown>> {
+    const limit = Math.max(1, Math.min(50, Math.floor(options.limit ?? 20)));
+    const caseSensitive = options.caseSensitive === true;
+    let matcher: (text: string) => boolean;
+    if (options.mode === "regex") {
+      let expression: RegExp;
+      try { expression = new RegExp(query, caseSensitive ? "u" : "iu"); }
+      catch (error) { throw new Error(`无效正则表达式：${error instanceof Error ? error.message : String(error)}`); }
+      matcher = text => expression.test(text);
+    } else {
+      const needle = caseSensitive ? query : query.toLocaleLowerCase();
+      matcher = text => (caseSensitive ? text : text.toLocaleLowerCase()).includes(needle);
+    }
+    return this.characterKnowledgeBundles().filter(bundle => !query || matcher(characterKnowledgeSearchText(bundle))).slice(0, limit)
+      .map(bundle => this.characterKnowledgeContext(bundle.entity.id, "catalog"));
+  }
+
+  characters(): Character[] {
+    const characters = this.characterKnowledgeBundles().map(characterFromKnowledgeBundle);
     validateCharacters(characters, this.outlineNodeIds());
     return characters.sort((a, b) => characterName(a).localeCompare(characterName(b), "zh-CN"));
   }
@@ -1983,7 +2388,7 @@ export class WriterStore {
     this.database.prepare(`INSERT INTO character_revisions(
       session_id,message_id,character_id,before_file,after_file,before_content,after_content,created_at
     ) VALUES(?,?,?,?,?,?,?,?)`).run(
-      sessionId, messageId, character.id, before ? "characters.jsonl" : null, "characters.jsonl",
+      sessionId, messageId, character.id, before ? `entities/char_${character.id}.json` : null, `entities/char_${character.id}.json`,
       beforeContent, afterContent, new Date().toISOString(),
     );
     return character;
@@ -2001,7 +2406,7 @@ export class WriterStore {
     this.database.prepare(`INSERT INTO character_revisions(
       session_id,message_id,character_id,before_file,after_file,before_content,after_content,created_at
     ) VALUES(?,?,?,?,?,?,?,?)`).run(
-      sessionId, messageId, id, "characters.jsonl", "characters.jsonl",
+      sessionId, messageId, id, `entities/char_${id}.json`, `entities/char_${id}.json`,
       JSON.stringify(before), JSON.stringify(result.character), new Date().toISOString(),
     );
     return result;
@@ -2704,8 +3109,63 @@ export class WriterStore {
   }
 
   private writeCharacters(characters: Character[]): void {
-    const content = [...characters].sort((a, b) => a.id - b.id).map(character => JSON.stringify(character)).join("\n");
-    this.project.writeCharacterCardsJsonl(content ? `${content}\n` : "");
+    validateCharacters(characters, this.outlineNodeIds());
+    const current = new Map(this.characterKnowledgeBundles().map(bundle => [bundle.entity.id, bundle]));
+    const bundles = [...characters].sort((left, right) => left.id - right.id).map(character =>
+      knowledgeBundleFromCharacter(character, current.get(character.id)));
+    const nextIds = new Set(bundles.map(bundle => bundle.entity.id));
+    const duplicateIds = bundles.length !== nextIds.size;
+    if (duplicateIds) throw new Error("角色知识实体 ID 重复");
+    const policies = bundles.flatMap(bundle => bundle.policies);
+    const policyIds = new Set<string>();
+    for (const policy of policies) {
+      if (policy.characterId <= 0 || !nextIds.has(policy.characterId)) throw new Error(`表达政策 ${policy.id} 指向不存在的角色`);
+      if (policyIds.has(policy.id)) throw new Error(`表达政策 ID 重复：${policy.id}`);
+      policyIds.add(policy.id);
+    }
+    for (const bundle of bundles) {
+      for (const record of bundle.entity.records.filter(record => record.type === "relationship" && record.status !== "retracted")) {
+        const target = Number(record.payload.characterId);
+        if (!Number.isInteger(target) || target <= 0 || target === bundle.entity.id || !nextIds.has(target)) {
+          throw new Error(`角色 ${bundle.entity.id} 的关系记录 ${record.id} 指向无效角色 ${target}`);
+        }
+      }
+    }
+
+    const snapshots = new Map<number, { entity: string; events: string }>();
+    for (const id of this.project.listCharacterKnowledgeEntityIds()) {
+      snapshots.set(id, {
+        entity: this.project.readCharacterKnowledgeEntity(id),
+        events: this.project.readCharacterKnowledgeEvents(id),
+      });
+    }
+    const policySnapshot = this.project.readCharacterPresentationPolicies();
+    try {
+      for (const bundle of bundles) {
+        this.project.writeCharacterKnowledgeEntity(bundle.entity.id, `${JSON.stringify(bundle.entity, null, 2)}\n`);
+        const events = bundle.events.map(event => JSON.stringify(event)).join("\n");
+        this.project.writeCharacterKnowledgeEvents(bundle.entity.id, events ? `${events}\n` : "");
+      }
+      for (const id of snapshots.keys()) if (!nextIds.has(id)) this.project.removeCharacterKnowledgeEntity(id);
+      this.project.writeCharacterPresentationPolicies(`${JSON.stringify(policies, null, 2)}\n`);
+      if (nextIds.size) {
+        const placeholders = [...nextIds].map(() => "?").join(",");
+        this.database.prepare(`DELETE FROM character_projection_cache WHERE character_id IN (${placeholders})`).run(...nextIds);
+      }
+      for (const id of snapshots.keys()) {
+        if (!nextIds.has(id)) this.database.prepare("DELETE FROM character_projection_cache WHERE character_id=?").run(id);
+      }
+    } catch (error) {
+      for (const id of this.project.listCharacterKnowledgeEntityIds()) {
+        if (!snapshots.has(id)) this.project.removeCharacterKnowledgeEntity(id);
+      }
+      for (const [id, snapshot] of snapshots) {
+        this.project.writeCharacterKnowledgeEntity(id, snapshot.entity);
+        this.project.writeCharacterKnowledgeEvents(id, snapshot.events);
+      }
+      this.project.writeCharacterPresentationPolicies(policySnapshot);
+      throw error;
+    }
   }
 
   private writeSimpleCharacters(cards: SavedRoleplayInterlocutor[]): void {
@@ -2728,24 +3188,12 @@ export class WriterStore {
     this.database.exec("DELETE FROM roleplay_interlocutors");
   }
 
-  private migrateCharacterCardsToJsonl(): void {
-    const jsonl = this.project.readCharacterCardsJsonl();
-    if (jsonl.trim()) {
-      const lines = jsonl.split(/\r?\n/).filter(line => line.trim());
-      const raw = lines.map((line, index) => { try { return JSON.parse(line) as unknown; } catch (error) { throw new Error(`characters/characters.jsonl:${index + 1}: ${error instanceof Error ? error.message : String(error)}`); } });
-      const needsMigration = raw.some(value => (value as { schemaVersion?: unknown }).schemaVersion !== 3);
-      const characters = raw.map(value => this.normalizeCharacter(value));
-      validateCharacters(characters, this.outlineNodeIds());
-      if (needsMigration) { this.project.backupV2CharacterCards(jsonl); this.writeCharacters(characters); }
-      return;
-    }
-    const files = this.project.listCharacterCardFiles();
-    if (!files.length) return;
-    const characters = files.map(file => { try { return this.normalizeCharacter(JSON.parse(this.project.readCharacterCard(file))); } catch (error) { throw new Error(`characters/${file}: ${error instanceof Error ? error.message : String(error)}`); } });
-    if (!characters.length) return;
-    validateCharacters(characters, this.outlineNodeIds());
-    this.writeCharacters(characters);
-    for (const file of files) this.project.removeCharacterCard(file);
+  private retireLegacyCharacterDrafts(): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`UPDATE context_artifacts
+      SET status='stale', updated_at=?,
+          digest=CASE WHEN digest LIKE '%v3 已停用%' THEN digest ELSE digest || '（v3 已停用，需用角色知识工具重新修改）' END
+      WHERE kind='character_draft' AND status IN ('active','submitted')`).run(now);
   }
 
   private normalizeCharacter(input: unknown): Character {
@@ -3083,6 +3531,17 @@ export class WriterStore {
           SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json FROM messages
           WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC
         `).all(sessionId, limit);
+    return rows.map((row) => this.messageFromRow(row as Row));
+  }
+
+  /** Recent attachment-bearing messages without an arbitrary plain-message lookback window. */
+  messagesWithAttachments(sessionId: string, limit = 8): Message[] {
+    const boundedLimit = Math.max(1, Math.min(50, Math.floor(limit) || 8));
+    const rows = this.database.prepare(`
+      SELECT * FROM (SELECT id,session_id,role,content,created_at,channel,variant_group_id,roleplay_input_mode,attachments_json
+      FROM messages WHERE session_id=? AND attachments_json IS NOT NULL AND attachments_json <> '[]'
+      ORDER BY id DESC LIMIT ?) ORDER BY id ASC
+    `).all(sessionId, boundedLimit);
     return rows.map((row) => this.messageFromRow(row as Row));
   }
 
@@ -3477,9 +3936,17 @@ export class WriterStore {
       try { this.assertChangeSetForwardState(changeSet); }
       catch (error) {
         this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
+        this.transitionCharacterDraftsForChangeSet(changeSet.sessionId, id, "stale");
         throw error;
       }
-      const evolved = this.evolveCharactersForProposal(changeSet.characterChanges);
+      let evolved: ReturnType<WriterStore["evolveCharactersForProposal"]>;
+      try {
+        evolved = this.evolveCharactersForProposal(changeSet.characterChanges);
+      } catch (error) {
+        this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
+        this.transitionCharacterDraftsForChangeSet(changeSet.sessionId, id, "stale");
+        throw error;
+      }
       const preparedAt = new Date().toISOString();
       this.database.prepare(`INSERT INTO change_set_applications(
         change_set_id,status,character_revisions_json,created_at,updated_at
@@ -3495,6 +3962,7 @@ export class WriterStore {
         filesAlreadyApplied = true;
       } catch (error) {
         this.database.prepare("UPDATE change_sets SET status='stale' WHERE id=?").run(id);
+        this.transitionCharacterDraftsForChangeSet(changeSet.sessionId, id, "stale");
         throw error;
       }
     }
@@ -3506,17 +3974,7 @@ export class WriterStore {
     try {
       if (!filesAlreadyApplied) this.applyChangeSetFiles(changeSet.files);
       {
-        let characters = this.characters();
-        for (const revision of characterRevisions) {
-          const current = characters.find(item => item.id === revision.characterId);
-          const before = this.normalizeCharacter(revision.before);
-          const after = this.normalizeCharacter(revision.after);
-          if (!current || (JSON.stringify(current) !== JSON.stringify(before)
-            && JSON.stringify(current) !== JSON.stringify(after))) {
-            throw new Error(`角色卡 ${revision.characterId} 已在 change set 应用过程中发生冲突`);
-          }
-          characters = [...characters.filter(item => item.id !== revision.characterId), after];
-        }
+        const characters = this.applyCharacterRevisionsForward(this.characters(), characterRevisions, "change set");
         validateCharacters(characters, this.outlineNodeIds());
         if (characterRevisions.length) this.writeCharacters(characters);
       }
@@ -3536,6 +3994,7 @@ export class WriterStore {
     }
     this.refreshWritingMemoryForChangeSet(changeSet.files, true);
     this.reindex();
+    this.finalizeCharacterDraftsForChangeSet(changeSet.sessionId, id);
     return this.changeSet(id);
   }
 
@@ -3607,6 +4066,7 @@ export class WriterStore {
     const changeSet = this.changeSet(id);
     if (changeSet.status !== "pending") throw new Error("该 change set 已处理");
     this.database.prepare("UPDATE change_sets SET status='rejected' WHERE id=?").run(id);
+    this.transitionCharacterDraftsForChangeSet(changeSet.sessionId, id, "editing");
     return this.changeSet(id);
   }
 
@@ -3635,16 +4095,40 @@ export class WriterStore {
     }
   }
 
+  private applyCharacterRevisionsForward(
+    initial: Character[],
+    revisions: ProposalCharacterRevision[],
+    owner: string,
+  ): Character[] {
+    let characters = initial;
+    for (const revision of revisions) {
+      const current = characters.find(item => item.id === revision.characterId);
+      const before = revision.before ? this.normalizeCharacter(revision.before) : undefined;
+      const after = revision.after ? this.normalizeCharacter(revision.after) : undefined;
+      if (!after) throw new Error(`角色卡 ${revision.characterId} 的 ${owner} 修订缺少提交结果`);
+      const currentMatchesBefore = before && current && JSON.stringify(current) === JSON.stringify(before);
+      const currentMatchesAfter = current && JSON.stringify(current) === JSON.stringify(after);
+      const validCreate = !before && !current;
+      if (!validCreate && !currentMatchesBefore && !currentMatchesAfter) {
+        throw new Error(`角色卡 ${revision.characterId} 已在 ${owner} 应用过程中发生冲突`);
+      }
+      characters = [...characters.filter(item => item.id !== revision.characterId), after];
+    }
+    return characters;
+  }
+
   private reverseCharacterRevisions(revisions: ProposalCharacterRevision[], expectedSide: "before" | "after"): Character[] {
     let characters = this.characters();
     for (const revision of revisions) {
-      const expected = this.normalizeCharacter(revision[expectedSide]);
+      const expectedRaw = revision[expectedSide];
+      const replacementRaw = revision[expectedSide === "after" ? "before" : "after"];
+      const expected = expectedRaw ? this.normalizeCharacter(expectedRaw) : undefined;
       const current = characters.find(item => item.id === revision.characterId);
-      if (!current || JSON.stringify(current) !== JSON.stringify(expected)) {
+      if (expected ? !current || JSON.stringify(current) !== JSON.stringify(expected) : Boolean(current)) {
         throw new Error(`角色卡 ${revision.characterId} 已变化，无法安全${expectedSide === "after" ? "回滚" : "重做"}`);
       }
-      const replacement = this.normalizeCharacter(revision[expectedSide === "after" ? "before" : "after"]);
-      characters = [...characters.filter(item => item.id !== revision.characterId), replacement];
+      const withoutCurrent = characters.filter(item => item.id !== revision.characterId);
+      characters = replacementRaw ? [...withoutCurrent, this.normalizeCharacter(replacementRaw)] : withoutCurrent;
     }
     return characters;
   }
@@ -3779,8 +4263,55 @@ export class WriterStore {
     let characters = this.characters();
     const revisions: ProposalCharacterRevision[] = [];
     for (const change of changes) {
+      if (change.operation === "create" || change.operation === "replace") {
+        const before = characters.find(item => item.id === change.characterId);
+        if (change.operation === "create" && before) {
+          throw new Error(`角色知识创建冲突：角色 ID ${change.characterId} 已存在，请重新搜索实体`);
+        }
+        if (change.operation === "replace") {
+          if (!before) throw new Error(`角色知识更新失败：角色 ${change.characterId} 不存在`);
+          if (!change.expectedUpdatedAt || before.updatedAt !== change.expectedUpdatedAt) {
+            throw new Error(`角色知识 ${change.characterId} 已变化，请重新读取用途投影并合并`);
+          }
+        }
+        const knowledgeUpdatedAt = (() => {
+          const extensions = change.after && typeof change.after === "object" && !Array.isArray(change.after)
+            ? (change.after as Character).extensions
+            : undefined;
+          const bundle = extensions?.characterKnowledgeV4;
+          if (!bundle || typeof bundle !== "object" || Array.isArray(bundle)) return undefined;
+          const entity = (bundle as { entity?: unknown }).entity;
+          if (!entity || typeof entity !== "object" || Array.isArray(entity)) return undefined;
+          const updatedAt = (entity as { updatedAt?: unknown }).updatedAt;
+          return typeof updatedAt === "string" && updatedAt ? updatedAt : undefined;
+        })();
+        const after = this.normalizeCharacter({
+          ...change.after,
+          id: change.characterId,
+          updatedAt: knowledgeUpdatedAt ?? new Date().toISOString(),
+        });
+        characters = [...characters.filter(item => item.id !== change.characterId), after];
+        revisions.push({ characterId: change.characterId, ...(before ? { before } : {}), after });
+        continue;
+      }
       const before = characters.find(item => item.id === change.characterId);
       if (!before) throw new Error(`延迟角色演进失败：角色 ${change.characterId} 不存在`);
+      const knowledgeOps = change.changes.filter(item => [
+        "set_identity", "set_lifecycle", "upsert_record", "supersede_record", "retract_record",
+      ].includes(item.op));
+      if (knowledgeOps.length) {
+        if (knowledgeOps.length !== change.changes.length) throw new Error(`角色 ${change.characterId} 的提案不能混用新旧演进操作`);
+        const bundle = knowledgeBundleFromCharacter(before, this.characterKnowledgeBundle(before.id));
+        const result = applyCharacterKnowledgeChanges(
+          bundle,
+          knowledgeOps as CharacterKnowledgeChange[],
+          new Set(characters.map(character => character.id)),
+        );
+        const after = characterFromKnowledgeBundle(result.bundle);
+        characters = [...characters.filter(item => item.id !== before.id), after];
+        revisions.push({ characterId: before.id, before, after });
+        continue;
+      }
       const result = applyCharacterChangesCore(before, {
         reason: change.reason,
         changes: change.changes,
@@ -3880,17 +4411,7 @@ export class WriterStore {
 
     const characterRevisions = parseProposalCharacterRevisions(application.character_revisions_json);
     if (characterRevisions.length) {
-      let characters = this.characters();
-      for (const revision of characterRevisions) {
-        const currentCharacter = characters.find(item => item.id === revision.characterId);
-        const before = this.normalizeCharacter(revision.before);
-        const after = this.normalizeCharacter(revision.after);
-        if (!currentCharacter || (JSON.stringify(currentCharacter) !== JSON.stringify(before)
-          && JSON.stringify(currentCharacter) !== JSON.stringify(after))) {
-          throw new Error(`角色卡 ${revision.characterId} 已在提案应用过程中发生冲突`);
-        }
-        characters = [...characters.filter(item => item.id !== revision.characterId), after];
-      }
+      const characters = this.applyCharacterRevisionsForward(this.characters(), characterRevisions, "提案");
       validateCharacters(characters, this.outlineNodeIds());
       this.writeCharacters(characters);
     }
@@ -3949,16 +4470,9 @@ export class WriterStore {
     const current = this.project.read(path);
     if (this.project.hash(current) !== row.after_hash) throw new Error("文档已在修改后发生变化，无法安全撤销");
     const characterRevisions = parseProposalCharacterRevisions(row.character_revisions_json);
-    let restoredCharacters = this.characters();
-    for (const revision of characterRevisions) {
-      const expected = this.normalizeCharacter(revision.after);
-      const currentCharacter = restoredCharacters.find(item => item.id === revision.characterId);
-      if (!currentCharacter || JSON.stringify(currentCharacter) !== JSON.stringify(expected)) {
-        throw new Error(`角色卡 ${revision.characterId} 已在提案通过后发生变化，无法安全撤销`);
-      }
-      const before = this.normalizeCharacter(revision.before);
-      restoredCharacters = [...restoredCharacters.filter(item => item.id !== revision.characterId), before];
-    }
+    const restoredCharacters = characterRevisions.length
+      ? this.reverseCharacterRevisions(characterRevisions, "after")
+      : this.characters();
     if (characterRevisions.length) validateCharacters(restoredCharacters, this.outlineNodeIds());
     if (row.created_file === 1) this.project.removeDocument(path);
     else this.project.writeRaw(path, row.before_content as string);
@@ -3980,16 +4494,9 @@ export class WriterStore {
       throw new Error("文档已发生变化，无法安全重做");
     }
     const characterRevisions = parseProposalCharacterRevisions(row.character_revisions_json);
-    let restoredCharacters = this.characters();
-    for (const revision of characterRevisions) {
-      const expected = this.normalizeCharacter(revision.before);
-      const currentCharacter = restoredCharacters.find(item => item.id === revision.characterId);
-      if (!currentCharacter || JSON.stringify(currentCharacter) !== JSON.stringify(expected)) {
-        throw new Error(`角色卡 ${revision.characterId} 已在撤销后发生变化，无法安全重做`);
-      }
-      const after = this.normalizeCharacter(revision.after);
-      restoredCharacters = [...restoredCharacters.filter(item => item.id !== revision.characterId), after];
-    }
+    const restoredCharacters = characterRevisions.length
+      ? this.reverseCharacterRevisions(characterRevisions, "before")
+      : this.characters();
     if (characterRevisions.length) validateCharacters(restoredCharacters, this.outlineNodeIds());
     this.project.writeRaw(path, row.after_content as string);
     if (characterRevisions.length) this.writeCharacters(restoredCharacters);
@@ -4015,7 +4522,7 @@ export class WriterStore {
     this.refreshWritingMemoryForDocument(path, Number(row.created_file) === 1 ? "" : String(row.before_content));
     return {
       path,
-      characterNames: revisions.map(revision => this.normalizeCharacter(revision.after).identity.name),
+      characterNames: revisions.flatMap(revision => revision.after ? [this.normalizeCharacter(revision.after).identity.name] : []),
     };
   }
 
@@ -4071,7 +4578,7 @@ export class WriterStore {
           const revisions = parseProposalCharacterRevisions(action.row.character_revisions_json);
           const changeSet = this.undoChangeSet(Number(action.row.id));
           undonePaths.push(...changeSet.files.map(file => file.targetPath ?? file.path));
-          undoneCharacters.push(...revisions.map(revision => this.normalizeCharacter(revision.after).identity.name));
+          undoneCharacters.push(...revisions.flatMap(revision => revision.after ? [this.normalizeCharacter(revision.after).identity.name] : []));
         } else if (action.kind === "proposal") {
           const undone = this.rewindProposalRevision(action.row);
           undonePaths.push(undone.path);

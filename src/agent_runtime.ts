@@ -564,6 +564,11 @@ export function isSuccessfulDocumentSubmission(
   result: Record<string, unknown>,
 ): boolean {
   if ("error" in result) return false;
+  if ([
+    "change_character_knowledge", "revise_character_expression",
+    "open_character_draft", "update_character_draft", "submit_character_draft",
+    "save_character", "apply_character_changes", "save_simple_character",
+  ].includes(toolName)) return false;
   const status = typeof result.status === "string" ? result.status : "";
   if (
     status === "final_review_revision_required"

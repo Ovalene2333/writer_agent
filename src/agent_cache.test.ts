@@ -29,6 +29,7 @@ import {
   dynamicContextPrompt,
   buildToolArgumentRepairMessages,
   characterMutationCompletesTask,
+  characterPersistenceIntent,
   chapterContinuationPrompt,
   captureProposalRevisionDocumentBase,
   proposalRevisionConvergePrompt,
@@ -102,7 +103,7 @@ test("agent tool schema has stable order and unique names", () => {
     assert.equal(names.includes(legacy), false, `legacy model tool must stay hidden: ${legacy}`);
   }
   // Update when TOOLS descriptions/schemas change intentionally (cache-critical).
-  assert.equal(agentToolSchemaHash(), "aed719fbeee6ebff");
+  assert.equal(agentToolSchemaHash(), "5ca1feb7c2fb2b7f");
 });
 
 test("isolated chapter review carries the full draft once and returns bounded structured evidence", () => {
@@ -327,7 +328,13 @@ test("task modes share one frozen universal capability catalog", () => {
   for (const required of ["read_file", "write_file", "edit_file", "move_file", "delete_file", "begin_chapter_draft", "write_chapter_scene", "revise_chapter_scene_guide", "inspect_chapter_draft"]) {
     assert.ok(writeNames.includes(required), `write profile missing ${required}`);
   }
-  assert.equal(writeNames.includes("save_character"), true);
+  for (const required of ["search_characters", "get_character_context", "change_character_knowledge", "revise_character_expression"]) {
+    assert.equal(writeNames.includes(required), true);
+  }
+  for (const legacy of ["list_characters", "get_character", "open_character_draft", "update_character_draft", "submit_character_draft"]) {
+    assert.equal(writeNames.includes(legacy), false, `legacy character tool stays replay-only: ${legacy}`);
+  }
+  assert.equal(writeNames.includes("save_character"), false, "legacy whole-card mutation stays replay-only");
   assert.deepEqual(agentToolsForTask("brainstorm", "ask").map(tool => tool.function.name), writeNames);
   assert.deepEqual(agentToolsForTask("audit", "ask").map(tool => tool.function.name), writeNames);
 
@@ -365,14 +372,18 @@ test("generic character card requests cannot be downgraded to simple cards", () 
   assert.equal(characterMutationCompletesTask("write_scene", "auto"), false);
   assert.equal(characterMutationCompletesTask("rewrite", "ask"), false);
   assert.equal(characterMutationCompletesTask("character", "plan"), false);
+  assert.equal(characterPersistenceIntent({ mode: "write_scene", mutation: "document" }), "candidate");
+  assert.equal(characterPersistenceIntent({ mode: "character", mutation: "character" }), "full");
+  assert.equal(characterPersistenceIntent({ mode: "simple_character", mutation: "character" }), "simple");
+  assert.equal(characterPersistenceIntent({ mode: "write_scene", mutation: "mixed" }), "full");
 
   const normal = taskInstructions("character", "deliver", "ask", false);
-  assert.match(normal, /检查同名卡/);
-  assert.match(normal, /角色保存成功即完成本任务/);
+  assert.match(normal, /检查同名实体/);
+  assert.match(normal, /成功后即完成本任务/);
   assert.match(normal, /禁止再写入无关文件/);
-  assert.match(normal, /直接 get_character/);
+  assert.match(normal, /change_character_knowledge/);
   assert.match(normal, /不要调用 save_simple_character/);
-  assert.match(normal, /结构化错误/);
+  assert.match(normal, /revise_character_expression/);
 });
 
 test("character tool JSON recovery is conservative and keeps repair requests isolated", () => {
@@ -1333,8 +1344,8 @@ test("stable system prefix uses fixed slots and is byte-stable across empty opti
     assert.match(messageContentText(a[3].content), /项目技能/);
     assert.match(messageContentText(a[3].content), /chapter-planning/);
     assert.doesNotMatch(messageContentText(a[3].content), /提交前验收/);
-    assert.match(messageContentText(a[0].content), /apply_character_changes/);
-    assert.match(messageContentText(a[0].content), /角色卡声线只约束所属角色说出口的对白/);
+    assert.match(messageContentText(a[0].content), /Session 候选/);
+    assert.match(messageContentText(a[0].content), /角色知识中的声线与表达政策只约束所属角色说出口的对白/);
     // Slot 4/5 must not flip with intensive or audit — those go in the dynamic tail.
     const intensive = buildStableSystemPrefix(project, store, "ask", { intensive: true }, "write_scene");
     const audit = buildStableSystemPrefix(project, store, "ask", { intensive: false }, "audit");
@@ -1390,6 +1401,16 @@ test("the turn's prose-length target lives in the dynamic tail, never in the sta
     assert.match(withTarget, /单章篇幅目标：本轮涉及的每一章都分别约 4200 字/u);
     assert.match(withTarget, /不是本轮所有章节合计；不得因本轮要写多章而均分/u);
     assert.match(withTarget, /用户本轮要求相对项目默认调整/u);
+    assert.match(withTarget, /直接成稿路径用 write_file\/edit_file/u);
+    assert.doesNotMatch(withTarget, /必须成功调用 write_file/u);
+
+    const sceneDelivery = dynamicContextPrompt(
+      project, store, "写一章", task, "ask", { ...scenePipeline, enabled: true }, "fast", false,
+      undefined, undefined, undefined, false,
+      { targetCharacters: 4_200, source: "settings", mode: "bounded" },
+    );
+    assert.match(sceneDelivery, /已建立场景草稿.*inspect_chapter_draft 终审并提交/u);
+    assert.match(sceneDelivery, /成功创建的文档产物统一判定交付/u);
 
     const guidanceTarget = dynamicContextPrompt(
       project, store, "写一章", task, "ask", scenePipeline, "fast", false,

@@ -159,7 +159,7 @@ export class WriterProject {
     project.writeRaw("chapters/chapter-001.md", "# 第一章\n\n");
     project.writeRaw("WRITER.md", DEFAULT_WRITER_INSTRUCTIONS);
     mkdirSync(resolve(project.privateDir, "skills"), { recursive: true });
-    project.writeCharacterCardsJsonl("");
+    project.initializeCharacterKnowledgeStore();
     return project;
   }
 
@@ -590,6 +590,92 @@ export class WriterProject {
   readCharacterCardsJsonl(): string {
     const target = resolve(this.charactersDir, "characters.jsonl");
     return existsSync(target) ? readFileSync(target, "utf8") : "";
+  }
+
+  /**
+   * v4 ordinary-character authority. The former whole-card JSONL is archived
+   * once and is deliberately never imported here; manual migration can read the
+   * backup later without making startup semantics depend on legacy data.
+   */
+  initializeCharacterKnowledgeStore(): void {
+    mkdirSync(resolve(this.charactersDir, "entities"), { recursive: true });
+    mkdirSync(resolve(this.charactersDir, "events"), { recursive: true });
+    const legacy = resolve(this.charactersDir, "characters.jsonl");
+    if (!existsSync(legacy)) return;
+    const backup = resolve(this.charactersDir, "characters.v3.backup.jsonl");
+    if (!existsSync(backup)) {
+      renameSync(legacy, backup);
+      return;
+    }
+    renameSync(legacy, resolve(this.charactersDir, `characters.v3.retired-${Date.now()}.jsonl`));
+  }
+
+  listCharacterKnowledgeEntityIds(): number[] {
+    const directory = resolve(this.charactersDir, "entities");
+    mkdirSync(directory, { recursive: true });
+    return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+      const match = entry.isFile() ? /^char_(\d+)\.json$/u.exec(entry.name) : null;
+      return match ? [Number(match[1])] : [];
+    }).filter(id => Number.isInteger(id) && id > 0).sort((left, right) => left - right);
+  }
+
+  readCharacterKnowledgeEntity(id: number): string {
+    return readFileSync(this.resolveCharacterKnowledgeFile("entities", id, ".json"), "utf8");
+  }
+
+  writeCharacterKnowledgeEntity(id: number, content: string): void {
+    this.writeCharacterKnowledgeFile("entities", id, ".json", content);
+  }
+
+  removeCharacterKnowledgeEntity(id: number): void {
+    const target = this.resolveCharacterKnowledgeFile("entities", id, ".json");
+    if (existsSync(target)) unlinkSync(target);
+    const events = this.resolveCharacterKnowledgeFile("events", id, ".jsonl");
+    if (existsSync(events)) unlinkSync(events);
+  }
+
+  readCharacterKnowledgeEvents(id: number): string {
+    const target = this.resolveCharacterKnowledgeFile("events", id, ".jsonl");
+    return existsSync(target) ? readFileSync(target, "utf8") : "";
+  }
+
+  writeCharacterKnowledgeEvents(id: number, content: string): void {
+    this.writeCharacterKnowledgeFile("events", id, ".jsonl", content);
+  }
+
+  readCharacterPresentationPolicies(): string {
+    const target = resolve(this.charactersDir, "policies.json");
+    return existsSync(target) ? readFileSync(target, "utf8") : "[]";
+  }
+
+  writeCharacterPresentationPolicies(content: string): void {
+    mkdirSync(this.charactersDir, { recursive: true });
+    this.atomicWrite(resolve(this.charactersDir, "policies.json"), content);
+  }
+
+  private resolveCharacterKnowledgeFile(directory: "entities" | "events", id: number, extension: ".json" | ".jsonl"): string {
+    if (!Number.isInteger(id) || id <= 0) throw new Error("角色知识实体 ID 无效");
+    const root = resolve(this.charactersDir, directory);
+    const target = resolve(root, `char_${id}${extension}`);
+    if (relative(root, target).startsWith("..")) throw new Error("角色知识路径越界");
+    return target;
+  }
+
+  private writeCharacterKnowledgeFile(directory: "entities" | "events", id: number, extension: ".json" | ".jsonl", content: string): void {
+    const target = this.resolveCharacterKnowledgeFile(directory, id, extension);
+    mkdirSync(dirname(target), { recursive: true });
+    this.atomicWrite(target, content);
+  }
+
+  private atomicWrite(target: string, content: string): void {
+    const temporary = `${target}.writer-tmp-${process.pid}`;
+    writeFileSync(temporary, content, "utf8");
+    try { renameSync(temporary, target); }
+    catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM") throw error;
+      writeFileSync(target, content, "utf8");
+      try { unlinkSync(temporary); } catch { /* temporary file is not authoritative */ }
+    }
   }
 
   writeCharacterCardsJsonl(content: string): void {

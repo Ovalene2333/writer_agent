@@ -6,6 +6,7 @@ import test from "node:test";
 import { emptyCharacter } from "./characters.js";
 import {
   buildNarrativeEvidencePacket,
+  formatNarrativeEvidenceGapAction,
   readNarrativeEvidenceSource,
   recordCharacterEvidenceRead,
 } from "./narrative_evidence.js";
@@ -49,6 +50,7 @@ test("narrative evidence blocks a scene until scoped character source sections w
     assert.ok(sectionGap);
     assert.deepEqual(new Set(sectionGap!.missing), new Set(["voice", "motivations", "storyState"]));
     assert.equal(sectionGap!.missing.includes("relationships"), false);
+    assert.match(formatNarrativeEvidenceGapAction(sectionGap!), new RegExp(`角色「闻溪」\\(id=${card.id}\\)`));
 
     recordCharacterEvidenceRead(
       context,

@@ -1055,7 +1055,7 @@ export function CharacterEditor(props: {
               <div className="ce-panel">
                 <SectionHead
                   title="已确认经历"
-                  description="随剧情推进写入的事件节点；不是完整传记散文。写作 Agent 可用 apply_character_changes 同步。"
+                  description="随剧情推进写入的事件节点；不是完整传记散文。写作 Agent 会通过角色知识事务同步。"
                   action={(
                     <button type="button" onClick={() => onChange({
                       ...draft,

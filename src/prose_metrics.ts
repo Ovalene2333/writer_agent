@@ -96,7 +96,7 @@ export function analyzeChapterProseMetrics(
     issues.push({
       code: "adjacent_duplicate",
       severity: "error",
-      message: `发现 ${duplicates.length} 处相邻逐字复读句（生成缺陷，零容忍）；用 revise_chapter_draft_style 把「S。S。」替换为单句。`,
+      message: `发现 ${duplicates.length} 处相邻逐字复读句（确定的生成缺陷）；在当前可用修订路径中将「S。S。」收敛为一个完整句，不改动其他内容。`,
       examples: duplicates.slice(0, 5),
       occurrences: duplicates,
     });
