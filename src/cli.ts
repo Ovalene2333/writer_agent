@@ -8,6 +8,7 @@ import { runAgent } from "./agent.js";
 import { DEFAULT_AGENT_EVALUATION_CASES, prepareAgentEvaluationFixtures, runPersistedAgentEvaluation } from "./agent_eval.js";
 import { isPermissionMode, loadAgentSettings, saveAgentSettings } from "./agent_runtime.js";
 import { createAgentStepDebugLogger, stepDebugEnabled } from "./model_debug.js";
+import { createDirectLogAnalyzer, createOpenCodeLogAnalyzer, runLogAudit } from "./log_analysis.js";
 import { prefixCacheLogPath, summarizePrefixCacheLog } from "./prefix_cache.js";
 import { WriterProject } from "./project.js";
 import { ProviderManager } from "./provider_catalog.js";
@@ -138,6 +139,99 @@ program.command("agent-eval")
       if (result.status !== "passed") process.exitCode = 1;
     } finally {
       store.close();
+    }
+  });
+
+program.command("log-audit")
+  .description("只读取证并用廉价模型自动分析 Agent 日志")
+  .option("-p, --project <directory>", "待分析的写作项目", ".")
+  .option("--provider-project <directory>", "direct 后端的供应商配置项目；默认同待分析项目")
+  .option("--backend <backend>", "分析后端：direct | opencode", "direct")
+  .option("--model <provider/model>", "OpenCode 模型，例如 deepseek/deepseek-chat")
+  .option("--opencode-bin <path>", "OpenCode 可执行文件", "opencode")
+  .option("--attach <url>", "连接已运行的 opencode serve")
+  .option("--since-hours <hours>", "采集最近小时数", "24")
+  .option("--limit <count>", "每类证据最大行数", "80")
+  .option("--max-evidence-kb <kb>", "证据包总预算 KiB", "160")
+  .option("--max-rounds <count>", "模型补证轮次上限", "3")
+  .option("--timeout <seconds>", "单轮 OpenCode 超时秒数", "300")
+  .option("--job <id>", "聚焦指定 Job 并收集步骤轨迹")
+  .option("--run-id <id>", "聚焦指定 Agent Run 并收集事件轨迹")
+  .option("--collect-only", "只生成脱敏证据包，不调用模型")
+  .option("--fail-on <severity>", "发现达到该级别时退出码为 2：critical | high | medium | low | info | none", "none")
+  .option("--json", "输出 JSON")
+  .action(async (options: {
+    project: string;
+    providerProject?: string;
+    backend: string;
+    model?: string;
+    opencodeBin: string;
+    attach?: string;
+    sinceHours: string;
+    limit: string;
+    maxEvidenceKb: string;
+    maxRounds: string;
+    timeout: string;
+    job?: string;
+    runId?: string;
+    collectOnly?: boolean;
+    failOn: string;
+    json?: boolean;
+  }) => {
+    const project = new WriterProject(resolve(options.project));
+    if (!project.exists()) throw new Error("待分析目录不是 Writer 项目");
+    if (options.backend !== "direct" && options.backend !== "opencode") {
+      throw new Error("backend 仅支持 direct 或 opencode");
+    }
+    if (options.backend === "opencode" && !options.collectOnly && !options.model?.trim()) {
+      throw new Error("OpenCode 后端需要 --model provider/model");
+    }
+    const severityRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4, none: 99 };
+    if (!(options.failOn in severityRank)) throw new Error("fail-on 级别无效");
+    const positive = (value: string, name: string) => {
+      const number = Number(value);
+      if (!Number.isFinite(number) || number <= 0) throw new Error(`${name} 必须是正数`);
+      return number;
+    };
+    let analyzer;
+    if (!options.collectOnly && options.backend === "opencode") {
+      analyzer = createOpenCodeLogAnalyzer({
+        bin: options.opencodeBin,
+        model: options.model!,
+        ...(options.attach ? { attach: options.attach } : {}),
+        timeoutMs: positive(options.timeout, "timeout") * 1_000,
+      });
+    } else if (!options.collectOnly) {
+      const providerProject = new WriterProject(resolve(options.providerProject ?? options.project));
+      if (!providerProject.exists()) throw new Error("供应商配置目录不是 Writer 项目");
+      analyzer = createDirectLogAnalyzer(new ProviderManager(providerProject).summaryModelConfig());
+    }
+    const result = await runLogAudit({
+      project,
+      ...(analyzer ? { analyzer } : {}),
+      options: {
+        sinceHours: positive(options.sinceHours, "since-hours"),
+        limit: positive(options.limit, "limit"),
+        maxEvidenceBytes: positive(options.maxEvidenceKb, "max-evidence-kb") * 1_024,
+        maxRounds: positive(options.maxRounds, "max-rounds"),
+        collectOnly: Boolean(options.collectOnly),
+        ...(options.job ? { jobId: options.job } : {}),
+        ...(options.runId ? { runId: options.runId } : {}),
+      },
+    });
+    if (options.json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      process.stdout.write(`log-audit run=${result.runId}\n证据：${result.evidencePath}\n`);
+      if (result.reportPath && result.report) {
+        process.stdout.write(`报告：${result.reportPath}\n状态：${result.report.status}，发现 ${result.report.findings.length} 项\n`);
+        for (const finding of result.report.findings) {
+          process.stdout.write(`${finding.severity.toUpperCase()}\t${finding.title}\t${finding.evidenceIds.join(",")}\n`);
+        }
+      }
+    }
+    if (result.report && result.report.findings.some(item => severityRank[item.severity] <= severityRank[options.failOn])) {
+      process.exitCode = 2;
     }
   });
 
