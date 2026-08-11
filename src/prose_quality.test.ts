@@ -10,6 +10,7 @@ import {
   proseMannerismPreflightLine,
   proseStyleRepairPacket,
   proseStyleIssuesError,
+  scanProseStyleIssues,
   sceneMannerismGateError,
 } from "./prose_quality.js";
 import {
@@ -171,6 +172,27 @@ test("distinguishes dialogue correction from narrator abstract reframing", () =>
   const narration = analyzeProseStyle(narrationText);
   assert.ok(narration.some(issue => issue.subtype === "abstract_reframing" && issue.severity === "error"));
   assert.ok(contrastStyleError(narrationText));
+});
+
+test("job regression separates narrator recasts from a necessary factual exclusion", () => {
+  const text = [
+    "\"什么情况。\"她低声说，不是对LANTERN说的。",
+    "装甲舱顶部落下两发压制，不是杀伤，是震。",
+    "一个热源，速度很快，不是步兵的速度。",
+    "不是她让它动的。",
+    "武器站已经转了。不是慢慢转，是一下子甩过去的。",
+  ].join("\n\n");
+  const issues = scanProseStyleIssues(text)
+    .filter(issue => issue.constructionRuleId === "negation_redefinition");
+  assert.deepEqual(issues.map(issue => issue.subtype), [
+    "factual_exclusion",
+    "narrator_redefinition",
+    "factual_exclusion",
+    "narrator_redefinition",
+    "narrator_redefinition",
+  ]);
+  const escalated = analyzeProseStyle(text);
+  assert.equal(escalated.filter(issue => issue.subtype === "narrator_redefinition" && issue.severity === "error").length, 3);
 });
 
 test("repeated abstract contrast frames exceed a shared deterministic budget", () => {

@@ -105,6 +105,20 @@ test("analyzeChapterProseMetrics reports flat staccato rhythm without numeric ha
   assert.equal(chapterMetricsBlockError(metrics), undefined);
 });
 
+test("contrast metrics count a standalone denial followed by an implicit reveal", () => {
+  const text = [
+    "不是她动的。",
+    "武器站已经转了。",
+    "装甲舱顶部落下两发压制，不是杀伤，是震。",
+    "一个热源，速度很快，不是步兵的速度。",
+  ].join("\n\n");
+  const metrics = analyzeChapterProseMetrics(text);
+  assert.equal(metrics.stats.contrastCount, 3);
+  const contrast = metrics.issues.find(issue => issue.code === "contrast_density");
+  assert.ok(contrast?.occurrences?.includes("不是她动的。"));
+  assert.ok(contrast?.occurrences?.includes("不是杀伤，是"));
+});
+
 test("analyzeChapterProseMetrics warns on monotone paragraph openings", () => {
   const text = Array.from({ length: 14 }, (_, index) => `千夏走过第${index}道门，检查了门后的通道。`).join("\n\n");
   const metrics = analyzeChapterProseMetrics(text);

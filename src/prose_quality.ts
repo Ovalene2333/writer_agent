@@ -575,6 +575,7 @@ function scanRegisteredConstructions(text: string): ProseStyleIssue[] {
     const bounds = sentenceBounds(text, match.start);
     const endBounds = sentenceBounds(text, Math.max(match.start, match.end - 1));
     const sentence = text.slice(bounds.start, Math.max(bounds.end, endBounds.end)).trim();
+    const semanticPivot = match.text.search(/(?:不是|并非|没有|与其|不在于|不能|算不上|谈不上|称不上)/u);
     const classification = match.rule.classify({
       text,
       matchedText: match.text,
@@ -582,7 +583,10 @@ function scanRegisteredConstructions(text: string): ProseStyleIssue[] {
       end: match.end,
       sentence,
       sentenceStart: bounds.start,
-      inQuote: quoteDepthAt(text, match.start) > 0,
+      // Broad patterns may start at a closing quote before the actual negation
+      // (e.g. `"台词。"她说，不是对同伴说的`). Test quote state at
+      // the construction pivot, not at the evidence-window start.
+      inQuote: quoteDepthAt(text, match.start + Math.max(0, semanticPivot)) > 0,
     });
     issues.push(makeIssue(
       text,

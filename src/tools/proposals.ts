@@ -41,6 +41,7 @@ import { documentKind, isScenePipelineDocument } from "../project.js";
 import { formatQualityReportLines } from "../final_quality.js";
 import {
   buildNarrativeValidationSnapshot,
+  contrastReviewCandidates,
   proseSignalsFromNarrativeValidation,
   validationReceiptMatches,
   type NarrativeValidationReceipt,
@@ -51,6 +52,7 @@ import {
   ChapterReviewRequestError,
   constrainChapterRevisionReview,
   reviewChapterDraft,
+  uncoveredProseCandidateEvidence,
   type ChapterReviewResult,
 } from "../chapter_review.js";
 import {
@@ -681,6 +683,48 @@ function chapterReviewRepairPacket(
   return directReviewRepairPacket(path, sourceHash, blockers);
 }
 
+function contrastCandidatesForReview(validation: NarrativeValidationSnapshot | undefined): string[] {
+  return validation ? contrastReviewCandidates(validation) : [];
+}
+
+function uncoveredContrastReview(
+  path: string,
+  sourceHash: string,
+  candidates: readonly string[],
+  review: ChapterReviewResult,
+): { review: ChapterReviewResult; response: string } | undefined {
+  if (review.verdict !== "pass" || !candidates.length) return undefined;
+  const missing = uncoveredProseCandidateEvidence(candidates, review).slice(0, 8);
+  if (!missing.length) return undefined;
+  const coverageReview: ChapterReviewResult = {
+    verdict: "revise",
+    chapterChange: review.chapterChange,
+    reviewNotes: `${review.reviewNotes}\n终审未逐项覆盖 ${missing.length} 个否定—改判候选，不能据此放行。`.slice(0, 1_000),
+    issues: missing.map(evidence => ({
+      severity: "blocker",
+      kind: "construction_repetition",
+      sceneId: "document",
+      evidence: [evidence],
+      oldText: evidence,
+      problem: "整章终审未逐字引用并判断该否定—改判候选的场景功能，当前 pass 缺少可验证依据。",
+      action: "保留事实与节奏，改用直接事实、动作、感受或人物特有说法；若确属必要排除或人物即时纠错，重新提交后由终审明确逐项裁决。",
+    })),
+  };
+  const repairPacket = chapterReviewRepairPacket(path, sourceHash, coverageReview);
+  return {
+    review: coverageReview,
+    response: JSON.stringify({
+      status: "final_review_revision_required",
+      code: "DIRECT_CHAPTER_REVIEW_CANDIDATE_COVERAGE_REQUIRED",
+      path,
+      proposalCreated: false,
+      chapterReview: coverageReview,
+      ...(repairPacket ? { repairPacket } : {}),
+      message: "终审未逐项覆盖质量报告中的否定—改判候选，已按未闭合候选生成最小修订包；提案未创建。",
+    }),
+  };
+}
+
 export const PRIMARY_PROSE_GATE_TIMEOUT_MS = 60_000;
 export const FINAL_PROSE_GATE_TIMEOUT_MS = 180_000;
 
@@ -1195,6 +1239,14 @@ async function reviewDirectNarrativeProposal(
   const cachedSemanticReview = args.store.narrativeSemanticReview(path, contentSourceHash, semanticContextHash);
   if (cachedSemanticReview && typeof cachedSemanticReview === "object" && !Array.isArray(cachedSemanticReview)
     && (cachedSemanticReview as Record<string, unknown>).verdict === "pass") {
+    const cachedReview = cachedSemanticReview as ChapterReviewResult;
+    const incompleteCoverage = uncoveredContrastReview(
+      path,
+      contentSourceHash,
+      contrastCandidatesForReview(validation),
+      cachedReview,
+    );
+    if (incompleteCoverage) return { kind: "blocked", response: incompleteCoverage.response };
     args.store.saveSessionArtifact(args.sessionId, {
       artifactKey: `semantic_review:${path}:${contentSourceHash}:${semanticContextHash}`,
       kind: "narrative_semantic_review",
@@ -1205,8 +1257,8 @@ async function reviewDirectNarrativeProposal(
       status: "active",
       metadata: { contextHash: semanticContextHash, cached: true },
     });
-    const chapterChange = typeof (cachedSemanticReview as Record<string, unknown>).chapterChange === "string"
-      ? String((cachedSemanticReview as Record<string, unknown>).chapterChange).trim()
+    const chapterChange = typeof cachedReview.chapterChange === "string"
+      ? cachedReview.chapterChange.trim()
       : "";
     return { kind: "pass", ...(chapterChange ? { chapterChange } : {}) };
   }
@@ -1285,6 +1337,13 @@ async function reviewDirectNarrativeProposal(
             content,
           )
         : reviewed.review;
+      const incompleteCoverage = uncoveredContrastReview(
+        path,
+        contentSourceHash,
+        contrastCandidatesForReview(validation),
+        constrainedReview,
+      );
+      if (incompleteCoverage) return { kind: "blocked", response: incompleteCoverage.response };
       if (constrainedReview.verdict === "pass") {
         args.store.saveNarrativeSemanticReview(
           path,

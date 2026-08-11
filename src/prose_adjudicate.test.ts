@@ -255,7 +255,7 @@ test("semantic progression and interpretation contrasts are blocked with non-mec
 });
 
 test("semantic allow and deterministic construction-family budget stay independent", () => {
-  const text = "走廊里不是风声，是人的脚步。门后不是护士，是一名警卫。";
+  const text = "一个热源，速度很快，不是步兵的速度。门锁内侧有新划痕，不是风吹出来的。";
   const issues = analyzeProseStyle(text);
   const candidates = issues.filter(item => item.constructionRuleId === "negation_redefinition");
   assert.equal(candidates.length, 2);
@@ -285,7 +285,7 @@ test("semantic allow and deterministic construction-family budget stay independe
     verdict: "allow" as const,
     reason: "必要客观排除",
   })));
-  assert.equal(proseStyleIssuesError(allowedOnly), undefined, "semantic allow must not be overturned by density");
+  assert.equal(proseStyleIssuesError(allowedOnly), undefined, "necessary factual exclusions may still be semantically allowed");
 });
 
 test("prose diagnosis gives Agent stable evidence and revision intent", () => {
@@ -307,7 +307,7 @@ test("prose diagnosis gives Agent stable evidence and revision intent", () => {
   assert.match(diagnosis.actionableIssues[0].evidence, /不是紧张/u);
   assert.ok(diagnosis.actionableIssues[0].revisionIntent.length > 0);
   assert.equal(diagnosis.familyBudgets[0].excess, 1);
-  assert.equal(diagnosis.familyBudgets[0].reviseIssueIds.length, 1);
+  assert.equal(diagnosis.familyBudgets[0].reviseIssueIds.length, 2);
   assert.equal(buildProseDiagnosis(sourceHash, reviewed, text).reviewId, diagnosis.reviewId);
 });
 

@@ -420,7 +420,9 @@ function openingMonotony(text: string): { prefix: string; ratio: number } | unde
 function collectContrastFrames(text: string): string[] {
   return findProseConstructionMatches(text)
     .filter(match => match.rule.familyId === "negation_redefinition")
-    .map(match => clip(match.text.trim(), 48));
+    // Keep exact source evidence so semantic review can prove that every
+    // candidate was considered. Registered patterns are already length-bounded.
+    .map(match => match.text.trim());
 }
 
 function stripStructuralLines(text: string): string {

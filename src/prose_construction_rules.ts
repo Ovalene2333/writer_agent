@@ -18,7 +18,7 @@ export type ProseConstructionCandidateContext = {
 };
 
 export type ProseConstructionClassification = {
-  subtype: "abstract_reframing" | "split_redefinition" | "dialogue_correction" | "factual_exclusion";
+  subtype: "narrator_redefinition" | "abstract_reframing" | "split_redefinition" | "dialogue_correction" | "factual_exclusion";
   severity: "warning" | "info";
   confidence: number;
   reason: string;
@@ -66,10 +66,11 @@ export const PROSE_CONSTRUCTION_RULES = [
       /与其(?:说)?[^\n。！？!?]{1,48}不如(?:说)?[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
       /不在于[^\n。！？!?]{1,48}而在于[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
       /(?:不能|算不上|谈不上|称不上)[^\n。！？!?]{1,40}(?:只是|不过是|更像)[^\n。！？!?]{1,48}(?:[。！？!?]|$)/gu,
+      /^\s*不是[^\n。！？!?，,；;：:]{1,32}[。！？!?](?=\s*(?![“「『"])[^\n。！？!?]{1,80})/gmu,
     ],
     generationGuidance: "叙述不要用先否定后改判（包括「不是……是/而是……」与拆句变体）、“没有A只有B”等同功能变体，或在成立事实后补一句否定标签制造力度；语义递进和语义诠释也应让动作、感受、视线变化或结果自然显出。人物对白中的即时纠错可以保留，但仍占句式家族额度。修订时保留原有节奏、意象和信息落点，可重组命中句及紧邻一句，避免压成生硬说明句。",
     adjudicationGuidance: "判断候选是否以否定—改判骨架完成语义递进、重新命名、感受诠释或在成立事实后追加否定补注。叙述中的 split_redefinition 与 abstract_reframing 必须 block：局部事实成立、比喻自然或确有语境作用都不能作为 allow 理由，因为应改由动作、感受、视线变化或结果承载。真实人物对白中的即时纠错可结合声线 allow；纯引用、代码或元数据标记为不计数。其他必要事实排除从严判断。语义 verdict 与句式家族计数彼此独立。",
-    revisionRequiredSubtypes: ["split_redefinition", "abstract_reframing"],
+    revisionRequiredSubtypes: ["narrator_redefinition", "split_redefinition", "abstract_reframing"],
     reviewAtCount: 2,
     allowedOccurrences: characters => Math.max(1, Math.floor((characters * 4) / 10_000)),
     classify: context => {
@@ -99,6 +100,19 @@ export const PROSE_CONSTRUCTION_RULES = [
           severity: "warning",
           confidence: 0.9,
           reason: "叙述者先否定表象再定义抽象意义，需由语义二审判断是否只是模板化重述。",
+          suggestions: DIRECT_FACT_SUGGESTIONS,
+        };
+      }
+      const pairedReplacement = /不是[^\n。！？!?]{0,48}(?:(?:而|却|只)是|(?<!不)是)/u.test(context.matchedText);
+      const standaloneDenial = /^\s*不是[^\n。！？!?，,；;：:]{1,32}[。！？!?]\s*$/u.test(context.matchedText);
+      if (pairedReplacement || standaloneDenial) {
+        return {
+          subtype: "narrator_redefinition",
+          severity: "warning",
+          confidence: pairedReplacement ? 0.98 : 0.94,
+          reason: pairedReplacement
+            ? "叙述者先否定一种表述再给出替代定义，事实内容不同不改变其共同的改判功能。"
+            : "叙述者把否定独立成句，并由后续叙述完成隐式揭示，属于跨句改判骨架。",
           suggestions: DIRECT_FACT_SUGGESTIONS,
         };
       }

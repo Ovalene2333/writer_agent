@@ -5,7 +5,10 @@ import { boundedRepairPacket, type RepairPacket } from "./repair_packet.js";
 import type { WriterStore } from "./store.js";
 import type { DocumentQualityReportSnapshot, ProseQualityReport } from "./types.js";
 
-export const NARRATIVE_VALIDATION_VERSION = 1;
+// v2 adds a shared construction-candidate checklist and fail-closed coverage.
+// Old receipts must not bypass the stricter style/semantic closure.
+export const NARRATIVE_VALIDATION_VERSION = 2;
+export const CONTRAST_REVIEW_CANDIDATE_LIMIT = 32;
 
 export type NarrativeValidationReceipt = {
   sourceHash: string;
@@ -89,6 +92,8 @@ export function buildNarrativeValidationSnapshot(input: {
 
 export function proseSignalsFromNarrativeValidation(snapshot: NarrativeValidationSnapshot): Record<string, unknown> {
   const warnings = adaptiveQualityWarnings(snapshot.adaptive);
+  const constructionCandidateChecklist = contrastReviewCandidates(snapshot)
+    .map((evidence, index) => ({ id: `negation_redefinition:${index + 1}`, evidence }));
   return {
     validationVersion: NARRATIVE_VALIDATION_VERSION,
     sourceHash: snapshot.sourceHash,
@@ -98,10 +103,18 @@ export function proseSignalsFromNarrativeValidation(snapshot: NarrativeValidatio
       message: warning.message,
       examples: warning.examples.slice(0, 5),
     })),
+    ...(constructionCandidateChecklist.length ? { constructionCandidateChecklist } : {}),
     vividness: snapshot.adaptive.vividness.stats,
     aiTells: snapshot.adaptive.aiTells.stats,
     dialogue: snapshot.adaptive.dialogue.stats,
   };
+}
+
+/** One bounded authority shared by review prompts and post-review coverage gates. */
+export function contrastReviewCandidates(snapshot: NarrativeValidationSnapshot): string[] {
+  const issue = snapshot.adaptive.metrics.issues.find(item => item.code === "contrast_density");
+  return [...new Set(issue?.occurrences ?? issue?.examples ?? [])]
+    .slice(0, CONTRAST_REVIEW_CANDIDATE_LIMIT);
 }
 
 function metricRepairPacket(

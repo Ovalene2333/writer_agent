@@ -42,8 +42,10 @@ import {
 } from "../prose_metrics.js";
 import {
   buildNarrativeValidationSnapshot,
+  contrastReviewCandidates,
   narrativeValidationReceipt,
   proseSignalsFromNarrativeValidation,
+  type NarrativeValidationSnapshot,
 } from "../narrative_validation.js";
 import { analyzeProseVividness, formatVividnessSummary } from "../prose_vividness.js";
 import { analyzeDialogueTexture, formatDialogueSummary } from "../dialogue_texture.js";
@@ -66,6 +68,7 @@ import {
   ChapterReviewRequestError,
   constrainChapterRevisionReview,
   reviewChapterDraft,
+  uncoveredProseCandidateEvidence,
   type ChapterReviewIssue,
   type ChapterReviewResult,
 } from "../chapter_review.js";
@@ -1121,6 +1124,32 @@ function chapterSceneReviewIssues(issues: readonly ChapterReviewIssue[]): Chapte
   });
 }
 
+function enforceSceneReviewCandidateCoverage(
+  review: ChapterReviewResult,
+  validation: NarrativeValidationSnapshot,
+  draft: ChapterSceneDraft,
+): ChapterReviewResult {
+  if (review.verdict !== "pass") return review;
+  const candidates = contrastReviewCandidates(validation);
+  const missing = uncoveredProseCandidateEvidence(candidates, review).slice(0, 8);
+  if (!missing.length) return review;
+  return {
+    verdict: "revise",
+    chapterChange: review.chapterChange,
+    reviewNotes: `${review.reviewNotes}\n终审未逐项覆盖 ${missing.length} 个否定—改判候选，不能据此放行。`.slice(0, 1_000),
+    issues: missing.map(evidence => ({
+      severity: "blocker",
+      kind: "construction_repetition",
+      sceneId: draft.completed.find(scene => scene.content.includes(evidence))?.sceneId
+        ?? draft.completed[0]?.sceneId,
+      evidence: [evidence],
+      oldText: evidence,
+      problem: "整章终审未逐字引用并判断该否定—改判候选的场景功能，当前 pass 缺少可验证依据。",
+      action: "保留事实与节奏，改用直接事实、动作、感受或人物特有说法；若确属必要排除或人物即时纠错，重新提交后由终审明确逐项裁决。",
+    })),
+  };
+}
+
 function targetScenesForReview(draft: ChapterSceneDraft, targetIds: ReadonlySet<string>) {
   return draft.completed.flatMap((completed, index) => {
     if (!targetIds.has(completed.sceneId)) return [];
@@ -1488,7 +1517,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
             requestComponents: isolatedRequestComponent("隔离整章终审请求", reviewRequestCharacters, "chapter_review"),
           });
         }
-        const chapterReview = revisionReview
+        const reviewedChapter = revisionReview
           ? constrainChapterRevisionReview(
               reviewed.review,
               revisionReview,
@@ -1496,6 +1525,7 @@ export async function handleInspectChapterDraft(args: ToolHandlerArgs): Promise<
               content,
             )
           : reviewed.review;
+        const chapterReview = enforceSceneReviewCandidateCoverage(reviewedChapter, validation, draft);
         if (chapterReview.verdict === "revise") {
           const cycleIssues = chapterSceneReviewIssues(chapterReview.issues);
           const transition = proposalIssueTransition(

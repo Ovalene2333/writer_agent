@@ -141,6 +141,31 @@ export type ChapterReviewResult = {
   priorBlockerDispositions?: ChapterReviewPriorBlockerDisposition[];
 };
 
+function normalizedCandidateAnchor(evidence: string): string {
+  const negation = evidence.search(/(?:不是|并非|没有|与其|不在于|不能|算不上|谈不上|称不上)/u);
+  const anchor = negation >= 0 ? evidence.slice(negation) : evidence;
+  return normalizeEvidenceNeedle(anchor.replace(/[。！？!?]+$/u, ""));
+}
+
+/**
+ * A pass may not silently skip deterministic construction candidates. The
+ * reviewer can keep or reject each one, but must quote its exact negation
+ * anchor so local differences in subject matter are not mistaken for coverage.
+ */
+export function uncoveredProseCandidateEvidence(
+  candidates: readonly string[],
+  review: Pick<ChapterReviewResult, "reviewNotes" | "issues">,
+): string[] {
+  const reviewedText = normalizeEvidenceNeedle([
+    review.reviewNotes,
+    ...review.issues.flatMap(issue => [...issue.evidence, issue.problem, issue.action]),
+  ].join("\n"));
+  return [...new Set(candidates)].filter(candidate => {
+    const anchor = normalizedCandidateAnchor(candidate);
+    return anchor.length >= 4 && !reviewedText.includes(anchor);
+  });
+}
+
 export type ChapterReviewPriorBlockerDisposition = {
   priorIssueId: string;
   status: "resolved" | "still_present";
@@ -218,7 +243,7 @@ const REVIEW_SYSTEM = `你是中文小说整章终审员。先查会让章节失
 - 场景接续是否存在因果断裂、状态矛盾或换地点重复同一功能；章首到章尾是否形成与 chapterGoal 相符的变化。静场、铺垫章、过渡章和收束章可以只改变认知、关系或选择，不必强造对抗、悬念和损失；
 - telemetry_pileup：读数或术语连续出现，却不影响人物判断与行动；register_leak：资料中的规范术语跨越专业报告、普通对白、贴身叙述或人物内心后仍被当作唯一默认指称，使人物不像在自己的处境中说话或感受。单个必要术语、角色确有专业身份、正式状态汇报和首次精确定义都应放行；不得因词频本身报告，必须引用至少两处能证明语域不分的原文，并说明各处为什么应采用不同的信息精度或体验表达；compressed_prose：叙述或对白连续把主谓、动作对象、感受来源、比较维度或句间承接压成“名词短语＋谓词”，或用抽象归属硬扣物件制造短梗，导致句子虽可猜懂却长期像提纲字段。报此项必须引用至少两处相邻或同段原文并指出被压掉的具体关系；单个短句、军令、紧张重音、自然问答和符合人物压力的口语省略应放行；expository_mechanics：已经成立的动作又被教程式解释挤占；semantic_echo：相邻句段重复同一信息；generic_prose：关键场面长期只有泛化判断，缺少可辨认的现场依据；
 - field_verbalization：角色把权限、状态、时刻、读数、分类或角色卡摘要直接念成对白，或叙述者把资料字段改写成判断句，没有经过人物当前关注、交际目的和感受来源转换。正式汇报、紧急命令、对表核验和对方确实询问该字段时放行；必须引用至少两处当前正文的连续证据，说明字段为何没有成为人物行动。
-- construction_repetition：结合 proseSignals 中的章级候选，检查“不是A，是B”“没有A，只有B”、说明性破折号等高辨识度骨架是否跨段反复承担同一种改判或补充解释。统计值只负责定位；必须引用至少三处当前正文，逐处判断其场景功能。必要事实排除、人物即时纠错、对白中确有目的的反驳和偶发重音应保留。只有重复骨架贯穿关键场面、让不同人物与叙述者持续使用同一种改判口吻，并且多数实例可改为直接事实或动作而不损失信息时，才可判 blocker；否则 warning 或不报。
+- construction_repetition：结合 proseSignals 中的章级候选，检查“不是A，是B”“没有A，只有B”、说明性破折号等高辨识度骨架是否跨段反复承担同一种改判或补充解释。统计值只负责定位；若提供 constructionCandidateChecklist，必须在 reviewNotes 或 issues 中逐项逐字引用并判断其功能，不得漏项。判断的是共同修辞动作，不是各句谈论的事实内容：“战术定性、威胁分类、动作节奏内容不同”不能证明句式功能不同。必要事实排除、人物即时纠错、对白中确有目的的反驳和偶发重音应保留。只有重复骨架贯穿关键场面、让不同人物与叙述者持续使用同一种改判口吻，并且多数实例可改为直接事实或动作而不损失信息时，才可判 blocker；否则 warning 或不报。
 - voice_macro_reuse：角色卡中的例句、短句节拍、反问、吐槽、术语或动作锚点被近邻改写后反复充当角色签名，出现时缺少当前触发条件和现场功能。相同动作若每次由不同压力触发并改变现场，不应判错；必须引用至少两处当前正文，说明复用的是句法/动作宏而非稳定的交际策略。
 - template_reuse：若提供 comparisonMaterials，只检查当前正文是否复用了旧章的事件槽位顺序、角色分工、道具功能、对白功能和收束方式；共享世界观事实、自然母题、地点或同一人物本身不构成复刻。evidence 仍必须逐字引用当前 fullChapter 至少两处连续证据，problem 可点明对照路径与结构，但不得把 comparisonMaterials 原句冒充当前正文证据。comparisonMaterials 仅供审查，绝不是写作范文。
 - voice_homogenization：主要人物的措辞、信息取舍和说话目的长期无法区分。若 evidence packet 有 dialogueCharacters，先对照其 voice、目标、关系与当前状态；判断两人是否因想达成不同事情而选择不同信息、回避角度和谈话策略（追问、换题、还价、拒绝、解释、威胁等）。报此项必须引用至少两名人物各自的逐字台词，并在 problem 说明可互换的原因；口语标记比例、短句或统计接近都不能单独成立。不要以口头禅、固定句长或强行回避作为角色声线模板；

@@ -7,12 +7,28 @@ import {
   extractChapterReviewPayload,
   parseChapterReview,
   SUBMIT_CHAPTER_REVIEW_TOOL_NAME,
+  uncoveredProseCandidateEvidence,
   type ChapterReviewResult,
 } from "./chapter_review.js";
 import { proposalRevisionIssueId, type ProposalRevisionIssue } from "./proposal_retry.js";
 
 const SCENES = new Set(["s1"]);
 const SOURCE = "「我们必须面对这个真相。」他说。「别把话说满。」她说。最后他终于明白了一切。";
+
+test("终审 pass 必须逐项覆盖否定—改判候选", () => {
+  const candidates = ["不是杀伤，是", "一个热源，速度很快，不是步兵的速度。", "不是慢慢转，是"];
+  const partial: ChapterReviewResult = {
+    verdict: "pass",
+    chapterChange: "炮塔完成拦截",
+    reviewNotes: "“不是杀伤，是震”属于战术定性；“不是步兵的速度”属于事实排除。",
+    issues: [],
+  };
+  assert.deepEqual(uncoveredProseCandidateEvidence(candidates, partial), ["不是慢慢转，是"]);
+  assert.deepEqual(uncoveredProseCandidateEvidence(candidates, {
+    ...partial,
+    reviewNotes: `${partial.reviewNotes}；“不是慢慢转，是一下子甩过去的”属于动作改判。`,
+  }), []);
+});
 
 function review(
   issues: unknown[],
